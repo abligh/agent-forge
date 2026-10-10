@@ -149,6 +149,23 @@ class Check(unittest.TestCase):
             self.problems(host_settings={"host_keys": ["a", 1]}),
             ["host_settings.host_keys must be a list of strings"])
 
+    def test_docs_types(self):
+        self.assertEqual(
+            self.problems(docs={"paths": "docs", "width": "80",
+                                "roles": 1, "designs_dir": None}),
+            ["docs.paths must be a list", "docs.width must be an integer",
+             "docs.roles must be a string",
+             "docs.designs_dir must be a string"])
+        self.assertEqual(self.problems(docs={"paths": ["docs", ""],
+                                             "width": 0}),
+                         ["docs.paths must be a list of path globs",
+                          "docs.width must be at least 1"])
+        self.assertEqual(self.problems(docs={"width": True}),
+                         ["docs.width must be an integer"])
+
+    def test_docs_keys_of_tools_not_here_yet_are_left_alone(self):
+        self.assertEqual(self.problems(docs={"spelling": "words.txt"}), [])
+
     def test_not_an_object(self):
         self.assertEqual(config.check([]),
                          ["the configuration must be a JSON object"])

@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Check Markdown files for whitespace and heading-structure mistakes.
+
+Usage: forge-doc-format [PATH...]
+
+Each PATH is a Markdown file or a directory, which is searched for
+`*.md` files recursively. With no PATH, the files are those the
+configuration's `docs.paths` globs match (default `*.md` and `docs`).
+A project runs it, with forge-doc-width and forge-doc-links, before
+pushing and again in CI, so a pull request can't merge on someone
+having forgotten.
+
+Checks, and why:
+
+* **No trailing whitespace.** It is invisible in review and shows up as
+  noise in the next diff that touches the line. Two trailing spaces are
+  also a Markdown hard line break, which nobody can see in the source.
+* **The file ends with exactly one newline.** A missing newline makes
+  the next appended line a change to this one; extra blank lines at the
+  end are trailing whitespace by another name.
+* **Headings are in order.** The first heading is `#`, there is only
+  one `#`, and a heading is at most one level deeper than the heading
+  before it (`##` then `####` skips a level). The heading outline is
+  the table of contents GitHub renders, and anchors other documents
+  link to; a skipped level renders as a broken outline.
+
+Lines inside fenced code blocks are exempt from the heading rule, since
+a `#` there is a comment or a prompt, not a heading. Trailing
+whitespace is reported everywhere, code included.
+
+This checks; it does not rewrite. The fix for each finding is one edit,
+and the message says which.
+
+Exit status:
+
+    0   every file is clean
+    1   at least one finding; each is listed as path:line: message
+    2   the configuration is invalid, a named path does not exist, a
+        file could not be read, or nothing matched a Markdown file
+"""
+
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import markdown  # noqa: E402
+
+PROG = "forge-doc-format"
+FENCE_RE = markdown.FENCE_RE
+HEADING_RE = re.compile(r"^(#{1,6})(\s|$)")
+
+
+def problems(text):
+    """(line, message) for each problem in `text`, in line order."""
+    found = []
+    if not text:
+        return [(1, "file is empty")]
+    lines = text.split("\n")
+    # split() leaves "" after a final newline; drop it so line numbers
+    # and the trailing checks see only real lines.
+    has_final_newline = lines[-1] == ""
+    if has_final_newline:
+        lines = lines[:-1]
+
+    fence = None
+    previous_level = 0
+    for number, line in enumerate(lines, 1):
+        if line != line.rstrip():
+            found.append((number, "trailing whitespace"))
+        match = FENCE_RE.match(line)
+        if fence is not None:
+            if match and match.group(1) == fence:
+                fence = None
+            continue
+        if match:
+            fence = match.group(1)
+            continue
+        heading = HEADING_RE.match(line)
+        if not heading:
+            continue
+        level = len(heading.group(1))
+        if previous_level == 0 and level != 1:
+            found.append((number, f"first heading is level {level}; "
+                                  "it should be a single '#'"))
+        elif previous_level and level == 1:
+            found.append((number, "a second level-1 heading; a document "
+                                  "has one '#' title"))
+        elif previous_level and level > previous_level + 1:
+            found.append((number, f"heading jumps from level "
+                                  f"{previous_level} to {level}; use "
+                                  f"{'#' * (previous_level + 1)}"))
+        previous_level = level
+
+    if not has_final_newline:
+        found.append((len(lines), "no newline at end of file"))
+    elif lines and not lines[-1].strip():
+        found.append((len(lines), "blank line(s) at end of file"))
+    return found
+
+
+def main(argv=None, out=sys.stdout, err=sys.stderr, environ=None):
+    paths = sys.argv[1:] if argv is None else argv
+    chosen = markdown.choose(PROG, paths, err, environ)
+    if chosen == 2:
+        return 2
+    files, _docs = chosen
+    count = 0
+    for path in files:
+        try:
+            with open(path, encoding="utf-8", newline="") as handle:
+                text = handle.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"{PROG}: {path}: {exc}", file=err)
+            return 2
+        for number, message in problems(text):
+            print(f"{path}:{number}: {message}", file=out)
+            count += 1
+    if count:
+        print(f"{PROG}: {count} problem(s) ({len(files)} files)", file=out)
+        return 1
+    print(f"{PROG}: clean ({len(files)} files)", file=out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""Check that every relative Markdown link and #anchor resolves.
+
+Usage: forge-doc-links [PATH...]
+
+Each PATH is a Markdown file or a directory, which is searched for
+`*.md` files recursively. With no PATH, the files are those the
+configuration's `docs.paths` globs match (default `*.md` and `docs`).
+A project runs it, with forge-doc-format and forge-doc-width, before
+pushing and again in CI.
+
+Why: a broken link is invisible until a reader clicks it, and a moved
+file or a renamed heading breaks every link to it without touching the
+files that hold them. Only a check over the whole tree sees that.
+
+What it checks, in each file's prose (fenced code and inline code
+spans are skipped, so an example of a link is not a link):
+
+* `[text](target)`, `![alt](target)` and `[name]: target` definitions;
+* a relative target must exist, resolved against the linking file's
+  directory, or against the top of the project's checkout when it
+  starts with `/`, as GitHub resolves it (the working directory when
+  there is no checkout);
+* an anchor, `target.md#section` or `#section`, must match a heading
+  in the target Markdown file, using GitHub's slug rules (lowercase,
+  punctuation dropped, spaces to hyphens, `-1`, `-2` for repeats), or
+  an explicit `<a id="...">` / `<a name="...">`.
+
+Not checked: absolute URLs (`http:`, `https:`, `mailto:` and any other
+scheme), since that needs the network and a flaky check gets ignored;
+and anchors into files that are not Markdown.
+
+Exit status:
+
+    0   every link resolves
+    1   at least one link does not; each is listed as path:line
+    2   the configuration is invalid, a named path does not exist, a
+        file could not be read, or nothing matched a Markdown file
+"""
+
+import os
+import re
+import sys
+from urllib.parse import unquote
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import markdown  # noqa: E402
+
+PROG = "forge-doc-links"
+FENCE_RE = markdown.FENCE_RE
+HEADING_RE = re.compile(r"^#{1,6}\s+(.*?)\s*#*\s*$")
+INLINE_LINK_RE = re.compile(r"\]\(\s*<?([^)\s>]*)>?(?:\s+[\"'(][^)]*)?\)")
+DEFINITION_RE = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*<?([^\s>]+)>?")
+CODE_SPAN_RE = re.compile(r"(`+)(?:(?!\1).)+\1")
+SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+HTML_ANCHOR_RE = re.compile(r"<a\s[^>]*\b(?:id|name)=[\"']([^\"']+)[\"']",
+                            re.IGNORECASE)
+
+
+def prose_lines(text):
+    """(line number, line) for each line outside fenced code, with
+    inline code spans removed."""
+    fence = None
+    for number, line in enumerate(text.split("\n"), 1):
+        match = FENCE_RE.match(line)
+        if fence is not None:
+            if match and match.group(1) == fence:
+                fence = None
+            continue
+        if match:
+            fence = match.group(1)
+            continue
+        yield number, CODE_SPAN_RE.sub("", line)
+
+
+def slug(heading):
+    """GitHub's anchor for a heading's text."""
+    # A link in a heading renders as its text, so the slug uses that.
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", heading)
+    text = re.sub(r"<[^>]+>", "", text).strip().lower()
+    text = re.sub(r"[^\w\s-]", "", text)
+    return re.sub(r"\s", "-", text)
+
+
+def anchors(text):
+    """Every anchor a link may name in a Markdown document."""
+    found, seen = set(), {}
+    for _, line in prose_lines(text):
+        found.update(HTML_ANCHOR_RE.findall(line))
+        heading = HEADING_RE.match(line)
+        if not heading:
+            continue
+        base = slug(heading.group(1))
+        # GitHub numbers repeats: intro, intro-1, intro-2.
+        repeat = seen.get(base, 0)
+        seen[base] = repeat + 1
+        found.add(base if repeat == 0 else f"{base}-{repeat}")
+    return found
+
+
+def links(text):
+    """(line number, target) for every link in `text`'s prose."""
+    for number, line in prose_lines(text):
+        for target in INLINE_LINK_RE.findall(line):
+            yield number, target
+        definition = DEFINITION_RE.match(line)
+        if definition:
+            yield number, definition.group(1)
+
+
+class Checker:
+    """Resolves links, reading each target file's anchors once."""
+
+    def __init__(self, root="."):
+        self.root = root
+        self._anchors = {}
+
+    def anchors_of(self, path):
+        if path not in self._anchors:
+            with open(path, encoding="utf-8") as handle:
+                self._anchors[path] = anchors(handle.read())
+        return self._anchors[path]
+
+    def problem(self, source, target):
+        """Why `target`, linked from `source`, does not resolve, or
+        None when it does or is not ours to check."""
+        if not target or SCHEME_RE.match(target):
+            return None
+        path, _, fragment = target.partition("#")
+        path, fragment = unquote(path), unquote(fragment)
+        if not path:
+            dest = source
+        elif path.startswith("/"):
+            dest = os.path.normpath(os.path.join(self.root,
+                                                 path.lstrip("/")))
+        else:
+            dest = os.path.normpath(
+                os.path.join(os.path.dirname(source), path))
+        if not os.path.exists(dest):
+            return f"links to {path}, which does not exist"
+        if not fragment or not dest.endswith(".md") or os.path.isdir(dest):
+            return None
+        try:
+            known = self.anchors_of(dest)
+        except (OSError, UnicodeDecodeError) as exc:
+            return f"links to {target}, which could not be read: {exc}"
+        if fragment.lower() not in {a.lower() for a in known}:
+            where = path or os.path.basename(source)
+            return f"links to {where}#{fragment}, which matches no heading"
+        return None
+
+
+def main(argv=None, out=sys.stdout, err=sys.stderr, environ=None):
+    paths = sys.argv[1:] if argv is None else argv
+    chosen = markdown.choose(PROG, paths, err, environ)
+    if chosen == 2:
+        return 2
+    files, docs = chosen
+    checker = Checker(docs.root)
+    count = checked = 0
+    for path in files:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"{PROG}: {path}: {exc}", file=err)
+            return 2
+        for number, target in links(text):
+            checked += 1
+            problem = checker.problem(path, target)
+            if problem:
+                print(f"{path}:{number}: {problem}", file=out)
+                count += 1
+    if count:
+        print(f"{PROG}: {count} broken link(s) "
+              f"({checked} links, {len(files)} files)", file=out)
+        return 1
+    print(f"{PROG}: clean ({checked} links, {len(files)} files)", file=out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

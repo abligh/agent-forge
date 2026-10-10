@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Check that Markdown prose is wrapped within the project's width.
+
+Usage: forge-doc-width [PATH...]
+
+Each PATH is a Markdown file or a directory, which is searched for
+`*.md` files recursively. With no PATH, the files are those the
+configuration's `docs.paths` globs match (default `*.md` and `docs`).
+The width is the configuration's `docs.width` (default 80).
+A project runs it, with forge-doc-format and forge-doc-links, before
+pushing and again in CI.
+
+Why: a document is reviewed as a diff, and a paragraph written as one
+long line turns a one-word change into a whole-paragraph change that
+nobody can review. A ceiling the tools enforce settles the question
+once instead of in every review. Wrap prose a little short of the
+width; this fails only past it.
+
+Exempt, because their line breaks carry meaning or cannot be moved:
+
+* fenced code blocks (``` or ~~~) and indented code blocks (four
+  spaces after a blank line);
+* table rows (lines starting with `|`);
+* lines carrying a link (`](`), a link definition, or a bare URL;
+* a line that is a single word, since no wrap could shorten it.
+
+The tool says what it read even when everything passes,
+`forge-doc-width: clean (N files)`, because a silent pass cannot be
+told apart from a check that matched nothing.
+
+It cannot see a reflow that lost a word: its silence is about line
+length and nothing else. After an edit meant only to re-wrap,
+`git diff --word-diff=porcelain -- FILE | grep '^-[^-]'` prints nothing
+for a pure reflow and the lost word for one that ate it.
+
+Exit status:
+
+    0   no line is too long
+    1   at least one line is too long; each is listed as path:line
+    2   the configuration is invalid, a named path does not exist, a
+        file could not be read, or nothing matched a Markdown file
+"""
+
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import markdown  # noqa: E402
+
+PROG = "forge-doc-width"
+LIMIT = markdown.DEFAULT_WIDTH
+
+FENCE_RE = markdown.FENCE_RE
+LINK_RE = re.compile(r"\]\(|^\s*\[[^\]]+\]:\s|https?://")
+
+
+def long_lines(text, limit=LIMIT):
+    """The 1-based numbers of lines in `text` that are too long and not
+    exempt."""
+    bad = []
+    fence = None
+    previous_blank = True
+    in_indented_code = False
+    for number, line in enumerate(text.split("\n"), 1):
+        match = FENCE_RE.match(line)
+        if fence is not None:
+            # Inside a fence until the same marker closes it.
+            if match and match.group(1) == fence:
+                fence = None
+            previous_blank = False
+            continue
+        if match:
+            fence = match.group(1)
+            previous_blank = False
+            continue
+        blank = not line.strip()
+        if blank:
+            previous_blank = True
+            continue
+        indented = line.startswith("    ") or line.startswith("\t")
+        if previous_blank:
+            # An indented code block starts only after a blank line, so
+            # an indented continuation of a list item is still prose.
+            in_indented_code = indented
+        elif not indented:
+            in_indented_code = False
+        previous_blank = False
+        if in_indented_code or len(line) <= limit:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("|") or LINK_RE.search(line):
+            continue
+        if len(stripped.split()) <= 1:
+            continue
+        bad.append(number)
+    return bad
+
+
+def main(argv=None, out=sys.stdout, err=sys.stderr, environ=None):
+    paths = sys.argv[1:] if argv is None else argv
+    chosen = markdown.choose(PROG, paths, err, environ)
+    if chosen == 2:
+        return 2
+    files, docs = chosen
+    limit = docs.width
+    count = 0
+    for path in files:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"{PROG}: {path}: {exc}", file=err)
+            return 2
+        for number in long_lines(text, limit):
+            print(f"{path}:{number}: longer than {limit} columns", file=out)
+            count += 1
+    if count:
+        print(f"{PROG}: {count} line(s) too long ({len(files)} files)",
+              file=out)
+        return 1
+    print(f"{PROG}: clean ({len(files)} files)", file=out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

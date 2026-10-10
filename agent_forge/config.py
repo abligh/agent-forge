@@ -57,6 +57,9 @@ HOST_SETTINGS = {"files": list, "host_keys": list}
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_minutes": int}
 HOST_FILE = {"from": str, "to": str, "mode": str, "json": bool}
+# docs is shared by several tools, some not here yet, so only the keys
+# known are checked; another is left to its tool.
+DOCS = {"paths": list, "width": int, "roles": str, "designs_dir": str}
 MODE_RE = re.compile(r"^0[0-7]{3}$")
 
 
@@ -185,6 +188,15 @@ def check(data):
         if not all(isinstance(k, str) for k in settings.get("host_keys", [])):
             problems.append("host_settings.host_keys must be a list of "
                             "strings")
+    docs = data.get("docs", {})
+    for key, kinds in DOCS.items():
+        if key in docs and not _is(docs[key], kinds):
+            problems.append("docs.%s must be %s" % (key, _type_name(kinds)))
+    if isinstance(docs.get("paths"), list) and \
+            not all(isinstance(p, str) and p for p in docs["paths"]):
+        problems.append("docs.paths must be a list of path globs")
+    if _is(docs.get("width"), int) and docs["width"] < 1:
+        problems.append("docs.width must be at least 1")
     suffix = data.get("naming", {}).get("app_slug_suffix")
     if not data["agents"]:
         problems.append("agents must name at least one agent")

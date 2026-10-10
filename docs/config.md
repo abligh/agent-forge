@@ -41,7 +41,8 @@ starts with `_` is a comment, at any level.
 | `identity` | no | The host's unconfigured git identity, which no commit may carry: `unattributed_domain` (an email domain such as `@host.example.org`) and `unattributed_name`. |
 | `merge` | no | How `forge-merger` merges: `merger`, the machinery App that acts (default `Merger`); `ci_workflow`, the Actions workflow every head must pass (default `ci`; `""` for none); `gate`, tools that must exit 0 before a merge, each an argument list with `{pr}`, `{base}` and `{head}` filled in, a `forge-` name run from the installation and anything else from the cron checkout (default `[["forge-commit-identity", "{base}..{head}"]]`); `stall_minutes`, how long a head may wait on its checks before the tick reports it stalled (default 30). The required status is `checks.context`, counted only when `checks.poster`'s App (default the merger) posted it. |
 | `host_settings` | no | Files every agent host carries, installed by `forge-host-settings`: `files`, each `{"from": path in the project, "to": path under the home directory, "mode": "0644", "json": true when compared as JSON}`, and `host_keys`, keys a JSON file's host may set for itself. |
-| `labels`, `checks`, `docs`, `relay` | no | Sections each tool documents for itself, as it moves here. |
+| `docs` | no | The project's documentation, as the tools that read it see it; see below. |
+| `labels`, `checks`, `relay` | no | Sections each tool documents for itself, as it moves here. |
 
 ### An agent
 
@@ -56,6 +57,18 @@ letter.
 | `session_name` | The name the agent's session is woken by, where it isn't `naming.session_prefix` followed by the name. |
 | `kind` | `developer` (the default) or `reviewer`. A reviewer's approval is what the Merger merges on. |
 | `reviews` | A reviewer's path globs (`fnmatch`, so `*` crosses `/`): which pull requests are theirs to review. |
+
+### `docs`
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `paths` | `["*.md", "docs"]` | What `forge-doc-format`, `forge-doc-width` and `forge-doc-links` check when given no paths: globs relative to the checkout's top (`**` crosses directories), each a Markdown file or a directory searched for `*.md`. A glob that matches nothing is skipped, but matching no Markdown at all is an error. |
+| `width` | `80` | The widest a prose line may be, for `forge-doc-width`. |
+| `roles` | `docs/roles.md` | The roles file `forge-session-start` takes each agent's brief from. |
+| `designs_dir` | `designs` | Where designs are, for `forge-approval-scope`. |
+
+Only these keys are checked; the section may hold others, for tools
+not here yet.
 
 ## Where state lives
 
