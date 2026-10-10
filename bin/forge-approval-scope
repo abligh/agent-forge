@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Does this branch add text to an already-approved design without saying so?
+
+A design document's `Status: approved (<human>, <date>)` line carries no
+scope, so text merged afterwards inherits the approval silently. Text
+that was on a branch while the human read the document was never in
+front of them, yet the merged result reads as approved in full.
+
+**Forward-looking, on purpose.** This looks only at the commits a branch
+adds, which is where the defect happens and where it can still be
+fixed, not at history nobody is going to relitigate.
+
+**What counts as saying so.** Either the commit message or the added
+text names it as an amendment ("Amended 2026-10-09, after approval").
+
+**An implemented design counts as approved.** Its Status reads
+`implemented. Approved by ...`. What may be recorded after approval is
+what shipped, so that is what is exempt: an `Implemented:` field, and
+the Status block on the commit that changes the status. Anything else
+is judged as it is for an approved design.
+
+**It does not judge whether the amendment is legitimate.** Most are:
+correcting a falsified claim is better than leaving it. The failure is
+silence, not amendment, and the remedy is one clause.
+
+Designs are the `.md` files under the configuration's
+`docs.designs_dir` (default `designs`).
+
+Exit 0 nothing unmarked, 1 something adds text to an approved design
+without marking it, 2 the range could not be read (including a shallow
+clone, where every commit below the graft reads as added).
+
+    forge-approval-scope                     origin/<default branch>..HEAD
+    forge-approval-scope BASE..HEAD          any range
+    forge-approval-scope --history FILE      every post-approval commit
+"""
+import argparse
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, proc  # noqa: E402
+
+# Set by main(); module-level so the helpers keep their signatures.
+RUN = [proc.sh]
+DESIGNS = ["designs"]
+
+
+# A header field's key, which may itself be emphasized, as in
+# `* **Status**: approved`. Missing that would make an approved design
+# read as a draft, and so drop it from the check.
+def field_key(name):
+    return r"^\*?\s*(?:\*\*|__)?%s(?:\*\*|__)?:" % name
+
+
+# The status word may be emphasized too, as in `Status: **approved**`,
+# for the same reason.
+APPROVED_RE = re.compile(
+    field_key("Status") +
+    r"\s*(?:\*\*|__|\*|_)?(approved|implemented)(?![a-z0-9])",
+    re.IGNORECASE)
+MARKER_RE = re.compile(r"\bamend(ed|ment|ing|s)?\b", re.IGNORECASE)
+
+
+def git(*args, cwd=None):
+    return RUN[0](["git", *args], cwd=cwd)
+
+
+def approval_state(path, ref="HEAD", cwd=None):
+    """`approved` or `implemented` if the document's Status says so at
+    `ref`, else None: not approved yet, or not readable there."""
+    r = git("show", "%s:%s" % (ref, path), cwd=cwd)
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        m = APPROVED_RE.match(line)
+        if m:
+            return m.group(1).lower()
+    return None
+
+
+def is_approved(path, ref="HEAD", cwd=None):
+    """Does the document carry an approval line at `ref`? An implemented
+    design was approved, so it counts."""
+    return approval_state(path, ref, cwd) is not None
+
+
+def added_lines(sha, path, cwd=None):
+    """The lines this commit ADDED to path, without the +."""
+    r = git("show", "--unified=0", "--pretty=format:", sha, "--", path,
+            cwd=cwd)
+    if r.returncode != 0:
+        return []
+    return [l[1:] for l in r.stdout.splitlines()
+            if l.startswith("+") and not l.startswith("+++")]
+
+
+def marked(sha, path, cwd=None):
+    """Is this commit declared as an amendment, in its message or its text?"""
+    message = git("log", "-1", "--format=%B", sha, cwd=cwd).stdout
+    if MARKER_RE.search(message):
+        return True
+    return any(MARKER_RE.search(line) for line in added_lines(sha, path, cwd))
+
+
+def shallow(cwd=None):
+    """True if this is a shallow clone, None if the question cannot be asked.
+
+    A shallow clone is the one input that makes this tool *fabricate* rather
+    than under-report. `origin/main..HEAD` against a grafted history has no
+    real merge-base, so rev-list walks back to the graft and every commit
+    below it reads as "added on this branch", against a commit that does
+    not exist in a full clone. That is worse
+    than the empty answer this tool was written to avoid, because a long
+    list of findings looks like the tool working.
+    """
+    r = git("rev-parse", "--is-shallow-repository", cwd=cwd)
+    if r.returncode != 0:
+        return None
+    out = r.stdout.strip()
+    if out == "true":
+        return True
+    if out == "false":
+        return False
+    return None
+
+
+def examined(rng="origin/main..HEAD", cwd=None):
+    """How many commits the range contains, or None if it cannot be read.
+
+    The summary reports findings, and findings alone cannot distinguish a
+    branch that touches no design -- the common, correct case -- from a
+    range with no commits in it, where nothing was checked at all. Both
+    print "0 commit(s) touch an approved design, 0 unmarked". Printing the
+    population makes the vacuous case say so.
+    """
+    r = git("rev-list", "--count", rng, cwd=cwd)
+    if r.returncode != 0:
+        return None
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+STATUS_RE = re.compile(field_key("Status"), re.IGNORECASE)
+IMPLEMENTED_RE = re.compile(field_key("Implemented"), re.IGNORECASE)
+
+
+def status_block(path, ref, cwd=None, field=STATUS_RE):
+    """The lines of the `Status:` field at `ref` (or of another header field
+    matching `field`): the field's own line and every indented continuation
+    line after it, as they appear in the file. An empty set if the file
+    cannot be read or has no such field."""
+    r = git("show", "%s:%s" % (ref, path), cwd=cwd)
+    if r.returncode != 0:
+        return set()
+    block, inside = set(), False
+    for line in r.stdout.splitlines():
+        if field.match(line):
+            inside = True
+            block.add(line)
+        elif inside and line[:1] in (" ", "\t") and line.strip():
+            block.add(line)
+        elif inside:
+            break
+    return block
+
+
+def survey(rng="origin/main..HEAD", cwd=None):
+    """[(sha, path, added, marked)] for approved designs touched in rng.
+
+    Returns None if the range cannot be read -- which is not the same as
+    finding nothing, and the caller must not report it as clean.
+    """
+    r = git("rev-list", "--reverse", rng, cwd=cwd)
+    if r.returncode != 0:
+        return None
+    rows = []
+    for sha in r.stdout.split():
+        files = git("show", "--name-only", "--pretty=format:", sha,
+                    cwd=cwd).stdout.split()
+        for path in files:
+            if not (path.startswith(DESIGNS[0].rstrip("/") + "/")
+                    and path.endswith(".md")):
+                continue
+            # Approved as of THIS commit: a document approved later should
+            # not make its own earlier drafting retrospectively suspect.
+            state = approval_state(path, sha, cwd)
+            if state is None:
+                continue
+            added = added_lines(sha, path, cwd)
+            # The commit that approves the design is not text added to an
+            # approved design. It is approved here and not at the parent,
+            # and its Status block IS the approval: documentation
+            # standards call approval "a later one-line amendment to that status".
+            # So those lines are exempt, wrapped continuation lines
+            # included. Anything else the same commit adds is still judged:
+            # an approval can't carry unmarked text in with it. The same
+            # holds for the commit that marks the design implemented: the
+            # status changes here, and standards name "a status change" as what
+            # may be recorded afterwards.
+            if approval_state(path, sha + "^", cwd) != state:
+                block = status_block(path, sha, cwd)
+                added = [l for l in added if l not in block]
+            # The other permitted record of what shipped: an `Implemented:`
+            # field with its date and deviations, whenever it is written.
+            shipped = status_block(path, sha, cwd, field=IMPLEMENTED_RE)
+            added = [l for l in added if l not in shipped]
+            substantive = [l for l in added if l.strip()]
+            if not substantive:
+                continue
+            rows.append((sha, path, len(substantive), marked(sha, path, cwd)))
+    return rows
+
+
+def history(path, cwd=None):
+    """Every commit that touched `path` after its approval line landed.
+    The approval is the first commit at which approval_state reads it as
+    approved, so this and survey agree on what an approval line is: a
+    literal search for `Status: approved` would miss a bold key."""
+    r = git("log", "--reverse", "--format=%H", "--", path, cwd=cwd)
+    if r.returncode != 0:
+        return None
+    approval = next((sha for sha in r.stdout.split()
+                     if approval_state(path, sha, cwd)), None)
+    if approval is None:
+        return None
+    after = git("log", "--format=%H %cI %s", "%s..HEAD" % approval, "--",
+                path, cwd=cwd)
+    return approval, [l for l in after.stdout.splitlines() if l.strip()]
+
+
+def main(argv=None, run=proc.sh, load=config.load, out=print, err=None):
+    err = err or (lambda line: print(line, file=sys.stderr))
+    RUN[0] = run
+    parser = argparse.ArgumentParser(prog="forge-approval-scope",
+                                     description=__doc__.splitlines()[0])
+    parser.add_argument("range", nargs="?")
+    parser.add_argument("--history", metavar="FILE",
+                        help="list every post-approval commit for one file")
+    args = parser.parse_args(argv)
+    branch = "main"
+    try:
+        project = load()
+        branch = project.default_branch
+        DESIGNS[0] = project.section("docs").get("designs_dir", "designs")
+    except config.ConfigError:
+        DESIGNS[0] = "designs"
+    rng = args.range or "origin/%s..HEAD" % branch
+
+    if args.history:
+        got = history(args.history)
+        if got is None:
+            err("forge-approval-scope: %s has no approval line" % args.history)
+            return 2
+        approval, commits = got
+        out("  approved by %s" % approval[:12])
+        for line in commits:
+            out("    %s" % line)
+        out("forge-approval-scope: %d commit(s) after approval" % len(commits))
+        return 0
+
+    is_shallow = shallow()
+    if is_shallow is not False:
+        err("forge-approval-scope: refusing to run on a shallow clone "
+            "(--is-shallow-repository said %r). Every commit below the graft "
+            "reads as added on this branch, so the answer would be fabricated "
+            "rather than merely empty. Fetch with depth 0."
+            % ("unknown" if is_shallow is None else "true"))
+        return 2
+    rows = survey(rng)
+    if rows is None:
+        err("forge-approval-scope: cannot read %s" % rng)
+        return 2
+    unmarked = [r for r in rows if not r[3]]
+    for sha, path, count, ok in rows:
+        if not ok:
+            err("%s: %s adds %d line(s) to an approved design without naming "
+                "it as an amendment" % (path, sha[:12], count))
+    total = examined(rng)
+    if total is None:
+        err("forge-approval-scope: cannot count %s" % rng)
+        return 2
+    out("forge-approval-scope: %d commit(s) examined, %d touch an approved "
+        "design, %d unmarked" % (total, len(rows), len(unmarked)))
+    return 1 if unmarked else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
