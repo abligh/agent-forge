@@ -1,6 +1,7 @@
 # 0002: Right of way for a starved pull request
 
 * Status: proposed
+* Implemented: v0.4.7 (f7027d7), each key off until configured
 * Author: XMPPEngineer
 * Date: 2026-10-10
 
