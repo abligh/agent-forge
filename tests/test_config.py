@@ -1,0 +1,234 @@
+"""Tests for agent_forge.config."""
+import json
+import os
+import tempfile
+import unittest
+
+from agent_forge import config
+from tests.helpers import EXAMPLE, done, example
+
+
+class Find(unittest.TestCase):
+
+    def test_forge_config_names_the_file(self):
+        self.assertEqual(config.find({"FORGE_CONFIG": "/a/b.json"}),
+                         "/a/b.json")
+
+    def test_project_root_names_the_checkout(self):
+        self.assertEqual(config.find({"FORGE_PROJECT_ROOT": "/p"}),
+                         "/p/.agent-forge/config.json")
+
+    def test_else_the_git_checkout_around_the_working_directory(self):
+        calls = []
+
+        def run(args, cwd=None):
+            calls.append((args, cwd))
+            return done(args, 0, "/repo\n")
+        self.assertEqual(config.find({}, cwd="/repo/sub", run=run),
+                         "/repo/.agent-forge/config.json")
+        self.assertEqual(calls, [(["git", "rev-parse", "--show-toplevel"],
+                                  "/repo/sub")])
+
+    def test_outside_a_checkout_says_so(self):
+        with self.assertRaises(config.ConfigError) as caught:
+            config.find({}, run=lambda a, cwd=None: done(a, 128))
+        self.assertIn("not inside a git checkout", str(caught.exception))
+
+
+class Check(unittest.TestCase):
+
+    def problems(self, **changes):
+        data = example()
+        for key, value in changes.items():
+            if value is None:
+                del data[key]
+            else:
+                data[key] = value
+        return config.check(data)
+
+    def test_the_example_is_good(self):
+        self.assertEqual(config.check(example()), [])
+
+    def test_required_keys(self):
+        self.assertEqual(self.problems(repo=None, owner=None),
+                         ["missing 'repo'", "missing 'owner'"])
+
+    def test_a_misspelt_key_is_a_problem_not_ignored(self):
+        self.assertEqual(self.problems(default_brnach="main"),
+                         ["unknown key 'default_brnach'"])
+
+    def test_comments_are_any_key_starting_with_underscore(self):
+        self.assertEqual(self.problems(_note=["anything"]), [])
+
+    def test_types(self):
+        self.assertEqual(self.problems(agents=[], host=3),
+                         ["'agents' must be an object",
+                          "'host' must be a string"])
+
+    def test_project_and_repo_shapes(self):
+        self.assertEqual(self.problems(project="Widget App", repo="widget"), [
+            "project 'Widget App' must be lower case letters, digits and "
+            "hyphens", "repo 'widget' must be owner/name"])
+
+    def test_every_problem_at_once(self):
+        data = example()
+        data["agents"]["LeadDev"]["app_id"] = "101"
+        data["agents"]["LeadDev"]["colour"] = "blue"
+        data["agents"]["UIDev"]["kind"] = "lead"
+        data["agents"]["UIDev"]["reviews"] = ["web/**"]
+        self.assertEqual(config.check(data), [
+            "agents.LeadDev.app_id must be an integer or null",
+            "agents.LeadDev: unknown key 'colour'",
+            "agents.UIDev.kind must be one of developer, reviewer",
+            "agents.UIDev.reviews: only a reviewer reviews paths"])
+
+    def test_a_bool_is_not_an_id(self):
+        data = example()
+        data["agents"]["LeadDev"]["app_id"] = True
+        self.assertEqual(config.check(data), [
+            "agents.LeadDev.app_id must be an integer or null"])
+
+    def test_globs_are_strings(self):
+        data = example()
+        data["agents"]["Reviewer"]["reviews"] = ["docs/**", ""]
+        self.assertEqual(config.check(data), [
+            "agents.Reviewer.reviews must be a list of path globs"])
+
+    def test_no_slug_and_no_suffix(self):
+        data = example()
+        del data["naming"]
+        problems = config.check(data)
+        self.assertIn("agents.LeadDev: no slug, and no "
+                      "naming.app_slug_suffix to make one", problems)
+        self.assertIn("machinery.Merger: no slug, and no "
+                      "naming.app_slug_suffix to make one", problems)
+        self.assertNotIn("agents.Helper: no slug, and no "
+                         "naming.app_slug_suffix to make one", problems)
+
+    def test_agent_names(self):
+        data = example()
+        data["agents"]["ui-dev"] = {"app_id": 1, "installation_id": 2}
+        self.assertEqual(config.check(data), [
+            "agents.ui-dev: an agent's name is letters and digits, "
+            "starting with a letter"])
+
+    def test_at_least_one_agent(self):
+        self.assertEqual(self.problems(agents={}),
+                         ["agents must name at least one agent"])
+
+    def test_an_agent_is_not_also_machinery(self):
+        data = example()
+        data["machinery"]["LeadDev"] = {"app_id": 1, "installation_id": 2}
+        self.assertEqual(config.check(data),
+                         ["LeadDev is both an agent and machinery"])
+
+    def test_not_an_object(self):
+        self.assertEqual(config.check([]),
+                         ["the configuration must be a JSON object"])
+
+
+class Load(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, ".agent-forge", "config.json")
+        os.makedirs(os.path.dirname(self.path))
+
+    def write(self, data):
+        with open(self.path, "w") as handle:
+            handle.write(data if isinstance(data, str) else json.dumps(data))
+
+    def test_loads_a_good_file(self):
+        self.write(example())
+        project = config.load(self.path)
+        self.assertEqual((project.name, project.root),
+                         ("widget", self.tmp.name))
+
+    def test_found_by_the_environment(self):
+        self.write(example())
+        project = config.load(environ={"FORGE_PROJECT_ROOT": self.tmp.name})
+        self.assertEqual(project.path, self.path)
+
+    def test_problems_name_the_file(self):
+        data = example()
+        del data["owner"]
+        self.write(data)
+        with self.assertRaises(config.ConfigError) as caught:
+            config.load(self.path)
+        self.assertEqual(caught.exception.problems, ["missing 'owner'"])
+        self.assertEqual(str(caught.exception),
+                         "%s: missing 'owner'" % self.path)
+
+    def test_missing_and_unreadable(self):
+        with self.assertRaises(config.ConfigError) as caught:
+            config.load(self.path)
+        self.assertEqual(caught.exception.problems, ["no configuration file"])
+        self.write("{not json")
+        with self.assertRaises(config.ConfigError) as caught:
+            config.load(self.path)
+        self.assertTrue(caught.exception.problems[0].startswith("unreadable"))
+
+
+class ProjectQueries(unittest.TestCase):
+
+    def setUp(self):
+        self.p = config.Project(example(), str(EXAMPLE))
+
+    def test_defaults(self):
+        data = example()
+        del data["default_branch"], data["host"]
+        p = config.Project(data)
+        self.assertEqual((p.default_branch, p.host, p.root), ("main", "", None))
+
+    def test_slugs_from_the_suffix_unless_named(self):
+        self.assertEqual(self.p.slug("LeadDev"), "leaddevwidgetagent")
+        self.assertEqual(self.p.slug("Helper"), "helperbot")
+        self.assertEqual(self.p.slug("Merger"), "mergerwidgetagent")
+        self.assertEqual(self.p.bot_login("Helper"), "helperbot[bot]")
+
+    def test_by_login_with_or_without_bot(self):
+        self.assertEqual(self.p.by_login("leaddevwidgetagent[bot]"), "LeadDev")
+        self.assertEqual(self.p.by_login("HelperBot"), "Helper")
+        self.assertEqual(self.p.by_login("mergerwidgetagent"), "Merger")
+        self.assertIsNone(self.p.by_login("example-owner"))
+
+    def test_kinds(self):
+        self.assertEqual(self.p.reviewers(), ["Reviewer", "UIReviewer"])
+        self.assertEqual(self.p.developers(), ["LeadDev", "UIDev", "Helper"])
+
+    def test_session_names(self):
+        self.assertEqual(self.p.session_name("LeadDev"), "WidgetLeadDev")
+        self.assertEqual(self.p.session_name("Helper"), "Helper")
+
+    def test_an_app_not_yet_made(self):
+        self.assertTrue(self.p.exists("LeadDev"))
+        self.assertFalse(self.p.exists("UIReviewer"))
+
+    def test_key_paths(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(self.p.key_path("LeadDev"),
+                         home + "/agent-keys/widget/LeadDev.pem")
+        self.assertEqual(self.p.key_path("Helper"),
+                         home + "/agent-keys/widget/helper.2026.pem")
+        data = example()
+        del data["key_dir"]
+        self.assertIsNone(config.Project(data).key_path("LeadDev"))
+
+    def test_reviewers_for_a_path(self):
+        self.assertEqual(self.p.reviewers_for("web/src/app.ts"),
+                         ["UIReviewer"])
+        self.assertEqual(self.p.reviewers_for("src/core/deep/x.rs"),
+                         ["Reviewer"])
+        self.assertEqual(self.p.reviewers_for("Cargo.lock"), [])
+
+    def test_sections_and_dotted_get(self):
+        self.assertEqual(self.p.section("checks")["poster"], "Merger")
+        self.assertEqual(self.p.section("nothing"), {})
+        self.assertEqual(self.p.get("agents.Reviewer.kind"), "reviewer")
+        with self.assertRaises(KeyError):
+            self.p.get("agents.Nobody.kind")
+
+
+if __name__ == "__main__":
+    unittest.main()

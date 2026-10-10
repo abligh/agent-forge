@@ -146,8 +146,9 @@ and the meta-tests every tool directory runs.
 3. The merge pipeline.
 4. The router engine, with the smaller project's rules first; the
    larger project's rules last, as they carry the most risk.
-5. Switch-over, one tool at a time, each through the consuming
-   project's own review.
+5. Switch-over, one project at a time, the smaller first; within a
+   project, one tool at a time, each through that project's own
+   review.
 
 ## Staying neutral
 

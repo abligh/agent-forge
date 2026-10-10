@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Check and read a project's agent-forge configuration.
+
+    forge-config check            check the file; list every problem
+    forge-config get KEY          print one value (dotted: agents.X.kind);
+                                  a string bare, anything else as JSON
+    forge-config agents [--kind developer|reviewer]
+                                  one agent per line: name, kind, slug,
+                                  session name
+    forge-config path             print where the file is
+
+The file is found as agent_forge.config says: $FORGE_CONFIG, else
+.agent-forge/config.json in $FORGE_PROJECT_ROOT or the git checkout
+around the working directory.
+
+Exit 0 on success, 1 when the file has problems or the key is absent,
+2 when there is no file to read.
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config  # noqa: E402
+
+
+def main(argv=None, out=print, err=None):
+    err = err or (lambda line: print(line, file=sys.stderr))
+    parser = argparse.ArgumentParser(prog="forge-config",
+                                     description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("check")
+    sub.add_parser("path")
+    get = sub.add_parser("get")
+    get.add_argument("key")
+    agents = sub.add_parser("agents")
+    agents.add_argument("--kind", choices=config.KINDS)
+    args = parser.parse_args(argv)
+    try:
+        path = config.find()
+    except config.ConfigError as e:
+        err("forge-config: %s" % e)
+        return 2
+    if args.command == "path":
+        out(path)
+        return 0
+    try:
+        project = config.load(path)
+    except config.ConfigError as e:
+        if e.problems == ["no configuration file"]:
+            err("forge-config: no configuration at %s" % path)
+            return 2
+        err("forge-config: %s has %d problem(s):" % (path, len(e.problems)))
+        for problem in e.problems:
+            err("  " + problem)
+        return 1
+    if args.command == "check":
+        out("forge-config: %s is good: project %s, %s, %d agent(s), "
+            "%d reviewer(s)" % (path, project.name, project.repo,
+                                len(project.agents), len(project.reviewers())))
+        return 0
+    if args.command == "get":
+        try:
+            value = project.get(args.key)
+        except KeyError:
+            err("forge-config: no %r in %s" % (args.key, path))
+            return 1
+        out(value if isinstance(value, str) else json.dumps(value,
+                                                            sort_keys=True))
+        return 0
+    for name in project.agents:
+        if args.kind and project.kind(name) != args.kind:
+            continue
+        out("%s\t%s\t%s\t%s" % (name, project.kind(name), project.slug(name),
+                                project.session_name(name)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

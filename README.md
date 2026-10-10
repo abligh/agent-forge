@@ -6,9 +6,11 @@ that tests every pull request's head, a webhook receiver, a router that
 wakes whichever agent's turn it is, per-agent App identities, and the
 small tools around them.
 
-Status: **being assembled.** The tools exist today as separate copies
-inside the projects that use them; [docs/design.md](docs/design.md)
-says what moves here, what each copy contributes, and in what order.
+Status: **being assembled.** The skeleton is here: configuration,
+library and tests. The tools still exist as separate copies inside the
+projects that use them, and move here one at a time;
+[docs/design.md](docs/design.md) says what moves, what each copy
+contributes, and in what order.
 
 * Python 3.11+, standard library only.
 * A project describes itself in one file, `.agent-forge/config.json`,
@@ -20,10 +22,31 @@ keeps each agent's Claude Code session running, and
 [xmpp-mcp](https://github.com/abligh/xmpp-mcp) is the chat channel the
 router wakes agents through.
 
+## Layout
+
+    agent_forge/   the shared library: config, proc, locks, state, markers
+    bin/           the tools, each forge-<name>
+    docs/          the design and the configuration reference
+    examples/      an example project configuration
+    tests/         one test file per tool and module, and meta-tests
+    tools/         this repository's own checks
+
+## Installing
+
+Clone at a release tag and put `bin/` on the path; nothing else is
+needed. Each project then adds `.agent-forge/config.json`
+([docs/config.md](docs/config.md)) and checks it:
+
+```sh
+git clone --branch vX.Y.Z https://github.com/abligh/agent-forge ~/.local/share/agent-forge
+ln -s ~/.local/share/agent-forge/bin/forge-* ~/.local/bin/
+cd ~/my-project && forge-config check
+```
+
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests
+make
 ```
 
 ## Neutrality

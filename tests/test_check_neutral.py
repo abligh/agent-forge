@@ -1,6 +1,8 @@
 """Tests for tools/check-neutral. The words here are invented; the real
 list lives outside the repository."""
+import contextlib
 import importlib.machinery
+import io
 import importlib.util
 import os
 import subprocess
@@ -53,7 +55,9 @@ class Repository(unittest.TestCase):
         if words is not None:
             with open(self.words, "w") as handle:
                 handle.write(words)
-        with mock.patch.dict(os.environ, {"FORGE_FORBIDDEN_WORDS": self.words}):
+        with mock.patch.dict(os.environ, {"FORGE_FORBIDDEN_WORDS": self.words}), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
             return cn.main(["--root", self.root, *args])
 
     def test_clean(self):
@@ -91,7 +95,10 @@ class ThisRepository(unittest.TestCase):
             "FORGE_FORBIDDEN_WORDS", cn.DEFAULT_LIST))
         if cn.load_words(path) is None:
             self.skipTest("no forbidden-words list on this host")
-        self.assertEqual(cn.main(["--root", str(HERE.parent)]), 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = cn.main(["--root", str(HERE.parent)])
+        self.assertEqual(rc, 0, out.getvalue())
 
 
 if __name__ == "__main__":

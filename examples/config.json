@@ -1,0 +1,28 @@
+{
+  "_comment": "An example project. docs/config.md describes each key.",
+  "project": "widget",
+  "repo": "example/widget",
+  "owner": "example-owner",
+  "default_branch": "main",
+  "host": "build.example.org",
+  "key_dir": "~/agent-keys/widget",
+  "naming": {"app_slug_suffix": "widgetagent", "session_prefix": "Widget"},
+  "agents": {
+    "LeadDev": {"app_id": 101, "installation_id": 201},
+    "Reviewer": {"app_id": 102, "installation_id": 202, "kind": "reviewer",
+                 "reviews": ["docs/**", "tools/**", "src/core/**"]},
+    "UIDev": {"app_id": 103, "installation_id": 203},
+    "UIReviewer": {"app_id": null, "installation_id": null,
+                   "kind": "reviewer", "reviews": ["web/**"]},
+    "Helper": {"app_id": 104, "installation_id": 204,
+               "slug": "helperbot", "session_name": "Helper",
+               "key": "helper.2026.pem"}
+  },
+  "machinery": {
+    "Merger": {"app_id": 105, "installation_id": 205}
+  },
+  "labels": {"owner_prefix": "Owner:", "waiting_on_owner": "Status:waiting-owner"},
+  "checks": {"context": "vm/build-and-test", "poster": "Merger"},
+  "docs": {"paths": ["README.md", "docs"], "width": 80},
+  "relay": {"url": "http://127.0.0.1:8788/hook", "room": "everyone@conference.example.org"}
+}
