@@ -46,6 +46,7 @@ TOP = {
     "relay": (dict, False),
     "identity": (dict, False),
     "host_settings": (dict, False),
+    "merge": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
@@ -53,6 +54,8 @@ APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
 AGENT = dict(APP, session_name=str, kind=str, reviews=list)
 IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list}
+MERGE = {"merger": str, "ci_workflow": str, "gate": list,
+         "stall_minutes": int}
 HOST_FILE = {"from": str, "to": str, "mode": str, "json": bool}
 MODE_RE = re.compile(r"^0[0-7]{3}$")
 
@@ -154,6 +157,16 @@ def check(data):
         problems.append("repo %r must be owner/name" % data["repo"])
     _fields("naming", data.get("naming", {}), NAMING, problems)
     _fields("identity", data.get("identity", {}), IDENTITY, problems)
+    merge = data.get("merge", {})
+    if _fields("merge", merge, MERGE, problems):
+        for i, argv in enumerate(merge.get("gate", [])):
+            if not (isinstance(argv, list) and argv
+                    and all(isinstance(a, str) for a in argv)):
+                problems.append("merge.gate[%d] must be a non-empty list of "
+                                "strings" % i)
+        name = merge.get("merger")
+        if isinstance(name, str) and name not in data.get("machinery", {}):
+            problems.append("merge.merger %r is not in machinery" % name)
     settings = data.get("host_settings", {})
     if _fields("host_settings", settings, HOST_SETTINGS, problems):
         for i, entry in enumerate(settings.get("files", [])):

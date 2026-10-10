@@ -1,0 +1,1007 @@
+#!/usr/bin/env python3
+"""Merge each reviewer-approved pull request in turn, oldest first.
+
+The Merger owns the default branch (`main` below): nobody else merges.
+A pull request is the Merger's once a reviewer agent's App has approved
+it at a head the approval
+still covers, nobody has spoken since, and nothing it names in a
+`Blocked-by:` line is still open. The Merger takes those in order:
+
+* the pull requests another open one is blocked by come first, held
+  or not;
+* then the rest, oldest-opened first.
+
+For the first candidate, it decides one action:
+
+* `UPDATE`: behind `main`, and merging `main` into it is clean;
+* `WAIT`: the build check (`checks.context`) has not reported on the
+  head, or a run of the CI workflow on it has not finished;
+* `MERGE`: every gate check passed;
+* `HAND-BACK`: a check failed. The record says to whom, the author or
+  the approving Reviewer, and why;
+* `SKIP`: the question can't be answered this tick (a fetch failed, or
+  the head moved while reading). The next tick asks again.
+
+**Without `--dry-run` it acts**, as the Merger's own App. A tick makes
+at most one update or merge. Before it, it hands back each pull
+request ahead in the queue that it can't take, unless that hand-back
+was already said:
+
+* `UPDATE` asks GitHub to merge `main` into the head (`update-branch`,
+  pinned to the head it judged);
+* `MERGE` squash-merges, pinned the same way, with GitHub's default
+  message;
+* `HAND-BACK` comments once per approval, head and reason, signed
+  `— Merger`. To the author it is a plain comment; to the approving
+  Reviewer it starts `Not-a-review`, since it asks for a review rather
+  than giving one.
+
+**A head that conflicts with `main` goes back to its author, once, and
+the tick moves on to the next pull request.** `git merge-tree` finds
+the conflict before any write, so a conflicted head is never sent to
+`update-branch` at all. If GitHub still refuses an update as a merge
+conflict, the same hand-back follows in the same tick and the queue
+moves on; that head is not sent to `update-branch` again until a new
+approval or head. A conflict is never retried: retrying one every tick stalls
+everything queued behind it. Any other write GitHub refuses is
+recorded, not retried in the same tick: the next tick judges the pull
+request afresh.
+
+Each tick appends one JSON record to `merger.jsonl` in the state
+directory (~/.local/state/agent-forge/<project>/merger, or
+`--state-dir`) (`dry-run.jsonl` under `--dry-run`). `held` names each pull
+request Reviewer approved that is not eligible, with the reason, and
+`handed-back.json` remembers what was already said.
+
+**`--dry-run` writes nothing to GitHub.** It reads with the Merger's
+App too, since a dry run is how to watch the Merger before it acts.
+
+**Which approvals count.** Only an `APPROVED` review by the App of an
+agent the configuration marks `"kind": "reviewer"` (`APPROVERS`), that
+did not open the pull request. Any reviewer's counts, whichever area
+the pull request is in: the areas decide whom to ask, not whose word
+counts.
+
+**What "covers the head" means.** Call the approval's commit A and the
+head H. Either H is A, or every commit reachable from H but not from A
+or from `main` is a merge with these properties:
+
+* one of its parents is on `main`;
+* its tree equals `git merge-tree --write-tree` of its two parents.
+
+GitHub carries an approval forward across any push, so this check is
+what stops an unreviewed commit being merged under it. An author's own
+clean merge of `main` passes; a hand-resolved conflict does not, and
+needs a new approval.
+
+**Where that re-review starts.** The hand-back to the approver lists
+the paths whose content in H a reviewer has not seen together with
+`main`'s, so the re-review can start there rather than at the whole pull request. With
+M the `main` commit H contains (their merge base) and B the merge base
+of A and M, comparing mode and blob, a path is listed when H has:
+
+* content from neither A nor M (a hand-merged path, or a commit after
+  the approval), listed first;
+* A's content where M has other content it gave the path itself: a
+  resolution that kept the pull request's side;
+* M's content where A had changed the path to something else: a
+  resolution that took `main`'s side.
+
+A path is not listed when H has A's content and `main` left it alone
+or agrees, or H has M's content for a path A didn't change. The list
+only points; it never lets a head through.
+
+**What "nobody has spoken" means.** No comment or review after the
+approval, except one carrying `Not-a-review` in the same text, one by
+the Merger's own App (`QUIET_LOGINS`), or a bare approval: an `APPROVED`
+review with no text and no line comments, such as the owner's
+code-owner approval. A plain hold carries no marker, so anything else
+said after the approval makes the pull request its reviewer's again,
+until a newer approval.
+
+**A `Defer-until:` holds it too**: the newest such line anywhere on the
+pull request, `Not-a-review` comments included. A time in the future,
+or a value that is not a time, holds it.
+
+**The gate, on a head that contains `main`'s tip:**
+
+* the newest commit status named `checks.context` on exactly that SHA
+  is `success`. The build check posts it as the App `checks.poster`
+  names (default: the Merger's own), and only statuses that App
+  created count, so nobody else can post a green one;
+* every run of the Actions workflow `merge.ci_workflow` (default `ci`)
+  on it succeeded. `""` means the project has no such workflow;
+* every gate tool in `merge.gate` exits 0. Each is an argument list
+  with `{pr}`, `{base}` (main's tip) and `{head}` filled in; the
+  default is `forge-commit-identity {base}..{head}`. A `forge-` tool
+  runs from this installation, anything else from the checkout.
+
+The checkout is the cron checkout (`$FORGE_CRON_CHECKOUT`), kept at
+`origin/main` by `forge-cron-run`, and the gate tools run there, so a
+pull request can't change the rule it is judged by.
+
+**A head it has waited on for 30 minutes (`merge.stall_minutes`) is
+`STALLED`.** When the same
+head of the same pull request has had no final `vm/build-and-test`
+status, or an unfinished `ci` run, for `STALL_AFTER`, the tick prints a
+`STALLED` line and exits 2. It doesn't hand the pull request back,
+since the author can't fix a stuck check, and the pull request stays
+first in the queue. A write GitHub goes on refusing on the same head
+for `STALL_AFTER` is `STALLED` too, with the latest refusal quoted,
+since the author can't fix the Merger's access either. `waiting.json`
+in the state directory says since when the tick has waited on which
+head.
+
+Exit 0 when the tick ran, whatever GitHub answered its write, or
+another tick held the lock; 2 when it could not ask (no checkout, no
+token, GitHub or git failed) or the head it waits on is `STALLED`.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, github as forge_github, locks  # noqa: E402
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+
+# Set from the project's configuration by `configure`; these are the
+# defaults it starts from.
+REPO_SLUG = ""
+MAIN = "main"
+# The reviewer Apps whose approval makes a pull request the Merger's:
+# {login without "[bot]": agent name}.
+APPROVERS = {}
+# Authors whose comments don't count as "said since the approval": the
+# Merger's own App, whose hand-back must not hold what it hands back.
+QUIET_LOGINS = frozenset()
+# The App a tick reads and writes with, dry run or not.
+ACT_AS = "Merger"
+SIGNATURE = "— Merger"
+# The required check: the commit status the build check posts, counted
+# only when the poster's App created it (REST's login, with its "[bot]"
+# suffix). Any other account with write access could post a status by
+# that name.
+STATUS_CONTEXT = "vm/build-and-test"
+STATUS_CREATOR = ""
+
+# Where the build check runs, for the STALLED line.
+BUILD_HOST = ""
+# The gate tools, as argument lists before `{pr}`, `{base}` and
+# `{head}` are filled in.
+DEFAULT_GATE = (("forge-commit-identity", "{base}..{head}"),)
+DEFAULT_CONTEXT = "vm/build-and-test"
+GATE = DEFAULT_GATE
+# How a Not-a-review hand-back heads each kind of path, in the order it
+# lists them, and how many paths of a kind it names before "and N more".
+PATH_KINDS = (
+    ("neither", "content from neither the approved head nor main"),
+    ("approved", "the approved content, where main has its own"),
+    ("main", "main's content, where the approval saw other content"),
+)
+PATHS_SHOWN = 5
+# A path is written into a comment the Merger signs, and git allows any
+# byte but NUL in one: a newline, a backtick or an @mention would be
+# read as the Merger's own words. So each is cut to this many
+# characters, escaped as a JSON string would be, with backticks too,
+# and shown in a code span, where GitHub renders nothing.
+PATH_CHARS = 120
+# The Actions workflow whose runs on the head must not have failed;
+# "" when the project has none.
+CI_WORKFLOW = "ci"
+# The reason a conflicting head is handed back for. It names no files,
+# so it stays the same while main moves and is said once per head.
+CONFLICT_REASON = "it conflicts with main, so it can't be updated"
+# The ref a pull request's head is fetched into, in this checkout.
+PR_REF = "refs/agent-forge-merger/pr/%d"
+# The pause before fetching main again after losing a race for its ref.
+FETCH_RETRY_S = 2
+# How long a head may wait for its checks before the tick reports it.
+STALL_AFTER = datetime.timedelta(minutes=30)
+# Lines of a refusing tool's output kept in a record.
+TAIL_LINES = 6
+
+
+def configure(project):
+    """Set the module's settings from `project`, a loaded configuration.
+    The `merge` section: `merger` (the machinery App that acts, default
+    "Merger"), `ci_workflow` (default "ci"; "" for none), `gate` (a list
+    of argument lists) and `stall_minutes` (default 30). The `checks`
+    section: `context` and `poster` (default the merger)."""
+    global REPO_SLUG, MAIN, APPROVERS, QUIET_LOGINS, ACT_AS, SIGNATURE
+    global STATUS_CONTEXT, STATUS_CREATOR, BUILD_HOST, GATE, CI_WORKFLOW
+    global STALL_AFTER
+    merge, checks = project.section("merge"), project.section("checks")
+    REPO_SLUG = project.repo
+    MAIN = project.default_branch
+    ACT_AS = merge.get("merger", "Merger")
+    SIGNATURE = "— " + ACT_AS
+    APPROVERS = {project.slug(n): n for n in project.reviewers()}
+    QUIET_LOGINS = frozenset((project.slug(ACT_AS),))
+    STATUS_CONTEXT = checks.get("context", DEFAULT_CONTEXT)
+    STATUS_CREATOR = project.bot_login(checks.get("poster", ACT_AS))
+    BUILD_HOST = project.host
+    GATE = tuple(tuple(argv) for argv in merge.get("gate", DEFAULT_GATE))
+    CI_WORKFLOW = merge.get("ci_workflow", "ci")
+    STALL_AFTER = datetime.timedelta(minutes=merge.get("stall_minutes", 30))
+
+NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
+BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
+                        re.MULTILINE | re.IGNORECASE)
+FENCE_RE = re.compile(r"^\s*(```|~~~).*?(^\s*\1|\Z)", re.MULTILINE | re.DOTALL)
+DEFER_ANY_RE = re.compile(r"^Defer-until:[ \t]*(.+?)[ \t]*$",
+                          re.MULTILINE | re.IGNORECASE)
+DEFER_FORMATS = ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M%z", "%Y-%m-%d")
+
+PR_QUERY = """
+query($owner:String!, $name:String!, $cursor:String) {
+  repository(owner:$owner, name:$name) {
+    pullRequests(states:OPEN, first:50, after:$cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number createdAt isDraft baseRefName headRefName headRefOid body
+        author { login }
+        reviews(last:100) {
+          nodes { author { login } state submittedAt body commit { oid }
+                  comments { totalCount } }
+        }
+        comments(last:100) { nodes { author { login } createdAt body } }
+      }
+    }
+  }
+}"""
+
+
+def sh(args, cwd=None, env=None):
+    return subprocess.run(args, cwd=cwd, env=env, capture_output=True,
+                          text=True)
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+
+
+def iso(when):
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def login(node):
+    """The author's login without GitHub's "[bot]" suffix, which REST
+    adds and GraphQL leaves off, or "" for a deleted account."""
+    name = ((node or {}).get("author") or {}).get("login") or ""
+    return name[:-len("[bot]")] if name.endswith("[bot]") else name
+
+
+def markers_of(text):
+    """`text` without fenced or indented code: a comment that quotes
+    `Not-a-review` or `Blocked-by:` in code is not marked."""
+    text = FENCE_RE.sub("", text or "")
+    return "\n".join(l for l in text.splitlines()
+                     if not l.startswith(("    ", "\t")))
+
+
+def approval_of(pr, approvers=None):
+    """The newest `APPROVED` review by an APPROVERS App (or one of the
+    logins `approvers` names) that is not the pull request's author, or
+    None."""
+    approvers = APPROVERS if approvers is None else approvers
+    best = None
+    for review in pr["reviews"]:
+        who = login(review)
+        if (review.get("state") == "APPROVED" and who in approvers
+                and who != login(pr)):
+            if best is None or review["submittedAt"] > best["submittedAt"]:
+                best = review
+    return best
+
+
+def said_since(pr, approval):
+    """Comments and reviews after `approval`, as (login, time, kind),
+    less those marked `Not-a-review`, those by QUIET_LOGINS and bare
+    approvals. Empty means nothing has been said since."""
+    at = approval["submittedAt"]
+    said = []
+    for kind, items, stamp in (("review", pr["reviews"], "submittedAt"),
+                               ("comment", pr["comments"], "createdAt")):
+        for item in items:
+            when = item.get(stamp) or ""
+            if item is approval or when <= at:
+                continue
+            if login(item) in QUIET_LOGINS:
+                continue
+            if NOT_A_REVIEW_RE.search(markers_of(item.get("body"))):
+                continue
+            if kind == "review" and is_bare_approval(item):
+                continue
+            said.append((login(item) or "ghost", when, kind))
+    return sorted(said, key=lambda s: s[1])
+
+
+def is_bare_approval(review):
+    """An `APPROVED` review with no text and no line comments: assent,
+    such as a code owner's approval after Reviewer's, which says nothing
+    to act on. One with any text, or any line comment, still holds."""
+    line_comments = (review.get("comments") or {}).get("totalCount") or 0
+    return (review.get("state") == "APPROVED"
+            and not (review.get("body") or "").strip()
+            and line_comments == 0)
+
+
+def blockers_of(pr):
+    """The pull request and issue numbers its body names in `Blocked-by:`
+    lines."""
+    return {int(m.group(1))
+            for m in BLOCKED_RE.finditer(markers_of(pr.get("body")))}
+
+
+def parse_defer(value):
+    """A `Defer-until:` value as an aware datetime, or None if it is not
+    one of DEFER_FORMATS. A value without a zone is UTC."""
+    for fmt in DEFER_FORMATS:
+        try:
+            when = datetime.datetime.strptime(value.replace("Z", "+0000"), fmt)
+        except ValueError:
+            continue
+        return when if when.tzinfo else when.replace(
+            tzinfo=datetime.timezone.utc)
+    return None
+
+
+def deferral_of(pr, now):
+    """Why `pr` is deferred at `now`, or None. The newest `Defer-until:`
+    line wins, across the body, comments and reviews. An unexpired one
+    holds the pull request, and so does one that isn't a time: a
+    deferral nobody can read is not a release."""
+    texts = [("", pr.get("body"))]
+    texts += [(c.get("createdAt") or "", c.get("body")) for c in pr["comments"]]
+    texts += [(r.get("submittedAt") or "", r.get("body"))
+              for r in pr["reviews"] if r.get("submittedAt")]
+    latest = None
+    for _, text in sorted(texts, key=lambda t: t[0]):
+        found = DEFER_ANY_RE.findall(markers_of(text))
+        if found:
+            latest = found[-1]
+    if latest is None:
+        return None
+    until = parse_defer(latest)
+    if until is None:
+        return "Defer-until: %s is not a time" % latest[:40]
+    if until > now:
+        return "deferred until %s" % iso(until.astimezone(
+            datetime.timezone.utc))
+    return None
+
+
+def eligible(pr, open_numbers, now=None):
+    """(approval, None) when `pr` is the Merger's, so far as GitHub's
+    records say, or (None, reason). Whether the approval covers the head
+    needs git, so `covers_head` asks that separately. `open_numbers` is
+    every open pull request and issue a `Blocked-by:` line could name;
+    `now` decides whether a `Defer-until:` has passed."""
+    if pr.get("isDraft"):
+        return None, "draft"
+    if pr.get("baseRefName") != MAIN:
+        return None, "based on %s, not %s" % (pr.get("baseRefName"), MAIN)
+    approval = approval_of(pr)
+    if approval is None:
+        return None, "no Reviewer approval"
+    said = said_since(pr, approval)
+    if said:
+        who, when, kind = said[0]
+        return None, "%s by %s at %s, after the approval" % (kind, who, when)
+    still = sorted(blockers_of(pr) & set(open_numbers))
+    if still:
+        return None, "Blocked-by: %s" % ", ".join("#%d" % n for n in still)
+    deferred = deferral_of(pr, now or now_utc())
+    if deferred:
+        return None, deferred
+    return approval, None
+
+
+def order(candidates, everyone=None):
+    """`candidates` in the order the Merger takes them. First come those
+    that another open pull request is blocked by, then the rest, each
+    group oldest first by `createdAt`, then by number.
+
+    `everyone` is every open pull request, candidates or not, and
+    defaults to `candidates`. It has to include the ineligible ones: a
+    pull request with an open `Blocked-by:` is never a candidate, so
+    reading blockers from candidates alone would promote nothing."""
+    named = set()
+    for pr in candidates if everyone is None else everyone:
+        named |= blockers_of(pr)
+    key = lambda pr: (pr["number"] not in named, pr["createdAt"], pr["number"])
+    return sorted(candidates, key=key)
+
+
+def git(repo, *args, run=sh):
+    return run(["git", "-C", repo] + list(args))
+
+
+def is_ancestor(repo, older, newer, run=sh):
+    return git(repo, "merge-base", "--is-ancestor", older, newer,
+               run=run).returncode == 0
+
+
+def covers_head(repo, approved, head, main_ref, run=sh):
+    """(True, None) if the approval at `approved` covers `head`, else
+    (False, reason). Both commits and `main_ref` must be in `repo`."""
+    if not is_ancestor(repo, approved, head, run):
+        return False, "the approved commit %s is not in the head's history" % (
+            approved[:10])
+    got = git(repo, "rev-list", "--parents", head, "^" + approved,
+              "^" + main_ref, run=run)
+    if got.returncode != 0:
+        return False, "git rev-list failed: %s" % got.stderr.strip()
+    for line in got.stdout.splitlines():
+        sha, *parents = line.split()
+        if len(parents) != 2:
+            return False, "%s, after the approval, is not a merge" % sha[:10]
+        if not any(is_ancestor(repo, p, main_ref, run) for p in parents):
+            return False, "%s merges nothing from %s" % (sha[:10], MAIN)
+        merged = git(repo, "merge-tree", "--write-tree", *parents, run=run)
+        tree = git(repo, "rev-parse", sha + "^{tree}", run=run)
+        if not (merged.returncode == 0 and tree.returncode == 0
+                and merged.stdout.split()[:1] == tree.stdout.split()[:1]):
+            return False, ("%s's tree is not the clean merge of its parents"
+                           % sha[:10])
+    return True, None
+
+
+def tree_of(repo, commit, run=sh):
+    """{path: (mode, blob)} for every file in `commit`, or None."""
+    got = git(repo, "ls-tree", "-r", "-z", "--full-tree", commit, run=run)
+    if got.returncode != 0:
+        return None
+    files = {}
+    for entry in got.stdout.split("\0"):
+        if entry:
+            meta, path = entry.split("\t", 1)
+            mode, _, blob = meta.split()
+            files[path] = (mode, blob)
+    return files
+
+
+def merge_base(repo, one, other, run=sh):
+    got = git(repo, "merge-base", one, other, run=run)
+    return got.stdout.strip() if got.returncode == 0 else None
+
+
+def review_paths(repo, approved, head, main_ref, run=sh):
+    """[[kind, [path, ...]], ...] in `PATH_KINDS` order, leaving out
+    empty kinds: where a re-review of `head` should start, as the
+    module docstring says. [] when git can't answer."""
+    main = merge_base(repo, head, main_ref, run)
+    base = main and merge_base(repo, approved, main, run)
+    trees = [tree_of(repo, c, run) for c in (base, approved, main, head)
+             if base]
+    if not trees or None in trees:
+        return []
+    b, a, m, h = trees
+    found = {kind: [] for kind, _ in PATH_KINDS}
+    for path in sorted(set(b) | set(a) | set(m) | set(h)):
+        was, ours, theirs, now = (t.get(path) for t in (b, a, m, h))
+        if ours != was:
+            seen = now == ours and theirs in (was, ours)
+        else:
+            seen = now == theirs
+        if seen:
+            continue
+        if now not in (ours, theirs):
+            found["neither"].append(path)
+        elif now == ours:
+            found["approved"].append(path)
+        else:
+            found["main"].append(path)
+    return [[kind, found[kind]] for kind, _ in PATH_KINDS if found[kind]]
+
+
+def path_span(path):
+    """`path` as an inert code span, at most `PATH_CHARS` long."""
+    cut = path[:PATH_CHARS]
+    shown = json.dumps(cut)[1:-1].replace("`", "\\u0060")
+    return "`%s%s`" % (shown, "..." if len(path) > PATH_CHARS else "")
+
+
+def paths_text(paths):
+    """The hand-back's paragraph for `review_paths`' answer."""
+    if not paths:
+        return ""
+    heads = dict(PATH_KINDS)
+    lines = []
+    for kind, names in paths:
+        shown = ", ".join(path_span(n) for n in names[:PATHS_SHOWN])
+        if len(names) > PATHS_SHOWN:
+            shown += " and %d more" % (len(names) - PATHS_SHOWN)
+        lines.append("* %s: %s" % (heads[kind], shown))
+    return "Start the re-review with:\n\n%s\n\n" % "\n".join(lines)
+
+
+def status_state(statuses):
+    """(state, description) of the newest `STATUS_CONTEXT` status in
+    `statuses`, as REST's commits/<sha>/statuses lists them (newest
+    first), counting only those STATUS_CREATOR created; (None, "") when
+    there is none."""
+    for status in statuses:
+        if (status.get("context") == STATUS_CONTEXT
+                and (status.get("creator") or {}).get("login")
+                == STATUS_CREATOR):
+            return (status.get("state") or "unknown",
+                    status.get("description") or "")
+    return None, ""
+
+
+def ci_problem(runs):
+    """None if the CI workflow succeeded on the head, or the project has
+    none, else why not. `runs` are REST's workflow runs for the head
+    SHA. A cancelled run is excused only by a successful run of the same
+    workflow on the same SHA. No run at all is a wait, not a pass: a
+    project that names a workflow runs it on every pull request, so a
+    head without one hasn't had it yet (Actions can lag); a run that
+    never comes ends in STALLED."""
+    if not CI_WORKFLOW:
+        return None
+    ours = [r for r in runs if r.get("name") == CI_WORKFLOW]
+    if not ours:
+        return "%s has not started on the head" % CI_WORKFLOW
+    green = any(r.get("status") == "completed"
+                and r.get("conclusion") == "success" for r in ours)
+    for run in ours:
+        if run.get("status") != "completed":
+            continue
+        if run.get("conclusion") in ("success", "skipped"):
+            continue
+        if run.get("conclusion") == "cancelled" and green:
+            continue
+        return "%s run %s concluded %s" % (CI_WORKFLOW, run.get("id"),
+                                          run.get("conclusion"))
+    if not green:
+        pending = any(r.get("status") != "completed" for r in ours)
+        return "%s has %s on the head" % (
+            CI_WORKFLOW, "not finished" if pending else "no successful run")
+    return None
+
+
+def tail(text, lines=TAIL_LINES):
+    return "\n".join((text or "").strip().splitlines()[-lines:])
+
+
+def tool_problem(args, env, cwd, run=sh):
+    """None if the tool in `args`, run in `cwd`, exits 0, else its last
+    lines. `cwd` is the checkout the head was fetched into, since
+    `forge-commit-identity` reads the range from the repository it runs
+    in."""
+    got = run(args, cwd=cwd, env=env)
+    if got.returncode == 0:
+        return None
+    return "%s exited %d: %s" % (os.path.basename(args[0]), got.returncode,
+                                 tail(got.stdout + "\n" + got.stderr))
+
+
+def parse_pages(text):
+    """`gh api`'s output as one value. With `--paginate`, gh prints one
+    JSON document per page, so several arrays are joined into one;
+    several documents of any other kind are refused rather than guessed
+    at."""
+    decoder, docs, at = json.JSONDecoder(), [], 0
+    text = text or ""
+    while True:
+        while at < len(text) and text[at].isspace():
+            at += 1
+        if at == len(text):
+            break
+        value, at = decoder.raw_decode(text, at)
+        docs.append(value)
+    if not docs:
+        return None
+    if len(docs) == 1:
+        return docs[0]
+    if all(isinstance(d, list) for d in docs):
+        return [item for d in docs for item in d]
+    raise ValueError("%d JSON documents that are not all arrays" % len(docs))
+
+
+class GitHub:
+    """`gh api` with a token, as one place tests replace."""
+
+    def __init__(self, token, run=sh):
+        self.env = dict(os.environ, GH_TOKEN=token)
+        self.run = run
+
+    def api(self, *args):
+        got = self.run(["gh", "api"] + list(args), env=self.env)
+        if got.returncode != 0:
+            raise RuntimeError("gh api %s: %s" % (args[0], got.stderr.strip()))
+        return parse_pages(got.stdout)
+
+    def write(self, method, path, **fields):
+        """(True, "") when GitHub took the write, else (False, why). Never
+        raises: a refused write is a fact for the record."""
+        args = ["gh", "api", "-X", method, path]
+        for key, value in sorted(fields.items()):
+            args += ["-f", "%s=%s" % (key, value)]
+        got = self.run(args, env=self.env)
+        if got.returncode == 0:
+            return True, ""
+        return False, tail(got.stderr + "\n" + got.stdout, 2)
+
+
+def fetch_prs(github):
+    """Every open pull request as a plain dictionary: GraphQL's node,
+    with `reviews` and `comments` flattened to lists."""
+    owner, name = REPO_SLUG.split("/")
+    prs, cursor = [], None
+    while True:
+        args = ["graphql", "-f", "query=" + PR_QUERY, "-F", "owner=" + owner,
+                "-F", "name=" + name]
+        if cursor:
+            args += ["-F", "cursor=" + cursor]
+        page = github.api(*args)["data"]["repository"]["pullRequests"]
+        for node in page["nodes"]:
+            node["reviews"] = node["reviews"]["nodes"]
+            node["comments"] = node["comments"]["nodes"]
+            prs.append(node)
+        if not page["pageInfo"]["hasNextPage"]:
+            return prs
+        cursor = page["pageInfo"]["endCursor"]
+
+
+def fetch_open_issues(github):
+    """Numbers of every open issue, for `Blocked-by:` lines that name
+    one rather than a pull request."""
+    got = github.api("--paginate", "repos/%s/issues?state=open&per_page=100"
+                     % REPO_SLUG, "--jq", "[.[].number]")
+    return set(got or [])
+
+
+def decide(pr, approval, repo, main_tip, github, env, run=sh):
+    """The action for one eligible pull request, as a dictionary with
+    `action`, and `to` and `reason` for a hand-back. Reads, never
+    writes."""
+    number, head = pr["number"], pr["headRefOid"]
+    approver = APPROVERS.get(login(approval), "a reviewer")
+
+    def back(to, reason):
+        return {"action": "HAND-BACK", "to": to, "reason": reason}
+
+    fetched = git(repo, "fetch", "-q", "origin",
+                  "+refs/pull/%d/head:%s" % (number, PR_REF % number),
+                  run=run)
+    if fetched.returncode != 0:
+        return {"action": "SKIP", "reason": "fetch failed: %s"
+                % fetched.stderr.strip()}
+    if git(repo, "rev-parse", PR_REF % number, run=run).stdout.strip() != head:
+        return {"action": "SKIP", "reason": "the head moved while reading"}
+    approved = (approval.get("commit") or {}).get("oid")
+    if not approved:
+        return back(approver, "the approval names no commit")
+    main_ref = "refs/remotes/origin/" + MAIN
+    covered, why = covers_head(repo, approved, head, main_ref, run)
+    if not covered:
+        return dict(back(approver, why),
+                    paths=review_paths(repo, approved, head, main_ref, run))
+    if not is_ancestor(repo, main_tip, head, run):
+        # GitHub refuses to update a head that conflicts with main, and
+        # retrying it every tick would stall the queue behind it. Ask
+        # git first: 1 is a conflict, and anything but 0 or 1 is git
+        # failing, which leaves the question to GitHub and the backstop
+        # in `tick`.
+        merged = git(repo, "merge-tree", "--write-tree", "--name-only",
+                     "--no-messages", main_tip, head, run=run)
+        if merged.returncode == 1:
+            return back("author", CONFLICT_REASON)
+        return {"action": "UPDATE"}
+    state, said = status_state(github.api(
+        "repos/%s/commits/%s/statuses?per_page=100" % (REPO_SLUG, head))
+        or [])
+    if state in (None, "pending"):
+        return {"action": "WAIT", "reason": "%s is %s" % (
+            STATUS_CONTEXT, state or "absent")}
+    if state != "success":
+        return back("author", "%s is %s%s" % (
+            STATUS_CONTEXT, state, ": " + said if said else ""))
+    problem = None
+    if CI_WORKFLOW:
+        runs = github.api("repos/%s/actions/runs?head_sha=%s&per_page=100"
+                          % (REPO_SLUG, head))
+        problem = ci_problem((runs or {}).get("workflow_runs") or [])
+    if problem and ("not finished" in problem or "not started" in problem):
+        return {"action": "WAIT", "reason": problem}
+    for argv in GATE:
+        if problem:
+            break
+        problem = tool_problem(gate_args(argv, repo, number, main_tip, head),
+                               env, repo, run)
+    if problem:
+        return back("author", problem)
+    return {"action": "MERGE"}
+
+
+def gate_args(argv, repo, number, base, head):
+    """A gate tool's argument list, filled in: `{pr}`, `{base}` and
+    `{head}` in any argument, and the tool's path, from this
+    installation for a `forge-` tool and from `repo` otherwise."""
+    filled = [a.replace("{pr}", str(number)).replace("{base}", base)
+              .replace("{head}", head) for a in argv]
+    tool = filled[0]
+    if os.sep not in tool and tool.startswith("forge-"):
+        filled[0] = os.path.join(BIN, tool)
+    else:
+        filled[0] = os.path.join(repo, tool)
+    return filled
+
+
+def hand_back_text(decision, approver):
+    """The comment a hand-back posts. To the author it is plain; to the
+    approver it starts `Not-a-review`, since it asks for a review."""
+    if decision["to"] == "author":
+        return ("Not merging %s: %s.\n\nThis is back with its author. "
+                "Once a reviewer approves a head that fixes it, the Merger "
+                "takes it again.\n\n%s" % (decision["head"][:10],
+                                             decision["reason"], SIGNATURE))
+    return ("Not-a-review\n\nNot merging %s: %s. The approval doesn't "
+            "cover the head, so this needs %s's approval of it.\n\n%s%s"
+            % (decision["head"][:10], decision["reason"], approver,
+               paths_text(decision.get("paths")), SIGNATURE))
+
+
+def hand_back_key(approval, head, reason):
+    """What `handed-back.json` keeps per pull request: the hand-back
+    already said for this approval, head and reason."""
+    return {"approved": approval.get("submittedAt"), "head": head,
+            "reason": reason}
+
+
+def carry_out(decision, approval, github, said):
+    """Do what `decision` says, as `github`'s App, and return the result
+    for the record, or None for an action that writes nothing. `said`
+    maps a pull request's number, as a string, to the approval, head
+    and reason it was last handed back for; a hand-back already said is
+    not said again. The approval is part of the key: a new approval of
+    an unchanged head that still fails is a new question, so it gets
+    its own answer."""
+    number, head = decision["pr"], decision["head"]
+    approver = APPROVERS.get(login(approval), "a reviewer")
+    path = "repos/%s/pulls/%d" % (REPO_SLUG, number)
+    if decision["action"] == "UPDATE":
+        ok, why = github.write("PUT", path + "/update-branch",
+                               expected_head_sha=head)
+    elif decision["action"] == "MERGE":
+        ok, why = github.write("PUT", path + "/merge", sha=head,
+                               merge_method="squash")
+    elif decision["action"] == "HAND-BACK":
+        key = hand_back_key(approval, head, decision["reason"])
+        if said.get(str(number)) == key:
+            return "already said"
+        ok, why = github.write(
+            "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG, number),
+            body=hand_back_text(decision, approver))
+        if ok:
+            said[str(number)] = key
+    else:
+        return None
+    return "done" if ok else "refused: " + why
+
+
+def load_json(path, default):
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, value):
+    with open(path + ".tmp", "w") as handle:
+        json.dump(value, handle, sort_keys=True)
+    os.replace(path + ".tmp", path)
+
+
+def stalled_for(state_dir, waiting, when):
+    """Whole minutes the Merger has waited on `waiting`'s head, once that
+    is `STALL_AFTER` or more, else None. `waiting` is the tick's WAIT
+    decision or a write GitHub refused, or None when the tick is held up
+    by nothing, which forgets the wait. The wait is timed per pull
+    request and head, so a new head or a different pull request starts
+    it again."""
+    path = os.path.join(state_dir, "waiting.json")
+    if waiting is None:
+        if os.path.exists(path):
+            os.remove(path)
+        return None
+    since = load_json(path, {})
+    try:
+        began = datetime.datetime.strptime(
+            since["since"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=datetime.timezone.utc)
+        same = (since["pr"], since["head"]) == (waiting["pr"],
+                                                 waiting["head"])
+    except (KeyError, TypeError, ValueError):
+        same = False
+    if not same:
+        began = when
+        save_json(path, {"pr": waiting["pr"], "head": waiting["head"],
+                         "since": iso(when)})
+    waited = when - began
+    return int(waited.total_seconds() // 60) if waited >= STALL_AFTER else None
+
+
+def conflict_hand_back(pr, approval, github, said, live):
+    """The hand-back for a head GitHub refused to update as a conflict:
+    to the author, like a conflict git found."""
+    decision = {"action": "HAND-BACK", "to": "author",
+                "reason": CONFLICT_REASON, "pr": pr["number"],
+                "head": pr["headRefOid"]}
+    if live:
+        decision["result"] = carry_out(decision, approval, github, said)
+    return decision
+
+
+def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
+         sleep=time.sleep, live=False):
+    """One tick: the queue, and the action for its first pull request
+    that isn't handed back or skipped, carried out when `live`. Appends
+    the record to merger.jsonl, or dry-run.jsonl when not live, and
+    prints one summary line (two when stalled). Returns the record."""
+    fetched = git(repo, "fetch", "-q", "origin", MAIN, run=run)
+    if fetched.returncode != 0 and "cannot lock ref" in fetched.stderr:
+        # The checkout's refs are shared with every worktree on the host,
+        # so another fetch can hold the ref for a moment.
+        sleep(FETCH_RETRY_S)
+        fetched = git(repo, "fetch", "-q", "origin", MAIN, run=run)
+    if fetched.returncode != 0:
+        raise RuntimeError("fetch %s: %s" % (MAIN, fetched.stderr.strip()))
+    main_tip = git(repo, "rev-parse", "refs/remotes/origin/" + MAIN,
+                   run=run).stdout.strip()
+    prs = fetch_prs(github)
+    open_numbers = {pr["number"] for pr in prs} | fetch_open_issues(github)
+    candidates, approvals, held = [], {}, {}
+    when = now()
+    for pr in prs:
+        approval, why = eligible(pr, open_numbers, when)
+        if approval is not None:
+            candidates.append(pr)
+            approvals[pr["number"]] = approval
+        elif approval_of(pr) is not None:
+            held[str(pr["number"])] = why
+    queue = order(candidates, prs)
+    record = {"at": iso(when), "main": main_tip, "held": held,
+              "queue": [pr["number"] for pr in queue], "decisions": []}
+    os.makedirs(state_dir, exist_ok=True)
+    said_path = os.path.join(state_dir, "handed-back.json")
+    said = load_json(said_path, {})
+    waiting = None
+    for pr in queue:
+        approval = approvals[pr["number"]]
+        decision = decide(pr, approval, repo, main_tip, github, github.env,
+                          run)
+        decision.update(pr=pr["number"], head=pr["headRefOid"])
+        if (decision["action"] == "UPDATE"
+                and said.get(str(pr["number"])) == hand_back_key(
+                    approval, pr["headRefOid"], CONFLICT_REASON)):
+            # GitHub already refused this head as a conflict and the
+            # author has it; asking again would only be refused again.
+            record["decisions"].append(
+                conflict_hand_back(pr, approval, github, said, live))
+            continue
+        if live:
+            result = carry_out(decision, approval, github, said)
+            if result is not None:
+                decision["result"] = result
+        record["decisions"].append(decision)
+        if (decision["action"] == "UPDATE"
+                and "merge conflict" in (decision.get("result") or "")):
+            # The backstop for a conflict git didn't see: GitHub's word
+            # is final, and the pull request goes back to its author
+            # like any other conflict, not round again next tick.
+            record["decisions"].append(
+                conflict_hand_back(pr, approval, github, said, live))
+            continue
+        if decision["action"] not in ("HAND-BACK", "SKIP"):
+            # A refused write ends the tick on this pull request, and the
+            # next tick picks it again; if GitHub goes on refusing, it is
+            # as stuck as a check that never finishes.
+            if (decision["action"] == "WAIT"
+                    or decision.get("result", "").startswith("refused")):
+                waiting = decision
+            break
+    if live:
+        minutes = stalled_for(state_dir, waiting, when)
+        if minutes is not None:
+            record["stalled"] = {"pr": waiting["pr"], "head": waiting["head"],
+                                 "minutes": minutes}
+            if waiting["action"] != "WAIT":
+                record["stalled"]["refused"] = "%s %s" % (
+                    waiting["action"], waiting["result"])
+        save_json(said_path, said)
+    name = "merger.jsonl" if live else "dry-run.jsonl"
+    with open(os.path.join(state_dir, name), "a") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+    out("%s %d eligible, %d approved but held; %s" % (
+        "TICK" if live else "DRY-RUN", len(queue), len(held), "; ".join(
+        "#%d %s%s%s" % (d["pr"], d["action"],
+                        " to %s" % d["to"] if "to" in d else "",
+                        " (%s)" % d["result"] if "result" in d else "")
+        for d in record["decisions"]) or "nothing to do"))
+    stalled = record.get("stalled")
+    if stalled and "refused" in stalled:
+        out("STALLED: GitHub has refused the Merger's write to #%d at %s "
+            "for %d minutes, most recently %s. It stays first in the queue "
+            "and is not handed back; look at the Merger App's access" % (
+                stalled["pr"], stalled["head"][:10], stalled["minutes"],
+                stalled["refused"]))
+    elif stalled:
+        out("STALLED: #%d has waited %d minutes on %s: %s. It stays "
+            "first in the queue and is not handed back; look at the "
+            "build check%s%s" % (
+                stalled["pr"], stalled["minutes"], stalled["head"][:10],
+                waiting["reason"], " on " + BUILD_HOST if BUILD_HOST else "",
+                ", or the %s workflow in GitHub Actions" % CI_WORKFLOW
+                if CI_WORKFLOW else ""))
+    return record
+
+
+def mint(project, agent):
+    try:
+        return forge_github.token(project, agent)
+    except forge_github.MintError:
+        return None
+
+
+def main(argv=None, run=sh, out=print, environ=None, mint=mint):
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(
+        prog="forge-merger", description=__doc__.splitlines()[0])
+    parser.add_argument("--dry-run", action="store_true",
+                        help="read and report, and write nothing to GitHub")
+    parser.add_argument("--state-dir", default=None,
+                        help="where records and state live (default "
+                        "~/.local/state/agent-forge/<project>/merger)")
+    parser.add_argument("--checkout", default=environ.get(
+        "FORGE_CRON_CHECKOUT"), help="the checkout kept at the default "
+        "branch (default $FORGE_CRON_CHECKOUT)")
+    args = parser.parse_args(argv)
+    if not args.checkout:
+        out("NO-REPO: no --checkout, and FORGE_CRON_CHECKOUT is not set")
+        return 2
+    got = git(os.path.expanduser(args.checkout), "rev-parse",
+              "--show-toplevel", run=run)
+    repo = got.stdout.strip()
+    if got.returncode != 0 or not repo:
+        out("NO-REPO: %s is not a git checkout" % args.checkout)
+        return 2
+    try:
+        project = config.load(os.path.join(repo, config.CONFIG_NAME))
+    except config.ConfigError as err:
+        out("NO-CONFIG: %s" % err)
+        return 2
+    configure(project)
+    state_dir = args.state_dir or locks.state_dir(project.name, "merger",
+                                                  environ)
+    os.makedirs(state_dir, exist_ok=True)
+    lock = locks.try_lock(os.path.join(state_dir, "lock"), str(os.getpid()))
+    if lock is None:
+        out("BUSY: another tick holds %s" % os.path.join(state_dir, "lock"))
+        return 0
+    with lock:
+        token = mint(project, ACT_AS)
+        if token is None:
+            out("NO-TOKEN: could not mint %s's token" % ACT_AS)
+            return 2
+        try:
+            record = tick(repo, state_dir, GitHub(token, run), run,
+                          out, live=not args.dry_run)
+        except (RuntimeError, KeyError, TypeError, ValueError) as err:
+            out("FAILED: %s" % err)
+            return 2
+    return 2 if "stalled" in (record or {}) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

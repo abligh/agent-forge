@@ -134,6 +134,16 @@ class Check(unittest.TestCase):
             "host_settings.files[1]: unknown key 'colour'",
             "host_settings.files[1]: missing 'from'"])
 
+    def test_merge(self):
+        self.assertEqual(self.problems(merge={
+            "merger": "Nobody", "gate": [["ok"], [], "x", [1]],
+            "stall_minutes": "30"}), [
+            "merge.stall_minutes must be an integer",
+            "merge.gate[1] must be a non-empty list of strings",
+            "merge.gate[2] must be a non-empty list of strings",
+            "merge.gate[3] must be a non-empty list of strings",
+            "merge.merger 'Nobody' is not in machinery"])
+
     def test_host_keys_are_strings(self):
         self.assertEqual(
             self.problems(host_settings={"host_keys": ["a", 1]}),
