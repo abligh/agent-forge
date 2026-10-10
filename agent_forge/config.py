@@ -44,11 +44,13 @@ TOP = {
     "checks": (dict, False),
     "docs": (dict, False),
     "relay": (dict, False),
+    "identity": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
        "slug": str, "key": str}
 AGENT = dict(APP, session_name=str, kind=str, reviews=list)
+IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
 
 
 class ConfigError(Exception):
@@ -147,6 +149,7 @@ def check(data):
     if not REPO_RE.match(data["repo"]):
         problems.append("repo %r must be owner/name" % data["repo"])
     _fields("naming", data.get("naming", {}), NAMING, problems)
+    _fields("identity", data.get("identity", {}), IDENTITY, problems)
     suffix = data.get("naming", {}).get("app_slug_suffix")
     if not data["agents"]:
         problems.append("agents must name at least one agent")

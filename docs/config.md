@@ -38,6 +38,7 @@ starts with `_` is a comment, at any level.
 | `key_dir` | no | Where the Apps' private keys are, `~` allowed. |
 | `naming` | no | `app_slug_suffix` and `session_prefix`; see below. |
 | `machinery` | no | Apps that act for scheduled tools rather than agents, such as the Merger's; each entry as an agent's App fields. |
+| `identity` | no | The host's unconfigured git identity, which no commit may carry: `unattributed_domain` (an email domain such as `@host.example.org`) and `unattributed_name`. |
 | `labels`, `checks`, `docs`, `relay` | no | Sections each tool documents for itself, as it moves here. |
 
 ### An agent

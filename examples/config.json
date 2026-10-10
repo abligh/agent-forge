@@ -24,5 +24,7 @@
   "labels": {"owner_prefix": "Owner:", "waiting_on_owner": "Status:waiting-owner"},
   "checks": {"context": "vm/build-and-test", "poster": "Merger"},
   "docs": {"paths": ["README.md", "docs"], "width": 80},
+  "identity": {"unattributed_domain": "@build.example.org",
+               "unattributed_name": "Anonymous Agent"},
   "relay": {"url": "http://127.0.0.1:8788/hook", "room": "everyone@conference.example.org"}
 }

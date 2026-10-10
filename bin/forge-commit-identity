@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Refuse commits authored under the host's unconfigured git identity.
+
+Every agent session on a host shares its `~/.gitconfig`. A commit
+carrying that identity came from a worktree nobody stamped
+(`forge-worktree-identity` does the stamping), so it is attributed to
+no one: GitHub links a commit to an account by its email, and that
+address belongs to none.
+
+    forge-commit-identity BASE..HEAD
+
+**The rule is on the domain, not the one address**, and on both the
+author and the committer. The configuration's
+`identity.unattributed_domain` is reserved for anything fabricated,
+precisely because it resolves to nobody, so either identity there is
+unattributed whatever its local part says; and
+`identity.unattributed_name` is refused whatever email accompanies it.
+
+**Only GitHub's synthetic merge is skipped, not merges in general.**
+The merge commit GitHub makes for a pull_request checkout (`Merge <sha>
+into <sha>`) is nobody's commit and no squash carries it. A merge an
+agent makes on its own branch is that agent's commit, and from an
+unstamped worktree it carries the default identity like any other, so
+it is judged. Every commit in the range is judged.
+
+**A name claiming an agent must carry that agent's stamp.** The host
+identity is not the only one an unstamped worktree can fall through
+to. A `git config user.name` run without `--worktree` in a linked
+worktree writes the shared repository's config, and every unstamped
+worktree then commits under whatever it says (`Reviewer (scratch)
+<reviewer@localhost>`, say). A list of refused names can't catch the
+next one, so the rule is structural: when the leading word of a name
+is an agent in the configuration, the email must be that agent's bot
+address, `<id>+<slug>[bot]@users.noreply.github.com`. A person's name,
+or an agent's own bot login, is not judged by this rule.
+
+Exit 0 when every commit is attributable; 1 when at least one is not
+(each is listed, with the remedy); 2 when the range or configuration
+could not be read, or the range held no commits: a range that examined
+nothing must not read as clean.
+"""
+import argparse
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, proc  # noqa: E402
+
+LEADING_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+# The merge commit GitHub synthesizes for a pull_request checkout.
+SYNTHETIC_MERGE_RE = re.compile(r"^Merge [0-9a-f]{40} into [0-9a-f]{40}")
+
+
+def commits(rng, run=proc.sh):
+    """[(sha, author name, author email, committer name, committer
+    email)] in `rng`, less GitHub's synthetic merge, or None if the range
+    cannot be read."""
+    got = run(["git", "log",
+               "--format=%H%x09%an%x09%ae%x09%cn%x09%ce%x09%s", rng])
+    if got.returncode != 0:
+        return None
+    rows = []
+    for line in got.stdout.splitlines():
+        parts = line.split("\t", 5)
+        if len(parts) == 6 and not SYNTHETIC_MERGE_RE.match(parts[5]):
+            rows.append(tuple(parts[:5]))
+    return rows
+
+
+def host_identity(project, name, email):
+    """Whether name/email is the host's unconfigured identity, or on its
+    domain. Case-insensitive, as emails are."""
+    ident = project.section("identity")
+    domain = ident.get("unattributed_domain", "").lower()
+    plain = ident.get("unattributed_name", "").lower()
+    return bool((domain and email.strip().lower().endswith(domain))
+                or (plain and name.strip().lower() == plain))
+
+
+def borrowed_agent(project, name, email):
+    """The agent whose name this identity claims without that agent's
+    stamped email, or None. The claim is the name's leading word matching
+    an agent exactly, case-insensitively, so `Reviewer-scratch` claims
+    Reviewer and `Reviewer2` claims Reviewer2, not Reviewer."""
+    m = LEADING_WORD_RE.match(name.strip())
+    if not m:
+        return None
+    word = m.group(0).lower()
+    for agent in project.agents:
+        if agent.lower() != word:
+            continue
+        stamp = r"\d+\+%s@users\.noreply\.github\.com" % re.escape(
+            project.bot_login(agent))
+        return None if re.fullmatch(stamp, email.strip().lower()) else agent
+    return None
+
+
+def unattributed(project, rows):
+    """[(sha, which, name, email, why)] for every unattributed author or
+    committer in `rows`, author first."""
+    bad = []
+    for sha, an, ae, cn, ce in rows:
+        for which, name, email in (("author", an, ae), ("committer", cn, ce)):
+            if host_identity(project, name, email):
+                bad.append((sha, which, name, email,
+                            "the unconfigured host identity"))
+                continue
+            agent = borrowed_agent(project, name, email)
+            if agent:
+                bad.append((sha, which, name, email,
+                            "the name of agent %s without its stamped "
+                            "address, so not its commit" % agent))
+    return bad
+
+
+REMEDY = """\
+Stamp the worktree first, so new commits are attributed:
+    forge-worktree-identity <YourAgent>
+An identity nobody stamped may come from the shared repository config,
+which every unstamped worktree reads; see it with
+    git config --show-scope --get-all user.name
+Then re-author the branch's commits onto a NEW branch (never force-push
+a reviewed one) and open a new pull request from it:
+    git checkout -b <new-branch>
+    git rebase --exec 'git commit --amend --no-edit --reset-author' <base>
+    git push origin <new-branch>"""
+
+
+def main(argv=None, run=proc.sh, load=config.load, out=print, err=None):
+    err = err or (lambda line: print(line, file=sys.stderr))
+    parser = argparse.ArgumentParser(prog="forge-commit-identity",
+                                     description=__doc__.splitlines()[0])
+    parser.add_argument("range", help="BASE..HEAD")
+    args = parser.parse_args(argv)
+    try:
+        project = load()
+    except config.ConfigError as e:
+        err("forge-commit-identity: %s" % e)
+        return 2
+    rows = commits(args.range, run)
+    if rows is None:
+        err("forge-commit-identity: cannot read %s" % args.range)
+        return 2
+    if not rows:
+        err("forge-commit-identity: %s holds no commits other than GitHub's "
+            "synthetic merge, so nothing was examined" % args.range)
+        return 2
+    bad = unattributed(project, rows)
+    for sha, which, name, email, why in bad:
+        err("%s %s is %s <%s>, %s; it is attributed to no one"
+            % (sha[:12], which, name, email, why))
+    if bad:
+        err(REMEDY)
+    out("forge-commit-identity: %d commit(s) examined, %d unattributed"
+        % (len(rows), len({b[0] for b in bad})))
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
