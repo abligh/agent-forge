@@ -230,3 +230,33 @@ def noreply_email(project, name, user_id):
     """The bot's commit email: <user id>+<login>@users.noreply.github.com."""
     return "%d+%s@users.noreply.github.com" % (user_id,
                                                project.bot_login(name))
+
+
+def read_token(project, environ=None, call=api_call, sign=openssl_sign):
+    """A token for reading: $FORGE_AGENT's App token when that mints,
+    else $GH_TOKEN, else None (anonymous, which public repositories
+    allow at a low rate)."""
+    environ = os.environ if environ is None else environ
+    name = environ.get("FORGE_AGENT")
+    if name:
+        try:
+            return token(project, name, call, sign)
+        except MintError:
+            pass
+    return environ.get("GH_TOKEN") or None
+
+
+def paged(token_, path, call=api_call, per_page=100):
+    """Every item of a REST list endpoint, following pages; (status,
+    items), status being the first failure's or 200."""
+    items, page = [], 1
+    sep = "&" if "?" in path else "?"
+    while True:
+        status, body = rest(token_, "GET", "%s%sper_page=%d&page=%d"
+                            % (path, sep, per_page, page), call=call)
+        if status != 200 or not isinstance(body, list):
+            return status or 0, items
+        items.extend(body)
+        if len(body) < per_page:
+            return 200, items
+        page += 1

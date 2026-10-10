@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Did the repository's owner decide this, on this item, after you asked?
+
+A comment by the owner on an issue or pull request is a **decision of
+record**: the durable, agent-readable form of an instruction, written
+once where every agent can read it rather than once on GitHub and again
+in each session. This answers whether one exists; reading the words is
+the agent's job.
+
+    forge-decision --issue 71 --answering 5696737727
+    forge-decision --issue 12 --answering body
+
+**The ask is often the item's own body**: an approval request is an
+issue whose body is the question, which nobody comments on before the
+answer. `--answering body` names that ask and uses the issue's
+`created_at`.
+
+**A decision of record is a comment satisfying all of:**
+
+1. `user.type == "User"`, not a `Bot`, so no agent can write one;
+2. `author_association == "OWNER"`, computed by GitHub from the
+   repository's permissions, not supplied by the writer;
+3. `user.login` equals the repository's own `owner.login`, read from
+   the API, so a second owner-permissioned account doesn't qualify and
+   a transfer breaks the check visibly rather than widening it;
+4. newer than the ask it answers. A decision can't precede its question.
+
+**This holds only because agents write through their own Apps.** An
+agent posts as its App's bot, type `Bot`, association `NONE`, and an
+App can't post as a `User`. An agent writing with a human's gh login
+would post as that human, and this could then not tell them apart.
+
+**An edited candidate makes the whole answer exit 2**, not just
+itself: the caller reads every owner comment after the ask as the
+answer, so one whose text no longer matches what was written makes the
+set untrustworthy. The remedy is one fresh comment.
+
+**Reads only**, as $FORGE_AGENT's App if set, else $GH_TOKEN, else
+anonymously. `--repo` defaults to the project's.
+
+Exit 0 a decision of record exists (printed); 1 none does; 2 it could
+not tell: the API failed, the named ask isn't on that item, or a
+candidate was edited. A check never answers "don't know" with "no".
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, github  # noqa: E402
+
+
+class DecisionError(Exception):
+    """The question could not be answered: exit 2, never 1."""
+
+
+def is_owner_comment(comment, owner):
+    """The three author tests, which carry the whole argument."""
+    user = comment.get("user") or {}
+    return (user.get("type") == "User"
+            and comment.get("author_association") == "OWNER"
+            and user.get("login") == owner)
+
+
+def edited(comment):
+    return comment.get("updated_at") != comment.get("created_at")
+
+
+def decisions(repo, issue, answering, token=None, call=github.api_call):
+    """Owner comments on `issue` newer than the ask `answering` names (a
+    comment id, or "body")."""
+    status, info = github.rest(token, "GET", "/repos/%s" % repo, call=call)
+    owner = (info.get("owner") or {}).get("login") if status == 200 else None
+    if not owner:
+        raise DecisionError("cannot read the owner of %s (%s)" % (repo, status))
+    status, all_comments = github.paged(
+        token, "/repos/%s/issues/%d/comments" % (repo, issue), call)
+    if status != 200:
+        raise DecisionError("cannot read the comments on %s#%d (%s)"
+                            % (repo, issue, status))
+    if answering == "body":
+        status, item = github.rest(token, "GET", "/repos/%s/issues/%d"
+                                   % (repo, issue), call=call)
+        asked_at = item.get("created_at") if status == 200 else None
+        if not asked_at:
+            raise DecisionError("cannot read %s#%d (%s)" % (repo, issue,
+                                                            status))
+    else:
+        ask = next((c for c in all_comments if c.get("id") == answering),
+                   None)
+        if ask is None:
+            raise DecisionError(
+                "comment %s is not on %s#%d, so there is no ask to be newer "
+                "than; a decision is scoped to the item it was written on"
+                % (answering, repo, issue))
+        asked_at = ask.get("created_at", "")
+    found = [c for c in all_comments if is_owner_comment(c, owner)
+             and c.get("created_at", "") > asked_at]
+    stale = [c for c in found if edited(c)]
+    if stale:
+        raise DecisionError(
+            "comment %d was edited at %s, after being written at %s. An "
+            "edited decision is not a decision: ask for a fresh one"
+            % (stale[0]["id"], stale[0].get("updated_at"),
+               stale[0].get("created_at")))
+    return found
+
+
+def ask_id(text):
+    """A comment id, or `body`. Anything else is refused rather than read
+    as the body, which would widen the window: the direction that turns
+    a "no" into a "yes"."""
+    if text == "body":
+        return text
+    try:
+        return int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "%r is neither a comment id nor `body`" % text) from None
+
+
+def main(argv=None, out=print, err=None, call=github.api_call,
+         load=config.load, environ=None):
+    err = err or (lambda line: print(line, file=sys.stderr))
+    parser = argparse.ArgumentParser(prog="forge-decision",
+                                     description=__doc__.splitlines()[0])
+    parser.add_argument("--issue", type=int, required=True)
+    parser.add_argument("--answering", type=ask_id, required=True,
+                        metavar="ID|body")
+    parser.add_argument("--repo")
+    args = parser.parse_args(argv)
+    project = None
+    try:
+        project = load()
+    except config.ConfigError as e:
+        if not args.repo:
+            err("forge-decision: %s, and no --repo" % e)
+            return 2
+    repo = args.repo or project.repo
+    token = github.read_token(project, environ, call) if project else \
+        (os.environ if environ is None else environ).get("GH_TOKEN")
+    try:
+        found = decisions(repo, args.issue, args.answering, token, call)
+    except DecisionError as e:
+        err("forge-decision: %s" % e)
+        return 2
+    if not found:
+        err("forge-decision: no decision of record on %s#%d after %s; the "
+            "owner has not decided this here" % (
+                repo, args.issue, "the body" if args.answering == "body"
+                else "comment %d" % args.answering))
+        return 1
+    for c in found:
+        out("decision: comment %d by %s at %s"
+            % (c["id"], c["user"]["login"], c["created_at"]))
+        out("  https://github.com/%s/issues/%d#issuecomment-%d"
+            % (repo, args.issue, c["id"]))
+        for line in (c.get("body") or "").splitlines():
+            out("  | %s" % line)
+    out("forge-decision: %d decision(s) of record. Quote the comment id in "
+        "whatever you write; the words are yours to read." % len(found))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
