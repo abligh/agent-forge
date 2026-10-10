@@ -268,8 +268,11 @@ relay already answers `unknown-name`, and that is reported.
    module in the tests (`tests/router_rules.py`), and no decision of
    the default rules changed. What the engine still refuses is the
    malformed decision (Decide, above).
-3. `router.rules` pointing at a project file, with an example module in
-   the tests. Loading one already works (`load_rules` in
-   `agent_forge/router.py`); what remains is the example and its tests.
+3. Done. `router.rules` pointing at a project file, loaded from the
+   checkout by `load_rules` in `agent_forge/router.py`.
+   [examples/rules.py](../examples/rules.py) is a starting point: the
+   default rules, plus one that makes a conflicted pull request its
+   author's turn, adding the field it needs to the query; its tests
+   load it as the engine does.
 4. The larger project writes its rules module in its own repository and
    compares its journal with its current router's before switching.
