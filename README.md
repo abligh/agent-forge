@@ -6,9 +6,9 @@ that tests every pull request's head, a webhook receiver, a router that
 wakes whichever agent's turn it is, per-agent App identities, and the
 small tools around them.
 
-Status: **being assembled.** The skeleton is here: configuration,
-library and tests. The tools still exist as separate copies inside the
-projects that use them, and move here one at a time;
+Status: **every tool is ported; no project uses them yet.** Each was
+ported from the copy in the smaller of the two projects that had one,
+with all its tests; the larger project's additions come next.
 [docs/design.md](docs/design.md) says what moves, what each copy
 contributes, and in what order.
 
@@ -30,6 +30,40 @@ router wakes agents through.
     examples/      an example project configuration
     tests/         one test file per tool and module, and meta-tests
     tools/         this repository's own checks
+
+## Tools
+
+The merge pipeline, which runs from cron and on webhooks:
+
+| Tool | What it does |
+| --- | --- |
+| `forge-merger` | Merges each reviewer-approved pull request in turn, oldest first. |
+| `forge-pr-check` | Builds and tests each open pull request's head on the host, under a memory limit, and posts the status the Merger requires. |
+| `forge-router` | Wakes each agent whose turn an open issue or pull request is, through the XMPP relay. |
+| `forge-receiver` | Takes GitHub's webhook deliveries and ticks the tools an event gives work. |
+| `forge-cron-run` | Runs a project's tool from cron against the reviewed checkout, under locks. |
+
+Identity, signing and decisions, which agents run:
+
+| Tool | What it does |
+| --- | --- |
+| `forge-app-token` | Mints an installation token for one agent's GitHub App. |
+| `forge-git-credential` | Gives git the stamped agent's App token as its push credential. |
+| `forge-worktree-identity` | Stamps a worktree's git identity as an agent's bot, and verifies it. |
+| `forge-commit-identity` | Refuses commits made under the host's unconfigured identity. |
+| `forge-new-body`, `forge-gh-signed` | Write a signed body file, and run `gh` with it as the agent's App. |
+| `forge-decision` | Says whether the owner decided something, on this item, after it was asked. |
+| `forge-approval-scope` | Says whether a branch adds text to an approved design without saying so. |
+| `forge-closing-keywords` | Reports every issue a squash merge will close, refusing a negated one. |
+
+Documentation and hosts:
+
+| Tool | What it does |
+| --- | --- |
+| `forge-doc-format`, `forge-doc-width`, `forge-doc-links` | Check Markdown: whitespace and headings, line width, links and anchors. |
+| `forge-host-settings` | Compares a host's agent settings with the project's tracked copy, or installs it. |
+| `forge-session-start` | A SessionStart hook: tells a restarted session what died and what it owns. |
+| `forge-config` | Checks and reads the project's configuration. |
 
 ## Installing
 
