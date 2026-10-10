@@ -57,17 +57,18 @@ class MintError(Exception):
 
 
 def api_call(url, token, scheme="Bearer", method="GET", body=None):
-    """One request. Returns (status, decoded body or {}); never raises
-    for an HTTP error. Status 0 means no answer: the network failed, or
+    """One request, anonymous when `token` is None. Returns (status,
+    decoded body or {}); never raises for an HTTP error. Status 0 means no answer: the network failed, or
     GitHub didn't reply within REQUEST_TIMEOUT_S."""
     data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(
-        url, method=method, data=data,
-        headers={"Authorization": "%s %s" % (scheme, token),
-                 "Accept": "application/vnd.github+json",
-                 "X-GitHub-Api-Version": "2022-11-28",
-                 "Content-Type": "application/json",
-                 "User-Agent": "agent-forge"})
+    headers = {"Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28",
+               "Content-Type": "application/json",
+               "User-Agent": "agent-forge"}
+    if token:
+        headers["Authorization"] = "%s %s" % (scheme, token)
+    req = urllib.request.Request(url, method=method, data=data,
+                                 headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
             raw = resp.read()
@@ -205,3 +206,27 @@ def graphql(token_, query, variables=None, call=api_call):
     return call(api_base() + "/graphql", token_, scheme="token",
                 method="POST", body={"query": query,
                                      "variables": variables or {}})
+
+
+def bot_user_id(project, name, call=api_call, sign=openssl_sign):
+    """The numeric id of `name`'s bot user, or None unless GitHub says
+    that login is a Bot. That id, not the App id (an unrelated number),
+    is what a commit email links to. Asked with the agent's own token
+    when one can be minted, else anonymously: the endpoint is public."""
+    try:
+        tok = token(project, name, call, sign)
+    except MintError:
+        tok = None
+    login = project.bot_login(name).replace("[", "%5B").replace("]", "%5D")
+    status, user = call("%s/users/%s" % (api_base(), login), tok,
+                        scheme="token")
+    if status != 200 or user.get("type") != "Bot" \
+            or not isinstance(user.get("id"), int):
+        return None
+    return user["id"]
+
+
+def noreply_email(project, name, user_id):
+    """The bot's commit email: <user id>+<login>@users.noreply.github.com."""
+    return "%d+%s@users.noreply.github.com" % (user_id,
+                                               project.bot_login(name))

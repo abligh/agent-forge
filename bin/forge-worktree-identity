@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Stamp this worktree's git identity as an agent's bot, and verify it.
+
+Each worktree commits as its own agent, through
+`extensions.worktreeConfig` plus `git config --worktree`. Without that,
+every commit is authored as the host's `~/.gitconfig`, attributed to
+no one, which `forge-commit-identity` refuses.
+
+Two traps, and how this handles them:
+
+* **An unstamped worktree does not fail, it inherits.** `git worktree
+  add` copies the creating worktree's `config.worktree` into the new
+  one, so a worktree nobody stamped commits as whoever created it: the
+  wrong value is present, not absent. So verification compares against
+  the EXPECTED identity, never against non-emptiness, and reads the
+  worktree's own config rather than whatever git would fall back to.
+* **The email is the bot user's noreply address**,
+  `<bot-user-id>+<slug>[bot]@users.noreply.github.com`, and the id is
+  the bot USER's, not the App id; the two are unrelated numbers. The
+  email is what links a commit to the bot; the name is only what a
+  human reads, so it stays the agent's name.
+
+    forge-worktree-identity AGENT               stamp, then verify
+    forge-worktree-identity --check AGENT       verify only
+    forge-worktree-identity --push app AGENT    stamp, and push as the App
+
+**`--push app`** also makes this worktree push as the agent's App,
+rather than over SSH with a deploy key, which GitHub attributes to the
+key's owner. It writes, at worktree scope only:
+
+    remote.origin.pushurl = https://github.com/<repo>.git
+    credential.https://github.com.helper = (empty, then)
+                                           !<this copy>/forge-git-credential
+    credential.https://github.com.useHttpPath = false
+
+`remote.origin.url` stays as it was, so fetching is unchanged. The
+empty helper value first clears any helper a broader scope configures
+(`gh auth setup-git` writes one to ~/.gitconfig), since git asks every
+helper in turn and the first answer wins. The helper is the installed
+agent-forge's, which outlives any worktree. Running it again changes
+nothing; with `--check` it verifies instead of writing. Undo it for one
+worktree with `git config --worktree --unset remote.origin.pushurl`.
+
+The agent must be in the project's configuration, and GitHub must say
+its bot login is a Bot before anything is written.
+
+Exit 0 when the worktree's identity (and, with `--push app`, its push
+credential) is the agent's; 1 when it is not (with `--check`), or a
+write did not read back; 2 when the agent or its bot can't be resolved.
+"""
+import argparse
+import os
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+from agent_forge import config, github, proc  # noqa: E402
+
+HELPER_KEY = "credential.https://github.com.helper"
+HTTP_PATH_KEY = "credential.https://github.com.useHttpPath"
+HELPER = "!" + os.path.join(HERE, "forge-git-credential")
+
+
+def git(run, *args):
+    return run(["git", *args])
+
+
+def current(run):
+    """(user.name, user.email) from THIS worktree's own config, or Nones.
+    `--worktree` means this worktree only with extensions.worktreeConfig
+    on; without it git reads the config every worktree shares."""
+    ext = git(run, "config", "--get", "extensions.worktreeConfig")
+    if ext.stdout.strip().lower() != "true":
+        return None, None
+    name = git(run, "config", "--worktree", "--get", "user.name")
+    email = git(run, "config", "--worktree", "--get", "user.email")
+    return ((name.stdout.strip() or None) if name.returncode == 0 else None,
+            (email.stdout.strip() or None) if email.returncode == 0 else None)
+
+
+def stamp(run, name, email):
+    for args in (("config", "extensions.worktreeConfig", "true"),
+                 ("config", "--worktree", "user.name", name),
+                 ("config", "--worktree", "user.email", email)):
+        if git(run, *args).returncode != 0:
+            return False
+    return True
+
+
+def push_settings(repo, helper=HELPER):
+    """{key: [values]} that `--push app` writes at worktree scope."""
+    return {"remote.origin.pushurl": ["https://github.com/%s.git" % repo],
+            HELPER_KEY: ["", helper],
+            HTTP_PATH_KEY: ["false"]}
+
+
+def current_push(run, repo, helper=HELPER):
+    have = {}
+    for key in push_settings(repo, helper):
+        got = git(run, "config", "--worktree", "--get-all", key)
+        have[key] = got.stdout.split("\n")[:-1] if got.returncode == 0 else []
+    return have
+
+
+def stamp_push(run, repo, helper=HELPER):
+    """Write push_settings, leaving a key alone that already holds
+    exactly its values, so a second run changes nothing."""
+    have = current_push(run, repo, helper)
+    for key, values in push_settings(repo, helper).items():
+        if have.get(key) == values:
+            continue
+        # --unset-all exits 5 when there is nothing to unset.
+        if git(run, "config", "--worktree", "--unset-all",
+               key).returncode not in (0, 5):
+            return False
+        for value in values:
+            if git(run, "config", "--worktree", "--add", key,
+                   value).returncode != 0:
+                return False
+    return True
+
+
+def main(argv=None, run=proc.sh, load=config.load, lookup=None,
+         helper=HELPER, out=print, err=None):
+    err = err or (lambda line: print(line, file=sys.stderr))
+    parser = argparse.ArgumentParser(prog="forge-worktree-identity",
+                                     description=__doc__.splitlines()[0])
+    parser.add_argument("agent")
+    parser.add_argument("--check", action="store_true",
+                        help="verify only; change nothing")
+    parser.add_argument("--push", choices=["app"],
+                        help="also push as the agent's App")
+    args = parser.parse_args(argv)
+    try:
+        project = load()
+    except config.ConfigError as e:
+        err("forge-worktree-identity: %s" % e)
+        return 2
+    if args.agent not in project.agents:
+        err("forge-worktree-identity: %r is not an agent in %s"
+            % (args.agent, project.path))
+        return 2
+    login = project.bot_login(args.agent)
+    user_id = (lookup or github.bot_user_id)(project, args.agent)
+    if user_id is None:
+        err("forge-worktree-identity: could not resolve %s as a Bot user"
+            % login)
+        return 2
+    want = (args.agent, github.noreply_email(project, args.agent, user_id))
+    if not args.check and not stamp(run, *want):
+        err("forge-worktree-identity: git config failed while stamping")
+        return 1
+    have = current(run)
+    if have != want:
+        err("forge-worktree-identity: this worktree commits as %s <%s>, not "
+            "%s <%s>%s" % (have[0], have[1], want[0], want[1],
+                           " -- run without --check to stamp it"
+                           if args.check else ""))
+        return 1
+    out("forge-worktree-identity: this worktree commits as %s <%s>" % want)
+    if not args.push:
+        return 0
+    if not args.check and not stamp_push(run, project.repo, helper):
+        err("forge-worktree-identity: git config failed while setting the "
+            "push credential")
+        return 1
+    if current_push(run, project.repo, helper) != push_settings(project.repo,
+                                                                helper):
+        err("forge-worktree-identity: this worktree does not push as %s's "
+            "App%s" % (args.agent, " -- run without --check to set it"
+                       if args.check else ""))
+        return 1
+    out("forge-worktree-identity: this worktree pushes as %s over HTTPS"
+        % login)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
