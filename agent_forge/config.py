@@ -74,7 +74,8 @@ LABELS = {"owner_prefix": str, "status_prefix": str,
           "waiting_on_owner": str, "waiting_external": str}
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
-ROUTER = {"rules": str}
+ROUTER = {"rules": str, "idle_offer": dict}
+IDLE_OFFER = {"idle_minutes": int, "report_to": str}
 RECEIVER = {"address": str, "port": int, "path": str, "secret_file": str,
             "max_body": int, "ticks": dict, "route": list}
 # The webhook events forge-receiver reads; `receiver.ticks` keys are
@@ -188,7 +189,10 @@ def check(data):
         problems.append("repo %r must be owner/name" % data["repo"])
     _fields("naming", data.get("naming", {}), NAMING, problems)
     _fields("identity", data.get("identity", {}), IDENTITY, problems)
-    _fields("router", data.get("router", {}), ROUTER, problems)
+    router = data.get("router", {})
+    if _fields("router", router, ROUTER, problems) and \
+            isinstance(router.get("idle_offer"), dict):
+        _check_idle_offer(router["idle_offer"], data["agents"], problems)
     merge = data.get("merge", {})
     if _fields("merge", merge, MERGE, problems):
         for i, argv in enumerate(merge.get("gate", [])):
@@ -354,6 +358,19 @@ def _check_test_ahead(ahead, checks, problems):
     if isinstance(checks, dict) and checks.get("merger_first") is False:
         problems.append("%s puts the Merger's pull request first, so "
                         "checks.merger_first must not be false" % where)
+
+
+def _check_idle_offer(offer, agents, problems):
+    """router.idle_offer: how long an agent is idle before it is offered
+    its next item, and who is told of a developer with none."""
+    where = "router.idle_offer"
+    _fields(where, offer, IDLE_OFFER, problems)
+    if _is(offer.get("idle_minutes"), int) and offer["idle_minutes"] < 1:
+        problems.append("%s.idle_minutes must be at least 1" % where)
+    if isinstance(offer.get("report_to"), str) and \
+            offer["report_to"] not in agents:
+        problems.append("%s.report_to: %r is not an agent"
+                        % (where, offer["report_to"]))
 
 
 def _check_receiver(receiver, problems):

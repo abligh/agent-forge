@@ -29,6 +29,9 @@ A rules module is a Python module with:
     recheck(item, ctx)  decide again just before delivery (absent: decide)
     summary(ctx)        a phrase for the run's last line, or "" (may be
                         absent)
+    wants_directory     true when the rules read the relay's directory,
+                        `ctx.directory` (absent: false). Read after
+                        `configure`, so it may depend on the project
 """
 
 import dataclasses
@@ -36,6 +39,7 @@ import datetime
 import importlib
 import importlib.machinery
 import importlib.util
+import math
 import os
 import zlib
 from typing import Any, Callable
@@ -113,6 +117,11 @@ class Reminder:
         return interval * (1 + self.jitter * spread)
 
 
+# A turn woken once and never reminded: its key changes when it should
+# be woken again (an idle offer, keyed on when the idle period began).
+ONCE = Reminder(math.inf, math.inf, 0)
+
+
 @dataclasses.dataclass(frozen=True)
 class Decision:
     """Whose turn one item is, and why.
@@ -151,12 +160,16 @@ class Context:
     every open item, so it can look at another (a blocker, say). `only`
     is the numbers a run started by an event routes (`--only`), else
     None: a sweep decides about those items alone, and the engine drops
-    any other decision it makes."""
+    any other decision it makes. `directory` is the relay's
+    `GET /directory` answer, read only for rules whose `wants_directory`
+    is true, and None when it wasn't read or couldn't be: a rule reads
+    None as "unknown", never as "nobody is there"."""
     roster: Any
     when: datetime.datetime
     prs: list
     issues: list
     only: frozenset | None = None
+    directory: Any = None
 
     @property
     def items(self):
@@ -178,6 +191,7 @@ def load_rules(name, root=None):
         if not hasattr(module, part):
             raise RulesError("rules %r has no %s" % (name, part))
     defaults = {"flatten": (), "lookups": (), "sweep": lambda ctx: [],
+                "wants_directory": False,
                 "recheck": module.decide, "summary": lambda ctx: ""}
     for part, value in defaults.items():
         if not hasattr(module, part):

@@ -123,6 +123,9 @@ times its interval, by a share fixed by a hash (crc32) of the key and
 the reminder's number, so a fleet woken together isn't reminded
 together. Jitter only delays, never brings a wake forward. Each
 interval runs from the last wake, and the state counts the reminders.
+`ONCE` is never reminded: a turn whose key changes when it should be
+woken again, such as the idle offer, keyed on when the idle period
+began.
 
 **Check before send.** When the module defines a `recheck` of its own
 (not the default, which is `decide` itself), a sending run fetches each
@@ -172,6 +175,7 @@ class Rules(Protocol):                # a module, not a class
     def sweep(ctx) -> Sequence[Decision]: ...         # optional
     def recheck(item, ctx) -> Sequence[Decision]: ... # optional
     def summary(ctx) -> str: ...                      # optional
+    wants_directory: bool         # optional: read the relay's directory
 
 @dataclass(frozen=True)
 class Lookup:
@@ -204,6 +208,8 @@ class Decision:
     suppressed: str | None = None # decided, not sent, and why
     actions: tuple = ()           # Actions, done before delivery
     reminder: Reminder | None = None   # None: relay.remind_seconds
+
+ONCE: Reminder                    # woken once, never reminded
 ```
 
 A module, because the rules are configured like every other tool
@@ -231,8 +237,15 @@ rule. The engine asks it two things: whether a name is an agent (only
 agents are woken) and its session name.
 
 `ctx` carries the clock, the roster, every fetched item (so a rule
-can read other items: a blocker's state, a reviewer's load) and
-`only`, the numbers an `--only` run routes, else None. A later step
+can read other items: a blocker's state, a reviewer's load),
+`only`, the numbers an `--only` run routes, else None, and
+`directory`, the relay's `GET /directory` answer (who is in the
+agents' room, busy or idle since when). The engine reads the directory
+once a run, sending or not, only for a module whose `wants_directory`
+is true after `configure`; one that can't be read, or isn't complete,
+is printed (`NO-DIRECTORY: …`) and handed over as None, which a module
+must read as unknown, not as nobody. The default rules want it only
+for `router.idle_offer` (rules 15 and 16). A later step
 may add the previous run's decisions, a namespaced store the module may
 write to, written only when the run's delivery is confirmed, and the
 configuration; until then a module keeps what it needs from

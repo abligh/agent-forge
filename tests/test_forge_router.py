@@ -1103,7 +1103,8 @@ class Main(unittest.TestCase):
         calls = []
 
         def fake_run(github, roster, state_dir, send, post, only, out,
-                     remind_s):
+                     remind_s, directory=None):
+            self.directory = directory
             calls.append((github.env["GH_TOKEN"], state_dir, send, only,
                           remind_s))
             return run() if run else 0

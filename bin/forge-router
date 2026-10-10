@@ -84,6 +84,14 @@ delivered. The run says which fault it was:
 * no answer at all means the relay is down: nothing more is posted to
   it this run, and every remaining wake stays due.
 
+**The directory.** Rules whose `wants_directory` is true (the default
+rules' idle offer, `router.idle_offer`) are handed the relay's `GET
+/directory` answer as `ctx.directory`: who is in the agents' room,
+and busy or idle since when. It is read once a run, with the same
+token as a post, sending or not. An answer that isn't a complete
+directory is printed (`NO-DIRECTORY: …`) and handed over as None,
+which the rules read as unknown, never as idle.
+
 **Without `--send` it is a dry run**: it prints each decision and the
 messages it would send, sends nothing, takes no lock and leaves
 `state.json` alone. It appends each turn it would send or withhold to
@@ -531,6 +539,37 @@ def make_poster(relay, token, opener=urllib.request.urlopen, sleep=time.sleep,
     return post
 
 
+def make_directory_reader(relay, token, opener=urllib.request.urlopen):
+    """A function () -> (the relay's `GET /directory` answer, None), or
+    (None, why not). Only a complete answer counts: a `200` whose JSON
+    has `"complete": true` and a list of `agents`. Anything else (no
+    token, a 503 while the relay loads its room, no answer) is "unknown",
+    which the rules must never read as "nobody is there". No reason ever
+    contains the token."""
+    url = relay.rstrip("/") + "/directory"
+
+    def read():
+        if not token:
+            return None, "no relay token in %s" % TOKEN_FILE
+        req = urllib.request.Request(url, method="GET",
+                                     headers={"X-Webhook-Token": token})
+        try:
+            with opener(req, timeout=POST_TIMEOUT_S) as resp:
+                code, raw = resp.status, resp.read(1000000)
+        except urllib.error.HTTPError as err:
+            return None, "HTTP %d" % err.code
+        except (urllib.error.URLError, OSError,
+                http.client.HTTPException) as err:
+            return None, "%s: %s" % (UNREACHABLE, getattr(err, "reason", err))
+        answer = relay_answer(raw)
+        if code != 200 or answer.get("complete") is not True \
+                or not isinstance(answer.get("agents"), list):
+            return None, "HTTP %d, not a complete directory" % code
+        return answer, None
+
+    return read
+
+
 def check(decision):
     """Raise ValueError for a decision this engine can't carry out: the
     rules are wrong, and half-doing it would be worse."""
@@ -654,7 +693,8 @@ def recheck(github, ctx, wakes):
                 for n in nodes
                 if n["number"] not in numbers or n["number"] in fresh]
     now = router.Context(ctx.roster, ctx.when, renewed(ctx.prs),
-                         renewed(ctx.issues), only=ctx.only)
+                         renewed(ctx.issues), only=ctx.only,
+                         directory=ctx.directory)
     again = {n: list(RULES.recheck(fresh[n], now)) if n in fresh else []
              for n in numbers}
     holding, withdrawn = [], []
@@ -671,17 +711,25 @@ def recheck(github, ctx, wakes):
 
 
 def run(github, roster, state_dir, send, post=None, only=None, out=print,
-        when=None, remind_s=None):
+        when=None, remind_s=None, directory=None):
     """One run: decide every open item, or `only` those numbers, and
     when `send`, do the due decisions' actions, wake each agent with
-    its due items and record it. Returns the exit status: 0 when nothing
-    was due or all of it was delivered, 1 when some was and the rest
-    stays due, 2 when something was due and none of it was delivered."""
+    its due items and record it. `directory`, for rules that want it,
+    reads the relay's directory (`make_directory_reader`). Returns the
+    exit status: 0 when nothing was due or all of it was delivered, 1
+    when some was and the rest stays due, 2 when something was due and
+    none of it was delivered."""
     when = when or merger.now_utc()
     remind_s = REMIND_S if remind_s is None else remind_s
     prs, issues = fetch(github)
+    listing = None
+    if RULES.wants_directory and directory is not None:
+        listing, why = directory()
+        if listing is None:
+            out("NO-DIRECTORY: %s; nobody is taken to be idle" % why)
     ctx = router.Context(roster, when, prs, issues,
-                         only=frozenset(only) if only else None)
+                         only=frozenset(only) if only else None,
+                         directory=listing)
     decisions = decide(ctx)
     tally = RULES.summary(ctx)
     if only:
@@ -886,7 +934,7 @@ def parse_only(text):
 
 
 def main(argv=None, sh=merger.sh, out=print, post=None, roster=None,
-         environ=None, mint=None):
+         environ=None, mint=None, directory=None):
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(
         prog="forge-router", description=__doc__.splitlines()[0])
@@ -928,6 +976,10 @@ def main(argv=None, sh=merger.sh, out=print, post=None, roster=None,
     if post is None and args.send:
         post = make_poster(environ.get("FORGE_ROUTER_RELAY", RELAY),
                            relay_token())
+    if directory is None and RULES.wants_directory:
+        # A dry run reads it too: reading changes nothing.
+        directory = make_directory_reader(
+            environ.get("FORGE_ROUTER_RELAY", RELAY), relay_token())
     mint = mint or merger.mint
 
     def go():
@@ -937,7 +989,8 @@ def main(argv=None, sh=merger.sh, out=print, post=None, roster=None,
             return 2
         try:
             return run(merger.GitHub(token, sh), roster, state_dir,
-                       args.send, post, args.only, out, remind_s=remind_s)
+                       args.send, post, args.only, out, remind_s=remind_s,
+                       directory=directory)
         except (RuntimeError, KeyError, TypeError, ValueError) as err:
             out("FAILED: %s" % err)
             return 2

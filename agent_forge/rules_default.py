@@ -68,6 +68,29 @@ Issues:
     don't need it: the Merger holds a blocked one and takes it up
     itself. What the named items are now is the `blockers` lookup.
 
+With `router.idle_offer` in the configuration, a run also sweeps for
+agents with nothing to do (off without it):
+
+15. an agent the relay's directory shows idle (status `idle`, every
+    entry of its session name, for at least `idle_minutes`, default 10),
+    with no turn from rules 1-14, which owns an actionable issue: the
+    agent's, offered the oldest such issue by creation. An issue is
+    actionable when it is labelled `Owner:<Name>`, is waiting neither
+    on the owner nor on someone outside, every item its `Blocked-by:`
+    lines name is closed or merged (a number naming nothing is left
+    out, as for rule 14), and no open pull request by the agent
+    references it (a closing reference, `#N` or its URL in the body).
+    The event is when the idle period began, and it is about no item,
+    so it is offered once per idle period, never reminded, and the
+    next idle period offers again;
+16. an idle developer (not a reviewer) with no such turn and nothing
+    actionable: `idle_offer.report_to`'s, so whoever plans the work
+    knows, once per idle period. Not for `report_to` itself, and not
+    without `report_to`.
+
+A directory that couldn't be read, or isn't complete, makes nobody
+idle: unknown is never idle.
+
 **Who wrote something is read from its login**, never its text (but
 for rule 10's exception): an App's bot login (`<slug>[bot]`) maps to
 its name through the configuration, the Merger's under `machinery`,
@@ -89,10 +112,11 @@ Each rule is written as `route_pr` or `route_issue` returning the dict
 `Decision`.
 """
 
+import datetime
 import fnmatch
 import re
 
-from agent_forge.router import Decision, Lookup
+from agent_forge.router import ONCE, Decision, Lookup
 
 # The Merger's hand-back names the head it judged, in both its forms.
 HAND_BACK_RE = re.compile(r"^Not merging ([0-9a-f]{7,40}):", re.MULTILINE)
@@ -109,10 +133,16 @@ WAITING_OWNER = "Status:waiting-owner"
 WAITING_EXTERNAL = "Status:waiting-external"
 OWNER_PREFIX = "Owner:"
 STATUS_CONTEXT = "vm/build-and-test"
+# `router.idle_offer`, with its defaults filled in, or None: off.
+IDLE_OFFER = None
+DEFAULT_IDLE_MINUTES = 10
+# The engine reads the relay's directory only for the idle offer.
+wants_directory = False
 
 # What the rules read of each open item, besides its number.
 graphql = {
-    "PullRequest": """isDraft headRefOid author { login }
+    "PullRequest": """isDraft headRefOid author { login } body
+        closingIssuesReferences(first:20) { nodes { number } }
         labels(first:30) { nodes { name } }
         files(first:100) { nodes { path additions deletions } }
         reviews(last:100) {
@@ -130,7 +160,7 @@ graphql = {
             status { contexts { context state createdAt
                                 creator { login } } } } }
         }""",
-    "Issue": """author { login } body createdAt lastEditedAt
+    "Issue": """title author { login } body createdAt lastEditedAt
         labels(first:30) { nodes { name } }
         comments(last:100) {
           nodes { databaseId author { login } createdAt body }
@@ -144,7 +174,7 @@ def configure(project, merger_tool):
     """Set the rules' settings from `project`. `merger_tool`, already
     configured for it, is bin/forge-merger."""
     global merger, MERGER, OWNER, WAITING_OWNER, WAITING_EXTERNAL
-    global OWNER_PREFIX, STATUS_CONTEXT
+    global OWNER_PREFIX, STATUS_CONTEXT, IDLE_OFFER, wants_directory
     merger = merger_tool
     labels = project.section("labels")
     MERGER = merger.ACT_AS
@@ -154,6 +184,11 @@ def configure(project, merger_tool):
                                   "Status:waiting-external")
     OWNER_PREFIX = labels.get("owner_prefix", "Owner:")
     STATUS_CONTEXT = merger.STATUS_CONTEXT
+    offer = project.section("router").get("idle_offer")
+    IDLE_OFFER = None if offer is None else {
+        "idle_minutes": offer.get("idle_minutes", DEFAULT_IDLE_MINUTES),
+        "report_to": offer.get("report_to")}
+    wants_directory = IDLE_OFFER is not None
 
 
 # --- who is who -------------------------------------------------------------
@@ -497,8 +532,12 @@ recheck = decide
 
 
 def sweep(ctx):
-    """The default rules decide nothing that isn't one item's."""
-    return []
+    """Rules 15 and 16, the idle offer, when it is configured; nothing
+    on a run started by an event (`ctx.only`), whose items are all it
+    may decide about."""
+    if IDLE_OFFER is None or ctx.only is not None:
+        return []
+    return idle_offers(ctx)
 
 
 def author(node, ctx):
@@ -511,6 +550,169 @@ def summary(ctx):
     """The run's tally of issues waiting on the owner."""
     waiting = sum(1 for i in ctx.issues if WAITING_OWNER in labels_of(i))
     return "%d waiting on %s" % (waiting, OWNER)
+
+
+# --- the idle offer (rules 15 and 16) -----------------------------------------
+
+
+def parse_stamp(stamp):
+    """A directory time ("2026-10-10T14:10:00Z") as an aware datetime,
+    or None."""
+    try:
+        return datetime.datetime.strptime(
+            stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def idle_agents(ctx):
+    """{agent: when its idle period began (the directory's string)} for
+    each agent the directory shows idle for at least `idle_minutes`. An
+    agent is matched by its session name; one listed more than once is
+    idle only when every entry is, since the latest of them. Nobody is
+    idle when the directory is unknown."""
+    listing = ctx.directory
+    if not isinstance(listing, dict) or listing.get("complete") is not True \
+            or not isinstance(listing.get("agents"), list):
+        return {}
+    sessions = {ctx.roster.session_name(a): a for a in ctx.roster.agents}
+    seen = {}
+    for entry in listing["agents"]:
+        if not isinstance(entry, dict):
+            continue
+        agent = sessions.get(entry.get("name"))
+        if agent is None:
+            continue
+        since = parse_stamp(entry.get("idle_since")) \
+            if entry.get("status") == "idle" else None
+        seen.setdefault(agent, []).append((since, entry.get("idle_since")))
+    cutoff = ctx.when - datetime.timedelta(minutes=IDLE_OFFER["idle_minutes"])
+    idle = {}
+    for agent, entries in seen.items():
+        if any(since is None for since, _ in entries):
+            continue
+        since, stamp = max(entries)
+        if since <= cutoff:
+            idle[agent] = stamp
+    return idle
+
+
+# A pull request body's reference to an issue: `#N`, or its URL.
+REFERENCE_RE = re.compile(
+    r"(?<![\w/&])#(\d+)\b|/issues/(\d+)\b")
+
+
+def referenced_by(pr):
+    """The issue numbers a pull request references: GitHub's closing
+    references, and every `#N` or issue URL in its body."""
+    refs = pr.get("closingIssuesReferences") or {}
+    nodes = refs.get("nodes") if isinstance(refs, dict) else refs
+    numbers = {n.get("number") for n in nodes or [] if isinstance(n, dict)}
+    for m in REFERENCE_RE.finditer(pr.get("body") or ""):
+        numbers.add(int(m.group(1) or m.group(2)))
+    return numbers
+
+
+def blocked(issue):
+    """Whether an item an issue's `Blocked-by:` lines name is still open,
+    or what they name is unknown. A number naming nothing is left out,
+    as rule 14 leaves it out."""
+    named = merger.blockers_of(issue)
+    if not named:
+        return False
+    known = issue.get("blockedBy")
+    if not isinstance(known, dict):
+        return True
+    return any((known.get(b) or {}).get("state") == "OPEN" for b in named)
+
+
+def owned_issues(agent, ctx):
+    """(actionable, blocked, waiting): the agent's issues (`Owner:<Name>`)
+    that it can act on, oldest first, and how many it can't, because
+    something they name is open, or they wait on someone, or its own
+    open pull request already references them."""
+    mine = ctx.roster.login_of(agent)
+    in_hand = set()
+    for pr in ctx.prs:
+        if author_of(pr) == mine:
+            in_hand |= referenced_by(pr)
+    actionable, held, waiting = [], 0, 0
+    for issue in ctx.issues:
+        if owner_of(issue) != agent:
+            continue
+        labels = labels_of(issue)
+        if WAITING_OWNER in labels or WAITING_EXTERNAL in labels:
+            waiting += 1
+        elif blocked(issue):
+            held += 1
+        elif issue["number"] not in in_hand:
+            actionable.append(issue)
+    actionable.sort(key=lambda i: (i.get("createdAt") or "", i["number"]))
+    return actionable, held, waiting
+
+
+def has_turn(agent, ctx):
+    """Whether rules 1-14 make any open item the agent's turn."""
+    for item in ctx.prs + ctx.issues:
+        route = route_pr if item.get("__typename") == "PullRequest" \
+            else route_issue
+        if route(item, ctx.roster)["who"] == agent:
+            return True
+    return False
+
+
+def since_text(stamp, when):
+    """When an idle period began, for a message: "14:10Z" today, else
+    with its date."""
+    since = parse_stamp(stamp)
+    if since.date() == when.date():
+        return since.strftime("%H:%MZ")
+    return since.strftime("%Y-%m-%d %H:%MZ")
+
+
+def counted(n, one, many):
+    return "%d %s" % (n, one if n == 1 else many)
+
+
+def idle_offers(ctx):
+    """Rules 15 and 16: an offer to each idle agent with an actionable
+    issue and no turn, and a report to `report_to` of each idle
+    developer with none."""
+    report_to = IDLE_OFFER["report_to"]
+    decisions = []
+    for agent, stamp in sorted(idle_agents(ctx).items()):
+        if not ctx.roster.is_agent(agent) or has_turn(agent, ctx):
+            continue
+        actionable, held, waiting = owned_issues(agent, ctx)
+        if actionable:
+            issue = actionable[0]
+            title = (issue.get("title") or "").strip()
+            decisions.append(Decision(
+                None, agent, 15, stamp,
+                "#%d%s is yours and nothing blocks it: start it, or say on "
+                "the issue why not (a %s or %s label, or a Blocked-by: "
+                "line). You have been idle since %s." % (
+                    issue["number"], ' "%s"' % title if title else "",
+                    WAITING_OWNER, WAITING_EXTERNAL,
+                    since_text(stamp, ctx.when)),
+                reminder=ONCE))
+            continue
+        if not report_to or agent == report_to or \
+                ctx.roster.project.kind(agent) == "reviewer":
+            continue
+        mine = ctx.roster.login_of(agent)
+        prs = sum(1 for pr in ctx.prs if author_of(pr) == mine)
+        why = ", ".join(part for n, part in (
+            (prs, counted(prs, "open pull request", "open pull requests")),
+            (held, counted(held, "issue blocked", "issues blocked")),
+            (waiting, counted(waiting, "issue waiting", "issues waiting")))
+            if n) or "no open issues of its own"
+        decisions.append(Decision(
+            None, report_to, 16, "%s %s" % (agent, stamp),
+            "%s has been idle since %s with nothing it can act on (%s)." % (
+                agent, since_text(stamp, ctx.when), why),
+            reminder=ONCE))
+    return decisions
 
 
 # --- lookups ----------------------------------------------------------------
