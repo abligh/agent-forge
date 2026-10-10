@@ -1560,13 +1560,37 @@ class NextAhead(unittest.TestCase):
         self.assertEqual(pc.next_ahead(state, self.AHEAD, when=T0),
                          (SHA_Q, 3))
 
-    def test_an_entry_whose_tree_has_a_verdict_is_skipped(self):
-        # Red or green: either way it would not be run again.
-        for ok in (True, False):
-            state = empty()
-            state["results"][SHA_A] = verdict(pr=9, ok=ok)
-            self.assertEqual(pc.next_ahead(state, self.AHEAD, when=T0),
-                             (SHA_Q, 3), ok)
+    def test_an_entry_whose_tree_is_green_is_skipped(self):
+        state = empty()
+        state["results"][SHA_A] = verdict(pr=9)
+        self.assertEqual(pc.next_ahead(state, self.AHEAD, when=T0),
+                         (SHA_Q, 3))
+
+    def test_nothing_after_an_entry_whose_tree_is_red(self):
+        # Every later prediction contains it: red too, a wasted run.
+        state = empty()
+        state["results"][SHA_A] = verdict(pr=9, ok=False)
+        self.assertIsNone(pc.next_ahead(state, self.AHEAD, when=T0))
+
+    def test_a_red_heads_tree_stops_the_list_too(self):
+        ahead = [entry(2, SHA_P, TREE_1, same_as_head=True)] + self.AHEAD[1:]
+        state = empty()
+        state["results"][SHA_A] = verdict(pr=2, ok=False)
+        self.assertIsNone(pc.next_ahead(state, ahead, when=T0))
+
+    def test_a_red_tree_green_since_does_not_stop_the_list(self):
+        # A flake: the tree is green after all.
+        state = empty()
+        state["results"][SHA_A] = verdict(pr=9, ok=False)
+        state["results"][SHA_B] = verdict(pr=9)
+        self.assertEqual(pc.next_ahead(state, self.AHEAD, when=T0),
+                         (SHA_Q, 3))
+
+    def test_another_hosts_red_does_not_stop_the_list(self):
+        state = empty()
+        state["results"][SHA_A] = verdict(pr=9, ok=False, host="elsewhere")
+        self.assertEqual(pc.next_ahead(state, self.AHEAD, when=T0),
+                         (SHA_P, 2))
 
     def test_another_hosts_verdict_does_not_count(self):
         state = empty()

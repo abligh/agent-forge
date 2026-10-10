@@ -92,6 +92,9 @@ requests in its queue will have once the ones in front of it merge
    `STARTED-AHEAD`;
 3. every other waiting head, oldest first.
 
+Nothing after an entry whose tree is red here is started: every later
+prediction contains that pull request, so it would only be red too.
+
 An entry is checked out from the object store its worktree shares with
 the Merger's checkout, so nothing is fetched and nothing is pushed; the
 Merger and this tool must therefore use the same checkout (`repo` in
@@ -612,16 +615,23 @@ def next_ahead(state, ahead, busy=(), when=None):
     """(sha, pr) of the first of the Merger's predictions, `ahead`, that
     is worth a run, or None: not running in a slot (`busy`) or started
     less than START_GRACE before `when`, not given up on, not the head's
-    own tree, and with no verdict of its own or on its tree."""
+    own tree, and with no verdict of its own or on its tree. Nothing
+    after an entry whose tree is red here (and not green too, as after a
+    flake): each later prediction contains it, so it would be red too,
+    and the Merger drops that pull request from the list on its next
+    tick anyway."""
     started = state.get("ahead_started", {})
+    when = when or now_utc()
     for entry in ahead:
         sha = entry["sha"]
+        if tested(state, entry["tree"], when, ok=False) is not None \
+                and tested(state, entry["tree"], when, ok=True) is None:
+            return None
         if (entry.get("same_as_head") or sha in busy
                 or sha in state["results"]
                 or just_started({"started": started.get(sha)}, when)
                 or state.get("ahead_errors", {}).get(sha, 0) >= MAX_ERRORS
-                or tested(state, entry["tree"], when or now_utc())
-                is not None):
+                or tested(state, entry["tree"], when) is not None):
             continue
         return sha, entry["pr"]
     return None
