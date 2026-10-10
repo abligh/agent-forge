@@ -11,10 +11,12 @@ import datetime
 import json
 import os
 import pathlib
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -544,6 +546,64 @@ class Tick(StateCase):
         self.assertEqual(self.lines, ["RUNNING #7 aaaaaaaaaa since %s; "
                                       "1 waiting" % pc.iso(T0)])
 
+    def test_a_run_of_a_superseded_head_is_stopped(self):
+        # #7 was pushed to (SHA_A -> SHA_C) while its old head ran.
+        self.write_state({"waiting": {SHA_B: {
+            "pr": 8, "since": pc.iso(T0 - datetime.timedelta(hours=1))}}})
+        self.hold(1, "#7 %s %s pid=4242" % (SHA_A, pc.iso(T0)))
+        stopped = []
+        run = FakeRun((is_pulls, done([], 0, heads_tsv(
+            (7, SHA_C, REPO, "false"), (8, SHA_B, REPO, "false")))))
+        self.spawned = []
+        pc.tick(self.state_dir, "tok", run,
+                lambda *a: self.spawned.append(a), self.lines.append,
+                when=T0, slots=1, stop=lambda pid: stopped.append(pid) or True)
+        self.assertEqual(stopped, [4242])
+        self.assertEqual(self.spawned, [])
+        line = ("%s SUPERSEDED #7 aaaaaaaaaa: no longer the head of any "
+                "open pull request; stopping the run in slot 1 (pid 4242), "
+                "since %s" % (pc.iso(T0), pc.iso(T0)))
+        self.assertEqual(self.lines, [line])
+        self.assertIn(line, pathlib.Path(self.state_dir,
+                                         "verdicts.log").read_text())
+
+    def test_a_superseded_run_frees_nothing_until_it_exits(self):
+        # The slot is still held, so the other slot starts the next head;
+        # the stopped worker's chain starts the new one.
+        self.write_state({"waiting": {SHA_B: {
+            "pr": 8, "since": pc.iso(T0 - datetime.timedelta(hours=1))}}})
+        self.hold(1, "#7 %s %s pid=4242" % (SHA_A, pc.iso(T0)))
+        run = FakeRun((is_pulls, done([], 0, heads_tsv(
+            (8, SHA_B, REPO, "false")))))
+        self.spawned = []
+        pc.tick(self.state_dir, "tok", run,
+                lambda *a: self.spawned.append(a), self.lines.append,
+                when=T0, slots=2, stop=lambda pid: True)
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_B, 8, False, 2)])
+        self.assertIn(" SUPERSEDED #7 ", self.lines[0])
+
+    def test_a_run_that_cannot_be_signalled_says_so(self):
+        self.hold(1, "#7 %s %s pid=4242" % (SHA_A, pc.iso(T0)))
+        run = FakeRun((is_pulls, done([], 0, "")))
+        pc.tick(self.state_dir, "tok", run, lambda *a: None,
+                self.lines.append, when=T0, slots=1, stop=lambda pid: False)
+        self.assertIn("could not stop the run in slot 1 (pid 4242)",
+                      self.lines[0])
+
+    def test_current_heads_predictions_and_old_lines_are_not_stopped(self):
+        self.hold(1, "#7 %s %s pid=1" % (SHA_A, pc.iso(T0)))
+        self.hold(2, "#8 %s %s pid=2 ahead" % (SHA_C, pc.iso(T0)))
+        self.hold(3, "#9 %s %s" % (SHA_B, pc.iso(T0)))
+        stopped = []
+        run = FakeRun((is_pulls, done([], 0, heads_tsv(
+            (7, SHA_A, REPO, "false")))))
+        pc.tick(self.state_dir, "tok", run, lambda *a: None,
+                self.lines.append, when=T0, slots=3,
+                stop=lambda pid: stopped.append(pid) or True)
+        self.assertEqual(stopped, [])
+        self.assertEqual([l.split()[0] for l in self.lines],
+                         ["RUNNING"] * 3)
+
     def test_a_second_slot_starts_the_next_head(self):
         self.write_state({"waiting": {
             SHA_A: {"pr": 7, "since": pc.iso(T0 - datetime.timedelta(hours=2))},
@@ -1021,7 +1081,8 @@ class Worker(StateCase):
                if k != "CARGO_TARGET_DIR"}
         with mock.patch.dict(os.environ, env, clear=True):
             self.work(run, slot=2)
-        self.assertEqual(seen, [("", "#7 %s %s" % (SHA_A, pc.iso(T0)))])
+        self.assertEqual(seen, [("", "#7 %s %s pid=%d"
+                                 % (SHA_A, pc.iso(T0), os.getpid()))])
         test, = [c for c in run.calls if c["args"] == ["make", "test"]]
         self.assertEqual(test["cwd"], os.path.join(self.state_dir, "wt-2"))
         self.assertEqual(test["env"]["CARGO_TARGET_DIR"],
@@ -1037,7 +1098,8 @@ class Worker(StateCase):
         run = self.run_for()
         run.rules.insert(0, (lambda a: a[0] == "make", peek))
         self.work(run)
-        self.assertEqual(seen, ["#7 %s %s" % (SHA_A, pc.iso(T0))])
+        self.assertEqual(seen, ["#7 %s %s pid=%d"
+                                % (SHA_A, pc.iso(T0), os.getpid())])
         self.assertIsNone(pc.running(self.state_dir))
 
     def test_the_lock_goes_even_when_a_step_raises(self):
@@ -1080,6 +1142,50 @@ class Worker(StateCase):
         self.assertFalse([c for c in run.calls
                           if c["args"][0] == "systemd-run"])
 
+    def test_sigterm_stops_the_run_frees_the_slot_and_chains(self):
+        self.queue()
+        self.addCleanup(signal.signal, signal.SIGTERM,
+                        signal.getsignal(signal.SIGTERM))
+        held = []
+
+        def superseded(args):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return done(args)
+        run = self.run_for()
+        run.rules.insert(0, (lambda a: a == ["make", "test"], superseded))
+        chain = lambda: held.append(pc.running(self.state_dir)) or [
+            "run", "forge-pr-check", "--post"]
+        self.assertEqual(self.work(run, chain=chain), 3)
+        state = self.state()
+        self.assertEqual((state["waiting"], state["results"]), ({}, {}))
+        self.assertFalse([c for c in run.calls
+                          if c["args"] == ["make", "doc-check"]])
+        self.assertIn("STOPPED #7 aaaaaaaaaa after 600s: superseded; "
+                      "no verdict", pathlib.Path(
+                          self.state_dir, "verdicts.log").read_text())
+        self.assertEqual(held, [None])
+        self.assertEqual(self.lines[-1], "CHAINED forge-pr-check --post")
+
+    def test_the_sigterm_handler_is_restored_afterwards(self):
+        self.queue()
+        before = signal.getsignal(signal.SIGTERM)
+        self.work(self.run_for())
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+
+    def test_nothing_is_posted_for_a_stopped_run(self):
+        self.queue()
+        self.addCleanup(signal.signal, signal.SIGTERM,
+                        signal.getsignal(signal.SIGTERM))
+        posts = []
+
+        def superseded(args):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return done(args)
+        run = self.run_for()
+        run.rules.insert(0, (lambda a: a == ["make", "test"], superseded))
+        self.work(run, post=lambda *a: posts.append(a) or True)
+        self.assertEqual([p[1] for p in posts], ["pending"])
+
     def test_a_failing_chain_is_reported_not_raised(self):
         self.queue()
 
@@ -1087,6 +1193,55 @@ class Worker(StateCase):
             raise OSError("no fork")
         self.assertEqual(self.work(self.run_for(), chain=chain), 0)
         self.assertEqual(self.lines[-1], "CHAIN-FAILED: OSError: no fork")
+
+
+class HolderFields(unittest.TestCase):
+
+    def test_a_line_naming_its_process(self):
+        self.assertEqual(
+            pc.holder_fields("#7 %s 2026-10-09T12:00:00Z pid=99" % SHA_A),
+            (7, SHA_A, "2026-10-09T12:00:00Z", 99, False))
+
+    def test_a_prediction(self):
+        self.assertEqual(
+            pc.holder_fields("#7 %s 2026-10-09T12:00:00Z pid=99 ahead"
+                             % SHA_A)[3:], (99, True))
+
+    def test_a_line_from_before_pids(self):
+        self.assertEqual(pc.holder_fields("#7 %s T" % SHA_A),
+                         (7, SHA_A, "T", None, False))
+
+    def test_lines_that_name_no_check(self):
+        for line in (None, "", "someone", "#x %s T" % SHA_A, "#7 %s" % SHA_A):
+            self.assertIsNone(pc.holder_fields(line), line)
+
+
+class StopWorker(unittest.TestCase):
+    """Real processes: a group leader and its child both get SIGTERM."""
+
+    def test_the_whole_group_is_stopped(self):
+        leader = subprocess.Popen(
+            ["sh", "-c", "sleep 30 & echo $!; wait"], start_new_session=True,
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(leader.stdout.close)
+        self.addCleanup(leader.wait)
+        child = int(leader.stdout.readline())
+        self.assertTrue(pc.stop_worker(leader.pid))
+        self.assertEqual(leader.wait(timeout=10), -signal.SIGTERM)
+        for _ in range(100):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            # The orphaned child is reaped by init; give it a moment.
+            time.sleep(0.05)
+        else:
+            self.fail("the step under the worker was not stopped")
+
+    def test_a_gone_process_is_false(self):
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        self.assertFalse(pc.stop_worker(gone.pid))
 
 
 class StartNextTick(unittest.TestCase):

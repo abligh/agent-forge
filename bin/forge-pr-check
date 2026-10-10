@@ -25,7 +25,8 @@ either.
 **`checks.slots` checks at a time** (default 2; `$FORGE_PR_CHECK_SLOTS`
 overrides it). A worker holds its slot's lock in the state directory
 while it runs, `worker.lock` for slot 1 and `worker-N.lock` for slot N;
-its one line names the pull request, head and start. Each slot has its
+its one line names the pull request, head, start and process (`#7
+<sha> <start> pid=<pid>`, then ` ahead` for a prediction). Each slot has its
 own worktree (`wt`, `wt-N`) and its own build caches (`checks.caches`,
 below), so two checks never share a checkout or wait on each other's
 cache lock. A tick starts the oldest waiting head that no slot is
@@ -38,6 +39,17 @@ Drafts are not checked. A head whose worktree can't be prepared goes
 behind every other, and after MAX_ERRORS failures it is given up on,
 so one unfetchable ref can't hold the queue. A head that moved before
 its check started is dropped; the new head is queued in its place.
+
+**A run of a head that is no longer its pull request's is stopped.**
+When a tick finds a slot running a head that no open pull request has
+any more (a new push, an update from `main`, or a closed pull request),
+it sends SIGTERM to that worker's process group, which its steps are
+in, and logs `SUPERSEDED`. The worker logs `STOPPED`, drops the head
+from the queue, records no verdict and posts nothing, frees its slot
+and chains the next tick, which starts the new head. Otherwise every
+push to a pull request being checked kept a slot busy for a whole run
+of a commit nobody would merge. A prediction (`ahead`) is never
+stopped this way: it is no pull request's head to begin with.
 
 **A head just started isn't started again.** Until its worker has
 taken its slot's lock and said who it is, nothing else shows the head
@@ -191,6 +203,7 @@ import datetime
 import hashlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -379,6 +392,44 @@ def running(state_dir, slot=1):
     """The slot's lock holder line while someone holds it ("" if it
     hasn't said who), or None when it is free."""
     return locks.holder(lock_path(state_dir, slot))
+
+
+def holder_fields(line):
+    """(pr, sha, started, pid, ahead) from a worker's lock line, or None
+    for a line that doesn't name a check. pid is None in a line from
+    before lock lines named it."""
+    parts = (line or "").split()
+    if len(parts) < 3 or not parts[0].startswith("#") \
+            or not parts[0][1:].isdigit():
+        return None
+    pid = None
+    for part in parts[3:]:
+        if part.startswith("pid=") and part[4:].isdigit():
+            pid = int(part[4:])
+    return int(parts[0][1:]), parts[1], parts[2], pid, "ahead" in parts[3:]
+
+
+def stop_worker(pid):
+    """SIGTERM to worker pid's process group, which it leads when it was
+    started by a tick (its steps are in it too), else to pid alone.
+    Whether a signal was sent."""
+    try:
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    return True
+
+
+class Stopped(BaseException):
+    """SIGTERM reached a worker: a tick found its head superseded. A
+    BaseException, so no `except Exception` on the way swallows it."""
+
+
+def _stopped(signum, frame):
+    raise Stopped()
 
 
 def mint(run=sh):
@@ -673,7 +724,8 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
 
 
 def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
-         post=None, slots=None, checkout=None, merger_dir=None):
+         post=None, slots=None, checkout=None, merger_dir=None,
+         stop=stop_worker):
     """Queue the open heads and start the next one in a free slot. With
     `merger_dir` (only with MERGER_FIRST), the Merger's pull request goes
     first; with TEST_AHEAD too, its predictions come next (see the
@@ -693,15 +745,23 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         queued = set(state["waiting"])
     slots = slots or slots_from_env()
     holders = {slot: running(state_dir, slot) for slot in range(1, slots + 1)}
-    busy = {h.split()[1] for h in holders.values()
-            if h and len(h.split()) == 3 and h.startswith("#")}
+    fields = {slot: holder_fields(h) for slot, h in holders.items()}
+    busy = {f[1] for f in fields.values() if f}
+    current = {sha for _, sha, _, _ in heads}
     for slot, holder in holders.items():
         if holder is None:
             continue
-        parts = holder.split()
-        if len(parts) == 3 and parts[0].startswith("#"):
-            out("RUNNING %s %s since %s; %d waiting"
-                % (parts[0], parts[1][:10], parts[2], len(queued - busy)))
+        got = fields[slot]
+        if got and not got[4] and got[1] not in current and got[3]:
+            pr, sha, since, pid, _ = got
+            sent = stop(pid)
+            log(state_dir, "SUPERSEDED #%d %s: no longer the head of any "
+                "open pull request; %s the run in %s (pid %d), since %s"
+                % (pr, sha[:10], "stopping" if sent else "could not stop",
+                   "slot %d" % slot, pid, since), when, out)
+        elif got:
+            out("RUNNING #%d %s since %s; %d waiting"
+                % (got[0], got[1][:10], got[2], len(queued - busy)))
         else:
             out("BUSY: %s is held; %d waiting"
                 % ("the worker lock" if slot == 1
@@ -962,11 +1022,16 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     os.makedirs(state_dir, exist_ok=True)
     started = clock()
     held = try_lock(lock_path(state_dir, slot),
-                    "#%d %s %s" % (pr, sha, iso(started)))
+                    "#%d %s %s pid=%d%s" % (pr, sha, iso(started),
+                                            os.getpid(),
+                                            " ahead" if ahead else ""))
     if held is None:
         out("BUSY: another check holds the worker lock"
             + ("" if slot == 1 else " for slot %d" % slot))
         return 0
+    # A tick that finds this head superseded stops it (see the module
+    # docstring); signal handlers can only be set in the main thread.
+    previous = signal.signal(signal.SIGTERM, _stopped)
     # Whether this head stopped waiting: checked, moved or given up on.
     # Only then is the next tick started, since a chained tick would at
     # once pick a head that is still waiting.
@@ -1069,7 +1134,21 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                     state["results"][sha]["posted"] = posted
                     save(state_dir, state)
         return 0 if ok else 1
+    except Stopped:
+        with state_lock(state_dir):
+            state = load(state_dir)
+            state["waiting"].pop(sha, None)
+            save(state_dir, state)
+        stopped = clock()
+        log(state_dir, "STOPPED #%d %s after %ds: superseded; no verdict"
+            % (pr, sha[:10], (stopped - started).total_seconds()),
+            stopped, out)
+        settled = True
+        return 3
     finally:
+        # A second SIGTERM must not cut the chain short. A handler, not
+        # SIG_IGN, which the chained tick would inherit.
+        signal.signal(signal.SIGTERM, lambda signum, frame: None)
         held.close()
         # After the lock is free, so the started tick can take it.
         if chain is not None and settled:
@@ -1079,6 +1158,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 # The verdict is recorded; cron's next tick starts what
                 # this could not.
                 out("CHAIN-FAILED: %s: %s" % (type(err).__name__, err))
+        signal.signal(signal.SIGTERM, previous)
 
 
 def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
