@@ -24,6 +24,16 @@ With `$FORGE_CRON_APP` set the job acts as that App: its token is
 minted into GH_TOKEN, and a mint that fails stops the job rather than
 falling back to the host's login.
 
+**It runs only the pinned agent-forge.** When the checkout has
+`.agent-forge/pin` (a full commit SHA of agent-forge, then anything,
+such as the tag, for readers), this installation's `HEAD` must be that
+commit, or nothing runs: `PIN-MISMATCH`, exit 2. The pin is read after
+the sync, so it is the reviewed default branch's. A host left at the
+old commit after a pin bump, or moved ahead of one, stops rather than
+runs code the project didn't approve. Without the file nothing is
+checked. The receiver's ticks run through here, so they are held to
+the pin too.
+
 **Locks.** Two kinds, taken in this order so no two jobs can each hold
 what the other waits for:
 
@@ -49,8 +59,8 @@ repository is retried once after `$FORGE_CRON_FETCH_RETRY_S` (default
 
 Exit: the tool's own status, unchanged, so a tool's "cannot check" (2)
 never turns into "found something" (1) a layer up; or 2 when the tool
-did not run: no checkout, a failed sync, no such tool, no lock in time,
-or no App token.
+did not run: no checkout, a failed sync, an installation not at the
+pin, no such tool, no lock in time, or no App token.
 """
 import datetime
 import fcntl
@@ -61,7 +71,8 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))
+INSTALL = os.path.dirname(HERE)
+sys.path.insert(0, INSTALL)
 from agent_forge import config, github  # noqa: E402
 
 
@@ -164,8 +175,38 @@ def default_mint(repo, app):
                         app)
 
 
+PIN_NAME = os.path.join(config.CONFIG_DIR, "pin")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def check_pin(repo, install):
+    """Raise Stop unless `install` is at the commit `repo`'s pin names;
+    nothing to check when it has no pin."""
+    path = os.path.join(repo, PIN_NAME)
+    try:
+        with open(path) as handle:
+            words = handle.read().split()
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        raise Stop("BAD-PIN: can't read %s: %s" % (PIN_NAME, e.strerror))
+    pin = words[0].lower() if words else ""
+    if not SHA_RE.match(pin):
+        raise Stop("BAD-PIN: %s must start with a full 40-character commit "
+                   "SHA" % PIN_NAME)
+    got = git(install, "rev-parse", "HEAD")
+    head = got.stdout.strip().lower() if got.returncode == 0 else ""
+    if not head:
+        raise Stop("PIN-MISMATCH: %s isn't a git checkout, so its commit "
+                   "can't be held to the pin %s" % (install, pin[:12]))
+    if head != pin:
+        raise Stop("PIN-MISMATCH: agent-forge here is at %s, and %s pins %s;"
+                   " nothing runs until the installation is at the pin"
+                   % (head[:12], PIN_NAME, pin[:12]))
+
+
 def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
-         nap=time.sleep, err=None):
+         nap=time.sleep, err=None, install=INSTALL):
     argv = sys.argv[1:] if argv is None else argv
     environ = os.environ if environ is None else environ
     err = err or (lambda line: print(line, file=sys.stderr))
@@ -246,6 +287,7 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
                     return give_up("another job held the checkout's lock")
             write("at %s" % git(repo, "rev-parse", "--short",
                                 "HEAD").stdout.strip())
+            check_pin(repo, install)
             path = tool_path(repo, tool)
             app = environ.get("FORGE_CRON_APP")
             if app:

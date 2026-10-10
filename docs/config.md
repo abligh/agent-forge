@@ -113,6 +113,18 @@ an issue already open for a person to close.
 Only these keys are checked; the section may hold others, for tools
 not here yet.
 
+## The pin
+
+`.agent-forge/pin`, beside the configuration, holds the agent-forge
+commit the project approved: a full 40-character SHA, then anything
+(such as the tag) for readers. When it exists, `forge-cron-run` reads
+it from the synced cron checkout and refuses to run any tool, saying
+`PIN-MISMATCH` and exiting 2, unless the installation it runs from is
+at that commit. The receiver's ticks run through `forge-cron-run`, so
+they are held to it too. A project that wants a pin bump reviewed as
+carefully as a change of who may approve should give the file the same
+code owner as the configuration.
+
 ## Where state lives
 
 Each tool keeps its state in

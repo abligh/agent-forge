@@ -117,6 +117,61 @@ class CronRun(unittest.TestCase):
         self.assertEqual(self.run_tool("forge-config", "get", "repo"), 0)
         self.assertIn("example/widget\n", self.log("forge-config"))
 
+    def install_at(self):
+        """A stand-in installation: a git repository with one commit."""
+        install = os.path.join(self.r.dir, "install")
+        self.r.git(self.r.dir, "init", "-q", install)
+        self.r.git(install, "-c", "user.name=t", "-c", "user.email=t@t",
+                   "commit", "-q", "--allow-empty", "-m", "v0")
+        return install, self.r.git(install, "rev-parse",
+                                   "HEAD").stdout.strip()
+
+    def pin(self, text):
+        with open(os.path.join(self.work, ".agent-forge", "pin"), "w") as h:
+            h.write(text)
+        self.push("pin")
+
+    def run_installed(self, install):
+        return tool.main(["report"], self.env, lambda repo, app: "x",
+                         err=self.err.append, install=install)
+
+    def test_an_installation_at_the_pin_runs(self):
+        install, sha = self.install_at()
+        self.pin("%s v0.1.0\n" % sha.upper())
+        self.assertEqual(self.run_installed(install), 0)
+        self.assertIn("cwd=", self.log())
+
+    def test_an_installation_not_at_the_pin_runs_nothing(self):
+        install, sha = self.install_at()
+        self.pin("%s v0.1.0\n" % ("0" * 40))
+        self.assertEqual(self.run_installed(install), 2)
+        log = self.log()
+        self.assertIn("PIN-MISMATCH: agent-forge here is at %s" % sha[:12], log)
+        self.assertNotIn("cwd=", log)
+
+    def test_the_pin_is_the_reviewed_branchs(self):
+        install, sha = self.install_at()
+        self.pin(sha + "\n")
+        with open(os.path.join(self.cron, ".agent-forge", "pin"), "w") as h:
+            h.write("0" * 40)
+        self.assertEqual(self.run_installed(install), 0)
+
+    def test_a_pin_that_isnt_a_full_sha_runs_nothing(self):
+        install, sha = self.install_at()
+        for text in ("v0.1.0\n", sha[:12], ""):
+            self.pin(text)
+            self.assertEqual(self.run_installed(install), 2)
+            self.assertIn("BAD-PIN", self.log())
+
+    def test_a_pin_needs_an_installation_with_a_commit(self):
+        _, sha = self.install_at()
+        self.pin(sha)
+        self.assertEqual(self.run_installed(os.path.join(self.r.dir, "x")), 2)
+        self.assertIn("isn't a git checkout", self.log())
+
+    def test_no_pin_checks_nothing(self):
+        self.assertEqual(self.run_installed(os.path.join(self.r.dir, "x")), 0)
+
     def test_no_checkout_is_2_and_says_so(self):
         self.assertEqual(self.run_tool("report", env={
             "FORGE_CRON_CHECKOUT": os.path.join(self.r.dir, "none")}), 2)

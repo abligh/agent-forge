@@ -23,7 +23,8 @@ import re
 
 from agent_forge import proc
 
-CONFIG_NAME = os.path.join(".agent-forge", "config.json")
+CONFIG_DIR = ".agent-forge"
+CONFIG_NAME = os.path.join(CONFIG_DIR, "config.json")
 KINDS = ("developer", "reviewer")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")

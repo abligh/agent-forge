@@ -77,6 +77,12 @@ ln -s ~/.local/share/agent-forge/bin/forge-* ~/.local/bin/
 cd ~/my-project && forge-config check
 ```
 
+To hold a host to a version, the project commits `.agent-forge/pin`:
+the full commit SHA it approved, optionally followed by the tag.
+`forge-cron-run` then runs nothing while the installation's `HEAD` is
+any other commit ([docs/config.md](docs/config.md#the-pin)). A tag can
+be moved; a commit can't.
+
 ## Tests
 
 ```sh
