@@ -30,6 +30,66 @@ class Decisions(unittest.TestCase):
     def test_the_context_finds_items_by_number(self):
         ctx = router.Context(None, None, [{"number": 4}], [{"number": 2}])
         self.assertEqual(sorted(ctx.items), [2, 4])
+        self.assertIsNone(ctx.only)
+
+    def test_the_kinds(self):
+        self.assertEqual(router.KINDS, ("turn", "notice", "relook",
+                                        "surface"))
+
+
+class Reminders(unittest.TestCase):
+
+    def test_doubling_to_the_ceiling(self):
+        policy = router.Reminder(600, 2400)
+        self.assertEqual([policy.interval(n) for n in range(5)],
+                         [600, 1200, 2400, 2400, 2400])
+        self.assertEqual(policy.interval(10 ** 6), 2400)
+
+    def test_jitter_delays_by_at_most_its_share_and_never_less(self):
+        policy = router.Reminder(600, 2400, jitter=0.5)
+        waits = [policy.wait("key %d" % k, 0) for k in range(200)]
+        self.assertTrue(all(600 <= w < 900 for w in waits))
+        self.assertGreater(len(set(waits)), 100)
+        self.assertEqual(router.Reminder(600, 2400, jitter=0).wait("k", 1),
+                         1200)
+
+    def test_jitter_is_fixed_by_the_key_and_the_count(self):
+        policy = router.Reminder(600, 2400)
+        self.assertEqual(policy.wait("a", 0), policy.wait("a", 0))
+        self.assertNotEqual(policy.wait("a", 2), policy.wait("b", 2))
+        self.assertNotEqual(policy.wait("a", 2) - 2400,
+                            policy.wait("a", 3) - 2400)
+
+    def test_a_policy_that_makes_no_sense_is_refused(self):
+        for args in ((0, 10), (10, 5), (10, 20, -1)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                router.Reminder(*args)
+
+
+class Actions(unittest.TestCase):
+
+    class GitHub:
+        def __init__(self, answer):
+            self.answer, self.calls = answer, []
+
+        def write(self, method, path, **fields):
+            self.calls.append((method, path, fields))
+            return self.answer
+
+    def test_add_label_posts_the_label(self):
+        github = self.GitHub((True, ""))
+        action = router.AddLabel(41, "Reviewer:Bea")
+        self.assertEqual(action.run(github, "example/widget"), (True, ""))
+        self.assertEqual(github.calls, [(
+            "POST", "repos/example/widget/issues/41/labels",
+            {"labels[]": "Reviewer:Bea"})])
+        self.assertEqual(action.describe(), "add label Reviewer:Bea to #41")
+        self.assertIsInstance(action, router.Action)
+
+    def test_a_refusal_is_returned_not_raised(self):
+        self.assertEqual(router.AddLabel(4, "x").run(
+            self.GitHub((False, "HTTP 403")), "example/widget"),
+            (False, "HTTP 403"))
 
 
 class LoadRules(unittest.TestCase):

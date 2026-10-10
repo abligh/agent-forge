@@ -28,7 +28,9 @@ Pull requests:
 6. a reviewer's newest review is `APPROVED`, covers the head, and
    nothing has been said after it (by `forge-merger`'s own test):
    nobody's, it is the Merger's;
-7. green and authored by the only reviewer: nobody's, and printed;
+7. green and authored by the only reviewer: nobody's, and surfaced
+   (printed on every run, sending or not: it is a problem in the
+   configuration, not anyone's turn);
 8. green, and no reviewer has reviewed it: no reviewer's review at the
    head (or approval covering it), or an author comment after the
    newest one: the pull request's reviewer's.
@@ -310,8 +312,9 @@ def turn(number, who, rule, event, line):
             "line": "#%d %s" % (number, line)}
 
 
-def nobody(number, rule, why):
-    return {"item": number, "who": None, "rule": rule, "why": why}
+def nobody(number, rule, why, kind="turn"):
+    return {"item": number, "who": None, "rule": rule, "why": why,
+            "kind": kind}
 
 
 def route_pr(pr, roster):
@@ -384,7 +387,7 @@ def route_pr(pr, roster):
     reviewer = roster.reviewer_for(pr)
     if reviewer is None:
         return nobody(n, 7, "green, and %s's own: no second reviewer"
-                      % author)
+                      % author, kind="surface")
     # Rule 8.
     seen = [r for r in theirs if at_head(r, pr) or (
         r.get("state") == "APPROVED" and covers_head(r, pr))]
@@ -475,10 +478,10 @@ def owner_answered(n, issue, owner, comments, roster, rule):
 
 def as_decision(d):
     """A `turn` or `nobody` dict as the engine's Decision: nobody's
-    reason goes in `suppressed`."""
+    reason goes in `suppressed`, and rule 7 is a surface."""
     if d["who"] is None:
         return Decision(d["item"], None, d["rule"], None, None,
-                        suppressed=d["why"])
+                        kind=d["kind"], suppressed=d["why"])
     return Decision(d["item"], d["who"], d["rule"], d["event"], d["line"])
 
 

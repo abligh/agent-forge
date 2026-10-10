@@ -44,6 +44,24 @@ class Interface(unittest.TestCase):
             router.Decision(23, None, 9, None, None,
                             suppressed="Status:waiting-external")])
 
+    def test_rule_7_is_a_surface(self):
+        head = "5b257c8" + "0" * 33
+        pr = {"__typename": "PullRequest", "number": 9, "isDraft": False,
+              "headRefOid": head, "author": {"login": "reviewerwidgetagent"},
+              "labels": [], "files": [], "reviews": [], "comments": [],
+              "commits": {"nodes": [{"commit": {
+                  "oid": head, "parents": {"totalCount": 1}}}]},
+              "headCommit": {"nodes": [{"commit": {"oid": head, "status": {
+                  "contexts": [{"context": merger.STATUS_CONTEXT,
+                                "state": "SUCCESS", "createdAt": T1,
+                                "creator": {"login": "mergerwidgetagent"}}]}}}]}}
+        one = config.Project(dict(example(), agents={
+            "LeadDev": {}, "Reviewer": {"kind": "reviewer"}}), None)
+        ctx = router.Context(rules.Roster(one), NOW, [pr], [])
+        self.assertEqual(rules.decide(pr, ctx), [router.Decision(
+            9, None, 7, None, None, kind="surface",
+            suppressed="green, and Reviewer's own: no second reviewer")])
+
     def test_no_sweep_and_recheck_decides_again(self):
         self.assertEqual(rules.sweep(context()), [])
         self.assertIs(rules.recheck, rules.decide)

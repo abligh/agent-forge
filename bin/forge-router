@@ -18,22 +18,47 @@ asks for each item's number and what the rules declare, and each lookup
 the rules declare runs after it (the default rules' finds what each
 `Blocked-by:` line names).
 
+**What the rules decide.** For each open item, `decide` gives any
+number of decisions, and `sweep`, once a run, more: about items or
+about none (a red default branch, say). Each has a kind. A **turn** is
+the agent's to act on. A **notice** (for its information) and a
+**relook** (worth looking at again) are sent too, each in its own
+section marked not the agent's turn. A **surface** wakes nobody: it is
+printed on every run, sending or not, and journalled once (the default
+rules' rule 7, a pull request nobody can review). A decision may carry
+**actions**, such as adding a label (`router.AddLabel`): a sending run
+does them as the Merger's App before delivery, when the decision is
+due, and a dry run prints them. A failed action is printed and
+journalled, and the wake still goes out.
+
 **Who is woken.** A turn that falls to someone not in the
 configuration's `agents`, such as the owner's own pull request, is
 printed and logged once, and not sent. Nobody's turn is forgotten, and
-printed in a dry run (and, for the default rules' rule 7, always). A
-wake is addressed to the agent's session name: the entry's
-`session_name`, else `naming.session_prefix` and its name.
+printed in a dry run. A wake is addressed to the agent's session name:
+the entry's `session_name`, else `naming.session_prefix` and its name.
 
-**Once per turn.** A turn's key is (agent, the event that started it,
-as the rules say). The rule is recorded but is not part of the key:
-rules that mean the same thing can hand one turn between them, and a
-label coming off is enough to do it. `state.json` in the state
-directory records, per item, the turn last woken and when. A turn is
-woken when its key is new, and again only as a reminder once
-`relay.remind_seconds` (default 7200; `$FORGE_ROUTER_REMIND`
-overrides it) have passed. `wakes.jsonl` appends every wake sent,
-failed or withheld, with the reason.
+**Once per turn.** A turn's key is (agent, item, the event that started
+it, as the rules say); a decision about no item has "-" and its rule in
+the item's place. The rule is otherwise recorded but is not part of the
+key: rules that mean the same thing can hand one turn between them, and
+a label coming off is enough to do it. `state.json` in the state
+directory records, per item, each turn last woken, when, and how many
+reminders it has had (one turn as an object, several as a list of
+them). A turn is woken when its key is new, and again only as a
+reminder: by the decision's `router.Reminder` (a first interval,
+doubling to a ceiling, delayed by a jitter fixed by the key), or, with
+none, once `relay.remind_seconds` (default 7200;
+`$FORGE_ROUTER_REMIND` overrides it) have passed. `wakes.jsonl`
+appends every wake sent, failed, withheld or withdrawn, with the
+reason.
+
+**Check before send.** When the rules have a `recheck` of their own
+(not `decide` itself, as the default rules'), a sending run fetches
+each item it is about to wake for again, in one query, and re-decides
+it just before delivery. A wake whose item no longer has a decision for
+its agent and event is not sent, is journalled as withdrawn on
+recheck, and isn't recorded; a recheck that can't be fetched leaves its
+wakes unsent and due.
 
 **One message per agent per run**, posted verbatim (`X-XMPP-Verbatim:
 1`, `text/plain`, `X-Webhook-Token` from `relay.token_file`, default
@@ -64,7 +89,9 @@ messages it would send, sends nothing, takes no lock and leaves
 `state.json` alone. It appends each turn it would send or withhold to
 `dry-run.jsonl`, once per turn key (`dry-state.json` remembers which),
 so its decisions can be compared with what happened. `--only N[,N]`
-routes those items alone, for a run started by one event. A sending
+routes those items alone, for a run started by one event: the sweep
+is told them (`ctx.only`), and any decision about another item, or
+about none, is dropped. A sending
 run holds an exclusive `flock` on `lock` in the state directory across
 read, decide, send and write, so cron's runs and an event's runs never
 wake the same turn twice; one that can't have it
@@ -74,9 +101,11 @@ GitHub is read as the Merger's App. The state directory is
 ~/.local/state/agent-forge/<project>/router; the configuration is the
 cron checkout's (`$FORGE_CRON_CHECKOUT`).
 
-Exit 0 when the run finished; 1 when a wake was not accepted (it stays
-due); 2 when the question could not be asked (no token, GitHub failed,
-the rules couldn't be loaded).
+Exit 0 when nothing was due or all of it was delivered (and for a dry
+run, and BUSY); 1 when some was delivered and the rest stays due; 2
+when something was due and none of it was delivered, or the question
+could not be asked (no token, GitHub failed, the rules couldn't be
+loaded or decided something this can't carry out).
 """
 
 import argparse
@@ -184,6 +213,16 @@ def parse_time(stamp):
 # --- GitHub -----------------------------------------------------------------
 
 
+def prepare(node, typename):
+    """`node` as the rules see it: the `flatten` connections as lists and
+    `__typename` set."""
+    for field in RULES.flatten:
+        if isinstance(node.get(field), dict):
+            node[field] = node[field].get("nodes") or []
+    node["__typename"] = typename
+    return node
+
+
 def fetch(github):
     """(pull requests, issues): every open one, as GraphQL's nodes with
     the rules' `flatten` connections as lists and `__typename` set, then
@@ -210,11 +249,7 @@ def fetch(github):
                 continue
             page = repo[conn]
             for node in page["nodes"]:
-                for field in RULES.flatten:
-                    if isinstance(node.get(field), dict):
-                        node[field] = node[field].get("nodes") or []
-                node["__typename"] = typename
-                out.append(node)
+                out.append(prepare(node, typename))
             more[kind] = page["pageInfo"]["hasNextPage"]
             cursors[cursor] = page["pageInfo"]["endCursor"]
     for lookup in RULES.lookups:
@@ -222,10 +257,53 @@ def fetch(github):
     return prs, issues
 
 
+# The recheck's query: the numbered items alone, as they are now.
+RECHECK_QUERY = """
+query($owner:String!, $name:String!) {
+  repository(owner:$owner, name:$name) {
+%s
+  }
+}"""
+RECHECK_FIELD = """    n%(n)d: issueOrPullRequest(number:%(n)d) {
+      __typename
+      ... on PullRequest { number state %(PullRequest)s }
+      ... on Issue { number state %(Issue)s }
+    }"""
+
+
+def refetch(github, numbers):
+    """{number: node} for those of `numbers` still open, fetched afresh
+    in one query, prepared as `fetch` prepares them and with the rules'
+    lookups run over them. One closed, merged or gone is left out.
+    Raises whatever the query or a lookup raises."""
+    owner, name = REPO_SLUG.split("/")
+    fields = {"PullRequest": RULES.graphql.get("PullRequest", ""),
+              "Issue": RULES.graphql.get("Issue", "")}
+    query = RECHECK_QUERY % "\n".join(
+        RECHECK_FIELD % dict(fields, n=n) for n in numbers)
+    repo = github.api("graphql", "-f", "query=" + query, "-F",
+                      "owner=" + owner, "-F", "name=" + name
+                      )["data"]["repository"]
+    prs, issues = [], []
+    for n in numbers:
+        node = repo.get("n%d" % n)
+        if not node or node.get("state") != "OPEN":
+            continue
+        typename = node.get("__typename")
+        if typename not in ("PullRequest", "Issue"):
+            continue
+        (prs if typename == "PullRequest" else issues).append(
+            prepare(node, typename))
+    for lookup in RULES.lookups:
+        lookup.run(github, REPO_SLUG, prs, issues)
+    return {node["number"]: node for node in prs + issues}
+
+
 # --- state and wakes --------------------------------------------------------
 
 
-# What makes a turn new. The rule is recorded beside them, not compared.
+# What makes a turn new, with the item: the rule is recorded beside
+# them, not compared.
 TURN_FIELDS = ("agent", "event")
 
 
@@ -234,28 +312,126 @@ def key_of(decision):
             "event": decision.event}
 
 
+def item_key(decision):
+    """Where `state.json` keeps a decision's turns: its item's number,
+    or, for one about no item, "-" and its rule, which a module keeps
+    stable from run to run."""
+    if decision.item is None:
+        return "-%s" % (decision.rule,)
+    return str(decision.item)
+
+
+def label(decision):
+    """How the output names what a decision is about."""
+    if decision.item is None:
+        return item_key(decision)
+    return "#%d" % decision.item
+
+
+def turn_id(decision):
+    """The turn's whole key, (agent, item, event), as one string: what a
+    `Reminder`'s jitter hashes."""
+    return json.dumps([decision.agent, item_key(decision), decision.event])
+
+
 def same_turn(entry, decision):
-    """Whether `entry`, as recorded, is `decision`'s turn."""
+    """Whether `entry`, as recorded for `decision`'s item, is
+    `decision`'s turn."""
     key = key_of(decision)
-    return bool(entry) and all(entry.get(k) == key[k] for k in TURN_FIELDS)
+    return isinstance(entry, dict) and bool(entry) and all(
+        entry.get(k) == key[k] for k in TURN_FIELDS)
+
+
+def entries(items, key):
+    """The turns recorded under an item key. One turn is recorded as a
+    dict, the only form before several per item, and several as a list
+    of them, so a state file from before still reads as it did."""
+    value = items.get(key)
+    if isinstance(value, dict):
+        return [value] if value else []
+    if isinstance(value, list):
+        return [e for e in value if isinstance(e, dict) and e]
+    return []
+
+
+def put_entries(items, key, turns):
+    """Record `turns` under an item key, in the form `entries` reads."""
+    if not turns:
+        items.pop(key, None)
+    elif len(turns) == 1:
+        items[key] = turns[0]
+    else:
+        items[key] = list(turns)
+
+
+def find(items, decision):
+    """The recorded entry of `decision`'s turn, or None."""
+    return next((e for e in entries(items, item_key(decision))
+                 if same_turn(e, decision)), None)
+
+
+def record(items, decision, entry):
+    """Record `entry` as `decision`'s turn, in place of what was."""
+    key = item_key(decision)
+    put_entries(items, key, [e for e in entries(items, key)
+                             if not same_turn(e, decision)] + [entry])
+
+
+def prune(items, live, only, held=()):
+    """Keep only the turns this run still decided: an item key's
+    entries not matching one of `live[key]` are forgotten, and so is an
+    item key not decided at all, unless the run was `only` some items.
+    A key in `held` had a wake that stays due, and is left as it was, as
+    a failed wake always has been."""
+    for key in list(items):
+        if key in held:
+            continue
+        if key in live:
+            put_entries(items, key, [e for e in entries(items, key)
+                                     if any(same_turn(e, d)
+                                            for d in live[key])])
+        elif not only:
+            del items[key]
+
+
+def reminders_sent(entry):
+    try:
+        return max(int((entry or {}).get("reminders") or 0), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def due(decision, entry, when, remind_s):
     """None when `decision`'s turn needs no wake now; "new" for a key
-    not woken before; "reminder" for one woken `remind_s` or more ago."""
+    not woken before; "reminder" for one woken long enough ago: by the
+    decision's `Reminder`, or `remind_s` when it has none."""
     if not same_turn(entry, decision):
         return "new"
-    if entry.get("withheld"):
+    if entry.get("withheld") or entry.get("surfaced"):
         return None
     try:
         woken = parse_time(entry["woken_at"])
     except (KeyError, TypeError, ValueError):
         return "new"
-    return "reminder" if (when - woken).total_seconds() >= remind_s else None
+    wait = remind_s if decision.reminder is None else decision.reminder.wait(
+        turn_id(decision), reminders_sent(entry))
+    return "reminder" if (when - woken).total_seconds() >= wait else None
 
 
-def message(lines):
-    return "From: Router\nYour turn:\n" + "\n".join(lines) + "\n"
+# The message's sections after its turns, by kind: what the agent is told
+# about without its being the agent's turn.
+SECTIONS = (("notice", "For your information (not your turn):"),
+            ("relook", "Worth another look (not your turn):"))
+
+
+def message(lines, notices=(), relooks=()):
+    """The text of one agent's wake: its turns, under the heading a
+    wake has always had, then each other section that has lines."""
+    parts = [(heading, body) for heading, body in (
+        ("Your turn:", lines), (SECTIONS[0][1], notices),
+        (SECTIONS[1][1], relooks)) if body]
+    return "From: Router\n" + "\n".join(
+        heading + "\n" + "\n".join(body) + "\n" for heading, body in parts)
 
 
 def relay_token(path=None):
@@ -355,80 +531,250 @@ def make_poster(relay, token, opener=urllib.request.urlopen, sleep=time.sleep,
     return post
 
 
+def check(decision):
+    """Raise ValueError for a decision this engine can't carry out: the
+    rules are wrong, and half-doing it would be worse."""
+    d = decision
+    problem = None
+    if not isinstance(d, router.Decision):
+        problem = "not a Decision"
+    elif d.item is not None and (not isinstance(d.item, int)
+                                 or isinstance(d.item, bool)):
+        problem = "its item is not a number or None"
+    elif d.kind not in router.KINDS:
+        problem = "its kind is not one of %s" % ", ".join(router.KINDS)
+    elif not isinstance(d.actions, tuple) or not all(
+            isinstance(a, router.Action) for a in d.actions):
+        problem = "its actions are not a tuple of Actions"
+    elif d.reminder is not None and not isinstance(d.reminder,
+                                                   router.Reminder):
+        problem = "its reminder is not a Reminder"
+    elif d.actions and d.agent is None and d.kind != "surface":
+        problem = "nobody's turn has no key to do its actions once for"
+    elif (d.agent is not None and d.suppressed is None
+          and d.kind != "surface" and not isinstance(d.line, str)):
+        problem = "a wake needs a line"
+    if problem:
+        raise ValueError("the rules decided %r, which this router can't "
+                         "carry out: %s" % (d, problem))
+
+
 def decide(ctx):
     """Every decision the rules make: `decide` for each open item, pull
-    requests first, then `sweep` once. The engine keeps one turn per
-    item, so a rules module that makes several, or one about no item,
-    is refused rather than half-handled."""
+    requests first, then `sweep` once, each checked. A second decision
+    with the key of one before it (agent, item, event) is the same turn,
+    and is dropped."""
     decisions = []
     for item in ctx.prs + ctx.issues:
         decisions += RULES.decide(item, ctx)
     decisions += RULES.sweep(ctx)
-    seen = set()
+    kept, seen = [], set()
     for d in decisions:
-        if d.item is None or d.item in seen or d.kind != "turn" \
-                or d.actions or d.reminder is not None:
-            raise ValueError("the rules decided %r, which this router "
-                             "can't carry out yet" % (d,))
-        seen.add(d.item)
-    return decisions
+        check(d)
+        if d.agent is not None or d.kind == "surface":
+            key = turn_id(d)
+            if key in seen:
+                continue
+            seen.add(key)
+        kept.append(d)
+    return kept
+
+
+def order(decision):
+    """Items by number, then those about no item, each in decided order."""
+    return (decision.item is None, decision.item or 0)
+
+
+def nobody_line(d):
+    """How a decision that wakes nobody is printed."""
+    why = d.suppressed if d.suppressed is not None else d.line
+    return "%s %s (%s)" % (label(d), "nobody's" if d.agent is None
+                           else "%s's" % d.agent,
+                           why if d.rule is None
+                           else "rule %s: %s" % (d.rule, why))
+
+
+def journal(d, line, outcome, **extra):
+    """One record for `wakes.jsonl` or `dry-run.jsonl`."""
+    entry = dict(key_of(d), item=d.item, line=line, outcome=outcome)
+    if d.kind != "turn":
+        entry["kind"] = d.kind
+    entry.update(extra)
+    return entry
+
+
+def act(github, d, send, out):
+    """Do `d`'s actions, in order, as the Merger's App, or, in a dry run,
+    print them. Returns what happened to each, for the journal. A failed
+    action is reported and the rest go on: the wake still goes out."""
+    done = []
+    for action in d.actions:
+        what = action.describe()
+        if not send:
+            out("WOULD %s" % what)
+            done.append("would " + what)
+            continue
+        try:
+            ok, why = action.run(github, REPO_SLUG)
+        except Exception as err:  # noqa: BLE001 - an action never stops a run
+            ok, why = False, str(err)
+        if ok:
+            out("DONE %s" % what)
+            done.append(what)
+        else:
+            out("ACTION FAILED: %s: %s" % (what, why))
+            done.append("failed: %s: %s" % (what, why))
+    return done
+
+
+def rechecks():
+    """Whether the rules re-decide before delivery: a `recheck` of their
+    own, not the default that is `decide` itself."""
+    return RULES.recheck is not RULES.decide
+
+
+def recheck(github, ctx, wakes):
+    """Re-decide, on a fresh fetch, each item `wakes` would wake for.
+    Returns (wakes that still hold, [(wake, why)] withdrawn, [(wake,
+    why)] that couldn't be rechecked and stay due). A wake holds when
+    the fresh decisions give its item a decision with its agent and
+    event. A wake about no item is sent as decided."""
+    numbers = sorted({w["d"].item for w in wakes if w["d"].item is not None})
+    if not numbers:
+        return wakes, [], []
+    try:
+        fresh = refetch(github, numbers)
+    except Exception as err:  # noqa: BLE001 - gh's and lookups' failures vary
+        return ([w for w in wakes if w["d"].item is None], [],
+                [(w, "recheck failed: %s" % err) for w in wakes
+                 if w["d"].item is not None])
+
+    def renewed(nodes):
+        return [fresh.get(n["number"]) if n["number"] in numbers else n
+                for n in nodes
+                if n["number"] not in numbers or n["number"] in fresh]
+    now = router.Context(ctx.roster, ctx.when, renewed(ctx.prs),
+                         renewed(ctx.issues), only=ctx.only)
+    again = {n: list(RULES.recheck(fresh[n], now)) if n in fresh else []
+             for n in numbers}
+    holding, withdrawn = [], []
+    for w in wakes:
+        d = w["d"]
+        if d.item is None or any(
+                r.agent == d.agent and r.event == d.event
+                and item_key(r) == item_key(d) for r in again[d.item]):
+            holding.append(w)
+        else:
+            withdrawn.append((w, "closed" if d.item not in fresh
+                              else "no longer decided"))
+    return holding, withdrawn, []
 
 
 def run(github, roster, state_dir, send, post=None, only=None, out=print,
         when=None, remind_s=None):
     """One run: decide every open item, or `only` those numbers, and
-    when `send`, wake each agent with its due items and record it.
-    Returns the number of agents whose wake was not accepted."""
+    when `send`, do the due decisions' actions, wake each agent with
+    its due items and record it. Returns the exit status: 0 when nothing
+    was due or all of it was delivered, 1 when some was and the rest
+    stays due, 2 when something was due and none of it was delivered."""
     when = when or merger.now_utc()
     remind_s = REMIND_S if remind_s is None else remind_s
     prs, issues = fetch(github)
-    ctx = router.Context(roster, when, prs, issues)
+    ctx = router.Context(roster, when, prs, issues,
+                         only=frozenset(only) if only else None)
     decisions = decide(ctx)
     tally = RULES.summary(ctx)
     if only:
         decisions = [d for d in decisions if d.item in only]
-    decisions.sort(key=lambda d: d.item)
+    decisions.sort(key=order)
     state_path = os.path.join(state_dir, "state.json")
     state = merger.load_json(state_path, {})
-    items = state.setdefault("items", {})
-    log, batches, would = [], {}, []
+    items = state.get("items")
+    if not isinstance(items, dict):
+        items = state["items"] = {}
+    # `live`: the decisions, by item key, whose recorded turns are kept.
+    # `acting`: decisions recorded once (withheld, surfaced) whose
+    # actions are done now, with their journal record.
+    log, would, wakes, acting, live = [], [], [], [], {}
     for d in decisions:
-        if d.agent is None:
-            # The default rules' rule 7 is printed even when sending: a
-            # pull request nobody can review is a problem in the
-            # configuration. A kind of decision will say so instead
-            # (docs/router.md, step 2).
-            if not send or d.rule == 7:
-                out("#%d nobody's (%s)" % (
-                    d.item, d.suppressed if d.rule is None
-                    else "rule %s: %s" % (d.rule, d.suppressed)))
-            items.pop(str(d.item), None)
+        keep = live.setdefault(item_key(d), [])
+        if d.kind == "surface":
+            out(nobody_line(d))
+            keep.append(d)
+            outcome = "surfaced: %s" % (
+                d.suppressed if d.suppressed is not None else d.line)
+            # The dry run's journal keeps its own once-per-key.
+            would.append((d, d.line, outcome))
+            if find(items, d) is None:
+                record(items, d, dict(key_of(d), surfaced=True,
+                                      at=merger.iso(when)))
+                rec = journal(d, d.line, outcome)
+                log.append(rec)
+                acting.append((d, rec))
             continue
-        why = due(d, items.get(str(d.item)), when, remind_s)
+        if d.agent is None or d.suppressed is not None:
+            if not send:
+                out(nobody_line(d))
+            continue
+        keep.append(d)
+        entry = find(items, d)
+        why = due(d, entry, when, remind_s)
         if why is None:
             if not send:
-                out("#%d %s's, rule %s: already woken" % (
-                    d.item, d.agent, d.rule))
+                out("%s %s's, rule %s: already woken" % (
+                    label(d), d.agent, d.rule))
                 would.append((d, d.line, "withheld: already woken"))
             continue
         if not roster.is_agent(d.agent):
-            out("#%d %s's, rule %s: withheld, %s is not an agent" % (
-                d.item, d.agent, d.rule, d.agent))
-            items[str(d.item)] = dict(key_of(d), withheld=True,
-                                      at=merger.iso(when))
-            log.append(dict(key_of(d), item=d.item, line=d.line,
-                            outcome="withheld: not an agent"))
+            out("%s %s's, rule %s: withheld, %s is not an agent" % (
+                label(d), d.agent, d.rule, d.agent))
+            record(items, d, dict(key_of(d), withheld=True,
+                                  at=merger.iso(when)))
+            rec = journal(d, d.line, "withheld: not an agent")
+            log.append(rec)
+            acting.append((d, rec))
             would.append((d, d.line, "withheld: not an agent"))
             continue
         line = d.line + (" (reminder)" if why == "reminder" else "")
         would.append((d, line, "would send to %s" % roster.session_name(
             d.agent)))
-        batches.setdefault(d.agent, []).append((d, line))
+        wakes.append({"d": d, "line": line, "why": why, "entry": entry})
+    # Item keys with a wake that stays due, and how much was delivered.
+    held, delivered, stayed, withdrawn_n, unchecked_n = set(), 0, 0, 0, 0
+    if send and wakes and rechecks():
+        wakes, withdrawn, unchecked = recheck(github, ctx, wakes)
+        for w, why in withdrawn:
+            d = w["d"]
+            withdrawn_n += 1
+            out("%s %s's, rule %s: withdrawn on recheck (%s)" % (
+                label(d), d.agent, d.rule, why))
+            live[item_key(d)].remove(d)
+            log.append(journal(d, w["line"], "withdrawn on recheck: " + why))
+        for w, why in unchecked:
+            d = w["d"]
+            stayed += 1
+            unchecked_n += 1
+            held.add(item_key(d))
+            out("NOT SENT %s to %s: %s; it stays due" % (
+                label(d), roster.session_name(d.agent), why))
+            log.append(journal(d, w["line"], "not sent: " + why,
+                               session=roster.session_name(d.agent)))
+    for d, rec in acting:
+        if d.actions:
+            rec["actions"] = act(github, d, send, out)
+    for w in wakes:
+        w["actions"] = act(github, w["d"], send, out) if w["d"].actions \
+            else None
+    batches = {}
+    for w in wakes:
+        batches.setdefault(w["d"].agent, []).append(w)
     failed, down = 0, None
     for who in sorted(batches):
         session = roster.session_name(who)
-        numbers = ", ".join("#%d" % d.item for d, _ in batches[who])
-        text = message([line for _, line in batches[who]])
+        numbers = ", ".join(label(w["d"]) for w in batches[who])
+        text = message(*[[w["line"] for w in batches[who]
+                          if w["d"].kind == kind]
+                         for kind in ("turn", "notice", "relook")])
         if not send:
             out("WOULD SEND to %s:\n%s" % (session, text.rstrip("\n")))
             continue
@@ -442,29 +788,40 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
                                                       numbers))
         else:
             out("SENT to %s: %s" % (session, numbers))
-        for d, line in batches[who]:
-            log.append(dict(key_of(d), item=d.item, line=line,
-                            session=session, outcome=(
-                                "not sent: " + problem if problem
-                                else "sent")))
-            if not problem:
-                items[str(d.item)] = dict(key_of(d),
-                                          woken_at=merger.iso(when))
-    if not only:
-        for gone in set(items) - {str(d.item) for d in decisions}:
-            del items[gone]
-    out("%s %d open, %d turn(s) to wake%s%s" % (
+        for w in batches[who]:
+            d = w["d"]
+            extra = {"actions": w["actions"]} if w["actions"] else {}
+            log.append(journal(d, w["line"], "not sent: " + problem
+                               if problem else "sent", session=session,
+                               **extra))
+            if problem:
+                stayed += 1
+                held.add(item_key(d))
+                continue
+            delivered += 1
+            entry = dict(key_of(d), woken_at=merger.iso(when))
+            count = reminders_sent(w["entry"]) + 1 \
+                if w["why"] == "reminder" else 0
+            if count:
+                entry["reminders"] = count
+            record(items, d, entry)
+    prune(items, live, only, held)
+    out("%s %d open, %d turn(s) to wake%s%s%s%s" % (
         "ROUTED" if send else "DRY-RUN", len(prs) + len(issues),
         sum(len(b) for b in batches.values()),
         ", " + tally if tally else "",
-        "; %d wake(s) not sent" % failed if failed else ""))
+        "; %d wake(s) not sent" % failed if failed else "",
+        "; %d withdrawn on recheck" % withdrawn_n if withdrawn_n else "",
+        "; %d not rechecked" % unchecked_n if unchecked_n else ""))
     if send:
         os.makedirs(state_dir, exist_ok=True)
         merger.save_json(state_path, state)
         append_records(os.path.join(state_dir, "wakes.jsonl"), log, when)
     else:
         record_dry_run(state_dir, decisions, would, only, when)
-    return failed
+    if not stayed:
+        return 0
+    return 1 if delivered else 2
 
 
 def append_records(path, records, when):
@@ -479,22 +836,25 @@ def append_records(path, records, when):
 def record_dry_run(state_dir, decisions, would, only, when):
     """Append each turn a dry run would send or withhold to
     `dry-run.jsonl`, once per turn key: `dry-state.json` remembers the
-    key last recorded per item, apart from the real state, which a dry
-    run never touches."""
+    keys last recorded per item key, in `state.json`'s form, apart from
+    the real state, which a dry run never touches."""
     path = os.path.join(state_dir, "dry-state.json")
     seen = merger.load_json(path, {})
+    if not isinstance(seen, dict):
+        seen = {}
     records = []
     for d, line, outcome in would:
-        if same_turn(seen.get(str(d.item)), d):
+        if find(seen, d) is not None:
             continue
-        seen[str(d.item)] = key_of(d)
-        records.append(dict(key_of(d), item=d.item, line=line,
-                            outcome=outcome))
-    turns = {str(d.item) for d in decisions if d.agent is not None}
-    for item in list(seen):
-        decided = any(str(d.item) == item for d in decisions)
-        if (decided or not only) and item not in turns:
-            del seen[item]
+        record(seen, d, key_of(d))
+        records.append(journal(d, line, outcome))
+    live = {}
+    for d in decisions:
+        keep = live.setdefault(item_key(d), [])
+        if d.kind == "surface" or (d.agent is not None
+                                   and d.suppressed is None):
+            keep.append(d)
+    prune(seen, live, only)
     os.makedirs(state_dir, exist_ok=True)
     merger.save_json(path, seen)
     append_records(os.path.join(state_dir, "dry-run.jsonl"), records, when)
@@ -576,12 +936,11 @@ def main(argv=None, sh=merger.sh, out=print, post=None, roster=None,
             out("NO-TOKEN: could not mint %s's token" % ACT_AS)
             return 2
         try:
-            failed = run(merger.GitHub(token, sh), roster, state_dir,
-                         args.send, post, args.only, out, remind_s=remind_s)
+            return run(merger.GitHub(token, sh), roster, state_dir,
+                       args.send, post, args.only, out, remind_s=remind_s)
         except (RuntimeError, KeyError, TypeError, ValueError) as err:
             out("FAILED: %s" % err)
             return 2
-        return 1 if failed else 0
 
     if not args.send:
         return go()

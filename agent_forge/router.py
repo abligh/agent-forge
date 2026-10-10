@@ -4,7 +4,9 @@ The engine fetches, locks, keeps state, delivers and journals; a rules
 module says whose turn each item is. docs/router.md is the design. This
 module is the contract between them: the `Decision` a module returns,
 the `Lookup` it declares, the `Context` it is handed, and how a module
-is found from `router.rules` in the configuration.
+is found from `router.rules` in the configuration. Besides them, the
+`Action`s a decision may carry (`AddLabel`) and the `Reminder` policy
+it may give.
 
 A rules module is a Python module with:
 
@@ -20,7 +22,10 @@ A rules module is a Python module with:
                  bin/forge-merger, so a rule can use its tests
     author(node, ctx)   who wrote a node, as a name
     decide(item, ctx)   [Decision] for one open item
-    sweep(ctx)          [Decision] not tied to one item (may be absent)
+    sweep(ctx)          [Decision] once a run, for what no one item's
+                        decide says: about no item, or about items
+                        (`ctx.only`, when set, names those it may decide
+                        about) (may be absent)
     recheck(item, ctx)  decide again just before delivery (absent: decide)
     summary(ctx)        a phrase for the run's last line, or "" (may be
                         absent)
@@ -32,7 +37,13 @@ import importlib
 import importlib.machinery
 import importlib.util
 import os
+import zlib
 from typing import Any, Callable
+
+# What a decision may be. A turn is the agent's to act on; a notice and
+# a relook are sent in their own sections, marked not the agent's turn;
+# a surface is printed and journalled, and never sent.
+KINDS = ("turn", "notice", "relook", "surface")
 
 DEFAULT_RULES = "default"
 # What `router.rules: "default"` names: the rules shipped here.
@@ -43,14 +54,77 @@ class RulesError(Exception):
     """The rules module named can't be loaded or isn't one."""
 
 
+class Action:
+    """Something a decision does on GitHub before its wake goes out, as
+    the Merger's App. `run(github, repo)` returns (True, "") when GitHub
+    took it, else (False, why), and never raises; `describe()` says what
+    it does, for the output and the journal."""
+
+    def describe(self):
+        raise NotImplementedError
+
+    def run(self, github, repo):
+        raise NotImplementedError
+
+
+@dataclasses.dataclass(frozen=True)
+class AddLabel(Action):
+    """Put `label` on issue or pull request `item`. Adding a label it
+    already has changes nothing, so doing it again is harmless."""
+    item: int
+    label: str
+
+    def describe(self):
+        return "add label %s to #%d" % (self.label, self.item)
+
+    def run(self, github, repo):
+        return github.write("POST", "repos/%s/issues/%d/labels" % (
+            repo, self.item), **{"labels[]": self.label})
+
+
+@dataclasses.dataclass(frozen=True)
+class Reminder:
+    """When a turn already woken is woken again: `first_s` after the
+    first wake, then each interval double the last, up to `ceiling_s`.
+    Each wait is lengthened by up to `jitter` times its interval, by an
+    amount fixed by a hash of the turn's key and the reminder's number,
+    so agents woken together aren't reminded together. Jitter only
+    delays: no reminder comes before its interval."""
+    first_s: float
+    ceiling_s: float
+    jitter: float = 0.5
+
+    def __post_init__(self):
+        if not (self.first_s > 0 and self.ceiling_s >= self.first_s
+                and self.jitter >= 0):
+            raise ValueError("Reminder needs 0 < first_s <= ceiling_s and "
+                             "jitter >= 0, not %r" % (self,))
+
+    def interval(self, sent):
+        """The interval before reminder number `sent` + 1, `sent` having
+        gone already."""
+        return min(self.first_s * 2 ** min(max(sent, 0), 64), self.ceiling_s)
+
+    def wait(self, key, sent):
+        """Seconds after the last wake that the next reminder is due:
+        the interval, plus its jitter for this `key` (a string)."""
+        interval = self.interval(sent)
+        spread = zlib.crc32(("%s\n%d" % (key, sent)).encode()) / 2 ** 32
+        return interval * (1 + self.jitter * spread)
+
+
 @dataclasses.dataclass(frozen=True)
 class Decision:
     """Whose turn one item is, and why.
 
     `agent` None is nobody's turn, and `suppressed` then says why; it is
-    printed, not sent. The engine keys a turn on (agent, event): `rule`
-    is recorded beside them but not compared, since rules that mean the
-    same thing ("you were answered") can hand one turn between them."""
+    printed, not sent. The engine keys a turn on (agent, item, event):
+    `rule` is recorded beside them but not compared, since rules that
+    mean the same thing ("you were answered") can hand one turn between
+    them. A decision about no item (`item` None) is keyed on its rule in
+    the item's place. `kind` is one of KINDS; `actions` are `Action`s
+    done before the wake; `reminder` is a `Reminder`, or None for the
+    configuration's fixed `relay.remind_seconds`."""
     item: int | None
     agent: str | None
     rule: Any
@@ -74,11 +148,15 @@ class Lookup:
 @dataclasses.dataclass
 class Context:
     """What a rule may read besides its item: the clock, the roster and
-    every open item, so it can look at another (a blocker, say)."""
+    every open item, so it can look at another (a blocker, say). `only`
+    is the numbers a run started by an event routes (`--only`), else
+    None: a sweep decides about those items alone, and the engine drops
+    any other decision it makes."""
     roster: Any
     when: datetime.datetime
     prs: list
     issues: list
+    only: frozenset | None = None
 
     @property
     def items(self):

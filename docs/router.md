@@ -1,7 +1,7 @@
 # The router: an engine and a project's rules
 
 `forge-router` decides whose turn every open issue and pull request is,
-and wakes that agent. Today the rules are written into it. Two projects
+and wakes that agent. Its rules used to be written into it. Two projects
 route very differently, so this splits it into an **engine** that every
 project shares and a **rules module** that each project chooses.
 
@@ -50,40 +50,106 @@ The engine runs one pass:
    lookup that fails yields `UNKNOWN` for what it covers, never an
    empty answer, and the module decides what `UNKNOWN` means.
 2. **Decide.** The module's `decide` for each item, and its `sweep` once,
-   each returning zero or more decisions.
-3. **Act.** The decisions' actions (label writes), as the Merger's App,
-   before delivery, so a failed send leaves them in place.
-4. **Deliver.** Due decisions batched into one message per agent, in
+   each returning zero or more decisions. The engine checks each one
+   and refuses (exit 2, nothing sent) a decision it can't carry out: an
+   unknown kind, actions that aren't `Action`s, a reminder that isn't a
+   `Reminder`, a wake with no line, or actions on nobody's turn, which
+   has no key to do them once for.
+3. **Recheck.** On a sending run, when the module has a `recheck` of its
+   own, the items about to be woken for are fetched again and
+   re-decided (below).
+4. **Act.** The due decisions' actions (label writes), as the Merger's
+   App, before delivery, so a failed send leaves them in place.
+5. **Deliver.** Due decisions batched into one message per agent, in
    sections by kind, through the relay, with the confirmed-delivery
    rules `forge-router` already has.
-5. **Record.** State only for what was delivered; the journal for
-   everything decided, including what was suppressed and why.
+6. **Record.** State only for what was delivered (and for what was
+   withheld or surfaced, once); the journal for every wake sent,
+   failed, withheld, withdrawn or surfaced.
+
+**Several decisions per item.** `decide` may return any number for
+one item: one agent's turn, a notice to another, a relook to its
+owner. Each is its own turn. A decision about no item (`item` None,
+usually from `sweep`) is keyed on its rule in the item's place, as
+`"-"` and the rule (`"-stall"`), so a module keeps that rule's name
+stable from run to run; two such decisions with one rule are told
+apart by agent and event. A second decision with the key of one
+before it in the same run is the same turn, and is dropped.
 
 **Once per turn.** A decision's key is (agent, item, event). The event
 is whatever the rules say started the turn: a comment's time, a head
 SHA, a delivery GUID. A level-triggered rule sets it to the time its
 turn began, so a restarted turn is a new key.
 
-**Reminders.** A key already woken is woken again by its reminder
-policy, which the module gives per decision: a fixed interval (the
-default rules' `remind_seconds`), or a first interval, doubling to a
-ceiling, with deterministic jitter from a hash of the key, so a fleet
-isn't woken in step. Jitter only delays, never brings a wake forward.
+**State.** `state.json` keeps `items`, by item key (the number, or
+`"-"` and the rule), holding each turn recorded for it: one turn as an
+object, as it always has been, and several as a list of them. So a
+state file from before several turns per item reads as it did, and
+what it records is still already woken: upgrading doesn't wake
+everything again. A turn's entry has its agent, rule and event, and
+`woken_at`, `reminders` (how many reminders it has had, left out while
+none), or `withheld` or `surfaced` with `at`. A run forgets the turns
+of an item key that it decided but no longer gave, and every item key
+it didn't decide at all, unless it was `--only`; an item key whose
+wake failed is left as it was, as it always has been.
 
-**Check before send.** With `recheck`, the module re-decides each item
-on a fresh fetch just before delivery, and a decision that no longer
-holds isn't sent.
+**Kinds.** A `turn` is the agent's to act on. A `notice` (for its
+information) and a `relook` (worth looking at again) are sent with the
+turns, one message per agent: the turns first, under the heading a
+wake has always had (`Your turn:`, so a message of turns alone is the
+text it always was), then `For your information (not your turn):` and
+`Worth another look (not your turn):`, each only when it has lines. A
+`surface` is sent to nobody: it is printed on every run, sending or
+not, as nobody's turn is printed (`#9 nobody's (rule 7: …)`), and
+journalled once per key. The default rules' rule 7, a pull request
+nobody can review, is a surface.
+
+**Actions** are `Action`s on the decision, done before delivery as the
+Merger's App, through the engine's own GitHub client, when the
+decision is due: about to be sent (a new turn or a reminder), or
+withheld or surfaced for the first time. A decision already woken does
+nothing again. The first is `AddLabel(item, label)`. A failed action
+(GitHub refused it, or it raised) is printed (`ACTION FAILED: …`) and
+journalled with the wake, and the decision still goes out. A dry run
+prints each (`WOULD add label …`) and does nothing.
+
+**Reminders.** A key already woken is woken again by its reminder
+policy, which the module gives per decision. None is the fixed
+interval, `relay.remind_seconds` (`$FORGE_ROUTER_REMIND`), as the
+default rules have it. `Reminder(first_s, ceiling_s, jitter=0.5)` is
+a first reminder `first_s` after the wake, then each interval double
+the last, up to `ceiling_s`. Each wait is lengthened by up to `jitter`
+times its interval, by a share fixed by a hash (crc32) of the key and
+the reminder's number, so a fleet woken together isn't reminded
+together. Jitter only delays, never brings a wake forward. Each
+interval runs from the last wake, and the state counts the reminders.
+
+**Check before send.** When the module defines a `recheck` of its own
+(not the default, which is `decide` itself), a sending run fetches each
+item it is about to wake for again, in one query naming those numbers
+(`issueOrPullRequest`, with the module's fields), runs the lookups over
+them, and calls `recheck(item, ctx)` with a context holding the fresh
+items. A wake holds when the fresh decisions give its item a decision
+with its agent and event; one that doesn't, or whose item has closed,
+isn't sent, isn't recorded, and is journalled as withdrawn on recheck.
+A recheck whose fetch fails sends none of the wakes it covers, and
+they stay due. A wake about no item is sent as decided. For the
+default rules nothing is fetched again: a run makes the GitHub calls
+it always did. A dry run never rechecks.
 
 **`--only`** narrows a run to items an event named, under the same lock
 and state as cron's runs. A `sweep` is told which items it may decide
-about.
+about (`ctx.only`, the numbers, None on a full run), and the engine
+drops every decision about another item, or about none: those are
+cron's runs' to make.
 
 **Exit status.** 0 when nothing was due or everything was delivered; 1
 when some was delivered and the rest stays due; 2 when the queue
 couldn't be read, or something was due and none of it was delivered.
-The last is a change from `forge-router` today, which says 1: a router
-that delivered nothing hasn't done its job, and 2 is what a scheduler
-reports as broken.
+The last was 1 before: a router that delivered nothing hasn't done its
+job, and 2 is what a scheduler reports as broken. A wake that stays due
+is one the relay didn't take or a recheck couldn't fetch; one withheld
+or withdrawn isn't due.
 
 ## The interface
 
@@ -113,6 +179,21 @@ class Lookup:
     run: Callable                 # run(github, repo, prs, issues)
 
 @dataclass(frozen=True)
+class Reminder:
+    first_s: float                # the first reminder, after the wake
+    ceiling_s: float              # intervals double up to this
+    jitter: float = 0.5           # delay by at most this x the interval
+
+class Action:                     # done before delivery
+    def describe(self) -> str: ...
+    def run(self, github, repo) -> tuple[bool, str]: ... # no raise
+
+@dataclass(frozen=True)
+class AddLabel(Action):
+    item: int
+    label: str
+
+@dataclass(frozen=True)
 class Decision:
     item: int | None              # None: not about one item
     agent: str | None             # None: nobody's
@@ -121,7 +202,7 @@ class Decision:
     line: str | None              # what the message says
     kind: str = "turn"            # turn, notice, relook, surface
     suppressed: str | None = None # decided, not sent, and why
-    actions: tuple = ()           # done before delivery
+    actions: tuple = ()           # Actions, done before delivery
     reminder: Reminder | None = None   # None: relay.remind_seconds
 ```
 
@@ -149,9 +230,10 @@ routed on its own (`--only`) without a second place to look.
 rule. The engine asks it two things: whether a name is an agent (only
 agents are woken) and its session name.
 
-`ctx` carries the clock, the roster and every fetched item (so a rule
-can read other items: a blocker's state, a reviewer's load). Step 2
-adds the previous run's decisions, a namespaced store the module may
+`ctx` carries the clock, the roster, every fetched item (so a rule
+can read other items: a blocker's state, a reviewer's load) and
+`only`, the numbers an `--only` run routes, else None. A later step
+may add the previous run's decisions, a namespaced store the module may
 write to, written only when the run's delivery is confirmed, and the
 configuration; until then a module keeps what it needs from
 `configure`.
@@ -173,18 +255,19 @@ relay already answers `unknown-name`, and that is reported.
 
 ## Order of work
 
-1. Move `forge-router`'s rules behind this interface as the `default`
-   module. No decision changes: every existing test passes unchanged,
-   and its dry-run journal is compared before and after on the same
-   input. The engine refuses what it can't carry out yet (several
-   decisions for one item, one about no item, another kind, actions, a
-   reminder policy) rather than half-doing it. One rule still leaks
-   into it: the default rules' rule 7, nobody's because nobody can
-   review it, is printed even when sending, by number. Step 2's
-   `surface` kind replaces that.
-2. Engine features the default rules don't use yet: several decisions
-   per item, `sweep`, kinds and sections, actions, the reminder policy,
-   recheck, the exit status above.
+1. Done. Move `forge-router`'s rules behind this interface as the
+   `default` module. No decision changes: every existing test passes
+   unchanged, and its dry-run journal is compared before and after on
+   the same input.
+2. Done. Engine features the default rules don't use yet: several
+   decisions per item and decisions about no item, `sweep` (told
+   `ctx.only`), kinds and sections, actions (`AddLabel`), the reminder
+   policy (`Reminder`), recheck, and the exit status above. Rule 7,
+   which the engine used to print by number, is now the default rules'
+   `surface`, printed as before. Each is tested against a small rules
+   module in the tests (`tests/router_rules.py`), and no decision of
+   the default rules changed. What the engine still refuses is the
+   malformed decision (Decide, above).
 3. `router.rules` pointing at a project file, with an example module in
    the tests. Loading one already works (`load_rules` in
    `agent_forge/router.py`); what remains is the example and its tests.

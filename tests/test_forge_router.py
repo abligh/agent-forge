@@ -814,7 +814,7 @@ class FailedRelay(StateCase):
 
     def test_a_refused_wake_stays_due_and_nothing_is_recorded_as_woken(self):
         self.refuse = "HTTP 404 unknown-name"
-        self.assertEqual(self.run_router([pr_node(41)]), 1)
+        self.assertEqual(self.run_router([pr_node(41)]), 2)
         self.assertEqual(self.state()["items"], {})
         (wake,) = self.wakes()
         self.assertEqual(wake["outcome"], "not sent: HTTP 404 unknown-name")
