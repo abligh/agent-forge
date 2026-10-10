@@ -55,7 +55,18 @@ Issues:
 13. no `Owner:` label, and a comment by the owner newer than the issue
     author's last comment: the author's, with rule 10's exception. The
     owner usually takes the waiting label off when answering, which
-    ends rule 10.
+    ends rule 10;
+14. its body has `Blocked-by: #N` lines (one number a line, the
+    Merger's notation, outside code), every item they name is closed or
+    merged, and the last of those closed after the body was last
+    written and after the item owner's last comment: the item owner's
+    (`Owner:<Name>`, else the author), "unblocked". The event is that
+    last close, so it is woken once. A merged pull request is nobody's
+    turn, so without this a step waiting on others' work waits until
+    someone notices. A line written after its item closed doesn't
+    wake, and a number that names nothing is left out. Pull requests
+    don't need it: the Merger holds a blocked one and takes it up
+    itself.
 
 **Who wrote something is read from its login**, never its text (but
 for rule 10's exception): an App's bot login (`<slug>[bot]`) maps to
@@ -197,7 +208,7 @@ query($owner:String!, $name:String!, $prCursor:String, $issueCursor:String,
     issues(states:OPEN, first:50, after:$issueCursor) @include(if:$issues) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        number author { login }
+        number author { login } body createdAt lastEditedAt
         labels(first:30) { nodes { name } }
         comments(last:100) {
           nodes { databaseId author { login } createdAt body }
@@ -206,6 +217,20 @@ query($owner:String!, $name:String!, $prCursor:String, $issueCursor:String,
     }
   }
 }"""
+
+
+# What each number named in an open issue's `Blocked-by:` lines is now,
+# for those that aren't open issues or pull requests themselves.
+BLOCKER_QUERY = """
+query($owner:String!, $name:String!) {
+  repository(owner:$owner, name:$name) {
+%s
+  }
+}"""
+BLOCKER_FIELD = ("    n%d: issueOrPullRequest(number:%d) {\n"
+                 "      ... on Issue { state closedAt }\n"
+                 "      ... on PullRequest { state closedAt }\n"
+                 "    }")
 
 
 def configure(project):
@@ -506,7 +531,32 @@ def route_issue(issue, roster):
         answered = owner_answered(n, issue, None, comments, roster, 13)
         if answered:
             return answered
+    # Rule 14.
+    unblocked = unblocked_by(issue, owner, comments, roster)
+    if unblocked:
+        return unblocked
     return nobody(n, None, "no rule matched")
+
+
+def unblocked_by(issue, owner, comments, roster):
+    """Rule 14: the item owner's turn when the last open item its
+    `Blocked-by:` lines name has closed since the body was written and
+    since the item owner last spoke, else None."""
+    named = merger.blockers_of(issue)
+    known = {b: info for b, info in (issue.get("blockedBy") or {}).items()
+             if b in named and info}
+    if not known or any(i.get("state") == "OPEN" for i in known.values()):
+        return None
+    event = max((i.get("closedAt") or "" for i in known.values()),
+                default="")
+    who = owner or roster.who(author_of(issue))
+    written = max(issue.get("lastEditedAt") or "",
+                  issue.get("createdAt") or "",
+                  last_by(comments, {roster.login_of(who)}))
+    if not event or event <= written:
+        return None
+    return turn(issue["number"], who, 14, event, "unblocked: %s closed" % (
+        ", ".join("#%d" % b for b in sorted(known))))
 
 
 def owner_answered(n, issue, owner, comments, roster, rule):
@@ -557,7 +607,43 @@ def fetch(github):
                 out.append(node)
             more[kind] = page["pageInfo"]["hasNextPage"]
             cursors[cursor] = page["pageInfo"]["endCursor"]
+    attach_blockers(github, prs, issues)
     return prs, issues
+
+
+def attach_blockers(github, prs, issues):
+    """Give each open issue a `blockedBy` map, {number: {"state",
+    "closedAt"} or None}, for the numbers its `Blocked-by:` lines name.
+    An open item is known from the listing; the rest are asked for in
+    one more query, only when there are any. None: names nothing."""
+    owner, name = REPO_SLUG.split("/")
+    open_now = {i["number"] for i in prs + issues}
+    named = {i["number"]: merger.blockers_of(i) for i in issues}
+    ask = sorted(set().union(*named.values()) - open_now) if named else []
+    def look_up(numbers):
+        query = BLOCKER_QUERY % "\n".join(BLOCKER_FIELD % (b, b)
+                                           for b in numbers)
+        repo = github.api("graphql", "-f", "query=" + query,
+                          "-F", "owner=" + owner, "-F", "name=" + name
+                          )["data"]["repository"]
+        return {b: repo.get("n%d" % b) or None for b in numbers}
+    found = {}
+    if ask:
+        # GitHub fails the whole query when one number names nothing, so
+        # a mistyped line mustn't stop every run: ask one at a time then,
+        # and leave out what still fails.
+        try:
+            found = look_up(ask)
+        except Exception:  # noqa: BLE001 - gh's failures vary
+            for b in ask:
+                try:
+                    found.update(look_up([b]))
+                except Exception:  # noqa: BLE001
+                    found[b] = None
+    for issue in issues:
+        issue["blockedBy"] = {
+            b: {"state": "OPEN", "closedAt": None} if b in open_now
+            else found.get(b) for b in named[issue["number"]]}
 
 
 # --- state and wakes --------------------------------------------------------

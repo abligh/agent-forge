@@ -96,8 +96,10 @@ def pr_node(number=41, author=LEADDEV, labels=(), draft=False,
                 else None}}]}}
 
 
-def issue_node(number=22, author=LEADDEV, labels=(), comments=()):
-    return {"number": number, "author": {"login": author},
+def issue_node(number=22, author=LEADDEV, labels=(), comments=(), body="",
+               created=T0, edited=None):
+    return {"number": number, "author": {"login": author}, "body": body,
+            "createdAt": created, "lastEditedAt": edited,
             "labels": {"nodes": [{"name": l} for l in labels]},
             "comments": {"nodes": list(comments)}}
 
@@ -373,6 +375,91 @@ class PullRequestRules(unittest.TestCase):
         d = decide_pr(pr_node(reviews=[review(REVIEWER, "APPROVED", T1)],
                               comments=[comment("someone", T2)]))
         self.assertNobody(d, None)
+
+
+def blockers_page(**found):
+    """The answer to the Blocked-by query: n<number> -> its state."""
+    return {"data": {"repository": {
+        k: ({"state": v[0], "closedAt": v[1]} if v else None)
+        for k, v in found.items()}}}
+
+
+class GitHubFailingOn:
+    """FakeGitHub, but a Blocked-by query naming `bad` fails, as GitHub
+    fails a query naming a number that doesn't exist."""
+
+    def __init__(self, bad, *pages):
+        self.bad, self.fake = bad, FakeGitHub(*pages)
+
+    def api(self, *args):
+        if any("n%d:" % self.bad in a for a in args):
+            raise RuntimeError("gh api graphql: Could not resolve")
+        return self.fake.api(*args)
+
+
+class UnblockedRule(unittest.TestCase):
+    """Rule 14: an issue whose Blocked-by items have all closed."""
+
+    BODY = "Next step.\n\nBlocked-by: #1\nBlocked-by: #2\n"
+
+    def decide(self, *pages, issues=None, github=None):
+        node = issue_node(number=30, labels=["Owner:LeadDev"], body=self.BODY)
+        github = github or FakeGitHub(response([], issues or [node]), *pages)
+        _, got = r.fetch(github)
+        return r.route_issue(got[0], ROSTER), github
+
+    def test_one_still_open_is_nobodys(self):
+        d, _ = self.decide(blockers_page(n1=("MERGED", T2)),
+                           issues=[issue_node(number=30, labels=["Owner:LeadDev"],
+                                              body=self.BODY),
+                                   issue_node(number=2)])
+        self.assertIsNone(d["who"])
+
+    def test_all_closed_is_the_owners_once_with_the_last_close(self):
+        d, github = self.decide(blockers_page(n1=("MERGED", T1),
+                                              n2=("CLOSED", T2)))
+        self.assertEqual((d["who"], d["rule"], d["event"]),
+                         ("LeadDev", 14, T2))
+        self.assertEqual(d["line"], "#30 unblocked: #1, #2 closed")
+        self.assertEqual(len(github.calls), 2)
+
+    def test_a_line_written_after_the_close_does_not_wake(self):
+        node = issue_node(number=30, labels=["Owner:LeadDev"], body=self.BODY,
+                          edited=T3)
+        d, _ = self.decide(blockers_page(n1=("MERGED", T1),
+                                         n2=("CLOSED", T2)), issues=[node])
+        self.assertIsNone(d["who"])
+
+    def test_the_owner_speaking_after_the_close_ends_it(self):
+        node = issue_node(number=30, labels=["Owner:LeadDev"], body=self.BODY,
+                          comments=[comment(LEADDEV, T3)])
+        d, _ = self.decide(blockers_page(n1=("MERGED", T1),
+                                         n2=("CLOSED", T2)), issues=[node])
+        self.assertIsNone(d["who"])
+
+    def test_no_owner_label_goes_to_the_author(self):
+        node = issue_node(number=30, author=REVIEWER, body=self.BODY)
+        d, _ = self.decide(blockers_page(n1=("MERGED", T1),
+                                         n2=("CLOSED", T2)), issues=[node])
+        self.assertEqual((d["who"], d["rule"]), ("Reviewer", 14))
+
+    def test_a_line_in_code_does_not_count_and_no_query_is_made(self):
+        node = issue_node(number=30, labels=["Owner:LeadDev"],
+                          body="```\nBlocked-by: #1\n```\n")
+        github = FakeGitHub(response([], [node]))
+        d, _ = self.decide(github=github)
+        self.assertIsNone(d["who"])
+        self.assertEqual(len(github.calls), 1)
+
+    def test_a_number_naming_nothing_is_left_out(self):
+        github = GitHubFailingOn(
+            2, response([], [issue_node(number=30, labels=["Owner:LeadDev"],
+                                        body=self.BODY)]),
+            blockers_page(n1=("MERGED", T1)))
+        d, _ = self.decide(github=github)
+        self.assertEqual((d["who"], d["rule"], d["event"]),
+                         ("LeadDev", 14, T1))
+        self.assertEqual(d["line"], "#30 unblocked: #1 closed")
 
 
 class IssueRules(unittest.TestCase):
