@@ -158,6 +158,14 @@ class Check(unittest.TestCase):
             "checks.caches must map variables to directory names",
             "checks.poster 'Nobody' is no App in the configuration"])
 
+    def test_labels_and_relay(self):
+        self.assertEqual(self.problems(
+            labels={"owner_prefix": 1, "other": "kept"},
+            relay={"url": 2, "remind_seconds": 0}), [
+            "labels.owner_prefix must be a string",
+            "relay.url must be a string",
+            "relay.remind_seconds must be at least 1"])
+
     def test_host_keys_are_strings(self):
         self.assertEqual(
             self.problems(host_settings={"host_keys": ["a", 1]}),

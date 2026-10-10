@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+"""Wake each agent whose turn an open issue or pull request is.
+
+Nothing else tells an agent that it is its turn. This reads every open
+issue and pull request with one GraphQL query, decides whose turn each
+is from GitHub alone, and sends each agent one XMPP message, through
+the host's webhook relay (xmpp-mcp's `xmpp-webhook-relay`), listing the
+items that became its turn.
+
+The labels are the configuration's `labels`: `owner_prefix` (default
+`Owner:`), `waiting_on_owner` (default `Status:waiting-owner`) and
+`waiting_external` (default `Status:waiting-external`). "The owner" is
+the person whose login is the configuration's `owner`.
+
+**Whose turn it is.** The first rule that matches decides; none means
+nobody's.
+
+Pull requests:
+
+1. a draft, or waiting on the owner or on someone outside: nobody's;
+2. a Merger hand-back of the current head is the newest thing said (a
+   comment by the Merger, "Not merging <head>:", newer than every review
+   and every author comment): the approving reviewer's if it starts
+   `Not-a-review`, otherwise the author's;
+3. a reviewer's newest review is at the head, is `CHANGES_REQUESTED` or
+   `COMMENTED`, and has no author comment after it: the author's;
+4. the build check's status (`checks.context`) is `failure` or `error`
+   on the head: the author's;
+5. it is `pending` or absent on the head: nobody's;
+6. a reviewer's newest review is `APPROVED`, covers the head, and
+   nothing has been said after it (by `forge-merger`'s own test):
+   nobody's, it is the Merger's;
+7. green and authored by the only reviewer: nobody's, and printed;
+8. green, and no reviewer has reviewed it: no reviewer's review at the
+   head (or approval covering it), or an author comment after the
+   newest one: the pull request's reviewer's.
+
+**A reviewer** is an agent the configuration marks `"kind":
+"reviewer"`. **A pull request's reviewer** is the one, other than its
+author, whose `reviews` path globs match the most changed lines; a tie,
+and lines nobody's globs match, go to the reviewer listed first.
+
+Issues:
+
+9. waiting on someone outside: nobody's;
+10. waiting on the owner, and a comment by the owner newer than the
+    item owner's last comment: the item owner's (`Owner:<Name>`, else
+    the issue's author), because the owner has answered. A comment by
+    the owner's login whose last non-empty line is `— <Name>`, for any
+    agent or machinery App in the configuration, is an agent writing
+    under the owner's login, not the owner;
+11. waiting on the owner otherwise: nobody's;
+12. `Owner:<Name>` and a comment by anyone but Name newer than Name's
+    last comment: Name's;
+13. no `Owner:` label, and a comment by the owner newer than the issue
+    author's last comment: the author's, with rule 10's exception. The
+    owner usually takes the waiting label off when answering, which
+    ends rule 10.
+
+**Who wrote something is read from its login**, never its text (but
+for rule 10's exception): an App's bot login (`<slug>[bot]`) maps to
+its name through the configuration, the Merger's under `machinery`,
+and the `owner` login is the owner. What a review saw is read from the
+commit it was made at, never a clock: a review is at the head when its
+commit is the head, and an approval covers the head when its commit is
+the head or every commit after it on the pull request is a merge (two
+parents). An author's comment is an issue comment or a review by the
+author's login. Only a status the poster's App posted counts, as for
+the Merger.
+
+**Who is woken.** A turn that falls to someone not in the
+configuration's `agents`, such as the owner's own pull request, is
+printed and logged once, and not sent. A wake is addressed to the
+agent's session name: the entry's `session_name`, else
+`naming.session_prefix` and its name.
+
+**Once per turn.** A turn's key is (agent, the time of the event that
+started it). The rule is recorded but is not part of the key: rules 10,
+12 and 13 all mean "you were answered", and a label coming off turns
+one into another for the same comment. `state.json` in the state
+directory records, per item, the turn last woken and when. A turn is
+woken when its key is new, and again only as a reminder once
+`relay.remind_seconds` (default 7200; `$FORGE_ROUTER_REMIND`
+overrides it) have passed. `wakes.jsonl` appends every wake sent,
+failed or withheld, with the reason.
+
+**One message per agent per run**, posted verbatim (`X-XMPP-Verbatim:
+1`, `text/plain`, `X-Webhook-Token` from `relay.token_file`, default
+`~/.config/xmpp-webhook-relay/token`) to `/agent/<session name>` on the
+relay at `relay.url` (default `http://127.0.0.1:8788`;
+`$FORGE_ROUTER_RELAY` overrides it). The relay resolves the name
+against the room its agents share. Only a `200` counts: a
+`404` (no such session in the room), `409`, `503`, any other answer or
+no connection leaves every item in the message due, and the next run
+tries again. State is written only after a `200`.
+
+**Without `--send` it is a dry run**: it prints each decision and the
+messages it would send, sends nothing, takes no lock and leaves
+`state.json` alone. It appends each turn it would send or withhold to
+`dry-run.jsonl`, once per turn key (`dry-state.json` remembers which),
+so its decisions can be compared with what happened. `--only N[,N]`
+routes those items alone, for a run started by one event. A sending
+run holds an exclusive `flock` on `lock` in the state directory across
+read, decide, send and write, so cron's runs and an event's runs never
+wake the same turn twice; one that can't have it
+within LOCK_WAIT_S says BUSY and exits 0.
+
+GitHub is read as the Merger's App. The state directory is
+~/.local/state/agent-forge/<project>/router; the configuration is the
+cron checkout's (`$FORGE_CRON_CHECKOUT`).
+
+Exit 0 when the run finished; 1 when a wake was not accepted (it stays
+due); 2 when the question could not be asked (no token, GitHub failed).
+"""
+
+import argparse
+import datetime
+import fcntl
+import fnmatch
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# The Merger's hand-back names the head it judged, in both its forms.
+HAND_BACK_RE = re.compile(r"^Not merging ([0-9a-f]{7,40}):", re.MULTILINE)
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(BIN))
+from agent_forge import config, locks  # noqa: E402
+
+
+def _load(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+# The Merger's own test of "nothing said since the approval", its `gh
+# api` wrapper and its token minting, so the two never disagree.
+merger = _load("forge_merger", os.path.join(BIN, "forge-merger"))
+
+# Set from the project's configuration by `configure`.
+REPO_SLUG = ""
+ACT_AS = "Merger"
+MERGER = "Merger"
+OWNER = ""
+WAITING_OWNER = "Status:waiting-owner"
+WAITING_EXTERNAL = "Status:waiting-external"
+OWNER_PREFIX = "Owner:"
+STATUS_CONTEXT = "vm/build-and-test"
+DEFAULT_RELAY = "http://127.0.0.1:8788"
+RELAY = DEFAULT_RELAY
+DEFAULT_TOKEN_FILE = "~/.config/xmpp-webhook-relay/token"
+TOKEN_FILE = os.path.expanduser(DEFAULT_TOKEN_FILE)
+DEFAULT_REMIND_S = 7200
+REMIND_S = DEFAULT_REMIND_S
+POST_TIMEOUT_S = 15
+# Seconds a sending run waits for another's lock before saying BUSY.
+LOCK_WAIT_S = 60
+
+QUERY = """
+query($owner:String!, $name:String!, $prCursor:String, $issueCursor:String,
+      $prs:Boolean!, $issues:Boolean!) {
+  repository(owner:$owner, name:$name) {
+    pullRequests(states:OPEN, first:30, after:$prCursor) @include(if:$prs) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number isDraft headRefOid author { login }
+        labels(first:30) { nodes { name } }
+        files(first:100) { nodes { path additions deletions } }
+        reviews(last:100) {
+          nodes { databaseId author { login } state submittedAt body
+                  commit { oid } comments { totalCount } }
+        }
+        comments(last:100) {
+          nodes { databaseId author { login } createdAt body }
+        }
+        commits(last:100) {
+          nodes { commit { oid parents { totalCount } } }
+        }
+        headCommit: commits(last:1) {
+          nodes { commit { oid
+            status { contexts { context state createdAt
+                                creator { login } } } } }
+        }
+      }
+    }
+    issues(states:OPEN, first:50, after:$issueCursor) @include(if:$issues) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number author { login }
+        labels(first:30) { nodes { name } }
+        comments(last:100) {
+          nodes { databaseId author { login } createdAt body }
+        }
+      }
+    }
+  }
+}"""
+
+
+def configure(project):
+    """Set the module's settings, and the Merger's, from `project`."""
+    global REPO_SLUG, ACT_AS, MERGER, OWNER, WAITING_OWNER, WAITING_EXTERNAL
+    global OWNER_PREFIX, STATUS_CONTEXT, RELAY, TOKEN_FILE, REMIND_S
+    merger.configure(project)
+    labels, relay = project.section("labels"), project.section("relay")
+    REPO_SLUG = project.repo
+    ACT_AS = MERGER = merger.ACT_AS
+    OWNER = project.owner.lower()
+    WAITING_OWNER = labels.get("waiting_on_owner", "Status:waiting-owner")
+    WAITING_EXTERNAL = labels.get("waiting_external",
+                                  "Status:waiting-external")
+    OWNER_PREFIX = labels.get("owner_prefix", "Owner:")
+    STATUS_CONTEXT = merger.STATUS_CONTEXT
+    RELAY = relay.get("url", DEFAULT_RELAY)
+    TOKEN_FILE = os.path.expanduser(relay.get("token_file",
+                                              DEFAULT_TOKEN_FILE))
+    REMIND_S = relay.get("remind_seconds", DEFAULT_REMIND_S)
+
+
+def parse_time(stamp):
+    return datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc)
+
+
+# --- who is who -------------------------------------------------------------
+
+
+class Roster:
+    """The configuration's Apps: names to logins and session names, and
+    back. Only `agents` are woken; machinery (the Merger) is known by
+    login and signature but is never anyone's turn."""
+
+    def __init__(self, project):
+        self.project = project
+        self.agents = project.agents
+        self.machinery = project.machinery
+        self.by_login = {self.slug(n): n
+                         for n in list(self.agents) + list(self.machinery)}
+
+    def slug(self, name):
+        return self.project.slug(name)
+
+    def who(self, login):
+        """The name a login maps to, or the login itself."""
+        login = strip_bot(login)
+        return self.by_login.get(login, login or "ghost")
+
+    def login_of(self, who):
+        """The login, without "[bot]", of a name or of a plain login."""
+        if who in self.agents or who in self.machinery:
+            return self.slug(who)
+        return (who or "").lower()
+
+    def is_agent(self, who):
+        return who in self.agents
+
+    def signatures(self):
+        """Every sign-off line an agent or the Merger ends a comment
+        with."""
+        return {"— " + n for n in list(self.agents) + list(self.machinery)}
+
+    def session_name(self, who):
+        return self.project.session_name(who)
+
+    def reviewers(self):
+        """Every agent of kind `reviewer`, in the configuration's order."""
+        return self.project.reviewers()
+
+    def reviewer_logins(self):
+        return {self.slug(n) for n in self.reviewers()}
+
+    def reviewer_for(self, pr):
+        """The reviewer whose `reviews` globs match the most changed
+        lines of `pr`, leaving out its author. A tie, and lines no
+        reviewer's globs match, go to the first listed. None when no
+        reviewer but the author exists."""
+        author = self.who(author_of(pr))
+        names = [n for n in self.reviewers() if n != author]
+        if not names:
+            return None
+        score = dict.fromkeys(names, 0)
+        for f in pr.get("files") or []:
+            lines = (f.get("additions") or 0) + (f.get("deletions") or 0)
+            path = f.get("path") or ""
+            owner = next((n for n in names if any(
+                fnmatch.fnmatchcase(path, glob)
+                for glob in self.agents[n].get("reviews") or [])), names[0])
+            score[owner] += lines
+        return max(names, key=lambda n: (score[n], -names.index(n)))
+
+
+def strip_bot(login):
+    """A login lowercased, without the "[bot]" REST adds and GraphQL
+    leaves off."""
+    login = (login or "").lower()
+    return login[:-len("[bot]")] if login.endswith("[bot]") else login
+
+
+def author_of(node):
+    return strip_bot(((node or {}).get("author") or {}).get("login"))
+
+
+# --- the rules --------------------------------------------------------------
+
+
+def labels_of(item):
+    return [l.get("name") or "" for l in item.get("labels") or []]
+
+
+def owner_of(item):
+    """The Name of the first `Owner:<Name>` label, by name, or None."""
+    for name in sorted(labels_of(item)):
+        if name.startswith(OWNER_PREFIX) and name[len(OWNER_PREFIX):].strip():
+            return name[len(OWNER_PREFIX):].strip()
+    return None
+
+
+def last_by(items, logins, stamp="createdAt"):
+    """The newest `stamp` of the `items` written by one of `logins`, or
+    "" when there is none. GitHub's UTC times compare as strings."""
+    return max((i.get(stamp) or "" for i in items
+                if author_of(i) in logins), default="")
+
+
+def status_of(pr):
+    """The newest Merger-posted vm/build-and-test context on the head
+    commit, or None."""
+    nodes = (pr.get("headCommit") or {}).get("nodes") or []
+    commit = (nodes[-1] or {}).get("commit") if nodes else None
+    if not commit or commit.get("oid") != pr.get("headRefOid"):
+        return None
+    status = None
+    for ctx in ((commit.get("status") or {}).get("contexts")) or []:
+        creator = strip_bot((ctx.get("creator") or {}).get("login"))
+        if (ctx.get("context") == STATUS_CONTEXT
+                and creator == strip_bot(merger.STATUS_CREATOR)
+                and (status is None or (ctx.get("createdAt") or "")
+                     > (status.get("createdAt") or ""))):
+            status = ctx
+    return status
+
+
+def commit_of(review):
+    return (review.get("commit") or {}).get("oid") or ""
+
+
+def at_head(review, pr):
+    """True when `review` was made at the pull request's head commit."""
+    return commit_of(review) == pr.get("headRefOid")
+
+
+def covers_head(review, pr):
+    """True when `review` was made at the head, or every commit after
+    its own on the pull request is a merge (two parents): the Merger's
+    update-branch merges of main. A commit not one of the pull request's
+    (last 100) commits covers nothing."""
+    if at_head(review, pr):
+        return True
+    oids = [((n or {}).get("commit") or {})
+            for n in (pr.get("commits") or {}).get("nodes") or []]
+    at = [i for i, c in enumerate(oids) if c.get("oid") == commit_of(review)]
+    if not at or not oids or oids[-1].get("oid") != pr.get("headRefOid"):
+        return False
+    return all(((c.get("parents") or {}).get("totalCount") or 0) == 2
+               for c in oids[at[-1] + 1:])
+
+
+def signed_by_agent(comment, roster):
+    """True when the comment's last non-empty line is an agent's or the
+    Merger's sign-off."""
+    lines = [l.strip() for l in (comment.get("body") or "").splitlines()
+             if l.strip()]
+    return bool(lines) and lines[-1] in roster.signatures()
+
+
+def turn(number, who, rule, event, line):
+    return {"item": number, "who": who, "rule": rule, "event": event,
+            "line": "#%d %s" % (number, line)}
+
+
+def nobody(number, rule, why):
+    return {"item": number, "who": None, "rule": rule, "why": why}
+
+
+def route_pr(pr, roster):
+    """The turn for one pull request, as `turn` or `nobody` builds it."""
+    n, head = pr["number"], pr.get("headRefOid") or ""
+    labels = labels_of(pr)
+    # Rule 1.
+    if pr.get("isDraft"):
+        return nobody(n, 1, "draft")
+    for label in (WAITING_OWNER, WAITING_EXTERNAL):
+        if label in labels:
+            return nobody(n, 1, label)
+    author_login = author_of(pr)
+    author = roster.who(author_login)
+    reviewer_logins = roster.reviewer_logins() - {strip_bot(author_login)}
+    status = status_of(pr)
+    reviews = [r for r in pr.get("reviews") or [] if r.get("submittedAt")]
+    comments = pr.get("comments") or []
+    spoke = max(last_by(comments, {author_login}),
+                last_by(reviews, {author_login}, "submittedAt"))
+
+    # Rule 2. A hand-back names the head it judged ("Not merging
+    # <head[:10]>:"), and holds only while that is still the head: a push
+    # is neither a comment nor a review, so without this a fixed and
+    # green head would stay the author's for ever.
+    handed = [c for c in comments
+              if author_of(c) == roster.login_of(MERGER)]
+    if handed:
+        back = max(handed, key=lambda c: c.get("createdAt") or "")
+        when = back.get("createdAt") or ""
+        newest_review = max((r["submittedAt"] for r in reviews), default="")
+        judged = HAND_BACK_RE.search(back.get("body") or "")
+        if (judged and head.startswith(judged.group(1))
+                and when > newest_review and when > spoke):
+            to = author
+            if (back.get("body") or "").lstrip().startswith("Not-a-review"):
+                approval = merger.approval_of(dict(pr, reviews=reviews),
+                                              roster.reviewer_logins())
+                to = (roster.who(author_of(approval)) if approval
+                      else roster.reviewer_for(pr) or roster.reviewers()[0])
+            return turn(n, to, 2, when, "the Merger handed it back "
+                        "(comment %s)" % back.get("databaseId"))
+    # Rule 3.
+    theirs = [r for r in reviews
+              if strip_bot(author_of(r)) in reviewer_logins]
+    newest = max(theirs, key=lambda r: r["submittedAt"]) if theirs else None
+    if (newest is not None and at_head(newest, pr)
+            and newest.get("state") in ("CHANGES_REQUESTED", "COMMENTED")
+            and spoke <= newest["submittedAt"]):
+        said = ("asked for changes" if newest["state"] == "CHANGES_REQUESTED"
+                else "commented")
+        return turn(n, author, 3, newest["submittedAt"],
+                    "%s %s (review %s)" % (roster.who(author_of(newest)), said,
+                                           newest.get("databaseId")))
+    state = ((status or {}).get("state") or "").lower()
+    # Rule 4.
+    if state in ("failure", "error"):
+        return turn(n, author, 4, status.get("createdAt") or head,
+                    "%s is %s at %s" % (STATUS_CONTEXT, state, head[:7]))
+    # Rule 5.
+    if state != "success":
+        return nobody(n, 5, "%s is %s" % (STATUS_CONTEXT, state or "absent"))
+    # Rule 6.
+    if (newest is not None and newest.get("state") == "APPROVED"
+            and covers_head(newest, pr)
+            and not merger.said_since(dict(pr, reviews=reviews,
+                                           comments=comments), newest)):
+        return nobody(n, 6, "the Merger's: approved, nothing said since")
+    # Rule 7.
+    reviewer = roster.reviewer_for(pr)
+    if reviewer is None:
+        return nobody(n, 7, "green, and %s's own: no second reviewer"
+                      % author)
+    # Rule 8.
+    seen = [r for r in theirs if at_head(r, pr) or (
+        r.get("state") == "APPROVED" and covers_head(r, pr))]
+    last = max((r["submittedAt"] for r in seen), default=None)
+    if last is None or spoke > last:
+        return turn(n, reviewer, 8, max(status.get("createdAt") or "", spoke),
+                    "needs your review (green at %s)" % head[:7])
+    return nobody(n, None, "no rule matched")
+
+
+def route_issue(issue, roster):
+    """The turn for one issue, as `turn` or `nobody` builds it."""
+    n = issue["number"]
+    labels = labels_of(issue)
+    comments = issue.get("comments") or []
+    owner = owner_of(issue)
+    # Rule 9.
+    if WAITING_EXTERNAL in labels:
+        return nobody(n, 9, WAITING_EXTERNAL)
+    if WAITING_OWNER in labels:
+        # Rule 10.
+        answered = owner_answered(n, issue, owner, comments, roster, 10)
+        # Rule 11.
+        return answered or nobody(n, 11, WAITING_OWNER)
+    # Rule 12.
+    if owner:
+        mine = {roster.login_of(owner)}
+        theirs = last_by(comments, mine)
+        others = [c for c in comments if author_of(c) not in mine
+                  and (c.get("createdAt") or "") > theirs]
+        if others:
+            newest = max(others, key=lambda c: c.get("createdAt") or "")
+            return turn(n, owner, 12, newest["createdAt"],
+                        "has a comment by %s (comment %s)" % (
+                            roster.who(author_of(newest)),
+                            newest.get("databaseId")))
+    # Rule 13: the owner usually takes the waiting label off when
+    # answering, which ends rule 10.
+    if not owner:
+        answered = owner_answered(n, issue, None, comments, roster, 13)
+        if answered:
+            return answered
+    return nobody(n, None, "no rule matched")
+
+
+def owner_answered(n, issue, owner, comments, roster, rule):
+    """The item owner's turn (`Owner:<Name>`, else the issue's author)
+    when a comment by the project's owner is newer than their last,
+    else None."""
+    who = owner or roster.who(author_of(issue))
+    theirs = last_by(comments, {roster.login_of(who)})
+    answers = [c for c in comments if author_of(c) == OWNER
+               and (c.get("createdAt") or "") > theirs
+               and not signed_by_agent(c, roster)]
+    if not answers:
+        return None
+    newest = max(answers, key=lambda c: c.get("createdAt") or "")
+    return turn(n, who, rule, newest["createdAt"],
+                "%s answered (comment %s)" % (OWNER, newest.get("databaseId")))
+
+
+# --- GitHub -----------------------------------------------------------------
+
+
+def fetch(github):
+    """(pull requests, issues): every open one, as GraphQL's nodes with
+    their connections flattened to lists."""
+    owner, name = REPO_SLUG.split("/")
+    prs, issues = [], []
+    cursors = {"prCursor": None, "issueCursor": None}
+    more = {"prs": True, "issues": True}
+    while more["prs"] or more["issues"]:
+        args = ["graphql", "-f", "query=" + QUERY, "-F", "owner=" + owner,
+                "-F", "name=" + name,
+                "-F", "prs=%s" % str(more["prs"]).lower(),
+                "-F", "issues=%s" % str(more["issues"]).lower()]
+        for key, cursor in cursors.items():
+            if cursor:
+                args += ["-f", "%s=%s" % (key, cursor)]
+        repo = github.api(*args)["data"]["repository"]
+        for kind, conn, out, cursor in (
+                ("prs", "pullRequests", prs, "prCursor"),
+                ("issues", "issues", issues, "issueCursor")):
+            if not more[kind]:
+                continue
+            page = repo[conn]
+            for node in page["nodes"]:
+                for field in ("labels", "reviews", "comments", "files"):
+                    if isinstance(node.get(field), dict):
+                        node[field] = node[field].get("nodes") or []
+                out.append(node)
+            more[kind] = page["pageInfo"]["hasNextPage"]
+            cursors[cursor] = page["pageInfo"]["endCursor"]
+    return prs, issues
+
+
+# --- state and wakes --------------------------------------------------------
+
+
+# What makes a turn new. The rule is recorded beside them, not compared.
+TURN_FIELDS = ("agent", "event")
+
+
+def key_of(decision):
+    return {"agent": decision["who"], "rule": decision["rule"],
+            "event": decision["event"]}
+
+
+def same_turn(entry, decision):
+    """Whether `entry`, as recorded, is `decision`'s turn."""
+    key = key_of(decision)
+    return bool(entry) and all(entry.get(k) == key[k] for k in TURN_FIELDS)
+
+
+def due(decision, entry, when, remind_s):
+    """None when `decision`'s turn needs no wake now; "new" for a key
+    not woken before; "reminder" for one woken `remind_s` or more ago."""
+    if not same_turn(entry, decision):
+        return "new"
+    if entry.get("withheld"):
+        return None
+    try:
+        woken = parse_time(entry["woken_at"])
+    except (KeyError, TypeError, ValueError):
+        return "new"
+    return "reminder" if (when - woken).total_seconds() >= remind_s else None
+
+
+def message(lines):
+    return "From: Router\nYour turn:\n" + "\n".join(lines) + "\n"
+
+
+def relay_token(path=None):
+    """The relay's shared token from its environment file, or None."""
+    path = path or TOKEN_FILE
+    try:
+        with open(path) as handle:
+            for line in handle:
+                key, _, value = line.strip().partition("=")
+                if key.strip() == "WEBHOOK_TOKEN" and value.strip():
+                    return value.strip().strip("'\"")
+    except OSError:
+        pass
+    return None
+
+
+def make_poster(relay, token, opener=urllib.request.urlopen):
+    """A function (session name, text) -> None when the relay answered
+    200, else why not. Every other answer, or none, leaves the wake due.
+    No reason ever contains the token."""
+
+    def post(session, text):
+        if not token:
+            return "no relay token in %s" % TOKEN_FILE
+        url = "%s/agent/%s" % (relay.rstrip("/"),
+                               urllib.parse.quote(session, safe=""))
+        req = urllib.request.Request(
+            url, data=text.encode("utf-8"), method="POST",
+            headers={"X-Webhook-Token": token, "X-XMPP-Verbatim": "1",
+                     "Content-Type": "text/plain; charset=utf-8"})
+        try:
+            with opener(req, timeout=POST_TIMEOUT_S) as resp:
+                code = resp.status
+        except urllib.error.HTTPError as err:
+            try:
+                detail = json.loads(err.read(2000) or b"{}").get("reason")
+            except (ValueError, AttributeError, OSError):
+                detail = None
+            return "HTTP %d%s" % (err.code, " " + detail if detail else "")
+        except (urllib.error.URLError, OSError) as err:
+            return "relay unreachable: %s" % getattr(err, "reason", err)
+        return None if code == 200 else "HTTP %d" % code
+
+    return post
+
+
+def run(github, roster, state_dir, send, post=None, only=None, out=print,
+        when=None, remind_s=None):
+    """One run: route every open item, or `only` those numbers, and
+    when `send`, wake each agent with its due items and record it.
+    Returns the number of agents whose wake was not accepted."""
+    when = when or merger.now_utc()
+    remind_s = REMIND_S if remind_s is None else remind_s
+    prs, issues = fetch(github)
+    decisions = [route_pr(p, roster) for p in prs]
+    decisions += [route_issue(i, roster) for i in issues]
+    waiting = sum(1 for i in issues if WAITING_OWNER in labels_of(i))
+    if only:
+        decisions = [d for d in decisions if d["item"] in only]
+    decisions.sort(key=lambda d: d["item"])
+    state_path = os.path.join(state_dir, "state.json")
+    state = merger.load_json(state_path, {})
+    items = state.setdefault("items", {})
+    log, batches, would = [], {}, []
+    for d in decisions:
+        if d["who"] is None:
+            if not send or d["rule"] == 7:
+                out("#%d nobody's (%s)" % (
+                    d["item"], d["why"] if d["rule"] is None
+                    else "rule %d: %s" % (d["rule"], d["why"])))
+            items.pop(str(d["item"]), None)
+            continue
+        why = due(d, items.get(str(d["item"])), when, remind_s)
+        if why is None:
+            if not send:
+                out("#%d %s's, rule %d: already woken" % (
+                    d["item"], d["who"], d["rule"]))
+                would.append((d, d["line"], "withheld: already woken"))
+            continue
+        if not roster.is_agent(d["who"]):
+            out("#%d %s's, rule %d: withheld, %s is not an agent" % (
+                d["item"], d["who"], d["rule"], d["who"]))
+            items[str(d["item"])] = dict(key_of(d), withheld=True,
+                                         at=merger.iso(when))
+            log.append(dict(key_of(d), item=d["item"], line=d["line"],
+                            outcome="withheld: not an agent"))
+            would.append((d, d["line"], "withheld: not an agent"))
+            continue
+        line = d["line"] + (" (reminder)" if why == "reminder" else "")
+        would.append((d, line, "would send to %s" % roster.session_name(
+            d["who"])))
+        batches.setdefault(d["who"], []).append((d, line))
+    failed = 0
+    for who in sorted(batches):
+        session = roster.session_name(who)
+        numbers = ", ".join("#%d" % d["item"] for d, _ in batches[who])
+        text = message([line for _, line in batches[who]])
+        if not send:
+            out("WOULD SEND to %s:\n%s" % (session, text.rstrip("\n")))
+            continue
+        problem = post(session, text)
+        if problem:
+            failed += 1
+            out("NOT SENT to %s: %s; %s stay due" % (session, problem,
+                                                      numbers))
+        else:
+            out("SENT to %s: %s" % (session, numbers))
+        for d, line in batches[who]:
+            log.append(dict(key_of(d), item=d["item"], line=line,
+                            session=session, outcome=(
+                                "not sent: " + problem if problem
+                                else "sent")))
+            if not problem:
+                items[str(d["item"])] = dict(key_of(d),
+                                             woken_at=merger.iso(when))
+    if not only:
+        for gone in set(items) - {str(d["item"]) for d in decisions}:
+            del items[gone]
+    out("%s %d open, %d turn(s) to wake, %d waiting on %s%s" % (
+        "ROUTED" if send else "DRY-RUN", len(prs) + len(issues),
+        sum(len(b) for b in batches.values()), waiting, OWNER,
+        "; %d wake(s) not sent" % failed if failed else ""))
+    if send:
+        os.makedirs(state_dir, exist_ok=True)
+        merger.save_json(state_path, state)
+        append_records(os.path.join(state_dir, "wakes.jsonl"), log, when)
+    else:
+        record_dry_run(state_dir, decisions, would, only, when)
+    return failed
+
+
+def append_records(path, records, when):
+    if not records:
+        return
+    with open(path, "a") as handle:
+        for record in records:
+            record["at"] = merger.iso(when)
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def record_dry_run(state_dir, decisions, would, only, when):
+    """Append each turn a dry run would send or withhold to
+    `dry-run.jsonl`, once per turn key: `dry-state.json` remembers the
+    key last recorded per item, apart from the real state, which a dry
+    run never touches."""
+    path = os.path.join(state_dir, "dry-state.json")
+    seen = merger.load_json(path, {})
+    records = []
+    for d, line, outcome in would:
+        if same_turn(seen.get(str(d["item"])), d):
+            continue
+        seen[str(d["item"])] = key_of(d)
+        records.append(dict(key_of(d), item=d["item"], line=line,
+                            outcome=outcome))
+    turns = {str(d["item"]) for d in decisions if d["who"] is not None}
+    for item in list(seen):
+        decided = any(str(d["item"]) == item for d in decisions)
+        if (decided or not only) and item not in turns:
+            del seen[item]
+    os.makedirs(state_dir, exist_ok=True)
+    merger.save_json(path, seen)
+    append_records(os.path.join(state_dir, "dry-run.jsonl"), records, when)
+
+
+def take_lock(handle, wait_s=LOCK_WAIT_S, sleep=time.sleep,
+              clock=time.monotonic):
+    """True once `handle` holds an exclusive flock, False after
+    `wait_s` seconds of trying."""
+    deadline = clock() + wait_s
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if clock() >= deadline:
+                return False
+            sleep(1)
+
+
+def parse_only(text):
+    try:
+        numbers = {int(n) for n in text.split(",") if n.strip()}
+    except ValueError:
+        numbers = set()
+    if not numbers or min(numbers) < 1:
+        raise argparse.ArgumentTypeError("--only takes numbers: N[,N]")
+    return numbers
+
+
+def main(argv=None, sh=merger.sh, out=print, post=None, roster=None,
+         environ=None, mint=None):
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(
+        prog="forge-router", description=__doc__.splitlines()[0])
+    parser.add_argument("--send", action="store_true",
+                        help="send the wakes and record them; without it, "
+                             "print the decisions and record them in "
+                             "dry-run.jsonl")
+    parser.add_argument("--only", type=parse_only, metavar="N[,N]",
+                        help="route only these issues or pull requests")
+    parser.add_argument("--state-dir", default=None,
+                        help="where state and records live (default "
+                        "~/.local/state/agent-forge/<project>/router)")
+    parser.add_argument("--checkout", default=environ.get(
+        "FORGE_CRON_CHECKOUT"), help="the checkout whose configuration "
+        "this reads (default $FORGE_CRON_CHECKOUT)")
+    args = parser.parse_args(argv)
+    if not args.checkout:
+        out("NO-CONFIG: no --checkout, and FORGE_CRON_CHECKOUT is not set")
+        return 2
+    try:
+        project = config.load(os.path.join(
+            os.path.expanduser(args.checkout), config.CONFIG_NAME))
+    except config.ConfigError as err:
+        out("NO-CONFIG: %s" % err)
+        return 2
+    configure(project)
+    state_dir = args.state_dir or locks.state_dir(project.name, "router",
+                                                  environ)
+    try:
+        remind_s = int(environ.get("FORGE_ROUTER_REMIND", REMIND_S))
+    except ValueError:
+        out("BAD-CONFIG: FORGE_ROUTER_REMIND is not a number of seconds")
+        return 2
+    roster = roster or Roster(project)
+    if post is None and args.send:
+        post = make_poster(environ.get("FORGE_ROUTER_RELAY", RELAY),
+                           relay_token())
+    mint = mint or merger.mint
+
+    def go():
+        token = mint(project, ACT_AS)
+        if token is None:
+            out("NO-TOKEN: could not mint %s's token" % ACT_AS)
+            return 2
+        try:
+            failed = run(merger.GitHub(token, sh), roster, state_dir,
+                         args.send, post, args.only, out, remind_s=remind_s)
+        except (RuntimeError, KeyError, TypeError, ValueError) as err:
+            out("FAILED: %s" % err)
+            return 2
+        return 1 if failed else 0
+
+    if not args.send:
+        return go()
+    os.makedirs(state_dir, exist_ok=True)
+    with open(os.path.join(state_dir, "lock"), "a") as lock:
+        if not take_lock(lock):
+            out("BUSY: another run held %s for %ds" % (lock.name, LOCK_WAIT_S))
+            return 0
+        return go()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

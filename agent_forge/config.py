@@ -61,6 +61,10 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
 CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "slots": int, "memory_max": str, "step_timeout_minutes": int}
 STEP = {"name": str, "run": list, "only_if": str}
+# Shared with tools not here yet: only these keys are checked.
+LABELS = {"owner_prefix": str, "status_prefix": str,
+          "waiting_on_owner": str, "waiting_external": str}
+RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 HOST_FILE = {"from": str, "to": str, "mode": str, "json": bool}
 # docs is shared by several tools, some not here yet, so only the keys
 # known are checked; another is left to its tool.
@@ -175,6 +179,15 @@ def check(data):
         name = merge.get("merger")
         if isinstance(name, str) and name not in data.get("machinery", {}):
             problems.append("merge.merger %r is not in machinery" % name)
+    for name, allowed in (("labels", LABELS), ("relay", RELAY)):
+        section = data.get(name, {})
+        for key, kinds in allowed.items():
+            if key in section and not _is(section[key], kinds):
+                problems.append("%s.%s must be %s"
+                                % (name, key, _type_name(kinds)))
+    if _is(data.get("relay", {}).get("remind_seconds"), int) and \
+            data["relay"]["remind_seconds"] < 1:
+        problems.append("relay.remind_seconds must be at least 1")
     checks = data.get("checks", {})
     for key, kinds in CHECKS.items():
         if key in checks and not _is(checks[key], kinds):

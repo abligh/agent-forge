@@ -22,7 +22,8 @@
     "Merger": {"app_id": 105, "installation_id": 205}
   },
   "labels": {"owner_prefix": "Owner:", "status_prefix": "Status:",
-             "waiting_on_owner": "Status:waiting-owner"},
+             "waiting_on_owner": "Status:waiting-owner",
+             "waiting_external": "Status:waiting-external"},
   "checks": {
     "context": "vm/build-and-test", "poster": "Merger", "slots": 2,
     "memory_max": "16G", "step_timeout_minutes": 30,
@@ -51,5 +52,8 @@
     ],
     "host_keys": ["skipWorkflowUsageWarning"]
   },
-  "relay": {"url": "http://127.0.0.1:8788/hook", "room": "everyone@conference.example.org"}
+  "relay": {"url": "http://127.0.0.1:8788",
+            "token_file": "~/.config/xmpp-webhook-relay/token",
+            "remind_seconds": 7200,
+            "room": "everyone@conference.example.org"}
 }

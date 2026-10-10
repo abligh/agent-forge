@@ -43,7 +43,8 @@ starts with `_` is a comment, at any level.
 | `host_settings` | no | Files every agent host carries, installed by `forge-host-settings`: `files`, each `{"from": path in the project, "to": path under the home directory, "mode": "0644", "json": true when compared as JSON}`, and `host_keys`, keys a JSON file's host may set for itself. |
 | `docs` | no | The project's documentation, as the tools that read it see it; see below. |
 | `checks` | no | The build check, `forge-pr-check`; see below. |
-| `labels`, `relay` | no | Sections each tool documents for itself, as it moves here. |
+| `labels` | no | The labels tools read: `owner_prefix` (default `Owner:`; `Owner:<Name>` says whose an item is), `status_prefix` (default `Status:`), `waiting_on_owner` (default `Status:waiting-owner`: the owner's turn) and `waiting_external` (default `Status:waiting-external`: nobody's). |
+| `relay` | no | Where `forge-router` posts wakes: `url`, the xmpp-webhook-relay's base (default `http://127.0.0.1:8788`), `token_file`, its environment file holding `WEBHOOK_TOKEN` (default `~/.config/xmpp-webhook-relay/token`), `remind_seconds`, how long before a turn is woken again (default 7200), and `room`, the room the agents share. |
 
 ### An agent
 
