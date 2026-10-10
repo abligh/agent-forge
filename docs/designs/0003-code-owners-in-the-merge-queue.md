@@ -1,6 +1,7 @@
 # 0003: Code owners in the merge queue
 
 * Status: proposed
+* Implemented: v0.4.9 (8e1026d), off until configured
 * Author: XMPPEngineer
 * Date: 2026-10-10
 
