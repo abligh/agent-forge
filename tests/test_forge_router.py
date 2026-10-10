@@ -19,6 +19,7 @@ import urllib.error
 from unittest import mock
 
 from agent_forge import config
+from agent_forge import rules_default as rules
 from tests.helpers import example, load_tool
 
 r = load_tool("forge-router")
@@ -46,11 +47,11 @@ def roster(agents, machinery=None):
     data["agents"] = agents
     if machinery is not None:
         data["machinery"] = machinery
-    return r.Roster(config.Project(data, None))
+    return rules.Roster(config.Project(data, None))
 
 
 # The example project, for the tests that pin what it says.
-LIVE = r.Roster(config.Project(example(), None))
+LIVE = rules.Roster(config.Project(example(), None))
 # The rules are tested against the example's LeadDev, Reviewer and
 # Helper, with Reviewer the one reviewer. TWO, below, adds a second.
 ROSTER = roster({name: example()["agents"][name]
@@ -143,12 +144,12 @@ class FailingGitHub:
 
 def decide_pr(node):
     prs, _ = r.fetch(FakeGitHub(response([node], [])))
-    return r.route_pr(prs[0], ROSTER)
+    return rules.route_pr(prs[0], ROSTER)
 
 
 def decide_issue(node):
     _, issues = r.fetch(FakeGitHub(response([], [node])))
-    return r.route_issue(issues[0], ROSTER)
+    return rules.route_issue(issues[0], ROSTER)
 
 
 class Mapping(unittest.TestCase):
@@ -407,7 +408,7 @@ class UnblockedRule(unittest.TestCase):
         node = issue_node(number=30, labels=["Owner:LeadDev"], body=self.BODY)
         github = github or FakeGitHub(response([], issues or [node]), *pages)
         _, got = r.fetch(github)
-        return r.route_issue(got[0], ROSTER), github
+        return rules.route_issue(got[0], ROSTER), github
 
     def test_one_still_open_is_nobodys(self):
         d, _ = self.decide(blockers_page(n1=("MERGED", T2)),
@@ -584,7 +585,7 @@ TWO = roster({
 
 def decide_two(node):
     prs, _ = r.fetch(FakeGitHub(response([node], [])))
-    return r.route_pr(prs[0], TWO)
+    return rules.route_pr(prs[0], TWO)
 
 
 class TwoReviewers(unittest.TestCase):
@@ -642,7 +643,7 @@ class TwoReviewers(unittest.TestCase):
         one = roster({"LeadDev": {}, "Reviewer": {"kind": "reviewer"}})
         prs, _ = r.fetch(FakeGitHub(response([pr_node(author=REVIEWER)],
                                              [])))
-        self.assertEqual(r.route_pr(prs[0], one)["rule"], 7)
+        self.assertEqual(rules.route_pr(prs[0], one)["rule"], 7)
 
     def test_the_example_has_two_reviewers_reviewer_first(self):
         # Reviewer first: unmatched lines go to the reviewer listed first.
@@ -1142,10 +1143,28 @@ class Main(unittest.TestCase):
 
     def test_the_owner_and_labels_come_from_the_configuration(self):
         self.main([])
-        self.assertEqual((r.OWNER, r.WAITING_OWNER, r.WAITING_EXTERNAL,
-                          r.OWNER_PREFIX),
+        self.assertEqual((rules.OWNER, rules.WAITING_OWNER,
+                          rules.WAITING_EXTERNAL, rules.OWNER_PREFIX),
                          ("example-owner", "Status:waiting-owner",
                           "Status:waiting-external", "Owner:"))
+
+    def test_rules_that_cant_be_loaded(self):
+        data = example()
+        data["router"] = {"rules": "missing.py"}
+        self.write_config(data)
+        self.assertEqual(self.main([]), (2, []))
+        self.assertIn("BAD-CONFIG: router.rules 'missing.py': no such file",
+                      self.lines[0])
+
+    def test_rules_from_the_project(self):
+        with open(os.path.join(self.checkout, "rules.py"), "w") as handle:
+            handle.write("from agent_forge.rules_default import *\n")
+        data = example()
+        data["router"] = {"rules": "rules.py"}
+        self.write_config(data)
+        self.assertEqual(self.main([])[0], 0)
+        self.assertEqual(r.RULES.__file__,
+                         os.path.join(self.checkout, "rules.py"))
 
     def test_no_token(self):
         self.assertEqual(self.main(["--send"], mint=None), (2, []))

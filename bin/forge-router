@@ -2,93 +2,33 @@
 """Wake each agent whose turn an open issue or pull request is.
 
 Nothing else tells an agent that it is its turn. This reads every open
-issue and pull request with one GraphQL query, decides whose turn each
-is from GitHub alone, and sends each agent one XMPP message, through
-the host's webhook relay (xmpp-mcp's `xmpp-webhook-relay`), listing the
+issue and pull request with one GraphQL query, asks the project's rules
+whose turn each is, and sends each agent one XMPP message, through the
+host's webhook relay (xmpp-mcp's `xmpp-webhook-relay`), listing the
 items that became its turn.
 
-The labels are the configuration's `labels`: `owner_prefix` (default
-`Owner:`), `waiting_on_owner` (default `Status:waiting-owner`) and
-`waiting_external` (default `Status:waiting-external`). "The owner" is
-the person whose login is the configuration's `owner`.
-
-**Whose turn it is.** The first rule that matches decides; none means
-nobody's.
-
-Pull requests:
-
-1. a draft, or waiting on the owner or on someone outside: nobody's;
-2. a Merger hand-back of the current head is the newest thing said (a
-   comment by the Merger, "Not merging <head>:", newer than every review
-   and every author comment): the approving reviewer's if it starts
-   `Not-a-review`, otherwise the author's;
-3. a reviewer's newest review is at the head, is `CHANGES_REQUESTED` or
-   `COMMENTED`, and has no author comment after it: the author's;
-4. the build check's status (`checks.context`) is `failure` or `error`
-   on the head: the author's;
-5. it is `pending` or absent on the head: nobody's;
-6. a reviewer's newest review is `APPROVED`, covers the head, and
-   nothing has been said after it (by `forge-merger`'s own test):
-   nobody's, it is the Merger's;
-7. green and authored by the only reviewer: nobody's, and printed;
-8. green, and no reviewer has reviewed it: no reviewer's review at the
-   head (or approval covering it), or an author comment after the
-   newest one: the pull request's reviewer's.
-
-**A reviewer** is an agent the configuration marks `"kind":
-"reviewer"`. **A pull request's reviewer** is the one, other than its
-author, whose `reviews` path globs match the most changed lines; a tie,
-and lines nobody's globs match, go to the reviewer listed first.
-
-Issues:
-
-9. waiting on someone outside: nobody's;
-10. waiting on the owner, and a comment by the owner newer than the
-    item owner's last comment: the item owner's (`Owner:<Name>`, else
-    the issue's author), because the owner has answered. A comment by
-    the owner's login whose last non-empty line is `— <Name>`, for any
-    agent or machinery App in the configuration, is an agent writing
-    under the owner's login, not the owner;
-11. waiting on the owner otherwise: nobody's;
-12. `Owner:<Name>` and a comment by anyone but Name newer than Name's
-    last comment: Name's;
-13. no `Owner:` label, and a comment by the owner newer than the issue
-    author's last comment: the author's, with rule 10's exception. The
-    owner usually takes the waiting label off when answering, which
-    ends rule 10;
-14. its body has `Blocked-by: #N` lines (one number a line, the
-    Merger's notation, outside code), every item they name is closed or
-    merged, and the last of those closed after the body was last
-    written and after the item owner's last comment: the item owner's
-    (`Owner:<Name>`, else the author), "unblocked". The event is that
-    last close, so it is woken once. A merged pull request is nobody's
-    turn, so without this a step waiting on others' work waits until
-    someone notices. A line written after its item closed doesn't
-    wake, and a number that names nothing is left out. Pull requests
-    don't need it: the Merger holds a blocked one and takes it up
-    itself.
-
-**Who wrote something is read from its login**, never its text (but
-for rule 10's exception): an App's bot login (`<slug>[bot]`) maps to
-its name through the configuration, the Merger's under `machinery`,
-and the `owner` login is the owner. What a review saw is read from the
-commit it was made at, never a clock: a review is at the head when its
-commit is the head, and an approval covers the head when its commit is
-the head or every commit after it on the pull request is a merge (two
-parents). An author's comment is an issue comment or a review by the
-author's login. Only a status the poster's App posted counts, as for
-the Merger.
+**The rules** are a module the configuration names in `router.rules`:
+`"default"`, the rules shipped here and the default, or a file in the
+project's own checkout, relative to its root. This is the engine every
+project shares: fetching, locking, state, the once-per-turn key,
+reminders, delivery and the journal. The rules say what a turn is and
+whom it falls to; agent_forge/rules_default.py lists the default ones,
+and agent_forge/router.py and docs/router.md the interface. The query
+asks for each item's number and what the rules declare, and each lookup
+the rules declare runs after it (the default rules' finds what each
+`Blocked-by:` line names).
 
 **Who is woken.** A turn that falls to someone not in the
 configuration's `agents`, such as the owner's own pull request, is
-printed and logged once, and not sent. A wake is addressed to the
-agent's session name: the entry's `session_name`, else
-`naming.session_prefix` and its name.
+printed and logged once, and not sent. Nobody's turn is forgotten, and
+printed in a dry run (and, for the default rules' rule 7, always). A
+wake is addressed to the agent's session name: the entry's
+`session_name`, else `naming.session_prefix` and its name.
 
-**Once per turn.** A turn's key is (agent, the time of the event that
-started it). The rule is recorded but is not part of the key: rules 10,
-12 and 13 all mean "you were answered", and a label coming off turns
-one into another for the same comment. `state.json` in the state
+**Once per turn.** A turn's key is (agent, the event that started it,
+as the rules say). The rule is recorded but is not part of the key:
+rules that mean the same thing can hand one turn between them, and a
+label coming off is enough to do it. `state.json` in the state
 directory records, per item, the turn last woken and when. A turn is
 woken when its key is new, and again only as a reminder once
 `relay.remind_seconds` (default 7200; `$FORGE_ROUTER_REMIND`
@@ -135,32 +75,28 @@ GitHub is read as the Merger's App. The state directory is
 cron checkout's (`$FORGE_CRON_CHECKOUT`).
 
 Exit 0 when the run finished; 1 when a wake was not accepted (it stays
-due); 2 when the question could not be asked (no token, GitHub failed).
+due); 2 when the question could not be asked (no token, GitHub failed,
+the rules couldn't be loaded).
 """
 
 import argparse
 import datetime
 import fcntl
-import fnmatch
 import hashlib
 import http.client
 import importlib.machinery
 import importlib.util
 import json
 import os
-import re
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-# The Merger's hand-back names the head it judged, in both its forms.
-HAND_BACK_RE = re.compile(r"^Not merging ([0-9a-f]{7,40}):", re.MULTILINE)
-
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(BIN))
-from agent_forge import config, locks  # noqa: E402
+from agent_forge import config, locks, router  # noqa: E402
 
 
 def _load(name, path):
@@ -171,19 +107,16 @@ def _load(name, path):
     return module
 
 
-# The Merger's own test of "nothing said since the approval", its `gh
-# api` wrapper and its token minting, so the two never disagree.
+# The Merger's `gh api` wrapper, its token minting and its state files,
+# and, through `configure`, the rules' use of its tests, so the two
+# never disagree.
 merger = _load("forge_merger", os.path.join(BIN, "forge-merger"))
 
 # Set from the project's configuration by `configure`.
 REPO_SLUG = ""
 ACT_AS = "Merger"
-MERGER = "Merger"
-OWNER = ""
-WAITING_OWNER = "Status:waiting-owner"
-WAITING_EXTERNAL = "Status:waiting-external"
-OWNER_PREFIX = "Owner:"
-STATUS_CONTEXT = "vm/build-and-test"
+# The rules module `router.rules` names.
+RULES = None
 DEFAULT_RELAY = "http://127.0.0.1:8788"
 RELAY = DEFAULT_RELAY
 DEFAULT_TOKEN_FILE = "~/.config/xmpp-webhook-relay/token"
@@ -199,6 +132,8 @@ UNREACHABLE = "relay unreachable"
 # Seconds a sending run waits for another's lock before saying BUSY.
 LOCK_WAIT_S = 60
 
+# The engine's query: each open item's number, and what the rules ask
+# for (`graphql`, by type).
 QUERY = """
 query($owner:String!, $name:String!, $prCursor:String, $issueCursor:String,
       $prs:Boolean!, $issues:Boolean!) {
@@ -206,72 +141,39 @@ query($owner:String!, $name:String!, $prCursor:String, $issueCursor:String,
     pullRequests(states:OPEN, first:30, after:$prCursor) @include(if:$prs) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        number isDraft headRefOid author { login }
-        labels(first:30) { nodes { name } }
-        files(first:100) { nodes { path additions deletions } }
-        reviews(last:100) {
-          nodes { databaseId author { login } state submittedAt body
-                  commit { oid } comments { totalCount } }
-        }
-        comments(last:100) {
-          nodes { databaseId author { login } createdAt body }
-        }
-        commits(last:100) {
-          nodes { commit { oid parents { totalCount } } }
-        }
-        headCommit: commits(last:1) {
-          nodes { commit { oid
-            status { contexts { context state createdAt
-                                creator { login } } } } }
-        }
+        number %(PullRequest)s
       }
     }
     issues(states:OPEN, first:50, after:$issueCursor) @include(if:$issues) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        number author { login } body createdAt lastEditedAt
-        labels(first:30) { nodes { name } }
-        comments(last:100) {
-          nodes { databaseId author { login } createdAt body }
-        }
+        number %(Issue)s
       }
     }
   }
 }"""
 
 
-# What each number named in an open issue's `Blocked-by:` lines is now,
-# for those that aren't open issues or pull requests themselves.
-BLOCKER_QUERY = """
-query($owner:String!, $name:String!) {
-  repository(owner:$owner, name:$name) {
-%s
-  }
-}"""
-BLOCKER_FIELD = ("    n%d: issueOrPullRequest(number:%d) {\n"
-                 "      ... on Issue { state closedAt }\n"
-                 "      ... on PullRequest { state closedAt }\n"
-                 "    }")
-
-
-def configure(project):
-    """Set the module's settings, and the Merger's, from `project`."""
-    global REPO_SLUG, ACT_AS, MERGER, OWNER, WAITING_OWNER, WAITING_EXTERNAL
-    global OWNER_PREFIX, STATUS_CONTEXT, RELAY, TOKEN_FILE, REMIND_S
+def configure(project, rules=True):
+    """Set the module's settings, the Merger's and, with `rules`, the
+    rules' from `project`. Raises router.RulesError when `router.rules`
+    names no rules module. The Merger borrows only the poster, so it
+    loads no rules: a project's rules file is no business of its."""
+    global REPO_SLUG, ACT_AS, RULES, RELAY, TOKEN_FILE, REMIND_S
     merger.configure(project)
-    labels, relay = project.section("labels"), project.section("relay")
+    relay = project.section("relay")
     REPO_SLUG = project.repo
-    ACT_AS = MERGER = merger.ACT_AS
-    OWNER = project.owner.lower()
-    WAITING_OWNER = labels.get("waiting_on_owner", "Status:waiting-owner")
-    WAITING_EXTERNAL = labels.get("waiting_external",
-                                  "Status:waiting-external")
-    OWNER_PREFIX = labels.get("owner_prefix", "Owner:")
-    STATUS_CONTEXT = merger.STATUS_CONTEXT
+    ACT_AS = merger.ACT_AS
     RELAY = relay.get("url", DEFAULT_RELAY)
     TOKEN_FILE = os.path.expanduser(relay.get("token_file",
                                               DEFAULT_TOKEN_FILE))
     REMIND_S = relay.get("remind_seconds", DEFAULT_REMIND_S)
+    if not rules:
+        return
+    module = router.load_rules(project.section("router").get(
+        "rules", router.DEFAULT_RULES), project.root)
+    module.configure(project, merger)
+    RULES = module
 
 
 def parse_time(stamp):
@@ -279,335 +181,21 @@ def parse_time(stamp):
         tzinfo=datetime.timezone.utc)
 
 
-# --- who is who -------------------------------------------------------------
-
-
-class Roster:
-    """The configuration's Apps: names to logins and session names, and
-    back. Only `agents` are woken; machinery (the Merger) is known by
-    login and signature but is never anyone's turn."""
-
-    def __init__(self, project):
-        self.project = project
-        self.agents = project.agents
-        self.machinery = project.machinery
-        self.by_login = {self.slug(n): n
-                         for n in list(self.agents) + list(self.machinery)}
-
-    def slug(self, name):
-        return self.project.slug(name)
-
-    def who(self, login):
-        """The name a login maps to, or the login itself."""
-        login = strip_bot(login)
-        return self.by_login.get(login, login or "ghost")
-
-    def login_of(self, who):
-        """The login, without "[bot]", of a name or of a plain login."""
-        if who in self.agents or who in self.machinery:
-            return self.slug(who)
-        return (who or "").lower()
-
-    def is_agent(self, who):
-        return who in self.agents
-
-    def signatures(self):
-        """Every sign-off line an agent or the Merger ends a comment
-        with."""
-        return {"— " + n for n in list(self.agents) + list(self.machinery)}
-
-    def session_name(self, who):
-        return self.project.session_name(who)
-
-    def reviewers(self):
-        """Every agent of kind `reviewer`, in the configuration's order."""
-        return self.project.reviewers()
-
-    def reviewer_logins(self):
-        return {self.slug(n) for n in self.reviewers()}
-
-    def reviewer_for(self, pr):
-        """The reviewer whose `reviews` globs match the most changed
-        lines of `pr`, leaving out its author. A tie, and lines no
-        reviewer's globs match, go to the first listed. None when no
-        reviewer but the author exists."""
-        author = self.who(author_of(pr))
-        names = [n for n in self.reviewers() if n != author]
-        if not names:
-            return None
-        score = dict.fromkeys(names, 0)
-        for f in pr.get("files") or []:
-            lines = (f.get("additions") or 0) + (f.get("deletions") or 0)
-            path = f.get("path") or ""
-            owner = next((n for n in names if any(
-                fnmatch.fnmatchcase(path, glob)
-                for glob in self.agents[n].get("reviews") or [])), names[0])
-            score[owner] += lines
-        return max(names, key=lambda n: (score[n], -names.index(n)))
-
-
-def strip_bot(login):
-    """A login lowercased, without the "[bot]" REST adds and GraphQL
-    leaves off."""
-    login = (login or "").lower()
-    return login[:-len("[bot]")] if login.endswith("[bot]") else login
-
-
-def author_of(node):
-    return strip_bot(((node or {}).get("author") or {}).get("login"))
-
-
-# --- the rules --------------------------------------------------------------
-
-
-def labels_of(item):
-    return [l.get("name") or "" for l in item.get("labels") or []]
-
-
-def owner_of(item):
-    """The Name of the first `Owner:<Name>` label, by name, or None."""
-    for name in sorted(labels_of(item)):
-        if name.startswith(OWNER_PREFIX) and name[len(OWNER_PREFIX):].strip():
-            return name[len(OWNER_PREFIX):].strip()
-    return None
-
-
-def last_by(items, logins, stamp="createdAt"):
-    """The newest `stamp` of the `items` written by one of `logins`, or
-    "" when there is none. GitHub's UTC times compare as strings."""
-    return max((i.get(stamp) or "" for i in items
-                if author_of(i) in logins), default="")
-
-
-def status_of(pr):
-    """The newest Merger-posted vm/build-and-test context on the head
-    commit, or None."""
-    nodes = (pr.get("headCommit") or {}).get("nodes") or []
-    commit = (nodes[-1] or {}).get("commit") if nodes else None
-    if not commit or commit.get("oid") != pr.get("headRefOid"):
-        return None
-    status = None
-    for ctx in ((commit.get("status") or {}).get("contexts")) or []:
-        creator = strip_bot((ctx.get("creator") or {}).get("login"))
-        if (ctx.get("context") == STATUS_CONTEXT
-                and creator == strip_bot(merger.STATUS_CREATOR)
-                and (status is None or (ctx.get("createdAt") or "")
-                     > (status.get("createdAt") or ""))):
-            status = ctx
-    return status
-
-
-def commit_of(review):
-    return (review.get("commit") or {}).get("oid") or ""
-
-
-def at_head(review, pr):
-    """True when `review` was made at the pull request's head commit."""
-    return commit_of(review) == pr.get("headRefOid")
-
-
-def covers_head(review, pr):
-    """True when `review` was made at the head, or every commit after
-    its own on the pull request is a merge (two parents): the Merger's
-    update-branch merges of main. A commit not one of the pull request's
-    (last 100) commits covers nothing."""
-    if at_head(review, pr):
-        return True
-    oids = [((n or {}).get("commit") or {})
-            for n in (pr.get("commits") or {}).get("nodes") or []]
-    at = [i for i, c in enumerate(oids) if c.get("oid") == commit_of(review)]
-    if not at or not oids or oids[-1].get("oid") != pr.get("headRefOid"):
-        return False
-    return all(((c.get("parents") or {}).get("totalCount") or 0) == 2
-               for c in oids[at[-1] + 1:])
-
-
-def signed_by_agent(comment, roster):
-    """True when the comment's last non-empty line is an agent's or the
-    Merger's sign-off."""
-    lines = [l.strip() for l in (comment.get("body") or "").splitlines()
-             if l.strip()]
-    return bool(lines) and lines[-1] in roster.signatures()
-
-
-def turn(number, who, rule, event, line):
-    return {"item": number, "who": who, "rule": rule, "event": event,
-            "line": "#%d %s" % (number, line)}
-
-
-def nobody(number, rule, why):
-    return {"item": number, "who": None, "rule": rule, "why": why}
-
-
-def route_pr(pr, roster):
-    """The turn for one pull request, as `turn` or `nobody` builds it."""
-    n, head = pr["number"], pr.get("headRefOid") or ""
-    labels = labels_of(pr)
-    # Rule 1.
-    if pr.get("isDraft"):
-        return nobody(n, 1, "draft")
-    for label in (WAITING_OWNER, WAITING_EXTERNAL):
-        if label in labels:
-            return nobody(n, 1, label)
-    author_login = author_of(pr)
-    author = roster.who(author_login)
-    reviewer_logins = roster.reviewer_logins() - {strip_bot(author_login)}
-    status = status_of(pr)
-    reviews = [r for r in pr.get("reviews") or [] if r.get("submittedAt")]
-    comments = pr.get("comments") or []
-    spoke = max(last_by(comments, {author_login}),
-                last_by(reviews, {author_login}, "submittedAt"))
-
-    # Rule 2. A hand-back names the head it judged ("Not merging
-    # <head[:10]>:"), and holds only while that is still the head: a push
-    # is neither a comment nor a review, so without this a fixed and
-    # green head would stay the author's for ever.
-    handed = [c for c in comments
-              if author_of(c) == roster.login_of(MERGER)]
-    if handed:
-        back = max(handed, key=lambda c: c.get("createdAt") or "")
-        when = back.get("createdAt") or ""
-        newest_review = max((r["submittedAt"] for r in reviews), default="")
-        judged = HAND_BACK_RE.search(back.get("body") or "")
-        if (judged and head.startswith(judged.group(1))
-                and when > newest_review and when > spoke):
-            to = author
-            if (back.get("body") or "").lstrip().startswith("Not-a-review"):
-                approval = merger.approval_of(dict(pr, reviews=reviews),
-                                              roster.reviewer_logins())
-                to = (roster.who(author_of(approval)) if approval
-                      else roster.reviewer_for(pr) or roster.reviewers()[0])
-            return turn(n, to, 2, when, "the Merger handed it back "
-                        "(comment %s)" % back.get("databaseId"))
-    # Rule 3.
-    theirs = [r for r in reviews
-              if strip_bot(author_of(r)) in reviewer_logins]
-    newest = max(theirs, key=lambda r: r["submittedAt"]) if theirs else None
-    if (newest is not None and at_head(newest, pr)
-            and newest.get("state") in ("CHANGES_REQUESTED", "COMMENTED")
-            and spoke <= newest["submittedAt"]):
-        said = ("asked for changes" if newest["state"] == "CHANGES_REQUESTED"
-                else "commented")
-        return turn(n, author, 3, newest["submittedAt"],
-                    "%s %s (review %s)" % (roster.who(author_of(newest)), said,
-                                           newest.get("databaseId")))
-    state = ((status or {}).get("state") or "").lower()
-    # Rule 4.
-    if state in ("failure", "error"):
-        return turn(n, author, 4, status.get("createdAt") or head,
-                    "%s is %s at %s" % (STATUS_CONTEXT, state, head[:7]))
-    # Rule 5.
-    if state != "success":
-        return nobody(n, 5, "%s is %s" % (STATUS_CONTEXT, state or "absent"))
-    # Rule 6.
-    if (newest is not None and newest.get("state") == "APPROVED"
-            and covers_head(newest, pr)
-            and not merger.said_since(dict(pr, reviews=reviews,
-                                           comments=comments), newest)):
-        return nobody(n, 6, "the Merger's: approved, nothing said since")
-    # Rule 7.
-    reviewer = roster.reviewer_for(pr)
-    if reviewer is None:
-        return nobody(n, 7, "green, and %s's own: no second reviewer"
-                      % author)
-    # Rule 8.
-    seen = [r for r in theirs if at_head(r, pr) or (
-        r.get("state") == "APPROVED" and covers_head(r, pr))]
-    last = max((r["submittedAt"] for r in seen), default=None)
-    if last is None or spoke > last:
-        return turn(n, reviewer, 8, max(status.get("createdAt") or "", spoke),
-                    "needs your review (green at %s)" % head[:7])
-    return nobody(n, None, "no rule matched")
-
-
-def route_issue(issue, roster):
-    """The turn for one issue, as `turn` or `nobody` builds it."""
-    n = issue["number"]
-    labels = labels_of(issue)
-    comments = issue.get("comments") or []
-    owner = owner_of(issue)
-    # Rule 9.
-    if WAITING_EXTERNAL in labels:
-        return nobody(n, 9, WAITING_EXTERNAL)
-    if WAITING_OWNER in labels:
-        # Rule 10.
-        answered = owner_answered(n, issue, owner, comments, roster, 10)
-        # Rule 11.
-        return answered or nobody(n, 11, WAITING_OWNER)
-    # Rule 12.
-    if owner:
-        mine = {roster.login_of(owner)}
-        theirs = last_by(comments, mine)
-        others = [c for c in comments if author_of(c) not in mine
-                  and (c.get("createdAt") or "") > theirs]
-        if others:
-            newest = max(others, key=lambda c: c.get("createdAt") or "")
-            return turn(n, owner, 12, newest["createdAt"],
-                        "has a comment by %s (comment %s)" % (
-                            roster.who(author_of(newest)),
-                            newest.get("databaseId")))
-    # Rule 13: the owner usually takes the waiting label off when
-    # answering, which ends rule 10.
-    if not owner:
-        answered = owner_answered(n, issue, None, comments, roster, 13)
-        if answered:
-            return answered
-    # Rule 14.
-    unblocked = unblocked_by(issue, owner, comments, roster)
-    if unblocked:
-        return unblocked
-    return nobody(n, None, "no rule matched")
-
-
-def unblocked_by(issue, owner, comments, roster):
-    """Rule 14: the item owner's turn when the last open item its
-    `Blocked-by:` lines name has closed since the body was written and
-    since the item owner last spoke, else None."""
-    named = merger.blockers_of(issue)
-    known = {b: info for b, info in (issue.get("blockedBy") or {}).items()
-             if b in named and info}
-    if not known or any(i.get("state") == "OPEN" for i in known.values()):
-        return None
-    event = max((i.get("closedAt") or "" for i in known.values()),
-                default="")
-    who = owner or roster.who(author_of(issue))
-    written = max(issue.get("lastEditedAt") or "",
-                  issue.get("createdAt") or "",
-                  last_by(comments, {roster.login_of(who)}))
-    if not event or event <= written:
-        return None
-    return turn(issue["number"], who, 14, event, "unblocked: %s closed" % (
-        ", ".join("#%d" % b for b in sorted(known))))
-
-
-def owner_answered(n, issue, owner, comments, roster, rule):
-    """The item owner's turn (`Owner:<Name>`, else the issue's author)
-    when a comment by the project's owner is newer than their last,
-    else None."""
-    who = owner or roster.who(author_of(issue))
-    theirs = last_by(comments, {roster.login_of(who)})
-    answers = [c for c in comments if author_of(c) == OWNER
-               and (c.get("createdAt") or "") > theirs
-               and not signed_by_agent(c, roster)]
-    if not answers:
-        return None
-    newest = max(answers, key=lambda c: c.get("createdAt") or "")
-    return turn(n, who, rule, newest["createdAt"],
-                "%s answered (comment %s)" % (OWNER, newest.get("databaseId")))
-
-
 # --- GitHub -----------------------------------------------------------------
 
 
 def fetch(github):
     """(pull requests, issues): every open one, as GraphQL's nodes with
-    their connections flattened to lists."""
+    the rules' `flatten` connections as lists and `__typename` set, then
+    what the rules' lookups attach."""
     owner, name = REPO_SLUG.split("/")
+    query = QUERY % {"PullRequest": RULES.graphql.get("PullRequest", ""),
+                     "Issue": RULES.graphql.get("Issue", "")}
     prs, issues = [], []
     cursors = {"prCursor": None, "issueCursor": None}
     more = {"prs": True, "issues": True}
     while more["prs"] or more["issues"]:
-        args = ["graphql", "-f", "query=" + QUERY, "-F", "owner=" + owner,
+        args = ["graphql", "-f", "query=" + query, "-F", "owner=" + owner,
                 "-F", "name=" + name,
                 "-F", "prs=%s" % str(more["prs"]).lower(),
                 "-F", "issues=%s" % str(more["issues"]).lower()]
@@ -615,56 +203,23 @@ def fetch(github):
             if cursor:
                 args += ["-f", "%s=%s" % (key, cursor)]
         repo = github.api(*args)["data"]["repository"]
-        for kind, conn, out, cursor in (
-                ("prs", "pullRequests", prs, "prCursor"),
-                ("issues", "issues", issues, "issueCursor")):
+        for kind, conn, out, cursor, typename in (
+                ("prs", "pullRequests", prs, "prCursor", "PullRequest"),
+                ("issues", "issues", issues, "issueCursor", "Issue")):
             if not more[kind]:
                 continue
             page = repo[conn]
             for node in page["nodes"]:
-                for field in ("labels", "reviews", "comments", "files"):
+                for field in RULES.flatten:
                     if isinstance(node.get(field), dict):
                         node[field] = node[field].get("nodes") or []
+                node["__typename"] = typename
                 out.append(node)
             more[kind] = page["pageInfo"]["hasNextPage"]
             cursors[cursor] = page["pageInfo"]["endCursor"]
-    attach_blockers(github, prs, issues)
+    for lookup in RULES.lookups:
+        lookup.run(github, REPO_SLUG, prs, issues)
     return prs, issues
-
-
-def attach_blockers(github, prs, issues):
-    """Give each open issue a `blockedBy` map, {number: {"state",
-    "closedAt"} or None}, for the numbers its `Blocked-by:` lines name.
-    An open item is known from the listing; the rest are asked for in
-    one more query, only when there are any. None: names nothing."""
-    owner, name = REPO_SLUG.split("/")
-    open_now = {i["number"] for i in prs + issues}
-    named = {i["number"]: merger.blockers_of(i) for i in issues}
-    ask = sorted(set().union(*named.values()) - open_now) if named else []
-    def look_up(numbers):
-        query = BLOCKER_QUERY % "\n".join(BLOCKER_FIELD % (b, b)
-                                           for b in numbers)
-        repo = github.api("graphql", "-f", "query=" + query,
-                          "-F", "owner=" + owner, "-F", "name=" + name
-                          )["data"]["repository"]
-        return {b: repo.get("n%d" % b) or None for b in numbers}
-    found = {}
-    if ask:
-        # GitHub fails the whole query when one number names nothing, so
-        # a mistyped line mustn't stop every run: ask one at a time then,
-        # and leave out what still fails.
-        try:
-            found = look_up(ask)
-        except Exception:  # noqa: BLE001 - gh's failures vary
-            for b in ask:
-                try:
-                    found.update(look_up([b]))
-                except Exception:  # noqa: BLE001
-                    found[b] = None
-    for issue in issues:
-        issue["blockedBy"] = {
-            b: {"state": "OPEN", "closedAt": None} if b in open_now
-            else found.get(b) for b in named[issue["number"]]}
 
 
 # --- state and wakes --------------------------------------------------------
@@ -675,8 +230,8 @@ TURN_FIELDS = ("agent", "event")
 
 
 def key_of(decision):
-    return {"agent": decision["who"], "rule": decision["rule"],
-            "event": decision["event"]}
+    return {"agent": decision.agent, "rule": decision.rule,
+            "event": decision.event}
 
 
 def same_turn(entry, decision):
@@ -800,56 +355,79 @@ def make_poster(relay, token, opener=urllib.request.urlopen, sleep=time.sleep,
     return post
 
 
+def decide(ctx):
+    """Every decision the rules make: `decide` for each open item, pull
+    requests first, then `sweep` once. The engine keeps one turn per
+    item, so a rules module that makes several, or one about no item,
+    is refused rather than half-handled."""
+    decisions = []
+    for item in ctx.prs + ctx.issues:
+        decisions += RULES.decide(item, ctx)
+    decisions += RULES.sweep(ctx)
+    seen = set()
+    for d in decisions:
+        if d.item is None or d.item in seen or d.kind != "turn" \
+                or d.actions or d.reminder is not None:
+            raise ValueError("the rules decided %r, which this router "
+                             "can't carry out yet" % (d,))
+        seen.add(d.item)
+    return decisions
+
+
 def run(github, roster, state_dir, send, post=None, only=None, out=print,
         when=None, remind_s=None):
-    """One run: route every open item, or `only` those numbers, and
+    """One run: decide every open item, or `only` those numbers, and
     when `send`, wake each agent with its due items and record it.
     Returns the number of agents whose wake was not accepted."""
     when = when or merger.now_utc()
     remind_s = REMIND_S if remind_s is None else remind_s
     prs, issues = fetch(github)
-    decisions = [route_pr(p, roster) for p in prs]
-    decisions += [route_issue(i, roster) for i in issues]
-    waiting = sum(1 for i in issues if WAITING_OWNER in labels_of(i))
+    ctx = router.Context(roster, when, prs, issues)
+    decisions = decide(ctx)
+    tally = RULES.summary(ctx)
     if only:
-        decisions = [d for d in decisions if d["item"] in only]
-    decisions.sort(key=lambda d: d["item"])
+        decisions = [d for d in decisions if d.item in only]
+    decisions.sort(key=lambda d: d.item)
     state_path = os.path.join(state_dir, "state.json")
     state = merger.load_json(state_path, {})
     items = state.setdefault("items", {})
     log, batches, would = [], {}, []
     for d in decisions:
-        if d["who"] is None:
-            if not send or d["rule"] == 7:
+        if d.agent is None:
+            # The default rules' rule 7 is printed even when sending: a
+            # pull request nobody can review is a problem in the
+            # configuration. A kind of decision will say so instead
+            # (docs/router.md, step 2).
+            if not send or d.rule == 7:
                 out("#%d nobody's (%s)" % (
-                    d["item"], d["why"] if d["rule"] is None
-                    else "rule %d: %s" % (d["rule"], d["why"])))
-            items.pop(str(d["item"]), None)
+                    d.item, d.suppressed if d.rule is None
+                    else "rule %s: %s" % (d.rule, d.suppressed)))
+            items.pop(str(d.item), None)
             continue
-        why = due(d, items.get(str(d["item"])), when, remind_s)
+        why = due(d, items.get(str(d.item)), when, remind_s)
         if why is None:
             if not send:
-                out("#%d %s's, rule %d: already woken" % (
-                    d["item"], d["who"], d["rule"]))
-                would.append((d, d["line"], "withheld: already woken"))
+                out("#%d %s's, rule %s: already woken" % (
+                    d.item, d.agent, d.rule))
+                would.append((d, d.line, "withheld: already woken"))
             continue
-        if not roster.is_agent(d["who"]):
-            out("#%d %s's, rule %d: withheld, %s is not an agent" % (
-                d["item"], d["who"], d["rule"], d["who"]))
-            items[str(d["item"])] = dict(key_of(d), withheld=True,
-                                         at=merger.iso(when))
-            log.append(dict(key_of(d), item=d["item"], line=d["line"],
+        if not roster.is_agent(d.agent):
+            out("#%d %s's, rule %s: withheld, %s is not an agent" % (
+                d.item, d.agent, d.rule, d.agent))
+            items[str(d.item)] = dict(key_of(d), withheld=True,
+                                      at=merger.iso(when))
+            log.append(dict(key_of(d), item=d.item, line=d.line,
                             outcome="withheld: not an agent"))
-            would.append((d, d["line"], "withheld: not an agent"))
+            would.append((d, d.line, "withheld: not an agent"))
             continue
-        line = d["line"] + (" (reminder)" if why == "reminder" else "")
+        line = d.line + (" (reminder)" if why == "reminder" else "")
         would.append((d, line, "would send to %s" % roster.session_name(
-            d["who"])))
-        batches.setdefault(d["who"], []).append((d, line))
+            d.agent)))
+        batches.setdefault(d.agent, []).append((d, line))
     failed, down = 0, None
     for who in sorted(batches):
         session = roster.session_name(who)
-        numbers = ", ".join("#%d" % d["item"] for d, _ in batches[who])
+        numbers = ", ".join("#%d" % d.item for d, _ in batches[who])
         text = message([line for _, line in batches[who]])
         if not send:
             out("WOULD SEND to %s:\n%s" % (session, text.rstrip("\n")))
@@ -865,19 +443,20 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
         else:
             out("SENT to %s: %s" % (session, numbers))
         for d, line in batches[who]:
-            log.append(dict(key_of(d), item=d["item"], line=line,
+            log.append(dict(key_of(d), item=d.item, line=line,
                             session=session, outcome=(
                                 "not sent: " + problem if problem
                                 else "sent")))
             if not problem:
-                items[str(d["item"])] = dict(key_of(d),
-                                             woken_at=merger.iso(when))
+                items[str(d.item)] = dict(key_of(d),
+                                          woken_at=merger.iso(when))
     if not only:
-        for gone in set(items) - {str(d["item"]) for d in decisions}:
+        for gone in set(items) - {str(d.item) for d in decisions}:
             del items[gone]
-    out("%s %d open, %d turn(s) to wake, %d waiting on %s%s" % (
+    out("%s %d open, %d turn(s) to wake%s%s" % (
         "ROUTED" if send else "DRY-RUN", len(prs) + len(issues),
-        sum(len(b) for b in batches.values()), waiting, OWNER,
+        sum(len(b) for b in batches.values()),
+        ", " + tally if tally else "",
         "; %d wake(s) not sent" % failed if failed else ""))
     if send:
         os.makedirs(state_dir, exist_ok=True)
@@ -906,14 +485,14 @@ def record_dry_run(state_dir, decisions, would, only, when):
     seen = merger.load_json(path, {})
     records = []
     for d, line, outcome in would:
-        if same_turn(seen.get(str(d["item"])), d):
+        if same_turn(seen.get(str(d.item)), d):
             continue
-        seen[str(d["item"])] = key_of(d)
-        records.append(dict(key_of(d), item=d["item"], line=line,
+        seen[str(d.item)] = key_of(d)
+        records.append(dict(key_of(d), item=d.item, line=line,
                             outcome=outcome))
-    turns = {str(d["item"]) for d in decisions if d["who"] is not None}
+    turns = {str(d.item) for d in decisions if d.agent is not None}
     for item in list(seen):
-        decided = any(str(d["item"]) == item for d in decisions)
+        decided = any(str(d.item) == item for d in decisions)
         if (decided or not only) and item not in turns:
             del seen[item]
     os.makedirs(state_dir, exist_ok=True)
@@ -973,7 +552,11 @@ def main(argv=None, sh=merger.sh, out=print, post=None, roster=None,
     except config.ConfigError as err:
         out("NO-CONFIG: %s" % err)
         return 2
-    configure(project)
+    try:
+        configure(project)
+    except router.RulesError as err:
+        out("BAD-CONFIG: %s" % err)
+        return 2
     state_dir = args.state_dir or locks.state_dir(project.name, "router",
                                                   environ)
     try:
@@ -981,7 +564,7 @@ def main(argv=None, sh=merger.sh, out=print, post=None, roster=None,
     except ValueError:
         out("BAD-CONFIG: FORGE_ROUTER_REMIND is not a number of seconds")
         return 2
-    roster = roster or Roster(project)
+    roster = roster or RULES.Roster(project)
     if post is None and args.send:
         post = make_poster(environ.get("FORGE_ROUTER_RELAY", RELAY),
                            relay_token())

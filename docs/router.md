@@ -12,10 +12,11 @@ turn is, and who it falls to.
 
 ## What the two routers do differently
 
-The rules shipped here (the "default" rules, 1–14 in `forge-router`)
-read everything from GitHub: who wrote something by login, what a
-review saw by commit. A turn is a decision about one open item, edge
-triggered: a new event starts it, and it is woken once.
+The rules shipped here (the "default" rules, 1–14 in
+`agent_forge/rules_default.py`) read everything from GitHub: who wrote
+something by login, what a review saw by commit. A turn is a decision
+about one open item, edge triggered: a new event starts it, and it is
+woken once.
 
 The larger project's router does more, and some of it doesn't fit that
 shape:
@@ -90,33 +91,70 @@ A rules module is Python, named by `router.rules` in the configuration:
 `"default"` (shipped here), or a path to a file in the project's own
 repository, read from the cron checkout, so it is reviewed there.
 
+`agent_forge/router.py` holds what the engine and a module share.
+
 ```python
-class Rules(Protocol):
-    graphql: Mapping[str, str]    # extra fields, by type: PullRequest, Issue
+class Rules(Protocol):                # a module, not a class
+    graphql: Mapping[str, str]    # fields besides `number`, by type:
+                                  #   PullRequest, Issue
+    flatten: Sequence[str]        # connections handed over as lists
     lookups: Sequence[Lookup]     # what to fetch besides
-    def author(self, node, ctx) -> str: ...        # who wrote this
-    def decide(self, item, ctx) -> Sequence[Decision]: ...
-    def sweep(self, ctx) -> Sequence[Decision]: ...
-    def recheck(self, item, ctx) -> Sequence[Decision]: ...
+    Roster: type                  # Roster(project): who is who
+    def configure(project, merger) -> None: ...
+    def author(node, ctx) -> str: ...        # who wrote this
+    def decide(item, ctx) -> Sequence[Decision]: ...
+    def sweep(ctx) -> Sequence[Decision]: ...         # optional
+    def recheck(item, ctx) -> Sequence[Decision]: ... # optional
+    def summary(ctx) -> str: ...                      # optional
+
+@dataclass(frozen=True)
+class Lookup:
+    name: str                     # "blockers"
+    run: Callable                 # run(github, repo, prs, issues)
 
 @dataclass(frozen=True)
 class Decision:
     item: int | None              # None: not about one item
     agent: str | None             # None: nobody's
-    rule: str                     # "pr.3", "issue.unblocked"
-    event: str                    # the turn key's event
-    line: str                     # what the message says
+    rule: Any                     # 8, "pr.3", "issue.unblocked"
+    event: str | None             # the turn key's event
+    line: str | None              # what the message says
     kind: str = "turn"            # turn, notice, relook, surface
     suppressed: str | None = None # decided, not sent, and why
     actions: tuple = ()           # done before delivery
-    reminder: Reminder = DEFAULT
+    reminder: Reminder | None = None   # None: relay.remind_seconds
 ```
 
-`ctx` carries the clock, the roster, every fetched item (so a rule can
-read other items: a blocker's state, a reviewer's load), the lookups'
-results, the previous run's decisions, a namespaced store the module
-may write to, written only when the run's delivery is confirmed, and
-the configuration.
+A module, because the rules are configured like every other tool
+here: `configure` sets them up for the project, and is given
+`forge-merger`, so a rule can use the Merger's own tests (what an
+approval is, whether anything was said since, what `Blocked-by:` names)
+rather than a copy that could drift. `sweep` defaults to deciding
+nothing, `recheck` to `decide`, and `summary`, a phrase for the run's
+last line ("1 waiting on the owner"), to none.
+
+**`item`** is the GraphQL node with the `flatten` connections as lists
+and `__typename` set, so `decide` can tell a pull request from an
+issue. **`rule`** is whatever the module names its rules: the default
+rules number them, and the number is recorded in `state.json` and the
+journal as it is. **Nobody's** turn has no event or line, and says why
+in `suppressed`.
+
+**A lookup attaches what it finds to the items it covers**, as the
+default rules' `blockers` gives each issue a `blockedBy` map, rather
+than into `ctx`: a rule reads it with the item, and the item can be
+routed on its own (`--only`) without a second place to look.
+
+**The roster** is the module's, since what makes a login a name is a
+rule. The engine asks it two things: whether a name is an agent (only
+agents are woken) and its session name.
+
+`ctx` carries the clock, the roster and every fetched item (so a rule
+can read other items: a blocker's state, a reviewer's load). Step 2
+adds the previous run's decisions, a namespaced store the module may
+write to, written only when the run's delivery is confirmed, and the
+configuration; until then a module keeps what it needs from
+`configure`.
 
 **Who wrote something** is the module's `author`. The default rules
 read the login. A module whose agents share a login reads the
@@ -138,11 +176,17 @@ relay already answers `unknown-name`, and that is reported.
 1. Move `forge-router`'s rules behind this interface as the `default`
    module. No decision changes: every existing test passes unchanged,
    and its dry-run journal is compared before and after on the same
-   input.
+   input. The engine refuses what it can't carry out yet (several
+   decisions for one item, one about no item, another kind, actions, a
+   reminder policy) rather than half-doing it. One rule still leaks
+   into it: the default rules' rule 7, nobody's because nobody can
+   review it, is printed even when sending, by number. Step 2's
+   `surface` kind replaces that.
 2. Engine features the default rules don't use yet: several decisions
    per item, `sweep`, kinds and sections, actions, the reminder policy,
    recheck, the exit status above.
 3. `router.rules` pointing at a project file, with an example module in
-   the tests.
+   the tests. Loading one already works (`load_rules` in
+   `agent_forge/router.py`); what remains is the example and its tests.
 4. The larger project writes its rules module in its own repository and
    compares its journal with its current router's before switching.

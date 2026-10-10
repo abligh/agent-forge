@@ -45,6 +45,7 @@ TOP = {
     "checks": (dict, False),
     "docs": (dict, False),
     "relay": (dict, False),
+    "router": (dict, False),
     "identity": (dict, False),
     "host_settings": (dict, False),
     "merge": (dict, False),
@@ -71,6 +72,8 @@ STEP = {"name": str, "run": list, "only_if": str}
 LABELS = {"owner_prefix": str, "status_prefix": str,
           "waiting_on_owner": str, "waiting_external": str}
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
+# forge-router's own: every key is checked.
+ROUTER = {"rules": str}
 RECEIVER = {"address": str, "port": int, "path": str, "secret_file": str,
             "max_body": int, "ticks": dict, "route": list}
 # The webhook events forge-receiver reads; `receiver.ticks` keys are
@@ -184,6 +187,7 @@ def check(data):
         problems.append("repo %r must be owner/name" % data["repo"])
     _fields("naming", data.get("naming", {}), NAMING, problems)
     _fields("identity", data.get("identity", {}), IDENTITY, problems)
+    _fields("router", data.get("router", {}), ROUTER, problems)
     merge = data.get("merge", {})
     if _fields("merge", merge, MERGE, problems):
         for i, argv in enumerate(merge.get("gate", [])):
@@ -393,7 +397,7 @@ class Project:
         return None
 
     def section(self, key):
-        """A free-form section (labels, checks, docs, relay), or {}."""
+        """A section (labels, checks, docs, relay, router), or {}."""
         return self.data.get(key, {})
 
     def app(self, name):

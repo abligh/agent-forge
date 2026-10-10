@@ -188,6 +188,12 @@ class Check(unittest.TestCase):
             "relay.url must be a string",
             "relay.remind_seconds must be at least 1"])
 
+    def test_router(self):
+        self.assertEqual(self.problems(router={"rules": "default"}), [])
+        self.assertEqual(self.problems(router={"rules": 1, "rule": "x"}), [
+            "router.rules must be a string",
+            "router: unknown key 'rule'"])
+
     def test_receiver(self):
         self.assertEqual(self.problems(receiver={
             "port": 0, "path": "hook", "max_body": 10 ** 8, "colour": 1,

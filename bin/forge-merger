@@ -1076,7 +1076,7 @@ def relay_sender(project, environ, opener=None):
     same `relay` section and addressed to the agent's session name, so
     the two can't diverge."""
     router = load_router()
-    router.configure(project)
+    router.configure(project, rules=False)
     post = router.make_poster(environ.get("FORGE_ROUTER_RELAY", router.RELAY),
                               router.relay_token(),
                               *([opener] if opener else []))
