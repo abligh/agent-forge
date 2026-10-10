@@ -165,6 +165,35 @@ class Check(unittest.TestCase):
             "merge.stall_alert.labels must be a list"])
         self.assertEqual(self.problems(merge={"stall_alert": {}}), [])
 
+    def test_merge_test_ahead(self):
+        self.assertEqual(self.problems(merge={"test_ahead": {
+            "depth": -1, "max_age_hours": 0, "width": 2,
+            "_note": "a comment"}}), [
+            "merge.test_ahead: unknown key 'width'",
+            "merge.test_ahead.depth must be at least 0",
+            "merge.test_ahead.max_age_hours must be at least 1"])
+        self.assertEqual(self.problems(merge={"test_ahead": {
+            "depth": "3", "max_age_hours": True}}), [
+            "merge.test_ahead.depth must be an integer",
+            "merge.test_ahead.max_age_hours must be an integer"])
+        self.assertEqual(self.problems(merge={"test_ahead": 3}),
+                         ["merge.test_ahead must be an object"])
+        self.assertEqual(self.problems(merge={"test_ahead": {}}), [])
+        self.assertEqual(self.problems(merge={"test_ahead": {"depth": 0}}),
+                         [])
+
+    def test_test_ahead_contradicts_merger_first_false(self):
+        data = example()
+        data["checks"]["merger_first"] = False
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead puts the Merger's pull request first, so "
+            "checks.merger_first must not be false"])
+        del data["checks"]["merger_first"]
+        self.assertEqual(config.check(data), [])
+        del data["merge"]["test_ahead"]
+        data["checks"]["merger_first"] = False
+        self.assertEqual(config.check(data), [])
+
     def test_checks(self):
         self.assertEqual(self.problems(checks={
             "poster": "Nobody", "slots": 0, "memory_max": 16,

@@ -12,6 +12,9 @@ merges on that status (`forge-merger`).
     forge-pr-check --post                the same, posting each verdict
     forge-pr-check --worker SHA --pr N   the check itself (started by the
                                          above; also runnable by hand)
+    forge-pr-check --worker SHA --pr N --ahead
+                                         the check of a Merger prediction
+                                         (merge.test_ahead), never posted
 
 **The cron tick returns at once and the check runs detached.**
 `forge-cron-run` holds locks while a job runs, so a long test run under
@@ -49,22 +52,76 @@ the grace is up.
 **With `checks.merger_first` on, the Merger's pull request goes first**
 (default off). The Merger writes `next.json` in its state directory
 each tick, naming the pull request it is waiting on (`--merger-dir`,
-default ~/.local/state/agent-forge/<project>/merger). That head is
-checked before every other, since the next merge waits on its verdict.
-**While the Merger names a pull request, nothing else is started**,
-even in a free slot, and even when that pull request's head isn't
-waiting yet (the Merger is about to update it, or it was checked and
-the Merger waits on something else). Under strict branch protection
-any other head's verdict is spent once the next merge moves the
-default branch, and a check started now would hold a slot for minutes
-just as the Merger's pull request needs one. The tick says `HELD`. Its
-head given up on after MAX_ERRORS failures doesn't hold anything, and
-nor does a `next.json` older than MERGER_FRESH, which a Merger that has
-stopped leaves behind: a stopped Merger must not hold every check. So
-the Merger has to tick more often than that for the rule to hold.
-Without branch protection that requires heads to be up to date, a
-verdict outlives the next merge and holding the slots only delays it,
-which is why the rule is off unless the project turns it on.
+default ~/.local/state/agent-forge/<project>/merger). When a head of
+that pull request is waiting, isn't given up on (MAX_ERRORS), and no
+slot is running or has just started it, it is started before every
+other, since the next merge waits on its verdict; the `STARTED` line
+then ends `, first: the Merger waits on it`. Otherwise heads are
+started oldest first, as without it. **It only orders: nothing is ever
+held.** A free slot is never kept empty for the Merger's pull request,
+because the Merger names one for any decision that isn't a hand-back
+or a skip, including a wait that no check here will end (a CI workflow
+that hasn't finished, say), and its `next.json` stays fresh all the
+while: holding the slots would stop every other check, the ones
+reviewers approve on included. A `next.json` older than MERGER_FRESH,
+which a Merger that has stopped leaves behind, names nothing.
+
+**With `merge.test_ahead`, it also tests the Merger's predictions**
+(default off; it implies `merger_first`). The Merger writes, in
+`ahead.json` beside `next.json`, the commit each of the next few pull
+requests in its queue will have once the ones in front of it merge
+(`forge-merger` says how). A tick starts, in this order:
+
+1. a head of the pull request in `next.json`, as `merger_first` does;
+2. the first entry in `ahead.json` that no slot is running or has just
+   started, that hasn't failed to check out MAX_ERRORS times, that is
+   not the head's own tree (`same_as_head`), and whose tree has no
+   verdict, green or red, from this host and step list; it logs
+   `STARTED-AHEAD`;
+3. every other waiting head, oldest first.
+
+An entry is checked out from the object store its worktree shares with
+the Merger's checkout, so nothing is fetched and nothing is pushed; the
+Merger and this tool must therefore use the same checkout (`repo` in
+`ahead.json`), and entries from another are ignored. It is run like a
+head, recorded with `ahead` set, logged `VERDICT AHEAD`, and posted
+nowhere, since it is no pull request's head. The list is short and each
+tree is run once, so the predictions delay other pull requests' checks
+by at most `depth` + 1 runs each time the queue or `main` moves.
+
+**With `merge.test_ahead`, a head whose tree is already green here is
+not run again.** Each verdict then records the `tree` its commit
+names, the `host` it ran on and `steps`, a digest of `checks.steps`.
+If an earlier verdict on another commit with the same tree, host and
+steps is green, and finished at most `test_ahead.max_age_hours`
+(default 24) ago, the worker records the head green with `matched`
+naming that commit, logs `MATCHED`, and posts `success` as `green on
+<host>: tree tested as <sha> (<whose>)`, naming the Merger's
+prediction or the other head. A matched verdict is dated from the run
+it stands in for, so a match of a match still ages out after that run.
+This is what turns a prediction into a merge: when GitHub's update
+produces the predicted tree, the head is posted green at once and the
+Merger merges it on its next tick.
+
+What that guarantees, and what it doesn't:
+
+* **Green is posted only for a tree a real run turned green**, here,
+  with these steps. A red verdict is never reused, since a flake is how
+  a red tree turns green: the head is run. So a prediction GitHub's
+  update doesn't reproduce costs only its own run, and nothing else is
+  posted green.
+* **A flaky test is accepted once per tree, not once per head.** A
+  green verdict on a tree an earlier verdict here called red logs
+  `FLAKE`, so that can be seen.
+* **The steps must depend on the tree alone.** A matched head was never
+  checked out itself; a prediction's history is not the head's (its
+  parent is a stand-in for a squash commit). A step that reads commit
+  messages, authors or history (`git log`, `git describe`) can pass on
+  one commit and fail on another with the same tree; a project with
+  such a step should leave `test_ahead` off, or run that check in
+  `merge.gate`, which runs on the real head.
+* **The step digest can't see a toolchain upgrade** on the host, which
+  is why a verdict counts for `max_age_hours` and no longer.
 
 **A head from another repository is refused.** The steps run the pull
 request's own code with this user's access to the host, so only
@@ -131,8 +188,10 @@ and 2 when the question could not be asked.
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -190,14 +249,20 @@ STEP_DROP_PREFIX = "FORGE_"
 CRON_RUN = os.path.join(BIN, "forge-cron-run")
 # What a posting worker starts when it is done: its own cron line.
 NEXT_TICK = ("forge-pr-check", "--post")
-# Whether the head of the pull request the Merger waits on goes first,
-# holding every other check while it names one.
+# Whether the head of the pull request the Merger waits on goes first.
+# It only orders: no slot is ever kept for it.
 DEFAULT_MERGER_FIRST = False
 MERGER_FIRST = DEFAULT_MERGER_FIRST
-# How old the Merger's next.json may be and still be obeyed. An older
-# one means the Merger has stopped, and a stopped Merger must not hold
-# a pull request's place at the front, or every other check behind it.
+# How old the Merger's next.json and ahead.json may be and still be
+# read. An older one means the Merger has stopped, and a stopped Merger
+# must not keep a pull request's place at the front.
 MERGER_FRESH = datetime.timedelta(minutes=10)
+# `merge.test_ahead`: whether the Merger's predictions are tested and a
+# head whose tree is green here already is posted green without a run,
+# and for how long a verdict counts for another commit with its tree.
+TEST_AHEAD = False
+DEFAULT_MATCH_MAX_HOURS = 24
+MATCH_MAX_AGE = datetime.timedelta(hours=DEFAULT_MATCH_MAX_HOURS)
 
 
 def configure(project):
@@ -205,9 +270,11 @@ def configure(project):
     its repository and default branch, and the `checks` section
     (`context`, `poster`, `steps`, `caches`, `slots`, `memory_max`,
     `step_timeout_minutes`, `merger_first`), each with the default
-    above."""
+    above, and `merge.test_ahead` (`max_age_hours`), which implies
+    `merger_first`."""
     global REPO_SLUG, MAIN, CONFIG_PATH, STATUS_CONTEXT, POSTER, HOST
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
+    global TEST_AHEAD, MATCH_MAX_AGE
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -222,7 +289,13 @@ def configure(project):
     MEMORY_MAX = checks.get("memory_max", DEFAULT_MEMORY_MAX)
     STEP_TIMEOUT_S = 60 * checks.get("step_timeout_minutes",
                                      DEFAULT_STEP_TIMEOUT_S // 60)
-    MERGER_FIRST = checks.get("merger_first", DEFAULT_MERGER_FIRST)
+    ahead = project.section("merge").get("test_ahead")
+    TEST_AHEAD = ahead is not None
+    MATCH_MAX_AGE = datetime.timedelta(hours=(ahead or {}).get(
+        "max_age_hours", DEFAULT_MATCH_MAX_HOURS))
+    # The configuration refuses test_ahead with merger_first false.
+    MERGER_FIRST = checks.get("merger_first", DEFAULT_MERGER_FIRST) \
+        or TEST_AHEAD
 
 
 def sh(args, cwd=None, env=None, timeout=None):
@@ -387,30 +460,20 @@ def next_head(state, busy=(), first_pr=None, when=None):
     START_GRACE before `when`.
 
     `first_pr` is the pull request the Merger is waiting on, or None.
-    Its head goes before every other, and while it is named nothing
-    else is picked: not while its head isn't waiting yet, and not while
-    a slot is running it or has just been started on it (see the module
-    docstring). Only once every head of it has been given up on does
-    the queue go on without it."""
+    A head of it that could be picked goes before every other. It only
+    orders: when none of its heads can be picked, the rest are picked
+    as if it were None (see the module docstring)."""
     waiting = state["waiting"]
 
     def order(sha):
         return waiting[sha].get("errors", 0), waiting[sha]["since"], sha
-    if first_pr is not None:
-        mine = [s for s, w in waiting.items() if w["pr"] == first_pr]
-        if not mine:
-            return None
-        live = [s for s in mine if waiting[s].get("errors", 0) < MAX_ERRORS]
-        if live:
-            free = [s for s in live if s not in busy
-                    and not just_started(waiting[s], when)]
-            return (min(free, key=order), first_pr) if free else None
     live = [s for s, w in waiting.items()
             if w.get("errors", 0) < MAX_ERRORS and s not in busy
             and not just_started(w, when)]
     if not live:
         return None
-    sha = min(live, key=order)
+    mine = [s for s in live if waiting[s]["pr"] == first_pr]
+    sha = min(mine or live, key=order)
     return sha, waiting[sha]["pr"]
 
 
@@ -431,6 +494,98 @@ def merger_first(merger_dir, when):
             else None
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def merger_ahead(merger_dir, when, repo=None):
+    """The Merger's predicted commits from its ahead.json, or [] when
+    there are none, it can't be read, it is older than MERGER_FRESH, or
+    it was written in a checkout other than `repo`, whose object store
+    this tool's worktrees would not share. Malformed entries are
+    dropped."""
+    if not merger_dir:
+        return []
+    try:
+        with open(os.path.join(merger_dir, "ahead.json")) as handle:
+            said = json.load(handle)
+        if when - parse(said["at"]) > MERGER_FRESH:
+            return []
+        if repo is not None and os.path.realpath(said["repo"]) \
+                != os.path.realpath(repo):
+            return []
+        return [e for e in said["entries"]
+                if isinstance(e.get("pr"), int)
+                and not isinstance(e.get("pr"), bool)
+                and isinstance(e.get("sha"), str) and len(e["sha"]) == 40
+                and isinstance(e.get("tree"), str) and e["tree"]]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return []
+
+
+def steps_digest(steps=None):
+    """A short digest of the step list, so a verdict stands for another
+    commit's only while the steps that made it are still the ones run."""
+    listed = [[name, list(args), only_if]
+              for name, args, only_if in (STEPS if steps is None else steps)]
+    return hashlib.sha256(json.dumps(listed).encode()).hexdigest()[:16]
+
+
+def verdict_age(record, when):
+    """How long before `when` a verdict finished, or None if its stamp
+    can't be read."""
+    try:
+        return when - parse(record["finished"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def tested(state, tree, when, ok=None):
+    """The sha of the newest verdict on `tree` from this host and step
+    list, green only when `ok`, or None. A verdict that finished more
+    than MATCH_MAX_AGE before `when`, or after it, doesn't count: the
+    step digest can't see a toolchain upgrade."""
+    host, steps = socket.gethostname(), steps_digest()
+    best = None
+    for sha, r in state["results"].items():
+        age = verdict_age(r, when)
+        if (tree and r.get("tree") == tree and r.get("host") == host
+                and r.get("steps") == steps
+                and (ok is None or r.get("ok") is ok)
+                and age is not None
+                and datetime.timedelta(0) <= age <= MATCH_MAX_AGE
+                and (best is None or r["finished"] > best[1]["finished"])):
+            best = (sha, r)
+    return best[0] if best else None
+
+
+def next_ahead(state, ahead, busy=(), when=None):
+    """(sha, pr) of the first of the Merger's predictions, `ahead`, that
+    is worth a run, or None: not running in a slot (`busy`) or started
+    less than START_GRACE before `when`, not given up on, not the head's
+    own tree, and with no verdict of its own or on its tree."""
+    started = state.get("ahead_started", {})
+    for entry in ahead:
+        sha = entry["sha"]
+        if (entry.get("same_as_head") or sha in busy
+                or sha in state["results"]
+                or just_started({"started": started.get(sha)}, when)
+                or state.get("ahead_errors", {}).get(sha, 0) >= MAX_ERRORS
+                or tested(state, entry["tree"], when or now_utc())
+                is not None):
+            continue
+        return sha, entry["pr"]
+    return None
+
+
+def forget_ahead(state, ahead):
+    """Drop the start stamps and error counts of predictions the Merger
+    no longer lists, so they don't pile up."""
+    current = {e["sha"] for e in ahead}
+    for key in ("ahead_started", "ahead_errors"):
+        if key in state:
+            state[key] = {s: v for s, v in state[key].items()
+                          if s in current}
+            if not state[key]:
+                del state[key]
 
 
 def prune(state, when):
@@ -468,7 +623,11 @@ def on_host():
 
 def final_status(r):
     """(state, description) for a verdict, naming the first failed step:
-    where its author starts reading."""
+    where its author starts reading, or for a matched one where its
+    tree was tested."""
+    if r["ok"] and r.get("matched"):
+        return "success", "green%s: tree tested as %s (%s)" % (
+            on_host(), r["matched"][:10], r.get("matched_as", "another head"))
     if r["ok"]:
         return "success", "green%s in %ds" % (on_host(), r["seconds"])
     failed = r["failed"]
@@ -493,18 +652,21 @@ def repost(state, heads, post, out=print):
             out("POSTED #%d %s: %s" % (r["pr"], sha[:10], verdict_word(r)))
 
 
-def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None):
+def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
+                 ahead=False):
     """Start the check detached; see the module docstring on the cron
-    lock. Its output goes to worker.log."""
+    lock. Its output goes to worker.log. A prediction (`ahead`) posts
+    nothing, but a posting one still chains the next tick."""
     wlog = open(os.path.join(state_dir, "worker.log"), "a")
-    wlog.write("=== %s worker #%d %s slot %d ===\n"
-               % (iso(now_utc()), pr, sha, slot))
+    wlog.write("=== %s worker #%d %s slot %d%s ===\n"
+               % (iso(now_utc()), pr, sha, slot, " ahead" if ahead else ""))
     wlog.flush()
     subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--worker", sha,
          "--pr", str(pr), "--state-dir", state_dir, "--slot", str(slot)]
         + (["--checkout", checkout] if checkout else [])
-        + (["--post"] if posting else []),
+        + (["--post"] if posting else [])
+        + (["--ahead"] if ahead else []),
         cwd=state_dir, stdin=subprocess.DEVNULL, stdout=wlog,
         stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
     wlog.close()
@@ -513,8 +675,9 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None):
 def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
          post=None, slots=None, checkout=None, merger_dir=None):
     """Queue the open heads and start the next one in a free slot. With
-    `merger_dir` (only when MERGER_FIRST), the Merger's pull request
-    goes first and holds the rest."""
+    `merger_dir` (only with MERGER_FIRST), the Merger's pull request goes
+    first; with TEST_AHEAD too, its predictions come next (see the
+    module docstring)."""
     when = when or now_utc()
     heads = open_heads(token, run)
     if heads is None:
@@ -547,18 +710,33 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     free = [slot for slot, holder in holders.items() if holder is None]
     if not free:
         return 0
-    held_for = merger_first(merger_dir, when)
+    first_pr = merger_first(merger_dir, when)
+    ahead = (merger_ahead(merger_dir, when, checkout)
+             if TEST_AHEAD and merger_dir else [])
+    predicted = None
     with state_lock(state_dir):
         state = load(state_dir)
-        pick = next_head(state, busy, held_for, when)
-        if pick is not None:
+        pick = next_head(state, busy, first_pr, when)
+        if TEST_AHEAD:
+            forget_ahead(state, ahead)
+            if pick is None or pick[1] != first_pr:
+                predicted = next_ahead(state, ahead, busy, when)
+        if predicted is not None:
+            state.setdefault("ahead_started", {})[predicted[0]] = iso(when)
+            save(state_dir, state)
+        elif pick is not None:
             state["waiting"][pick[0]]["started"] = iso(when)
+            save(state_dir, state)
+        elif TEST_AHEAD:
             save(state_dir, state)
         starting = sum(1 for s, w in state["waiting"].items()
                        if s not in busy and just_started(w, when))
-    if pick is None and held_for is not None and queued - busy:
-        out("HELD: free slots are kept for the Merger's #%d; %d waiting"
-            % (held_for, len(queued - busy)))
+    if predicted is not None:
+        sha, pr = predicted
+        spawn(state_dir, sha, pr, post is not None, free[0], checkout, True)
+        out("STARTED-AHEAD #%d %s%s, the Merger's prediction; %d waiting"
+            % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
+               len(queued - busy)))
         return 0
     if pick is None:
         if starting:
@@ -574,9 +752,10 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         spawn(state_dir, sha, pr, post is not None, free[0], checkout)
     else:
         spawn(state_dir, sha, pr, post is not None, free[0])
-    out("STARTED #%d %s%s; %d waiting"
+    out("STARTED #%d %s%s; %d waiting%s"
         % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
-           len(queued - busy) - 1))
+           len(queued - busy) - 1,
+           ", first: the Merger waits on it" if pr == first_pr else ""))
     return 0
 
 
@@ -611,6 +790,85 @@ def prepare(repo, wt, sha, pr, run=sh):
             return "error", "%s: %s" % (" ".join(args[3:5]),
                                         got.stderr.strip())
     return "ready", ""
+
+
+def prepare_ahead(repo, wt, sha, run=sh):
+    """Check the Merger's predicted commit sha out, clean and detached,
+    at wt, as `prepare` does a head. The Merger wrote it into the
+    object store wt shares with `repo`, so nothing is fetched. Returns
+    ("ready", "") or ("error", why)."""
+    if not os.path.exists(os.path.join(wt, ".git")):
+        for args in (["git", "-C", repo, "worktree", "prune"],
+                     ["git", "-C", repo, "worktree", "add", "-q", "--detach",
+                      "--force", wt, "origin/" + MAIN]):
+            got = run(args)
+            if got.returncode != 0:
+                return "error", "%s: %s" % (" ".join(args[3:5]),
+                                            got.stderr.strip())
+    for args in (["git", "-C", wt, "cat-file", "-e", sha + "^{commit}"],
+                 ["git", "-C", wt, "checkout", "-q", "--detach", "--force",
+                  sha],
+                 ["git", "-C", wt, "clean", "-q", "-ffdx"]):
+        got = run(args)
+        if got.returncode != 0:
+            return "error", "%s: %s" % (" ".join(args[3:5]),
+                                        got.stderr.strip())
+    return "ready", ""
+
+
+def tree_of(wt, sha, run=sh):
+    """The tree sha's commit names, or None if git can't say."""
+    got = run(["git", "-C", wt, "rev-parse", sha + "^{tree}"])
+    tree = (got.stdout or "").strip()
+    return tree if got.returncode == 0 and len(tree) == 40 else None
+
+
+def flakes_of(state, sha, record):
+    """The commits whose red verdict, on this host and step list, this
+    green record's identical tree contradicts: a red that was not the
+    tree's. Nothing for a record without a tree."""
+    if not record["ok"] or not record.get("tree"):
+        return []
+    return sorted(other for other, r in state["results"].items()
+                  if other != sha and not r.get("ok")
+                  and r.get("tree") == record["tree"]
+                  and r.get("host") == record["host"]
+                  and r.get("steps") == record["steps"])
+
+
+def matched(state_dir, sha, pr, same, tree, started, post, out=print):
+    """Record and post green for head sha without running it: its tree
+    has a green verdict here already, as `same`. Only a green verdict is
+    reused; a red one is always run again."""
+    with state_lock(state_dir):
+        state = load(state_dir)
+        source = state["results"].get(same, {})
+        seen = state["waiting"].pop(sha, {}).get("since", iso(started))
+        # Dated from the run it stands in for, not from now, so a match
+        # of a match still ages out MATCH_MAX_AGE after the run itself.
+        record = {
+            "pr": pr, "seen": seen, "started": iso(started),
+            "finished": source.get("finished", iso(started)), "ok": True,
+            "failed": [], "seconds": 0, "tree": tree,
+            "host": socket.gethostname(), "steps": steps_digest(),
+            "matched": same,
+            "matched_as": ("the Merger's prediction for #%s" % source.get("pr")
+                           if source.get("ahead")
+                           else "#%s's head" % source.get("pr")),
+        }
+        state["results"][sha] = record
+        save(state_dir, state)
+    log(state_dir, "MATCHED #%d %s: its tree tested green as %s %s; not run "
+        "again" % (pr, sha[:10], record["matched_as"], same[:10]), started,
+        out)
+    if post is not None:
+        posted = post(sha, *final_status(record))
+        with state_lock(state_dir):
+            state = load(state_dir)
+            if sha in state["results"]:
+                state["results"][sha]["posted"] = posted
+                save(state_dir, state)
+    return 0
 
 
 def step_env(state_dir, base=None, slot=1):
@@ -695,9 +953,12 @@ def start_next_tick(popen=None, checkout=None):
 
 
 def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
-           post=None, chain=None, slot=1, memory_max=None):
+           post=None, chain=None, slot=1, memory_max=None, ahead=False):
     """Check sha, pull request pr's head, now, in this process, in
-    `slot`, each step limited to memory_max (None: no limit)."""
+    `slot`, each step limited to memory_max (None: no limit). With
+    `ahead`, sha is the Merger's prediction for pr: checked out without
+    a fetch, recorded with `ahead`, and posted nowhere. With TEST_AHEAD,
+    a head whose tree is green here already is posted green unrun."""
     os.makedirs(state_dir, exist_ok=True)
     started = clock()
     held = try_lock(lock_path(state_dir, slot),
@@ -711,8 +972,14 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     # once pick a head that is still waiting.
     settled = False
     wt = os.path.join(state_dir, slot_name("wt", slot))
+    if ahead:
+        # A prediction is no pull request's head: it gets no status.
+        post = None
     try:
-        status, detail = prepare(repo, wt, sha, pr, run)
+        if ahead:
+            status, detail = prepare_ahead(repo, wt, sha, run)
+        else:
+            status, detail = prepare(repo, wt, sha, pr, run)
         if status == "moved":
             with state_lock(state_dir):
                 state = load(state_dir)
@@ -727,13 +994,17 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 state = load(state_dir)
                 entry = state["waiting"].get(sha)
                 errors = 0
-                if entry is not None:
+                if ahead:
+                    counts = state.setdefault("ahead_errors", {})
+                    errors = counts[sha] = counts.get(sha, 0) + 1
+                elif entry is not None:
                     errors = entry["errors"] = entry.get("errors", 0) + 1
                 save(state_dir, state)
             if errors >= MAX_ERRORS:
-                log(state_dir, "GAVE-UP #%d %s after %d failures to prepare "
-                    "it; the last: %s" % (pr, sha[:10], errors, detail),
-                    started, out)
+                log(state_dir, "GAVE-UP%s #%d %s after %d failures to "
+                    "prepare it; the last: %s"
+                    % (" AHEAD" if ahead else "", pr, sha[:10], errors,
+                       detail), started, out)
                 if post is not None:
                     post(sha, "error", "not run: could not check the head "
                          "out %d times; the last: %s" % (errors, detail))
@@ -741,6 +1012,14 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             else:
                 out("NO-WORKTREE #%d %s: %s" % (pr, sha[:10], detail))
             return 2
+        tree = tree_of(wt, sha, run) if TEST_AHEAD else None
+        if tree and not ahead:
+            with state_lock(state_dir):
+                same = tested(load(state_dir), tree, started, ok=True)
+            if same is not None and same != sha:
+                settled = True
+                return matched(state_dir, sha, pr, same, tree, started,
+                               post, out)
         if post is not None:
             post(sha, "pending", "running%s since %s" % (on_host(),
                                                         iso(started)))
@@ -762,13 +1041,26 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 "failed": [r["name"] for r in results if r["rc"] != 0],
                 "seconds": sum(r["seconds"] for r in results),
             }
+            if TEST_AHEAD:
+                # What a later head with the same tree is matched by.
+                record.update(tree=tree, host=socket.gethostname(),
+                              steps=steps_digest())
+            if ahead:
+                record["ahead"] = True
+            flaked = flakes_of(state, sha, record)
             state["results"][sha] = record
             save(state_dir, state)
         settled = True
-        log(state_dir, "VERDICT #%d %s: %s waited=%ds ran=%ds"
-            % (pr, sha[:10], verdict_word(record),
+        log(state_dir, "VERDICT%s #%d %s: %s waited=%ds ran=%ds"
+            % (" AHEAD" if ahead else "", pr, sha[:10], verdict_word(record),
                (started - parse(seen)).total_seconds(), record["seconds"]),
             finished, out)
+        for other in flaked:
+            red = state["results"].get(other) or {}
+            log(state_dir, "FLAKE tree %s: red(%s) on #%s %s, then green on "
+                "#%d %s" % (tree[:10], ",".join(red.get("failed", [])),
+                            red.get("pr"), other[:10], pr, sha[:10]),
+                finished, out)
         if post is not None:
             posted = post(sha, *final_status(record))
             with state_lock(state_dir):
@@ -801,15 +1093,20 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
                         help="with --worker: the slot to run in (default 1)")
     parser.add_argument("--post", action="store_true",
                         help="post each verdict as the commit status")
+    parser.add_argument("--ahead", action="store_true",
+                        help="with --worker: SHA is the Merger's predicted "
+                        "commit for pull request --pr, checked and recorded "
+                        "but never posted (merge.test_ahead)")
     parser.add_argument("--state-dir", default=None,
                         help="where the queue, the verdicts and the logs "
                         "live (default ~/.local/state/agent-forge/"
                         "<project>/pr-check)")
     parser.add_argument("--merger-dir", default=None,
-                        help="with checks.merger_first: the Merger's state "
-                        "directory, whose next.json names the pull request "
-                        "to check first (default ~/.local/state/agent-forge/"
-                        "<project>/merger)")
+                        help="with checks.merger_first or merge.test_ahead: "
+                        "the Merger's state directory, whose next.json names "
+                        "the pull request to check first and whose "
+                        "ahead.json lists its predictions (default "
+                        "~/.local/state/agent-forge/<project>/merger)")
     parser.add_argument("--checkout", default=environ.get(
         "FORGE_CRON_CHECKOUT"), help="the checkout kept at the default "
         "branch (default $FORGE_CRON_CHECKOUT)")
@@ -839,7 +1136,8 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
         chain = (lambda: start_next_tick(checkout=repo)) if args.post else None
         return worker(repo, state_dir, args.worker, args.pr, run, out,
                       post=post, chain=chain, slot=args.slot,
-                      memory_max=memory_max_from_env(environ))
+                      memory_max=memory_max_from_env(environ),
+                      ahead=args.ahead)
     token = mint(run)
     if token is None:
         out("NO-TOKEN: could not mint %s's token" % POSTER)

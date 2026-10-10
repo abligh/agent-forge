@@ -1824,5 +1824,267 @@ class Configure(unittest.TestCase):
                          ["/r/tools/forge-x"])
 
 
+# merge.test_ahead.
+
+class PredictAhead(unittest.TestCase):
+    """The predicted commits are the ones a squash of each pull request
+    ahead, then GitHub's update, would make."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Repo(tmp.name)
+        self.repo.commit("shared.txt", "one\ntwo\nthree\n", "shared")
+        self.repo.push("main")
+        self.base = self.repo.main_tip()
+
+    def pr_on(self, number, start, files):
+        self.repo.branch("b%d" % number, start)
+        for name, text in files.items():
+            sha = self.repo.commit(name, text, "#%d %s" % (number, name))
+        self.repo.publish_pr(number, sha)
+        return pr(number, T1, head=sha)
+
+    def landed(self, onto, head):
+        """What merging `head` makes on top of `onto`, the way a squash
+        then an update does it, with `git merge` rather than the code
+        under test."""
+        self.repo.branch("land", head)
+        run_git(self.repo.path, "merge", "-q", "--no-edit", onto)
+        return run_git(self.repo.path, "rev-parse", "HEAD^{tree}")
+
+    def squash(self, parent, tree):
+        return run_git(self.repo.path, "commit-tree", tree, "-p", parent,
+                       "-m", "squash")
+
+    def refs(self):
+        return run_git(self.repo.path, "for-each-ref",
+                       "--format=%(refname)", m.AHEAD_REF).split()
+
+    def test_each_prediction_is_what_the_merges_ahead_of_it_make(self):
+        # #2 branches from an older main, and #3 edits a file #1 and #2
+        # leave alone, so each needs a real three-way merge.
+        old = run_git(self.repo.path, "rev-parse", "HEAD~1")
+        q = [self.pr_on(1, self.base, {"a.txt": "a\n"}),
+             self.pr_on(2, old, {"b.txt": "b\n"}),
+             self.pr_on(3, self.base, {"shared.txt": "one\ntwo\nTHREE\n"})]
+        got = m.predict_ahead(self.repo.path, self.base, q)
+        self.assertEqual([e["pr"] for e in got], [1, 2, 3])
+        main = self.base
+        for entry, item in zip(got, q):
+            tree = self.landed(main, item["headRefOid"])
+            self.assertEqual(entry["tree"], tree, "#%d" % entry["pr"])
+            self.assertEqual(run_git(self.repo.path, "rev-parse",
+                                     entry["sha"] + "^{tree}"), tree)
+            main = self.squash(main, tree)
+        self.assertEqual([run_git(self.repo.path, "rev-parse",
+                                  m.AHEAD_REF + str(k)) for k in range(3)],
+                         [e["sha"] for e in got])
+
+    def test_each_prediction_is_a_child_of_the_one_before(self):
+        q = [self.pr_on(n, self.base, {"f%d.txt" % n: "x\n"})
+             for n in (1, 2)]
+        got = m.predict_ahead(self.repo.path, self.base, q)
+        parents = [run_git(self.repo.path, "rev-parse", e["sha"] + "^")
+                   for e in got]
+        self.assertEqual(parents, [self.base, got[0]["sha"]])
+
+    def test_an_up_to_date_head_is_its_own_tree(self):
+        q = [self.pr_on(1, self.base, {"a.txt": "a\n"}),
+             self.pr_on(2, self.base, {"b.txt": "b\n"})]
+        got = m.predict_ahead(self.repo.path, self.base, q)
+        self.assertIs(got[0].get("same_as_head"), True)
+        self.assertNotIn("same_as_head", got[1])
+
+    def test_the_same_prediction_is_the_same_commit(self):
+        q = [self.pr_on(1, self.base, {"a.txt": "a\n"}),
+             self.pr_on(2, self.base, {"b.txt": "b\n"})]
+        self.assertEqual(m.predict_ahead(self.repo.path, self.base, q),
+                         m.predict_ahead(self.repo.path, self.base, q))
+
+    def test_a_signing_configuration_does_not_change_the_commit(self):
+        q = [self.pr_on(1, self.base, {"a.txt": "a\n"})]
+        first = m.predict_ahead(self.repo.path, self.base, q)
+        run_git(self.repo.path, "config", "commit.gpgsign", "true")
+        run_git(self.repo.path, "config", "gpg.program", "/nonexistent")
+        self.assertEqual(m.predict_ahead(self.repo.path, self.base, q), first)
+
+    def test_a_conflict_ends_the_list(self):
+        q = [self.pr_on(1, self.base, {"shared.txt": "ONE\n"}),
+             self.pr_on(2, self.base, {"shared.txt": "uno\n"}),
+             self.pr_on(3, self.base, {"c.txt": "c\n"})]
+        self.assertEqual([e["pr"] for e in m.predict_ahead(
+            self.repo.path, self.base, q)], [1])
+
+    def test_a_head_not_fetched_yet_is_fetched(self):
+        q = [self.pr_on(1, self.base, {"a.txt": "a\n"})]
+        other = os.path.join(os.path.dirname(self.repo.path), "other")
+        run_git(os.path.dirname(self.repo.path), "clone", "-q",
+                self.repo.origin, other)
+        run_git(other, "fetch", "-q", "origin", "main")
+        got = m.predict_ahead(other, run_git(other, "rev-parse",
+                                             "origin/main"), q)
+        self.assertEqual([e["pr"] for e in got], [1])
+
+    def test_no_more_than_the_depth_and_old_refs_go(self):
+        q = [self.pr_on(n, self.base, {"f%d.txt" % n: "x\n"})
+             for n in range(1, 7)]
+        self.assertEqual(len(m.predict_ahead(self.repo.path, self.base, q)),
+                         m.DEFAULT_AHEAD_DEPTH + 1)
+        self.assertEqual(len(m.predict_ahead(self.repo.path, self.base, q,
+                                             depth=1)), 2)
+        m.predict_ahead(self.repo.path, self.base, q[:1])
+        self.assertEqual(self.refs(), [m.AHEAD_REF + "0"])
+        m.predict_ahead(self.repo.path, self.base, [])
+        self.assertEqual(self.refs(), [])
+
+    def test_the_build_check_checks_a_prediction_out_unfetched(self):
+        # The build check's worktree shares the Merger's object store, so
+        # the prediction is there without any fetch or push.
+        pc = load_tool("forge-pr-check")
+        q = [self.pr_on(1, self.base, {"a.txt": "a\n"}),
+             self.pr_on(2, self.base, {"b.txt": "b\n"})]
+        got = m.predict_ahead(self.repo.path, self.base, q)
+        wt = os.path.join(os.path.dirname(self.repo.path), "wt")
+        pc.MAIN = "main"
+        self.assertEqual(pc.prepare_ahead(self.repo.path, wt, got[1]["sha"]),
+                         ("ready", ""))
+        self.assertEqual(pc.tree_of(wt, got[1]["sha"]), got[1]["tree"])
+        self.assertEqual(sorted(os.listdir(wt)),
+                         [".git", "a.txt", "b.txt", "base.txt", "shared.txt"])
+
+
+class TickAhead(RepoCase):
+    """A live tick predicts from the pull request it acts on. Tick's
+    helpers, without running its tests again."""
+
+    item = Decide.item
+    tick = Tick.tick
+    other_pr = Tick.other_pr
+    next_json = Tick.next_json
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        m.configure(project(test_ahead={}))
+        self.addCleanup(m.configure, project())
+
+    def ahead_json(self):
+        return m.load_json(os.path.join(self.state, m.AHEAD_FILE), None)
+
+    def test_the_configuration(self):
+        self.assertEqual((m.TEST_AHEAD, m.AHEAD_DEPTH), (True, 3))
+        m.configure(project(test_ahead={"depth": 1}))
+        self.assertEqual(m.AHEAD_DEPTH, 1)
+        m.configure(project())
+        self.assertIs(m.TEST_AHEAD, False)
+
+    def test_a_live_tick_predicts_from_the_one_it_acts_on(self):
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,), live=True)
+        self.assertEqual(record["decisions"][0]["action"], "WAIT")
+        self.assertEqual(record["ahead"], [5, 6])
+        ahead = self.ahead_json()
+        self.assertEqual([e["pr"] for e in ahead["entries"]], [5, 6])
+        self.assertEqual((ahead["base"], ahead["repo"], ahead["at"]),
+                         (self.repo.main_tip(), self.repo.path,
+                          record["at"]))
+        self.assertEqual(self.next_json(), {"at": record["at"], "pr": 5,
+                                            "action": "WAIT"})
+
+    def test_an_update_predicts_the_tree_the_update_makes(self):
+        self.advance_main("n.txt")
+        self.tick([self.item()], live=True)
+        entry, = self.ahead_json()["entries"]
+        self.assertEqual(entry["tree"], run_git(
+            self.repo.path, "merge-tree", "--write-tree",
+            self.repo.main_tip(), self.head))
+        self.assertNotIn("same_as_head", entry)
+
+    def test_a_dry_tick_predicts_nothing(self):
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,))
+        self.assertIsNone(self.ahead_json())
+        self.assertNotIn("ahead", record)
+
+    def test_handed_back(self):
+        other = self.other_pr()
+        approval = other["reviews"][0]
+        said = {"6": {"approved": approval["submittedAt"],
+                      "head": other["headRefOid"]}}
+        self.assertTrue(m.handed_back(said, other, approval))
+        self.assertFalse(m.handed_back(
+            said, other, dict(approval, submittedAt="later")))
+        self.assertFalse(m.handed_back(
+            said, dict(other, headRefOid="0" * 40), approval))
+        self.assertFalse(m.handed_back({}, other, approval))
+
+    def test_one_handed_back_under_its_approval_is_not_predicted(self):
+        other = self.other_pr()
+        os.makedirs(os.path.join(self.tmp.name, "state"), exist_ok=True)
+        m.save_json(os.path.join(self.tmp.name, "state", "handed-back.json"),
+                    {"6": {"head": other["headRefOid"], "reason": "red",
+                           "approved": other["reviews"][0]["submittedAt"]}})
+        self.tick([self.item(), other], conclusions=(None,), live=True)
+        self.assertEqual([e["pr"] for e in self.ahead_json()["entries"]], [5])
+
+    def test_a_tick_waiting_on_nothing_predicts_nothing(self):
+        # The old predictions and refs go.
+        self.tick([self.item(), self.other_pr()], conclusions=(None,),
+                  live=True)
+        self.assertTrue(run_git(self.repo.path, "for-each-ref", m.AHEAD_REF))
+        self.tick([], live=True, minutes=1)
+        self.assertEqual(self.ahead_json()["entries"], [])
+        self.assertEqual(run_git(self.repo.path, "for-each-ref",
+                                 m.AHEAD_REF), "")
+
+    def keeps_place(self, action):
+        os.makedirs(os.path.join(self.tmp.name, "state"), exist_ok=True)
+        m.save_json(os.path.join(self.tmp.name, "state", "next.json"),
+                    {"at": "2026-10-07T11:59:00Z", "pr": 6, "action": action})
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,), live=True)
+        return record["queue"][0]
+
+    def test_one_with_a_run_in_flight_keeps_its_place(self):
+        # #5 is older, so it would go first; #6 is mid-run.
+        self.assertEqual(m.IN_FLIGHT, ("UPDATE", "WAIT"))
+        for action in m.IN_FLIGHT:
+            with self.subTest(action=action):
+                self.assertEqual(self.keeps_place(action), 6)
+
+    def test_the_control_one_merged_or_handed_back_keeps_nothing(self):
+        for action in ("MERGE", "HAND-BACK", None):
+            with self.subTest(action=action):
+                self.assertEqual(self.keeps_place(action), 5)
+
+    def test_a_blocker_is_not_promoted_past_one_in_flight(self):
+        # #6 names #7 as its blocker, which would put #7 first.
+        os.makedirs(os.path.join(self.tmp.name, "state"), exist_ok=True)
+        m.save_json(os.path.join(self.tmp.name, "state", "next.json"),
+                    {"at": "2026-10-07T11:59:00Z", "pr": 5, "action": "WAIT"})
+        blocker = self.other_pr(7)
+        held = pr(6, T1, body="Blocked-by: #7")
+        record, _ = self.tick([self.item(), held, blocker],
+                              conclusions=(None,), live=True)
+        self.assertEqual(record["queue"], [5, 7])
+
+    def test_without_test_ahead_a_blocker_still_goes_first(self):
+        m.configure(project())
+        os.makedirs(os.path.join(self.tmp.name, "state"), exist_ok=True)
+        m.save_json(os.path.join(self.tmp.name, "state", "next.json"),
+                    {"at": "2026-10-07T11:59:00Z", "pr": 5, "action": "WAIT"})
+        blocker = self.other_pr(7)
+        held = pr(6, T1, body="Blocked-by: #7")
+        record, _ = self.tick([self.item(), held, blocker],
+                              conclusions=(None,), live=True)
+        self.assertEqual(record["queue"], [7, 5])
+        self.assertIsNone(self.ahead_json())
+        self.assertNotIn("action", self.next_json())
+        self.assertNotIn("ahead", record)
+
+
 if __name__ == "__main__":
     unittest.main()

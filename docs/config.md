@@ -39,7 +39,7 @@ starts with `_` is a comment, at any level.
 | `naming` | no | `app_slug_suffix` and `session_prefix`; see below. |
 | `machinery` | no | Apps that act for scheduled tools rather than agents, such as the Merger's; each entry as an agent's App fields. |
 | `identity` | no | The host's unconfigured git identity, which no commit may carry: `unattributed_domain` (an email domain such as `@host.example.org`; default `$FORGE_UNATTRIBUTED_DOMAIN`, else the host's own fully qualified name, so a configuration need not name its hosts) and `unattributed_name`. |
-| `merge` | no | How `forge-merger` merges: `merger`, the machinery App that acts (default `Merger`); `ci_workflow`, the Actions workflow every head must pass (default `ci`; `""` for none); `gate`, tools that must exit 0 before a merge, each an argument list with `{pr}`, `{base}` and `{head}` filled in, a `forge-` name run from the installation and anything else from the cron checkout (default `[["forge-commit-identity", "{base}..{head}"]]`); `stall_minutes`, how long a head may wait on its checks before the tick reports it stalled (default 30); `stall_alert`, whom a stall is told to (default none: a stall is only printed; see below). The required status is `checks.context`, counted only when `checks.poster`'s App (default the merger) posted it. |
+| `merge` | no | How `forge-merger` merges: `merger`, the machinery App that acts (default `Merger`); `ci_workflow`, the Actions workflow every head must pass (default `ci`; `""` for none); `gate`, tools that must exit 0 before a merge, each an argument list with `{pr}`, `{base}` and `{head}` filled in, a `forge-` name run from the installation and anything else from the cron checkout (default `[["forge-commit-identity", "{base}..{head}"]]`); `stall_minutes`, how long a head may wait on its checks before the tick reports it stalled (default 30); `stall_alert`, whom a stall is told to (default none: a stall is only printed; see below); `test_ahead`, whether the next pull requests are tested ahead (default none: they aren't; see below). The required status is `checks.context`, counted only when `checks.poster`'s App (default the merger) posted it. |
 | `host_settings` | no | Files every agent host carries, installed by `forge-host-settings`: `files`, each `{"from": path in the project, "to": path under the home directory, "mode": "0644", "json": true when compared as JSON}`, and `host_keys`, keys a JSON file's host may set for itself. |
 | `receiver` | no | How `forge-receiver` takes GitHub's webhook deliveries: `address` and `port` it listens on (default `127.0.0.1`, 8789), `path` (default `/hook`), `secret_file`, the webhook's secret, mode 0600 (default `~/.config/agent-forge/<project>/receiver-secret`), and `max_body`, the largest body in bytes (default 1048576); `ticks`, which tools each event runs, by GitHub event name (`issues`, `issue_comment`, `pull_request`, `pull_request_review`, `status`, `push`), each tool a name or an argument list, a `forge-` name run from the installation and anything else from the cron checkout (default none; `bin/forge-receiver` says when each event counts); and `route`, the router's argument list with `{items}` filled in as `N[,N]`, run for the items events name (default none: nothing is routed). |
 | `docs` | no | The project's documentation, as the tools that read it see it; see below. |
@@ -98,6 +98,68 @@ with its own issue. `stall-alert.json` in the Merger's state directory
 holds the open issue. Removing `stall_alert` stops the alerts but leaves
 an issue already open for a person to close.
 
+### `merge.test_ahead`
+
+Under branch protection that requires a pull request to be up to date
+with the default branch before it merges, the Merger takes one pull
+request at a time: it updates it, waits for the build check, merges,
+and only then starts on the next. The queue can drain no faster than
+one merge per check run plus the Merger's ticks around it.
+`test_ahead` keeps that rule and removes the wait. While the queue's
+first pull request is being checked, the Merger works out the commit
+each of the next few will have once those ahead of it merge, and the
+build check tests those commits in its free slots. When the queue
+reaches one of them, GitHub's update makes a commit whose tree has
+already been tested green, the build check posts green on it at once,
+and the Merger merges it on its next tick. Off without the key; `{}`
+turns it on with the defaults.
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `depth` | `3` | How many pull requests behind the one the Merger acts on are predicted, so `depth` + 1 commits in all. Deeper keeps more slots busy, but tests further into a queue that new approvals reorder. |
+| `max_age_hours` | `24` | How long a green verdict counts for another commit with the same tree, on the same host with the same steps. The steps' digest can't see a toolchain upgrade on the host. |
+
+How it works, and why it is safe:
+
+* **The prediction.** For the queue's first pull request, the Merger
+  writes a local commit with the tree `git merge-tree --write-tree`
+  gives for its head on the default branch's tip, and that tip as its
+  parent: a squash of an up-to-date head has the head's tree. For each
+  one after, it merges that pull request's head onto the commit before
+  it, as GitHub's update will once the one before has merged. A
+  conflict ends the list. The commits stay on the host, under
+  `refs/agent-forge-merger/ahead/<k>` in the Merger's checkout, listed
+  in `ahead.json` in its state directory. The build check reads them
+  from the same object store, so the two must use the same checkout.
+* **Green by tree.** The build check records each verdict's tree, host
+  and steps. A head whose tree has a green verdict here, younger than
+  `max_age_hours`, is posted `success` without a run, the description
+  naming the commit it was tested as. A red verdict is never reused.
+* **What it guarantees.** Nothing a merge requires changes: the head
+  is still up to date, the status is still on exactly that head, and
+  green is only ever posted for a tree a real run turned green. If
+  GitHub's merge ever gives a different tree, that tree has no verdict
+  and the head is checked as without `test_ahead`. Nothing more is
+  written to GitHub.
+* **What it costs.** Build time spent on predictions thrown away: a
+  hand-back, or a push to a pull request in the list, spends every
+  prediction behind it, at most `depth` + 1 runs. Other pull requests'
+  checks wait behind the predictions, at most `depth` + 1 runs each
+  time the queue or the default branch moves. A flaky test is accepted
+  once per tree rather than once per head; a green after a red on the
+  same tree is logged `FLAKE`.
+* **When not to use it.** The steps must depend on the tree alone. A
+  matched head is never checked out itself, and a prediction's history
+  is not the head's, so a step that reads commit messages, authors or
+  history can pass on one commit and fail on another with the same
+  tree. Run such a check in `merge.gate`, on the real head, or leave
+  `test_ahead` off. Without branch protection that requires heads to
+  be up to date, the queue isn't serial and there is no wait to remove.
+* **The queue doesn't churn.** With `test_ahead`, a pull request the
+  Merger last updated or waited on keeps its place: a blocker isn't
+  promoted past it, since that would spend the run it is having and
+  every prediction behind it.
+
 ### `checks`
 
 | Key | Default | What it is |
@@ -109,7 +171,7 @@ an issue already open for a person to close.
 | `slots` | `2` | Checks run at once (`$FORGE_PR_CHECK_SLOTS` overrides). |
 | `memory_max` | `16G` | Each step's memory limit, in systemd's syntax, or `off` (`$FORGE_PR_CHECK_MEMORY_MAX` overrides). |
 | `step_timeout_minutes` | `30` | When a step is stopped. |
-| `merger_first` | `false` | Check first the head of the pull request the Merger waits on (its `next.json`), and start nothing else while it names one. Right under branch protection that requires heads to be up to date, where any other verdict is spent by the next merge; it holds only while the Merger ticks at least every 10 minutes. |
+| `merger_first` | `false` | Start first a waiting head of the pull request the Merger waits on (its `next.json`, read while under 10 minutes old), since the next merge waits on its verdict; every other head is then started oldest first, as without it. It only orders: a free slot is never kept empty for the Merger, whose wait may be on something no check here ends. `merge.test_ahead` turns it on, and refuses `false`. |
 
 Only these keys are checked; the section may hold others, for tools
 not here yet.

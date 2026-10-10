@@ -11,6 +11,7 @@ import datetime
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import tempfile
@@ -152,6 +153,24 @@ class Configure(unittest.TestCase):
                           pc.STEP_TIMEOUT_S, pc.MERGER_FIRST),
                          (3, None, 300, True))
 
+    def test_test_ahead_and_its_defaults(self):
+        self.assertIs(pc.TEST_AHEAD, True)
+        self.assertEqual(pc.MATCH_MAX_AGE, datetime.timedelta(hours=24))
+        data = example()
+        data["merge"]["test_ahead"] = {"max_age_hours": 2}
+        del data["checks"]["merger_first"]
+        pc.configure(config.Project(data, None))
+        self.assertEqual(pc.MATCH_MAX_AGE, datetime.timedelta(hours=2))
+        # It implies merger_first: the Merger's head goes first.
+        self.assertIs(pc.MERGER_FIRST, True)
+
+    def test_without_test_ahead_it_is_off(self):
+        data = example()
+        del data["merge"]["test_ahead"]
+        data["checks"]["merger_first"] = False
+        pc.configure(config.Project(data, None))
+        self.assertEqual((pc.TEST_AHEAD, pc.MERGER_FIRST), (False, False))
+
     def test_no_host_says_nowhere(self):
         data = example()
         del data["host"]
@@ -268,12 +287,13 @@ class NextHead(unittest.TestCase):
                                      "started": "soon"}}}
         self.assertEqual(pc.next_head(state, when=T0), (SHA_A, 1))
 
-    def test_the_mergers_head_just_started_still_holds_the_rest(self):
+    def test_the_mergers_head_just_started_counts_as_busy(self):
+        # It holds nothing: the rest go on, oldest first.
         state = {"waiting": {
             SHA_A: {"pr": 1, "since": "2026-10-09T11:00:00Z",
                     "started": pc.iso(T0)},
             SHA_B: {"pr": 2, "since": "2026-10-09T09:00:00Z"}}}
-        self.assertIsNone(pc.next_head(state, first_pr=1, when=T0))
+        self.assertEqual(pc.next_head(state, first_pr=1, when=T0), (SHA_B, 2))
         self.assertEqual(pc.next_head(state, first_pr=1,
                                       when=T0 + pc.START_GRACE), (SHA_A, 1))
 
@@ -285,19 +305,27 @@ class NextHead(unittest.TestCase):
             SHA_B: {"pr": 2, "since": "2026-10-09T10:00:00Z"}}}
         self.assertEqual(pc.next_head(state, first_pr=2), (SHA_B, 2))
 
-    def test_a_merger_pull_request_with_nothing_waiting_holds_the_slot(self):
-        # Another head's verdict is spent once the Merger's next merge
-        # moves main, so the slot waits for the Merger's head.
+    def test_a_merger_pull_request_with_nothing_waiting_holds_nothing(self):
+        # The Merger may be waiting on something no check here ends, so
+        # its pull request only orders; it never keeps a slot empty.
         state = {"waiting": {
             SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z"}}}
-        self.assertIsNone(pc.next_head(state, first_pr=9))
+        self.assertEqual(pc.next_head(state, first_pr=9), (SHA_A, 1))
 
-    def test_the_mergers_head_running_in_a_slot_holds_the_rest(self):
+    def test_the_mergers_head_running_in_a_slot_holds_nothing(self):
         state = {"waiting": {
             SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z"},
             SHA_B: {"pr": 2, "since": "2026-10-09T10:00:00Z"}}}
-        self.assertIsNone(pc.next_head(state, {SHA_B}, first_pr=2))
+        self.assertEqual(pc.next_head(state, {SHA_B}, first_pr=2), (SHA_A, 1))
         self.assertEqual(pc.next_head(state, {SHA_B}), (SHA_A, 1))
+
+    def test_the_oldest_of_the_mergers_heads_goes_first(self):
+        state = {"waiting": {
+            SHA_A: {"pr": 1, "since": "2026-10-09T08:00:00Z"},
+            SHA_B: {"pr": 2, "since": "2026-10-09T10:00:00Z"},
+            SHA_C: {"pr": 2, "since": "2026-10-09T09:00:00Z"}}}
+        self.assertEqual(pc.next_head(state, first_pr=2), (SHA_C, 2))
+        self.assertEqual(pc.next_head(state, {SHA_C}, first_pr=2), (SHA_B, 2))
 
     def test_without_the_merger_the_oldest_head_is_picked(self):
         state = {"waiting": {
@@ -602,23 +630,37 @@ class Tick(StateCase):
                   merger_dir=self.merger_says(7))
         self.assertEqual(self.spawned,
                          [(self.state_dir, SHA_A, 7, False, 1)])
-        self.assertEqual(self.lines, ["STARTED #7 aaaaaaaaaa; 1 waiting"])
+        self.assertEqual(self.lines, ["STARTED #7 aaaaaaaaaa; 1 waiting, "
+                                      "first: the Merger waits on it"])
 
-    def test_holds_every_slot_while_the_mergers_head_is_not_waiting(self):
+    def test_a_stuck_wait_holds_nothing(self):
+        # The Merger names #7 for a wait no check here ends (its CI
+        # workflow hasn't finished, say), and next.json stays fresh all
+        # the while. Nothing of #7 is waiting, so #8 is started.
         self.tick([(8, SHA_B, REPO, "false")],
                   merger_dir=self.merger_says(7))
-        self.assertEqual(self.spawned, [])
-        self.assertEqual(self.lines, ["HELD: free slots are kept for the "
-                                      "Merger's #7; 1 waiting"])
+        self.assertEqual(self.spawned,
+                         [(self.state_dir, SHA_B, 8, False, 1)])
+        self.assertEqual(self.lines, ["STARTED #8 bbbbbbbbbb; 0 waiting"])
+        self.assertFalse(any(l.startswith("HELD") for l in self.lines))
 
-    def test_the_mergers_head_running_holds_the_free_slot(self):
+    def test_the_mergers_head_running_leaves_the_free_slot_to_the_rest(self):
         self.hold(1, "#7 %s %s" % (SHA_A, pc.iso(T0)))
         self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
                   merger_dir=self.merger_says(7))
-        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.spawned,
+                         [(self.state_dir, SHA_B, 8, False, 2)])
         self.assertEqual(self.lines, [
             "RUNNING #7 aaaaaaaaaa since %s; 1 waiting" % pc.iso(T0),
-            "HELD: free slots are kept for the Merger's #7; 1 waiting"])
+            "STARTED #8 bbbbbbbbbb in slot 2; 0 waiting"])
+
+    def test_the_mergers_head_just_started_leaves_the_slot_to_the_rest(self):
+        self.write_state({"waiting": {SHA_A: {
+            "pr": 7, "since": pc.iso(T0), "started": pc.iso(T0)}}})
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
+                  merger_dir=self.merger_says(7))
+        self.assertEqual(self.spawned,
+                         [(self.state_dir, SHA_B, 8, False, 1)])
 
     def test_a_stale_merger_holds_nothing(self):
         merger = self.merger_says(
@@ -1172,21 +1214,39 @@ class Main(StateCase):
             self.main(environ={"FORGE_PR_CHECK_SLOTS": "4"})
         self.assertEqual(tick.call_args.kwargs["slots"], 4)
 
+    def write_config(self, data):
+        with open(os.path.join(self.checkout, config.CONFIG_NAME), "w") as f:
+            json.dump(data, f)
+
     def test_the_mergers_directory_is_read_only_when_configured(self):
+        data = example()
+        data["checks"]["merger_first"] = False
+        del data["merge"]["test_ahead"]
+        self.write_config(data)
         with mock.patch.object(pc, "tick", return_value=0) as tick:
             self.main()
         self.assertIsNone(tick.call_args.kwargs["merger_dir"])
-        data = example()
-        data["checks"]["merger_first"] = True
-        with open(os.path.join(self.checkout, config.CONFIG_NAME), "w") as f:
-            json.dump(data, f)
-        for argv, where in (
-                ([], os.path.join(self._tmp.name, ".local", "state",
-                                  "agent-forge", "widget", "merger")),
-                (["--merger-dir", "/m"], "/m")):
-            with mock.patch.object(pc, "tick", return_value=0) as tick:
-                self.main(*argv)
-            self.assertEqual(tick.call_args.kwargs["merger_dir"], where)
+        mine = os.path.join(self._tmp.name, ".local", "state", "agent-forge",
+                            "widget", "merger")
+        # merger_first on its own, and test_ahead, which implies it.
+        first = example()
+        del first["merge"]["test_ahead"]
+        ahead = example()
+        del ahead["checks"]["merger_first"]
+        for data in (first, ahead):
+            self.write_config(data)
+            for argv, where in (([], mine), (["--merger-dir", "/m"], "/m")):
+                with mock.patch.object(pc, "tick", return_value=0) as tick:
+                    self.main(*argv)
+                self.assertEqual(tick.call_args.kwargs["merger_dir"], where)
+
+    def test_a_prediction_worker_is_started_with_ahead(self):
+        with mock.patch.object(pc, "worker", return_value=0) as worker:
+            self.main("--worker", SHA_A, "--pr", "7", "--ahead", "--post")
+        self.assertIs(worker.call_args.kwargs["ahead"], True)
+        with mock.patch.object(pc, "worker", return_value=0) as worker:
+            self.main("--worker", SHA_A, "--pr", "7")
+        self.assertIs(worker.call_args.kwargs["ahead"], False)
 
     def test_the_state_directory_defaults_under_the_home(self):
         with mock.patch.object(pc, "tick", return_value=0) as tick:
@@ -1194,6 +1254,488 @@ class Main(StateCase):
         self.assertEqual(tick.call_args.args[0], os.path.join(
             self._tmp.name, ".local", "state", "agent-forge", "widget",
             "pr-check"))
+
+
+# merge.test_ahead: the Merger's predictions, and green by tree.
+
+SHA_P = "d" * 40
+SHA_Q = "e" * 40
+TREE_1 = "1" * 40
+TREE_2 = "2" * 40
+
+
+def entry(pr, sha, tree, **more):
+    return dict({"pr": pr, "head": "f" * 40, "sha": sha, "tree": tree},
+                **more)
+
+
+def write_ahead(merger_dir, entries, when=T0, repo="/repo"):
+    with open(os.path.join(merger_dir, "ahead.json"), "w") as handle:
+        json.dump({"at": pc.iso(when), "base": "0" * 40, "repo": repo,
+                   "entries": entries}, handle)
+
+
+def verdict(pr=4, ok=True, tree=TREE_1, finished=T0, **more):
+    """A verdict here, on this host with these steps."""
+    return dict({"pr": pr, "ok": ok, "failed": [] if ok else ["test"],
+                 "seconds": 60, "seen": pc.iso(finished),
+                 "started": pc.iso(finished), "finished": pc.iso(finished),
+                 "tree": tree, "host": socket.gethostname(),
+                 "steps": pc.steps_digest()}, **more)
+
+
+def empty():
+    return {"waiting": {}, "results": {}, "refused": {}}
+
+
+class MergerAhead(unittest.TestCase):
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+
+    def test_fresh_entries_are_read(self):
+        write_ahead(self.dir, [entry(2, SHA_P, TREE_1)])
+        self.assertEqual(pc.merger_ahead(self.dir, T0),
+                         [entry(2, SHA_P, TREE_1)])
+
+    def test_a_stale_file_is_ignored(self):
+        write_ahead(self.dir, [entry(2, SHA_P, TREE_1)])
+        self.assertEqual(len(pc.merger_ahead(self.dir, T0 + pc.MERGER_FRESH)),
+                         1)
+        self.assertEqual(pc.merger_ahead(
+            self.dir, T0 + pc.MERGER_FRESH + datetime.timedelta(seconds=1)),
+            [])
+
+    def test_another_checkouts_predictions_are_ignored(self):
+        # Its commits are in an object store this worktree doesn't share.
+        write_ahead(self.dir, [entry(2, SHA_P, TREE_1)], repo="/elsewhere")
+        self.assertEqual(pc.merger_ahead(self.dir, T0, "/repo"), [])
+        self.assertEqual(len(pc.merger_ahead(self.dir, T0, "/elsewhere")), 1)
+
+    def test_malformed_entries_are_dropped(self):
+        write_ahead(self.dir, [entry("2", SHA_P, TREE_1),
+                               entry(True, SHA_P, TREE_1),
+                               entry(3, "short", TREE_1),
+                               entry(4, SHA_Q, ""),
+                               entry(5, SHA_Q, TREE_2)])
+        self.assertEqual(pc.merger_ahead(self.dir, T0),
+                         [entry(5, SHA_Q, TREE_2)])
+
+    def test_unreadable_or_absent_is_empty(self):
+        self.assertEqual(pc.merger_ahead(self.dir, T0), [])
+        self.assertEqual(pc.merger_ahead(None, T0), [])
+        for bad in ("{", "[]", '{"at": "x", "entries": []}',
+                    '{"at": "%s"}' % pc.iso(T0),
+                    '{"at": "%s", "entries": [1]}' % pc.iso(T0)):
+            with open(os.path.join(self.dir, "ahead.json"), "w") as handle:
+                handle.write(bad)
+            self.assertEqual(pc.merger_ahead(self.dir, T0), [], bad)
+
+
+class Tested(unittest.TestCase):
+
+    def state(self, **results):
+        return dict(empty(), results=results)
+
+    def test_a_verdict_on_the_tree_here(self):
+        state = self.state(**{SHA_A: verdict()})
+        self.assertEqual(pc.tested(state, TREE_1, T0), SHA_A)
+        self.assertEqual(pc.tested(state, TREE_1, T0, ok=True), SHA_A)
+        self.assertIsNone(pc.tested(state, TREE_2, T0))
+        self.assertIsNone(pc.tested(state, None, T0))
+
+    def test_green_only_when_asked(self):
+        state = self.state(**{SHA_A: verdict(ok=False)})
+        self.assertEqual(pc.tested(state, TREE_1, T0), SHA_A)
+        self.assertIsNone(pc.tested(state, TREE_1, T0, ok=True))
+
+    def test_not_another_hosts_or_another_step_lists(self):
+        for other in (verdict(host="elsewhere"), verdict(steps="other"),
+                      verdict(tree=None)):
+            self.assertIsNone(pc.tested(self.state(**{SHA_A: other}),
+                                        TREE_1, T0), other)
+
+    def test_a_different_step_list_is_a_different_digest(self):
+        self.assertNotEqual(pc.steps_digest(),
+                            pc.steps_digest([("test", ["make"], None)]))
+        self.assertEqual(pc.steps_digest(), pc.steps_digest(list(pc.STEPS)))
+
+    def test_the_newest_green_is_named(self):
+        hour = datetime.timedelta(hours=1)
+        state = self.state(**{SHA_B: verdict(finished=T0 - 5 * hour),
+                              SHA_A: verdict(finished=T0 - hour)})
+        self.assertEqual(pc.tested(state, TREE_1, T0, ok=True), SHA_A)
+
+    def test_a_verdict_older_than_the_limit_does_not_count(self):
+        # The step digest can't see a toolchain upgrade.
+        limit = pc.MATCH_MAX_AGE
+        state = self.state(**{SHA_A: verdict()})
+        self.assertEqual(pc.tested(state, TREE_1, T0 + limit, ok=True), SHA_A)
+        later = T0 + limit + datetime.timedelta(seconds=1)
+        self.assertIsNone(pc.tested(state, TREE_1, later, ok=True))
+        self.assertIsNone(pc.tested(state, TREE_1, later))
+
+    def test_a_verdict_from_the_future_or_undated_does_not_count(self):
+        state = self.state(**{SHA_A: verdict(
+            finished=T0 + datetime.timedelta(minutes=5))})
+        self.assertIsNone(pc.tested(state, TREE_1, T0))
+        bad = verdict()
+        bad["finished"] = "yesterday"
+        self.assertIsNone(pc.tested(self.state(**{SHA_A: bad}), TREE_1, T0))
+
+
+class NextAhead(unittest.TestCase):
+    AHEAD = [entry(2, SHA_P, TREE_1), entry(3, SHA_Q, TREE_2)]
+
+    def test_the_first_entry_in_order(self):
+        self.assertEqual(pc.next_ahead(empty(), self.AHEAD, when=T0),
+                         (SHA_P, 2))
+
+    def test_an_entry_with_a_verdict_is_not_run_again(self):
+        state = empty()
+        state["results"][SHA_P] = dict(verdict(pr=2), ahead=True)
+        self.assertEqual(pc.next_ahead(state, self.AHEAD, when=T0),
+                         (SHA_Q, 3))
+
+    def test_an_entry_run_without_a_tree_is_not_run_again(self):
+        state = empty()
+        state["results"][SHA_P] = verdict(pr=2, tree=None, ahead=True)
+        self.assertEqual(pc.next_ahead(state, self.AHEAD, when=T0),
+                         (SHA_Q, 3))
+
+    def test_an_entry_whose_tree_has_a_verdict_is_skipped(self):
+        # Red or green: either way it would not be run again.
+        for ok in (True, False):
+            state = empty()
+            state["results"][SHA_A] = verdict(pr=9, ok=ok)
+            self.assertEqual(pc.next_ahead(state, self.AHEAD, when=T0),
+                             (SHA_Q, 3), ok)
+
+    def test_another_hosts_verdict_does_not_count(self):
+        state = empty()
+        state["results"][SHA_A] = verdict(pr=9, host="elsewhere")
+        self.assertEqual(pc.next_ahead(state, self.AHEAD, when=T0),
+                         (SHA_P, 2))
+
+    def test_the_heads_own_tree_is_left_to_the_heads_check(self):
+        ahead = [entry(2, SHA_P, TREE_1, same_as_head=True)] + self.AHEAD[1:]
+        self.assertEqual(pc.next_ahead(empty(), ahead, when=T0), (SHA_Q, 3))
+
+    def test_one_running_or_just_started_is_not_started_again(self):
+        self.assertEqual(pc.next_ahead(empty(), self.AHEAD, {SHA_P}, T0),
+                         (SHA_Q, 3))
+        state = dict(empty(), ahead_started={SHA_P: pc.iso(T0)})
+        self.assertEqual(pc.next_ahead(state, self.AHEAD, when=T0),
+                         (SHA_Q, 3))
+        self.assertEqual(pc.next_ahead(state, self.AHEAD,
+                                       when=T0 + pc.START_GRACE), (SHA_P, 2))
+
+    def test_an_entry_that_errored_out_is_skipped(self):
+        state = dict(empty(), ahead_errors={SHA_P: pc.MAX_ERRORS})
+        self.assertEqual(pc.next_ahead(state, self.AHEAD, when=T0),
+                         (SHA_Q, 3))
+        state["ahead_errors"] = {SHA_P: pc.MAX_ERRORS - 1}
+        self.assertEqual(pc.next_ahead(state, self.AHEAD, when=T0),
+                         (SHA_P, 2))
+
+    def test_nothing_left(self):
+        self.assertIsNone(pc.next_ahead(empty(), [], when=T0))
+
+    def test_what_the_merger_no_longer_lists_is_forgotten(self):
+        state = dict(empty(), ahead_started={SHA_P: "x", SHA_C: "y"},
+                     ahead_errors={SHA_C: 1})
+        pc.forget_ahead(state, self.AHEAD)
+        self.assertEqual(state["ahead_started"], {SHA_P: "x"})
+        self.assertNotIn("ahead_errors", state)
+
+
+class TickAhead(Tick):
+
+    def merger(self, pr=7, entries=(entry(2, SHA_P, TREE_1),)):
+        merger = self.merger_says(pr)
+        write_ahead(merger, list(entries), when=T0 - datetime.timedelta(
+            minutes=1))
+        return merger
+
+    def test_a_prediction_runs_while_the_mergers_head_is_not_waiting(self):
+        self.write_state({"waiting": {SHA_B: {
+            "pr": 8, "since": pc.iso(T0 - datetime.timedelta(hours=1))}}})
+        self.tick([(8, SHA_B, REPO, "false")], merger_dir=self.merger(),
+                  post=lambda *a: True)
+        self.assertEqual(self.spawned,
+                         [(self.state_dir, SHA_P, 2, True, 1, None, True)])
+        self.assertEqual(self.lines[-1], "STARTED-AHEAD #2 dddddddddd, the "
+                         "Merger's prediction; 1 waiting")
+        self.assertEqual(self.state()["ahead_started"], {SHA_P: pc.iso(T0)})
+
+    def test_the_mergers_own_head_comes_first(self):
+        self.tick([(7, SHA_A, REPO, "false")], merger_dir=self.merger())
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_A, 7, False, 1)])
+
+    def test_the_mergers_head_running_leaves_the_other_slot_to_a_prediction(
+            self):
+        self.hold(1, "#7 %s %s" % (SHA_A, pc.iso(T0)))
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
+                  merger_dir=self.merger())
+        self.assertEqual(self.spawned,
+                         [(self.state_dir, SHA_P, 2, False, 2, None, True)])
+
+    def test_a_prediction_started_is_not_started_in_another_slot(self):
+        merger = self.merger()
+        self.tick([], merger_dir=merger)
+        self.assertEqual(len(self.spawned), 1)
+        self.tick([], merger_dir=merger)
+        self.assertEqual(self.spawned, [])
+
+    def test_one_running_is_not_started_again(self):
+        self.hold(1, "#2 %s %s" % (SHA_P, pc.iso(T0)))
+        self.tick([], merger_dir=self.merger(
+            entries=[entry(2, SHA_P, TREE_1), entry(3, SHA_Q, TREE_2)]))
+        self.assertEqual(self.spawned,
+                         [(self.state_dir, SHA_Q, 3, False, 2, None, True)])
+
+    def test_predictions_go_before_other_heads_and_then_they_resume(self):
+        self.write_state({"waiting": {SHA_B: {"pr": 8, "since": pc.iso(T0)}}})
+        merger = self.merger()
+        self.tick([(8, SHA_B, REPO, "false")], merger_dir=merger)
+        self.assertEqual(self.spawned[0][1], SHA_P)
+        # Once tested, the prediction is spent and the queue goes on.
+        state = self.state()
+        state["results"][SHA_P] = verdict(pr=2, ahead=True)
+        self.write_state(state)
+        self.tick([(8, SHA_B, REPO, "false")], merger_dir=merger)
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_B, 8, False, 1)])
+
+    def test_nothing_to_predict_and_nothing_waiting_is_idle(self):
+        self.write_state(dict(empty(), results={SHA_P: verdict(pr=2)}))
+        self.tick([], merger_dir=self.merger())
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.lines, ["IDLE: no open head is waiting"])
+
+    def test_without_test_ahead_the_predictions_are_not_read(self):
+        data = example()
+        del data["merge"]["test_ahead"]
+        pc.configure(config.Project(data, None))
+        self.addCleanup(pc.configure, config.Project(example(), None))
+        self.tick([], merger_dir=self.merger())
+        self.assertEqual(self.spawned, [])
+        self.assertNotIn("ahead_started", self.state())
+
+
+class PrepareAhead(unittest.TestCase):
+
+    def test_checks_the_commit_out_without_fetching(self):
+        with tempfile.TemporaryDirectory() as wt:
+            os.mkdir(os.path.join(wt, ".git"))
+            run = FakeRun()
+            self.assertEqual(pc.prepare_ahead("/repo", wt, SHA_P, run),
+                             ("ready", ""))
+            self.assertEqual([c["args"] for c in run.calls], [
+                ["git", "-C", wt, "cat-file", "-e", SHA_P + "^{commit}"],
+                ["git", "-C", wt, "checkout", "-q", "--detach", "--force",
+                 SHA_P],
+                ["git", "-C", wt, "clean", "-q", "-ffdx"]])
+
+    def test_a_missing_commit_is_an_error_and_nothing_is_checked_out(self):
+        with tempfile.TemporaryDirectory() as wt:
+            os.mkdir(os.path.join(wt, ".git"))
+            run = FakeRun((lambda a: "cat-file" in a,
+                           done([], 1, "", "bad object")))
+            self.assertEqual(pc.prepare_ahead("/repo", wt, SHA_P, run),
+                             ("error", "cat-file -e: bad object"))
+            self.assertFalse([c for c in run.calls if "checkout" in c["args"]])
+
+    def test_a_missing_worktree_is_added_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = FakeRun()
+            pc.prepare_ahead("/repo", os.path.join(tmp, "wt"), SHA_P, run)
+            self.assertEqual(run.calls[1]["args"][:5],
+                             ["git", "-C", "/repo", "worktree", "add"])
+
+
+class WorkerAhead(Worker):
+    """A prediction is run as a head is, recorded by tree, and posted
+    nowhere; a head whose tree is green already is posted green unrun."""
+
+    def run_for(self, fetched=SHA_A, failing=(), fail_git=None,
+                tree=TREE_1):
+        run = super().run_for(fetched, failing, fail_git)
+        run.rules.insert(0, (lambda a: a[-1].endswith("^{tree}"),
+                             done([], 0, tree + "\n")))
+        return run
+
+    def queue(self, errors=0):
+        """As Worker's, keeping the verdicts already written."""
+        results = self.state()["results"]
+        super().queue(errors)
+        state = self.state()
+        state["results"] = results
+        self.write_state(state)
+
+    def ahead(self, run, sha=SHA_P, pr=2, post=None, chain=None):
+        os.makedirs(os.path.join(self.state_dir, "wt", ".git"), exist_ok=True)
+        clock = iter([T0, T0 + datetime.timedelta(minutes=10)])
+        return pc.worker("/repo", self.state_dir, sha, pr, run,
+                         self.lines.append, lambda: next(clock), post, chain,
+                         ahead=True)
+
+    def ran(self, run):
+        return any(c["args"][0] == "make" for c in run.calls)
+
+    def logged(self):
+        return pathlib.Path(self.state_dir, "verdicts.log").read_text()
+
+    def test_a_prediction_is_checked_recorded_and_not_posted(self):
+        posts, chained = [], []
+        run = self.run_for()
+        self.assertEqual(self.ahead(run, post=lambda *a: posts.append(a),
+                                    chain=lambda: chained.append(1) or
+                                    ["x", "y"]), 0)
+        self.assertEqual(posts, [])
+        # Still chained: the next tick drains the queue.
+        self.assertEqual(chained, [1])
+        self.assertFalse([c for c in run.calls if "fetch" in c["args"]])
+        self.assertTrue(self.ran(run))
+        r = self.state()["results"][SHA_P]
+        self.assertEqual((r["pr"], r["ok"], r["tree"], r["ahead"], r["host"],
+                          r["steps"]),
+                         (2, True, TREE_1, True, socket.gethostname(),
+                          pc.steps_digest()))
+        self.assertIn("VERDICT AHEAD #2 dddddddddd: green", self.logged())
+
+    def test_a_prediction_is_run_even_when_its_tree_is_green(self):
+        # It is only chosen when its tree has no verdict; if one lands
+        # meanwhile, running it costs one run and posts nothing.
+        self.write_state(dict(empty(), results={SHA_A: verdict(pr=9)}))
+        run = self.run_for()
+        self.ahead(run)
+        self.assertTrue(self.ran(run))
+        self.assertNotIn("matched", self.state()["results"][SHA_P])
+
+    def test_a_prediction_that_cannot_be_prepared_counts_its_errors(self):
+        run = self.run_for(fail_git="cat-file")
+        for _ in range(pc.MAX_ERRORS):
+            self.assertEqual(self.ahead(run), 2)
+        state = self.state()
+        self.assertEqual(state["ahead_errors"], {SHA_P: pc.MAX_ERRORS})
+        self.assertNotIn(SHA_P, state["results"])
+        self.assertIn("GAVE-UP AHEAD #2 dddddddddd", self.logged())
+
+    def test_a_head_whose_tree_tested_green_is_posted_without_a_run(self):
+        self.write_state(dict(empty(), results={
+            SHA_P: verdict(pr=2, ahead=True)}))
+        self.queue()
+        posts = []
+        run = self.run_for()
+        self.assertEqual(self.work(run, post=lambda *a: posts.append(a)
+                                   or True), 0)
+        self.assertFalse(self.ran(run))
+        self.assertEqual(posts, [(
+            SHA_A, "success", "green on build.example.org: tree tested as "
+            "dddddddddd (the Merger's prediction for #2)")])
+        state = self.state()
+        r = state["results"][SHA_A]
+        self.assertEqual((r["ok"], r["matched"], r["seconds"], r["posted"],
+                          r["tree"]), (True, SHA_P, 0, True, TREE_1))
+        self.assertEqual(state["waiting"], {})
+        self.assertIn("MATCHED #7 aaaaaaaaaa", self.logged())
+
+    def test_another_heads_green_is_named_as_that_head(self):
+        self.write_state(dict(empty(), results={SHA_B: verdict(pr=4)}))
+        self.queue()
+        posts = []
+        self.work(self.run_for(), post=lambda *a: posts.append(a) or True)
+        self.assertEqual(posts[0][2], "green on build.example.org: tree "
+                         "tested as bbbbbbbbbb (#4's head)")
+
+    def test_a_red_verdict_is_never_reused(self):
+        self.write_state(dict(empty(), results={SHA_B: verdict(
+            pr=4, ok=False)}))
+        self.queue()
+        run = self.run_for()
+        posts = []
+        self.work(run, post=lambda *a: posts.append(a) or True)
+        self.assertTrue(self.ran(run))
+        self.assertEqual([p[1] for p in posts], ["pending", "success"])
+        self.assertNotIn("matched", self.state()["results"][SHA_A])
+
+    def test_a_green_after_a_red_on_the_same_tree_logs_a_flake(self):
+        self.write_state(dict(empty(), results={SHA_B: verdict(
+            pr=4, ok=False)}))
+        self.queue()
+        self.work(self.run_for())
+        self.assertIn("FLAKE tree 1111111111: red(test) on #4 bbbbbbbbbb, "
+                      "then green on #7 aaaaaaaaaa", self.logged())
+
+    def test_another_hosts_step_lists_or_trees_green_is_not_reused(self):
+        for other, tree in ((verdict(pr=4, host="elsewhere"), TREE_1),
+                            (verdict(pr=4, steps="other"), TREE_1),
+                            (verdict(pr=4), TREE_2)):
+            self.write_state(dict(empty(), results={SHA_B: other}))
+            self.queue()
+            run = self.run_for(tree=tree)
+            self.work(run)
+            self.assertTrue(self.ran(run), other)
+
+    def test_a_green_older_than_the_limit_is_not_reused(self):
+        self.write_state(dict(empty(), results={SHA_B: verdict(
+            pr=4, finished=T0 - pc.MATCH_MAX_AGE
+            - datetime.timedelta(seconds=1))}))
+        self.queue()
+        run = self.run_for()
+        self.work(run)
+        self.assertTrue(self.ran(run))
+
+    def test_a_match_is_dated_from_the_run_it_stands_in_for(self):
+        # So a match of a match ages out after the run, not after the
+        # last match.
+        before = T0 - datetime.timedelta(hours=1)
+        self.write_state(dict(empty(), results={SHA_B: verdict(
+            pr=4, finished=before)}))
+        self.queue()
+        self.work(self.run_for())
+        r = self.state()["results"][SHA_A]
+        self.assertEqual((r["finished"], r["started"]),
+                         (pc.iso(before), pc.iso(T0)))
+        self.assertIsNone(pc.tested(self.state(), TREE_1, before +
+                                    pc.MATCH_MAX_AGE +
+                                    datetime.timedelta(seconds=1)))
+
+    def test_its_own_earlier_verdict_is_run_again(self):
+        # A head queued again after its verdict is run, not matched
+        # against itself.
+        self.write_state(dict(empty(), results={SHA_A: verdict(pr=7)}))
+        self.queue()
+        run = self.run_for()
+        self.work(run)
+        self.assertTrue(self.ran(run))
+
+    def test_without_test_ahead_nothing_is_matched_or_recorded_by_tree(self):
+        data = example()
+        del data["merge"]["test_ahead"]
+        pc.configure(config.Project(data, None))
+        self.addCleanup(pc.configure, config.Project(example(), None))
+        self.write_state(dict(empty(), results={SHA_B: verdict(pr=4)}))
+        self.queue()
+        run = self.run_for()
+        self.work(run)
+        self.assertTrue(self.ran(run))
+        self.assertFalse([c for c in run.calls
+                          if c["args"][-1].endswith("^{tree}")])
+        self.assertNotIn("tree", self.state()["results"][SHA_A])
+
+
+class FinalStatusMatched(unittest.TestCase):
+
+    def test_a_matched_verdict_names_its_source(self):
+        r = {"ok": True, "seconds": 0, "matched": SHA_P,
+             "matched_as": "the Merger's prediction for #2"}
+        self.assertEqual(pc.final_status(r), (
+            "success", "green on build.example.org: tree tested as "
+            "dddddddddd (the Merger's prediction for #2)"))
+        self.assertLessEqual(len(pc.final_status(r)[1]), pc.DESCRIPTION_MAX)
 
 
 if __name__ == "__main__":

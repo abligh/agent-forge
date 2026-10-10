@@ -59,7 +59,8 @@ AGENT = dict(APP, session_name=str, kind=str, reviews=list)
 IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list}
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
-         "stall_minutes": int, "stall_alert": dict}
+         "stall_minutes": int, "stall_alert": dict, "test_ahead": dict}
+TEST_AHEAD = {"depth": int, "max_age_hours": int}
 STALL_ALERT = {"tell": list, "retell_minutes": int,
                "owner_after_minutes": int, "title": str, "labels": list}
 # checks is shared with tools not here yet, so only these keys are
@@ -200,6 +201,9 @@ def check(data):
             problems.append("merge.merger %r is not in machinery" % name)
         if isinstance(merge.get("stall_alert"), dict):
             _check_stall_alert(merge["stall_alert"], data["agents"], problems)
+        if isinstance(merge.get("test_ahead"), dict):
+            _check_test_ahead(merge["test_ahead"], data.get("checks"),
+                              problems)
     for name, allowed in (("labels", LABELS), ("relay", RELAY)):
         section = data.get(name, {})
         for key, kinds in allowed.items():
@@ -334,6 +338,22 @@ def _check_stall_alert(alert, agents, problems):
     if isinstance(labels, list) and not all(
             isinstance(l, str) and l.strip() for l in labels):
         problems.append("%s.labels must be a list of label names" % where)
+
+
+def _check_test_ahead(ahead, checks, problems):
+    """merge.test_ahead: how far ahead the Merger predicts, and how long
+    the build check reuses a green verdict for another commit with its
+    tree. Testing ahead puts the Merger's pull request first, so
+    `checks.merger_first: false` contradicts it."""
+    where = "merge.test_ahead"
+    _fields(where, ahead, TEST_AHEAD, problems)
+    if _is(ahead.get("depth"), int) and ahead["depth"] < 0:
+        problems.append("%s.depth must be at least 0" % where)
+    if _is(ahead.get("max_age_hours"), int) and ahead["max_age_hours"] < 1:
+        problems.append("%s.max_age_hours must be at least 1" % where)
+    if isinstance(checks, dict) and checks.get("merger_first") is False:
+        problems.append("%s puts the Merger's pull request first, so "
+                        "checks.merger_first must not be false" % where)
 
 
 def _check_receiver(receiver, problems):

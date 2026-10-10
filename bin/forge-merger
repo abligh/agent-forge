@@ -159,6 +159,55 @@ nothing is opened or sent; a dry run never opens, labels, closes or
 sends anything either. Only `main` passes the relay sender, so a test
 that ticks through a stall messages nobody.
 
+**With `merge.test_ahead`, it predicts the commits the next pull
+requests will be tested at** (default off). Under branch protection
+that requires a head to be up to date, the queue is serial: update,
+wait for the build check, merge, and only then start on the next. This
+removes the wait without changing what a merge requires. On a live
+tick that is waiting on a pull request (Q0), it writes, for Q0 and up
+to `test_ahead.depth` (default 3) behind it, the commit each will have
+once those in front of it have merged:
+
+* S0 stands in for Q0's squash commit: the tree `git merge-tree
+  --write-tree` gives for Q0's head on `main`'s tip (its own tree when
+  it is up to date), with that tip as its parent. A squash of an
+  up-to-date head has the head's tree.
+* Each later Sk is `git merge-tree --write-tree` of S(k-1) with Qk's
+  head, with S(k-1) as its parent: the tree GitHub's `update-branch`
+  makes for Qk once the ones ahead have merged.
+
+A conflict ends the list, since nothing behind it can be predicted.
+Pull requests already handed back under their current approval and
+head are left out. The commits never leave this host: they are local
+commits under `refs/agent-forge-merger/ahead/<k>` in this checkout,
+with a fixed author, committer and date and no signature, so the same
+inputs give the same SHA and a prediction is never tested twice. Their
+list is `ahead.json` in the state directory (`at`, `base`, `repo`,
+`entries` of `pr`, `head`, `sha`, `tree`, and `same_as_head` when the
+tree is the head's own, which the head's own check already tests).
+Every live tick rewrites both and empties them when it waits on
+nothing; a dry run writes neither. `forge-pr-check` tests the entries
+in its free slots and posts green on a head whose tree one of them, or
+any other check here, already turned green.
+
+**Why that is safe.** A merge tree is a function of its inputs, so a
+prediction that matches is exactly the code the update produces. The
+prediction matters only when it is right: if GitHub's merge ever
+produces a different tree, that tree is simply not one the build check
+has tested, and the pull request is checked as it would be without
+`test_ahead`. Nothing is written to GitHub that isn't written without
+it, the gate is unchanged, and green is only ever posted for a tree a
+real run turned green. What it costs is build time: a hand-back or a
+push spends the predictions behind it, at most `depth` + 1 runs.
+
+**With `test_ahead`, the pull request a run is in flight for keeps its
+place.** When the last tick updated or waited on a pull request that
+is still a candidate, it stays first, and no blocker (a pull request
+another one's `Blocked-by:` names) is promoted past it. A blocker that
+jumped it would merge, move `main` and put it behind again, spending
+the run it was already having. One merged or handed back keeps
+nothing. `next.json` then also says that tick's `action`.
+
 Exit 0 when the tick ran, whatever GitHub answered its write, or
 another tick held the lock; 2 when it could not ask (no checkout, no
 token, GitHub or git failed) or the head it waits on is `STALLED`.
@@ -253,6 +302,20 @@ STALL_TITLE = DEFAULT_STALL_TITLE
 STALL_LABELS = ()
 WAITING_OWNER = DEFAULT_WAITING_OWNER
 STALL_ALERT_NAME = "stall-alert.json"
+# `merge.test_ahead`: whether the next pull requests' commits are
+# predicted for the build check to test ahead, and how many behind the
+# one acted on. The predictions are local commits under AHEAD_REF<k>,
+# with a fixed identity and date so the same inputs give the same SHA.
+DEFAULT_AHEAD_DEPTH = 3
+TEST_AHEAD = False
+AHEAD_DEPTH = DEFAULT_AHEAD_DEPTH
+AHEAD_FILE = "ahead.json"
+AHEAD_REF = "refs/agent-forge-merger/ahead/"
+AHEAD_DATE = "2000-01-01T00:00:00Z"
+AHEAD_IDENTITY = ("forge-merger", "merger@agent-forge.invalid")
+# The actions that leave a run in progress or about to start on the
+# pull request: with test_ahead, it keeps its place in the queue.
+IN_FLIGHT = ("UPDATE", "WAIT")
 
 
 def configure(project):
@@ -260,13 +323,15 @@ def configure(project):
     The `merge` section: `merger` (the machinery App that acts, default
     "Merger"), `ci_workflow` (default "ci"; "" for none), `gate` (a list
     of argument lists), `stall_minutes` (default 30) and `stall_alert`
-    (default none: a stall is only printed). The `checks` section:
-    `context` and `poster` (default the merger). `labels.waiting_on_owner`
-    is the label a long stall gets."""
+    (default none: a stall is only printed), and `test_ahead` (default
+    none: nothing is predicted; `depth`, default 3). The `checks`
+    section: `context` and `poster` (default the merger).
+    `labels.waiting_on_owner` is the label a long stall gets."""
     global REPO_SLUG, MAIN, APPROVERS, QUIET_LOGINS, ACT_AS, SIGNATURE
     global STATUS_CONTEXT, STATUS_CREATOR, BUILD_HOST, GATE, CI_WORKFLOW
     global STALL_AFTER, STALL_ALERT, STALL_TELL, STALL_RETELL
     global STALL_TO_OWNER, STALL_TITLE, STALL_LABELS, WAITING_OWNER
+    global TEST_AHEAD, AHEAD_DEPTH
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -292,6 +357,9 @@ def configure(project):
     STALL_LABELS = tuple(alert.get("labels", ()))
     WAITING_OWNER = project.section("labels").get("waiting_on_owner",
                                                   DEFAULT_WAITING_OWNER)
+    ahead = merge.get("test_ahead")
+    TEST_AHEAD = ahead is not None
+    AHEAD_DEPTH = (ahead or {}).get("depth", DEFAULT_AHEAD_DEPTH)
 
 NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
 BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
@@ -1094,6 +1162,74 @@ def conflict_hand_back(pr, approval, github, said, live):
     return decision
 
 
+def handed_back(said, pr, approval):
+    """Whether `pr` was handed back under the approval it has now, at the
+    head it has now: it would only be handed back again, so it is not
+    predicted."""
+    before = said.get(str(pr["number"])) or {}
+    return bool(before.get("approved")) and \
+        before["approved"] == approval.get("submittedAt") and \
+        before.get("head") == pr["headRefOid"]
+
+
+def predict_ahead(repo, main_tip, queue, run=sh, depth=None):
+    """The commits the first `depth` + 1 pull requests in `queue`
+    (default AHEAD_DEPTH) will have once those ahead of each have
+    merged, as [{pr, head, sha, tree}], each also written as
+    AHEAD_REF<k> in `repo`, and any ref past the last one deleted.
+
+    S0 stands in for the first one's squash commit: the tree its update
+    gives (its own tree when it is up to date), with `main_tip` as its
+    parent. Each Sk is the next one's head merged onto S(k-1), with
+    S(k-1) as its parent, which is what GitHub's update makes once the
+    one before has merged. A conflict, or anything git can't do, ends
+    the list: nothing behind it can be predicted. An entry whose tree is
+    its head's own says `same_as_head`, since the head's own check
+    tests it. The commits carry a fixed identity and date and no
+    signature, so the same prediction is the same commit on every
+    tick."""
+    depth = AHEAD_DEPTH if depth is None else depth
+    name, email = AHEAD_IDENTITY
+    env = dict(os.environ, GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
+               GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email,
+               GIT_AUTHOR_DATE=AHEAD_DATE, GIT_COMMITTER_DATE=AHEAD_DATE)
+    entries, parent = [], main_tip
+    for pr in queue[:depth + 1]:
+        head = pr["headRefOid"]
+        # Only the pull requests the tick decided on were fetched, so
+        # the ones behind them may not be here yet.
+        if git(repo, "cat-file", "-e", head + "^{commit}",
+               run=run).returncode != 0:
+            git(repo, "fetch", "-q", "origin", "+refs/pull/%d/head:%s"
+                % (pr["number"], PR_REF % pr["number"]), run=run)
+        merged = git(repo, "merge-tree", "--write-tree", "--no-messages",
+                     parent, head, run=run)
+        if merged.returncode != 0 or not merged.stdout.split():
+            break
+        tree = merged.stdout.split()[0]
+        made = run(["git", "-C", repo, "commit-tree", "--no-gpg-sign", tree,
+                    "-p", parent, "-m", "forge-merger: #%d ahead"
+                    % pr["number"]], env=env)
+        sha = (made.stdout or "").strip()
+        if made.returncode != 0 or len(sha) != 40:
+            break
+        entry = {"pr": pr["number"], "head": head, "sha": sha, "tree": tree}
+        own = git(repo, "rev-parse", head + "^{tree}", run=run)
+        if own.returncode == 0 and own.stdout.strip() == tree:
+            entry["same_as_head"] = True
+        entries.append(entry)
+        parent = sha
+    listed = git(repo, "for-each-ref", "--format=%(refname)", AHEAD_REF,
+                 run=run)
+    stale = set(listed.stdout.split()) if listed.returncode == 0 else set()
+    for k, entry in enumerate(entries):
+        git(repo, "update-ref", AHEAD_REF + str(k), entry["sha"], run=run)
+        stale.discard(AHEAD_REF + str(k))
+    for ref in sorted(stale):
+        git(repo, "update-ref", "-d", ref, run=run)
+    return entries
+
+
 def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
          sleep=time.sleep, live=False, send=None):
     """One tick: the queue, and the action for its first pull request
@@ -1124,6 +1260,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         elif approval_of(pr) is not None:
             held[str(pr["number"])] = why
     queue = order(candidates, prs)
+    if TEST_AHEAD:
+        # The pull request the last tick updated or waited on keeps its
+        # place: a blocker promoted past it would spend the run it is
+        # already having, and every prediction behind it.
+        last = load_json(os.path.join(state_dir, "next.json"), {})
+        if isinstance(last, dict) and last.get("action") in IN_FLIGHT:
+            queue.sort(key=lambda pr: pr["number"] != last.get("pr"))
     record = {"at": iso(when), "main": main_tip, "held": held,
               "queue": [pr["number"] for pr in queue], "decisions": []}
     os.makedirs(state_dir, exist_ok=True)
@@ -1174,8 +1317,22 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 record["stalled"]["refused"] = "%s %s" % (
                     waiting["action"], waiting["result"])
         save_json(said_path, said)
-        save_json(os.path.join(state_dir, "next.json"),
-                  {"at": record["at"], "pr": waiting_on})
+        said_next = {"at": record["at"], "pr": waiting_on}
+        if TEST_AHEAD:
+            acted = [d["action"] for d in record["decisions"]
+                     if d["pr"] == waiting_on]
+            said_next["action"] = acted[-1] if acted else None
+        save_json(os.path.join(state_dir, "next.json"), said_next)
+        if TEST_AHEAD:
+            acting = [pr for pr in queue if pr["number"] == waiting_on]
+            rest = [pr for pr in queue if pr["number"] != waiting_on
+                    and not handed_back(said, pr, approvals[pr["number"]])]
+            entries = predict_ahead(repo, main_tip,
+                                    acting + rest if acting else [], run)
+            record["ahead"] = [e["pr"] for e in entries]
+            save_json(os.path.join(state_dir, AHEAD_FILE),
+                      {"at": record["at"], "base": main_tip, "repo": repo,
+                       "entries": entries})
     name = "merger.jsonl" if live else "dry-run.jsonl"
     with open(os.path.join(state_dir, name), "a") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
