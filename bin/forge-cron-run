@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Run a project's tool from cron, against the reviewed copy.
+
+    FORGE_CRON_CHECKOUT=~/widget-cron forge-cron-run TOOL [ARGS...]
+
+Why a wrapper rather than calling the tool from the crontab:
+
+* **It syncs first.** The copy that runs should be the copy that was
+  reviewed, so this resets a dedicated checkout of the project (never a
+  person's working copy, which sits on whatever branch they last chose)
+  to `origin/<default branch>` before the run.
+* **cron's environment is not a login shell.** PATH is set here, in the
+  one wrapper every job goes through: `$FORGE_CRON_PATH` (a host's
+  toolchains, first so they win), then ~/.local/bin and the system
+  directories. The caller's PATH is discarded, so a job resolves the
+  same binaries whatever fired it.
+* **It logs.** Each run appends to `<logdir>/<tool>.log` (logdir
+  `$FORGE_CRON_LOGDIR`, default ~/cron-logs): a header, the commit it
+  ran at, the tool's output and `exit=<status>`.
+
+TOOL is the project's `tools/TOOL`, or, when it starts `forge-`, this
+installation's own, run with the checkout as its working directory.
+With `$FORGE_CRON_APP` set the job acts as that App: its token is
+minted into GH_TOKEN, and a mint that fails stops the job rather than
+falling back to the host's login.
+
+**Locks.** Two kinds, taken in this order so no two jobs can each hold
+what the other waits for:
+
+* `.TOOL.lock`, exclusive: one run of each tool at a time. Tools rely on
+  it; each appends to its own log and the status is read back from it.
+* the checkout's lock, held shared while a job runs, so different jobs
+  run side by side, and exclusive only to reset the checkout, which so
+  waits for every running job. flock lets a new shared holder past a
+  waiting exclusive one, so under a steady stream of short jobs a reset
+  would starve; a job that finds the checkout behind leaves a
+  `sync-wanted` marker, and a job that starts while it is there queues
+  for the exclusive lock instead. Whoever syncs removes it.
+
+The wait is bounded (`$FORGE_CRON_LOCK_WAIT_S`, default 300, one budget
+for every lock), shorter than any job's period, so a waiter gives up
+before its successor is launched rather than piling up behind a hung
+job. A give-up is written to the job's log as a run that couldn't ask
+its question, `exit=2`, since cron has nowhere else to put it.
+
+A fetch that loses a ref-lock race to another fetch of the same
+repository is retried once after `$FORGE_CRON_FETCH_RETRY_S` (default
+5); any other failure is not, since a retry would only hide it.
+
+Exit: the tool's own status, unchanged, so a tool's "cannot check" (2)
+never turns into "found something" (1) a layer up; or 2 when the tool
+did not run: no checkout, a failed sync, no such tool, no lock in time,
+or no App token.
+"""
+import datetime
+import fcntl
+import os
+import re
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+from agent_forge import config, github  # noqa: E402
+
+
+class Stop(Exception):
+    """The tool won't run; the message is the log line."""
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def lock(handle, exclusive, deadline, clock=time.monotonic, nap=time.sleep):
+    """flock `handle`, waiting no later than `deadline`; False on timeout."""
+    mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
+    while True:
+        try:
+            fcntl.flock(handle, mode)
+            return True
+        except OSError:
+            if clock() >= deadline:
+                return False
+            nap(0.2)
+
+
+# The environment git runs with: the job's, set by main().
+GIT_ENV = [None]
+
+
+def git(repo, *args):
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True,
+                          text=True, env=GIT_ENV[0])
+
+
+def cron_env(environ):
+    """The environment every job runs with."""
+    env = dict(environ)
+    home = env.get("HOME") or os.path.expanduser("~")
+    parts = [p for p in env.get("FORGE_CRON_PATH", "").split(":") if p]
+    parts += [os.path.join(home, ".local", "bin"), "/usr/local/bin",
+              "/usr/bin", "/bin"]
+    env["HOME"] = home
+    env["PATH"] = ":".join(parts)
+    return env
+
+
+def branch_of(repo):
+    """The default branch from the checkout's configuration, else main.
+    Read before the sync, so a change to it takes one run to apply."""
+    try:
+        return config.load(os.path.join(repo, config.CONFIG_NAME)) \
+            .default_branch
+    except config.ConfigError:
+        return "main"
+
+
+def fetch(repo, branch, write, retry_s, nap=time.sleep):
+    got = git(repo, "fetch", "-q", "origin", branch)
+    text = (got.stdout + got.stderr).strip()
+    if got.returncode != 0 and "cannot lock ref" in text:
+        write(text)
+        write("RETRY: fetch lost a race for a ref; again in %ss" % retry_s)
+        nap(retry_s)
+        got = git(repo, "fetch", "-q", "origin", branch)
+        text = (got.stdout + got.stderr).strip()
+    if text:
+        write(text)
+    if got.returncode != 0:
+        raise Stop("SYNC-FAILED: fetch")
+
+
+def current(repo, branch):
+    """At origin/<branch> with no tracked file edited: nothing to reset."""
+    head = git(repo, "rev-parse", "HEAD").stdout.strip()
+    want = git(repo, "rev-parse", "origin/" + branch).stdout.strip()
+    return head == want and git(repo, "diff", "--quiet", "HEAD",
+                                "--").returncode == 0
+
+
+def tool_path(repo, tool):
+    if "/" in tool or tool.startswith("."):
+        raise Stop("NO-SUCH-TOOL: %s" % tool)
+    path = os.path.join(HERE, tool) if tool.startswith("forge-") else \
+        os.path.join(repo, "tools", tool)
+    if not os.access(path, os.X_OK):
+        raise Stop("NO-SUCH-TOOL: %s" % tool)
+    return path
+
+
+def mint_into(env, app, repo, mint):
+    try:
+        env["GH_TOKEN"] = mint(repo, app)
+    except (config.ConfigError, github.MintError) as e:
+        raise Stop("APP-TOKEN-FAILED: no token for %s (%s)" % (app, e)) \
+            from None
+
+
+def default_mint(repo, app):
+    return github.token(config.load(os.path.join(repo, config.CONFIG_NAME)),
+                        app)
+
+
+def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
+         nap=time.sleep, err=None):
+    argv = sys.argv[1:] if argv is None else argv
+    environ = os.environ if environ is None else environ
+    err = err or (lambda line: print(line, file=sys.stderr))
+    if not argv:
+        err("usage: forge-cron-run TOOL [ARGS...]")
+        return 2
+    tool, args = argv[0], argv[1:]
+    env = cron_env(environ)
+    GIT_ENV[0] = env
+    repo = os.path.expanduser(environ.get("FORGE_CRON_CHECKOUT", ""))
+    if not repo:
+        err("forge-cron-run: set FORGE_CRON_CHECKOUT to the project's cron "
+            "checkout")
+        return 2
+    logdir = os.path.expanduser(environ.get("FORGE_CRON_LOGDIR")
+                                or os.path.join(env["HOME"], "cron-logs"))
+    wait = float(environ.get("FORGE_CRON_LOCK_WAIT_S", "300"))
+    retry_s = float(environ.get("FORGE_CRON_FETCH_RETRY_S", "5"))
+    os.makedirs(logdir, exist_ok=True)
+    name = os.path.basename(tool)
+    log_path = os.path.join(logdir, name + ".log")
+    key = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.realpath(repo).strip("/"))
+    wanted = os.path.join(logdir, ".forge-cron.%s.sync-wanted" % key)
+    deadline = clock() + wait
+    header = "=== %s %s ===" % (now(), " ".join([tool] + args))
+
+    log = open(log_path, "a")
+    tool_lock = open(os.path.join(logdir, ".%s.lock" % name), "a")
+    repo_lock = open(os.path.join(logdir, ".forge-cron.%s.lock" % key), "a")
+    started = []
+
+    def write(line):
+        log.write(line + "\n")
+        log.flush()
+
+    def give_up(what):
+        if not started:
+            write(header)
+        write("LOCK-TIMEOUT: %s for %gs; giving up" % (what, wait))
+        write("exit=2")
+        err("forge-cron-run: %s for %gs; giving up" % (what, wait))
+        return 2
+
+    try:
+        if not lock(tool_lock, True, deadline, clock, nap):
+            return give_up("another %s run held its own lock" % name)
+        exclusive = os.path.exists(wanted)
+        if not lock(repo_lock, exclusive, deadline, clock, nap):
+            return give_up("another job held the checkout's lock")
+        write(header)
+        started.append(True)
+        try:
+            if not os.path.exists(os.path.join(repo, ".git")):
+                raise Stop("NO-CHECKOUT: %s is not a git checkout; every "
+                           "job runs from it. Clone the project there."
+                           % repo)
+            branch = branch_of(repo)
+            fetch(repo, branch, write, retry_s, nap)
+            if not exclusive and not current(repo, branch):
+                open(wanted, "w").close()
+                fcntl.flock(repo_lock, fcntl.LOCK_UN)
+                exclusive = True
+                if not lock(repo_lock, True, deadline, clock, nap):
+                    return give_up("another job held the checkout's lock")
+                fetch(repo, branch, write, retry_s, nap)
+            if exclusive:
+                got = git(repo, "reset", "-q", "--hard", "origin/" + branch)
+                if got.returncode != 0:
+                    write(got.stderr.strip())
+                    raise Stop("SYNC-FAILED: reset")
+                if os.path.exists(wanted):
+                    os.unlink(wanted)
+                # Back to shared for the run. flock converts by unlocking
+                # and relocking, so a queued reset may come in between;
+                # `at` is read after this for that reason.
+                fcntl.flock(repo_lock, fcntl.LOCK_UN)
+                if not lock(repo_lock, False, deadline, clock, nap):
+                    return give_up("another job held the checkout's lock")
+            write("at %s" % git(repo, "rev-parse", "--short",
+                                "HEAD").stdout.strip())
+            path = tool_path(repo, tool)
+            app = environ.get("FORGE_CRON_APP")
+            if app:
+                mint_into(env, app, repo, mint)
+                write("as %s" % app)
+        except Stop as e:
+            write(str(e))
+            write("exit=2")
+            return 2
+        # The locks stay with this process: a child that outlived the run
+        # holding copies would hold them too.
+        rc = subprocess.call([path] + args, cwd=repo, env=env, stdout=log,
+                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             close_fds=True)
+        if rc < 0:
+            rc = 128 - rc   # killed by a signal, as a shell reports it
+        write("exit=%d" % rc)
+        return rc
+    finally:
+        for handle in (repo_lock, tool_lock, log):
+            handle.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
