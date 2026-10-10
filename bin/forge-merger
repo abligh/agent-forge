@@ -9,7 +9,9 @@ still covers, nobody has spoken since, and nothing it names in a
 
 * the pull requests another open one is blocked by come first, held
   or not;
-* then the rest, oldest-opened first.
+* then the rest, oldest-opened first;
+* with `merge.yield_after_hand_back`, each that was handed back lately
+  then lets others in its group go first (below).
 
 For the first candidate, it decides one action:
 
@@ -52,6 +54,23 @@ directory (~/.local/state/agent-forge/<project>/merger, or
 `--state-dir`) (`dry-run.jsonl` under `--dry-run`). `held` names each pull
 request Reviewer approved that is not eligible, with the reason, and
 `handed-back.json` remembers what was already said.
+
+**With `merge.yield_after_hand_back: N`, a pull request handed back
+lately lets others go first** (default off). Otherwise one handed back
+to its author for its own failure (a red check, a conflict, a failed
+gate) goes
+straight back to the front once it is fixed and approved again, and if
+it fails again everything behind it waits another update and build,
+every prediction behind it wasted. With it, a candidate handed back K
+times in the last 24 hours (to its author, distinct heads and reasons
+in this state directory's record, K at most `merge.yield_cap`, default
+3) is moved
+back N times K places after the order above, within its group: a pull
+request another is blocked by is never moved behind one that isn't,
+and none past the group's end. A hand-back to the approving reviewer
+(a fresh review is wanted), holds, waits and stall alerts don't count. With `test_ahead`, the pull request a run is in flight for
+keeps its place and never yields. The record's `yielded` says who
+moved back how many places.
 
 **`--dry-run` writes nothing to GitHub.** It reads with the Merger's
 App too, since a dry run is how to watch the Merger before it acts.
@@ -338,6 +357,12 @@ IN_FLIGHT = ("UPDATE", "WAIT")
 HOLD_CONFLICTING = False
 HOLD_REASON = "conflicts with #%d, ahead of it in the queue"
 HOLD_FILE = "held-conflicting.json"
+# merge.yield_after_hand_back: places a lately handed-back pull request
+# yields per hand-back (0: off), counting at most YIELD_CAP of them
+# within YIELD_WINDOW.
+YIELD_PLACES = 0
+YIELD_CAP = 3
+YIELD_WINDOW = datetime.timedelta(hours=24)
 
 
 def configure(project):
@@ -347,13 +372,16 @@ def configure(project):
     of argument lists), `stall_minutes` (default 30) and `stall_alert`
     (default none: a stall is only printed), and `test_ahead` (default
     none: nothing is predicted; `depth`, default 3) and
-    `hold_conflicting` (default false). The `checks` section: `context` and `poster` (default the merger).
+    `hold_conflicting` (default false), `yield_after_hand_back`
+    (default none: nobody yields) and `yield_cap` (default 3). The
+    `checks` section: `context` and `poster` (default the merger).
     `labels.waiting_on_owner` is the label a long stall gets."""
     global REPO_SLUG, MAIN, APPROVERS, QUIET_LOGINS, ACT_AS, SIGNATURE
     global STATUS_CONTEXT, STATUS_CREATOR, BUILD_HOST, GATE, CI_WORKFLOW
     global STALL_AFTER, STALL_ALERT, STALL_TELL, STALL_RETELL
     global STALL_TO_OWNER, STALL_TITLE, STALL_LABELS, WAITING_OWNER
-    global TEST_AHEAD, AHEAD_DEPTH, HOLD_CONFLICTING
+    global TEST_AHEAD, AHEAD_DEPTH, HOLD_CONFLICTING, YIELD_PLACES
+    global YIELD_CAP
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -383,6 +411,8 @@ def configure(project):
     TEST_AHEAD = ahead is not None
     AHEAD_DEPTH = (ahead or {}).get("depth", DEFAULT_AHEAD_DEPTH)
     HOLD_CONFLICTING = merge.get("hold_conflicting", False) is True
+    YIELD_PLACES = merge.get("yield_after_hand_back", 0)
+    YIELD_CAP = merge.get("yield_cap", 3)
 
 NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
 BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
@@ -571,6 +601,93 @@ def order(candidates, everyone=None):
         named |= blockers_of(pr)
     key = lambda pr: (pr["number"] not in named, pr["createdAt"], pr["number"])
     return sorted(candidates, key=key)
+
+
+def recent_records(path, since, block=65536):
+    """The records of the JSON-lines file `path` stamped (`at`) at or
+    after `since`, oldest first, read from the end in blocks until one
+    older turns up: a long record is never read whole for one tick."""
+    try:
+        handle = open(path, "rb")
+    except OSError:
+        return []
+    with handle:
+        handle.seek(0, os.SEEK_END)
+        end = handle.tell()
+        tail, records, done = b"", [], False
+        while end > 0 and not done:
+            start = max(0, end - block)
+            handle.seek(start)
+            chunk = handle.read(end - start) + tail
+            end = start
+            lines = chunk.split(b"\n")
+            # The first line may be cut short unless the file starts here.
+            tail = lines.pop(0) if start > 0 else b""
+            for line in reversed(lines):
+                try:
+                    record = json.loads(line)
+                    at = parse_time(record["at"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if at < since:
+                    done = True
+                    break
+                records.append(record)
+        if not done and tail:
+            try:
+                record = json.loads(tail)
+                if parse_time(record["at"]) >= since:
+                    records.append(record)
+            except (ValueError, KeyError, TypeError):
+                pass
+    records.reverse()
+    return records
+
+
+def hand_backs(records):
+    """{pr: how many times it was handed back to its author} in
+    `records`: distinct heads and reasons, since a tick repeats a
+    hand-back already said; one GitHub refused to post is not counted.
+    A hand-back to the approving reviewer asks for a fresh review and is
+    not the pull request's own failure, so it doesn't count either."""
+    seen = {}
+    for record in records:
+        for d in record.get("decisions") or ():
+            if not isinstance(d, dict) or d.get("action") != "HAND-BACK" \
+                    or d.get("to") != "author":
+                continue
+            if str(d.get("result") or "").startswith("refused"):
+                continue
+            seen.setdefault(d.get("pr"), set()).add(
+                (d.get("head"), d.get("reason")))
+    return {pr: len(keys) for pr, keys in seen.items()}
+
+
+def yield_places(queue, everyone, counts, keep=None):
+    """(`queue` reordered, {pr: places moved back}): each pull request
+    handed back K times (`counts`, K at most YIELD_CAP) moved back
+    YIELD_PLACES times K places within its group, those another open
+    pull request is blocked by being one group and the rest the other.
+    `keep`, the pull request a run is in flight for, never moves. Later
+    ones are moved first, so one yielding never takes a place another
+    yielded."""
+    named = set()
+    for pr in everyone:
+        named |= blockers_of(pr)
+    groups = ([pr for pr in queue if pr["number"] in named],
+              [pr for pr in queue if pr["number"] not in named])
+    moved = {}
+    for group in groups:
+        for i in range(len(group) - 1, -1, -1):
+            pr = group[i]
+            k = min(counts.get(pr["number"], 0), YIELD_CAP)
+            if not k or pr["number"] == keep:
+                continue
+            to = min(i + YIELD_PLACES * k, len(group) - 1)
+            if to > i:
+                group.insert(to, group.pop(i))
+                moved[pr["number"]] = to - i
+    return groups[0] + groups[1], moved
 
 
 def git(repo, *args, run=sh):
@@ -1346,19 +1463,30 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         elif approval_of(pr) is not None:
             held[str(pr["number"])] = why
     queue = order(candidates, prs)
+    in_flight = None
     if TEST_AHEAD:
+        last = load_json(os.path.join(state_dir, "next.json"), {})
+        if isinstance(last, dict) and last.get("action") in IN_FLIGHT:
+            in_flight = last.get("pr")
+    yielded = {}
+    if YIELD_PLACES:
+        name = "merger.jsonl" if live else "dry-run.jsonl"
+        counts = hand_backs(recent_records(os.path.join(state_dir, name),
+                                           when - YIELD_WINDOW))
+        queue, yielded = yield_places(queue, prs, counts, in_flight)
+    if in_flight is not None:
         # The pull request the last tick updated or waited on keeps its
         # place: a blocker promoted past it would spend the run it is
         # already having, and every prediction behind it.
-        last = load_json(os.path.join(state_dir, "next.json"), {})
-        if isinstance(last, dict) and last.get("action") in IN_FLIGHT:
-            queue.sort(key=lambda pr: pr["number"] != last.get("pr"))
+        queue.sort(key=lambda pr: pr["number"] != in_flight)
     held_by = conflicts_ahead(repo, queue, run) if HOLD_CONFLICTING else {}
     for number, ahead in held_by.items():
         held[str(number)] = HOLD_REASON % ahead
     queue = [pr for pr in queue if pr["number"] not in held_by]
     record = {"at": iso(when), "main": main_tip, "held": held,
               "queue": [pr["number"] for pr in queue], "decisions": []}
+    if YIELD_PLACES:
+        record["yielded"] = {str(n): p for n, p in sorted(yielded.items())}
     os.makedirs(state_dir, exist_ok=True)
     said_path = os.path.join(state_dir, "handed-back.json")
     said = load_json(said_path, {})

@@ -60,7 +60,8 @@ IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list}
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_minutes": int, "stall_alert": dict, "test_ahead": dict,
-         "hold_conflicting": bool}
+         "hold_conflicting": bool, "yield_after_hand_back": int,
+         "yield_cap": int}
 TEST_AHEAD = {"depth": int, "max_age_hours": int}
 STALL_ALERT = {"tell": list, "retell_minutes": int,
                "owner_after_minutes": int, "title": str, "labels": list}
@@ -213,6 +214,11 @@ def check(data):
         if isinstance(merge.get("test_ahead"), dict):
             _check_test_ahead(merge["test_ahead"], data.get("checks"),
                               problems)
+        for key in ("yield_after_hand_back", "yield_cap"):
+            if _is(merge.get(key), int) and merge[key] < 1:
+                problems.append("merge.%s must be at least 1" % key)
+        if "yield_cap" in merge and "yield_after_hand_back" not in merge:
+            problems.append("merge.yield_cap needs merge.yield_after_hand_back")
     for name, allowed in (("labels", LABELS), ("relay", RELAY)):
         section = data.get(name, {})
         for key, kinds in allowed.items():

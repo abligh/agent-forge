@@ -39,7 +39,7 @@ starts with `_` is a comment, at any level.
 | `naming` | no | `app_slug_suffix` and `session_prefix`; see below. |
 | `machinery` | no | Apps that act for scheduled tools rather than agents, such as the Merger's; each entry as an agent's App fields. |
 | `identity` | no | The host's unconfigured git identity, which no commit may carry: `unattributed_domain` (an email domain such as `@host.example.org`; default `$FORGE_UNATTRIBUTED_DOMAIN`, else the host's own fully qualified name, so a configuration need not name its hosts) and `unattributed_name`. |
-| `merge` | no | How `forge-merger` merges: `merger`, the machinery App that acts (default `Merger`); `ci_workflow`, the Actions workflow every head must pass (default `ci`; `""` for none); `gate`, tools that must exit 0 before a merge, each an argument list with `{pr}`, `{base}` and `{head}` filled in, a `forge-` name run from the installation and anything else from the cron checkout (default `[["forge-commit-identity", "{base}..{head}"]]`); `stall_minutes`, how long a head may wait on its checks before the tick reports it stalled (default 30); `stall_alert`, whom a stall is told to (default none: a stall is only printed; see below); `test_ahead`, whether the next pull requests are tested ahead (default none: they aren't; see below); `hold_conflicting`, whether a pull request that conflicts with one ahead of it in the queue waits for it rather than being handed back after every merge (default `false`; see below). The required status is `checks.context`, counted only when `checks.poster`'s App (default the merger) posted it. |
+| `merge` | no | How `forge-merger` merges: `merger`, the machinery App that acts (default `Merger`); `ci_workflow`, the Actions workflow every head must pass (default `ci`; `""` for none); `gate`, tools that must exit 0 before a merge, each an argument list with `{pr}`, `{base}` and `{head}` filled in, a `forge-` name run from the installation and anything else from the cron checkout (default `[["forge-commit-identity", "{base}..{head}"]]`); `stall_minutes`, how long a head may wait on its checks before the tick reports it stalled (default 30); `stall_alert`, whom a stall is told to (default none: a stall is only printed; see below); `test_ahead`, whether the next pull requests are tested ahead (default none: they aren't; see below); `hold_conflicting`, whether a pull request that conflicts with one ahead of it in the queue waits for it rather than being handed back after every merge (default `false`; see below); `yield_after_hand_back`, how many places a pull request handed back lately lets others go ahead of it, per hand-back (default none: nobody yields; see below), and `yield_cap`, the most hand-backs counted (default 3). The required status is `checks.context`, counted only when `checks.poster`'s App (default the merger) posted it. |
 | `host_settings` | no | Files every agent host carries, installed by `forge-host-settings`: `files`, each `{"from": path in the project, "to": path under the home directory, "mode": "0644", "json": true when compared as JSON}`, and `host_keys`, keys a JSON file's host may set for itself. |
 | `receiver` | no | How `forge-receiver` takes GitHub's webhook deliveries: `address` and `port` it listens on (default `127.0.0.1`, 8789), `path` (default `/hook`), `secret_file`, the webhook's secret, mode 0600 (default `~/.config/agent-forge/<project>/receiver-secret`), and `max_body`, the largest body in bytes (default 1048576); `ticks`, which tools each event runs, by GitHub event name (`issues`, `issue_comment`, `pull_request`, `pull_request_review`, `status`, `push`), each tool a name or an argument list, a `forge-` name run from the installation and anything else from the cron checkout (default none; `bin/forge-receiver` says when each event counts); and `route`, the router's argument list with `{items}` filled in as `N[,N]`, run for the items events name (default none: nothing is routed). |
 | `docs` | no | The project's documentation, as the tools that read it see it; see below. |
@@ -176,6 +176,25 @@ once per head and Q, asking the author to leave it until Q merges;
 then it is judged as usual, and handed back once if it still conflicts.
 So each merge costs the author one rebase, not one per pull request.
 Off by default.
+
+### `merge.yield_after_hand_back`
+
+The queue is taken blockers first, then oldest first, so a pull
+request handed back to its author goes straight back to the front once
+it is fixed and approved again. If it fails again, everything behind it
+waits another update and build, and with `test_ahead` every prediction
+behind it is spent too. With `yield_after_hand_back: N`, a candidate
+handed back to its author K times in the last 24 hours is moved back N
+times K places after that order, K at most `yield_cap` (default 3). The
+count is of distinct heads and reasons in the Merger's own record
+(`merger.jsonl`, or `dry-run.jsonl` for a dry run), so a hand-back a
+tick repeats counts once. A hand-back to the approving reviewer (the
+approval no longer covers the head, so a fresh review is wanted), a
+hold, a wait and a stall don't count. It moves within its group: a pull
+request another is blocked by is never moved behind one that isn't,
+and none past the group's end. With `test_ahead`, the one a run is in
+flight for keeps its place. The tick's record says, under `yielded`,
+who moved back how many places. Off by default.
 
 ### `router.idle_offer`
 

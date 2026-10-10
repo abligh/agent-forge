@@ -2086,6 +2086,202 @@ class TickAhead(RepoCase):
         self.assertNotIn("ahead", record)
 
 
+def hand_back(number, at, head="h" * 40, reason="red", to="author",
+              result="done"):
+    """A tick record holding one HAND-BACK decision."""
+    d = {"action": "HAND-BACK", "pr": number, "head": head, "reason": reason,
+         "to": to}
+    if result is not None:
+        d["result"] = result
+    return {"at": at, "decisions": [d]}
+
+
+class RecentRecords(unittest.TestCase):
+
+    def write(self, records, raw=""):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "merger.jsonl")
+        with open(path, "w") as handle:
+            for r in records:
+                handle.write(json.dumps(r) + "\n")
+            handle.write(raw)
+        return path
+
+    def test_only_records_since_the_time_oldest_first(self):
+        path = self.write([{"at": T0, "n": 0}, {"at": T1, "n": 1},
+                           {"at": T2, "n": 2}])
+        got = m.recent_records(path, m.parse_time(T1))
+        self.assertEqual([r["n"] for r in got], [1, 2])
+
+    def test_read_from_the_end_in_small_blocks(self):
+        records = [{"at": "2026-10-07T%02d:00:00Z" % h, "pad": "x" * 50}
+                   for h in range(24)]
+        path = self.write(records)
+        got = m.recent_records(path, m.parse_time("2026-10-07T20:00:00Z"),
+                               block=37)
+        self.assertEqual([r["at"][11:13] for r in got],
+                         ["20", "21", "22", "23"])
+        got = m.recent_records(path, m.parse_time(T0), block=37)
+        self.assertEqual(len(got), 14)
+        got = m.recent_records(path, m.parse_time("2026-10-06T00:00:00Z"),
+                               block=37)
+        self.assertEqual(len(got), 24)
+
+    def test_a_bad_line_or_no_file_is_no_record(self):
+        path = self.write([{"at": T1}], raw="{not json\n")
+        self.assertEqual(len(m.recent_records(path, m.parse_time(T0))), 1)
+        self.assertEqual(m.recent_records(path + ".none", m.parse_time(T0)),
+                         [])
+
+
+class HandBacks(unittest.TestCase):
+
+    def test_distinct_heads_and_reasons_count_once_each(self):
+        records = [hand_back(5, T0), hand_back(5, T1, result="already said"),
+                   hand_back(5, T1, reason="conflict"),
+                   hand_back(5, T2, head="g" * 40), hand_back(6, T2)]
+        self.assertEqual(m.hand_backs(records), {5: 3, 6: 1})
+
+    def test_a_hand_back_to_the_reviewer_does_not_count(self):
+        records = [hand_back(5, T0, to="reviewer",
+                             reason="its tree is not the clean merge of its "
+                             "parents")]
+        self.assertEqual(m.hand_backs(records), {})
+
+    def test_a_refused_hand_back_does_not_count(self):
+        self.assertEqual(m.hand_backs([hand_back(5, T0,
+                                                 result="refused: 502")]), {})
+
+    def test_a_dry_runs_hand_back_counts(self):
+        self.assertEqual(m.hand_backs([hand_back(5, T0, result=None)]), {5: 1})
+
+    def test_other_decisions_do_not_count(self):
+        records = [{"at": T0, "decisions": [
+            {"action": a, "pr": 5, "head": "h" * 40, "to": "author"}
+            for a in ("WAIT", "UPDATE", "SKIP", "MERGE")]},
+            {"at": T0, "held": {"5": "conflicts with #4, ahead of it in "
+                                     "the queue"}, "decisions": []},
+            {"at": T0, "stalled": {"pr": 5}, "decisions": []}]
+        self.assertEqual(m.hand_backs(records), {})
+
+
+class YieldPlaces(unittest.TestCase):
+
+    def setUp(self):
+        m.configure(project(yield_after_hand_back=2))
+        self.addCleanup(m.configure, project())
+
+    def numbers(self, queue, counts, everyone=None, keep=None):
+        got, moved = m.yield_places(queue, everyone or queue, counts, keep)
+        return [p["number"] for p in got], moved
+
+    def test_one_hand_back_yields_n_places(self):
+        queue = [pr(n) for n in (1, 2, 3, 4)]
+        self.assertEqual(self.numbers(queue, {1: 1}),
+                         ([2, 3, 1, 4], {1: 2}))
+
+    def test_k_hand_backs_yield_n_times_k_capped(self):
+        m.configure(project(yield_after_hand_back=1, yield_cap=2))
+        queue = [pr(n) for n in range(1, 7)]
+        self.assertEqual(self.numbers(queue, {1: 2})[0], [2, 3, 1, 4, 5, 6])
+        self.assertEqual(self.numbers(queue, {1: 5})[0], [2, 3, 1, 4, 5, 6])
+
+    def test_not_past_the_end(self):
+        queue = [pr(n) for n in (1, 2)]
+        self.assertEqual(self.numbers(queue, {1: 3}), ([2, 1], {1: 1}))
+        self.assertEqual(self.numbers([pr(1)], {1: 1}), ([1], {}))
+
+    def test_two_yielding_keep_their_order_and_both_yield(self):
+        queue = [pr(n) for n in (1, 2, 3, 4, 5)]
+        self.assertEqual(self.numbers(queue, {1: 1, 2: 1}),
+                         ([3, 4, 1, 2, 5], {1: 2, 2: 2}))
+
+    def test_a_blocker_is_never_moved_behind_the_rest(self):
+        # #1 is named by #9's Blocked-by, so it stays in the first group.
+        queue = [pr(1), pr(2), pr(3)]
+        blocked = pr(9, body="Blocked-by: #1")
+        self.assertEqual(self.numbers(queue, {1: 1}, queue + [blocked]),
+                         ([1, 2, 3], {}))
+
+    def test_the_rest_yield_to_each_other(self):
+        queue = [pr(1), pr(2), pr(3), pr(4)]
+        blocked = pr(9, body="Blocked-by: #1")
+        self.assertEqual(self.numbers(queue, {2: 1}, queue + [blocked]),
+                         ([1, 3, 4, 2], {2: 2}))
+
+    def test_the_one_in_flight_keeps_its_place(self):
+        queue = [pr(n) for n in (1, 2, 3)]
+        self.assertEqual(self.numbers(queue, {1: 1}, keep=1),
+                         ([1, 2, 3], {}))
+
+
+class YieldAfterHandBack(RepoCase):
+    """The tick: history read from this state directory's record."""
+
+    item = Decide.item
+    tick = Tick.tick
+    other_pr = Tick.other_pr
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        m.configure(project(yield_after_hand_back=1))
+        self.addCleanup(m.configure, project())
+        self.state = os.path.join(self.tmp.name, "state")
+        os.makedirs(self.state)
+
+    def history(self, *records, name="dry-run.jsonl"):
+        with open(os.path.join(self.state, name), "a") as handle:
+            for r in records:
+                handle.write(json.dumps(r) + "\n")
+
+    def test_off_by_default(self):
+        m.configure(project())
+        self.history(hand_back(5, "2026-10-07T11:30:00Z"))
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,))
+        self.assertEqual(record["queue"], [5, 6])
+        self.assertNotIn("yielded", record)
+
+    def test_handed_back_lately_lets_the_next_go_first(self):
+        self.history(hand_back(5, "2026-10-07T11:30:00Z"))
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,))
+        self.assertEqual(record["queue"], [6, 5])
+        self.assertEqual(record["yielded"], {"5": 1})
+
+    def test_a_live_tick_reads_the_live_record(self):
+        self.history(hand_back(5, "2026-10-07T11:30:00Z"),
+                     name="merger.jsonl")
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,), live=True)
+        self.assertEqual(record["yielded"], {"5": 1})
+
+    def test_a_hand_back_older_than_a_day_does_not_count(self):
+        self.history(hand_back(5, "2026-10-06T11:59:00Z"))
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,))
+        self.assertEqual((record["queue"], record["yielded"]), ([5, 6], {}))
+
+    def test_a_hand_back_to_the_reviewer_does_not_yield(self):
+        self.history(hand_back(5, "2026-10-07T11:30:00Z", to="reviewer"))
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,))
+        self.assertEqual((record["queue"], record["yielded"]), ([5, 6], {}))
+
+    def test_with_test_ahead_the_one_in_flight_keeps_its_place(self):
+        m.configure(project(yield_after_hand_back=1, test_ahead={}))
+        self.history(hand_back(5, "2026-10-07T11:30:00Z"))
+        with open(os.path.join(self.state, "next.json"), "w") as handle:
+            json.dump({"at": T1, "pr": 5, "action": "WAIT"}, handle)
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,))
+        self.assertEqual((record["queue"], record["yielded"]), ([5, 6], {}))
+
+
 class HoldConflicting(RepoCase):
     """merge.hold_conflicting: a pull request that conflicts with one
     ahead of it in the queue waits for it, said once, instead of being

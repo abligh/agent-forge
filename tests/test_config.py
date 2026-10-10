@@ -182,6 +182,20 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"test_ahead": {"depth": 0}}),
                          [])
 
+    def test_merge_yield_after_hand_back(self):
+        self.assertEqual(self.problems(merge={"yield_after_hand_back": 2,
+                                              "yield_cap": 4}), [])
+        self.assertEqual(self.problems(merge={"yield_after_hand_back": 0}),
+                         ["merge.yield_after_hand_back must be at least 1"])
+        self.assertEqual(self.problems(merge={"yield_after_hand_back": "2"}),
+                         ["merge.yield_after_hand_back must be an integer"])
+        self.assertEqual(self.problems(merge={"yield_after_hand_back": 1,
+                                              "yield_cap": 0}),
+                         ["merge.yield_cap must be at least 1"])
+        self.assertEqual(self.problems(merge={"yield_cap": 2}),
+                         ["merge.yield_cap needs "
+                          "merge.yield_after_hand_back"])
+
     def test_merge_hold_conflicting(self):
         self.assertEqual(self.problems(merge={"hold_conflicting": True}), [])
         self.assertEqual(self.problems(merge={"hold_conflicting": "yes"}),
