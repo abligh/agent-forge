@@ -62,7 +62,7 @@ def main(argv=None, err=None, environ=None, mint=None, execvpe=os.execvpe):
                 % (path, signing.sign_off(agent)))
             return 3
     try:
-        token = (mint or (lambda a: github.token(config.load(), a)))(agent)
+        token = (mint or (lambda a: github.token(config.load_reviewed(), a)))(agent)
     except (config.ConfigError, github.MintError) as e:
         err("forge-gh-signed: refusing: could not mint %s's App token (%s); "
             "not sending as the ambient login" % (agent, e))

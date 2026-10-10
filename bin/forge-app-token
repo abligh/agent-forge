@@ -43,7 +43,7 @@ def main(argv=None, out=print, err=None, call=github.api_call,
     group.add_argument("--list", action="store_true")
     args = parser.parse_args(argv)
     try:
-        project = config.load()
+        project = config.load_reviewed()
     except config.ConfigError as e:
         err("forge-app-token: %s" % e)
         return 2

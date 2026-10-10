@@ -122,6 +122,22 @@ def find(environ=None, cwd=None, run=proc.sh):
                         CONFIG_NAME)
 
 
+def load_reviewed(environ=None, cwd=None, run=proc.sh):
+    """The configuration the tools that say who an agent is should trust:
+    $FORGE_CONFIG if set, else the cron checkout's
+    ($FORGE_CRON_CHECKOUT, kept at the default branch), else the one
+    `find` finds. Set FORGE_CRON_CHECKOUT in a host's sessions and an
+    agent's branch can't change the roster its own App token, push
+    credential and signature are judged by. Tools that check the
+    branch itself, such as the documentation checks, use `load`."""
+    environ = os.environ if environ is None else environ
+    checkout = environ.get("FORGE_CRON_CHECKOUT")
+    if checkout and not environ.get("FORGE_CONFIG"):
+        return load(os.path.join(os.path.abspath(
+            os.path.expanduser(checkout)), CONFIG_NAME))
+    return load(environ=environ, cwd=cwd, run=run)
+
+
 def load(path=None, environ=None, cwd=None, run=proc.sh):
     """The checked Project at `path`, or found by `find`."""
     path = path or find(environ, cwd, run)

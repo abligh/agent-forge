@@ -188,12 +188,8 @@ def brief(source, agent, items, project=None, now=None, role=None,
 def project_for(cwd, environ):
     """The cron checkout's configuration when there is one, else the one
     found from `cwd`; None when neither loads."""
-    checkout = environ.get("FORGE_CRON_CHECKOUT")
     try:
-        if checkout:
-            return config.load(os.path.join(os.path.expanduser(checkout),
-                                            config.CONFIG_NAME))
-        return config.load(environ=environ, cwd=cwd)
+        return config.load_reviewed(environ=environ, cwd=cwd)
     except config.ConfigError:
         return None
 

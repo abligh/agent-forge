@@ -18,6 +18,16 @@ A tool reads, in order:
 So one installed copy of agent-forge serves every project on a host:
 a scheduled job runs from that project's checkout.
 
+The tools that say who an agent is (`forge-app-token`,
+`forge-git-credential`, `forge-worktree-identity`, `forge-gh-signed`)
+and `forge-session-start` read `.agent-forge/config.json` under
+`$FORGE_CRON_CHECKOUT` before step 2, when it is set. Set it in a
+host's agent sessions (the `env` of Claude Code's settings), and an
+agent's branch can't change the roster its own App token, push
+credential and signature are judged by: they come from the checkout
+kept at the default branch. The documentation checks still read the
+branch's own file.
+
 ## Checking
 
 The whole file is checked when it is loaded, and every problem is

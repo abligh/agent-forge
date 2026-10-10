@@ -120,7 +120,7 @@ def stamp_push(run, repo, helper=HELPER):
     return True
 
 
-def main(argv=None, run=proc.sh, load=config.load, lookup=None,
+def main(argv=None, run=proc.sh, load=config.load_reviewed, lookup=None,
          helper=HELPER, out=print, err=None):
     err = err or (lambda line: print(line, file=sys.stderr))
     parser = argparse.ArgumentParser(prog="forge-worktree-identity",

@@ -313,6 +313,57 @@ class Check(unittest.TestCase):
                          ["the configuration must be a JSON object"])
 
 
+class LoadReviewed(unittest.TestCase):
+    """The identity tools' configuration: the cron checkout's when there
+    is one, so a branch can't change who its agent is."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cron = os.path.join(self.tmp.name, "cron")
+        self.branch = os.path.join(self.tmp.name, "branch")
+        for root, name in ((self.cron, "widget"), (self.branch, "gadget")):
+            os.makedirs(os.path.join(root, ".agent-forge"))
+            data = example()
+            data["project"] = name
+            with open(os.path.join(root, config.CONFIG_NAME), "w") as handle:
+                json.dump(data, handle)
+
+    def test_the_cron_checkout_wins_over_the_working_directory(self):
+        def run(args, cwd=None):
+            return done(args, 0, self.branch + "\n")
+        project = config.load_reviewed(
+            {"FORGE_CRON_CHECKOUT": self.cron}, cwd=self.branch, run=run)
+        self.assertEqual(project.name, "widget")
+
+    def test_forge_config_still_names_the_file(self):
+        path = os.path.join(self.branch, config.CONFIG_NAME)
+        project = config.load_reviewed({"FORGE_CONFIG": path,
+                                        "FORGE_CRON_CHECKOUT": self.cron})
+        self.assertEqual(project.name, "gadget")
+
+    def test_without_a_cron_checkout_it_is_found_as_usual(self):
+        def run(args, cwd=None):
+            return done(args, 0, self.branch + "\n")
+        project = config.load_reviewed({}, cwd=self.branch, run=run)
+        self.assertEqual(project.name, "gadget")
+
+    def test_the_identity_tools_use_it(self):
+        from tests.helpers import load_tool
+        self.assertIs(load_tool("forge-git-credential").mint.__defaults__[0],
+                      config.load_reviewed)
+        self.assertIs(
+            load_tool("forge-worktree-identity").main.__defaults__[2],
+            config.load_reviewed)
+        for name in ("forge-app-token", "forge-gh-signed"):
+            path = os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "bin", name)
+            with open(path) as handle:
+                text = handle.read()
+            self.assertIn("config.load_reviewed()", text, name)
+            self.assertNotIn("config.load()", text, name)
+
+
 class Load(unittest.TestCase):
 
     def setUp(self):
