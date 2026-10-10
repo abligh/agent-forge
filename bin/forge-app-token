@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Mint an installation token for one agent's GitHub App.
+
+    forge-app-token --token NAME   the token, on stdout only
+    forge-app-token --check        check every App against GitHub
+    forge-app-token --list         the Apps, without the network
+
+NAME is an agent or a machinery App in the project's configuration.
+See agent_forge.github for why the key is checked against GitHub on
+every mint. Nothing is written to disk, and no message on stderr ever
+contains a token.
+
+Exit status, so a caller can tell a missing agent from a broken key:
+
+    0   minted, or every App checked good
+    1   no agent or machinery App by that name
+    2   the configuration or a key could not be read
+    3   GitHub refused the App, or the key belongs to another App
+    4   --check found an App that disagrees with GitHub or isn't made
+    5   GitHub could not be reached
+    6   the App isn't made yet: its ids are null
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, github  # noqa: E402
+
+
+def show_id(value):
+    return "null" if value is None else str(value)
+
+
+def main(argv=None, out=print, err=None, call=github.api_call,
+         sign=github.openssl_sign):
+    err = err or (lambda line: print(line, file=sys.stderr))
+    parser = argparse.ArgumentParser(prog="forge-app-token",
+                                     description=__doc__.splitlines()[0])
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--token", metavar="NAME")
+    group.add_argument("--check", action="store_true")
+    group.add_argument("--list", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        project = config.load()
+    except config.ConfigError as e:
+        err("forge-app-token: %s" % e)
+        return 2
+    names = list(project.agents) + list(project.machinery)
+    if args.list:
+        for name in names:
+            entry = project.app(name)
+            out("  %-17s app %-8s installation %-10s %s%s"
+                % (name, show_id(entry.get("app_id")),
+                   show_id(entry.get("installation_id")),
+                   project.key_path(name),
+                   "" if name in project.agents else "  (machinery)"))
+        return 0
+    if args.check:
+        ok = True
+        for name in names:
+            line, good = github.check(project, name, call, sign)
+            out("  %-17s %s" % (name, line))
+            ok = ok and good
+        return 0 if ok else 4
+    try:
+        out(github.token(project, args.token, call, sign))
+    except github.MintError as e:
+        err("forge-app-token: %s" % e)
+        return e.status
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
