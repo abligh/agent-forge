@@ -232,6 +232,40 @@ class CronRun(unittest.TestCase):
         self.assertEqual(self.run_tool("report"), 2)
         self.assertTrue(os.path.exists(self.checkout_lock("sync-wanted")))
 
+    def test_an_old_wrappers_lock_held_for_a_job_is_waited_for(self):
+        # Another wrapper running a job from the same checkout holds its
+        # own lock exclusively; with FORGE_CRON_LOCK naming it, nothing
+        # runs, and nothing is reset, until that job is done.
+        old = os.path.join(self.logs, ".old-cron.lock")
+        self.run_tool("report")
+        self.push("moved")
+        held = self.hold(old)
+        self.assertEqual(self.run_tool("report", env={"FORGE_CRON_LOCK": old}),
+                         2)
+        self.assertIn("another job held the checkout's lock", self.log())
+        held.close()
+        self.assertEqual(self.run_tool("report", env={"FORGE_CRON_LOCK": old}),
+                         0)
+
+    def test_without_forge_cron_lock_an_old_wrappers_lock_is_not_seen(self):
+        old = os.path.join(self.logs, ".old-cron.lock")
+        self.run_tool("report")
+        self.hold(old)
+        self.assertEqual(self.run_tool("report"), 0)
+
+    def test_a_job_holds_the_named_lock_while_it_runs(self):
+        old = os.path.join(self.logs, ".old-cron.lock")
+        self.add_tool("probe", "#!/usr/bin/env python3\n"
+                      "import fcntl, sys\n"
+                      "h = open(%r, 'a')\n"
+                      "try:\n"
+                      "    fcntl.flock(h, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                      "except OSError:\n"
+                      "    sys.exit(7)\n" % old)
+        self.push("probe")
+        self.assertEqual(self.run_tool("probe", env={"FORGE_CRON_LOCK": old}),
+                         7)
+
     def test_with_a_reset_wanted_a_job_queues_rather_than_joins(self):
         self.run_tool("report")
         open(self.checkout_lock("sync-wanted"), "w").close()

@@ -47,6 +47,15 @@ what the other waits for:
   `sync-wanted` marker, and a job that starts while it is there queues
   for the exclusive lock instead. Whoever syncs removes it.
 
+**Sharing a checkout with another wrapper.** While a project moves its
+crontab onto this one, its old wrapper may run jobs from the same
+checkout. Two wrappers with two locks would each reset the checkout
+under the other's running job. `$FORGE_CRON_LOCK` names the lock file
+the old wrapper takes (it must use `flock`); this one then takes that
+file, in the same modes, instead of its own. An old wrapper that holds
+the file exclusively for each whole job is simply waited for, and
+waits in turn.
+
 The wait is bounded (`$FORGE_CRON_LOCK_WAIT_S`, default 300, one budget
 for every lock), shorter than any job's period, so a waiter gives up
 before its successor is launched rather than piling up behind a hung
@@ -235,7 +244,8 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
 
     log = open(log_path, "a")
     tool_lock = open(os.path.join(logdir, ".%s.lock" % name), "a")
-    repo_lock = open(os.path.join(logdir, ".forge-cron.%s.lock" % key), "a")
+    repo_lock = open(os.path.expanduser(environ.get("FORGE_CRON_LOCK") or
+                     os.path.join(logdir, ".forge-cron.%s.lock" % key)), "a")
     started = []
 
     def write(line):
