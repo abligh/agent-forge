@@ -48,6 +48,7 @@ TOP = {
     "host_settings": (dict, False),
     "merge": (dict, False),
     "receiver": (dict, False),
+    "closing_keywords": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
@@ -74,6 +75,7 @@ RECEIVER_EVENTS = ("issues", "issue_comment", "pull_request",
                    "pull_request_review", "status", "push")
 # The receiver reads at most eight digits of Content-Length.
 RECEIVER_MAX_BODY = 99999999
+CLOSING_KEYWORDS = {"enforced_by": str, "rerun": str}
 HOST_FILE = {"from": str, "to": str, "mode": str, "json": bool}
 # docs is shared by several tools, some not here yet, so only the keys
 # known are checked; another is left to its tool.
@@ -226,6 +228,11 @@ def check(data):
         problems.append("checks.poster %r is no App in the configuration"
                         % poster)
     _check_receiver(data.get("receiver", {}), problems)
+    closing = data.get("closing_keywords", {})
+    if _fields("closing_keywords", closing, CLOSING_KEYWORDS, problems):
+        for key in CLOSING_KEYWORDS:
+            if isinstance(closing.get(key), str) and not closing[key].strip():
+                problems.append("closing_keywords.%s must not be empty" % key)
     settings = data.get("host_settings", {})
     if _fields("host_settings", settings, HOST_SETTINGS, problems):
         for i, entry in enumerate(settings.get("files", [])):

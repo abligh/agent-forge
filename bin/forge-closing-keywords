@@ -1,0 +1,911 @@
+#!/usr/bin/env python3
+"""Report every issue a squash-merge will close, refusing a negated one.
+
+A closing keyword (`close`, `fix`, `resolve` and their forms) in a
+commit message **body** closes an issue on squash-merge, and
+`closingIssuesReferences` cannot see it: that field reads the pull
+request body only. So the answer a tool can query and the answer that
+acts disagree, and the one that acts is invisible. This reads both.
+
+**GitHub ignores negation.** "fixes #12 and does nothing here" and
+"This does not close #12." both close #12. So negation never excuses a
+keyword: a parser that honoured the "not" would pass exactly the cases
+that fire. It is read in one place only, and only ever adds a refusal:
+a body keyword GitHub will act on, in a sentence that denies it, is the
+tell that the author did not mean the close GitHub is about to perform.
+
+**Both squash shapes carry the commit body.** At one commit the squash
+message is that commit's message verbatim; at two or more the subject
+becomes the pull request title and the bodies are concatenated beneath
+it, so commit count is no mitigation. **The remedy has to be
+pre-merge**: once a keyword is in a merged commit message nobody can
+take it out. That is why this is a Merger gate:
+
+    forge-closing-keywords --pr N --include-subject
+
+**`--pr N` names the whole subject**: the pull request's own commits,
+its declaration (`closingIssuesReferences`), its title and its body. Its
+commits come from GitHub, not from the checkout, because they are what
+the squash is built from; a checkout on another branch would answer
+about two pull requests at once. A range may be given alongside, to
+judge a commit not pushed yet; it is checked against the pull request's
+commits, and refused if it is another branch or reaches past the base
+(`A...B` is the symmetric difference, and names commits somebody else's
+merge already closed). With `--pr` this prints the whole will-close set
+and refuses:
+
+* a commit-message keyword closing an issue the pull request does not
+  declare (commit bodies; subjects too with `--include-subject`);
+* a title keyword, at two or more commits, the body does not declare;
+* a body keyword GitHub will act on whose sentence is a denial.
+
+A subject keyword is reported, not refused, without
+`--include-subject`: a subject is composed, so a keyword there is
+usually meant. The gate passes the flag because a subject can also
+arrive from another branch, and then only a declaration in the body
+says the close is meant.
+
+A keyword naming a pull request rather than an issue closes nothing,
+so it is never flagged; one that cannot be looked up is exit 2, since
+treating it as either would be wrong in one direction or the other.
+When the body declares an issue that `closingIssuesReferences` does not
+list yet, the refusal says to wait and run again: that field lags a
+body edit by minutes.
+
+**Without `--pr` this does not pretend to have read one**: findings
+are reported as half a comparison, and the summary says what was not
+read. `--include-subject` without `--pr`, on a branch that has an open
+pull request, is refused and names it.
+
+**`--check-body FILE --surface body|commit`** checks text that is not
+on GitHub yet: a pull request body, a comment, or a commit message
+about to be used with `-F`. A code span disarms a keyword in a body (as
+GitHub reads one); in a commit message that is not established, so
+there it is reported as acting, and says so. `--declares N...` names
+the closes the text means, and only the others are findings.
+
+    forge-closing-keywords                        origin/<default>..HEAD
+    forge-closing-keywords --check-body f.md --surface body --declares 12
+
+**Configuration.** The repository whose issues a keyword closes is the
+configuration's `repo`; the default range starts at `default_branch`.
+`closing_keywords.enforced_by` names what refuses a pull request this
+check fails (default "the Merger") and `closing_keywords.rerun` says
+how to run it again once GitHub catches up (default: the Merger does,
+on its next tick); a project running it in CI names its workflow there.
+Reads only, as `$FORGE_AGENT`'s App if set, else `$GH_TOKEN`, which the
+Merger sets for its gates, else anonymously.
+
+Exit 0 when nothing closes that is not declared and nothing closes from
+a denial, 1 when something does, and 2 when the question could not be
+asked: no configuration, an unreadable range or file, a pull request
+whose declaration or commits could not be fetched, a range that is not
+that pull request's branch, an empty range, or `--include-subject` on a
+branch whose open pull request was not named. A range with no commits
+closes nothing, which reads exactly like a clean branch, so it is 2,
+not 0.
+"""
+
+import argparse
+import os
+import re
+import sys
+import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, github as forge_github, proc  # noqa: E402
+
+PROG = "forge-closing-keywords"
+
+# Set from the project's configuration by `configure`.
+# The repository whose issues a keyword can close from here.
+REPO_NAME = "example/widget"
+# The commits to judge when neither a range nor `--pr` names any.
+DEFAULT_RANGE = "origin/main..HEAD"
+# What refuses a pull request this check fails, and how to run it again.
+DEFAULT_ENFORCED_BY = "the Merger"
+DEFAULT_RERUN = "run the check again (the Merger does, on its next tick)"
+ENFORCED_BY = DEFAULT_ENFORCED_BY
+RERUN = DEFAULT_RERUN
+
+
+def closing_re(repo):
+    """GitHub's closing keywords, case-insensitive, with an optional
+    colon, followed by whitespace and a reference to an issue in `repo`:
+    `#N`, a markdown link around `#N`, `owner/name#N`, or the issue's
+    URL. Measured on GitHub: `close (#N)`, `close *#N*`, `close "#N"` and
+    the like close nothing, so only `[` may displace the whitespace;
+    admitting `(` would flag a squash subject's `(#PR)` suffix and every
+    "fixes (#1, #2)" citation list. A `/pull/N` URL and another
+    repository's `owner/repo#N` close nothing here either. `close [#N]`
+    without a link target is flagged though it does not close: a
+    spurious flag costs a rewording, a missed one an issue shut by
+    accident."""
+    return re.compile(
+        r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+"
+        r"(?:\[?#(\d+)|%s#(\d+)|https?://github\.com/%s/issues/(\d+))\b"
+        % (re.escape(repo), re.escape(repo)),
+        re.IGNORECASE)
+
+
+CLOSING_RE = closing_re(REPO_NAME)
+
+
+def configure(project):
+    """Set the module's settings from `project`, a loaded configuration:
+    `repo`, `default_branch`, and the `closing_keywords` section's
+    `enforced_by` and `rerun`."""
+    global REPO_NAME, DEFAULT_RANGE, CLOSING_RE, ENFORCED_BY, RERUN
+    section = project.section("closing_keywords")
+    REPO_NAME = project.repo
+    DEFAULT_RANGE = "origin/%s..HEAD" % project.default_branch
+    CLOSING_RE = closing_re(REPO_NAME)
+    ENFORCED_BY = section.get("enforced_by", DEFAULT_ENFORCED_BY)
+    RERUN = section.get("rerun", DEFAULT_RERUN)
+
+
+def refs(text):
+    """The issue numbers `text`'s closing keywords name, in order. Code
+    spans are not skipped here; `blank_code` does that for a body."""
+    return [int(next(g for g in m if g)) for m in CLOSING_RE.findall(text)]
+
+
+CODE_FENCE_RE = re.compile(
+    r"^(?P<fence>`{3,}|~{3,})[^\n]*$.*?(?:^(?P=fence)`*~*[^\n]*$|\Z)",
+    re.MULTILINE | re.DOTALL)
+
+# A run of N backticks closed by a run of exactly N. It may cross a
+# newline but not a blank line, as GitHub renders one: otherwise a stray
+# backtick pairs with any later one and blanks the keyword between them,
+# and the check passes a body GitHub acts on.
+CODE_SPAN_RE = re.compile(
+    r"(?<!`)(`+)(?!`)(?:[^\n]|\n(?![ \t]*\n))+?(?<!`)\1(?!`)")
+
+
+def blank_code(text):
+    """`text` with code fences and spans replaced by spaces, newlines kept,
+    so every byte outside a code region keeps its line and column."""
+    def blank(match):
+        return re.sub(r"[^\n]", " ", match.group(0))
+
+    return CODE_SPAN_RE.sub(blank, CODE_FENCE_RE.sub(blank, text))
+
+
+# Where a `--check-body` text is going. A code span disarms a keyword in
+# a pull request body (measured); in a commit message that is not
+# established, so the commit surface fails closed: stripping wrongly
+# there closes an issue on merge, permanently, where not stripping costs
+# a reworded quotation.
+SURFACES = ("body", "commit")
+
+
+def unsafe_pairs(text, surface):
+    """Every keyword-then-reference pair in `text` that would act on
+    `surface`, as (line, column, issue number, matched text), 1-based."""
+    searchable = blank_code(text) if surface == "body" else text
+    found = []
+    for match in CLOSING_RE.finditer(searchable):
+        number = int(next(g for g in match.groups() if g))
+        start = match.start()
+        line = searchable.count("\n", 0, start) + 1
+        column = start - (searchable.rfind("\n", 0, start) + 1) + 1
+        found.append((line, column, number, text[start:match.end()]))
+    return found
+
+
+def quoted_pairs(text):
+    """The (line, column) of every pair inside a code region. Those are
+    still treated as acting on the commit surface; this only lets the
+    report say so, so a measured finding and an unmeasured one don't
+    print in the same voice."""
+    blanked = blank_code(text)
+    out = set()
+    for match in CLOSING_RE.finditer(text):
+        start = match.start()
+        if blanked[start] == text[start]:
+            continue
+        line = text.count("\n", 0, start) + 1
+        out.add((line, start - (text.rfind("\n", 0, start) + 1) + 1))
+    return out
+
+
+QUOTED_NOTE = ("    inside a code region: whether GitHub honors one in a "
+               "commit message is not established, so this is reported "
+               "as acting rather than checked")
+
+
+def _print_quoted_note(quoted, line, column):
+    if (line, column) in quoted:
+        print(QUOTED_NOTE)
+
+
+# A commit's subject is its first line. A keyword there is composed, so
+# deliberate; one in the body arrives by accident, inside prose.
+SUBJECT_LINES = 1
+
+# What makes a body sentence a denial. Broad on purpose: a false refusal
+# costs a rewording, a false pass shuts an issue that should stay open.
+NEGATION_RE = re.compile(
+    r"\b(?:not|never|no|neither|nor|nothing|without|cannot)\b|n't\b",
+    re.IGNORECASE)
+
+# The same question of a commit message, wider, since it only chooses
+# which explanation to print for a finding already made.
+COMMIT_DENIAL_RE = re.compile(
+    NEGATION_RE.pattern + r"|\brather than\b|\binstead of\b",
+    re.IGNORECASE)
+
+# The merge commit GitHub synthesizes for a pull_request checkout. No
+# squash contains it.
+SYNTHETIC_MERGE_RE = re.compile(r"^Merge [0-9a-f]{40} into [0-9a-f]{40}")
+
+
+class GitHub:
+    """Reads from GitHub as one token (None: anonymously). Tests replace
+    `call`, which has `agent_forge.github.api_call`'s signature."""
+
+    def __init__(self, token=None, call=forge_github.api_call):
+        self.token = token
+        self.call = call
+
+    def get(self, path):
+        return forge_github.rest(self.token, "GET", path, call=self.call)
+
+    def graphql(self, query, variables):
+        return forge_github.graphql(self.token, query, variables,
+                                    call=self.call)
+
+
+def closers(message, body_only=False):
+    """Issue numbers `message` would close. `body_only` drops the subject
+    line, where a keyword is deliberate."""
+    text = message
+    if body_only:
+        text = "\n".join(message.split("\n")[SUBJECT_LINES:])
+    return set(refs(text))
+
+
+def commit_messages(rng, cwd=None, run=proc.sh):
+    """Every (abbreviated sha, message) in `rng`, or None if unreadable."""
+    got = run(["git", "-C", cwd or ".", "log", "--format=%h %B%x00", rng])
+    if got.returncode != 0:
+        return None
+    out = []
+    for part in got.stdout.split("\0"):
+        part = part.strip()
+        if not part:
+            continue
+        sha, _, message = part.partition(" ")
+        out.append((sha, message.strip()))
+    return out
+
+
+# How much of a sha to show, so git's and the API's shas print alike.
+SHA_WIDTH = 8
+
+
+# Commits asked for per page of a pull request's list.
+PER_PAGE = 100
+
+
+def pr_commits(pr, github, repo=None):
+    """Every (full sha, message) the pull request carries, or None. This is
+    the list the squash message is built from. A page that is not a list
+    of commits is None, not a shorter list: a list cut short would judge
+    part of the pull request as if it were all of it."""
+    out, page = [], 1
+    while True:
+        status, items = github.get(
+            "/repos/%s/pulls/%d/commits?per_page=%d&page=%d"
+            % (repo or REPO_NAME, pr, PER_PAGE, page))
+        if status != 200 or not isinstance(items, list):
+            return None
+        for item in items:
+            try:
+                sha, message = item["sha"], item["commit"]["message"]
+            except (KeyError, TypeError):
+                return None
+            if not isinstance(sha, str) or not isinstance(message, str):
+                return None
+            out.append((sha, message.strip()))
+        if len(items) < PER_PAGE:
+            return out
+        page += 1
+
+
+def range_shas(rng, cwd=None, run=proc.sh):
+    """Every full sha in `rng`, as a set, or None if unreadable."""
+    got = run(["git", "-C", cwd or ".", "rev-list", rng])
+    if got.returncode != 0:
+        return None
+    return set(got.stdout.split())
+
+
+def pr_base_ref(pr, github, repo=None):
+    """The name of the branch the pull request merges into, or None. The
+    name, not `base.sha`: that is the tip the pull request last synced
+    against, and the question is about the tip the merge will use."""
+    status, body = github.get("/repos/%s/pulls/%d" % (repo or REPO_NAME, pr))
+    if status != 200 or not isinstance(body, dict):
+        return None
+    ref = (body.get("base") or {}).get("ref")
+    return ref.strip() or None if isinstance(ref, str) else None
+
+
+def not_reachable_from(rng, base, cwd=None, run=proc.sh):
+    """Shas in `rng` not already on `base`, or None. A commit on the base
+    closes nothing when this pull request merges."""
+    got = run(["git", "-C", cwd or ".", "rev-list", rng, "--not", base])
+    if got.returncode != 0:
+        return None
+    return set(got.stdout.split())
+
+
+def subject_closers(messages):
+    """{issue number: [sha, ...]} from commit subjects only, for the
+    report. GitHub's synthetic merge commit is skipped."""
+    out = {}
+    for sha, message in messages:
+        if SYNTHETIC_MERGE_RE.match(message):
+            continue
+        for number in refs("\n".join(message.split("\n")[:SUBJECT_LINES])):
+            out.setdefault(number, []).append(sha)
+    return out
+
+
+QUERY = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r)"
+         "{pullRequest(number:$n){title body commits{totalCount}"
+         " closingIssuesReferences(first:50){nodes{number}}}}}")
+
+
+def pr_facts(pr, github, repo=None):
+    """What the pull request says about itself, or None if unreadable:
+    {"declared": closingIssuesReferences' numbers, "title", "body",
+    "commits": the count, or None}."""
+    owner, _, name = (repo or REPO_NAME).partition("/")
+    status, doc = github.graphql(QUERY, {"o": owner, "r": name, "n": pr})
+    if status != 200:
+        return None
+    try:
+        node = doc["data"]["repository"]["pullRequest"]
+        nodes = node["closingIssuesReferences"]["nodes"]
+        declared_ = {n["number"] for n in nodes if "number" in n}
+    except (KeyError, TypeError):
+        return None
+    commits = (node.get("commits") or {}).get("totalCount")
+    return {"declared": declared_,
+            "title": node.get("title") or "",
+            "body": node.get("body") or "",
+            "commits": commits if isinstance(commits, int) else None}
+
+
+def lag_note(number, pr):
+    """What to say when the body declares `number` and GitHub's field
+    does not list it yet: still a refusal, since the field is what the
+    merge acts on, but the remedy is to wait and run again."""
+    return ("#%d is declared by a closing keyword in pull request %s's "
+            "body, but GitHub's closingIssuesReferences does not list it "
+            "yet. That field can lag a body edit by minutes: wait, then "
+            "%s. Reword nothing for this." % (number, pr, RERUN))
+
+
+def field_lags_body(facts):
+    """Issues the body's own keywords declare that `closingIssuesReferences`
+    does not list yet. The field can lag a body edit by minutes; this
+    only chooses the explanation, never the verdict."""
+    return set(refs(blank_code(facts["body"]))) - set(facts["declared"])
+
+
+def declared(pr, github, repo=None):
+    """The issues the pull request body declares, or None if unreadable."""
+    facts = pr_facts(pr, github, repo=repo)
+    return None if facts is None else facts["declared"]
+
+
+def open_pr_for_head(github, cwd=None, repo=None, run=proc.sh):
+    """The open pull request for the checked-out branch, or None for "there
+    is none" and "could not tell" alike: refusing because GitHub was
+    unreachable would make the offline case the error case. A detached
+    HEAD is not asked."""
+    got = run(["git", "-C", cwd or ".", "rev-parse", "--abbrev-ref", "HEAD"])
+    if got.returncode != 0:
+        return None
+    branch = got.stdout.strip()
+    if not branch or branch == "HEAD":
+        return None
+    repo = repo or REPO_NAME
+    owner, _, _name = repo.partition("/")
+    status, body = github.get("/repos/%s/pulls?state=open&head=%s" % (
+        repo, urllib.parse.quote("%s:%s" % (owner, branch), safe=":/")))
+    if status != 200 or not isinstance(body, list) or not body:
+        return None
+    number = body[0].get("number") if isinstance(body[0], dict) else None
+    return number if isinstance(number, int) and \
+        not isinstance(number, bool) else None
+
+
+def sentences(text):
+    """`text` as sentences, with emphasis marks and line wraps removed."""
+    flat = re.sub(r"[*_`]", "", text)
+    out = []
+    for para in re.split(r"\n\s*\n", flat):
+        para = " ".join(para.split())
+        out.extend(s for s in re.split(r"(?<=[.!?])\s+", para) if s)
+    return out
+
+
+def negated_closers(body, acts_on):
+    """[(number, sentence)] for each body keyword GitHub will act on
+    (`acts_on`) whose sentence is a denial. The body is read with code
+    blanked, so a keyword quoted to explain it is not refused."""
+    found = []
+    for sentence in sentences(blank_code(body)):
+        if not NEGATION_RE.search(sentence):
+            continue
+        for n in refs(sentence):
+            if n in acts_on and (n, sentence) not in found:
+                found.append((n, sentence))
+    return found
+
+
+def denying_commits(messages):
+    """{issue number: [(sha, sentence), ...]} for commit-message keywords
+    whose own sentence denies the close. It only chooses the explanation
+    for a finding already made, so it reads the wider COMMIT_DENIAL_RE."""
+    found = {}
+    for sha, message in messages:
+        if SYNTHETIC_MERGE_RE.match(message):
+            continue
+        for sentence in sentences(message):
+            if not COMMIT_DENIAL_RE.search(sentence):
+                continue
+            for number in refs(sentence):
+                found.setdefault(number, []).append((sha, sentence))
+    return found
+
+
+def will_close(facts, messages):
+    """Every issue the squash-merge will close, by surface: {"body",
+    "title", "commit messages"}, each a set. At one commit the title is
+    not used; at two or more it is the squash subject."""
+    own = [m for m in messages if not SYNTHETIC_MERGE_RE.match(m)]
+    count = facts.get("commits")
+    if count is None:
+        count = len(own)
+    title = (set() if count == 1 else
+             set(refs(facts.get("title", ""))))
+    from_messages = set()
+    for m in own:
+        from_messages |= closers(m)
+    return {"body": set(facts["declared"]), "title": title,
+            "commit messages": from_messages}
+
+
+def is_issue(number, github, repo=None):
+    """True if `number` is an issue, False if a pull request (which a
+    keyword cannot close), None if the lookup failed: "could not tell"
+    is not "is an issue"."""
+    status, body = github.get("/repos/%s/issues/%d"
+                              % (repo or REPO_NAME, number))
+    if status != 200 or not isinstance(body, dict) or "number" not in body:
+        return None
+    return "pull_request" not in body
+
+
+def survey(rng=None, pr=None, cwd=None, run=proc.sh, github=None,
+           body_only=True, messages=None):
+    """(undeclared, from_commits, declared), ("unknown", numbers, None)
+    when some number could not be looked up, or None if unaskable.
+    `messages` is the commits to judge, when already read."""
+    if messages is None:
+        messages = commit_messages(rng or DEFAULT_RANGE, cwd=cwd, run=run)
+    if messages is None:
+        return None
+    raw = set()
+    for _sha, message in messages:
+        raw |= closers(message, body_only=body_only)
+
+    from_commits, unknown = set(), set()
+    for number in raw:
+        verdict = is_issue(number, github)
+        if verdict is True:
+            from_commits.add(number)
+        elif verdict is None:
+            unknown.add(number)
+    if unknown:
+        return ("unknown", unknown, None)
+    if pr is None:
+        return (from_commits, from_commits, set())
+    known = declared(pr, github)
+    if known is None:
+        return None
+    return (from_commits - known, from_commits, known)
+
+
+def _numbers(nums):
+    return ", ".join("#%d" % n for n in sorted(nums))
+
+
+def _sentence_start(text):
+    return text[:1].upper() + text[1:]
+
+
+def check_body(path, surface, opener=open, declares=None):
+    """Report what `path`'s text would close on `surface`: 0 clean, 1 a
+    keyword would act that `declares` does not name (or a body denies a
+    close), 2 unreadable. A subject-line keyword on the commit surface
+    is reported, not refused: a subject is composed."""
+    try:
+        with opener(path) as handle:
+            text = handle.read()
+    except OSError as err:
+        print("%s: cannot read %s: %s" % (PROG, path, err), file=sys.stderr)
+        return 2
+
+    found = unsafe_pairs(text, surface)
+    meant = set(declares or ())
+    quoted = quoted_pairs(text) if surface == "commit" else set()
+
+    subject = [f for f in found if surface == "commit" and f[0] == 1]
+    acting = [f for f in found if f not in subject and f[2] not in meant]
+    agreed = [f for f in found if f not in subject and f[2] in meant]
+    undelivered = sorted(meant - {f[2] for f in found})
+    denied = (negated_closers(text, {f[2] for f in found})
+              if surface == "body" else [])
+
+    for line, column, number, matched in subject:
+        print("%s:%d:%d: %r closes #%d from the subject line, where a "
+              "keyword is deliberate. Confirm you mean it: after this is "
+              "committed the subject cannot be reworded here."
+              % (path, line, column, matched, number))
+        _print_quoted_note(quoted, line, column)
+
+    for line, column, number, matched in agreed:
+        print("%s:%d:%d: %r closes #%d on merge, as declared"
+              % (path, line, column, matched, number))
+        _print_quoted_note(quoted, line, column)
+
+    for number in undelivered:
+        print("  #%d is declared and no keyword here closes it. If the "
+              "keyword is in a commit message this is fine -- this mode "
+              "reads one file and cannot see one." % number)
+
+    for number, sentence in denied:
+        print("%s: #%d would close on merge from a sentence that denies it "
+              "-- GitHub ignores negation: %s" % (path, number, sentence))
+    if denied:
+        print("  %s refuses this body as written. If the close is meant, "
+              "give it a sentence of its own, `Fixes #N.`, away from the "
+              "negation. If it is not, take the keyword off the number: "
+              "other wording, or a code span."
+              % _sentence_start(ENFORCED_BY))
+
+    if not acting:
+        if denied:
+            return 1
+        if not subject and not agreed:
+            print("%s: %s carries no closing keyword that would act as a %s"
+                  % (PROG, path, surface))
+            if surface == "body":
+                print("  code spans were not searched, which is what lets "
+                      "a note quote the keyword it warns about")
+        elif agreed:
+            print("%s: %d keyword(s) in %s would act as a %s, and every one "
+                  "is declared." % (PROG, len(agreed), path, surface))
+        return 0
+
+    for line, column, number, matched in acting:
+        print("%s:%d:%d: %r would close #%d on merge"
+              % (path, line, column, matched, number))
+        _print_quoted_note(quoted, line, column)
+    print("%s: %d keyword(s) in %s would act as a %s that %s."
+          % (PROG, len(acting), path, surface,
+             "were not declared" if declares is not None
+             else "nothing was declared against"))
+    hedged = sum(1 for f in acting if (f[0], f[1]) in quoted)
+    if hedged:
+        print("  %d of those %s inside a code region: treated as acting "
+              "because the question is open, not because it was measured."
+              % (hedged, "is" if hedged == 1 else "are"))
+    if surface == "body":
+        print("  Either declare the close on purpose -- `--declares %s` "
+              "here, and a line in the body when you post it -- or put the "
+              "keyword inside a code span, which is how a note quotes the "
+              "thing it is disarming, and why this check skipped the spans "
+              "already there."
+              % " ".join(str(f[2]) for f in acting))
+    else:
+        print("  A commit subject cannot be reworded here without a "
+              "force-push, and a code span is not established to disarm "
+              "one. Reword before committing: any wording that does not "
+              "put a keyword immediately before a reference, such as "
+              "\"shuts\" or \"the issue filed as\".")
+    return 1
+
+
+def err(message):
+    print("%s: %s" % (PROG, message), file=sys.stderr)
+
+
+def pr_messages(args, github, run):
+    """(messages, what was examined) for `--pr`, or None after saying why
+    the pull request's commits could not be judged."""
+    records = pr_commits(args.pr, github)
+    # A pull request with no commits is not a thing GitHub makes, so an
+    # empty list is a read that went wrong quietly.
+    if not records:
+        err("could not read pull request %s's commits, so what the merge "
+            "will close was not judged" % args.pr)
+        return None
+    if args.range is None:
+        return ([(sha[:SHA_WIDTH], m) for sha, m in records],
+                "pull request %d's commits" % args.pr)
+    have = range_shas(args.range, run=run)
+    if have is None:
+        err("cannot read %s" % args.range)
+        return None
+    absent = [sha for sha, _m in records if sha not in have]
+    if absent:
+        err("%s does not contain %d of pull request %s's %d commit(s) -- "
+            "%s -- so it is not that pull request's branch and nothing was "
+            "judged. Drop the range: `--pr %s` alone reads the commits from "
+            "the pull request."
+            % (args.range, len(absent), args.pr, len(records),
+               ", ".join(s[:SHA_WIDTH] for s in absent[:3])
+               + (", ..." if len(absent) > 3 else ""), args.pr))
+        return None
+    name = pr_base_ref(args.pr, github)
+    if name is None:
+        err("could not read pull request %s's base branch, so whether %s "
+            "reaches past it was not judged. `--pr %s` alone needs no base, "
+            "because it reads the commits from the pull request."
+            % (args.pr, args.range, args.pr))
+        return None
+    base = "origin/%s" % name
+    fresh = not_reachable_from(args.range, base, run=run)
+    if fresh is None:
+        err("cannot read %s, so whether %s reaches past the base was not "
+            "judged. `git fetch origin %s` and run it again."
+            % (base, args.range, name))
+        return None
+    mine = set(sha for sha, _m in records)
+    behind = have - mine - fresh
+    if behind:
+        err("%s holds %d commit(s) that are not pull request %s's and are "
+            "already on %s, so the merge will not introduce them -- %s. "
+            "Nothing was judged, because reporting them would name issues "
+            "somebody else's merge already closed. Two dots, not three: "
+            "`A...B` is the symmetric difference when it is a commit range, "
+            "and includes A's own commits. Or drop the range: `--pr %s` "
+            "alone reads the commits from the pull request."
+            % (args.range, len(behind), args.pr, base,
+               ", ".join(sorted(s[:SHA_WIDTH] for s in behind)[:3])
+               + (", ..." if len(behind) > 3 else ""), args.pr))
+        return None
+    messages = commit_messages(args.range, run=run)
+    if messages is None:
+        err("cannot read %s" % args.range)
+        return None
+    return messages, "%s, against base %s" % (args.range, base)
+
+
+def main(argv=None, run=proc.sh, call=forge_github.api_call,
+         load=config.load, environ=None):
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(prog=PROG,
+                                     description=__doc__.splitlines()[0])
+    parser.add_argument("range", nargs="?",
+                        help="commits to judge; defaults to "
+                             "origin/<default branch>..HEAD, and with --pr "
+                             "to the pull request's own")
+    parser.add_argument("--pr", type=int,
+                        help="the pull request this is about: its commits, "
+                             "its declaration, its title and its body")
+    parser.add_argument("--include-subject", action="store_true",
+                        help="also count the subject line, where a keyword "
+                             "is deliberate")
+    parser.add_argument("--check-body", metavar="FILE",
+                        help="check a text that does not exist on GitHub "
+                             "yet: a pull request body, a comment, or a "
+                             "commit message about to be used with -F")
+    parser.add_argument("--surface", choices=SURFACES,
+                        help="where the --check-body text is going; decides "
+                             "whether a code span disarms a keyword")
+    parser.add_argument("--declares", type=int, nargs="*", metavar="N",
+                        help="the issues this text means to close; "
+                             "--check-body then reports only the keywords "
+                             "you did not declare, which is the verdict "
+                             "every other mode gives")
+    args = parser.parse_args(argv)
+
+    if args.check_body:
+        if args.surface is None:
+            parser.error("--check-body needs --surface {%s}: a code span "
+                         "disarms a keyword in a pull request body and is "
+                         "not established to in a commit message, so the "
+                         "same bytes are safe in one and not the other"
+                         % "|".join(SURFACES))
+    elif args.surface:
+        parser.error("--surface only means anything with --check-body")
+    elif args.declares is not None:
+        parser.error("--declares only means anything with --check-body: "
+                     "elsewhere the declaration comes from the pull "
+                     "request itself, with --pr N")
+
+    try:
+        project = load(environ=environ)
+    except config.ConfigError as e:
+        err(str(e))
+        return 2
+    configure(project)
+    if args.check_body:
+        return check_body(args.check_body, args.surface,
+                          declares=args.declares)
+    github = GitHub(forge_github.read_token(project, environ, call), call)
+
+    if args.include_subject and args.pr is None:
+        mine = open_pr_for_head(github, run=run)
+        if mine is not None:
+            err("--include-subject judges a commit subject against what a "
+                "pull request declares, and no pull request was named. This "
+                "branch has one, #%d -- rerun with `--pr %d`. Without it "
+                "every keyword reads as undeclared, because nothing was "
+                "asked." % (mine, mine))
+            return 2
+
+    examined = args.range or DEFAULT_RANGE
+    if args.pr is not None:
+        got = pr_messages(args, github, run)
+        if got is None:
+            return 2
+        messages, examined = got
+    else:
+        messages = commit_messages(examined, run=run)
+        if messages is None:
+            err("cannot read %s" % examined)
+            return 2
+    if not messages:
+        err("%s contains no commits, so nothing was examined" % examined)
+        return 2
+
+    got = survey(args.range, pr=args.pr, run=run, github=github,
+                 body_only=not args.include_subject, messages=messages)
+    if got is None:
+        err("could not read what pull request %s declares, so the "
+            "comparison was not made" % args.pr)
+        return 2
+    undeclared, from_commits, known = got
+    if undeclared == "unknown":
+        err("could not tell whether %s name issues or pull requests, so "
+            "nothing was judged. A keyword naming a pull request closes "
+            "nothing and must not be flagged; one naming an issue must be. "
+            "Treating either as the other is worse than refusing."
+            % _numbers(from_commits))
+        return 2
+
+    print("  %d commit(s) examined, from %s" % (len(messages), examined))
+    if from_commits:
+        print("  commit messages would close: %s" % _numbers(from_commits))
+    if args.pr:
+        print("  the pull request declares:   %s"
+              % (_numbers(known) or "(nothing)"))
+    # Which remedy to name. A body keyword is somebody writing about this
+    # pull request, so declaring it is right. A subject can have arrived
+    # from another branch, so the costly remedy is named beside the cheap
+    # one. A denial must not be told to declare: that turns the check
+    # green and still shuts an issue its author said to leave open.
+    carriers = subject_closers(messages)
+    deniers = denying_commits(messages)
+    lagging = set()
+    if args.pr:
+        facts = pr_facts(args.pr, github)
+        if facts is None:
+            err("could not read pull request %s's title and body, so what "
+                "the merge will close was not judged" % args.pr)
+            return 2
+        lagging = field_lags_body(facts)
+    for number in sorted(undeclared):
+        where = carriers.get(number)
+        denied_in = deniers.get(number)
+        if args.pr is None:
+            print("#%d will close on merge%s. No pull request was named, "
+                  "so this was not compared against any declaration -- "
+                  "rerun with `--pr N`, which is what decides whether it "
+                  "is a finding."
+                  % (number, " from %s's subject" % ", ".join(where)
+                     if where else ""), file=sys.stderr)
+        elif number in lagging and not denied_in:
+            print(lag_note(number, args.pr), file=sys.stderr)
+        elif where:
+            print("#%d will close on merge from %s's subject, which the "
+                  "pull request does not declare. Either declare it -- one "
+                  "line in the body -- or stop closing it, which means "
+                  "rewording that subject on a new branch."
+                  % (number, ", ".join(where)), file=sys.stderr)
+        elif denied_in:
+            sha, sentence = denied_in[0]
+            print("#%d will close on merge from a sentence in %s's commit "
+                  "message that denies it -- GitHub ignores negation, so "
+                  "\"%s\" closes it. Reword so no closing keyword sits in "
+                  "front of the number. Do NOT declare it in the body: that "
+                  "would make this check pass and still shut an issue you "
+                  "have said to leave open."
+                  % (number, sha, sentence), file=sys.stderr)
+        else:
+            print("#%d will close on merge and the pull request does not "
+                  "say so" % number, file=sys.stderr)
+
+    negated = []
+    undercounted = set()
+    undeclared_title = set()
+    if args.pr:
+        sources = will_close(facts, [m for _sha, m in messages])
+        closes, unverified = set(), set()
+        for number in set().union(*sources.values()):
+            if number in facts["declared"]:
+                closes.add(number)
+                continue
+            verdict = is_issue(number, github)
+            if verdict is True:
+                closes.add(number)
+            elif verdict is None:
+                unverified.add(number)
+        print("  will close on merge:         %s"
+              % (_numbers(closes) or "(nothing)"))
+        for source, nums in sources.items():
+            if nums & (closes | unverified):
+                print("    from the %s: %s"
+                      % (source, _numbers(nums & (closes | unverified))))
+        if unverified:
+            print("    could not tell whether %s name issues"
+                  % _numbers(unverified))
+        undeclared_title = (sources["title"] & closes) - set(facts["declared"])
+        for number in sorted(undeclared_title):
+            if number in lagging:
+                print(lag_note(number, args.pr), file=sys.stderr)
+                continue
+            print("#%d will close on merge from the pull request's title, "
+                  "which at %d commits is the squash subject, and the body "
+                  "does not declare it. Either retitle -- no push needed, "
+                  "and nothing else keys on the title -- or declare it in "
+                  "the body."
+                  % (number, facts.get("commits") or len(messages)),
+                  file=sys.stderr)
+        undercounted = (closes - set(facts["declared"]) - undeclared
+                        - undeclared_title)
+        negated = negated_closers(facts["body"], facts["declared"])
+        for number, sentence in negated:
+            print("#%d will close on merge from a sentence in the body that "
+                  "denies it -- GitHub ignores negation: %s"
+                  % (number, sentence), file=sys.stderr)
+        if negated:
+            print("Reword so no closing keyword sits in front of the number, "
+                  "then %s." % RERUN, file=sys.stderr)
+    from_denial = {n for n, _s in negated} | (set(deniers) & undeclared)
+    surface = ("a commit message, subject included" if args.include_subject
+               else "a commit body")
+    if args.pr is None:
+        print("%s: %d issue(s) closed by %s, %d of them from a denial in a "
+              "commit message. No pull request was named, so nothing was "
+              "compared against a declaration and the body was not read -- "
+              "pass `--pr N` for those."
+              % (PROG, len(from_commits), surface, len(from_denial)))
+    else:
+        print("%s: %d issue(s) closed by %s, %d not declared, %d closed from "
+              "a denial"
+              % (PROG, len(from_commits), surface,
+                 len(undeclared | undeclared_title), len(from_denial)))
+    # Not an error: a subject is composed, so a keyword in one is usually
+    # meant. Saying it and naming the flag that judges it is what is left.
+    for number in sorted(undercounted):
+        where = carriers.get(number)
+        print("%s: #%d will close on merge from a commit subject%s, which "
+              "the pull request does not declare. Deliberate, if the keyword "
+              "in that subject is meant -- `--include-subject` judges it "
+              "rather than reporting it."
+              % (PROG, number, " (%s)" % ", ".join(where) if where else ""))
+    return 1 if (undeclared or negated or undeclared_title) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

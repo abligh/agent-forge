@@ -200,6 +200,16 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(receiver={
             "route": ["r", "--only={items}"]}), [])
 
+    def test_closing_keywords(self):
+        self.assertEqual(self.problems(closing_keywords={
+            "enforced_by": 1, "rerun": " ", "colour": "red"}), [
+            "closing_keywords.enforced_by must be a string",
+            "closing_keywords: unknown key 'colour'",
+            "closing_keywords.rerun must not be empty"])
+        self.assertEqual(self.problems(closing_keywords="CI"),
+                         ["'closing_keywords' must be an object"])
+        self.assertEqual(self.problems(closing_keywords={}), [])
+
     def test_host_keys_are_strings(self):
         self.assertEqual(
             self.problems(host_settings={"host_keys": ["a", 1]}),

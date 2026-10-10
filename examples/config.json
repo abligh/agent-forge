@@ -38,8 +38,10 @@
     "caches": {"CARGO_TARGET_DIR": "cargo-target"}
   },
   "merge": {"merger": "Merger", "ci_workflow": "ci", "stall_minutes": 30,
-            "gate": [["tools/closing-keywords", "--pr", "{pr}"],
+            "gate": [["forge-closing-keywords", "--pr", "{pr}", "--include-subject"],
                      ["forge-commit-identity", "{base}..{head}"]]},
+  "closing_keywords": {"enforced_by": "the Merger",
+                       "rerun": "run the check again (the Merger does, on its next tick)"},
   "docs": {"paths": ["README.md", "docs"], "width": 80, "roles": "docs/roles.md"},
   "identity": {"unattributed_domain": "@build.example.org",
                "unattributed_name": "Anonymous Agent"},
