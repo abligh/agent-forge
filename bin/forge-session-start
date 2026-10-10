@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Tell a session what a restart killed, and what it owns.
+
+Run as a Claude Code SessionStart hook, through a thin wrapper the
+project tracks and `forge-host-settings` installs. Whatever this prints
+as `additionalContext` goes into the session's context, before its
+first turn.
+
+**Why a hook, when the project's instructions already have the
+checklist.** When every session is restarted at once, every background
+watch dies with them, and a rule the agent has to remember at the
+moment it's least likely to doesn't hold. A fixed reminder that
+something puts in front of you does. A hook is one.
+
+**It lists, and doesn't re-arm.** Only the session that owned a watch
+knows whether it's still wanted, and a measurement restarted blindly is
+a second run rather than a continuation. So this names what died and
+lists the agent's own open items as the candidates. The agent decides.
+
+**Only on `startup` and `resume`.** A compaction keeps the process, and
+with it every background task. Briefing after one would tell the agent
+its running watches were dead. This checks the source itself, so a
+mis-set matcher can't make it lie: any other source prints nothing.
+
+**The agent is the worktree's stamped identity** (`git config
+--worktree user.name`, set by forge-worktree-identity), read from the
+hook's `cwd`. An unstamped worktree gets the checklist and the
+instruction to stamp it, and no listing, because there's no name to
+list for.
+
+**A listing that fails says so.** One REST call, with a short timeout
+($FORGE_SESSION_START_TIMEOUT, default 15 s). If it fails, the brief
+says it couldn't list and gives the command to run, rather than
+printing an empty list that reads as "you own nothing". The items are
+the open issues and pull requests labeled `<labels.owner_prefix><agent>`
+(default `Owner:`), with their `<labels.status_prefix>` labels (default
+`Status:`).
+
+**Then the agent's own role**: its `## <Name>` section of the roles
+file (`docs.roles`, default docs/roles.md). Read from the cron checkout
+($FORGE_CRON_CHECKOUT) when there is one, which is kept at the default
+branch, else from the configuration found from `cwd`; so a restarted
+session gets its brief back. An agent with no section is told so.
+
+Never blocks a session: it always exits 0.
+"""
+import datetime
+import json
+import os
+import subprocess
+import sys
+import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, github  # noqa: E402
+
+SOURCES = ("startup", "resume")
+DEFAULT_ROLES = "docs/roles.md"
+
+CHECKLIST = """\
+Assume nothing you started before this is still running. In short:
+- Background tasks are gone: watch loops, pollers, background Bash. Decide which of your open items below still need one, and re-arm those. A restarted measurement is a second run, not a continuation, and its owner records the discontinuity.
+- A Monitor died too, and only this session can re-arm it. Confirm a re-arm by a live event, not by the arming call returning.
+- Don't ask CronList: it's session-scoped, so it's empty either way. Persistent routines are behind RemoteTrigger action: list.
+- Check your tools rather than assuming: ToolSearch select:SendMessage,ListAgents.
+- Scratch state you left behind (worktrees, files in /tmp) may be half-finished. Check it before relying on it."""
+
+
+def agent_name(cwd, unstamped, run=subprocess.run):
+    """The agent name in the worktree at `cwd`'s OWN config, or "" if none.
+
+    Read as forge-worktree-identity writes it: with `--worktree`, and
+    only when extensions.worktreeConfig is on, since without the
+    extension git reads `--worktree` as `--local`, which every worktree
+    shares. A name set for the whole repository is therefore not a
+    stamp: one there would make every unstamped worktree list a single
+    agent's items.
+    """
+    def get(*args):
+        try:
+            got = run(["git", "-C", cwd, "config"] + list(args),
+                      capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return got.stdout.strip() if got.returncode == 0 else ""
+    if get("--get", "extensions.worktreeConfig").lower() != "true":
+        return ""
+    name = get("--worktree", "--get", "user.name")
+    return "" if name in ("",) + tuple(unstamped) else name
+
+
+def labels_of(project):
+    labels = project.section("labels")
+    return (labels.get("owner_prefix", "Owner:"),
+            labels.get("status_prefix", "Status:"))
+
+
+def listing_path(project, agent):
+    owner, _ = labels_of(project)
+    return "/repos/%s/issues?labels=%s&state=open&per_page=100" % (
+        project.repo, urllib.parse.quote(owner + agent, safe=":"))
+
+
+def open_items(project, agent, token, call=github.api_call):
+    """[(number, "PR"|"issue", status labels, title)], or an error string.
+
+    The agent's open items, PRs included, since the issues endpoint
+    returns both. At most 100: an agent owning more has a different
+    problem.
+    """
+    _, status_prefix = labels_of(project)
+    status, raw = github.rest(token, "GET", listing_path(project, agent),
+                              call=call)
+    if status != 200:
+        message = raw.get("message", "") if isinstance(raw, dict) else ""
+        return ("GitHub answered %s%s" % (status or "nothing",
+                                          ": " + message if message else ""))[:200]
+    if not isinstance(raw, list):
+        return "GitHub returned %s, not a list" % type(raw).__name__
+    items = []
+    for it in raw:
+        labels = [l.get("name", "") for l in it.get("labels") or []]
+        # A PR is marked by the key's presence, not by what it holds.
+        items.append((it.get("number"),
+                      "PR" if "pull_request" in it else "issue",
+                      [l for l in labels if l.startswith(status_prefix)],
+                      it.get("title", "")))
+    return items
+
+
+def role_of(agent, path):
+    """The body of `agent`'s `## <agent>` section of the roles file, or
+    None when it has none or the file can't be read."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    body, inside = [], False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            if inside:
+                break
+            inside = line[3:].strip() == agent
+        elif inside:
+            body.append(line)
+    return "\n".join(body).strip() or None
+
+
+def brief(source, agent, items, project=None, now=None, role=None,
+          roles_name=DEFAULT_ROLES):
+    """The text a session gets in its context."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    lines = ["Session %s at %s%s." % (source, now.strftime("%Y-%m-%dT%H:%MZ"),
+                                      " for " + agent if agent else ""),
+             CHECKLIST, ""]
+    owner = labels_of(project)[0] if project else "Owner:"
+    if not agent:
+        lines.append("This worktree has no agent identity in its own config "
+                     "(git config --worktree user.name is unset or the "
+                     "unattributed name; a name set for the whole repository "
+                     "does not count), so your open items can't be listed. "
+                     "Run forge-worktree-identity <YourName> first.")
+    elif isinstance(items, str):
+        lines.append("Could not list your open items (%s). Run this "
+                     "yourself:\n  gh api '%s'"
+                     % (items, listing_path(project, agent).lstrip("/")
+                        if project else "issues?labels=%s%s" % (owner, agent)))
+    elif not items:
+        lines.append("You own no open items (%s%s), so nothing of yours "
+                     "needs re-watching." % (owner, agent))
+    else:
+        lines.append("Your open items (%s%s), the candidates to re-watch:"
+                     % (owner, agent))
+        for number, kind, statuses, title in items:
+            lines.append("  #%s %-5s %s%s" % (
+                number, kind, (",".join(statuses) + " ") if statuses else "",
+                title[:90]))
+    if agent:
+        lines.append("")
+        lines.append("Your role (%s, ## %s):\n%s" % (roles_name, agent, role)
+                     if role else
+                     "%s has no section for %s, so no role brief. Ask the "
+                     "project's owner what yours is." % (roles_name, agent))
+    return "\n".join(lines)
+
+
+def project_for(cwd, environ):
+    """The cron checkout's configuration when there is one, else the one
+    found from `cwd`; None when neither loads."""
+    checkout = environ.get("FORGE_CRON_CHECKOUT")
+    try:
+        if checkout:
+            return config.load(os.path.join(os.path.expanduser(checkout),
+                                            config.CONFIG_NAME))
+        return config.load(environ=environ, cwd=cwd)
+    except config.ConfigError:
+        return None
+
+
+def main(stdin=None, run=subprocess.run, out=None, environ=None,
+         call=github.api_call):
+    stdin = stdin if stdin is not None else sys.stdin
+    out = out or sys.stdout
+    environ = os.environ if environ is None else environ
+    try:
+        data = json.loads(stdin.read() or "{}")
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    source = data.get("source") or "startup"
+    if source not in SOURCES:
+        return 0
+    cwd = data.get("cwd") or os.getcwd()
+    project = project_for(cwd, environ)
+    unstamped = [project.section("identity").get(
+        "unattributed_name", "Anonymous Agent")] if project else []
+    agent = agent_name(cwd, unstamped, run=run)
+    items, role, roles_name = None, None, DEFAULT_ROLES
+    if agent and project is None:
+        items = "no agent-forge configuration found from %s" % cwd
+    elif agent:
+        github.REQUEST_TIMEOUT_S = float(
+            environ.get("FORGE_SESSION_START_TIMEOUT", "15"))
+        token = github.read_token(project, dict(environ, FORGE_AGENT=agent),
+                                  call=call)
+        items = open_items(project, agent, token, call=call)
+        roles_name = project.section("docs").get("roles", DEFAULT_ROLES)
+        if project.root:
+            role = role_of(agent, os.path.join(project.root, roles_name))
+    out.write(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": brief(source, agent, items, project, role=role,
+                                   roles_name=roles_name)}}) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as err:  # a hook must never stop a session starting
+        print("forge-session-start: %s" % err, file=sys.stderr)
+        sys.exit(0)

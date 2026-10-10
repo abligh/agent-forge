@@ -21,9 +21,10 @@
   "machinery": {
     "Merger": {"app_id": 105, "installation_id": 205}
   },
-  "labels": {"owner_prefix": "Owner:", "waiting_on_owner": "Status:waiting-owner"},
+  "labels": {"owner_prefix": "Owner:", "status_prefix": "Status:",
+             "waiting_on_owner": "Status:waiting-owner"},
   "checks": {"context": "vm/build-and-test", "poster": "Merger"},
-  "docs": {"paths": ["README.md", "docs"], "width": 80},
+  "docs": {"paths": ["README.md", "docs"], "width": 80, "roles": "docs/roles.md"},
   "identity": {"unattributed_domain": "@build.example.org",
                "unattributed_name": "Anonymous Agent"},
   "host_settings": {
