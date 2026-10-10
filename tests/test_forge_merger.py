@@ -2434,5 +2434,217 @@ class HoldConflicting(RepoCase):
             self.repo.path, [self.item(), self.rival()], run), {})
 
 
+class YieldIgnoresConflicts(unittest.TestCase):
+
+    def test_hand_backs_without_conflicts(self):
+        records = [hand_back(5, T0, reason=m.CONFLICT_REASON),
+                   hand_back(5, T1, head="g" * 40),
+                   hand_back(6, T1, reason=m.CONFLICT_REASON)]
+        self.assertEqual(m.hand_backs(records), {5: 2, 6: 1})
+        self.assertEqual(m.hand_backs(records, conflicts=False), {5: 1})
+        self.assertEqual(m.conflict_hand_backs(records), {5: 1, 6: 1})
+
+    def test_the_configuration(self):
+        m.configure(project(yield_ignores_conflicts=True))
+        self.addCleanup(m.configure, project())
+        self.assertIs(m.YIELD_IGNORES_CONFLICTS, True)
+        m.configure(project())
+        self.assertIs(m.YIELD_IGNORES_CONFLICTS, False)
+
+
+class YieldIgnoringConflicts(YieldAfterHandBack):
+
+    def test_a_conflict_does_not_yield(self):
+        m.configure(project(yield_after_hand_back=1,
+                            yield_ignores_conflicts=True))
+        self.history(hand_back(5, "2026-10-07T11:30:00Z",
+                               reason=m.CONFLICT_REASON))
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,))
+        self.assertEqual((record["queue"], record["yielded"]), ([5, 6], {}))
+
+    def test_another_reason_still_yields(self):
+        m.configure(project(yield_after_hand_back=1,
+                            yield_ignores_conflicts=True))
+        self.history(hand_back(5, "2026-10-07T11:30:00Z"))
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,))
+        self.assertEqual(record["queue"], [6, 5])
+
+
+class RightOfWay(RepoCase):
+    """merge.right_of_way (designs/0002): #5, overtaken twice, holds
+    back what conflicts with its clean head for a while, and goes first.
+    The rivals are older, so without it they would go first."""
+
+    OLDER = "2026-10-07T09:00:00Z"
+    item = Decide.item
+    tick = Tick.tick
+    other_pr = Tick.other_pr
+    rival = HoldConflicting.rival
+    comments = HoldConflicting.comments
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        m.configure(project(right_of_way={}))
+        self.addCleanup(m.configure, project())
+        self.state = os.path.join(self.tmp.name, "state")
+        os.makedirs(self.state)
+        self.overtaken()
+
+    def overtaken(self, times=2, name="merger.jsonl"):
+        with open(os.path.join(self.state, name), "a") as handle:
+            for k in range(times):
+                handle.write(json.dumps(hand_back(
+                    5, "2026-10-07T11:%02d:00Z" % (10 + k), head=str(k) * 40,
+                    reason=m.CONFLICT_REASON)) + "\n")
+
+    def row(self):
+        return {"pr": 5, "head": self.head, "since": "2026-10-07T12:00:00Z"}
+
+    def test_the_configuration(self):
+        self.assertEqual((m.RIGHT_OF_WAY, m.ROW_AFTER, m.ROW_FOR),
+                         (True, 2, datetime.timedelta(minutes=60)))
+        m.configure(project(right_of_way={"after_conflicts": 3,
+                                          "minutes": 30}))
+        self.assertEqual((m.ROW_AFTER, m.ROW_FOR),
+                         (3, datetime.timedelta(minutes=30)))
+        m.configure(project())
+        self.assertIs(m.RIGHT_OF_WAY, False)
+
+    def test_off_by_default(self):
+        m.configure(project())
+        record, _ = self.tick([self.item(), self.rival(created=self.OLDER)],
+                              live=True)
+        self.assertNotIn("right_of_way", record)
+        self.assertEqual(record["held"], {})
+        self.assertEqual(record["queue"], [6, 5])
+
+    def test_it_holds_what_conflicts_and_goes_first(self):
+        rival = self.rival(created=self.OLDER)
+        other = self.other_pr(7)
+        other["createdAt"] = self.OLDER
+        record, _ = self.tick([self.item(), rival, other],
+                              conclusions=(None,), live=True)
+        self.assertEqual(record["right_of_way"], self.row())
+        self.assertEqual(record["held"],
+                         {"6": "conflicts with #5, which has right of way"})
+        self.assertEqual(record["queue"], [5, 7])
+        self.assertEqual(record["holds"], [
+            {"pr": 6, "head": rival["headRefOid"], "behind": 5,
+             "right_of_way": True, "result": "done"}])
+        (where, body), = self.comments()
+        self.assertEqual(where, SLUG + "/issues/6/comments")
+        self.assertTrue(body.startswith(
+            "Holding %s: it conflicts with #5, which has right of way."
+            % rival["headRefOid"][:10]))
+        self.assertIn("within 60 minutes", body)
+        self.assertTrue(body.endswith("\n\n— Merger"))
+        record, _ = self.tick([self.item(), rival, other],
+                              conclusions=(None,), live=True, minutes=1)
+        self.assertEqual(record["holds"][0]["result"], "already said")
+        self.assertEqual(self.comments(), [])
+
+    def test_one_conflict_has_not_earned_it(self):
+        os.remove(os.path.join(self.state, "merger.jsonl"))
+        self.overtaken(1)
+        record, _ = self.tick([self.item(), self.rival(created=self.OLDER)],
+                              live=True)
+        self.assertIsNone(record["right_of_way"])
+        self.assertEqual((record["queue"], record["held"]), ([6, 5], {}))
+
+    def test_it_holds_while_not_yet_approved_again(self):
+        unapproved = pr(5, head=self.head, reviews=[])
+        record, _ = self.tick([unapproved, self.rival(created=self.OLDER)],
+                              live=True)
+        self.assertEqual(record["right_of_way"], self.row())
+        self.assertEqual(record["queue"], [])
+        self.assertEqual(list(record["held"]), ["6"])
+
+    def test_it_ends_after_the_minutes_and_the_clock_survives(self):
+        rival = self.rival(created=self.OLDER)
+        self.tick([self.item(), rival], conclusions=(None,), live=True)
+        record, _ = self.tick([self.item(), rival], conclusions=(None,),
+                              live=True, minutes=59)
+        self.assertEqual(record["right_of_way"], self.row())
+        record, _ = self.tick([self.item(), rival], conclusions=(None,),
+                              live=True, minutes=60)
+        self.assertIsNone(record["right_of_way"])
+        self.assertEqual(record["queue"], [6, 5])
+
+    def test_a_new_head_starts_the_clock_again(self):
+        rival = self.rival(created=self.OLDER)
+        self.tick([self.item(), rival], conclusions=(None,), live=True)
+        head = self.repo.commit("f2.txt", "more\n", "more")
+        self.repo.publish_pr(5, head)
+        moved = pr(5, head=head, reviews=[])
+        record, _ = self.tick([moved, rival], live=True, minutes=61)
+        self.assertEqual(record["right_of_way"],
+                         {"pr": 5, "head": head,
+                          "since": "2026-10-07T13:01:00Z"})
+
+    def test_not_while_its_head_conflicts_with_main(self):
+        self.advance_main("f.txt", "main moved f\n")
+        record, _ = self.tick([self.item(), self.rival(created=self.OLDER)],
+                              live=True)
+        self.assertIsNone(record["right_of_way"])
+        self.assertNotIn("6", record["held"])
+
+    def test_not_when_its_head_was_handed_back_for_anything_else(self):
+        with open(os.path.join(self.state, "merger.jsonl"), "a") as handle:
+            handle.write(json.dumps(hand_back(
+                5, "2026-10-07T11:50:00Z", head=self.head)) + "\n")
+        record, _ = self.tick([self.item(), self.rival(created=self.OLDER)],
+                              conclusions=(None,), live=True)
+        self.assertIsNone(record["right_of_way"])
+
+    def test_it_never_yields(self):
+        m.configure(project(right_of_way={}, yield_after_hand_back=2))
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,), live=True)
+        self.assertEqual(record["queue"], [5, 6])
+        self.assertEqual(record["yielded"], {})
+
+    def test_the_one_in_flight_stays_ahead_unless_it_conflicts(self):
+        m.configure(project(right_of_way={}, test_ahead={}))
+        other = self.other_pr(7)
+        other["createdAt"] = self.OLDER
+        with open(os.path.join(self.state, "next.json"), "w") as handle:
+            json.dump({"at": T1, "pr": 7, "action": "WAIT"}, handle)
+        record, _ = self.tick([self.item(), other], conclusions=(None,),
+                              live=True)
+        self.assertEqual(record["queue"], [7, 5])
+        rival = self.rival(created=self.OLDER)
+        with open(os.path.join(self.state, "next.json"), "w") as handle:
+            json.dump({"at": T1, "pr": 6, "action": "WAIT"}, handle)
+        record, _ = self.tick([self.item(), rival], conclusions=(None,),
+                              live=True, minutes=1)
+        self.assertEqual(record["queue"], [5])
+
+    def test_a_dry_tick_keeps_its_own_clock_and_says_nothing(self):
+        self.overtaken(name="dry-run.jsonl")
+        record, _ = self.tick([self.item(), self.rival(created=self.OLDER)])
+        self.assertEqual(record["right_of_way"], self.row())
+        self.assertTrue(os.path.exists(
+            os.path.join(self.state, "dry-run-" + m.ROW_FILE)))
+        self.assertFalse(os.path.exists(os.path.join(self.state, m.ROW_FILE)))
+
+    def test_of_two_the_first_in_order_has_it(self):
+        six = self.rival(created=self.OLDER)
+        with open(os.path.join(self.state, "merger.jsonl"), "a") as handle:
+            for k in range(2):
+                handle.write(json.dumps(hand_back(
+                    6, "2026-10-07T11:3%d:00Z" % k, head=str(k) * 40,
+                    reason=m.CONFLICT_REASON)) + "\n")
+        record, _ = self.tick([self.item(), six], conclusions=(None,),
+                              live=True)
+        self.assertEqual(record["right_of_way"]["pr"], 6)
+        self.assertEqual(record["held"],
+                         {"5": "conflicts with #6, which has right of way"})
+
+
 if __name__ == "__main__":
     unittest.main()

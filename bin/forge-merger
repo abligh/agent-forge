@@ -239,6 +239,24 @@ each tick held. Once Q has merged it is judged as usual, and goes back
 to its author if it then conflicts with `main`: one rebase instead of
 one per merge. Two heads git can't compare are not held.
 
+**With `merge.yield_ignores_conflicts`, a conflict with `main` doesn't
+count toward the yield** (default false). A conflict is mostly what
+merged after the approval, not the pull request's own failure.
+
+**With `merge.right_of_way`, a pull request overtaken again and again
+gets to land** (default off; designs/0002). One handed back to its
+author for a conflict with `main` at `after_conflicts` heads (default
+2) in the last 24 hours has earned it, and has it for its head H while
+H is clean against `main`, H wasn't handed back for anything else, and
+less than `minutes` (default 60) has passed since a tick first saw H
+with it earned (`right-of-way.json` in the state directory remembers
+when). Meanwhile every other candidate whose head conflicts with H is
+held, `held` saying `conflicts with #P, which has right of way`, told
+once like a hold above; once P is a candidate it goes first, after
+only the one a `test_ahead` run is in flight for, and never yields.
+The record's `right_of_way` says who has it, `{pr, head, since}`, or
+null. Of several that earned it, the first in the order above has it.
+
 **With `test_ahead`, the pull request a run is in flight for keeps its
 place.** When the last tick updated or waited on a pull request that
 is still a candidate, it stays first, and no blocker (a pull request
@@ -365,6 +383,15 @@ HOLD_FILE = "held-conflicting.json"
 YIELD_PLACES = 0
 YIELD_CAP = 3
 YIELD_WINDOW = datetime.timedelta(hours=24)
+# merge.yield_ignores_conflicts: a conflict with main doesn't count.
+YIELD_IGNORES_CONFLICTS = False
+# merge.right_of_way: after ROW_AFTER conflict hand-backs, those that
+# conflict with the pull request's clean head are held for ROW_FOR.
+RIGHT_OF_WAY = False
+ROW_AFTER = 2
+ROW_FOR = datetime.timedelta(minutes=60)
+ROW_REASON = "conflicts with #%d, which has right of way"
+ROW_FILE = "right-of-way.json"
 
 
 def configure(project):
@@ -375,7 +402,10 @@ def configure(project):
     (default none: a stall is only printed), and `test_ahead` (default
     none: nothing is predicted; `depth`, default 3) and
     `hold_conflicting` (default false), `yield_after_hand_back`
-    (default none: nobody yields) and `yield_cap` (default 3). The
+    (default none: nobody yields), `yield_cap` (default 3),
+    `yield_ignores_conflicts` (default false) and `right_of_way`
+    (default none: nobody has it; `after_conflicts`, default 2, and
+    `minutes`, default 60). The
     `checks` section: `context` and `poster` (default the merger).
     `labels.waiting_on_owner` is the label a long stall gets."""
     global REPO_SLUG, MAIN, APPROVERS, QUIET_LOGINS, ACT_AS, SIGNATURE
@@ -383,7 +413,8 @@ def configure(project):
     global STALL_AFTER, STALL_ALERT, STALL_TELL, STALL_RETELL
     global STALL_TO_OWNER, STALL_TITLE, STALL_LABELS, WAITING_OWNER
     global TEST_AHEAD, AHEAD_DEPTH, HOLD_CONFLICTING, YIELD_PLACES
-    global YIELD_CAP
+    global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
+    global ROW_FOR
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -415,6 +446,12 @@ def configure(project):
     HOLD_CONFLICTING = merge.get("hold_conflicting", False) is True
     YIELD_PLACES = merge.get("yield_after_hand_back", 0)
     YIELD_CAP = merge.get("yield_cap", 3)
+    YIELD_IGNORES_CONFLICTS = merge.get("yield_ignores_conflicts",
+                                        False) is True
+    row = merge.get("right_of_way")
+    RIGHT_OF_WAY = row is not None
+    ROW_AFTER = (row or {}).get("after_conflicts", 2)
+    ROW_FOR = datetime.timedelta(minutes=(row or {}).get("minutes", 60))
 
 NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
 BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
@@ -646,13 +683,13 @@ def recent_records(path, since, block=65536):
     return records
 
 
-def hand_backs(records):
-    """{pr: how many times it was handed back to its author} in
-    `records`: distinct heads and reasons, since a tick repeats a
-    hand-back already said; one GitHub refused to post is not counted.
-    A hand-back to the approving reviewer asks for a fresh review and is
-    not the pull request's own failure, so it doesn't count either."""
-    seen = {}
+def author_hand_backs(records):
+    """Each distinct (pr, head, reason) handed back to its author in
+    `records`, since a tick repeats a hand-back already said; one GitHub
+    refused to post is not one. A hand-back to the approving reviewer
+    asks for a fresh review and is not the pull request's own failure,
+    so it isn't one either."""
+    seen = set()
     for record in records:
         for d in record.get("decisions") or ():
             if not isinstance(d, dict) or d.get("action") != "HAND-BACK" \
@@ -660,9 +697,29 @@ def hand_backs(records):
                 continue
             if str(d.get("result") or "").startswith("refused"):
                 continue
-            seen.setdefault(d.get("pr"), set()).add(
-                (d.get("head"), d.get("reason")))
-    return {pr: len(keys) for pr, keys in seen.items()}
+            seen.add((d.get("pr"), d.get("head"), d.get("reason")))
+    return seen
+
+
+def hand_backs(records, conflicts=True):
+    """{pr: how many times it was handed back to its author} in
+    `records` (see `author_hand_backs`); without `conflicts`, a conflict
+    with main doesn't count."""
+    counts = {}
+    for pr, _, reason in author_hand_backs(records):
+        if conflicts or reason != CONFLICT_REASON:
+            counts[pr] = counts.get(pr, 0) + 1
+    return counts
+
+
+def conflict_hand_backs(records):
+    """{pr: how many heads were handed back to its author for a conflict
+    with main} in `records`."""
+    counts = {}
+    for pr, _, reason in author_hand_backs(records):
+        if reason == CONFLICT_REASON:
+            counts[pr] = counts.get(pr, 0) + 1
+    return counts
 
 
 def yield_places(queue, everyone, counts, keep=None):
@@ -1349,6 +1406,74 @@ def conflicts_ahead(repo, queue, run=sh, main_ref=None):
     return held
 
 
+def right_of_way(repo, prs, records, path, when, main_ref, run=sh,
+                 save=True):
+    """{pr, head, since} for the pull request that has right of way, or
+    None. One handed back to its author for a conflict with main at
+    ROW_AFTER heads in `records` has earned it; it has it for its head
+    H while H is clean against `main_ref`, it wasn't handed back at H
+    for anything else, and less than ROW_FOR has passed since a tick
+    first saw H with it earned. `path` remembers that moment per pull
+    request ({pr: {head, since}}), written when `save`. Of several, the
+    first in the Merger's order has it."""
+    counts = conflict_hand_backs(records)
+    other = {(pr, head) for pr, head, reason in author_hand_backs(records)
+             if reason != CONFLICT_REASON}
+    earned = order([pr for pr in prs if counts.get(pr["number"], 0)
+                    >= ROW_AFTER and not pr.get("isDraft")
+                    and pr.get("baseRefName") == MAIN], prs)
+    seen = {k: v for k, v in load_json(path, {}).items()
+            if isinstance(v, dict) and k.isdigit()
+            and any(pr["number"] == int(k) for pr in earned)}
+    found = None
+    for pr in earned:
+        head, key = pr["headRefOid"], str(pr["number"])
+        if (seen.get(key) or {}).get("head") != head:
+            seen[key] = {"head": head, "since": iso(when)}
+        if found or (pr["number"], head) in other:
+            continue
+        try:
+            since = parse_time(seen[key]["since"])
+        except (ValueError, TypeError, KeyError):
+            continue
+        if when - since >= ROW_FOR:
+            continue
+        have_head(repo, pr, run)
+        if git(repo, "merge-tree", "--write-tree", "--name-only",
+               "--no-messages", main_ref, head, run=run).returncode != 0:
+            continue
+        found = {"pr": pr["number"], "head": head, "since": iso(since)}
+    if save:
+        save_json(path, seen)
+    return found
+
+
+def conflicts_with(repo, head, queue, run=sh):
+    """The pull requests in `queue` whose heads conflict with `head`.
+    A comparison git can't make holds nothing."""
+    held = []
+    for pr in queue:
+        have_head(repo, pr, run)
+        if git(repo, "merge-tree", "--write-tree", "--name-only",
+               "--no-messages", head, pr["headRefOid"],
+               run=run).returncode == 1:
+            held.append(pr["number"])
+    return held
+
+
+def row_text(head, ahead):
+    """The comment a right-of-way hold posts: plain, to the author."""
+    return ("Holding %s: it conflicts with #%d, which has right of way. "
+            "#%d has been handed back again and again for conflicts with "
+            "`main` as others merged, so for a while nothing that "
+            "conflicts with it merges first.\n\nThis keeps its approval "
+            "and is not handed back. Please leave it until #%d merges or "
+            "its right of way ends, within %d minutes: then, if it "
+            "conflicts with `main`, the Merger hands it back once.\n\n%s"
+            % (head[:10], ahead, ahead, ahead,
+               ROW_FOR.total_seconds() // 60, SIGNATURE))
+
+
 def hold_text(head, ahead):
     """The comment a hold posts: plain, to the author, and not a
     hand-back, so it doesn't start `Not merging`."""
@@ -1359,10 +1484,11 @@ def hold_text(head, ahead):
             "both.\n\n%s" % (head[:10], ahead, ahead, SIGNATURE))
 
 
-def tell_holds(state_dir, github, prs, held_by, live):
+def tell_holds(state_dir, github, prs, held_by, live, row=()):
     """[{pr, head, behind, result}] for each hold. When `live`, each
     head and Q is said on its pull request once, `held-conflicting.json`
-    remembering it; pull requests no longer open are forgotten."""
+    remembering it; pull requests no longer open are forgotten. Those in
+    `row` are held for right of way, which their entries say."""
     path = os.path.join(state_dir, HOLD_FILE)
     heads = {pr["number"]: pr["headRefOid"] for pr in prs}
     said = {k: v for k, v in load_json(path, {}).items()
@@ -1370,6 +1496,8 @@ def tell_holds(state_dir, github, prs, held_by, live):
     told = []
     for number, ahead in sorted(held_by.items()):
         key = {"head": heads[number], "behind": ahead}
+        if number in row:
+            key["right_of_way"] = True
         entry = dict(key, pr=number)
         if live:
             if said.get(str(number)) == key:
@@ -1378,7 +1506,8 @@ def tell_holds(state_dir, github, prs, held_by, live):
                 ok, why = github.write(
                     "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG,
                                                            number),
-                    body=hold_text(heads[number], ahead))
+                    body=(row_text if number in row else hold_text)(
+                        heads[number], ahead))
                 entry["result"] = "done" if ok else "refused: " + why
                 if ok:
                     said[str(number)] = key
@@ -1476,17 +1605,36 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         last = load_json(os.path.join(state_dir, "next.json"), {})
         if isinstance(last, dict) and last.get("action") in IN_FLIGHT:
             in_flight = last.get("pr")
-    yielded = {}
+    yielded, records, row = {}, [], None
+    name = "merger.jsonl" if live else "dry-run.jsonl"
+    if YIELD_PLACES or RIGHT_OF_WAY:
+        records = recent_records(os.path.join(state_dir, name),
+                                 when - YIELD_WINDOW)
     if YIELD_PLACES:
-        name = "merger.jsonl" if live else "dry-run.jsonl"
-        counts = hand_backs(recent_records(os.path.join(state_dir, name),
-                                           when - YIELD_WINDOW))
+        counts = hand_backs(records, not YIELD_IGNORES_CONFLICTS)
         queue, yielded = yield_places(queue, prs, counts, in_flight)
     if in_flight is not None:
         # The pull request the last tick updated or waited on keeps its
         # place: a blocker promoted past it would spend the run it is
         # already having, and every prediction behind it.
         queue.sort(key=lambda pr: pr["number"] != in_flight)
+    os.makedirs(state_dir, exist_ok=True)
+    row_held = {}
+    if RIGHT_OF_WAY:
+        row = right_of_way(repo, prs, records, os.path.join(
+            state_dir, ROW_FILE if live else "dry-run-" + ROW_FILE),
+            when, main_tip, run)
+    if row:
+        # Nothing that conflicts with it merges first; it goes first
+        # once it is a candidate, after only the one in flight.
+        others = [pr for pr in queue if pr["number"] != row["pr"]]
+        for number in conflicts_with(repo, row["head"], others, run):
+            row_held[number] = row["pr"]
+            held[str(number)] = ROW_REASON % row["pr"]
+        queue = [pr for pr in queue if pr["number"] not in row_held]
+        queue.sort(key=lambda pr: (pr["number"] != in_flight,
+                                   pr["number"] != row["pr"]))
+        yielded.pop(row["pr"], None)
     held_by = (conflicts_ahead(repo, queue, run, main_tip)
                if HOLD_CONFLICTING else {})
     for number, ahead in held_by.items():
@@ -1496,11 +1644,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
               "queue": [pr["number"] for pr in queue], "decisions": []}
     if YIELD_PLACES:
         record["yielded"] = {str(n): p for n, p in sorted(yielded.items())}
-    os.makedirs(state_dir, exist_ok=True)
+    if RIGHT_OF_WAY:
+        record["right_of_way"] = row
     said_path = os.path.join(state_dir, "handed-back.json")
     said = load_json(said_path, {})
-    if HOLD_CONFLICTING:
-        record["holds"] = tell_holds(state_dir, github, prs, held_by, live)
+    if HOLD_CONFLICTING or RIGHT_OF_WAY:
+        record["holds"] = tell_holds(state_dir, github, prs,
+                                     {**held_by, **row_held}, live,
+                                     row_held)
     waiting_on = waiting = None
     for pr in queue:
         approval = approvals[pr["number"]]
@@ -1562,7 +1713,6 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             save_json(os.path.join(state_dir, AHEAD_FILE),
                       {"at": record["at"], "base": main_tip, "repo": repo,
                        "entries": entries})
-    name = "merger.jsonl" if live else "dry-run.jsonl"
     with open(os.path.join(state_dir, name), "a") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
     out("%s %d eligible, %d approved but held; %s" % (

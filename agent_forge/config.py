@@ -61,7 +61,9 @@ HOST_SETTINGS = {"files": list, "host_keys": list}
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_minutes": int, "stall_alert": dict, "test_ahead": dict,
          "hold_conflicting": bool, "yield_after_hand_back": int,
-         "yield_cap": int}
+         "yield_cap": int, "yield_ignores_conflicts": bool,
+         "right_of_way": dict}
+RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int}
 TEST_AHEAD = {"depth": int, "max_age_hours": int}
 STALL_ALERT = {"tell": list, "retell_minutes": int,
                "owner_after_minutes": int, "title": str, "labels": list}
@@ -235,6 +237,13 @@ def check(data):
                 problems.append("merge.%s must be at least 1" % key)
         if "yield_cap" in merge and "yield_after_hand_back" not in merge:
             problems.append("merge.yield_cap needs merge.yield_after_hand_back")
+        if isinstance(merge.get("right_of_way"), dict):
+            row = merge["right_of_way"]
+            _fields("merge.right_of_way", row, RIGHT_OF_WAY, problems)
+            for key in RIGHT_OF_WAY:
+                if _is(row.get(key), int) and row[key] < 1:
+                    problems.append("merge.right_of_way.%s must be at least 1"
+                                    % key)
     for name, allowed in (("labels", LABELS), ("relay", RELAY)):
         section = data.get(name, {})
         for key, kinds in allowed.items():

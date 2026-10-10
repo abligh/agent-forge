@@ -196,6 +196,21 @@ class Check(unittest.TestCase):
                          ["merge.yield_cap needs "
                           "merge.yield_after_hand_back"])
 
+    def test_merge_right_of_way(self):
+        self.assertEqual(self.problems(merge={
+            "yield_ignores_conflicts": True,
+            "right_of_way": {"after_conflicts": 2, "minutes": 60}}), [])
+        self.assertEqual(self.problems(merge={"right_of_way": {}}), [])
+        self.assertEqual(self.problems(merge={"right_of_way": {
+            "after_conflicts": 0, "minutes": "60", "width": 1}}), [
+            "merge.right_of_way.minutes must be an integer",
+            "merge.right_of_way: unknown key 'width'",
+            "merge.right_of_way.after_conflicts must be at least 1"])
+        self.assertEqual(self.problems(merge={"right_of_way": 2}),
+                         ["merge.right_of_way must be an object"])
+        self.assertEqual(self.problems(merge={"yield_ignores_conflicts": 1}),
+                         ["merge.yield_ignores_conflicts must be true or false"])
+
     def test_merge_hold_conflicting(self):
         self.assertEqual(self.problems(merge={"hold_conflicting": True}), [])
         self.assertEqual(self.problems(merge={"hold_conflicting": "yes"}),
