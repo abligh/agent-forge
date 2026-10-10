@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Refuse any tracked file that names something agent-forge mustn't.
+
+agent-forge is shared by several projects and is public, so it names
+none of them, nor the hosts they run on. The words that mustn't appear
+are kept OUTSIDE the repository, one per line, in the file
+$FORGE_FORBIDDEN_WORDS (default ~/.config/agent-forge/forbidden-words),
+so the list itself is never published. Matching ignores case and finds
+a word anywhere, inside identifiers and paths too.
+
+    check-neutral            check every tracked file; exit 1 on a hit
+    check-neutral --staged   check what is staged (the pre-commit hook)
+
+With no list it says so and exits 0: a clone without the list can't
+check, and must not pretend it did. Exits 2 if the list exists but is
+empty, since an empty list would pass everything.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+DEFAULT_LIST = "~/.config/agent-forge/forbidden-words"
+
+
+def load_words(path):
+    """The words in `path`, lower-cased, or None if there is no file."""
+    try:
+        with open(os.path.expanduser(path)) as handle:
+            lines = handle.read().splitlines()
+    except FileNotFoundError:
+        return None
+    return [w.strip().lower() for w in lines
+            if w.strip() and not w.lstrip().startswith("#")]
+
+
+def hits(text, words):
+    """(line number, word) for each line of `text` holding a word."""
+    if not words:
+        return []
+    pattern = re.compile("|".join(re.escape(w) for w in words), re.IGNORECASE)
+    found = []
+    for number, line in enumerate(text.splitlines(), 1):
+        for match in pattern.finditer(line):
+            found.append((number, match.group(0).lower()))
+    return found
+
+
+def tracked_files(root, staged):
+    if staged:
+        args = ["git", "-C", root, "diff", "--cached", "--name-only",
+                "--diff-filter=ACMR", "-z"]
+    else:
+        args = ["git", "-C", root, "ls-files", "-z"]
+    out = subprocess.run(args, capture_output=True, text=True, check=True)
+    return [p for p in out.stdout.split("\0") if p]
+
+
+def read(root, path, staged):
+    if staged:
+        got = subprocess.run(["git", "-C", root, "show", ":" + path],
+                             capture_output=True, check=True)
+        data = got.stdout
+    else:
+        with open(os.path.join(root, path), "rb") as handle:
+            data = handle.read()
+    return data.decode("utf-8", errors="replace")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--staged", action="store_true")
+    parser.add_argument("--root", default=None)
+    args = parser.parse_args(argv)
+    path = os.environ.get("FORGE_FORBIDDEN_WORDS", DEFAULT_LIST)
+    words = load_words(path)
+    if words is None:
+        print("check-neutral: no word list at %s; nothing checked" % path)
+        return 0
+    if not words:
+        print("check-neutral: %s is empty; refusing to pass everything" % path,
+              file=sys.stderr)
+        return 2
+    root = args.root or subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True,
+        text=True, check=True).stdout.strip()
+    files = tracked_files(root, args.staged)
+    bad = 0
+    for name in files:
+        # The file name counts too: a path can name a project.
+        for _, word in hits(name, words):
+            print("%s: the path names %r" % (name, word))
+            bad += 1
+        for number, word in hits(read(root, name, args.staged), words):
+            print("%s:%d: names %r" % (name, number, word))
+            bad += 1
+    if bad:
+        print("check-neutral: %d hit(s) in %d file(s) checked" % (bad, len(files)),
+              file=sys.stderr)
+        return 1
+    print("check-neutral: clean (%d files)" % len(files))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
