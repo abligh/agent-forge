@@ -5,7 +5,7 @@ PYTHON ?= python3
 all: test check-neutral
 
 test:
-	$(PYTHON) -m unittest discover -s tests -t . -q
+	$(PYTHON) -W error::ResourceWarning -m unittest discover -s tests -t . -q
 
 check-neutral:
 	tools/check-neutral
