@@ -1703,6 +1703,9 @@ class RelaySender(unittest.TestCase):
     class Response:
         status = 200
 
+        def read(self, limit=-1):
+            return b'{"status": "queued", "targets": [{"to": "x"}]}'
+
         def __enter__(self):
             return self
 

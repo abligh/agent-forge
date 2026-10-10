@@ -8,6 +8,7 @@ reaches the network, mints a token or touches the real state.
 """
 
 import datetime
+import http.client
 import io
 import json
 import os
@@ -835,6 +836,18 @@ class FailedRelay(StateCase):
         self.assertEqual(self.run_router(prs), 1)
         self.assertEqual(set(self.state()["items"]), {"41"})
 
+    def test_a_relay_that_did_not_answer_is_not_asked_again(self):
+        def post(session, text):
+            self.posts.append(session)
+            return r.UNREACHABLE + ": refused"
+        self.post = post
+        prs = [pr_node(41), pr_node(44, statuses=[status("FAILURE")])]
+        self.assertEqual(self.run_router(prs), 2)
+        self.assertEqual(self.posts, ["WidgetLeadDev"])
+        self.assertEqual(self.state()["items"], {})
+        self.assertEqual({w["outcome"] for w in self.wakes()},
+                         {"not sent: relay unreachable: refused"})
+
 
 class Only(StateCase):
 
@@ -923,11 +936,17 @@ class DryRun(StateCase):
         self.assertFalse(os.path.exists(os.path.join(self.dir, "lock")))
 
 
+QUEUED = {"status": "queued", "targets": [{"to": "x"}]}
+
+
 class Poster(unittest.TestCase):
 
     class Response:
-        def __init__(self, code):
-            self.status = code
+        def __init__(self, code, answer=QUEUED):
+            self.status, self.answer = code, answer
+
+        def read(self, limit=-1):
+            return json.dumps(self.answer).encode()
 
         def __enter__(self):
             return self
@@ -935,20 +954,32 @@ class Poster(unittest.TestCase):
         def __exit__(self, *exc):
             return False
 
-    def post(self, answer, token="s3cret", relay="http://relay:8788/"):
-        seen = []
+    def post(self, *answers, token="s3cret", relay="http://relay:8788/",
+             text="From: x", stamp="run1"):
+        seen, slept, answers = [], [], list(answers)
 
         def opener(req, timeout):
             seen.append(req)
+            answer = answers.pop(0)
             if isinstance(answer, Exception):
                 raise answer
+            if isinstance(answer, tuple):
+                return self.Response(*answer)
             return self.Response(answer)
-        got = r.make_poster(relay, token, opener)("WidgetLeadDev", "From: x")
+        poster = r.make_poster(relay, token, opener, sleep=slept.append,
+                               stamp=stamp)
+        got = poster("WidgetLeadDev", text)
+        self.slept = slept
         return got, seen
 
-    def http_error(self, code, reason):
+    def http_error(self, code, reason, retry=None):
         body = json.dumps({"error": "x", "reason": reason}).encode()
-        return urllib.error.HTTPError("u", code, "m", {}, io.BytesIO(body))
+        headers = {"Retry-After": retry} if retry is not None else {}
+        return urllib.error.HTTPError("u", code, "m", headers, io.BytesIO(body))
+
+    def delivery(self, req):
+        return {k.lower(): v for k, v in req.header_items()}[
+            "x-webhook-delivery"]
 
     def test_the_request_is_the_relays_verbatim_agent_post(self):
         got, (req,) = self.post(200)
@@ -961,14 +992,49 @@ class Poster(unittest.TestCase):
         self.assertEqual(headers["x-xmpp-verbatim"], "1")
         self.assertTrue(headers["content-type"].startswith("text/plain"))
 
-    def test_only_200_counts(self):
+    def test_only_the_relay_taking_one_message_counts(self):
+        self.assertIsNone(self.post((200, {"status": "duplicate"}))[0])
+        for answer in ({}, {"status": "queued", "targets": []},
+                       {"status": "queued", "targets": [1, 2]}, ["queued"]):
+            self.assertIn("not the relay's answer",
+                          self.post((200, answer))[0], answer)
         self.assertEqual(self.post(202)[0], "HTTP 202")
-        self.assertEqual(self.post(self.http_error(404, "unknown-name"))[0],
-                         "HTTP 404 unknown-name")
         self.assertEqual(self.post(self.http_error(409, "ambiguous-name"))[0],
                          "HTTP 409 ambiguous-name")
         self.assertEqual(self.post(self.http_error(503, "queue-full"))[0],
                          "HTTP 503 queue-full")
+
+    def test_a_missing_agent_is_told_from_a_wrong_url(self):
+        got, _ = self.post(self.http_error(404, "unknown-name"))
+        self.assertEqual(got, "HTTP 404 unknown-name: no session "
+                         "WidgetLeadDev in the room")
+        got, _ = self.post(urllib.error.HTTPError(
+            "u", 404, "m", {}, io.BytesIO(b"404: Not Found")))
+        self.assertIn("not the relay's: is relay.url (http://relay:8788) "
+                      "the relay?", got)
+
+    def test_a_503_asking_briefly_is_tried_once_more_as_the_same_delivery(self):
+        got, (first, second) = self.post(
+            self.http_error(503, "directory-not-ready", "5"), 200)
+        self.assertIsNone(got)
+        self.assertEqual(self.slept, [5.0])
+        self.assertEqual(self.delivery(first), self.delivery(second))
+
+    def test_a_503_asking_for_longer_waits_for_the_next_run(self):
+        got, seen = self.post(self.http_error(503, "queue-full", "60"))
+        self.assertEqual(got, "HTTP 503 queue-full")
+        self.assertEqual((len(seen), self.slept), (1, []))
+
+    def test_the_delivery_id_is_new_each_run(self):
+        _, (a,) = self.post(200, stamp="run1")
+        _, (b,) = self.post(200, stamp="run1")
+        _, (c,) = self.post(200, stamp="run2")
+        self.assertEqual(self.delivery(a), self.delivery(b))
+        self.assertNotEqual(self.delivery(a), self.delivery(c))
+
+    def test_an_answer_cut_off_is_no_answer(self):
+        got, _ = self.post(http.client.IncompleteRead(b""))
+        self.assertTrue(got.startswith(r.UNREACHABLE), got)
 
     def test_no_connection(self):
         got, _ = self.post(urllib.error.URLError("refused"))

@@ -100,10 +100,24 @@ failed or withheld, with the reason.
 `~/.config/xmpp-webhook-relay/token`) to `/agent/<session name>` on the
 relay at `relay.url` (default `http://127.0.0.1:8788`;
 `$FORGE_ROUTER_RELAY` overrides it). The relay resolves the name
-against the room its agents share. Only a `200` counts: a
-`404` (no such session in the room), `409`, `503`, any other answer or
-no connection leaves every item in the message due, and the next run
-tries again. State is written only after a `200`.
+against the room its agents share. A wake counts as delivered only
+when the relay says it took exactly that message: a `200` whose answer
+is `"status": "queued"` with one target, or `"duplicate"` (it already
+took this delivery). Anything else leaves every item in the message
+due, and the next run tries again; state is written only for what was
+delivered. The run says which fault it was:
+
+* a `404` saying `unknown-name` is the relay's: no session of that name
+  is in the room now. Any other `404` isn't the relay speaking, so
+  `relay.url` is wrong, a different fault from an absent agent;
+* a `503` asking to retry within RELAY_RETRY_MAX_S seconds
+  (`Retry-After`; its queue is full, or it hasn't loaded the room yet)
+  is tried once more, under the same `X-Webhook-Delivery` ID, so the
+  relay can't deliver it twice. Each message's ID is fixed for the run
+  and new the next run, so a later wake of the same text isn't taken
+  for a duplicate;
+* no answer at all means the relay is down: nothing more is posted to
+  it this run, and every remaining wake stays due.
 
 **Without `--send` it is a dry run**: it prints each decision and the
 messages it would send, sends nothing, takes no lock and leaves
@@ -128,6 +142,8 @@ import argparse
 import datetime
 import fcntl
 import fnmatch
+import hashlib
+import http.client
 import importlib.machinery
 import importlib.util
 import json
@@ -175,6 +191,11 @@ TOKEN_FILE = os.path.expanduser(DEFAULT_TOKEN_FILE)
 DEFAULT_REMIND_S = 7200
 REMIND_S = DEFAULT_REMIND_S
 POST_TIMEOUT_S = 15
+# The longest Retry-After a 503 may ask for and still be tried again in
+# the same run; a longer one waits for the next run.
+RELAY_RETRY_MAX_S = 10
+# How a poster's reason starts when the relay gave no answer at all.
+UNREACHABLE = "relay unreachable"
 # Seconds a sending run waits for another's lock before saying BUSY.
 LOCK_WAIT_S = 60
 
@@ -696,32 +717,85 @@ def relay_token(path=None):
     return None
 
 
-def make_poster(relay, token, opener=urllib.request.urlopen):
-    """A function (session name, text) -> None when the relay answered
-    200, else why not. Every other answer, or none, leaves the wake due.
-    No reason ever contains the token."""
+def delivery_id(session, text, stamp):
+    """X-Webhook-Delivery: the same for a retry within one run, different
+    for the next run's wake of the same text."""
+    return hashlib.sha256(json.dumps([session, text, stamp]).encode()
+                          ).hexdigest()[:32]
+
+
+def relay_answer(raw):
+    """The relay's JSON answer as a dict, or {} for anything else."""
+    try:
+        answer = json.loads(raw or b"{}")
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    return answer if isinstance(answer, dict) else {}
+
+
+def accepted(answer):
+    """Whether a 200's answer says the relay took exactly this message."""
+    return (answer.get("status") == "duplicate"
+            or (answer.get("status") == "queued"
+                and len(answer.get("targets") or []) == 1))
+
+
+def make_poster(relay, token, opener=urllib.request.urlopen, sleep=time.sleep,
+                stamp=None):
+    """A function (session name, text) -> None when the relay took the
+    message, else why not (see the module docstring). A reason starting
+    UNREACHABLE means the relay gave no answer. No reason ever contains
+    the token."""
+    stamp = repr(time.time()) if stamp is None else stamp
+    base = relay.rstrip("/")
+
+    def attempt(req):
+        """(status, answer dict, retry-after header or None)."""
+        try:
+            with opener(req, timeout=POST_TIMEOUT_S) as resp:
+                read = getattr(resp, "read", None)
+                return resp.status, relay_answer(read(2000) if read else b""), None
+        except urllib.error.HTTPError as err:
+            try:
+                raw = err.read(2000)
+            except (AttributeError, OSError):
+                raw = b""
+            headers = err.headers or {}
+            return err.code, relay_answer(raw), headers.get("Retry-After")
 
     def post(session, text):
         if not token:
             return "no relay token in %s" % TOKEN_FILE
-        url = "%s/agent/%s" % (relay.rstrip("/"),
-                               urllib.parse.quote(session, safe=""))
+        url = "%s/agent/%s" % (base, urllib.parse.quote(session, safe=""))
         req = urllib.request.Request(
             url, data=text.encode("utf-8"), method="POST",
             headers={"X-Webhook-Token": token, "X-XMPP-Verbatim": "1",
+                     "X-Webhook-Delivery": delivery_id(session, text, stamp),
                      "Content-Type": "text/plain; charset=utf-8"})
         try:
-            with opener(req, timeout=POST_TIMEOUT_S) as resp:
-                code = resp.status
-        except urllib.error.HTTPError as err:
-            try:
-                detail = json.loads(err.read(2000) or b"{}").get("reason")
-            except (ValueError, AttributeError, OSError):
-                detail = None
-            return "HTTP %d%s" % (err.code, " " + detail if detail else "")
-        except (urllib.error.URLError, OSError) as err:
-            return "relay unreachable: %s" % getattr(err, "reason", err)
-        return None if code == 200 else "HTTP %d" % code
+            code, answer, retry = attempt(req)
+            if code == 503:
+                try:
+                    wait = float(retry) if retry is not None else None
+                except ValueError:
+                    wait = None
+                if wait is not None and 0 <= wait <= RELAY_RETRY_MAX_S:
+                    sleep(wait)
+                    code, answer, retry = attempt(req)
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
+            # HTTPException too: a relay killed mid-answer raises
+            # IncompleteRead or BadStatusLine, which aren't OSErrors.
+            return "%s: %s" % (UNREACHABLE, getattr(err, "reason", err))
+        reason = answer.get("reason")
+        if code == 200:
+            return None if accepted(answer) else (
+                "HTTP 200, but not the relay's answer for one message")
+        if code == 404 and reason == "unknown-name":
+            return "HTTP 404 unknown-name: no session %s in the room" % session
+        if code == 404:
+            return ("HTTP 404, not the relay's: is relay.url (%s) the relay?"
+                    % base)
+        return "HTTP %d%s" % (code, " " + reason if reason else "")
 
     return post
 
@@ -772,7 +846,7 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
         would.append((d, line, "would send to %s" % roster.session_name(
             d["who"])))
         batches.setdefault(d["who"], []).append((d, line))
-    failed = 0
+    failed, down = 0, None
     for who in sorted(batches):
         session = roster.session_name(who)
         numbers = ", ".join("#%d" % d["item"] for d, _ in batches[who])
@@ -780,7 +854,10 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
         if not send:
             out("WOULD SEND to %s:\n%s" % (session, text.rstrip("\n")))
             continue
-        problem = post(session, text)
+        # A relay that didn't answer isn't asked again this run.
+        problem = down or post(session, text)
+        if problem.startswith(UNREACHABLE) if problem else False:
+            down = problem
         if problem:
             failed += 1
             out("NOT SENT to %s: %s; %s stay due" % (session, problem,
