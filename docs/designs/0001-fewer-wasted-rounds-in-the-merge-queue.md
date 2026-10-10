@@ -1,6 +1,8 @@
 # 0001: Fewer wasted rounds in the merge queue
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-10, at ecd2156,
+  <https://github.com/abligh/agent-forge/issues/1#issuecomment-6099490016>)
+* Implemented: v0.4.4 (ecd2156), each rule off until configured
 * Author: XMPPEngineer
 * Date: 2026-10-10
 
