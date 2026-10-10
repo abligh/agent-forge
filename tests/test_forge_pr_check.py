@@ -1054,6 +1054,55 @@ class Worker(StateCase):
         logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
         self.assertIn("GAVE-UP #7", logged)
 
+    def faulty(self, rc=1, text="it broke\n", step="test"):
+        fetched = done([], 0, SHA_A + "\n")
+        return FakeRun((lambda a: "FETCH_HEAD" in a, fetched),
+                       (lambda a: a[0] == "make" and a[-1] == step,
+                        done([], rc, "", text)))
+
+    def test_a_missing_command_is_a_host_fault_not_red(self):
+        self.queue()
+        posts, chained = [], []
+        rc = self.work(self.faulty(rc=127, text="npx: not found\n"),
+                       post=lambda *a: posts.append(a) or True,
+                       chain=lambda: chained.append(1) or ["x", "y"])
+        self.assertEqual(rc, 2)
+        state = self.state()
+        self.assertNotIn(SHA_A, state.get("results", {}))
+        self.assertEqual(state["waiting"][SHA_A]["errors"], 1)
+        self.assertEqual([p[1] for p in posts], ["pending"])
+        self.assertEqual(chained, [])
+        logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertIn("HOST-FAULT #7 aaaaaaaaaa: test: exit 127: its command "
+                      "could not be run; no verdict", logged)
+
+    def test_a_full_disk_is_a_host_fault(self):
+        self.queue()
+        self.assertEqual(self.work(self.faulty(
+            text="error: failed to write: No space left on device (os "
+                 "error 28)\n")), 2)
+        self.assertNotIn(SHA_A, self.state().get("results", {}))
+        self.assertIn("test: no space left on device", pathlib.Path(
+            self.state_dir, "verdicts.log").read_text())
+
+    def test_repeated_host_faults_give_up_with_error(self):
+        self.queue(errors=pc.MAX_ERRORS - 1)
+        posts, chained = [], []
+        self.work(self.faulty(rc=126),
+                  post=lambda *a: posts.append(a) or True,
+                  chain=lambda: chained.append(1) or ["x", "y"])
+        self.assertEqual([p[1] for p in posts], ["pending", "error"])
+        self.assertIn("the host failed 3 times; the last: test: exit 126",
+                      posts[1][2])
+        self.assertEqual(chained, [1])
+        logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertIn("GAVE-UP #7 aaaaaaaaaa after 3 host faults", logged)
+
+    def test_an_ordinary_failure_is_still_red(self):
+        self.queue()
+        self.assertEqual(self.work(self.faulty(rc=2)), 1)
+        self.assertEqual(self.state()["results"][SHA_A]["failed"], ["test"])
+
     def test_busy_while_another_check_holds_the_lock(self):
         held = pc.try_lock(os.path.join(self.state_dir, "worker.lock"))
         try:

@@ -40,6 +40,17 @@ behind every other, and after MAX_ERRORS failures it is given up on,
 so one unfetchable ref can't hold the queue. A head that moved before
 its check started is dropped; the new head is queued in its place.
 
+**A run the host broke is no verdict.** A failed step that exited 126
+or 127 (its command can't be run: a tool missing from the host's
+`PATH`, say) or whose output says `No space left on device` (or
+`ENOSPC`) failed for the host, not the head. Such a run records no
+verdict and posts nothing more: the head stays waiting, `pending`, its
+errors counted as for a head that can't be checked out, and
+`verdicts.log` says `HOST-FAULT` with the step and why. It is tried
+again at cron's next tick, not at once, and after MAX_ERRORS it is
+given up on with `error`. A red verdict says the head is broken, and
+its author would otherwise be sent to fix what isn't hers.
+
 **A run of a head that is no longer its pull request's is stopped.**
 When a tick finds a slot running a head that no open pull request has
 any more (a new push, an update from `main`, or a closed pull request),
@@ -696,6 +707,40 @@ def final_status(r):
     return "failure", "red%s: %s failed%s" % (on_host(), failed[0], rest)
 
 
+# What a failed step's output says when the host, not the head, broke.
+HOST_FAULT_TEXT = ("No space left on device", "ENOSPC")
+
+
+def host_fault(results):
+    """(step, why) for the first failed step the host broke, or None:
+    one that exited 126 or 127, so its command could not be run, or
+    whose output says the disk is full."""
+    for r in results:
+        if r["rc"] == 0:
+            continue
+        if r["rc"] in (126, 127):
+            return r["name"], "exit %d: its command could not be run" % r["rc"]
+        if any(text in r["tail"] for text in HOST_FAULT_TEXT):
+            return r["name"], "no space left on device"
+    return None
+
+
+def count_error(state_dir, sha, ahead):
+    """One more error for `sha`, waiting or (`ahead`) predicted; the
+    count so far, 0 for a head no longer waiting."""
+    with state_lock(state_dir):
+        state = load(state_dir)
+        entry = state["waiting"].get(sha)
+        errors = 0
+        if ahead:
+            counts = state.setdefault("ahead_errors", {})
+            errors = counts[sha] = counts.get(sha, 0) + 1
+        elif entry is not None:
+            errors = entry["errors"] = entry.get("errors", 0) + 1
+        save(state_dir, state)
+    return errors
+
+
 def verdict_word(r):
     return "green" if r["ok"] else "red(%s)" % ",".join(r["failed"])
 
@@ -1065,16 +1110,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             settled = True
             return 0
         if status != "ready":
-            with state_lock(state_dir):
-                state = load(state_dir)
-                entry = state["waiting"].get(sha)
-                errors = 0
-                if ahead:
-                    counts = state.setdefault("ahead_errors", {})
-                    errors = counts[sha] = counts.get(sha, 0) + 1
-                elif entry is not None:
-                    errors = entry["errors"] = entry.get("errors", 0) + 1
-                save(state_dir, state)
+            errors = count_error(state_dir, sha, ahead)
             if errors >= MAX_ERRORS:
                 log(state_dir, "GAVE-UP%s #%d %s after %d failures to "
                     "prepare it; the last: %s"
@@ -1107,6 +1143,23 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 for line in r["tail"].splitlines():
                     out("    | " + line)
         finished = clock()
+        fault = host_fault(results)
+        if fault is not None:
+            errors = count_error(state_dir, sha, ahead)
+            why = "%s: %s" % fault
+            if errors >= MAX_ERRORS:
+                log(state_dir, "GAVE-UP%s #%d %s after %d host faults; the "
+                    "last: %s" % (" AHEAD" if ahead else "", pr, sha[:10],
+                                  errors, why), finished, out)
+                if post is not None:
+                    post(sha, "error", "not run: the host failed %d times; "
+                         "the last: %s" % (errors, why))
+                settled = True
+            else:
+                log(state_dir, "HOST-FAULT%s #%d %s: %s; no verdict, tried "
+                    "again later" % (" AHEAD" if ahead else "", pr, sha[:10],
+                                     why), finished, out)
+            return 2
         with state_lock(state_dir):
             state = load(state_dir)
             seen = state["waiting"].pop(sha, {}).get("since", iso(started))
