@@ -47,7 +47,33 @@ class HostIdentity(unittest.TestCase):
         data = example()
         del data["identity"]
         p = config.Project(data)
-        self.assertFalse(tool.host_identity(p, *HOST))
+        self.assertFalse(tool.host_identity(p, *HOST, environ={},
+                                            fqdn=lambda: "localhost"))
+
+    def test_the_domain_defaults_to_the_hosts_own(self):
+        data = example()
+        del data["identity"]
+        p = config.Project(data)
+        fqdn = lambda: "build.example.org"
+        self.assertEqual(tool.unattributed_domain(p, {}, fqdn),
+                         "@build.example.org")
+        self.assertTrue(tool.host_identity(p, *HOST, environ={}, fqdn=fqdn))
+        self.assertFalse(tool.host_identity(p, *BOT, environ={}, fqdn=fqdn))
+        self.assertEqual(tool.unattributed_domain(
+            p, {}, lambda: "build.example.org."), "@build.example.org")
+
+    def test_the_environment_overrides_the_host(self):
+        data = example()
+        del data["identity"]
+        p = config.Project(data)
+        self.assertEqual(tool.unattributed_domain(
+            p, {"FORGE_UNATTRIBUTED_DOMAIN": "@Other.Example"},
+            lambda: "build.example.org"), "@other.example")
+
+    def test_the_configuration_wins(self):
+        self.assertEqual(tool.unattributed_domain(
+            project(), {"FORGE_UNATTRIBUTED_DOMAIN": "@other.example"},
+            lambda: "elsewhere.example"), "@build.example.org")
 
 
 class Borrowed(unittest.TestCase):

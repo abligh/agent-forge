@@ -16,6 +16,13 @@ precisely because it resolves to nobody, so either identity there is
 unattributed whatever its local part says; and
 `identity.unattributed_name` is refused whatever email accompanies it.
 
+**The domain defaults to the host's own.** Git's default email is
+`<user>@<the host's fully qualified name>`, so with no
+`unattributed_domain` configured the rule takes the host's name
+(`$FORGE_UNATTRIBUTED_DOMAIN` overrides it, as `@host.example.org`).
+A project's configuration then never has to name its hosts. A host
+whose name has no dot gives no domain, and only the name rule applies.
+
 **Only GitHub's synthetic merge is skipped, not merges in general.**
 The merge commit GitHub makes for a pull_request checkout (`Merge <sha>
 into <sha>`) is nobody's commit and no squash carries it. A merge an
@@ -42,6 +49,7 @@ nothing must not read as clean.
 import argparse
 import os
 import re
+import socket
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
@@ -68,11 +76,23 @@ def commits(rng, run=proc.sh):
     return rows
 
 
-def host_identity(project, name, email):
+def unattributed_domain(project, environ=None, fqdn=socket.getfqdn):
+    """The reserved domain, "@host.example.org": the configuration's,
+    else $FORGE_UNATTRIBUTED_DOMAIN, else this host's own; "" for none."""
+    environ = os.environ if environ is None else environ
+    domain = (project.section("identity").get("unattributed_domain")
+              or environ.get("FORGE_UNATTRIBUTED_DOMAIN"))
+    if not domain:
+        host = (fqdn() or "").strip().rstrip(".")
+        domain = "@" + host if "." in host else ""
+    return domain.lower()
+
+
+def host_identity(project, name, email, environ=None, fqdn=socket.getfqdn):
     """Whether name/email is the host's unconfigured identity, or on its
     domain. Case-insensitive, as emails are."""
     ident = project.section("identity")
-    domain = ident.get("unattributed_domain", "").lower()
+    domain = unattributed_domain(project, environ, fqdn)
     plain = ident.get("unattributed_name", "").lower()
     return bool((domain and email.strip().lower().endswith(domain))
                 or (plain and name.strip().lower() == plain))
