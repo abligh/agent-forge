@@ -252,6 +252,20 @@ class NextHead(unittest.TestCase):
         state["waiting"][SHA_A]["errors"] = pc.MAX_ERRORS
         self.assertIsNone(pc.next_head(state))
 
+    def test_a_head_just_started_is_skipped_until_the_grace_is_up(self):
+        state = {"waiting": {
+            SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z",
+                    "started": pc.iso(T0)},
+            SHA_B: {"pr": 2, "since": "2026-10-09T10:00:00Z"}}}
+        self.assertEqual(pc.next_head(state, when=T0), (SHA_B, 2))
+        later = T0 + pc.START_GRACE
+        self.assertEqual(pc.next_head(state, when=later), (SHA_A, 1))
+
+    def test_an_unreadable_start_stamp_does_not_hide_a_head(self):
+        state = {"waiting": {SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z",
+                                     "started": "soon"}}}
+        self.assertEqual(pc.next_head(state, when=T0), (SHA_A, 1))
+
 
 class Prune(unittest.TestCase):
 
@@ -413,6 +427,25 @@ class Tick(StateCase):
         self.assertEqual(self.lines, [
             "RUNNING #7 aaaaaaaaaa since %s; 1 waiting" % pc.iso(T0),
             "STARTED #8 bbbbbbbbbb in slot 2; 0 waiting"])
+
+    def test_a_head_just_started_is_not_started_again_in_the_other_slot(self):
+        # The race: the first tick's worker hasn't taken its lock yet, so
+        # no slot shows the head as running.
+        self.tick([(7, SHA_A, REPO, "false")])
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_A, 7, False, 1)])
+        self.assertEqual(self.state()["waiting"][SHA_A]["started"], pc.iso(T0))
+        self.lines.clear()
+        self.tick([(7, SHA_A, REPO, "false")])
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.lines, [
+            "STARTING: 1 just started, not yet running; 0 waiting"])
+
+    def test_a_head_whose_worker_never_ran_is_started_after_the_grace(self):
+        self.write_state({"waiting": {SHA_A: {
+            "pr": 7, "since": pc.iso(T0 - datetime.timedelta(hours=1)),
+            "started": pc.iso(T0 - pc.START_GRACE)}}})
+        self.tick([(7, SHA_A, REPO, "false")])
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_A, 7, False, 1)])
 
     def test_a_head_running_in_one_slot_is_not_started_in_another(self):
         self.hold(1, "#7 %s %s" % (SHA_A, pc.iso(T0)))

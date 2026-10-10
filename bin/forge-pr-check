@@ -36,6 +36,16 @@ behind every other, and after MAX_ERRORS failures it is given up on,
 so one unfetchable ref can't hold the queue. A head that moved before
 its check started is dropped; the new head is queued in its place.
 
+**A head just started isn't started again.** Until its worker has
+taken its slot's lock and said who it is, nothing else shows the head
+is being checked, and a tick in that window (from cron, an event, or a
+worker's chained tick) would start it again in another slot: a
+duplicate run and a duplicate post. So the tick that starts a head
+stamps `started` on its waiting entry, under the state lock, and
+`next_head` skips a head started less than START_GRACE ago. A worker
+that dies before taking its lock leaves its head pickable again once
+the grace is up.
+
 **A head from another repository is refused.** The steps run the pull
 request's own code with this user's access to the host, so only
 branches of this repository are run.
@@ -142,6 +152,9 @@ TAIL_LINES = 40
 KEEP = datetime.timedelta(days=21)
 # Failures to prepare a head's worktree before it is given up on.
 MAX_ERRORS = 3
+# How long a head just started is left to its worker before another
+# tick may start it: longer than a worker takes to take its lock.
+START_GRACE = datetime.timedelta(seconds=60)
 # Checks run at once; FORGE_PR_CHECK_SLOTS overrides it.
 DEFAULT_SLOTS = 2
 SLOTS = DEFAULT_SLOTS
@@ -327,13 +340,24 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
             del state["waiting"][sha]
 
 
-def next_head(state, busy=()):
+def just_started(entry, when):
+    """Whether a waiting entry was started less than START_GRACE before
+    `when`. An unreadable stamp counts as not started."""
+    try:
+        return when is not None and when - parse(entry["started"]) < START_GRACE
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def next_head(state, busy=(), when=None):
     """(sha, pr) of the head that has waited longest, or None. A head
     that failed to prepare goes behind every head that has not, one
     that failed MAX_ERRORS times is not picked at all, and nor is one a
-    slot is running (`busy`)."""
+    slot is running (`busy`) or one a tick started less than
+    START_GRACE before `when`."""
     live = [s for s, w in state["waiting"].items()
-            if w.get("errors", 0) < MAX_ERRORS and s not in busy]
+            if w.get("errors", 0) < MAX_ERRORS and s not in busy
+            and not just_started(w, when)]
     if not live:
         return None
     sha = min(live, key=lambda s: (state["waiting"][s].get("errors", 0),
@@ -453,9 +477,18 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     if not free:
         return 0
     with state_lock(state_dir):
-        pick = next_head(load(state_dir), busy)
+        state = load(state_dir)
+        pick = next_head(state, busy, when)
+        if pick is not None:
+            state["waiting"][pick[0]]["started"] = iso(when)
+            save(state_dir, state)
+        starting = sum(1 for s, w in state["waiting"].items()
+                       if s not in busy and just_started(w, when))
     if pick is None:
-        if len(free) == slots:
+        if starting:
+            out("STARTING: %d just started, not yet running; %d waiting"
+                % (starting, len(queued - busy) - starting))
+        elif len(free) == slots:
             out("IDLE: no open head is waiting" if not queued else
                 "IDLE: %d waiting, each given up on after %d failures"
                 % (len(queued), MAX_ERRORS))
