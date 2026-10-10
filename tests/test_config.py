@@ -113,7 +113,8 @@ class Check(unittest.TestCase):
             "starting with a letter"])
 
     def test_at_least_one_agent(self):
-        self.assertEqual(self.problems(agents={}),
+        # Without the merge section, whose stall_alert names agents.
+        self.assertEqual(self.problems(agents={}, merge={}),
                          ["agents must name at least one agent"])
 
     def test_an_agent_is_not_also_machinery(self):
@@ -143,6 +144,26 @@ class Check(unittest.TestCase):
             "merge.gate[2] must be a non-empty list of strings",
             "merge.gate[3] must be a non-empty list of strings",
             "merge.merger 'Nobody' is not in machinery"])
+
+    def test_merge_stall_alert(self):
+        self.assertEqual(self.problems(merge={"stall_alert": {
+            "tell": ["Reviewer", "Merger", 3], "retell_minutes": 0,
+            "owner_after_minutes": "120", "title": " ",
+            "labels": ["bug", ""], "colour": "red", "_note": "a comment"}}), [
+            "merge.stall_alert.owner_after_minutes must be an integer",
+            "merge.stall_alert: unknown key 'colour'",
+            "merge.stall_alert.tell: 'Merger' is not an agent",
+            "merge.stall_alert.tell: 3 is not an agent",
+            "merge.stall_alert.retell_minutes must be at least 1",
+            "merge.stall_alert.title must not be empty",
+            "merge.stall_alert.labels must be a list of label names"])
+        self.assertEqual(self.problems(merge={"stall_alert": []}),
+                         ["merge.stall_alert must be an object"])
+        self.assertEqual(self.problems(merge={"stall_alert": {
+            "tell": "Reviewer", "labels": "bug"}}), [
+            "merge.stall_alert.tell must be a list",
+            "merge.stall_alert.labels must be a list"])
+        self.assertEqual(self.problems(merge={"stall_alert": {}}), [])
 
     def test_checks(self):
         self.assertEqual(self.problems(checks={

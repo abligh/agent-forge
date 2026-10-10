@@ -39,13 +39,13 @@ starts with `_` is a comment, at any level.
 | `naming` | no | `app_slug_suffix` and `session_prefix`; see below. |
 | `machinery` | no | Apps that act for scheduled tools rather than agents, such as the Merger's; each entry as an agent's App fields. |
 | `identity` | no | The host's unconfigured git identity, which no commit may carry: `unattributed_domain` (an email domain such as `@host.example.org`; default `$FORGE_UNATTRIBUTED_DOMAIN`, else the host's own fully qualified name, so a configuration need not name its hosts) and `unattributed_name`. |
-| `merge` | no | How `forge-merger` merges: `merger`, the machinery App that acts (default `Merger`); `ci_workflow`, the Actions workflow every head must pass (default `ci`; `""` for none); `gate`, tools that must exit 0 before a merge, each an argument list with `{pr}`, `{base}` and `{head}` filled in, a `forge-` name run from the installation and anything else from the cron checkout (default `[["forge-commit-identity", "{base}..{head}"]]`); `stall_minutes`, how long a head may wait on its checks before the tick reports it stalled (default 30). The required status is `checks.context`, counted only when `checks.poster`'s App (default the merger) posted it. |
+| `merge` | no | How `forge-merger` merges: `merger`, the machinery App that acts (default `Merger`); `ci_workflow`, the Actions workflow every head must pass (default `ci`; `""` for none); `gate`, tools that must exit 0 before a merge, each an argument list with `{pr}`, `{base}` and `{head}` filled in, a `forge-` name run from the installation and anything else from the cron checkout (default `[["forge-commit-identity", "{base}..{head}"]]`); `stall_minutes`, how long a head may wait on its checks before the tick reports it stalled (default 30); `stall_alert`, whom a stall is told to (default none: a stall is only printed; see below). The required status is `checks.context`, counted only when `checks.poster`'s App (default the merger) posted it. |
 | `host_settings` | no | Files every agent host carries, installed by `forge-host-settings`: `files`, each `{"from": path in the project, "to": path under the home directory, "mode": "0644", "json": true when compared as JSON}`, and `host_keys`, keys a JSON file's host may set for itself. |
 | `receiver` | no | How `forge-receiver` takes GitHub's webhook deliveries: `address` and `port` it listens on (default `127.0.0.1`, 8789), `path` (default `/hook`), `secret_file`, the webhook's secret, mode 0600 (default `~/.config/agent-forge/<project>/receiver-secret`), and `max_body`, the largest body in bytes (default 1048576); `ticks`, which tools each event runs, by GitHub event name (`issues`, `issue_comment`, `pull_request`, `pull_request_review`, `status`, `push`), each tool a name or an argument list, a `forge-` name run from the installation and anything else from the cron checkout (default none; `bin/forge-receiver` says when each event counts); and `route`, the router's argument list with `{items}` filled in as `N[,N]`, run for the items events name (default none: nothing is routed). |
 | `docs` | no | The project's documentation, as the tools that read it see it; see below. |
 | `checks` | no | The build check, `forge-pr-check`; see below. |
 | `labels` | no | The labels tools read: `owner_prefix` (default `Owner:`; `Owner:<Name>` says whose an item is), `status_prefix` (default `Status:`), `waiting_on_owner` (default `Status:waiting-owner`: the owner's turn) and `waiting_external` (default `Status:waiting-external`: nobody's). |
-| `relay` | no | Where `forge-router` posts wakes: `url`, the xmpp-webhook-relay's base (default `http://127.0.0.1:8788`), `token_file`, its environment file holding `WEBHOOK_TOKEN` (default `~/.config/xmpp-webhook-relay/token`), `remind_seconds`, how long before a turn is woken again (default 7200), and `room`, the room the agents share. |
+| `relay` | no | Where `forge-router` posts wakes, and `forge-merger` its stall messages (`merge.stall_alert`): `url`, the xmpp-webhook-relay's base (default `http://127.0.0.1:8788`), `token_file`, its environment file holding `WEBHOOK_TOKEN` (default `~/.config/xmpp-webhook-relay/token`), `remind_seconds`, how long before a turn is woken again (default 7200), and `room`, the room the agents share. |
 | `closing_keywords` | no | How `forge-closing-keywords` words a refusal: `enforced_by`, what refuses a pull request it fails (default `the Merger`), and `rerun`, how to run it again once GitHub's `closingIssuesReferences` catches up with a body edit (default `run the check again (the Merger does, on its next tick)`). A project that runs it in CI names its workflow and `gh run rerun --failed <run>`. The issues it judges are `repo`'s, and its default range starts at `default_branch`. The Merger runs it as a gate: `["forge-closing-keywords", "--pr", "{pr}", "--include-subject"]`. |
 
 ### An agent
@@ -73,6 +73,29 @@ letter.
 
 Only these keys are checked; the section may hold others, for tools
 not here yet.
+
+### `merge.stall_alert`
+
+Without it, a stalled queue is a `STALLED` line in the Merger's log and
+exit status 2. With it, the Merger also opens an issue for the stall,
+messages agents through the XMPP relay (the `relay` section's `url` and
+`token_file`, as `forge-router` posts; `$FORGE_ROUTER_RELAY` overrides
+the url), and closes the issue, saying how, when the stall ends. A
+`--dry-run` tick never opens, labels or closes an issue, or sends a
+message.
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `tell` | `[]` | The agents messaged, by name, at their session names. Only agents: the relay reaches sessions. `[]` opens the issue and messages nobody. |
+| `retell_minutes` | `60` | How often the message is sent again while the stall lasts. A message no agent took is tried again on the next tick. |
+| `owner_after_minutes` | `120` | When the issue gets `labels.waiting_on_owner`, counted from when the wait began, like `stall_minutes`. The label comes off when the stall ends. |
+| `title` | `forge-merger: the queue is stalled on #{pr}` | The issue's title, `{pr}` the stalled pull request's number. |
+| `labels` | `[]` | Labels the issue is opened with, such as an `Owner:` label so `forge-router` knows whose it is. A label GitHub refuses is tried again on the next tick. |
+
+A new head, or another pull request first in the queue, is a new stall
+with its own issue. `stall-alert.json` in the Merger's state directory
+holds the open issue. Removing `stall_alert` stops the alerts but leaves
+an issue already open for a person to close.
 
 ### `checks`
 

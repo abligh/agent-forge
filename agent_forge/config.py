@@ -57,7 +57,9 @@ AGENT = dict(APP, session_name=str, kind=str, reviews=list)
 IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list}
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
-         "stall_minutes": int}
+         "stall_minutes": int, "stall_alert": dict}
+STALL_ALERT = {"tell": list, "retell_minutes": int,
+               "owner_after_minutes": int, "title": str, "labels": list}
 # checks is shared with tools not here yet, so only these keys are
 # checked.
 CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
@@ -191,6 +193,8 @@ def check(data):
         name = merge.get("merger")
         if isinstance(name, str) and name not in data.get("machinery", {}):
             problems.append("merge.merger %r is not in machinery" % name)
+        if isinstance(merge.get("stall_alert"), dict):
+            _check_stall_alert(merge["stall_alert"], data["agents"], problems)
     for name, allowed in (("labels", LABELS), ("relay", RELAY)):
         section = data.get(name, {})
         for key, kinds in allowed.items():
@@ -303,6 +307,28 @@ def _argv(value):
     return (isinstance(value, list) and value
             and all(isinstance(a, str) and a for a in value)
             and "/" not in value[0] and not value[0].startswith("."))
+
+
+def _check_stall_alert(alert, agents, problems):
+    """merge.stall_alert: whom the Merger tells of a stalled queue, and
+    how its issue looks. Only agents can be told: the relay reaches
+    sessions, and machinery has none."""
+    where = "merge.stall_alert"
+    _fields(where, alert, STALL_ALERT, problems)
+    tell = alert.get("tell")
+    if isinstance(tell, list):
+        for name in tell:
+            if not isinstance(name, str) or name not in agents:
+                problems.append("%s.tell: %r is not an agent" % (where, name))
+    for key in ("retell_minutes", "owner_after_minutes"):
+        if _is(alert.get(key), int) and alert[key] < 1:
+            problems.append("%s.%s must be at least 1" % (where, key))
+    if isinstance(alert.get("title"), str) and not alert["title"].strip():
+        problems.append("%s.title must not be empty" % where)
+    labels = alert.get("labels")
+    if isinstance(labels, list) and not all(
+            isinstance(l, str) and l.strip() for l in labels):
+        problems.append("%s.labels must be a list of label names" % where)
 
 
 def _check_receiver(receiver, problems):

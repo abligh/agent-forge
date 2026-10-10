@@ -140,6 +140,25 @@ does. With `checks.merger_first` on, the build check (`forge-pr-check`)
 reads it and checks that pull request's head before any other, since
 the next merge waits on that verdict.
 
+**With `merge.stall_alert`, a stall is told to people, not only
+logged.** A `STALLED` line reaches nobody unless something reads the
+log. On its first `STALLED` tick for a pull request and head, the
+Merger opens an issue titled `stall_alert.title`, labelled
+`stall_alert.labels`, and messages each agent in `stall_alert.tell`
+through the XMPP relay, with the router's own sender
+(`relay.url`, `relay.token_file`; `$FORGE_ROUTER_RELAY` overrides the
+url). It sends the message again every `stall_alert.retell_minutes`
+while the stall lasts, or on the next tick if nobody took it. It adds
+`labels.waiting_on_owner` once the wait reaches
+`stall_alert.owner_after_minutes`. When the stall ends, it comments
+how, takes that label off, and closes the issue. `stall-alert.json` in
+the state directory holds the open issue, its pull request and head,
+and when it was last told. The stall gets its own issue so that no
+wait recorded on another item can hide it. Without `stall_alert`
+nothing is opened or sent; a dry run never opens, labels, closes or
+sends anything either. Only `main` passes the relay sender, so a test
+that ticks through a stall messages nobody.
+
 Exit 0 when the tick ran, whatever GitHub answered its write, or
 another tick held the lock; 2 when it could not ask (no checkout, no
 token, GitHub or git failed) or the head it waits on is `STALLED`.
@@ -147,12 +166,15 @@ token, GitHub or git failed) or the head it waits on is `STALLED`.
 
 import argparse
 import datetime
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from agent_forge import config, github as forge_github, locks  # noqa: E402
@@ -214,17 +236,37 @@ FETCH_RETRY_S = 2
 STALL_AFTER = datetime.timedelta(minutes=30)
 # Lines of a refusing tool's output kept in a record.
 TAIL_LINES = 6
+# Who is told of a stall, how often while it lasts, when it becomes
+# the owner's, and how its issue is titled and labelled. STALL_ALERT is
+# False when the project has no `merge.stall_alert`: a stall is then
+# only printed, as it always was.
+DEFAULT_STALL_TITLE = "forge-merger: the queue is stalled on #{pr}"
+DEFAULT_STALL_RETELL_MINUTES = 60
+DEFAULT_STALL_OWNER_AFTER_MINUTES = 120
+DEFAULT_WAITING_OWNER = "Status:waiting-owner"
+STALL_ALERT = False
+STALL_TELL = ()
+STALL_RETELL = datetime.timedelta(minutes=DEFAULT_STALL_RETELL_MINUTES)
+STALL_TO_OWNER = datetime.timedelta(
+    minutes=DEFAULT_STALL_OWNER_AFTER_MINUTES)
+STALL_TITLE = DEFAULT_STALL_TITLE
+STALL_LABELS = ()
+WAITING_OWNER = DEFAULT_WAITING_OWNER
+STALL_ALERT_NAME = "stall-alert.json"
 
 
 def configure(project):
     """Set the module's settings from `project`, a loaded configuration.
     The `merge` section: `merger` (the machinery App that acts, default
     "Merger"), `ci_workflow` (default "ci"; "" for none), `gate` (a list
-    of argument lists) and `stall_minutes` (default 30). The `checks`
-    section: `context` and `poster` (default the merger)."""
+    of argument lists), `stall_minutes` (default 30) and `stall_alert`
+    (default none: a stall is only printed). The `checks` section:
+    `context` and `poster` (default the merger). `labels.waiting_on_owner`
+    is the label a long stall gets."""
     global REPO_SLUG, MAIN, APPROVERS, QUIET_LOGINS, ACT_AS, SIGNATURE
     global STATUS_CONTEXT, STATUS_CREATOR, BUILD_HOST, GATE, CI_WORKFLOW
-    global STALL_AFTER
+    global STALL_AFTER, STALL_ALERT, STALL_TELL, STALL_RETELL
+    global STALL_TO_OWNER, STALL_TITLE, STALL_LABELS, WAITING_OWNER
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -238,6 +280,18 @@ def configure(project):
     GATE = tuple(tuple(argv) for argv in merge.get("gate", DEFAULT_GATE))
     CI_WORKFLOW = merge.get("ci_workflow", "ci")
     STALL_AFTER = datetime.timedelta(minutes=merge.get("stall_minutes", 30))
+    alert = merge.get("stall_alert")
+    STALL_ALERT = alert is not None
+    alert = alert or {}
+    STALL_TELL = tuple(alert.get("tell", ()))
+    STALL_RETELL = datetime.timedelta(minutes=alert.get(
+        "retell_minutes", DEFAULT_STALL_RETELL_MINUTES))
+    STALL_TO_OWNER = datetime.timedelta(minutes=alert.get(
+        "owner_after_minutes", DEFAULT_STALL_OWNER_AFTER_MINUTES))
+    STALL_TITLE = alert.get("title", DEFAULT_STALL_TITLE)
+    STALL_LABELS = tuple(alert.get("labels", ()))
+    WAITING_OWNER = project.section("labels").get("waiting_on_owner",
+                                                  DEFAULT_WAITING_OWNER)
 
 NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
 BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
@@ -639,6 +693,17 @@ class GitHub:
             return True, ""
         return False, tail(got.stderr + "\n" + got.stdout, 2)
 
+    def create(self, path, **fields):
+        """(number, "") for what a POST to `path` created, else (None,
+        why). Never raises, as `write`."""
+        args = ["gh", "api", "-X", "POST", path, "--jq", ".number"]
+        for key, value in sorted(fields.items()):
+            args += ["-f", "%s=%s" % (key, value)]
+        got = self.run(args, env=self.env)
+        if got.returncode == 0 and got.stdout.strip().isdigit():
+            return int(got.stdout.strip()), ""
+        return None, tail(got.stderr + "\n" + got.stdout, 2)
+
 
 def fetch_prs(github):
     """Every open pull request as a plain dictionary: GraphQL's node,
@@ -840,6 +905,184 @@ def stalled_for(state_dir, waiting, when):
     return int(waited.total_seconds() // 60) if waited >= STALL_AFTER else None
 
 
+def where_to_look():
+    """Where a wait that never ends is looked into: the build check, on
+    its host, and the CI workflow, when the project names them."""
+    return "the build check%s%s" % (
+        " on " + BUILD_HOST if BUILD_HOST else "",
+        ", or the %s workflow in GitHub Actions" % CI_WORKFLOW
+        if CI_WORKFLOW else "")
+
+
+def stall_text(stalled, reason=None):
+    """What a stall is, for the issue and the message: the pull request,
+    the head, how long, and GitHub's own words when it refused. `reason`
+    is the WAIT decision's, when it is a wait."""
+    if "refused" in stalled:
+        what = ("GitHub has refused the Merger's write for %d minutes, "
+                "most recently:\n\n```\n%s\n```\n\nLook at the Merger App's "
+                "access." % (stalled["minutes"], stalled["refused"]))
+    else:
+        what = ("it has waited %d minutes%s; look at %s."
+                % (stalled["minutes"], ": " + reason if reason else "",
+                   where_to_look()))
+    return ("The merge queue is stalled on #%d at `%s`: %s\n\nIt stays "
+            "first in the queue, so nothing behind it merges until this "
+            "clears." % (stalled["pr"], stalled["head"][:10], what))
+
+
+def ended_by(pr, decisions):
+    """How the stall on `pr` ended, from this tick's decisions."""
+    for d in decisions:
+        if d["pr"] == pr:
+            return "this tick's %s of #%d" % (d["action"], pr)
+    return "#%d is no longer first in the queue" % pr
+
+
+def label_path(number, label=None):
+    """The REST path of issue `number`'s labels, or of one of them. A
+    label is a path segment there, so it is quoted: one may hold a
+    space or a slash."""
+    path = "repos/%s/issues/%d/labels" % (REPO_SLUG, number)
+    return path + "/" + urllib.parse.quote(label, safe="") if label else path
+
+
+def end_stall(state_dir, github, alert, decisions, out):
+    """Comment how the stall in `alert` ended, take the owner's label
+    off if it was put on, close its issue and forget it. The issue is
+    forgotten even when GitHub refuses: closing it again on every tick
+    would say the same thing each time, and a person can close it."""
+    number = alert["issue"]
+    github.write("POST", "repos/%s/issues/%d/comments" % (REPO_SLUG, number),
+                 body="The stall has ended: %s.\n\n%s"
+                 % (ended_by(alert["pr"], decisions), SIGNATURE))
+    if alert.get("to_owner"):
+        github.write("DELETE", label_path(number, WAITING_OWNER))
+    ok, why = github.write("PATCH", "repos/%s/issues/%d" % (REPO_SLUG, number),
+                           state="closed")
+    out("STALL-ENDED: closed #%d" % number if ok
+        else "STALL-ENDED: #%d could not be closed: %s" % (number, why))
+    path = os.path.join(state_dir, STALL_ALERT_NAME)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def tell_stall(state_dir, github, stalled, decisions, when, send, out,
+               reason=None):
+    """A stall opens its own issue and messages STALL_TELL, again every
+    STALL_RETELL while it lasts, adds WAITING_OWNER after STALL_TO_OWNER,
+    and closes the issue when it ends. `stalled` is the tick's record of
+    it, or None when nothing is stalled; `send` is a function (agent
+    name, text) -> None when the relay took the message, else why not,
+    or None to message nobody.
+
+    Its own issue, so no wait recorded on another item can hide it. The
+    message repeats because an agent that restarted has lost the first
+    one. Nothing here raises: what GitHub refused is printed and tried
+    again on the next tick, labels included, so the router can always
+    see whose the issue is. A message is tried again on the next tick
+    only if nobody took it; once anyone has, the rest hear again
+    STALL_RETELL later."""
+    path = os.path.join(state_dir, STALL_ALERT_NAME)
+    alert = load_json(path, {})
+    same = stalled is not None and (alert.get("pr"), alert.get("head")) == (
+        stalled["pr"], stalled["head"])
+    if alert.get("issue") and not same:
+        end_stall(state_dir, github, alert, decisions, out)
+        alert = {}
+    if stalled is None:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    text = stall_text(stalled, reason)
+    if not same:
+        number, why = github.create(
+            "repos/%s/issues" % REPO_SLUG,
+            title=STALL_TITLE.replace("{pr}", str(stalled["pr"])),
+            body="%s\n\nThe Merger closes this when the stall ends.\n\n%s"
+            % (text, SIGNATURE))
+        if number is None:
+            # Nothing is saved, so the next tick opens it again.
+            out("STALL-ISSUE refused: %s" % why)
+            return
+        out("STALL-ISSUE: opened #%d" % number)
+        alert = {"pr": stalled["pr"], "head": stalled["head"],
+                 "issue": number, "labeled": []}
+    number = alert["issue"]
+    labeled = alert.setdefault("labeled", list(STALL_LABELS))
+    for label in STALL_LABELS:
+        if label in labeled:
+            continue
+        ok, why = github.write("POST", label_path(number),
+                               **{"labels[]": label})
+        if ok:
+            labeled.append(label)
+        else:
+            out("STALL-LABEL refused: %s on #%d: %s" % (label, number, why))
+    if (not alert.get("to_owner")
+            and datetime.timedelta(minutes=stalled["minutes"])
+            >= STALL_TO_OWNER):
+        ok, why = github.write("POST", label_path(number),
+                               **{"labels[]": WAITING_OWNER})
+        if ok:
+            alert["to_owner"] = True
+            out("STALL-TO-OWNER: labeled #%d %s" % (number, WAITING_OWNER))
+        else:
+            out("STALL-LABEL refused: %s on #%d: %s"
+                % (WAITING_OWNER, number, why))
+    try:
+        due = when - parse_time(alert["told"]) >= STALL_RETELL
+    except (KeyError, TypeError, ValueError):
+        due = True
+    # No sender, no message: only `main` passes the relay, so a test
+    # that ticks through a stall never messages a real agent.
+    if send is not None and STALL_TELL and due:
+        message = "From: %s\n%s\n\nIssue: #%d.\n%s" % (ACT_AS, text, number,
+                                                       SIGNATURE)
+        confirmed, problems = [], []
+        for name in STALL_TELL:
+            problem = send(name, message)
+            if problem:
+                problems.append("%s: %s" % (name, problem))
+            else:
+                confirmed.append(name)
+        if confirmed:
+            alert["told"] = iso(when)
+        out("STALL-TOLD: %s%s" % (",".join(confirmed) or "nobody",
+                                   "; " + "; ".join(problems)
+                                   if problems else ""))
+    save_json(path, alert)
+
+
+def parse_time(stamp):
+    return datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc)
+
+
+def load_router():
+    """bin/forge-router as a module, loaded when needed: it loads this
+    file itself, so it can't be imported at the top."""
+    loader = importlib.machinery.SourceFileLoader(
+        "forge_router", os.path.join(BIN, "forge-router"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def relay_sender(project, environ, opener=None):
+    """A function (agent name, text) -> None when the relay took the
+    message, else why not: the router's own poster, configured from the
+    same `relay` section and addressed to the agent's session name, so
+    the two can't diverge."""
+    router = load_router()
+    router.configure(project)
+    post = router.make_poster(environ.get("FORGE_ROUTER_RELAY", router.RELAY),
+                              router.relay_token(),
+                              *([opener] if opener else []))
+    return lambda name, text: post(project.session_name(name), text)
+
+
 def conflict_hand_back(pr, approval, github, said, live):
     """The hand-back for a head GitHub refused to update as a conflict:
     to the author, like a conflict git found."""
@@ -852,11 +1095,13 @@ def conflict_hand_back(pr, approval, github, said, live):
 
 
 def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
-         sleep=time.sleep, live=False):
+         sleep=time.sleep, live=False, send=None):
     """One tick: the queue, and the action for its first pull request
     that isn't handed back or skipped, carried out when `live`. Appends
     the record to merger.jsonl, or dry-run.jsonl when not live, and
-    prints one summary line (two when stalled). Returns the record."""
+    prints one summary line (two when stalled). With STALL_ALERT, a live
+    tick then tells people of a stall, through `send` (see
+    `tell_stall`). Returns the record."""
     fetched = git(repo, "fetch", "-q", "origin", MAIN, run=run)
     if fetched.returncode != 0 and "cannot lock ref" in fetched.stderr:
         # The checkout's refs are shared with every worktree on the host,
@@ -949,12 +1194,12 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 stalled["refused"]))
     elif stalled:
         out("STALLED: #%d has waited %d minutes on %s: %s. It stays "
-            "first in the queue and is not handed back; look at the "
-            "build check%s%s" % (
+            "first in the queue and is not handed back; look at %s" % (
                 stalled["pr"], stalled["minutes"], stalled["head"][:10],
-                waiting["reason"], " on " + BUILD_HOST if BUILD_HOST else "",
-                ", or the %s workflow in GitHub Actions" % CI_WORKFLOW
-                if CI_WORKFLOW else ""))
+                waiting["reason"], where_to_look()))
+    if live and STALL_ALERT:
+        tell_stall(state_dir, github, stalled, record["decisions"], when,
+                   send, out, (waiting or {}).get("reason"))
     return record
 
 
@@ -965,7 +1210,8 @@ def mint(project, agent):
         return None
 
 
-def main(argv=None, run=sh, out=print, environ=None, mint=mint):
+def main(argv=None, run=sh, out=print, environ=None, mint=mint,
+         sender=None):
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(
         prog="forge-merger", description=__doc__.splitlines()[0])
@@ -1005,9 +1251,13 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint):
         if token is None:
             out("NO-TOKEN: could not mint %s's token" % ACT_AS)
             return 2
+        # Only a live tick, and only with a stall alert, is given the
+        # relay: a dry run messages nobody.
+        send = ((sender or relay_sender)(project, environ)
+                if STALL_ALERT and not args.dry_run else None)
         try:
             record = tick(repo, state_dir, GitHub(token, run), run,
-                          out, live=not args.dry_run)
+                          out, live=not args.dry_run, send=send)
         except (RuntimeError, KeyError, TypeError, ValueError) as err:
             out("FAILED: %s" % err)
             return 2

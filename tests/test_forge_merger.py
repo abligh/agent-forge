@@ -630,6 +630,12 @@ class FakeGitHub:
                   else self.refuse)
         return (False, refuse) if refuse else (True, "")
 
+    def create(self, path, **fields):
+        """As `write`, answering with the next issue number from 900."""
+        ok, why = self.write("POST", path, **fields)
+        self.created = getattr(self, "created", 899) + 1
+        return (self.created, "") if ok else (None, why)
+
     def api(self, *args):
         self.calls.append(args)
         for prefix, value in self.answers.items():
@@ -882,7 +888,7 @@ class GitHubApi(unittest.TestCase):
 class Tick(Decide):
 
     def tick(self, prs, issues=(), conclusions=("success",), live=False,
-             refuse=None, minutes=0):
+             refuse=None, minutes=0, send=None):
         github = FakeGitHub(answers(conclusions, prs=prs, issues=issues),
                             refuse)
         self.github = github
@@ -893,7 +899,7 @@ class Tick(Decide):
         record = m.tick(self.repo.path, state, github, tools_run(),
                         lines.append,
                         now=lambda: start + datetime.timedelta(minutes=minutes),
-                        live=live)
+                        live=live, send=send)
         name = "merger.jsonl" if live else "dry-run.jsonl"
         with open(os.path.join(state, name)) as handle:
             written = [json.loads(l) for l in handle]
@@ -1266,6 +1272,292 @@ class Tick(Decide):
                    lambda line: None, sleep=lambda s: None)
 
 
+class StallAlert(Decide):
+    """`merge.stall_alert`: a stall opens its own issue and tells
+    people, through a `send` the tests fake, never the relay."""
+
+    ALERT = {"tell": ["LeadDev", "Reviewer"], "retell_minutes": 60,
+             "owner_after_minutes": 120,
+             "title": "forge-merger: the queue is stalled on #{pr}",
+             "labels": ["bug", "Owner:LeadDev"]}
+    OWNER_LABEL = SLUG + "/issues/900/labels/Status%3Awaiting-owner"
+
+    tick = Tick.tick
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(m.configure, project())
+        self.alert()
+
+    def alert(self, **changes):
+        m.configure(project(stall_alert=dict(self.ALERT, **changes)))
+
+    def relay(self, confirm=True):
+        """(sent, send): `sent` lists each (agent, text) sent, and every
+        one is taken, or none when not `confirm`."""
+        sent = []
+
+        def send(name, text):
+            sent.append((name, text))
+            return None if confirm else "HTTP 503 queue-full"
+        return sent, send
+
+    def waits(self, minutes, item=None, live=True, send=None):
+        return self.tick([item or self.item()], conclusions=(None,),
+                         live=live, minutes=minutes, send=send)
+
+    def stall_writes(self):
+        return [w for w in self.github.writes if "/pulls/" not in w[1]]
+
+    def saved(self):
+        path = os.path.join(self.state, "stall-alert.json")
+        if not os.path.exists(path):
+            return None
+        with open(path) as handle:
+            return json.load(handle)
+
+    def test_a_stall_opens_one_issue_and_tells_each_agent(self):
+        sent, send = self.relay()
+        self.waits(0, send=send)
+        self.assertEqual((self.stall_writes(), sent), ([], []))
+        _, lines = self.waits(30, send=send)
+        created, *labels = self.stall_writes()
+        self.assertEqual(created[:2], ("POST", SLUG + "/issues"))
+        self.assertEqual(created[2]["title"],
+                         "forge-merger: the queue is stalled on #5")
+        body = created[2]["body"]
+        self.assertIn("stalled on #5 at `%s`" % self.head[:10], body)
+        self.assertIn("vm/build-and-test is pending", body)
+        self.assertIn("build check on build.example.org", body)
+        self.assertTrue(body.endswith("\n\n— Merger"))
+        self.assertEqual([(w[1], w[2]) for w in labels],
+                         [(SLUG + "/issues/900/labels", {"labels[]": "bug"}),
+                          (SLUG + "/issues/900/labels",
+                           {"labels[]": "Owner:LeadDev"})])
+        self.assertEqual([name for name, _ in sent], ["LeadDev", "Reviewer"])
+        text = sent[0][1]
+        self.assertTrue(text.startswith("From: Merger\n"))
+        self.assertIn("Issue: #900.", text)
+        self.assertTrue(text.endswith("— Merger"))
+        self.assertIn("STALL-ISSUE: opened #900", lines)
+        self.assertIn("STALL-TOLD: LeadDev,Reviewer", lines)
+
+    def test_the_next_tick_opens_nothing_and_says_nothing(self):
+        sent, send = self.relay()
+        self.waits(0, send=send)
+        self.waits(30, send=send)
+        self.waits(31, send=send)
+        self.assertEqual(self.stall_writes(), [])
+        self.assertEqual(len(sent), 2)
+
+    def test_it_is_said_again_every_retell_minutes(self):
+        sent, send = self.relay()
+        self.waits(0, send=send)
+        self.waits(30, send=send)
+        self.waits(89, send=send)
+        self.assertEqual(len(sent), 2)
+        self.waits(90, send=send)
+        self.assertEqual(len(sent), 4)
+
+    def test_a_message_nobody_took_is_tried_on_the_next_tick(self):
+        sent, send = self.relay(confirm=False)
+        self.waits(0, send=send)
+        _, lines = self.waits(30, send=send)
+        self.assertIn("STALL-TOLD: nobody; LeadDev: HTTP 503 queue-full; "
+                      "Reviewer: HTTP 503 queue-full", lines)
+        self.waits(31, send=send)
+        self.assertEqual(len(sent), 4)
+
+    def test_owner_after_minutes_puts_it_on_the_owners_list_once(self):
+        _, send = self.relay()
+        self.waits(0, send=send)
+        self.waits(30, send=send)
+        self.waits(119, send=send)
+        self.assertEqual(self.stall_writes(), [])
+        _, lines = self.waits(120, send=send)
+        (labeled,) = self.stall_writes()
+        self.assertEqual((labeled[1], labeled[2]),
+                         (SLUG + "/issues/900/labels",
+                          {"labels[]": "Status:waiting-owner"}))
+        self.assertIn("STALL-TO-OWNER: labeled #900 Status:waiting-owner",
+                      lines)
+        self.waits(121, send=send)
+        self.assertEqual(self.stall_writes(), [])
+
+    def test_the_owners_label_is_the_configured_one(self):
+        data = example()
+        data["merge"] = {"gate": GATE, "stall_alert": dict(
+            self.ALERT, owner_after_minutes=30)}
+        data["labels"]["waiting_on_owner"] = "Blocked on owner"
+        m.configure(config.Project(data, None))
+        self.waits(0)
+        self.waits(30)
+        self.assertIn((SLUG + "/issues/900/labels",
+                       {"labels[]": "Blocked on owner"}),
+                      [(w[1], w[2]) for w in self.stall_writes()])
+
+    def test_the_end_of_a_stall_closes_its_issue_and_takes_the_label_off(self):
+        _, send = self.relay()
+        self.waits(0, send=send)
+        self.waits(30, send=send)
+        self.waits(120, send=send)
+        _, lines = self.tick([self.item()], live=True, minutes=121,
+                             send=send)
+        said, unlabeled, closed = self.stall_writes()
+        self.assertEqual(said[1], SLUG + "/issues/900/comments")
+        self.assertIn("this tick's MERGE of #5", said[2]["body"])
+        self.assertTrue(said[2]["body"].endswith("— Merger"))
+        self.assertEqual(unlabeled[:2], ("DELETE", self.OWNER_LABEL))
+        self.assertEqual(closed, ("PATCH", SLUG + "/issues/900",
+                                  {"state": "closed"}))
+        self.assertIn("STALL-ENDED: closed #900", lines)
+        self.assertIsNone(self.saved())
+
+    def test_an_end_before_owner_after_minutes_removes_no_label(self):
+        _, send = self.relay()
+        self.waits(0, send=send)
+        self.waits(30, send=send)
+        self.tick([self.item()], live=True, minutes=31, send=send)
+        self.assertEqual([w[0] for w in self.stall_writes()],
+                         ["POST", "PATCH"])
+
+    def test_a_queue_that_empties_ends_it_too(self):
+        self.waits(0)
+        self.waits(30)
+        self.tick([], live=True, minutes=31)
+        said, _ = self.stall_writes()
+        self.assertIn("#5 is no longer first in the queue", said[2]["body"])
+
+    def test_without_a_sender_nothing_is_messaged(self):
+        """Only `main` passes the relay, so no test messages an agent."""
+        self.waits(0)
+        record, _ = self.waits(30)
+        self.assertIn("stalled", record)
+        self.assertEqual(self.saved()["issue"], 900)
+        self.assertNotIn("told", self.saved())
+
+    def test_nobody_to_tell_still_opens_the_issue(self):
+        self.alert(tell=[])
+        sent, send = self.relay()
+        self.waits(0, send=send)
+        _, lines = self.waits(30, send=send)
+        self.assertEqual(sent, [])
+        self.assertIn("STALL-ISSUE: opened #900", lines)
+        self.assertFalse(any(l.startswith("STALL-TOLD") for l in lines))
+
+    def test_a_refused_label_is_tried_on_the_next_tick(self):
+        """Without its Owner: label, the router can't say whose the
+        issue is."""
+        _, send = self.relay()
+        self.waits(0, send=send)
+        _, lines = self.tick(
+            [self.item()], conclusions=(None,), live=True, minutes=30,
+            send=send, refuse=lambda method, path: "HTTP 502"
+            if path.endswith("/labels") else None)
+        self.assertIn("STALL-LABEL refused: bug on #900: HTTP 502", lines)
+        self.waits(31, send=send)
+        self.assertEqual([w[2] for w in self.stall_writes()],
+                         [{"labels[]": "bug"}, {"labels[]": "Owner:LeadDev"}])
+        self.waits(32, send=send)
+        self.assertEqual(self.stall_writes(), [])
+
+    def test_a_refused_issue_is_tried_on_the_next_tick(self):
+        _, send = self.relay()
+        self.waits(0, send=send)
+        _, lines = self.tick(
+            [self.item()], conclusions=(None,), live=True, minutes=30,
+            send=send, refuse=lambda method, path: "HTTP 502"
+            if path == SLUG + "/issues" else None)
+        self.assertIn("STALL-ISSUE refused: HTTP 502", lines)
+        self.assertIsNone(self.saved())
+        self.waits(31, send=send)
+        self.assertEqual(self.stall_writes()[0][1], SLUG + "/issues")
+
+    def test_a_new_head_on_the_same_pull_request_is_a_new_stall(self):
+        """The stall was on a head; a push ends it, and if the new head
+        stalls too, that is told as itself, with its own issue."""
+        _, send = self.relay()
+        self.waits(0, send=send)
+        self.waits(30, send=send)
+        other = self.repo.commit("g.txt", "pushed\n", "pushed")
+        self.repo.publish_pr(5, other)
+        moved = self.item(head=other, approved=other)
+        self.waits(31, item=moved, send=send)
+        said, closed = self.stall_writes()
+        self.assertIn("this tick's WAIT of #5", said[2]["body"])
+        self.assertEqual(closed[1:], (SLUG + "/issues/900",
+                                      {"state": "closed"}))
+        self.waits(61, item=moved, send=send)
+        created, *_ = self.stall_writes()
+        self.assertEqual(created[1], SLUG + "/issues")
+        self.assertIn(other[:10], created[2]["body"])
+
+    def test_a_stall_on_a_new_head_is_never_taken_for_the_old_one(self):
+        """Through a tick, a new head isn't stalled until it has waited
+        `stall_minutes`, so the old stall ends in between; this pins the
+        rule itself, for a Merger that missed those ticks."""
+        github, when, lines = FakeGitHub({}), m.now_utc(), []
+        for head in ("a" * 40, "b" * 40):
+            m.tell_stall(self.tmp.name, github,
+                         {"pr": 5, "head": head, "minutes": 30}, [], when,
+                         None, lines.append)
+        self.assertEqual(lines[-2:], ["STALL-ENDED: closed #900",
+                                      "STALL-ISSUE: opened #901"])
+
+    def test_an_ended_stall_is_closed_once_even_if_the_next_issue_is_refused(
+            self):
+        github, when, lines = FakeGitHub({}), m.now_utc(), []
+        m.tell_stall(self.tmp.name, github,
+                     {"pr": 5, "head": "a" * 40, "minutes": 30}, [], when,
+                     None, lines.append)
+        github.refuse = lambda method, path: (
+            "HTTP 502" if path == SLUG + "/issues" else None)
+        for _ in range(2):
+            m.tell_stall(self.tmp.name, github,
+                         {"pr": 6, "head": "b" * 40, "minutes": 30}, [],
+                         when, None, lines.append)
+        self.assertEqual(lines.count("STALL-ENDED: closed #900"), 1)
+        self.assertEqual(lines.count("STALL-ISSUE refused: HTTP 502"), 2)
+
+    def test_a_refused_close_is_said_and_not_tried_again(self):
+        self.waits(0)
+        self.waits(30)
+        _, lines = self.tick([], live=True, minutes=31,
+                             refuse=lambda method, path: "HTTP 403"
+                             if method == "PATCH" else None)
+        self.assertIn("STALL-ENDED: #900 could not be closed: HTTP 403", lines)
+        self.assertIsNone(self.saved())
+
+    def test_a_refused_write_is_quoted_in_the_issue(self):
+        self.advance_main("n.txt")
+        self.tick([self.item()], live=True, refuse=lambda method, path:
+                  "HTTP 403: forbidden" if "/pulls/" in path else None)
+        self.tick([self.item()], live=True, minutes=30,
+                  refuse=lambda method, path: "HTTP 403: forbidden"
+                  if "/pulls/" in path else None)
+        created = self.stall_writes()[0]
+        self.assertIn("UPDATE refused: HTTP 403: forbidden",
+                      created[2]["body"])
+        self.assertIn("the Merger App's access", created[2]["body"])
+
+    def test_a_dry_run_opens_nothing_and_tells_nobody(self):
+        sent, send = self.relay()
+        self.waits(0, live=False, send=send)
+        record, _ = self.waits(30, live=False, send=send)
+        self.assertEqual((self.github.writes, sent), ([], []))
+        self.assertIsNone(self.saved())
+
+    def test_without_stall_alert_a_stall_is_only_printed(self):
+        m.configure(project())
+        sent, send = self.relay()
+        self.waits(0, send=send)
+        record, lines = self.waits(30, send=send)
+        self.assertIn("stalled", record)
+        self.assertEqual((self.github.writes, sent), ([], []))
+        self.assertEqual(len(lines), 2)
+        self.assertIsNone(self.saved())
+
+
 class Main(unittest.TestCase):
 
     def setUp(self):
@@ -1283,7 +1575,7 @@ class Main(unittest.TestCase):
         self.addCleanup(m.configure, project())
 
     def run_main(self, argv, mint="token", tick=None, state_flag=True):
-        minted = []
+        minted, self.senders = [], []
 
         def run(args, cwd=None, env=None):
             if args[:4] == ["git", "-C", self.checkout, "rev-parse"]:
@@ -1296,13 +1588,19 @@ class Main(unittest.TestCase):
             return mint
         calls = []
 
-        def fake_tick(repo, state_dir, github, run, out, live):
+        def fake_tick(repo, state_dir, github, run, out, live, send=None):
             calls.append((repo, state_dir, github.env["GH_TOKEN"], live))
+            self.sent_with = send
             return tick() if tick else None
+
+        def fake_sender(project_, environ):
+            self.senders.append(project_.name)
+            return fake_sender
         flag = ["--state-dir", self.state] if state_flag else []
         with mock.patch.object(m, "tick", fake_tick):
             rc = m.main(argv + flag, run, self.lines.append,
-                        environ=self.environ, mint=fake_mint)
+                        environ=self.environ, mint=fake_mint,
+                        sender=fake_sender)
         if calls:
             self.assertEqual(minted, [("widget", "Merger")])
         return rc, calls
@@ -1314,6 +1612,33 @@ class Main(unittest.TestCase):
     def test_a_dry_run_does_not_act(self):
         self.assertEqual(self.run_main(["--dry-run"]),
                          (0, [(self.checkout, self.state, "token", False)]))
+
+    def configure_alert(self, alert):
+        data = example()
+        if alert is None:
+            del data["merge"]["stall_alert"]
+        else:
+            data["merge"]["stall_alert"] = alert
+        with open(os.path.join(self.checkout, config.CONFIG_NAME), "w") as f:
+            json.dump(data, f)
+
+    def test_a_live_tick_with_a_stall_alert_is_given_the_relay(self):
+        # Only main passes it, so a test that ticks through a stall
+        # never messages a real agent.
+        self.run_main([])
+        self.assertEqual(self.senders, ["widget"])
+        self.assertIsNotNone(self.sent_with)
+
+    def test_a_dry_run_is_given_no_relay(self):
+        self.run_main(["--dry-run"])
+        self.assertEqual(self.senders, [])
+        self.assertIsNone(self.sent_with)
+
+    def test_without_a_stall_alert_no_relay(self):
+        self.configure_alert(None)
+        self.run_main([])
+        self.assertEqual(self.senders, [])
+        self.assertIsNone(self.sent_with)
 
     def test_no_token(self):
         rc, calls = self.run_main([], mint=None)
@@ -1371,6 +1696,53 @@ class Main(unittest.TestCase):
             "merger")))
 
 
+class RelaySender(unittest.TestCase):
+    """The stall message goes out through the router's own poster, to
+    the agent's session name."""
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.token_file = os.path.join(tmp.name, "token")
+        with open(self.token_file, "w") as handle:
+            handle.write("WEBHOOK_TOKEN=s3cret\n")
+
+    def send(self, environ):
+        data = example()
+        data["relay"] = {"url": "http://relay:8788",
+                         "token_file": self.token_file}
+        seen = []
+
+        def opener(req, timeout):
+            seen.append(req)
+            return self.Response()
+        got = m.relay_sender(config.Project(data, None), environ,
+                             opener)("LeadDev", "From: Merger\nx")
+        return got, seen
+
+    def test_the_message_is_the_relays_verbatim_agent_post(self):
+        got, (req,) = self.send({})
+        self.assertIsNone(got)
+        self.assertEqual(req.full_url, "http://relay:8788/agent/WidgetLeadDev")
+        headers = {k.lower(): v for k, v in req.header_items()}
+        self.assertEqual(headers["x-webhook-token"], "s3cret")
+        self.assertEqual(headers["x-xmpp-verbatim"], "1")
+        self.assertEqual(req.data, b"From: Merger\nx")
+
+    def test_the_routers_override_of_the_relay_applies(self):
+        _, (req,) = self.send({"FORGE_ROUTER_RELAY": "http://other:1"})
+        self.assertEqual(req.full_url, "http://other:1/agent/WidgetLeadDev")
+
+
 class Configure(unittest.TestCase):
     """What the configuration decides."""
 
@@ -1404,6 +1776,23 @@ class Configure(unittest.TestCase):
         self.assertEqual(m.GATE, (("forge-commit-identity", "{base}..{head}"),))
         self.assertEqual(m.CI_WORKFLOW, "ci")
         self.assertEqual(m.STALL_AFTER, datetime.timedelta(minutes=30))
+        self.assertFalse(m.STALL_ALERT)
+
+    def test_a_stall_alert_and_its_defaults(self):
+        m.configure(project(stall_alert={}))
+        self.assertTrue(m.STALL_ALERT)
+        self.assertEqual((m.STALL_TELL, m.STALL_LABELS), ((), ()))
+        self.assertEqual((m.STALL_RETELL, m.STALL_TO_OWNER), (
+            datetime.timedelta(minutes=60), datetime.timedelta(minutes=120)))
+        self.assertEqual(m.STALL_TITLE,
+                         "forge-merger: the queue is stalled on #{pr}")
+        self.assertEqual(m.WAITING_OWNER, "Status:waiting-owner")
+
+    def test_the_example_stall_alert(self):
+        m.configure(config.Project(example(), None))
+        self.assertEqual(m.STALL_TELL, ("LeadDev", "Reviewer"))
+        self.assertEqual(m.STALL_LABELS, ("bug", "Owner:LeadDev"))
+        self.assertEqual(m.STALL_RETELL, datetime.timedelta(minutes=60))
 
     def test_a_status_poster_other_than_the_merger(self):
         data = example()
