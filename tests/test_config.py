@@ -208,6 +208,9 @@ class Check(unittest.TestCase):
             "merge.right_of_way.after_conflicts must be at least 1"])
         self.assertEqual(self.problems(merge={"right_of_way": 2}),
                          ["merge.right_of_way must be an object"])
+        self.assertEqual(self.problems(merge={"code_owners": True}), [])
+        self.assertEqual(self.problems(merge={"code_owners": "yes"}),
+                         ["merge.code_owners must be true or false"])
         self.assertEqual(self.problems(merge={"yield_ignores_conflicts": 1}),
                          ["merge.yield_ignores_conflicts must be true or false"])
 

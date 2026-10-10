@@ -239,6 +239,17 @@ each tick held. Once Q has merged it is judged as usual, and goes back
 to its author if it then conflicts with `main`: one rebase instead of
 one per merge. Two heads git can't compare are not held.
 
+**With `merge.code_owners`, a code owner's word is needed** (default
+off). A candidate that changes (since `main`) a path the default
+branch's CODEOWNERS (`.github/`, the root or `docs/`, the first found)
+gives owners is held, `held` saying `waits for code owner @owner:
+path`, until for each such path one of its owners wrote it or has
+approved: their newest review is `APPROVED`, at a commit that covers
+the head as a reviewer's must. Owners are `@login`s; a team's or an
+email's path waits for good, since the Merger can't check it. A path
+whose changes can't be listed waits too. It is a hold, not a
+hand-back: nothing is said, and the author isn't asked to do anything.
+
 **With `merge.yield_ignores_conflicts`, a conflict with `main` doesn't
 count toward the yield** (default false). A conflict is mostly what
 merged after the approval, not the pull request's own failure.
@@ -385,6 +396,10 @@ YIELD_CAP = 3
 YIELD_WINDOW = datetime.timedelta(hours=24)
 # merge.yield_ignores_conflicts: a conflict with main doesn't count.
 YIELD_IGNORES_CONFLICTS = False
+# merge.code_owners: hold one that changes a path CODEOWNERS gives an
+# owner until an owner has approved its head.
+CODE_OWNERS = False
+CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
 # merge.right_of_way: after ROW_AFTER conflict hand-backs, those that
 # conflict with the pull request's clean head are held for ROW_FOR.
 RIGHT_OF_WAY = False
@@ -405,7 +420,7 @@ def configure(project):
     (default none: nobody yields), `yield_cap` (default 3),
     `yield_ignores_conflicts` (default false) and `right_of_way`
     (default none: nobody has it; `after_conflicts`, default 2, and
-    `minutes`, default 60). The
+    `minutes`, default 60) and `code_owners` (default false). The
     `checks` section: `context` and `poster` (default the merger).
     `labels.waiting_on_owner` is the label a long stall gets."""
     global REPO_SLUG, MAIN, APPROVERS, QUIET_LOGINS, ACT_AS, SIGNATURE
@@ -414,7 +429,7 @@ def configure(project):
     global STALL_TO_OWNER, STALL_TITLE, STALL_LABELS, WAITING_OWNER
     global TEST_AHEAD, AHEAD_DEPTH, HOLD_CONFLICTING, YIELD_PLACES
     global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
-    global ROW_FOR
+    global ROW_FOR, CODE_OWNERS
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -448,6 +463,7 @@ def configure(project):
     YIELD_CAP = merge.get("yield_cap", 3)
     YIELD_IGNORES_CONFLICTS = merge.get("yield_ignores_conflicts",
                                         False) is True
+    CODE_OWNERS = merge.get("code_owners", False) is True
     row = merge.get("right_of_way")
     RIGHT_OF_WAY = row is not None
     ROW_AFTER = (row or {}).get("after_conflicts", 2)
@@ -1448,6 +1464,112 @@ def right_of_way(repo, prs, records, path, when, main_ref, run=sh,
     return found
 
 
+def codeowners_rules(repo, ref, run=sh):
+    """[(pattern, [owner, ...]), ...] from the first CODEOWNERS file at
+    `ref` (.github/, the root, docs/), in file order; [] when there is
+    none."""
+    for path in CODEOWNERS_PATHS:
+        got = git(repo, "show", "%s:%s" % (ref, path), run=run)
+        if got.returncode != 0:
+            continue
+        rules = []
+        for line in got.stdout.splitlines():
+            words = line.split("#", 1)[0].split()
+            if words:
+                rules.append((words[0], words[1:]))
+        return rules
+    return []
+
+
+def codeowners_match(pattern, path):
+    """Whether CODEOWNERS `pattern` covers `path`: gitignore's rules as
+    GitHub applies them. A leading or inner `/` anchors it to the root,
+    a trailing one makes it a directory's, `*` and `?` stay within a
+    name and `**` crosses directories; a pattern also covers everything
+    under a directory it names."""
+    body = pattern.lstrip("/")
+    directory = body.endswith("/")
+    body = body.rstrip("/")
+    anchored = pattern.startswith("/") or "/" in body
+    out, i = [], 0
+    while i < len(body):
+        if body.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif body.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif body[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif body[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(body[i]))
+            i += 1
+    regex = (("^" if anchored else "^(?:.*/)?") + "".join(out)
+             + ("/.*$" if directory else "(?:/.*)?$"))
+    return re.match(regex, path) is not None
+
+
+def owners_of(path, rules):
+    """The owners of `path`: the last matching rule's, [] for none."""
+    owners = []
+    for pattern, who in rules:
+        if codeowners_match(pattern, path):
+            owners = who
+    return owners
+
+
+def code_owner_wait(repo, pr, rules, main_ref, run=sh):
+    """Why `pr` waits for a code owner, or None. Each path it changes
+    since `main_ref` that `rules` gives owners needs one of them: its
+    author, or an owner whose newest review is `APPROVED` at a commit
+    that covers the head. Owners are `@login`s; a team or an email
+    can't be checked, so it is never satisfied."""
+    head = pr["headRefOid"]
+    have_head(repo, pr, run)
+    got = git(repo, "diff", "--name-only", "%s...%s" % (main_ref, head),
+              run=run)
+    if got.returncode != 0:
+        return "waits for a code owner: its changed paths can't be listed"
+    latest = {}
+    for review in pr["reviews"]:
+        who = login(review).lower()
+        if review.get("state") in ("APPROVED", "CHANGES_REQUESTED",
+                                   "DISMISSED") and (
+                who not in latest or review["submittedAt"]
+                > latest[who]["submittedAt"]):
+            latest[who] = review
+    covered = {}
+
+    def approved(owner):
+        if owner == login(pr).lower():
+            return True
+        review = latest.get(owner)
+        if not review or review.get("state") != "APPROVED":
+            return False
+        oid = (review.get("commit") or {}).get("oid")
+        if oid not in covered:
+            covered[oid] = bool(oid) and covers_head(
+                repo, oid, head, main_ref, run)[0]
+        return covered[oid]
+    waiting = {}
+    for path in got.stdout.split():
+        owners = owners_of(path, rules)
+        logins = [o[1:].lower() for o in owners
+                  if o.startswith("@") and "/" not in o]
+        if owners and not any(approved(o) for o in logins):
+            waiting.setdefault(" ".join(owners), []).append(path)
+    if not waiting:
+        return None
+    who, paths = sorted(waiting.items())[0]
+    more = sum(len(p) for p in waiting.values()) - 1
+    return "waits for code owner %s: %s%s" % (
+        who, paths[0], " and %d more" % more if more else "")
+
+
 def conflicts_with(repo, head, queue, run=sh):
     """The pull requests in `queue` whose heads conflict with `head`.
     A comparison git can't make holds nothing."""
@@ -1599,6 +1721,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             approvals[pr["number"]] = approval
         elif approval_of(pr) is not None:
             held[str(pr["number"])] = why
+    if CODE_OWNERS:
+        rules = codeowners_rules(repo, "refs/remotes/origin/" + MAIN, run)
+        for pr in list(candidates):
+            why = rules and code_owner_wait(repo, pr, rules, main_tip, run)
+            if why:
+                held[str(pr["number"])] = why
+                candidates.remove(pr)
     queue = order(candidates, prs)
     in_flight = None
     if TEST_AHEAD:

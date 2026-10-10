@@ -2646,5 +2646,150 @@ class RightOfWay(RepoCase):
                          {"5": "conflicts with #6, which has right of way"})
 
 
+class CodeownersMatch(unittest.TestCase):
+
+    def test_patterns(self):
+        cases = [("/tools/host/", "tools/host/README.md", True),
+                 ("/tools/host/", "tools/hostile.md", False),
+                 ("/tools/host/", "x/tools/host/a", False),
+                 ("/.agent-forge/", ".agent-forge/config.json", True),
+                 ("/.github/CODEOWNERS", ".github/CODEOWNERS", True),
+                 ("/.github/CODEOWNERS", ".github/CODEOWNERS.bak", False),
+                 ("*.js", "web/a/b.js", True),
+                 ("*.js", "web/a/b.jsx", False),
+                 ("docs/*", "docs/a.md", True),
+                 ("docs/*", "docs/a/b.md", True),
+                 ("docs/*", "x/docs/a.md", False),
+                 ("build", "a/build/x", True),
+                 ("/a/**/z", "a/z", True),
+                 ("/a/**/z", "a/b/c/z", True),
+                 ("*", "anything/at/all", True)]
+        for pattern, path, want in cases:
+            self.assertIs(m.codeowners_match(pattern, path), want,
+                          (pattern, path))
+
+    def test_the_last_matching_rule_wins(self):
+        rules = [("*", ["@everyone"]), ("/tools/", ["@tools"]),
+                 ("/tools/free.py", [])]
+        self.assertEqual(m.owners_of("a.md", rules), ["@everyone"])
+        self.assertEqual(m.owners_of("tools/x", rules), ["@tools"])
+        self.assertEqual(m.owners_of("tools/free.py", rules), [])
+        self.assertEqual(m.owners_of("a.md", []), [])
+
+
+class CodeOwners(RepoCase):
+    """merge.code_owners: a candidate that changes an owned path waits
+    for its owner's approval of the head."""
+
+    item = Decide.item
+    tick = Tick.tick
+    other_pr = Tick.other_pr
+    OWNER = "theowner"
+
+    def setUp(self):
+        super().setUp()
+        self.repo.branch("main")
+        os.makedirs(os.path.join(self.repo.path, ".github"))
+        self.repo.commit(".github/CODEOWNERS",
+                         "# owned\n/owned/ @TheOwner\n/team.txt @org/team\n",
+                         "codeowners")
+        self.repo.push("main")
+        self.repo.branch("feature", "feature")
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        m.configure(project(code_owners=True))
+        self.addCleanup(m.configure, project())
+
+    def owned_pr(self, number=6, reviews=None, name="owned/x.json",
+                 author=AUTHOR):
+        self.repo.branch("owned%d" % number, "origin/main")
+        os.makedirs(os.path.join(self.repo.path, os.path.dirname(name)
+                                 or "."), exist_ok=True)
+        sha = self.repo.commit(name, "x\n", "owned")
+        self.repo.publish_pr(number, sha)
+        self.repo.branch("feature", "feature")
+        self.sha = sha
+        return pr(number, T1, head=sha, author=author,
+                  reviews=[review(REVIEWER, oid=sha)] + (reviews or []))
+
+    def test_the_configuration(self):
+        self.assertIs(m.CODE_OWNERS, True)
+        m.configure(project())
+        self.assertIs(m.CODE_OWNERS, False)
+
+    def test_off_by_default(self):
+        m.configure(project())
+        record, _ = self.tick([self.owned_pr()], live=True)
+        self.assertEqual(record["held"], {})
+        self.assertEqual([d["action"] for d in record["decisions"]],
+                         ["MERGE"])
+
+    def test_an_owned_path_waits_for_its_owner(self):
+        record, _ = self.tick([self.item(), self.owned_pr()],
+                              conclusions=(None,), live=True)
+        self.assertEqual(record["held"], {
+            "6": "waits for code owner @TheOwner: owned/x.json"})
+        self.assertEqual(record["queue"], [5])
+        # Held, not handed back: nothing is said.
+        self.assertEqual(self.github.writes, [])
+
+    def test_the_owners_approval_of_the_head_lets_it_merge(self):
+        item = self.owned_pr()
+        item["reviews"].append(review(self.OWNER, oid=self.sha, at=T2))
+        record, _ = self.tick([item], live=True)
+        self.assertEqual(record["held"], {})
+        self.assertEqual([d["action"] for d in record["decisions"]],
+                         ["MERGE"])
+
+    def test_an_approval_that_does_not_cover_the_head_is_not_enough(self):
+        item = self.owned_pr()
+        item["reviews"].append(review(self.OWNER, oid=self.approved, at=T2))
+        record, _ = self.tick([item], live=True)
+        self.assertIn("6", record["held"])
+
+    def test_a_later_change_request_takes_it_back(self):
+        item = self.owned_pr()
+        item["reviews"] += [review(self.OWNER, oid=self.sha, at=T2),
+                            review(self.OWNER, "CHANGES_REQUESTED",
+                                   oid=self.sha, at=T3)]
+        record, _ = self.tick([item], live=True)
+        self.assertIn("6", record["held"])
+
+    def test_a_later_comment_leaves_the_approval_standing(self):
+        item = self.owned_pr()
+        item["reviews"] += [review(self.OWNER, oid=self.sha, at=T2),
+                            review(self.OWNER, "COMMENTED", oid=self.sha,
+                                   at=T3)]
+        # (The tick holds it anyway, for speaking after the approval.)
+        rules = m.codeowners_rules(self.repo.path, "refs/remotes/origin/main")
+        self.assertIsNone(m.code_owner_wait(self.repo.path, item, rules,
+                                            self.repo.main_tip()))
+
+    def test_an_owners_own_pull_request_needs_nobody_else(self):
+        record, _ = self.tick([self.owned_pr(author=self.OWNER)], live=True)
+        self.assertEqual(record["held"], {})
+
+    def test_a_team_owner_cannot_be_checked(self):
+        item = self.owned_pr(name="team.txt")
+        item["reviews"].append(review("org", oid=self.sha, at=T2))
+        record, _ = self.tick([item], live=True)
+        self.assertEqual(record["held"],
+                         {"6": "waits for code owner @org/team: team.txt"})
+
+    def test_unowned_paths_and_no_codeowners_pass(self):
+        record, _ = self.tick([self.item()], live=True)
+        self.assertEqual(record["held"], {})
+        self.assertEqual(m.codeowners_rules(self.repo.path, "HEAD~5"), [])
+
+    def test_paths_that_cannot_be_listed_wait(self):
+        def run(args, cwd=None, env=None):
+            if "diff" in args:
+                return subprocess.CompletedProcess(args, 128, "", "fatal")
+            return m.sh(args, cwd, env)
+        rules = m.codeowners_rules(self.repo.path, "refs/remotes/origin/main")
+        self.assertIn("can't be listed", m.code_owner_wait(
+            self.repo.path, self.item(), rules, self.repo.main_tip(), run))
+
+
 if __name__ == "__main__":
     unittest.main()
