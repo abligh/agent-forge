@@ -1208,6 +1208,40 @@ class Tick(Decide):
         self.assertFalse(os.path.exists(
             os.path.join(self.state, "waiting.json")))
 
+    # What the build check reads: the pull request the tick stopped at.
+
+    def next_json(self):
+        with open(os.path.join(self.state, "next.json")) as handle:
+            return json.load(handle)
+
+    def test_a_live_tick_names_the_pull_request_it_waits_on(self):
+        self.waits(0)
+        self.assertEqual(self.next_json(),
+                         {"at": "2026-10-07T12:00:00Z", "pr": 5})
+
+    def test_an_update_names_its_pull_request_too(self):
+        # Its new head is the one the next merge waits on.
+        self.advance_main("n.txt")
+        self.tick([self.item()], live=True)
+        self.assertEqual(self.next_json()["pr"], 5)
+
+    def test_a_pull_request_handed_back_is_not_named(self):
+        self.advance_main("f.txt", "main's own line\n")
+        other = self.other_pr()
+        self.tick([self.item(), other], live=True)
+        self.assertEqual(self.next_json()["pr"], 6)
+
+    def test_a_tick_with_nothing_to_do_names_nothing(self):
+        self.waits(0)
+        self.tick([], live=True, minutes=1)
+        self.assertEqual(self.next_json(),
+                         {"at": "2026-10-07T12:01:00Z", "pr": None})
+
+    def test_a_dry_run_names_nothing(self):
+        self.waits(0, live=False)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state, "next.json")))
+
     # Fetching main.
 
     def test_a_lost_race_for_the_main_ref_is_retried_once(self):

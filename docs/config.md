@@ -85,6 +85,7 @@ not here yet.
 | `slots` | `2` | Checks run at once (`$FORGE_PR_CHECK_SLOTS` overrides). |
 | `memory_max` | `16G` | Each step's memory limit, in systemd's syntax, or `off` (`$FORGE_PR_CHECK_MEMORY_MAX` overrides). |
 | `step_timeout_minutes` | `30` | When a step is stopped. |
+| `merger_first` | `false` | Check first the head of the pull request the Merger waits on (its `next.json`), and start nothing else while it names one. Right under branch protection that requires heads to be up to date, where any other verdict is spent by the next merge; it holds only while the Merger ticks at least every 10 minutes. |
 
 Only these keys are checked; the section may hold others, for tools
 not here yet.

@@ -26,7 +26,7 @@
              "waiting_external": "Status:waiting-external"},
   "checks": {
     "context": "vm/build-and-test", "poster": "Merger", "slots": 2,
-    "memory_max": "16G", "step_timeout_minutes": 30,
+    "memory_max": "16G", "step_timeout_minutes": 30, "merger_first": false,
     "steps": [
       {"name": "web dependencies", "run": ["npm", "ci", "--prefix", "web"],
        "only_if": "web/package.json"},

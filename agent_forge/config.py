@@ -61,7 +61,8 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
 # checks is shared with tools not here yet, so only these keys are
 # checked.
 CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
-          "slots": int, "memory_max": str, "step_timeout_minutes": int}
+          "slots": int, "memory_max": str, "step_timeout_minutes": int,
+          "merger_first": bool}
 STEP = {"name": str, "run": list, "only_if": str}
 # Shared with tools not here yet: only these keys are checked.
 LABELS = {"owner_prefix": str, "status_prefix": str,
@@ -136,8 +137,8 @@ def _is(value, kinds):
 
 def _type_name(kinds):
     kinds = kinds if isinstance(kinds, tuple) else (kinds,)
-    names = {str: "a string", int: "an integer", dict: "an object",
-             list: "a list", type(None): "null"}
+    names = {str: "a string", int: "an integer", bool: "true or false",
+             dict: "an object", list: "a list", type(None): "null"}
     return " or ".join(names[k] for k in kinds)
 
 

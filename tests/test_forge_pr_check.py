@@ -133,6 +133,7 @@ class Configure(unittest.TestCase):
         self.assertEqual((pc.SLOTS, pc.MEMORY_MAX, pc.STEP_TIMEOUT_S,
                           pc.POSTER, pc.STATUS_CONTEXT),
                          (2, "16G", 1800, "Merger", "vm/build-and-test"))
+        self.assertIs(pc.MERGER_FIRST, False)
 
     def test_the_poster_defaults_to_the_merger(self):
         data = example()
@@ -145,10 +146,11 @@ class Configure(unittest.TestCase):
     def test_settings(self):
         data = example()
         data["checks"].update(slots=3, memory_max="off",
-                              step_timeout_minutes=5)
+                              step_timeout_minutes=5, merger_first=True)
         pc.configure(config.Project(data, None))
         self.assertEqual((pc.slots_from_env({}), pc.memory_max_from_env({}),
-                          pc.STEP_TIMEOUT_S), (3, None, 300))
+                          pc.STEP_TIMEOUT_S, pc.MERGER_FIRST),
+                         (3, None, 300, True))
 
     def test_no_host_says_nowhere(self):
         data = example()
@@ -266,6 +268,94 @@ class NextHead(unittest.TestCase):
                                      "started": "soon"}}}
         self.assertEqual(pc.next_head(state, when=T0), (SHA_A, 1))
 
+    def test_the_mergers_head_just_started_still_holds_the_rest(self):
+        state = {"waiting": {
+            SHA_A: {"pr": 1, "since": "2026-10-09T11:00:00Z",
+                    "started": pc.iso(T0)},
+            SHA_B: {"pr": 2, "since": "2026-10-09T09:00:00Z"}}}
+        self.assertIsNone(pc.next_head(state, first_pr=1, when=T0))
+        self.assertEqual(pc.next_head(state, first_pr=1,
+                                      when=T0 + pc.START_GRACE), (SHA_A, 1))
+
+    # The Merger's pull request first.
+
+    def test_the_mergers_pull_request_goes_first(self):
+        state = {"waiting": {
+            SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z"},
+            SHA_B: {"pr": 2, "since": "2026-10-09T10:00:00Z"}}}
+        self.assertEqual(pc.next_head(state, first_pr=2), (SHA_B, 2))
+
+    def test_a_merger_pull_request_with_nothing_waiting_holds_the_slot(self):
+        # Another head's verdict is spent once the Merger's next merge
+        # moves main, so the slot waits for the Merger's head.
+        state = {"waiting": {
+            SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z"}}}
+        self.assertIsNone(pc.next_head(state, first_pr=9))
+
+    def test_the_mergers_head_running_in_a_slot_holds_the_rest(self):
+        state = {"waiting": {
+            SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z"},
+            SHA_B: {"pr": 2, "since": "2026-10-09T10:00:00Z"}}}
+        self.assertIsNone(pc.next_head(state, {SHA_B}, first_pr=2))
+        self.assertEqual(pc.next_head(state, {SHA_B}), (SHA_A, 1))
+
+    def test_without_the_merger_the_oldest_head_is_picked(self):
+        state = {"waiting": {
+            SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z"}}}
+        self.assertEqual(pc.next_head(state, first_pr=None), (SHA_A, 1))
+
+    def test_the_mergers_head_given_up_on_holds_nothing(self):
+        state = {"waiting": {
+            SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z"},
+            SHA_B: {"pr": 2, "since": "2026-10-09T10:00:00Z",
+                    "errors": pc.MAX_ERRORS}}}
+        self.assertEqual(pc.next_head(state, first_pr=2), (SHA_A, 1))
+
+    def test_the_mergers_head_one_short_of_max_errors_still_goes_first(self):
+        state = {"waiting": {
+            SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z"},
+            SHA_B: {"pr": 2, "since": "2026-10-09T10:00:00Z",
+                    "errors": pc.MAX_ERRORS - 1}}}
+        self.assertEqual(pc.next_head(state, first_pr=2), (SHA_B, 2))
+
+
+class MergerFirst(unittest.TestCase):
+    """What the Merger said it waits on, from its next.json."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+
+    def said(self, value):
+        with open(os.path.join(self.dir, "next.json"), "w") as handle:
+            handle.write(value if isinstance(value, str)
+                         else json.dumps(value))
+
+    def test_a_fresh_pull_request_up_to_the_limit(self):
+        self.said({"at": pc.iso(T0), "pr": 7})
+        self.assertEqual(pc.merger_first(self.dir, T0), 7)
+        self.assertEqual(pc.merger_first(self.dir, T0 + pc.MERGER_FRESH), 7)
+
+    def test_a_stale_one_is_ignored(self):
+        # A Merger that has stopped must not hold every check.
+        self.said({"at": pc.iso(T0), "pr": 7})
+        self.assertIsNone(pc.merger_first(
+            self.dir, T0 + pc.MERGER_FRESH + datetime.timedelta(seconds=1)))
+
+    def test_nothing_waited_on(self):
+        self.said({"at": pc.iso(T0), "pr": None})
+        self.assertIsNone(pc.merger_first(self.dir, T0))
+
+    def test_unreadable_or_absent_is_none(self):
+        self.assertIsNone(pc.merger_first(self.dir, T0))
+        self.assertIsNone(pc.merger_first(None, T0))
+        for bad in ("{", "[]", '{"at": "x", "pr": 1}', '{"pr": 1}',
+                    '{"at": "%s", "pr": "1"}' % pc.iso(T0),
+                    '{"at": "%s", "pr": true}' % pc.iso(T0)):
+            self.said(bad)
+            self.assertIsNone(pc.merger_first(self.dir, T0), bad)
+
 
 class Prune(unittest.TestCase):
 
@@ -353,14 +443,24 @@ class Posting(unittest.TestCase):
 
 class Tick(StateCase):
 
-    def tick(self, heads=None, post=None, fail=False, slots=2):
+    def tick(self, heads=None, post=None, fail=False, slots=2,
+             merger_dir=None):
         run = FakeRun((is_pulls, done([], 1 if fail else 0,
                                       heads_tsv(*(heads or [])))))
         self.spawned = []
         rc = pc.tick(self.state_dir, "tok", run,
                      lambda *a: self.spawned.append(a), self.lines.append,
-                     when=T0, post=post, slots=slots)
+                     when=T0, post=post, slots=slots, merger_dir=merger_dir)
         return rc
+
+    def merger_says(self, pr, age=datetime.timedelta(minutes=1)):
+        """A Merger state directory whose next.json names pr, written
+        `age` before the tick."""
+        merger = os.path.join(self._tmp.name, "merger")
+        os.makedirs(merger, exist_ok=True)
+        with open(os.path.join(merger, "next.json"), "w") as handle:
+            json.dump({"at": pc.iso(T0 - age), "pr": pr}, handle)
+        return merger
 
     def hold(self, slot, holder=None):
         held = pc.try_lock(pc.lock_path(self.state_dir, slot), holder)
@@ -492,6 +592,58 @@ class Tick(StateCase):
             held.close()
         self.assertEqual(self.lines,
                          ["BUSY: the worker lock is held; 1 waiting"])
+
+    # The Merger's pull request first.
+
+    def test_starts_the_mergers_head_before_an_older_one(self):
+        self.write_state({"waiting": {SHA_B: {
+            "pr": 8, "since": pc.iso(T0 - datetime.timedelta(hours=1))}}})
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
+                  merger_dir=self.merger_says(7))
+        self.assertEqual(self.spawned,
+                         [(self.state_dir, SHA_A, 7, False, 1)])
+        self.assertEqual(self.lines, ["STARTED #7 aaaaaaaaaa; 1 waiting"])
+
+    def test_holds_every_slot_while_the_mergers_head_is_not_waiting(self):
+        self.tick([(8, SHA_B, REPO, "false")],
+                  merger_dir=self.merger_says(7))
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.lines, ["HELD: free slots are kept for the "
+                                      "Merger's #7; 1 waiting"])
+
+    def test_the_mergers_head_running_holds_the_free_slot(self):
+        self.hold(1, "#7 %s %s" % (SHA_A, pc.iso(T0)))
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
+                  merger_dir=self.merger_says(7))
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.lines, [
+            "RUNNING #7 aaaaaaaaaa since %s; 1 waiting" % pc.iso(T0),
+            "HELD: free slots are kept for the Merger's #7; 1 waiting"])
+
+    def test_a_stale_merger_holds_nothing(self):
+        merger = self.merger_says(
+            7, age=pc.MERGER_FRESH + datetime.timedelta(minutes=1))
+        self.tick([(8, SHA_B, REPO, "false")], merger_dir=merger)
+        self.assertEqual(self.spawned,
+                         [(self.state_dir, SHA_B, 8, False, 1)])
+
+    def test_a_merger_waiting_on_nothing_holds_nothing(self):
+        self.tick([(8, SHA_B, REPO, "false")],
+                  merger_dir=self.merger_says(None))
+        self.assertEqual(self.spawned,
+                         [(self.state_dir, SHA_B, 8, False, 1)])
+
+    def test_the_mergers_head_given_up_on_holds_nothing(self):
+        self.write_state({"waiting": {SHA_A: {
+            "pr": 7, "since": pc.iso(T0), "errors": pc.MAX_ERRORS}}})
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
+                  merger_dir=self.merger_says(7))
+        self.assertEqual(self.spawned,
+                         [(self.state_dir, SHA_B, 8, False, 1)])
+
+    def test_nothing_waiting_with_the_merger_named_is_idle(self):
+        self.tick([], merger_dir=self.merger_says(7))
+        self.assertEqual(self.lines, ["IDLE: no open head is waiting"])
 
     def test_a_dead_holders_line_is_not_read(self):
         pathlib.Path(self.state_dir, "worker.lock").write_text(
@@ -1019,6 +1171,22 @@ class Main(StateCase):
         with mock.patch.object(pc, "tick", return_value=0) as tick:
             self.main(environ={"FORGE_PR_CHECK_SLOTS": "4"})
         self.assertEqual(tick.call_args.kwargs["slots"], 4)
+
+    def test_the_mergers_directory_is_read_only_when_configured(self):
+        with mock.patch.object(pc, "tick", return_value=0) as tick:
+            self.main()
+        self.assertIsNone(tick.call_args.kwargs["merger_dir"])
+        data = example()
+        data["checks"]["merger_first"] = True
+        with open(os.path.join(self.checkout, config.CONFIG_NAME), "w") as f:
+            json.dump(data, f)
+        for argv, where in (
+                ([], os.path.join(self._tmp.name, ".local", "state",
+                                  "agent-forge", "widget", "merger")),
+                (["--merger-dir", "/m"], "/m")):
+            with mock.patch.object(pc, "tick", return_value=0) as tick:
+                self.main(*argv)
+            self.assertEqual(tick.call_args.kwargs["merger_dir"], where)
 
     def test_the_state_directory_defaults_under_the_home(self):
         with mock.patch.object(pc, "tick", return_value=0) as tick:

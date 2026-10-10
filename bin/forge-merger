@@ -132,6 +132,14 @@ since the author can't fix the Merger's access either. `waiting.json`
 in the state directory says since when the tick has waited on which
 head.
 
+**`next.json` names the pull request the tick stopped at**: `{"at":
+..., "pr": N}`, the first in the queue it neither handed back nor
+skipped, whether it updates, merges or waits on it, or `"pr": null`
+when there is none. Every live tick writes it, and a dry run never
+does. With `checks.merger_first` on, the build check (`forge-pr-check`)
+reads it and checks that pull request's head before any other, since
+the next merge waits on that verdict.
+
 Exit 0 when the tick ran, whatever GitHub answered its write, or
 another tick held the lock; 2 when it could not ask (no checkout, no
 token, GitHub or git failed) or the head it waits on is `STALLED`.
@@ -876,7 +884,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     os.makedirs(state_dir, exist_ok=True)
     said_path = os.path.join(state_dir, "handed-back.json")
     said = load_json(said_path, {})
-    waiting = None
+    waiting_on = waiting = None
     for pr in queue:
         approval = approvals[pr["number"]]
         decision = decide(pr, approval, repo, main_tip, github, github.env,
@@ -904,6 +912,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 conflict_hand_back(pr, approval, github, said, live))
             continue
         if decision["action"] not in ("HAND-BACK", "SKIP"):
+            waiting_on = pr["number"]
             # A refused write ends the tick on this pull request, and the
             # next tick picks it again; if GitHub goes on refusing, it is
             # as stuck as a check that never finishes.
@@ -920,6 +929,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 record["stalled"]["refused"] = "%s %s" % (
                     waiting["action"], waiting["result"])
         save_json(said_path, said)
+        save_json(os.path.join(state_dir, "next.json"),
+                  {"at": record["at"], "pr": waiting_on})
     name = "merger.jsonl" if live else "dry-run.jsonl"
     with open(os.path.join(state_dir, name), "a") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
