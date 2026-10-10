@@ -42,7 +42,8 @@ starts with `_` is a comment, at any level.
 | `merge` | no | How `forge-merger` merges: `merger`, the machinery App that acts (default `Merger`); `ci_workflow`, the Actions workflow every head must pass (default `ci`; `""` for none); `gate`, tools that must exit 0 before a merge, each an argument list with `{pr}`, `{base}` and `{head}` filled in, a `forge-` name run from the installation and anything else from the cron checkout (default `[["forge-commit-identity", "{base}..{head}"]]`); `stall_minutes`, how long a head may wait on its checks before the tick reports it stalled (default 30). The required status is `checks.context`, counted only when `checks.poster`'s App (default the merger) posted it. |
 | `host_settings` | no | Files every agent host carries, installed by `forge-host-settings`: `files`, each `{"from": path in the project, "to": path under the home directory, "mode": "0644", "json": true when compared as JSON}`, and `host_keys`, keys a JSON file's host may set for itself. |
 | `docs` | no | The project's documentation, as the tools that read it see it; see below. |
-| `labels`, `checks`, `relay` | no | Sections each tool documents for itself, as it moves here. |
+| `checks` | no | The build check, `forge-pr-check`; see below. |
+| `labels`, `relay` | no | Sections each tool documents for itself, as it moves here. |
 
 ### An agent
 
@@ -66,6 +67,21 @@ letter.
 | `width` | `80` | The widest a prose line may be, for `forge-doc-width`. |
 | `roles` | `docs/roles.md` | The roles file `forge-session-start` takes each agent's brief from. |
 | `designs_dir` | `designs` | Where designs are, for `forge-approval-scope`. |
+
+Only these keys are checked; the section may hold others, for tools
+not here yet.
+
+### `checks`
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `context` | `vm/build-and-test` | The commit status the build check posts and the Merger requires. |
+| `poster` | `merge.merger` | The App that posts it; the Merger counts only its statuses. |
+| `steps` | one step, `make test` | What runs on each head, in order: `{"name": ..., "run": [argv], "only_if": path}`, `only_if` a file the head must have. |
+| `caches` | none | `{variable: directory name}`: each slot's own build cache, kept in the state directory, such as `{"CARGO_TARGET_DIR": "cargo-target"}`. |
+| `slots` | `2` | Checks run at once (`$FORGE_PR_CHECK_SLOTS` overrides). |
+| `memory_max` | `16G` | Each step's memory limit, in systemd's syntax, or `off` (`$FORGE_PR_CHECK_MEMORY_MAX` overrides). |
+| `step_timeout_minutes` | `30` | When a step is stopped. |
 
 Only these keys are checked; the section may hold others, for tools
 not here yet.

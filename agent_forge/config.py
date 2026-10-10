@@ -56,6 +56,11 @@ IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list}
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_minutes": int}
+# checks is shared with tools not here yet, so only these keys are
+# checked.
+CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
+          "slots": int, "memory_max": str, "step_timeout_minutes": int}
+STEP = {"name": str, "run": list, "only_if": str}
 HOST_FILE = {"from": str, "to": str, "mode": str, "json": bool}
 # docs is shared by several tools, some not here yet, so only the keys
 # known are checked; another is left to its tool.
@@ -170,6 +175,34 @@ def check(data):
         name = merge.get("merger")
         if isinstance(name, str) and name not in data.get("machinery", {}):
             problems.append("merge.merger %r is not in machinery" % name)
+    checks = data.get("checks", {})
+    for key, kinds in CHECKS.items():
+        if key in checks and not _is(checks[key], kinds):
+            problems.append("checks.%s must be %s" % (key, _type_name(kinds)))
+    for key in ("slots", "step_timeout_minutes"):
+        if _is(checks.get(key), int) and checks[key] < 1:
+            problems.append("checks.%s must be at least 1" % key)
+    if isinstance(checks.get("steps"), list):
+        for i, step in enumerate(checks["steps"]):
+            where = "checks.steps[%d]" % i
+            if not _fields(where, step, STEP, problems):
+                continue
+            if "name" not in step:
+                problems.append("%s: missing 'name'" % where)
+            run = step.get("run")
+            if not (isinstance(run, list) and run
+                    and all(isinstance(a, str) for a in run)):
+                problems.append("%s.run must be a non-empty list of strings"
+                                % where)
+    if isinstance(checks.get("caches"), dict) and not all(
+            isinstance(v, str) and v and "/" not in v
+            for v in checks["caches"].values()):
+        problems.append("checks.caches must map variables to directory names")
+    poster = checks.get("poster")
+    if isinstance(poster, str) and poster not in data.get("machinery", {}) \
+            and poster not in data.get("agents", {}):
+        problems.append("checks.poster %r is no App in the configuration"
+                        % poster)
     settings = data.get("host_settings", {})
     if _fields("host_settings", settings, HOST_SETTINGS, problems):
         for i, entry in enumerate(settings.get("files", [])):

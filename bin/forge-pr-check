@@ -1,0 +1,738 @@
+#!/usr/bin/env python3
+"""Build and test each open pull request's head on this host; post the verdict.
+
+The default branch's protection requires a commit status
+(`checks.context`, say `vm/build-and-test`), and this is what produces
+it: the checks every agent runs before pushing, run again on the pull
+request's head on this host rather than on GitHub Actions. The Merger
+merges on that status (`forge-merger`).
+
+    forge-pr-check                       from cron: start a check of the
+                                         oldest waiting head, if none runs
+    forge-pr-check --post                the same, posting each verdict
+    forge-pr-check --worker SHA --pr N   the check itself (started by the
+                                         above; also runnable by hand)
+
+**The cron tick returns at once and the check runs detached.**
+`forge-cron-run` holds locks while a job runs, so a long test run under
+it would starve the rest of the schedule. The worker is started with
+its own session and no inherited descriptors, so it doesn't keep them
+either.
+
+**`checks.slots` checks at a time** (default 2; `$FORGE_PR_CHECK_SLOTS`
+overrides it). A worker holds its slot's lock in the state directory
+while it runs, `worker.lock` for slot 1 and `worker-N.lock` for slot N;
+its one line names the pull request, head and start. Each slot has its
+own worktree (`wt`, `wt-N`) and its own build caches (`checks.caches`,
+below), so two checks never share a checkout or wait on each other's
+cache lock. A tick starts the oldest waiting head that no slot is
+running, in the first free slot, and starts nothing when every slot is
+held. The kernel drops a lock however its holder dies, so a killed
+worker is never reported as running.
+
+**Oldest-waiting first.** A head waits from when a tick first sees it.
+Drafts are not checked. A head whose worktree can't be prepared goes
+behind every other, and after MAX_ERRORS failures it is given up on,
+so one unfetchable ref can't hold the queue. A head that moved before
+its check started is dropped; the new head is queued in its place.
+
+**A head from another repository is refused.** The steps run the pull
+request's own code with this user's access to the host, so only
+branches of this repository are run.
+
+**The steps are the configuration's**, `checks.steps`: each
+`{"name": ..., "run": [argv], "only_if": path}`, `only_if` naming a
+file the head must have for the step to run (default: one step, `make
+test`). The list comes from the cron checkout, so a pull request can't
+change which checks it is judged by; what each target does is the
+head's own. Each step runs even if an earlier one failed, and none is
+retried. They run in a clean, detached worktree of the head (`wt` in
+the state directory), without `GH_TOKEN` or any `FORGE_` setting, so a
+test can't behave differently here for having one. `checks.caches`
+maps an environment variable to a directory name, such as
+`{"CARGO_TARGET_DIR": "cargo-target"}`: each slot gets its own such
+directory in the state directory, outside the worktree, so a head isn't
+built from nothing each time. A variable the host already sets wins.
+A step is stopped after `checks.step_timeout_minutes` (default 30).
+
+**Each step runs under a memory limit**, in its own `systemd-run
+--user --scope` with `MemoryMax` (`checks.memory_max`, default `16G`;
+`$FORGE_PR_CHECK_MEMORY_MAX` overrides it; `off` for none) and no swap.
+Its `OOMPolicy` is `continue`, so a test that runs out is killed alone:
+the step fails with that test's output, rather than systemd stopping
+the whole step without a word. A worker that can't start a user scope
+says so in `worker.log` and runs its steps without the limit.
+
+**Without `--post` it posts nothing.** It reads the open pull requests
+as the poster's App either way (`checks.poster`, default the Merger),
+minting its token with `forge-app-token`.
+
+**`--post` writes the status** as that App, which needs *Commit
+statuses: write*: `pending` when the steps start, then `success`, or
+`failure` naming the first failed step. A head refused or given up on
+gets `error`, saying why, since the Merger would otherwise wait on it
+for a status that never comes. The Merger counts only statuses that App
+posted. A post GitHub refuses changes neither the verdict nor the exit
+status: each tick posts again any verdict on a still-open head that
+never reached GitHub. A worker killed mid-run leaves `pending`, and its
+head still waiting, so the next check replaces it.
+
+**A posting worker starts the next tick when it lets the lock go**,
+through `forge-cron-run`, so a head that arrived while it ran waits for
+that rather than for the next cron minute. A tick with nothing to do
+starts nothing, which ends the chain. A head that could not be checked
+out is still waiting, so it is left for cron's next tick rather than
+retried at once.
+
+The state directory (`--state-dir`, default
+~/.local/state/agent-forge/<project>/pr-check) holds `state.json` (the
+queue, and each verdict for KEEP), `verdicts.log` (one line per
+verdict, refusal and give-up), and `worker.log`, each worker's output:
+every step's exit status and time, and under a failed step its last
+TAIL_LINES lines, each prefixed `    | `. The status names the failed
+step and nothing more; why it failed is in `worker.log`.
+
+The checkout is the cron checkout (`--checkout`, default
+`$FORGE_CRON_CHECKOUT`), kept at the default branch.
+
+Exit 0 when the tick ran or the check was green, 1 from a red check,
+and 2 when the question could not be asked.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, locks  # noqa: E402
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+
+# Set from the project's configuration by `configure`; these are the
+# defaults it starts from.
+REPO_SLUG = ""
+MAIN = "main"
+# The configuration file, for forge-app-token, whatever the cwd.
+CONFIG_PATH = None
+# The commit status this posts, and the App it posts and reads as.
+DEFAULT_CONTEXT = "vm/build-and-test"
+STATUS_CONTEXT = DEFAULT_CONTEXT
+POSTER = "Merger"
+HOST = ""
+# What the worker runs, in order: (name, argv, run only if this path
+# exists in the head, or None).
+DEFAULT_STEPS = [("test", ["make", "test"], None)]
+STEPS = DEFAULT_STEPS
+# {environment variable: directory name} for each slot's build caches.
+CACHES = {}
+DEFAULT_STEP_TIMEOUT_S = 30 * 60
+STEP_TIMEOUT_S = DEFAULT_STEP_TIMEOUT_S
+# Each step's memory limit, in systemd's syntax; FORGE_PR_CHECK_MEMORY_MAX
+# overrides it, and "off" runs the steps without one.
+DEFAULT_MEMORY_MAX = "16G"
+MEMORY_MAX = DEFAULT_MEMORY_MAX
+# Lines of a failed step's output kept in worker.log.
+TAIL_LINES = 40
+# Verdicts older than this are dropped from state.json.
+KEEP = datetime.timedelta(days=21)
+# Failures to prepare a head's worktree before it is given up on.
+MAX_ERRORS = 3
+# Checks run at once; FORGE_PR_CHECK_SLOTS overrides it.
+DEFAULT_SLOTS = 2
+SLOTS = DEFAULT_SLOTS
+# GitHub refuses a status description longer than this.
+DESCRIPTION_MAX = 140
+# The most unposted verdicts one tick posts again, oldest first.
+POST_BATCH = 10
+# Never passed to the steps: they must not act on GitHub, and a test in
+# the head must not find this tool's state or settings. Nor is any
+# variable starting STEP_DROP_PREFIX.
+STEP_DROP_ENV = ("GH_TOKEN", "GITHUB_TOKEN")
+STEP_DROP_PREFIX = "FORGE_"
+CRON_RUN = os.path.join(BIN, "forge-cron-run")
+# What a posting worker starts when it is done: its own cron line.
+NEXT_TICK = ("forge-pr-check", "--post")
+
+
+def configure(project):
+    """Set the module's settings from `project`, a loaded configuration:
+    its repository and default branch, and the `checks` section
+    (`context`, `poster`, `steps`, `caches`, `slots`, `memory_max`,
+    `step_timeout_minutes`), each with the default above."""
+    global REPO_SLUG, MAIN, CONFIG_PATH, STATUS_CONTEXT, POSTER, HOST
+    global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S
+    checks = project.section("checks")
+    REPO_SLUG, MAIN = project.repo, project.default_branch
+    CONFIG_PATH = project.path
+    STATUS_CONTEXT = checks.get("context", DEFAULT_CONTEXT)
+    POSTER = checks.get("poster",
+                        project.section("merge").get("merger", "Merger"))
+    HOST = project.host
+    STEPS = [(s["name"], list(s["run"]), s.get("only_if"))
+             for s in checks["steps"]] if "steps" in checks else DEFAULT_STEPS
+    CACHES = dict(checks.get("caches", {}))
+    SLOTS = checks.get("slots", DEFAULT_SLOTS)
+    MEMORY_MAX = checks.get("memory_max", DEFAULT_MEMORY_MAX)
+    STEP_TIMEOUT_S = 60 * checks.get("step_timeout_minutes",
+                                     DEFAULT_STEP_TIMEOUT_S // 60)
+
+
+def sh(args, cwd=None, env=None, timeout=None):
+    """Run args; a timeout comes back as exit 124, like timeout(1)."""
+    try:
+        return subprocess.run(args, cwd=cwd, env=env, capture_output=True,
+                              text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as err:
+        out = err.stdout if isinstance(err.stdout, str) else ""
+        return subprocess.CompletedProcess(
+            args, 124, out, "timed out after %ss" % timeout)
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+
+
+def iso(when):
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse(stamp):
+    return datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc)
+
+
+def state_lock(state_dir):
+    """Held around every read-modify-write of state.json, which the tick
+    and the worker both write."""
+    return locks.locked(os.path.join(state_dir, "state.lock"))
+
+
+def load(state_dir):
+    try:
+        with open(os.path.join(state_dir, "state.json")) as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        state = {}
+    for key in ("waiting", "results", "refused"):
+        state.setdefault(key, {})
+    return state
+
+
+def save(state_dir, state):
+    """Written whole and renamed into place, so a reader never sees half."""
+    fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".state.")
+    with os.fdopen(fd, "w") as handle:
+        json.dump(state, handle, indent=1, sort_keys=True)
+    os.replace(tmp, os.path.join(state_dir, "state.json"))
+
+
+def log(state_dir, line, when, out=print):
+    """One line to verdicts.log, and to out."""
+    text = "%s %s" % (iso(when), line)
+    with open(os.path.join(state_dir, "verdicts.log"), "a") as handle:
+        handle.write(text + "\n")
+    out(text)
+
+
+try_lock = locks.try_lock
+
+
+def slot_name(name, slot):
+    """`name` for slot 1, which keeps the one-slot names, else name-N."""
+    return name if slot == 1 else "%s-%d" % (name, slot)
+
+
+def lock_path(state_dir, slot=1):
+    return os.path.join(state_dir, slot_name("worker", slot) + ".lock")
+
+
+def slots_from_env(environ=None):
+    """FORGE_PR_CHECK_SLOTS as an int of at least 1, else SLOTS."""
+    value = (os.environ if environ is None else environ).get(
+        "FORGE_PR_CHECK_SLOTS", "")
+    return int(value) if value.isascii() and value.isdigit() \
+        and int(value) >= 1 else SLOTS
+
+
+def running(state_dir, slot=1):
+    """The slot's lock holder line while someone holds it ("" if it
+    hasn't said who), or None when it is free."""
+    return locks.holder(lock_path(state_dir, slot))
+
+
+def mint(run=sh):
+    """POSTER's installation token, or None."""
+    env = dict(os.environ)
+    if CONFIG_PATH:
+        env["FORGE_CONFIG"] = CONFIG_PATH
+    got = run([os.path.join(BIN, "forge-app-token"), "--token", POSTER],
+              env=env)
+    token = (got.stdout or "").strip()
+    return token if got.returncode == 0 and token else None
+
+
+def gh(args, token, run=sh):
+    return run(["gh", "api"] + args, env=dict(os.environ, GH_TOKEN=token))
+
+
+def open_heads(token, run=sh):
+    """[(pr, sha, head repository, draft)] for every open pull request,
+    or None if GitHub could not be read. A head whose repository is gone
+    reports "" for it."""
+    got = gh(["--paginate", "repos/%s/pulls?state=open&per_page=100"
+              % REPO_SLUG, "--jq", '.[] | [.number, .head.sha, '
+              '(.head.repo.full_name // ""), .draft] | @tsv'], token, run)
+    if got.returncode != 0:
+        return None
+    heads = []
+    for line in got.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 4 or not fields[0].isdigit() or len(fields[1]) != 40:
+            return None
+        heads.append((int(fields[0]), fields[1], fields[2],
+                      fields[3] == "true"))
+    return heads
+
+
+def note_heads(state, heads, when, state_dir, out=print, post=None):
+    """Queue each open, non-draft head not yet checked, refuse a foreign
+    one (posting why, once, with post), and forget a waiting head that
+    is no longer any pull request's."""
+    current = set()
+    for pr, sha, repo, draft in heads:
+        if draft or sha in state["results"]:
+            continue
+        if repo != REPO_SLUG:
+            if sha not in state["refused"]:
+                state["refused"][sha] = {"pr": pr, "repo": repo,
+                                         "since": iso(when)}
+                where = repo or "a deleted repository"
+                log(state_dir, "REFUSED #%d %s: head is in %s, not %s"
+                    % (pr, sha[:10], where, REPO_SLUG), when, out)
+                if post is not None:
+                    post(sha, "error", "not run: the head is in %s, and "
+                         "only %s's own branches are run" % (where,
+                                                             REPO_SLUG))
+            continue
+        current.add(sha)
+        state["waiting"].setdefault(sha, {"pr": pr, "since": iso(when)})
+        state["waiting"][sha]["pr"] = pr
+    for sha in list(state["waiting"]):
+        if sha not in current:
+            del state["waiting"][sha]
+
+
+def next_head(state, busy=()):
+    """(sha, pr) of the head that has waited longest, or None. A head
+    that failed to prepare goes behind every head that has not, one
+    that failed MAX_ERRORS times is not picked at all, and nor is one a
+    slot is running (`busy`)."""
+    live = [s for s, w in state["waiting"].items()
+            if w.get("errors", 0) < MAX_ERRORS and s not in busy]
+    if not live:
+        return None
+    sha = min(live, key=lambda s: (state["waiting"][s].get("errors", 0),
+                                   state["waiting"][s]["since"], s))
+    return sha, state["waiting"][sha]["pr"]
+
+
+def prune(state, when):
+    for key, stamp in (("results", "finished"), ("refused", "since")):
+        for sha in list(state[key]):
+            if when - parse(state[key][sha][stamp]) > KEEP:
+                del state[key][sha]
+
+
+def make_poster(run=sh, out=print):
+    """A post(sha, state, description) that writes STATUS_CONTEXT on sha
+    as POSTER's App and returns whether GitHub took it. The token is
+    minted for each post: one minted before a long check could expire."""
+    def post(sha, state, description):
+        token = mint(run)
+        if token is None:
+            out("POST-FAILED %s %s: could not mint %s's token"
+                % (sha[:10], state, POSTER))
+            return False
+        got = gh(["-X", "POST", "repos/%s/statuses/%s" % (REPO_SLUG, sha),
+                  "-f", "state=" + state, "-f", "context=" + STATUS_CONTEXT,
+                  "-f", "description=" + description[:DESCRIPTION_MAX]],
+                 token, run)
+        if got.returncode != 0:
+            out("POST-FAILED %s %s: %s" % (sha[:10], state,
+                                           got.stderr.strip()))
+            return False
+        return True
+    return post
+
+
+def on_host():
+    return " on " + HOST if HOST else ""
+
+
+def final_status(r):
+    """(state, description) for a verdict, naming the first failed step:
+    where its author starts reading."""
+    if r["ok"]:
+        return "success", "green%s in %ds" % (on_host(), r["seconds"])
+    failed = r["failed"]
+    rest = " (then %s)" % ", ".join(failed[1:]) if failed[1:] else ""
+    return "failure", "red%s: %s failed%s" % (on_host(), failed[0], rest)
+
+
+def verdict_word(r):
+    return "green" if r["ok"] else "red(%s)" % ",".join(r["failed"])
+
+
+def repost(state, heads, post, out=print):
+    """Post again, oldest first, up to POST_BATCH verdicts on open heads
+    whose status never reached GitHub."""
+    open_shas = {sha for _, sha, _, _ in heads}
+    todo = sorted((r["finished"], sha) for sha, r in state["results"].items()
+                  if sha in open_shas and r.get("posted") is not True)
+    for _, sha in todo[:POST_BATCH]:
+        r = state["results"][sha]
+        r["posted"] = post(sha, *final_status(r))
+        if r["posted"]:
+            out("POSTED #%d %s: %s" % (r["pr"], sha[:10], verdict_word(r)))
+
+
+def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None):
+    """Start the check detached; see the module docstring on the cron
+    lock. Its output goes to worker.log."""
+    wlog = open(os.path.join(state_dir, "worker.log"), "a")
+    wlog.write("=== %s worker #%d %s slot %d ===\n"
+               % (iso(now_utc()), pr, sha, slot))
+    wlog.flush()
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--worker", sha,
+         "--pr", str(pr), "--state-dir", state_dir, "--slot", str(slot)]
+        + (["--checkout", checkout] if checkout else [])
+        + (["--post"] if posting else []),
+        cwd=state_dir, stdin=subprocess.DEVNULL, stdout=wlog,
+        stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+    wlog.close()
+
+
+def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
+         post=None, slots=None, checkout=None):
+    when = when or now_utc()
+    heads = open_heads(token, run)
+    if heads is None:
+        out("NO-PULLS: could not list %s's open pull requests" % REPO_SLUG)
+        return 2
+    with state_lock(state_dir):
+        state = load(state_dir)
+        note_heads(state, heads, when, state_dir, out, post)
+        if post is not None:
+            repost(state, heads, post, out)
+        prune(state, when)
+        save(state_dir, state)
+        queued = set(state["waiting"])
+    slots = slots or slots_from_env()
+    holders = {slot: running(state_dir, slot) for slot in range(1, slots + 1)}
+    busy = {h.split()[1] for h in holders.values()
+            if h and len(h.split()) == 3 and h.startswith("#")}
+    for slot, holder in holders.items():
+        if holder is None:
+            continue
+        parts = holder.split()
+        if len(parts) == 3 and parts[0].startswith("#"):
+            out("RUNNING %s %s since %s; %d waiting"
+                % (parts[0], parts[1][:10], parts[2], len(queued - busy)))
+        else:
+            out("BUSY: %s is held; %d waiting"
+                % ("the worker lock" if slot == 1
+                   else os.path.basename(lock_path(state_dir, slot)),
+                   len(queued - busy)))
+    free = [slot for slot, holder in holders.items() if holder is None]
+    if not free:
+        return 0
+    with state_lock(state_dir):
+        pick = next_head(load(state_dir), busy)
+    if pick is None:
+        if len(free) == slots:
+            out("IDLE: no open head is waiting" if not queued else
+                "IDLE: %d waiting, each given up on after %d failures"
+                % (len(queued), MAX_ERRORS))
+        return 0
+    sha, pr = pick
+    if checkout:
+        spawn(state_dir, sha, pr, post is not None, free[0], checkout)
+    else:
+        spawn(state_dir, sha, pr, post is not None, free[0])
+    out("STARTED #%d %s%s; %d waiting"
+        % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
+           len(queued - busy) - 1))
+    return 0
+
+
+def prepare(repo, wt, sha, pr, run=sh):
+    """Check pull request pr's head out, clean and detached, at wt,
+    creating that worktree of repo the first time. Returns (status,
+    detail): "ready", "moved" with the head it found instead, or
+    "error"."""
+    if not os.path.exists(os.path.join(wt, ".git")):
+        for args in (["git", "-C", repo, "worktree", "prune"],
+                     ["git", "-C", repo, "worktree", "add", "-q", "--detach",
+                      "--force", wt, "origin/" + MAIN]):
+            got = run(args)
+            if got.returncode != 0:
+                return "error", "%s: %s" % (" ".join(args[3:5]),
+                                            got.stderr.strip())
+    got = run(["git", "-C", wt, "fetch", "-q", "origin",
+               "+refs/pull/%d/head" % pr])
+    if got.returncode != 0:
+        return "error", "fetch pull/%d/head: %s" % (pr, got.stderr.strip())
+    got = run(["git", "-C", wt, "rev-parse", "FETCH_HEAD"])
+    fetched = got.stdout.strip()
+    if got.returncode != 0 or len(fetched) != 40:
+        return "error", "rev-parse FETCH_HEAD: %s" % got.stderr.strip()
+    if fetched != sha:
+        return "moved", fetched
+    for args in (["git", "-C", wt, "checkout", "-q", "--detach", "--force",
+                  sha],
+                 ["git", "-C", wt, "clean", "-q", "-ffdx"]):
+        got = run(args)
+        if got.returncode != 0:
+            return "error", "%s: %s" % (" ".join(args[3:5]),
+                                        got.stderr.strip())
+    return "ready", ""
+
+
+def step_env(state_dir, base=None, slot=1):
+    """The steps' environment: `base` (os.environ) less STEP_DROP_ENV
+    and every FORGE_ setting, with the slot's build caches (CACHES)
+    outside the worktree unless the host set them."""
+    env = {k: v for k, v in (os.environ if base is None else base).items()
+           if k not in STEP_DROP_ENV and not k.startswith(STEP_DROP_PREFIX)}
+    for name, folder in CACHES.items():
+        env.setdefault(name, os.path.join(state_dir, slot_name(folder, slot)))
+    # systemd-run --user finds the user's manager through it, and cron
+    # doesn't set it.
+    env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    return env
+
+
+def memory_max_from_env(environ=None):
+    """The steps' memory limit, or None for none."""
+    value = (os.environ if environ is None else environ).get(
+        "FORGE_PR_CHECK_MEMORY_MAX", MEMORY_MAX).strip()
+    return None if value.lower() in ("", "off") else value
+
+
+def scope_prefix(memory_max):
+    """What runs a command in its own user scope under memory_max."""
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+            "-p", "MemoryMax=" + memory_max, "-p", "MemorySwapMax=0",
+            "-p", "OOMPolicy=continue", "--"]
+
+
+def memory_cap(memory_max, env, run=sh, out=print):
+    """The prefix for each step: scope_prefix(memory_max) once a scope
+    is seen to start, else none, saying so."""
+    if memory_max is None:
+        return []
+    prefix = scope_prefix(memory_max)
+    got = run(prefix + ["true"], env=env, timeout=60)
+    if got.returncode != 0:
+        why = ((got.stderr or "") + (got.stdout or "")).strip()
+        out("UNCAPPED: could not start a user scope (rc=%d%s); the steps "
+            "run without a memory limit"
+            % (got.returncode, ": " + why.splitlines()[-1] if why else ""))
+        return []
+    out("  each step limited to %s" % memory_max)
+    return prefix
+
+
+def tail(text, lines=TAIL_LINES):
+    return "\n".join(text.rstrip("\n").splitlines()[-lines:])
+
+
+def check(wt, env, run=sh, steps=None, prefix=()):
+    """Every step that applies to the head, each run even if an earlier
+    one failed, and none retried, each after `prefix` (memory_cap).
+    Returns (ok, results)."""
+    results = []
+    for name, args, only_if in STEPS if steps is None else steps:
+        if only_if and not os.path.exists(os.path.join(wt, only_if)):
+            continue
+        started = time.monotonic()
+        got = run(list(prefix) + args, cwd=wt, env=env,
+                  timeout=STEP_TIMEOUT_S)
+        results.append({"name": name, "rc": got.returncode,
+                        "seconds": int(time.monotonic() - started),
+                        "tail": tail((got.stdout or "") + (got.stderr or ""))})
+    return all(r["rc"] == 0 for r in results), results
+
+
+def start_next_tick(popen=None, checkout=None):
+    """Start one `forge-pr-check --post` tick through forge-cron-run,
+    detached, and return its argv. Not waited for: the caller is about
+    to exit. The tick uses the default state directory, as cron's do,
+    and the checkout this worker checked from."""
+    popen = popen or subprocess.Popen
+    argv = [CRON_RUN] + list(NEXT_TICK)
+    env = dict(os.environ)
+    if checkout:
+        env["FORGE_CRON_CHECKOUT"] = checkout
+    popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+          stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    return argv
+
+
+def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
+           post=None, chain=None, slot=1, memory_max=None):
+    """Check sha, pull request pr's head, now, in this process, in
+    `slot`, each step limited to memory_max (None: no limit)."""
+    os.makedirs(state_dir, exist_ok=True)
+    started = clock()
+    held = try_lock(lock_path(state_dir, slot),
+                    "#%d %s %s" % (pr, sha, iso(started)))
+    if held is None:
+        out("BUSY: another check holds the worker lock"
+            + ("" if slot == 1 else " for slot %d" % slot))
+        return 0
+    # Whether this head stopped waiting: checked, moved or given up on.
+    # Only then is the next tick started, since a chained tick would at
+    # once pick a head that is still waiting.
+    settled = False
+    wt = os.path.join(state_dir, slot_name("wt", slot))
+    try:
+        status, detail = prepare(repo, wt, sha, pr, run)
+        if status == "moved":
+            with state_lock(state_dir):
+                state = load(state_dir)
+                state["waiting"].pop(sha, None)
+                save(state_dir, state)
+            log(state_dir, "MOVED #%d %s: the head is now %s; not checked"
+                % (pr, sha[:10], detail[:10]), started, out)
+            settled = True
+            return 0
+        if status != "ready":
+            with state_lock(state_dir):
+                state = load(state_dir)
+                entry = state["waiting"].get(sha)
+                errors = 0
+                if entry is not None:
+                    errors = entry["errors"] = entry.get("errors", 0) + 1
+                save(state_dir, state)
+            if errors >= MAX_ERRORS:
+                log(state_dir, "GAVE-UP #%d %s after %d failures to prepare "
+                    "it; the last: %s" % (pr, sha[:10], errors, detail),
+                    started, out)
+                if post is not None:
+                    post(sha, "error", "not run: could not check the head "
+                         "out %d times; the last: %s" % (errors, detail))
+                settled = True
+            else:
+                out("NO-WORKTREE #%d %s: %s" % (pr, sha[:10], detail))
+            return 2
+        if post is not None:
+            post(sha, "pending", "running%s since %s" % (on_host(),
+                                                        iso(started)))
+        env = step_env(state_dir, slot=slot)
+        ok, results = check(wt, env, run,
+                            prefix=memory_cap(memory_max, env, run, out))
+        for r in results:
+            out("  %-20s rc=%-3d %4ds" % (r["name"], r["rc"], r["seconds"]))
+            if r["rc"] != 0:
+                for line in r["tail"].splitlines():
+                    out("    | " + line)
+        finished = clock()
+        with state_lock(state_dir):
+            state = load(state_dir)
+            seen = state["waiting"].pop(sha, {}).get("since", iso(started))
+            record = {
+                "pr": pr, "seen": seen, "started": iso(started),
+                "finished": iso(finished), "ok": ok,
+                "failed": [r["name"] for r in results if r["rc"] != 0],
+                "seconds": sum(r["seconds"] for r in results),
+            }
+            state["results"][sha] = record
+            save(state_dir, state)
+        settled = True
+        log(state_dir, "VERDICT #%d %s: %s waited=%ds ran=%ds"
+            % (pr, sha[:10], verdict_word(record),
+               (started - parse(seen)).total_seconds(), record["seconds"]),
+            finished, out)
+        if post is not None:
+            posted = post(sha, *final_status(record))
+            with state_lock(state_dir):
+                state = load(state_dir)
+                if sha in state["results"]:
+                    state["results"][sha]["posted"] = posted
+                    save(state_dir, state)
+        return 0 if ok else 1
+    finally:
+        held.close()
+        # After the lock is free, so the started tick can take it.
+        if chain is not None and settled:
+            try:
+                out("CHAINED %s" % " ".join(chain()[1:]))
+            except Exception as err:
+                # The verdict is recorded; cron's next tick starts what
+                # this could not.
+                out("CHAIN-FAILED: %s: %s" % (type(err).__name__, err))
+
+
+def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(
+        prog="forge-pr-check", description=__doc__.splitlines()[0])
+    parser.add_argument("--worker", metavar="SHA",
+                        help="check SHA now, in this process")
+    parser.add_argument("--pr", type=int,
+                        help="with --worker: the pull request SHA heads")
+    parser.add_argument("--slot", type=int, default=1,
+                        help="with --worker: the slot to run in (default 1)")
+    parser.add_argument("--post", action="store_true",
+                        help="post each verdict as the commit status")
+    parser.add_argument("--state-dir", default=None,
+                        help="where the queue, the verdicts and the logs "
+                        "live (default ~/.local/state/agent-forge/"
+                        "<project>/pr-check)")
+    parser.add_argument("--checkout", default=environ.get(
+        "FORGE_CRON_CHECKOUT"), help="the checkout kept at the default "
+        "branch (default $FORGE_CRON_CHECKOUT)")
+    args = parser.parse_args(argv)
+    if args.worker and args.pr is None:
+        parser.error("--worker needs --pr")
+    if not args.checkout:
+        out("NO-REPO: no --checkout, and FORGE_CRON_CHECKOUT is not set")
+        return 2
+    got = run(["git", "-C", os.path.expanduser(args.checkout), "rev-parse",
+               "--show-toplevel"])
+    repo = (got.stdout or "").strip()
+    if got.returncode != 0 or not repo:
+        out("NO-REPO: %s is not a git checkout" % args.checkout)
+        return 2
+    try:
+        project = config.load(os.path.join(repo, config.CONFIG_NAME))
+    except config.ConfigError as err:
+        out("NO-CONFIG: %s" % err)
+        return 2
+    configure(project)
+    state_dir = args.state_dir or locks.state_dir(project.name, "pr-check",
+                                                  environ)
+    os.makedirs(state_dir, exist_ok=True)
+    post = make_poster(run, out) if args.post else None
+    if args.worker:
+        chain = (lambda: start_next_tick(checkout=repo)) if args.post else None
+        return worker(repo, state_dir, args.worker, args.pr, run, out,
+                      post=post, chain=chain, slot=args.slot,
+                      memory_max=memory_max_from_env(environ))
+    token = mint(run)
+    if token is None:
+        out("NO-TOKEN: could not mint %s's token" % POSTER)
+        return 2
+    return tick(state_dir, token, run, spawn, out, post=post,
+                slots=slots_from_env(environ), checkout=repo)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

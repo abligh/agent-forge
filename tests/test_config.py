@@ -144,6 +144,20 @@ class Check(unittest.TestCase):
             "merge.gate[3] must be a non-empty list of strings",
             "merge.merger 'Nobody' is not in machinery"])
 
+    def test_checks(self):
+        self.assertEqual(self.problems(checks={
+            "poster": "Nobody", "slots": 0, "memory_max": 16,
+            "steps": [{"name": "a", "run": ["make"]}, {"run": []},
+                      {"name": "b", "run": ["x"], "when": "y"}],
+            "caches": {"CARGO_TARGET_DIR": "../up"}}), [
+            "checks.memory_max must be a string",
+            "checks.slots must be at least 1",
+            "checks.steps[1]: missing 'name'",
+            "checks.steps[1].run must be a non-empty list of strings",
+            "checks.steps[2]: unknown key 'when'",
+            "checks.caches must map variables to directory names",
+            "checks.poster 'Nobody' is no App in the configuration"])
+
     def test_host_keys_are_strings(self):
         self.assertEqual(
             self.problems(host_settings={"host_keys": ["a", 1]}),
