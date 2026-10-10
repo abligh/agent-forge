@@ -47,6 +47,7 @@ TOP = {
     "identity": (dict, False),
     "host_settings": (dict, False),
     "merge": (dict, False),
+    "receiver": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
@@ -65,6 +66,14 @@ STEP = {"name": str, "run": list, "only_if": str}
 LABELS = {"owner_prefix": str, "status_prefix": str,
           "waiting_on_owner": str, "waiting_external": str}
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
+RECEIVER = {"address": str, "port": int, "path": str, "secret_file": str,
+            "max_body": int, "ticks": dict, "route": list}
+# The webhook events forge-receiver reads; `receiver.ticks` keys are
+# these. bin/forge-receiver says when each one gives a tool work.
+RECEIVER_EVENTS = ("issues", "issue_comment", "pull_request",
+                   "pull_request_review", "status", "push")
+# The receiver reads at most eight digits of Content-Length.
+RECEIVER_MAX_BODY = 99999999
 HOST_FILE = {"from": str, "to": str, "mode": str, "json": bool}
 # docs is shared by several tools, some not here yet, so only the keys
 # known are checked; another is left to its tool.
@@ -216,6 +225,7 @@ def check(data):
             and poster not in data.get("agents", {}):
         problems.append("checks.poster %r is no App in the configuration"
                         % poster)
+    _check_receiver(data.get("receiver", {}), problems)
     settings = data.get("host_settings", {})
     if _fields("host_settings", settings, HOST_SETTINGS, problems):
         for i, entry in enumerate(settings.get("files", [])):
@@ -277,6 +287,50 @@ def check(data):
     for name in sorted(clash):
         problems.append("%s is both an agent and machinery" % name)
     return problems
+
+
+def _argv(value):
+    """Whether `value` is a non-empty list of strings whose first names a
+    tool as forge-cron-run takes one: a bare name, no path."""
+    return (isinstance(value, list) and value
+            and all(isinstance(a, str) and a for a in value)
+            and "/" not in value[0] and not value[0].startswith("."))
+
+
+def _check_receiver(receiver, problems):
+    if not _fields("receiver", receiver, RECEIVER, problems):
+        return
+    port = receiver.get("port")
+    if _is(port, int) and not 1 <= port <= 65535:
+        problems.append("receiver.port must be from 1 to 65535")
+    path = receiver.get("path")
+    if isinstance(path, str) and not path.startswith("/"):
+        problems.append("receiver.path must start with /")
+    cap = receiver.get("max_body")
+    if _is(cap, int) and not 1 <= cap <= RECEIVER_MAX_BODY:
+        problems.append("receiver.max_body must be from 1 to %d"
+                        % RECEIVER_MAX_BODY)
+    for event, tools in receiver.get("ticks", {}).items():
+        where = "receiver.ticks.%s" % event
+        if event.startswith("_"):
+            continue
+        if event not in RECEIVER_EVENTS:
+            problems.append("%s: not an event the receiver reads (%s)"
+                            % (where, ", ".join(RECEIVER_EVENTS)))
+            continue
+        if not isinstance(tools, list):
+            problems.append("%s must be a list" % where)
+            continue
+        for i, tool in enumerate(tools):
+            if not (_argv([tool]) if isinstance(tool, str) else _argv(tool)):
+                problems.append("%s[%d] must be a tool's name or a non-empty "
+                                "list of strings starting with one"
+                                % (where, i))
+    route = receiver.get("route")
+    if isinstance(route, list) and not (
+            _argv(route) and any("{items}" in a for a in route)):
+        problems.append("receiver.route must be a non-empty list of strings "
+                        "starting with a tool's name, with {items} in one")
 
 
 class Project:

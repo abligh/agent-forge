@@ -52,6 +52,16 @@
     ],
     "host_keys": ["skipWorkflowUsageWarning"]
   },
+  "receiver": {
+    "address": "0.0.0.0", "port": 8789, "path": "/hook",
+    "secret_file": "~/.config/agent-forge/widget/receiver-secret",
+    "max_body": 1048576,
+    "ticks": {"pull_request": [["forge-pr-check", "--post"]],
+              "pull_request_review": ["forge-merger"],
+              "status": ["forge-merger"],
+              "push": ["forge-merger"]},
+    "route": ["forge-router", "--send", "--only", "{items}"]
+  },
   "relay": {"url": "http://127.0.0.1:8788",
             "token_file": "~/.config/xmpp-webhook-relay/token",
             "remind_seconds": 7200,

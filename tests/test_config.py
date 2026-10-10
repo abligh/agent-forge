@@ -166,6 +166,40 @@ class Check(unittest.TestCase):
             "relay.url must be a string",
             "relay.remind_seconds must be at least 1"])
 
+    def test_receiver(self):
+        self.assertEqual(self.problems(receiver={
+            "port": 0, "path": "hook", "max_body": 10 ** 8, "colour": 1,
+            "secret_file": 5, "_note": "a comment"}), [
+            "receiver: unknown key 'colour'",
+            "receiver.secret_file must be a string",
+            "receiver.port must be from 1 to 65535",
+            "receiver.path must start with /",
+            "receiver.max_body must be from 1 to 99999999"])
+        self.assertEqual(self.problems(receiver={"port": True}),
+                         ["receiver.port must be an integer"])
+
+    def test_receiver_ticks(self):
+        self.assertEqual(self.problems(receiver={"ticks": {
+            "push": ["forge-merger", ["widget-pr-check", "--post"]],
+            "_comment": "x",
+            "release": ["forge-merger"],
+            "status": "forge-merger",
+            "issues": ["", [], ["tools/x"], [".x"], [1], 2]}}), [
+            "receiver.ticks.release: not an event the receiver reads "
+            "(issues, issue_comment, pull_request, pull_request_review, "
+            "status, push)",
+            "receiver.ticks.status must be a list"] + [
+            "receiver.ticks.issues[%d] must be a tool's name or a non-empty "
+            "list of strings starting with one" % i for i in range(6)])
+
+    def test_receiver_route(self):
+        for route in (["widget-router"], [], ["tools/r", "{items}"], [1]):
+            self.assertEqual(self.problems(receiver={"route": route}), [
+                "receiver.route must be a non-empty list of strings "
+                "starting with a tool's name, with {items} in one"], route)
+        self.assertEqual(self.problems(receiver={
+            "route": ["r", "--only={items}"]}), [])
+
     def test_host_keys_are_strings(self):
         self.assertEqual(
             self.problems(host_settings={"host_keys": ["a", 1]}),

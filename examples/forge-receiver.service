@@ -1,0 +1,32 @@
+# forge-receiver: GitHub webhook deliveries -> the tools they give work.
+# A systemd user unit template, one per project on a host. Replace the
+# placeholders, then:
+#
+#   cp forge-receiver.service ~/.config/systemd/user/PROJECT-receiver.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now PROJECT-receiver
+#
+#   AGENT_FORGE   where agent-forge is installed, such as
+#                 %h/.local/share/agent-forge
+#   CRON_CHECKOUT the project's cron checkout, the one forge-cron-run
+#                 keeps at the default branch, such as %h/widget-cron
+#   PROJECT       the project's name, to tell its unit from others'
+#
+# It runs the installed agent-forge, at its pinned version, and reads
+# the project's `receiver` section from the cron checkout at start: a
+# change to either takes effect on
+# `systemctl --user restart PROJECT-receiver`. Its log is the journal:
+# journalctl --user -u PROJECT-receiver. The runs it starts log where
+# cron's do.
+[Unit]
+Description=PROJECT webhook receiver
+After=network-online.target
+
+[Service]
+Environment=FORGE_CRON_CHECKOUT=CRON_CHECKOUT
+ExecStart=AGENT_FORGE/bin/forge-receiver
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

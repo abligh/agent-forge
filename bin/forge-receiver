@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""Take GitHub webhook deliveries; tick the tools an event gives work, and
+route the item it names.
+
+Why: the scheduled jobs (the Merger, the build check, the router) run
+every few minutes from cron. This runs them within seconds of the event
+that gave them work, so a merge, a build or a wake follows its cause
+rather than the next tick. It never decides anything itself: it only
+says which tool to tick and which item to look at. Losing it loses
+latency, not merges or wakes, because cron's runs still happen.
+
+    FORGE_CRON_CHECKOUT=~/widget-cron forge-receiver [--port N]
+
+Its settings are the `receiver` section of the project's configuration,
+read from the cron checkout (`$FORGE_CRON_CHECKOUT`, or `--checkout`)
+once, at start; a change takes effect on a restart.
+docs/config.md lists the keys. It listens on `address`:`port` (default
+127.0.0.1:8789; `$FORGE_RECEIVER_PORT` or `--port` override the port),
+at `path` (default `/hook`), usually behind a TLS proxy. It faces the
+internet, so a delivery is checked in this order, and nothing is parsed
+before the signature:
+
+1. `POST` to `path`, or `404` / `405`;
+2. a `Content-Length` of at most `max_body` (default 1 MiB), or `411` /
+   `413`, before the body is read. Only ASCII digits count, and at most
+   eight of them: `str.isdigit()` takes "²", which `int()` refuses, and
+   a bound on the digits bounds the work `int()` does;
+3. `X-Hub-Signature-256`, an HMAC-SHA256 of the raw bytes under the
+   secret, compared with `hmac.compare_digest`, or `401`.
+   `X-Hub-Signature` (SHA-1) is never accepted;
+4. an `X-GitHub-Delivery` seen in the last DEDUPE_KEEP is answered
+   `202` and dropped;
+5. what the event gives work, below. Anything else, `ping` included, is
+   answered `202` and ignored.
+
+**Which tools an event ticks** is the table `ticks`: GitHub event name
+to a list of tools, each a name or an argument list. An event gives its
+tools work only when:
+
+* `pull_request`: the action leaves a new head for the build check:
+  `opened`, `reopened`, `synchronize` or `ready_for_review`;
+* `pull_request_review`: an approval was submitted;
+* `status`: the build check's status (`checks.context`) went `success`;
+* `push`: to the default branch, after which an approved head is
+  behind it and needs updating;
+* `issues`, `issue_comment`: any delivery naming an item.
+
+**Routing.** With `route` set (an argument list with `{items}` in it),
+the item each `issues`, `issue_comment`, `pull_request` and
+`pull_request_review` event names, an `int`, is routed too. A `status`
+for `checks.context` names a commit, which the worker maps to its open
+pull requests with one API call as the Merger's App (`merge.merger`);
+other contexts are ignored. Without `route`, nothing is routed and no
+token is minted.
+
+It answers `202` and never runs anything in the request. A worker waits
+DEBOUNCE_S after a key's first event, so a burst on one item makes one
+run, then ticks each tool due, in the order the table first names them,
+and then the router once with `{items}` as `N[,N]`. Each runs as
+
+    forge-cron-run TOOL [ARGS...]
+
+with an argument list, never a shell, and `$FORGE_CRON_CHECKOUT` set:
+from the reviewed checkout, under the cron jobs' locks, logging where
+cron's runs log. A `forge-` tool is this installation's, anything else
+the project's `tools/`. An extra tick changes nothing but timing: the
+Merger still makes one update or merge per tick, and the router's own
+lock and state keep it from waking a turn twice.
+
+The secret is read once, at start, from `secret_file` (default
+`~/.config/agent-forge/<project>/receiver-secret`;
+`$FORGE_RECEIVER_SECRET_FILE` overrides it): the webhook's secret, mode
+0600. It refuses to start if the file is missing, empty or readable by
+anyone else. The secret is never printed.
+
+**Seams, not yet built.** De-duplication is in memory (`Seen`), so a
+restart forgets it; one that survives a restart would keep its IDs in
+the state directory (`agent_forge.locks.state_dir(project,
+"receiver")`). A sweep that asks GitHub to redeliver what was missed
+would hand each recovered delivery to `accept`, which does everything
+after the signature.
+
+Exit 2 when it cannot start (no checkout or configuration, no secret,
+the port taken); otherwise it runs until stopped.
+"""
+
+import argparse
+import collections
+import hashlib
+import hmac
+import http.server
+import json
+import os
+import re
+import stat
+import sys
+import threading
+import time
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(BIN))
+from agent_forge import config, github as forge_github, proc  # noqa: E402
+
+DEDUPE_KEEP = 5000
+DEBOUNCE_S = 20
+DEFAULT_CONTEXT = "vm/build-and-test"
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# The `pull_request` actions that leave a head for the build check.
+NEW_HEAD_ACTIONS = {"opened", "reopened", "synchronize", "ready_for_review"}
+# ASCII digits only: str.isdigit() takes "²", which int() refuses. Eight
+# is enough for any cap the configuration allows and bounds the work
+# int() does.
+LENGTH_RE = re.compile(r"[0-9]{1,8}")
+# The events whose item is read from the payload, and where.
+ITEM_OF = {
+    "issues": "issue",
+    "issue_comment": "issue",
+    "pull_request": "pull_request",
+    "pull_request_review": "pull_request",
+}
+
+# Set from the project's configuration by `configure`; these are the
+# defaults it starts from.
+REPO_SLUG = ""
+MAIN_REF = "refs/heads/main"
+STATUS_CONTEXT = DEFAULT_CONTEXT
+# The App the commit lookup reads as.
+ACT_AS = "Merger"
+ADDRESS = "127.0.0.1"
+PORT = 8789
+PATH = "/hook"
+MAX_BODY = 1 << 20
+SECRET_FILE = ""
+# {event: [argv tuple, ...]}, and every argv once, in the order the
+# table first names it: the order a run ticks them.
+TICKS = {}
+TOOL_ORDER = []
+# The router's argument list, with "{items}" to fill; None to route
+# nothing.
+ROUTE = None
+
+
+def configure(project):
+    """Set the module's settings from `project`, a loaded configuration:
+    its `receiver` section, `checks.context`, `merge.merger`, the
+    repository and its default branch."""
+    global REPO_SLUG, MAIN_REF, STATUS_CONTEXT, ACT_AS, ADDRESS, PORT
+    global PATH, MAX_BODY, SECRET_FILE, TICKS, TOOL_ORDER, ROUTE
+    receiver = project.section("receiver")
+    REPO_SLUG = project.repo
+    MAIN_REF = "refs/heads/" + project.default_branch
+    STATUS_CONTEXT = project.section("checks").get("context",
+                                                   DEFAULT_CONTEXT)
+    ACT_AS = project.section("merge").get("merger", "Merger")
+    ADDRESS = receiver.get("address", "127.0.0.1")
+    PORT = receiver.get("port", 8789)
+    PATH = receiver.get("path", "/hook")
+    MAX_BODY = receiver.get("max_body", 1 << 20)
+    SECRET_FILE = receiver.get(
+        "secret_file", "~/.config/agent-forge/%s/receiver-secret"
+        % project.name)
+    TICKS, TOOL_ORDER = {}, []
+    for event, tools in receiver.get("ticks", {}).items():
+        if event.startswith("_"):
+            continue
+        TICKS[event] = [(t,) if isinstance(t, str) else tuple(t)
+                        for t in tools]
+        TOOL_ORDER += [t for t in TICKS[event] if t not in TOOL_ORDER]
+    ROUTE = tuple(receiver["route"]) if receiver.get("route") else None
+
+
+def expand(path, environ):
+    """`path` with a leading ~ made `environ`'s HOME."""
+    if path == "~" or path.startswith("~/"):
+        return (environ.get("HOME") or os.path.expanduser("~")) + path[1:]
+    return path
+
+
+def load_secret(path):
+    """The secret's bytes, or raise ValueError saying why not. Never
+    includes the secret in the message."""
+    try:
+        info = os.stat(path)
+    except OSError as err:
+        raise ValueError("%s: %s" % (path, err.strerror))
+    if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise ValueError("%s is readable by others (mode %o); chmod 600"
+                         % (path, stat.S_IMODE(info.st_mode)))
+    with open(path, "rb") as handle:
+        secret = handle.read().strip()
+    if not secret:
+        raise ValueError("%s is empty" % path)
+    return secret
+
+
+def signed(secret, body, header):
+    """True when `header` is `sha256=<hex>` of `body` under `secret`."""
+    if not header or not header.startswith("sha256="):
+        return False
+    want = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(want.encode("ascii"),
+                               header.encode("utf-8", "replace"))
+
+
+def number(value):
+    """`value` if it is a positive int (and not a bool), else None."""
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def ticks(event):
+    """The debouncer keys for the tools `event` ticks."""
+    return [("tool", argv) for argv in TICKS.get(event, ())]
+
+
+def gives_work(event, payload):
+    """Whether an item event gives its tools work: see the module doc."""
+    action = payload.get("action")
+    if event == "pull_request":
+        return action in NEW_HEAD_ACTIONS
+    if event == "pull_request_review":
+        review = payload.get("review")
+        return (action == "submitted" and isinstance(review, dict)
+                and review.get("state") == "approved")
+    return True
+
+
+def keys_for(event, payload):
+    """(keys, why): the debouncer keys an event gives work, ("item", N),
+    ("commit", sha) or ("tool", argv), and, when there are none, why."""
+    if not isinstance(payload, dict):
+        return [], "not an object"
+    if event in ITEM_OF:
+        item = payload.get(ITEM_OF[event])
+        n = number(item.get("number")) if isinstance(item, dict) else None
+        if not n:
+            return [], "no item number"
+        keys = [("item", n)] if ROUTE else []
+        if gives_work(event, payload):
+            keys += ticks(event)
+        return keys, None if keys else "nothing to route or tick"
+    if event == "status":
+        if payload.get("context") != STATUS_CONTEXT:
+            return [], "not %s" % STATUS_CONTEXT
+        sha = payload.get("sha")
+        if not (isinstance(sha, str) and SHA_RE.match(sha)):
+            return [], "no commit"
+        keys = [("commit", sha)] if ROUTE else []
+        if payload.get("state") == "success":
+            keys += ticks(event)
+        return keys, None if keys else "nothing to route or tick"
+    if event == "push":
+        if payload.get("ref") != MAIN_REF:
+            return [], "a push to %s" % (payload.get("ref") or "-")
+        keys = ticks(event)
+        return keys, None if keys else "nothing ticks on a push"
+    return [], "event %s" % (event or "-")
+
+
+class Seen:
+    """The last `keep` delivery IDs, oldest dropped first. In memory: the
+    seam for de-duplication that survives a restart."""
+
+    def __init__(self, keep=DEDUPE_KEEP):
+        self.keep = keep
+        self.ids = collections.OrderedDict()
+        self.lock = threading.Lock()
+
+    def first(self, delivery):
+        """True the first time `delivery` is offered."""
+        with self.lock:
+            if delivery in self.ids:
+                return False
+            self.ids[delivery] = None
+            while len(self.ids) > self.keep:
+                self.ids.popitem(last=False)
+            return True
+
+
+class Debouncer:
+    """Collects keys; `due` hands back those whose first event is
+    `wait_s` old."""
+
+    def __init__(self, wait_s=DEBOUNCE_S, clock=time.monotonic):
+        self.wait_s = wait_s
+        self.clock = clock
+        self.pending = {}
+        self.cond = threading.Condition()
+
+    def add(self, kind, value):
+        with self.cond:
+            self.pending.setdefault((kind, value), self.clock())
+            self.cond.notify()
+
+    def due(self):
+        """Remove and return the keys whose wait is over, oldest first."""
+        with self.cond:
+            now = self.clock()
+            ready = sorted((k for k, t in self.pending.items()
+                            if now - t >= self.wait_s),
+                           key=self.pending.get)
+            for key in ready:
+                del self.pending[key]
+            return ready
+
+    def wait(self, timeout):
+        with self.cond:
+            self.cond.wait(timeout)
+
+
+def shown(kind, value):
+    """A key's value as a log line shows it."""
+    if kind == "commit":
+        return value[:10]
+    if kind == "tool":
+        return " ".join(value)
+    return value
+
+
+def accept(event, delivery, body, seen, debouncer):
+    """Everything after the signature, for a delivery known to be
+    GitHub's: (status, answer, log note). A redelivery sweep would
+    call this too."""
+    if delivery and not seen.first(delivery):
+        return 202, "duplicate", "duplicate"
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return 400, "not JSON", "not JSON"
+    keys, why = keys_for(event, payload)
+    if not keys:
+        return 202, "ignored", "ignored (%s)" % why
+    for kind, value in keys:
+        debouncer.add(kind, value)
+    return 202, "accepted", ", ".join("%s %s" % (kind, shown(kind, value))
+                                      for kind, value in keys)
+
+
+class Lookup:
+    """GitHub's REST API as the Merger's App, for the one lookup a status
+    event needs; one place tests replace."""
+
+    def __init__(self, token, call=forge_github.api_call):
+        self.token = token
+        self.call = call
+
+    def api(self, path):
+        status, body = forge_github.rest(self.token, "GET", "/" + path,
+                                         call=self.call)
+        if status != 200:
+            raise RuntimeError("GET %s: %s" % (path, status or "no answer"))
+        return body
+
+
+def prs_of(sha, github):
+    """The open pull requests whose head is `sha`."""
+    got = github.api("repos/%s/commits/%s/pulls" % (REPO_SLUG, sha))
+    pages = got if isinstance(got, list) else [got]
+    return sorted({n for pr in pages if isinstance(pr, dict)
+                   and pr.get("state") == "open"
+                   and (pr.get("head") or {}).get("sha") == sha
+                   for n in [number(pr.get("number"))] if n})
+
+
+def items_of(keys, github_for, out):
+    """The item numbers `keys` name. A commit is looked up only when
+    there is one; a failed lookup is reported and dropped, and cron's
+    sweep covers it."""
+    items = {value for kind, value in keys if kind == "item"}
+    commits = [value for kind, value in keys if kind == "commit"]
+    if commits:
+        github = github_for()
+        if github is None:
+            out("NO-TOKEN: could not mint %s's token; %d commit(s) left to "
+                "cron" % (ACT_AS, len(commits)))
+            return sorted(items)
+        for sha in commits:
+            try:
+                found = prs_of(sha, github)
+            except (RuntimeError, ValueError) as err:
+                out("LOOKUP-FAILED: %s: %s" % (sha[:10], err))
+                continue
+            out("commit %s: %s" % (sha[:10], ", ".join(
+                "#%d" % n for n in found) or "no open pull request"))
+            items.update(found)
+    return sorted(items)
+
+
+def cron_command(argv, here=BIN):
+    """`argv` as forge-cron-run runs it."""
+    return [os.path.join(here, "forge-cron-run")] + list(argv)
+
+
+def router_command(items, here=BIN):
+    numbers = ",".join(str(n) for n in items)
+    return cron_command([a.replace("{items}", numbers) for a in ROUTE], here)
+
+
+def route(keys, github_for, out, run=proc.sh, env=None):
+    """Tick each tool `keys` names, in TOOL_ORDER, then route the items.
+    The router's exit status, or None when there were none."""
+    tools = {value for kind, value in keys if kind == "tool"}
+    for argv in [t for t in TOOL_ORDER if t in tools]:
+        out("ticking %s" % " ".join(argv))
+        got = run(cron_command(argv), env=env)
+        out("%s exit %d" % (argv[0], got.returncode))
+    if not ROUTE:
+        return None
+    items = items_of([k for k in keys if k[0] != "tool"], github_for, out)
+    if not items:
+        return None
+    out("routing %s" % ", ".join("#%d" % n for n in items))
+    got = run(router_command(items), env=env)
+    out("%s exit %d" % (ROUTE[0], got.returncode))
+    return got.returncode
+
+
+def worker(debouncer, github_for, out, stop, run=proc.sh, env=None):
+    while not stop.is_set():
+        keys = debouncer.due()
+        if keys:
+            try:
+                route(keys, github_for, out, run, env)
+            except Exception as err:  # the worker must outlive one bad run
+                out("ROUTE-FAILED: %s" % err)
+            continue
+        debouncer.wait(1)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "forge-receiver"
+    sys_version = ""
+    # Seconds a connection may sit idle, so a slow sender can't hold a
+    # thread for ever.
+    timeout = 10
+    # Set on the class by make_server.
+    secret = b""
+    seen = None
+    debouncer = None
+    out = print
+
+    def answer(self, code, text):
+        body = (text + "\n").encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass  # each delivery is reported once, by `note`
+
+    def note(self, code, why):
+        self.out("%d %s %s: %s" % (
+            code, self.headers.get("X-GitHub-Event", "-"),
+            self.headers.get("X-GitHub-Delivery", "-"), why))
+
+    def refuse(self, code, why):
+        self.note(code, why)
+        self.answer(code, why)
+
+    def do_GET(self):
+        self.refuse(404 if self.path != PATH else 405, "not here")
+
+    do_PUT = do_DELETE = do_PATCH = do_GET
+
+    def do_POST(self):
+        if self.path != PATH:
+            return self.refuse(404, "not here")
+        length = self.headers.get("Content-Length")
+        if length is None or not LENGTH_RE.fullmatch(length):
+            if length and re.fullmatch(r"[0-9]+", length):
+                return self.refuse(413, "too large")  # over 8 digits
+            return self.refuse(411, "length required")
+        if int(length) > MAX_BODY:
+            return self.refuse(413, "too large")
+        body = self.rfile.read(int(length))
+        if not signed(self.secret, body,
+                      self.headers.get("X-Hub-Signature-256")):
+            return self.refuse(401, "bad signature")
+        code, text, why = accept(self.headers.get("X-GitHub-Event"),
+                                 self.headers.get("X-GitHub-Delivery", ""),
+                                 body, self.seen, self.debouncer)
+        self.note(code, why)
+        self.answer(code, text)
+
+
+def make_server(port, secret, out=print, debouncer=None, seen=None,
+                host=None):
+    handler = type("BoundHandler", (Handler,), {
+        "secret": secret, "seen": seen or Seen(),
+        "debouncer": debouncer or Debouncer(), "out": staticmethod(out)})
+    server = http.server.ThreadingHTTPServer(
+        (ADDRESS if host is None else host, port), handler)
+    server.daemon_threads = True
+    return server
+
+
+def main(argv=None, out=None, environ=None, run=proc.sh):
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(
+        prog="forge-receiver", description=__doc__.splitlines()[0])
+    parser.add_argument("--port", type=int, default=None,
+                        help="the port (default $FORGE_RECEIVER_PORT, else "
+                        "receiver.port)")
+    parser.add_argument("--checkout", default=environ.get(
+        "FORGE_CRON_CHECKOUT"), help="the checkout kept at the default "
+        "branch (default $FORGE_CRON_CHECKOUT)")
+    args = parser.parse_args(argv)
+    if out is None:
+        def out(line):
+            print(line, flush=True)
+    if not args.checkout:
+        out("NO-REPO: no --checkout, and FORGE_CRON_CHECKOUT is not set")
+        return 2
+    checkout = os.path.abspath(expand(args.checkout, environ))
+    try:
+        project = config.load(os.path.join(checkout, config.CONFIG_NAME))
+    except config.ConfigError as err:
+        out("NO-CONFIG: %s" % err)
+        return 2
+    configure(project)
+    try:
+        secret = load_secret(expand(environ.get(
+            "FORGE_RECEIVER_SECRET_FILE") or SECRET_FILE, environ))
+    except ValueError as err:
+        out("NO-SECRET: %s" % err)
+        return 2
+    port = args.port
+    if port is None:
+        port = int(environ.get("FORGE_RECEIVER_PORT") or PORT)
+    debouncer = Debouncer()
+    try:
+        server = make_server(port, secret, out, debouncer)
+    except OSError as err:
+        out("NO-PORT: %s:%d: %s" % (ADDRESS, port, err.strerror))
+        return 2
+
+    def github_for():
+        try:
+            return Lookup(forge_github.token(project, ACT_AS))
+        except forge_github.MintError:
+            return None
+
+    env = dict(environ, FORGE_CRON_CHECKOUT=checkout)
+    stop = threading.Event()
+    threading.Thread(target=worker, args=(debouncer, github_for, out, stop,
+                                          run, env), daemon=True).start()
+    out("listening on %s:%d%s" % (ADDRESS, port, PATH))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
