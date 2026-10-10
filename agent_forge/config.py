@@ -74,8 +74,9 @@ LABELS = {"owner_prefix": str, "status_prefix": str,
           "waiting_on_owner": str, "waiting_external": str}
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
-ROUTER = {"rules": str, "idle_offer": dict}
+ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict}
 IDLE_OFFER = {"idle_minutes": int, "report_to": str}
+MERGE_NOTICE = {"window_minutes": int}
 RECEIVER = {"address": str, "port": int, "path": str, "secret_file": str,
             "max_body": int, "ticks": dict, "route": list}
 # The webhook events forge-receiver reads; `receiver.ticks` keys are
@@ -190,9 +191,12 @@ def check(data):
     _fields("naming", data.get("naming", {}), NAMING, problems)
     _fields("identity", data.get("identity", {}), IDENTITY, problems)
     router = data.get("router", {})
-    if _fields("router", router, ROUTER, problems) and \
-            isinstance(router.get("idle_offer"), dict):
-        _check_idle_offer(router["idle_offer"], data["agents"], problems)
+    if _fields("router", router, ROUTER, problems):
+        if isinstance(router.get("idle_offer"), dict):
+            _check_idle_offer(router["idle_offer"], data["agents"],
+                              problems)
+        if isinstance(router.get("merge_notice"), dict):
+            _check_merge_notice(router["merge_notice"], problems)
     merge = data.get("merge", {})
     if _fields("merge", merge, MERGE, problems):
         for i, argv in enumerate(merge.get("gate", [])):
@@ -371,6 +375,16 @@ def _check_idle_offer(offer, agents, problems):
             offer["report_to"] not in agents:
         problems.append("%s.report_to: %r is not an agent"
                         % (where, offer["report_to"]))
+
+
+def _check_merge_notice(notice, problems):
+    """router.merge_notice: how far back a run looks for merges to tell
+    their authors of."""
+    where = "router.merge_notice"
+    _fields(where, notice, MERGE_NOTICE, problems)
+    if _is(notice.get("window_minutes"), int) and \
+            notice["window_minutes"] < 1:
+        problems.append("%s.window_minutes must be at least 1" % where)
 
 
 def _check_receiver(receiver, problems):

@@ -46,7 +46,7 @@ starts with `_` is a comment, at any level.
 | `checks` | no | The build check, `forge-pr-check`; see below. |
 | `labels` | no | The labels tools read: `owner_prefix` (default `Owner:`; `Owner:<Name>` says whose an item is), `status_prefix` (default `Status:`), `waiting_on_owner` (default `Status:waiting-owner`: the owner's turn) and `waiting_external` (default `Status:waiting-external`: nobody's). |
 | `relay` | no | Where `forge-router` posts wakes, and `forge-merger` its stall messages (`merge.stall_alert`): `url`, the xmpp-webhook-relay's base (default `http://127.0.0.1:8788`), `token_file`, its environment file holding `WEBHOOK_TOKEN` (default `~/.config/xmpp-webhook-relay/token`), `remind_seconds`, how long before a turn is woken again (default 7200), and `room`, the room the agents share. |
-| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer (below). Every key is checked. |
+| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, and `merge_notice` their merge notice (both below). Every key is checked. |
 | `closing_keywords` | no | How `forge-closing-keywords` words a refusal: `enforced_by`, what refuses a pull request it fails (default `the Merger`), and `rerun`, how to run it again once GitHub's `closingIssuesReferences` catches up with a body edit (default `run the check again (the Merger does, on its next tick)`). A project that runs it in CI names its workflow and `gh run rerun --failed <run>`. The issues it judges are `repo`'s, and its default range starts at `default_branch`. The Merger runs it as a gate: `["forge-closing-keywords", "--pr", "{pr}", "--include-subject"]`. |
 
 ### An agent
@@ -180,6 +180,23 @@ be read, or isn't complete, makes nobody idle. Off without the key;
 | --- | --- | --- |
 | `idle_minutes` | `10` | How long an agent's directory entry must have been `idle` before it is offered anything: long enough to skip the pause between two turns of one task. |
 | `report_to` | none | The agent told about a developer (not a reviewer) that is idle with nothing it can act on, such as whoever plans the work. Not told about itself. Without it, nobody is told. |
+
+### `router.merge_notice`
+
+No rule wakes an author when their pull request merges: it is closed,
+so it is nobody's turn. An agent waiting on its own work to land then
+waits until someone tells it. With `merge_notice`, each router run
+that isn't `--only`'s reads the pull requests merged in the last
+`window_minutes`, and tells each agent that wrote one, once: that it
+merged, which open issues it leaves with nothing blocking them, and
+the author's oldest issue it can act on (as the idle offer reads it).
+Merges that can't be read are not taken as none. Off without the key;
+`{}` turns it on with the defaults. `agent_forge/rules_default.py`
+(rule 17) has the detail.
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `window_minutes` | `30` | How far back each run looks for merges. Longer than the router's interval, so a run that fails or is late misses none; a merge older than this when the router first sees it is not announced. |
 
 ### `checks`
 

@@ -125,7 +125,7 @@ together. Jitter only delays, never brings a wake forward. Each
 interval runs from the last wake, and the state counts the reminders.
 `ONCE` is never reminded: a turn whose key changes when it should be
 woken again, such as the idle offer, keyed on when the idle period
-began.
+began, or the merge notice, keyed on the merge.
 
 **Check before send.** When the module defines a `recheck` of its own
 (not the default, which is `decide` itself), a sending run fetches each
@@ -245,7 +245,14 @@ once a run, sending or not, only for a module whose `wants_directory`
 is true after `configure`; one that can't be read, or isn't complete,
 is printed (`NO-DIRECTORY: …`) and handed over as None, which a module
 must read as unknown, not as nobody. The default rules want it only
-for `router.idle_offer` (rules 15 and 16). A later step
+for `router.idle_offer` (rules 15 and 16). `merged`, likewise, is the
+pull requests merged in the last `merged_window` minutes (each with
+`number`, `title`, `mergedAt` and `author`), read by one GitHub search
+on a run that isn't `--only`'s, only for a module whose
+`merged_window` is above 0; a search that fails is printed
+(`NO-MERGED: …`) and handed over as None, which a module must read as
+unknown, not as nothing merged. The default rules want it only for
+`router.merge_notice` (rule 17). A later step
 may add the previous run's decisions, a namespaced store the module may
 write to, written only when the run's delivery is confirmed, and the
 configuration; until then a module keeps what it needs from

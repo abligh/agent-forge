@@ -32,6 +32,10 @@ A rules module is a Python module with:
     wants_directory     true when the rules read the relay's directory,
                         `ctx.directory` (absent: false). Read after
                         `configure`, so it may depend on the project
+    merged_window       minutes: when above 0, the pull requests merged
+                        in the last that many are read, as
+                        `ctx.merged` (absent: 0, none read). Read after
+                        `configure`, as `wants_directory` is
 """
 
 import dataclasses
@@ -163,13 +167,18 @@ class Context:
     any other decision it makes. `directory` is the relay's
     `GET /directory` answer, read only for rules whose `wants_directory`
     is true, and None when it wasn't read or couldn't be: a rule reads
-    None as "unknown", never as "nobody is there"."""
+    None as "unknown", never as "nobody is there". `merged` is the pull
+    requests merged in the rules' `merged_window` (each with `number`,
+    `title`, `mergedAt` and `author`), read only when that is above 0
+    and the run isn't `only`'s, and None when it wasn't read or
+    couldn't be: unknown, never "nothing merged"."""
     roster: Any
     when: datetime.datetime
     prs: list
     issues: list
     only: frozenset | None = None
     directory: Any = None
+    merged: Any = None
 
     @property
     def items(self):
@@ -191,7 +200,7 @@ def load_rules(name, root=None):
         if not hasattr(module, part):
             raise RulesError("rules %r has no %s" % (name, part))
     defaults = {"flatten": (), "lookups": (), "sweep": lambda ctx: [],
-                "wants_directory": False,
+                "wants_directory": False, "merged_window": 0,
                 "recheck": module.decide, "summary": lambda ctx: ""}
     for part, value in defaults.items():
         if not hasattr(module, part):

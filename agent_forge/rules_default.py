@@ -91,6 +91,19 @@ agents with nothing to do (off without it):
 A directory that couldn't be read, or isn't complete, makes nobody
 idle: unknown is never idle.
 
+With `router.merge_notice`, a run also tells authors of their merges
+(off without it):
+
+17. a pull request by an agent merged in the last `window_minutes`
+    (default 30): its author's, "merged", naming any open issue it
+    leaves with every `Blocked-by:` item closed (whose owners rule 14
+    wakes in their own right) and the author's oldest actionable issue
+    (as rule 15 reads it), so an author learns their work landed and
+    what to do next. The event is the pull request and when it merged,
+    so each merge is told once and never reminded. Nothing is said
+    when the merges couldn't be read: unknown is never "nothing
+    merged".
+
 **Who wrote something is read from its login**, never its text (but
 for rule 10's exception): an App's bot login (`<slug>[bot]`) maps to
 its name through the configuration, the Merger's under `machinery`,
@@ -138,6 +151,11 @@ IDLE_OFFER = None
 DEFAULT_IDLE_MINUTES = 10
 # The engine reads the relay's directory only for the idle offer.
 wants_directory = False
+# `router.merge_notice`, with its defaults filled in, or None: off.
+MERGE_NOTICE = None
+DEFAULT_MERGE_WINDOW = 30
+# How far back, in minutes, the engine reads merges: 0, none.
+merged_window = 0
 
 # What the rules read of each open item, besides its number.
 graphql = {
@@ -175,6 +193,7 @@ def configure(project, merger_tool):
     configured for it, is bin/forge-merger."""
     global merger, MERGER, OWNER, WAITING_OWNER, WAITING_EXTERNAL
     global OWNER_PREFIX, STATUS_CONTEXT, IDLE_OFFER, wants_directory
+    global MERGE_NOTICE, merged_window
     merger = merger_tool
     labels = project.section("labels")
     MERGER = merger.ACT_AS
@@ -189,6 +208,11 @@ def configure(project, merger_tool):
         "idle_minutes": offer.get("idle_minutes", DEFAULT_IDLE_MINUTES),
         "report_to": offer.get("report_to")}
     wants_directory = IDLE_OFFER is not None
+    notice = project.section("router").get("merge_notice")
+    MERGE_NOTICE = None if notice is None else {
+        "window_minutes": notice.get("window_minutes",
+                                     DEFAULT_MERGE_WINDOW)}
+    merged_window = MERGE_NOTICE["window_minutes"] if MERGE_NOTICE else 0
 
 
 # --- who is who -------------------------------------------------------------
@@ -532,12 +556,17 @@ recheck = decide
 
 
 def sweep(ctx):
-    """Rules 15 and 16, the idle offer, when it is configured; nothing
-    on a run started by an event (`ctx.only`), whose items are all it
-    may decide about."""
-    if IDLE_OFFER is None or ctx.only is not None:
+    """Rules 15 and 16, the idle offer, and rule 17, the merge notice,
+    each when it is configured; nothing on a run started by an event
+    (`ctx.only`), whose items are all it may decide about."""
+    if ctx.only is not None:
         return []
-    return idle_offers(ctx)
+    decisions = []
+    if IDLE_OFFER is not None:
+        decisions += idle_offers(ctx)
+    if MERGE_NOTICE is not None:
+        decisions += merge_notices(ctx)
+    return decisions
 
 
 def author(node, ctx):
@@ -712,6 +741,56 @@ def idle_offers(ctx):
             "%s has been idle since %s with nothing it can act on (%s)." % (
                 agent, since_text(stamp, ctx.when), why),
             reminder=ONCE))
+    return decisions
+
+
+# --- the merge notice (rule 17) -----------------------------------------------
+
+
+def unblocked_by_merge(number, ctx):
+    """"#N (Owner)" for each open issue whose `Blocked-by:` lines name
+    `number` and whose every named item is now closed or merged."""
+    out = []
+    for issue in sorted(ctx.issues, key=lambda i: i["number"]):
+        if number in merger.blockers_of(issue) and not blocked(issue):
+            out.append("#%d (%s)" % (issue["number"], owner_of(issue)
+                                     or ctx.roster.who(author_of(issue))))
+    return out
+
+
+def merge_notices(ctx):
+    """Rule 17: a word to the author of each pull request an agent wrote
+    that merged in the window, with what it unblocks and the author's
+    next item. Nothing when the merges are unknown."""
+    if not isinstance(ctx.merged, list):
+        return []
+    cutoff = ctx.when - datetime.timedelta(
+        minutes=MERGE_NOTICE["window_minutes"])
+    decisions = []
+    for pr in sorted(ctx.merged, key=lambda p: (p.get("mergedAt") or "",
+                                                p.get("number") or 0)):
+        at = parse_stamp(pr.get("mergedAt"))
+        if at is None or not cutoff <= at <= ctx.when:
+            continue
+        agent = ctx.roster.who(author_of(pr))
+        if not ctx.roster.is_agent(agent):
+            continue
+        title = (pr.get("title") or "").strip()
+        text = "#%d%s merged at %s." % (
+            pr["number"], ' "%s"' % title if title else "",
+            since_text(pr["mergedAt"], ctx.when))
+        freed = unblocked_by_merge(pr["number"], ctx)
+        if freed:
+            text += " It unblocks %s." % ", ".join(freed)
+        actionable, _, _ = owned_issues(agent, ctx)
+        if actionable:
+            nxt = actionable[0]
+            nxt_title = (nxt.get("title") or "").strip()
+            text += " Your oldest item nothing blocks: #%d%s." % (
+                nxt["number"], ' "%s"' % nxt_title if nxt_title else "")
+        decisions.append(Decision(
+            None, agent, 17, "#%d %s" % (pr["number"], pr["mergedAt"]),
+            text, reminder=ONCE))
     return decisions
 
 

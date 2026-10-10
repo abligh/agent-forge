@@ -92,6 +92,14 @@ token as a post, sending or not. An answer that isn't a complete
 directory is printed (`NO-DIRECTORY: …`) and handed over as None,
 which the rules read as unknown, never as idle.
 
+**What merged.** When the rules' `merged_window` is above 0 (the
+default rules' merge notice, `router.merge_notice`), a run that isn't
+`--only`'s also reads the pull requests merged in the last that many
+minutes, with one GitHub search, and hands them over as `ctx.merged`.
+A dry run reads them too. A search that fails is printed
+(`NO-MERGED: …`) and handed over as None, which the rules read as
+unknown, never as "nothing merged".
+
 **Without `--send` it is a dry run**: it prints each decision and the
 messages it would send, sends nothing, takes no lock and leaves
 `state.json` alone. It appends each turn it would send or withhold to
@@ -263,6 +271,34 @@ def fetch(github):
     for lookup in RULES.lookups:
         lookup.run(github, REPO_SLUG, prs, issues)
     return prs, issues
+
+
+# The pull requests merged since a time: `fetch_merged`.
+MERGED_QUERY = """
+query($q:String!, $cursor:String) {
+  search(query:$q, type:ISSUE, first:100, after:$cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest { number title mergedAt author { login } } }
+  }
+}"""
+
+
+def fetch_merged(github, since):
+    """[{number, title, mergedAt, author}] for every pull request merged
+    at or after `since`, by GitHub's search, every page of it."""
+    q = "repo:%s is:pr is:merged merged:>=%s" % (REPO_SLUG,
+                                                  merger.iso(since))
+    merged, cursor = [], None
+    while True:
+        args = ["graphql", "-f", "query=" + MERGED_QUERY, "-f", "q=" + q]
+        if cursor:
+            args += ["-f", "cursor=" + cursor]
+        page = github.api(*args)["data"]["search"]
+        merged += [n for n in page["nodes"]
+                   if isinstance(n, dict) and n.get("number")]
+        if not page["pageInfo"]["hasNextPage"]:
+            return merged
+        cursor = page["pageInfo"]["endCursor"]
 
 
 # The recheck's query: the numbered items alone, as they are now.
@@ -694,7 +730,7 @@ def recheck(github, ctx, wakes):
                 if n["number"] not in numbers or n["number"] in fresh]
     now = router.Context(ctx.roster, ctx.when, renewed(ctx.prs),
                          renewed(ctx.issues), only=ctx.only,
-                         directory=ctx.directory)
+                         directory=ctx.directory, merged=ctx.merged)
     again = {n: list(RULES.recheck(fresh[n], now)) if n in fresh else []
              for n in numbers}
     holding, withdrawn = [], []
@@ -727,9 +763,16 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
         listing, why = directory()
         if listing is None:
             out("NO-DIRECTORY: %s; nobody is taken to be idle" % why)
+    merged = None
+    if RULES.merged_window and not only:
+        try:
+            merged = fetch_merged(github, when - datetime.timedelta(
+                minutes=RULES.merged_window))
+        except (RuntimeError, KeyError, TypeError, ValueError) as err:
+            out("NO-MERGED: %s; no merge is announced" % err)
     ctx = router.Context(roster, when, prs, issues,
                          only=frozenset(only) if only else None,
-                         directory=listing)
+                         directory=listing, merged=merged)
     decisions = decide(ctx)
     tally = RULES.summary(ctx)
     if only:
