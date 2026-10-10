@@ -13,10 +13,13 @@ import os
 
 def state_dir(project, tool, environ=None):
     """~/.local/state/agent-forge/<project>/<tool>, created. FORGE_STATE_DIR
-    moves the root (tests, and hosts that keep state elsewhere)."""
+    moves the root (tests, and hosts that keep state elsewhere). The home
+    directory is `environ`'s HOME, so a caller's environment is honoured
+    whole."""
     environ = os.environ if environ is None else environ
+    home = environ.get("HOME") or os.path.expanduser("~")
     root = environ.get("FORGE_STATE_DIR") or os.path.join(
-        environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+        environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"),
         "agent-forge")
     path = os.path.join(root, project, tool)
     os.makedirs(path, exist_ok=True)

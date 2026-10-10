@@ -26,5 +26,14 @@
   "docs": {"paths": ["README.md", "docs"], "width": 80},
   "identity": {"unattributed_domain": "@build.example.org",
                "unattributed_name": "Anonymous Agent"},
+  "host_settings": {
+    "files": [
+      {"from": "tools/host/claude-settings.json", "to": ".claude/settings.json",
+       "mode": "0644", "json": true},
+      {"from": "tools/host/session-start-hook", "to": ".claude/hooks/session-start",
+       "mode": "0755"}
+    ],
+    "host_keys": ["skipWorkflowUsageWarning"]
+  },
   "relay": {"url": "http://127.0.0.1:8788/hook", "room": "everyone@conference.example.org"}
 }

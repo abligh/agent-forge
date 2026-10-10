@@ -45,12 +45,16 @@ TOP = {
     "docs": (dict, False),
     "relay": (dict, False),
     "identity": (dict, False),
+    "host_settings": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
        "slug": str, "key": str}
 AGENT = dict(APP, session_name=str, kind=str, reviews=list)
 IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
+HOST_SETTINGS = {"files": list, "host_keys": list}
+HOST_FILE = {"from": str, "to": str, "mode": str, "json": bool}
+MODE_RE = re.compile(r"^0[0-7]{3}$")
 
 
 class ConfigError(Exception):
@@ -150,6 +154,24 @@ def check(data):
         problems.append("repo %r must be owner/name" % data["repo"])
     _fields("naming", data.get("naming", {}), NAMING, problems)
     _fields("identity", data.get("identity", {}), IDENTITY, problems)
+    settings = data.get("host_settings", {})
+    if _fields("host_settings", settings, HOST_SETTINGS, problems):
+        for i, entry in enumerate(settings.get("files", [])):
+            where = "host_settings.files[%d]" % i
+            if not _fields(where, entry, HOST_FILE, problems):
+                continue
+            for key in ("from", "to"):
+                if key not in entry:
+                    problems.append("%s: missing %r" % (where, key))
+                elif entry[key].startswith("/") or ".." in entry[key].split("/"):
+                    problems.append("%s.%s must be a relative path inside "
+                                    "its tree" % (where, key))
+            if "mode" in entry and not MODE_RE.match(entry["mode"]):
+                problems.append("%s.mode must be octal, like \"0644\""
+                                % where)
+        if not all(isinstance(k, str) for k in settings.get("host_keys", [])):
+            problems.append("host_settings.host_keys must be a list of "
+                            "strings")
     suffix = data.get("naming", {}).get("app_slug_suffix")
     if not data["agents"]:
         problems.append("agents must name at least one agent")

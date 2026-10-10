@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Compare a host's agent settings with the project's tracked copy, or install it.
+
+Every agent session on a host loads the same files: Claude Code's
+~/.claude/settings.json, and the hooks it names. Edited by hand on one
+host, they drift silently from the others. The project tracks its
+copies and lists them in its configuration's `host_settings.files`; they change
+by pull request like anything else.
+
+    forge-host-settings --check      0 when the host matches; 1 when it
+                                     differs (a unified diff on stdout);
+                                     2 when a tracked copy can't be read
+    forge-host-settings --install    write the tracked copies over the host's
+
+**Installing is a person's step.** The settings decide what agents may
+do without asking, so a change reaches a host only when the owner
+installs it, or an agent at their explicit request. Nothing should run
+`--install` on a schedule. Running sessions pick settings up only when
+they next start.
+
+**What counts as a difference.** A file marked `json` is compared as
+JSON, so key order and layout don't count, and the keys in
+`host_settings.host_keys`, which Claude Code writes itself to record a choice
+made in its interface, are the host's: `--check` ignores them and
+`--install` keeps them.
+
+**What `--install` guarantees.** It refuses a JSON file that isn't
+valid, before writing anything. It writes only the files that differ,
+keeps each replaced file under
+~/.local/state/agent-forge/<project>/host-settings/backups/ as
+`<name>.<UTC timestamp>` (never beside the file: every file in a hooks
+directory is taken for a hook), and writes through a temporary file and
+a rename, so a failure leaves the old file whole. A second run finds
+nothing to do.
+
+The copies are read from the project's cron checkout
+($FORGE_CRON_CHECKOUT), which is kept at the default branch, not from
+the working tree this runs in: installing a branch by mistake would
+otherwise be one `cd` away. `--tree PATH` reads another checkout, on
+purpose.
+"""
+import argparse
+import datetime
+import difflib
+import json
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, locks  # noqa: E402
+
+
+class Unreadable(Exception):
+    """A tracked copy is missing, unreadable or invalid."""
+
+
+def read(path):
+    """The file's text, or None if it doesn't exist."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+
+
+def tracked(tree, files, home):
+    """[(installed path, text, mode, is JSON)] for every tracked file,
+    validated."""
+    out = []
+    for rel, dest, mode, is_json in files:
+        src = os.path.join(tree, rel)
+        try:
+            text = read(src)
+        except OSError as err:
+            raise Unreadable("%s: %s" % (src, err)) from err
+        if text is None:
+            raise Unreadable("%s: no such file" % src)
+        if is_json:
+            try:
+                json.loads(text)
+            except ValueError as err:
+                raise Unreadable("%s is not valid JSON: %s" % (src, err)) from err
+        out.append((os.path.join(home, dest), text, mode, is_json))
+    return out
+
+
+def settings_of(text, host_keys=()):
+    """The settings `text` holds, less the host's own keys. ValueError if
+    it isn't a JSON object: a host file of `[]` or `null` is no settings."""
+    d = json.loads(text)
+    if not isinstance(d, dict):
+        raise ValueError("not a JSON object")
+    for k in host_keys:
+        d.pop(k, None)
+    return d
+
+
+def same(have, text, is_json, host_keys=()):
+    """Whether the host's file `have` matches the tracked `text`. A JSON
+    file matches when it holds the same settings: Claude Code rewrites the
+    file when it records a host key, and may reorder an object's keys as
+    it does, so neither key order nor layout is a difference."""
+    if have == text:
+        return True
+    if not is_json or have is None:
+        return False
+    try:
+        return settings_of(have, host_keys) == settings_of(text, host_keys)
+    except ValueError:
+        return False
+
+
+def wanted(text, have, is_json, host_keys=()):
+    """What to install over `have`: the tracked text, plus the host keys
+    `have` sets, so an install doesn't undo a choice made on the host."""
+    if not is_json or have is None:
+        return text
+    try:
+        host = json.loads(have)
+    except ValueError:
+        return text  # a corrupt host file has no choices to keep
+    if not isinstance(host, dict):
+        return text
+    kept = {k: host[k] for k in host_keys if k in host}
+    if not kept:
+        return text
+    d = json.loads(text)
+    d.update(kept)
+    return json.dumps(d, indent=2, ensure_ascii=False) + "\n"
+
+
+def differences(files, host_keys=(), read=read):
+    """[(installed path, unified diff)] for each file the host has wrong."""
+    out = []
+    for dest, text, _mode, is_json in files:
+        have = read(dest)
+        if same(have, text, is_json, host_keys):
+            continue
+        want = wanted(text, have, is_json, host_keys)
+        diff = "".join(difflib.unified_diff(
+            (have or "").splitlines(keepends=True), want.splitlines(keepends=True),
+            fromfile=dest + (" (absent)" if have is None else ""),
+            tofile="tracked"))
+        out.append((dest, diff))
+    return out
+
+
+def install_one(dest, text, mode, backups, now=None):
+    """Write `text` to `dest` atomically, keeping the old file. The backup's
+    path, or None when there was no old file."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    backup = None
+    if os.path.exists(dest):
+        folder = backups
+        os.makedirs(folder, exist_ok=True)
+        backup = os.path.join(folder, "%s.%s" % (
+            os.path.basename(dest), now.strftime("%Y%m%dT%H%M%SZ")))
+        with open(dest, "rb") as src, open(backup, "wb") as out:
+            out.write(src.read())
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest),
+                               prefix="." + os.path.basename(dest) + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return backup
+
+
+def files_of(project):
+    """(tracked path, installed path, mode, is JSON) for each host file."""
+    return [(f["from"], f["to"], int(f.get("mode", "0644"), 8),
+             bool(f.get("json"))) for f in project.section("host_settings")
+            .get("files", [])]
+
+
+def main(argv=None, out=sys.stdout, err=sys.stderr, environ=None):
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(prog="forge-host-settings",
+                                     description=__doc__.splitlines()[0])
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--check", action="store_true",
+                       help="report differences; change nothing")
+    group.add_argument("--install", action="store_true",
+                       help="write the tracked copies over the host's")
+    parser.add_argument("--tree", default=environ.get("FORGE_CRON_CHECKOUT"),
+                        help="the checkout to read the copies from "
+                        "(default $FORGE_CRON_CHECKOUT)")
+    args = parser.parse_args(argv)
+    if not args.tree:
+        print("forge-host-settings: no --tree, and FORGE_CRON_CHECKOUT is "
+              "not set", file=err)
+        return 2
+    tree = os.path.expanduser(args.tree)
+    home = os.path.expanduser(environ.get("HOME") or "~")
+    try:
+        project = config.load(os.path.join(tree, config.CONFIG_NAME))
+    except config.ConfigError as exc:
+        print("forge-host-settings: %s" % exc, file=err)
+        return 2
+    host_keys = tuple(project.section("host_settings").get("host_keys", []))
+    if not files_of(project):
+        print("forge-host-settings: %s lists no host_settings.files" % project.path,
+              file=err)
+        return 2
+    try:
+        files = tracked(tree, files_of(project), home)
+    except Unreadable as exc:
+        print("forge-host-settings: %s; nothing written" % exc, file=err)
+        return 2
+    wrong = differences(files, host_keys)
+    if args.check:
+        for _dest, diff in wrong:
+            out.write(diff)
+        if wrong:
+            print("forge-host-settings: %d file(s) differ from %s: %s"
+                  % (len(wrong), tree, ", ".join(d for d, _ in wrong)),
+                  file=err)
+            return 1
+        print("forge-host-settings: host matches %s" % tree, file=out)
+        return 0
+    if not wrong:
+        print("forge-host-settings: nothing to install; host matches %s"
+              % tree, file=out)
+        return 0
+    backups = os.path.join(locks.state_dir(project.name, "host-settings",
+                                           environ), "backups")
+    modes = {dest: (text, mode, is_json) for dest, text, mode, is_json in files}
+    for dest, _diff in wrong:
+        text, mode, is_json = modes[dest]
+        backup = install_one(dest, wanted(text, read(dest), is_json,
+                                          host_keys), mode, backups)
+        print("forge-host-settings: installed %s%s" % (
+            dest, "; kept the old file as %s" % backup if backup else ""),
+            file=out)
+    print("forge-host-settings: sessions pick the settings up when they "
+          "next start", file=out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -122,6 +122,23 @@ class Check(unittest.TestCase):
         self.assertEqual(config.check(data),
                          ["LeadDev is both an agent and machinery"])
 
+    def test_host_settings_files(self):
+        files = [{"from": "/etc/passwd", "to": "../x", "mode": "644"},
+                 {"to": "a", "colour": "red"}]
+        self.assertEqual(self.problems(host_settings={"files": files}), [
+            "host_settings.files[0].from must be a relative path inside its "
+            "tree",
+            "host_settings.files[0].to must be a relative path inside its "
+            "tree",
+            'host_settings.files[0].mode must be octal, like "0644"',
+            "host_settings.files[1]: unknown key 'colour'",
+            "host_settings.files[1]: missing 'from'"])
+
+    def test_host_keys_are_strings(self):
+        self.assertEqual(
+            self.problems(host_settings={"host_keys": ["a", 1]}),
+            ["host_settings.host_keys must be a list of strings"])
+
     def test_not_an_object(self):
         self.assertEqual(config.check([]),
                          ["the configuration must be a JSON object"])

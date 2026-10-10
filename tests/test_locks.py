@@ -79,6 +79,14 @@ class StateDir(unittest.TestCase):
                                                      "XDG_STATE_HOME": "/x"}),
                 os.path.join(tmp, "widget", "router"))
 
+    def test_the_home_is_the_given_environments(self):
+        """Not the process's: a caller passing an environment means it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                locks.state_dir("widget", "router", {"HOME": tmp}),
+                os.path.join(tmp, ".local", "state", "agent-forge", "widget",
+                             "router"))
+
 
 if __name__ == "__main__":
     unittest.main()

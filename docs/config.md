@@ -39,6 +39,7 @@ starts with `_` is a comment, at any level.
 | `naming` | no | `app_slug_suffix` and `session_prefix`; see below. |
 | `machinery` | no | Apps that act for scheduled tools rather than agents, such as the Merger's; each entry as an agent's App fields. |
 | `identity` | no | The host's unconfigured git identity, which no commit may carry: `unattributed_domain` (an email domain such as `@host.example.org`) and `unattributed_name`. |
+| `host_settings` | no | Files every agent host carries, installed by `forge-host-settings`: `files`, each `{"from": path in the project, "to": path under the home directory, "mode": "0644", "json": true when compared as JSON}`, and `host_keys`, keys a JSON file's host may set for itself. |
 | `labels`, `checks`, `docs`, `relay` | no | Sections each tool documents for itself, as it moves here. |
 
 ### An agent
