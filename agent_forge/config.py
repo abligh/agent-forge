@@ -59,7 +59,8 @@ AGENT = dict(APP, session_name=str, kind=str, reviews=list)
 IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list}
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
-         "stall_minutes": int, "stall_alert": dict, "test_ahead": dict}
+         "stall_minutes": int, "stall_alert": dict, "test_ahead": dict,
+         "hold_conflicting": bool}
 TEST_AHEAD = {"depth": int, "max_age_hours": int}
 STALL_ALERT = {"tell": list, "retell_minutes": int,
                "owner_after_minutes": int, "title": str, "labels": list}

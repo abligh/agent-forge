@@ -2086,5 +2086,145 @@ class TickAhead(RepoCase):
         self.assertNotIn("ahead", record)
 
 
+class HoldConflicting(RepoCase):
+    """merge.hold_conflicting: a pull request that conflicts with one
+    ahead of it in the queue waits for it, said once, instead of being
+    handed back after every merge. Tick's helpers, without its tests."""
+
+    item = Decide.item
+    tick = Tick.tick
+    other_pr = Tick.other_pr
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        m.configure(project(hold_conflicting=True))
+        self.addCleanup(m.configure, project())
+
+    def rival(self, number=6, created=T1, files=(("f.txt", "rival\n"),)):
+        """An approved pull request from main whose files conflict with
+        #5's (f.txt) unless told otherwise; clean against main."""
+        self.repo.branch("rival%d" % number, "origin/main")
+        for name, text in files:
+            sha = self.repo.commit(name, text, "rival " + name)
+        self.repo.publish_pr(number, sha)
+        self.repo.branch("feature", "feature")
+        return pr(number, created, head=sha,
+                  reviews=[review(REVIEWER, oid=sha)])
+
+    def comments(self):
+        return [(w[1], w[2]["body"]) for w in self.github.writes
+                if w[1].endswith("/comments")]
+
+    def test_the_configuration(self):
+        self.assertIs(m.HOLD_CONFLICTING, True)
+        m.configure(project())
+        self.assertIs(m.HOLD_CONFLICTING, False)
+
+    def test_one_conflicting_with_one_ahead_is_held_and_told_once(self):
+        rival = self.rival()
+        record, lines = self.tick([self.item(), rival], live=True)
+        self.assertEqual(record["queue"], [5])
+        self.assertEqual(record["held"],
+                         {"6": "conflicts with #5, ahead of it in the queue"})
+        self.assertEqual([d["pr"] for d in record["decisions"]], [5])
+        self.assertEqual(record["holds"], [
+            {"pr": 6, "head": rival["headRefOid"], "behind": 5,
+             "result": "done"}])
+        (where, body), = self.comments()
+        self.assertEqual(where, SLUG + "/issues/6/comments")
+        self.assertTrue(body.startswith(
+            "Holding %s: it conflicts with #5" % rival["headRefOid"][:10]))
+        self.assertNotIn("Not merging", body)
+        self.assertTrue(body.endswith("\n\n— Merger"))
+        self.assertIn("1 approved but held", lines[0])
+        # Said once per head and Q.
+        record, _ = self.tick([self.item(), rival], live=True, minutes=1)
+        self.assertEqual(record["holds"][0]["result"], "already said")
+        self.assertEqual(self.comments(), [])
+
+    def test_a_new_head_is_told_again(self):
+        rival = self.rival()
+        self.tick([self.item(), rival], live=True)
+        moved = self.rival(files=(("f.txt", "rival again\n"),))
+        record, _ = self.tick([self.item(), moved], live=True, minutes=1)
+        self.assertEqual(record["holds"][0]["result"], "done")
+        self.assertEqual(len(self.comments()), 1)
+
+    def test_nothing_is_held_without_the_key(self):
+        m.configure(project())
+        record, _ = self.tick([self.item(), self.rival()], live=True)
+        self.assertEqual(record["held"], {})
+        self.assertNotIn("holds", record)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state, m.HOLD_FILE)))
+
+    def test_one_that_does_not_conflict_is_not_held(self):
+        # #5 is waiting, so the tick reaches nothing behind it; the
+        # queue says #6 stayed in it.
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,), live=True)
+        self.assertEqual((record["queue"], record["held"], record["holds"]),
+                         ([5, 6], {}, []))
+
+    def test_the_first_in_the_queue_is_never_held(self):
+        # #6 is older, so it is first, and #5 waits for it.
+        rival = self.rival(created="2026-10-07T09:00:00Z")
+        record, _ = self.tick([self.item(), rival], conclusions=(None,),
+                              live=True)
+        self.assertEqual(record["queue"], [6])
+        self.assertEqual(record["held"],
+                         {"5": "conflicts with #6, ahead of it in the queue"})
+
+    def test_only_ones_not_held_themselves_hold_others(self):
+        # #6 conflicts with #5 on f.txt; #7 conflicts only with #6, on
+        # g.txt. #6 is held, so it holds nothing: #7 can merge first.
+        six = self.rival(6, files=(("f.txt", "rival\n"), ("g.txt", "6\n")))
+        seven = self.rival(7, created=T2, files=(("g.txt", "7\n"),))
+        record, _ = self.tick([self.item(), six, seven],
+                              conclusions=(None,), live=True)
+        self.assertEqual(record["queue"], [5, 7])
+        self.assertEqual(sorted(record["held"]), ["6"])
+
+    def test_once_the_one_ahead_merges_it_is_judged_as_usual(self):
+        rival = self.rival()
+        self.tick([self.item(), rival], live=True)
+        # #5 merged: #6 is first now, and clean against main.
+        record, _ = self.tick([rival], live=True, minutes=1)
+        self.assertEqual(record["held"], {})
+        self.assertEqual([(d["pr"], d["action"]) for d in
+                          record["decisions"]], [(6, "MERGE")])
+        self.assertEqual(m.load_json(os.path.join(self.state, m.HOLD_FILE),
+                                     None), {"6": {"head": rival["headRefOid"],
+                                                   "behind": 5}})
+
+    def test_a_dry_tick_holds_and_says_nothing(self):
+        rival = self.rival()
+        record, _ = self.tick([self.item(), rival])
+        self.assertIn("6", record["held"])
+        self.assertEqual(record["holds"], [
+            {"pr": 6, "head": rival["headRefOid"], "behind": 5}])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state, m.HOLD_FILE)))
+
+    def test_a_held_one_is_not_predicted(self):
+        m.configure(project(hold_conflicting=True, test_ahead={}))
+        rival = self.rival()
+        other = self.other_pr(7)
+        record, _ = self.tick([self.item(), rival, other],
+                              conclusions=(None,), live=True)
+        self.assertEqual(record["ahead"], [5, 7])
+
+    def test_heads_git_cannot_compare_hold_nothing(self):
+        def run(args, cwd=None, env=None):
+            if "merge-tree" in args:
+                return subprocess.CompletedProcess(args, 128, "", "fatal")
+            return m.sh(args, cwd, env)
+        self.assertEqual(m.conflicts_ahead(
+            self.repo.path, [self.item(), self.rival()], run), {})
+
+
 if __name__ == "__main__":
     unittest.main()

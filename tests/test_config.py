@@ -182,6 +182,11 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"test_ahead": {"depth": 0}}),
                          [])
 
+    def test_merge_hold_conflicting(self):
+        self.assertEqual(self.problems(merge={"hold_conflicting": True}), [])
+        self.assertEqual(self.problems(merge={"hold_conflicting": "yes"}),
+                         ["merge.hold_conflicting must be true or false"])
+
     def test_test_ahead_contradicts_merger_first_false(self):
         data = example()
         data["checks"]["merger_first"] = False

@@ -200,6 +200,24 @@ it, the gate is unchanged, and green is only ever posted for a tree a
 real run turned green. What it costs is build time: a hand-back or a
 push spends the predictions behind it, at most `depth` + 1 runs.
 
+**With `merge.hold_conflicting`, a pull request that conflicts with
+one ahead of it waits for that one instead of going round again**
+(default off). An author with several approved pull requests that
+change the same lines (a generated file, say) otherwise has every one
+handed back after each merge: each is rebased, approved again and
+rebuilt, and the next merge does it all again. With it, each tick
+checks every pull request in the queue but the first against the ones
+ahead of it that are not themselves held this way, with `git merge-tree
+--write-tree` of the two heads. One that conflicts with one ahead (Q)
+is held, `held` saying `conflicts with #Q, ahead of it in the queue`:
+it is neither updated, merged, handed back nor predicted. A live tick
+says so on it once per head and Q, signed like a hand-back, asking the
+author to leave it until Q merges; `held-conflicting.json` in the
+state directory remembers what was said, and the record's `holds` what
+each tick held. Once Q has merged it is judged as usual, and goes back
+to its author if it then conflicts with `main`: one rebase instead of
+one per merge. Two heads git can't compare are not held.
+
 **With `test_ahead`, the pull request a run is in flight for keeps its
 place.** When the last tick updated or waited on a pull request that
 is still a candidate, it stays first, and no blocker (a pull request
@@ -316,6 +334,10 @@ AHEAD_IDENTITY = ("forge-merger", "merger@agent-forge.invalid")
 # The actions that leave a run in progress or about to start on the
 # pull request: with test_ahead, it keeps its place in the queue.
 IN_FLIGHT = ("UPDATE", "WAIT")
+# merge.hold_conflicting: hold one that conflicts with one ahead of it.
+HOLD_CONFLICTING = False
+HOLD_REASON = "conflicts with #%d, ahead of it in the queue"
+HOLD_FILE = "held-conflicting.json"
 
 
 def configure(project):
@@ -324,14 +346,14 @@ def configure(project):
     "Merger"), `ci_workflow` (default "ci"; "" for none), `gate` (a list
     of argument lists), `stall_minutes` (default 30) and `stall_alert`
     (default none: a stall is only printed), and `test_ahead` (default
-    none: nothing is predicted; `depth`, default 3). The `checks`
-    section: `context` and `poster` (default the merger).
+    none: nothing is predicted; `depth`, default 3) and
+    `hold_conflicting` (default false). The `checks` section: `context` and `poster` (default the merger).
     `labels.waiting_on_owner` is the label a long stall gets."""
     global REPO_SLUG, MAIN, APPROVERS, QUIET_LOGINS, ACT_AS, SIGNATURE
     global STATUS_CONTEXT, STATUS_CREATOR, BUILD_HOST, GATE, CI_WORKFLOW
     global STALL_AFTER, STALL_ALERT, STALL_TELL, STALL_RETELL
     global STALL_TO_OWNER, STALL_TITLE, STALL_LABELS, WAITING_OWNER
-    global TEST_AHEAD, AHEAD_DEPTH
+    global TEST_AHEAD, AHEAD_DEPTH, HOLD_CONFLICTING
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -360,6 +382,7 @@ def configure(project):
     ahead = merge.get("test_ahead")
     TEST_AHEAD = ahead is not None
     AHEAD_DEPTH = (ahead or {}).get("depth", DEFAULT_AHEAD_DEPTH)
+    HOLD_CONFLICTING = merge.get("hold_conflicting", False) is True
 
 NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
 BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
@@ -1172,6 +1195,74 @@ def handed_back(said, pr, approval):
         before.get("head") == pr["headRefOid"]
 
 
+def have_head(repo, pr, run=sh):
+    """Fetch `pr`'s head unless the checkout has it already: only the
+    pull requests a tick decided on were fetched."""
+    if git(repo, "cat-file", "-e", pr["headRefOid"] + "^{commit}",
+           run=run).returncode != 0:
+        git(repo, "fetch", "-q", "origin", "+refs/pull/%d/head:%s"
+            % (pr["number"], PR_REF % pr["number"]), run=run)
+
+
+def conflicts_ahead(repo, queue, run=sh):
+    """{P: Q} for each pull request P in `queue` whose head conflicts
+    with the head of a Q ahead of it, Q not itself held this way. The
+    first is never held. A comparison git can't make (anything but 0 or
+    1) holds nothing."""
+    kept, held = [], {}
+    for pr in queue:
+        have_head(repo, pr, run)
+        for q in kept:
+            merged = git(repo, "merge-tree", "--write-tree", "--name-only",
+                         "--no-messages", q["headRefOid"], pr["headRefOid"],
+                         run=run)
+            if merged.returncode == 1:
+                held[pr["number"]] = q["number"]
+                break
+        if pr["number"] not in held:
+            kept.append(pr)
+    return held
+
+
+def hold_text(head, ahead):
+    """The comment a hold posts: plain, to the author, and not a
+    hand-back, so it doesn't start `Not merging`."""
+    return ("Holding %s: it conflicts with #%d, which is ahead of it in "
+            "the queue.\n\nIt keeps its approval and is not handed back. "
+            "Please leave it until #%d merges: then, if it conflicts with "
+            "`main`, the Merger hands it back once, and one rebase covers "
+            "both.\n\n%s" % (head[:10], ahead, ahead, SIGNATURE))
+
+
+def tell_holds(state_dir, github, prs, held_by, live):
+    """[{pr, head, behind, result}] for each hold. When `live`, each
+    head and Q is said on its pull request once, `held-conflicting.json`
+    remembering it; pull requests no longer open are forgotten."""
+    path = os.path.join(state_dir, HOLD_FILE)
+    heads = {pr["number"]: pr["headRefOid"] for pr in prs}
+    said = {k: v for k, v in load_json(path, {}).items()
+            if k.isdigit() and int(k) in heads}
+    told = []
+    for number, ahead in sorted(held_by.items()):
+        key = {"head": heads[number], "behind": ahead}
+        entry = dict(key, pr=number)
+        if live:
+            if said.get(str(number)) == key:
+                entry["result"] = "already said"
+            else:
+                ok, why = github.write(
+                    "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG,
+                                                           number),
+                    body=hold_text(heads[number], ahead))
+                entry["result"] = "done" if ok else "refused: " + why
+                if ok:
+                    said[str(number)] = key
+        told.append(entry)
+    if live:
+        save_json(path, said)
+    return told
+
+
 def predict_ahead(repo, main_tip, queue, run=sh, depth=None):
     """The commits the first `depth` + 1 pull requests in `queue`
     (default AHEAD_DEPTH) will have once those ahead of each have
@@ -1196,12 +1287,7 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None):
     entries, parent = [], main_tip
     for pr in queue[:depth + 1]:
         head = pr["headRefOid"]
-        # Only the pull requests the tick decided on were fetched, so
-        # the ones behind them may not be here yet.
-        if git(repo, "cat-file", "-e", head + "^{commit}",
-               run=run).returncode != 0:
-            git(repo, "fetch", "-q", "origin", "+refs/pull/%d/head:%s"
-                % (pr["number"], PR_REF % pr["number"]), run=run)
+        have_head(repo, pr, run)
         merged = git(repo, "merge-tree", "--write-tree", "--no-messages",
                      parent, head, run=run)
         if merged.returncode != 0 or not merged.stdout.split():
@@ -1267,11 +1353,17 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         last = load_json(os.path.join(state_dir, "next.json"), {})
         if isinstance(last, dict) and last.get("action") in IN_FLIGHT:
             queue.sort(key=lambda pr: pr["number"] != last.get("pr"))
+    held_by = conflicts_ahead(repo, queue, run) if HOLD_CONFLICTING else {}
+    for number, ahead in held_by.items():
+        held[str(number)] = HOLD_REASON % ahead
+    queue = [pr for pr in queue if pr["number"] not in held_by]
     record = {"at": iso(when), "main": main_tip, "held": held,
               "queue": [pr["number"] for pr in queue], "decisions": []}
     os.makedirs(state_dir, exist_ok=True)
     said_path = os.path.join(state_dir, "handed-back.json")
     said = load_json(said_path, {})
+    if HOLD_CONFLICTING:
+        record["holds"] = tell_holds(state_dir, github, prs, held_by, live)
     waiting_on = waiting = None
     for pr in queue:
         approval = approvals[pr["number"]]
