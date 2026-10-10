@@ -228,7 +228,9 @@ rebuilt, and the next merge does it all again. With it, each tick
 checks every pull request in the queue but the first against the ones
 ahead of it that are not themselves held this way, with `git merge-tree
 --write-tree` of the two heads. One that conflicts with one ahead (Q)
-is held, `held` saying `conflicts with #Q, ahead of it in the queue`:
+is held, `held` saying `conflicts with #Q, ahead of it in the queue`
+(never behind a Q that conflicts with `main`, which goes back to its
+author):
 it is neither updated, merged, handed back nor predicted. A live tick
 says so on it once per head and Q, signed like a hand-back, asking the
 author to leave it until Q merges; `held-conflicting.json` in the
@@ -1321,14 +1323,20 @@ def have_head(repo, pr, run=sh):
             % (pr["number"], PR_REF % pr["number"]), run=run)
 
 
-def conflicts_ahead(repo, queue, run=sh):
+def conflicts_ahead(repo, queue, run=sh, main_ref=None):
     """{P: Q} for each pull request P in `queue` whose head conflicts
     with the head of a Q ahead of it, Q not itself held this way. The
     first is never held. A comparison git can't make (anything but 0 or
-    1) holds nothing."""
+    1) holds nothing. With `main_ref`, one whose head conflicts with it
+    is going back to its author, so nothing waits behind it: it is
+    neither a Q nor held."""
     kept, held = [], {}
     for pr in queue:
         have_head(repo, pr, run)
+        if main_ref and git(repo, "merge-tree", "--write-tree",
+                            "--name-only", "--no-messages", main_ref,
+                            pr["headRefOid"], run=run).returncode == 1:
+            continue
         for q in kept:
             merged = git(repo, "merge-tree", "--write-tree", "--name-only",
                          "--no-messages", q["headRefOid"], pr["headRefOid"],
@@ -1479,7 +1487,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # place: a blocker promoted past it would spend the run it is
         # already having, and every prediction behind it.
         queue.sort(key=lambda pr: pr["number"] != in_flight)
-    held_by = conflicts_ahead(repo, queue, run) if HOLD_CONFLICTING else {}
+    held_by = (conflicts_ahead(repo, queue, run, main_tip)
+               if HOLD_CONFLICTING else {})
     for number, ahead in held_by.items():
         held[str(number)] = HOLD_REASON % ahead
     queue = [pr for pr in queue if pr["number"] not in held_by]

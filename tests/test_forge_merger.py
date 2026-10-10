@@ -2413,6 +2413,18 @@ class HoldConflicting(RepoCase):
                               conclusions=(None,), live=True)
         self.assertEqual(record["ahead"], [5, 7])
 
+    def test_nothing_waits_behind_one_that_conflicts_with_main(self):
+        # #5 conflicts with main, so it goes back to its author: #6,
+        # which conflicts with #5 but not with main, is not held behind
+        # it, and the tick moves on to it.
+        self.advance_main("f.txt", "main moved f\n")
+        rival = self.rival()
+        record, _ = self.tick([self.item(), rival], live=True)
+        self.assertEqual(record["held"], {})
+        self.assertEqual([(d["pr"], d["action"]) for d in
+                          record["decisions"]][0], (5, "HAND-BACK"))
+        self.assertIn(6, [d["pr"] for d in record["decisions"]])
+
     def test_heads_git_cannot_compare_hold_nothing(self):
         def run(args, cwd=None, env=None):
             if "merge-tree" in args:
