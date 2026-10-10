@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Run gh with a signed body file, as the agent's own App.
+
+    forge-gh-signed <gh args...>     the args must include --body-file
+
+**The signature is checked where the call is made**, not where the body
+was composed: whatever produced the file, the file about to be sent
+must carry `— $FORGE_AGENT` on a line of its own.
+
+**Deny by default on the body's source.** --body-file is required and
+every other way of supplying a body is refused, --body, --fill and any
+flag gh adds later, because a check that lists known-bad flags goes
+stale the moment one is added.
+
+**It sends as the agent.** gh's own login may be shared, or a human's,
+so the call is made with the agent's App token (agent_forge.github),
+and GitHub records the agent's bot. If no token can be minted this
+refuses rather than fall back to the ambient login. The token goes only
+into gh's environment.
+
+Exit: 2 no body file, 3 not signed by $FORGE_AGENT, 4 no App token;
+otherwise gh's.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, github, signing  # noqa: E402
+
+
+def body_file(args):
+    """The path after the last --body-file (or --body-file=PATH), or None."""
+    path = None
+    for i, arg in enumerate(args):
+        if arg == "--body-file" and i + 1 < len(args):
+            path = args[i + 1]
+        elif arg.startswith("--body-file="):
+            path = arg.split("=", 1)[1]
+    return path
+
+
+def main(argv=None, err=None, environ=None, mint=None, execvpe=os.execvpe):
+    argv = sys.argv[1:] if argv is None else argv
+    environ = dict(os.environ if environ is None else environ)
+    err = err or (lambda line: print(line, file=sys.stderr))
+    path = body_file(argv)
+    if not path:
+        err("forge-gh-signed: refusing: no --body-file (an inline body "
+            "bypasses the check)")
+        return 2
+    if not os.path.isfile(path):
+        err("forge-gh-signed: %s does not exist" % path)
+        return 2
+    try:
+        agent = signing.agent(environ)
+    except signing.SigningError as e:
+        err("forge-gh-signed: %s" % e)
+        return e.status
+    with open(path) as handle:
+        if not signing.is_signed(handle.read(), agent):
+            err("forge-gh-signed: refusing: %s has no '%s' line"
+                % (path, signing.sign_off(agent)))
+            return 3
+    try:
+        token = (mint or (lambda a: github.token(config.load(), a)))(agent)
+    except (config.ConfigError, github.MintError) as e:
+        err("forge-gh-signed: refusing: could not mint %s's App token (%s); "
+            "not sending as the ambient login" % (agent, e))
+        return 4
+    environ["GH_TOKEN"] = token
+    environ.pop("GITHUB_TOKEN", None)
+    execvpe("gh", ["gh"] + argv, environ)
+    return 127
+
+
+if __name__ == "__main__":
+    sys.exit(main())
