@@ -85,10 +85,11 @@ LABELS = {"owner_prefix": str, "status_prefix": str,
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
-          "stuck": dict}
+          "stuck": dict, "owners": dict}
 IDLE_OFFER = {"idle_minutes": int, "report_to": str}
 MERGE_NOTICE = {"window_minutes": int}
 STUCK = {"retarget": bool, "self_blocked": bool, "draft_hours": int}
+OWNERS = {"triage": str}
 RECEIVER = {"address": str, "port": int, "path": str, "secret_file": str,
             "max_body": int, "ticks": dict, "route": list}
 # The webhook events forge-receiver reads; `receiver.ticks` keys are
@@ -227,6 +228,8 @@ def check(data):
             _check_merge_notice(router["merge_notice"], problems)
         if isinstance(router.get("stuck"), dict):
             _check_stuck(router["stuck"], problems)
+        if isinstance(router.get("owners"), dict):
+            _check_owners(router["owners"], data["agents"], problems)
     merge = data.get("merge", {})
     if _fields("merge", merge, MERGE, problems):
         for i, argv in enumerate(merge.get("gate", [])):
@@ -459,6 +462,17 @@ def _check_stuck(stuck, problems):
     _fields(where, stuck, STUCK, problems)
     if _is(stuck.get("draft_hours"), int) and stuck["draft_hours"] < 1:
         problems.append("%s.draft_hours must be at least 1" % where)
+
+
+def _check_owners(owners, agents, problems):
+    """router.owners (designs/0008): who is asked to label an issue
+    nobody owns."""
+    where = "router.owners"
+    _fields(where, owners, OWNERS, problems)
+    if isinstance(owners.get("triage"), str) and \
+            owners["triage"] not in agents:
+        problems.append("%s.triage: %r is not an agent"
+                        % (where, owners["triage"]))
 
 
 def _check_receiver(receiver, problems):

@@ -56,7 +56,7 @@ starts with `_` is a comment, at any level.
 | `checks` | no | The build check, `forge-pr-check`; see below. |
 | `labels` | no | The labels tools read: `owner_prefix` (default `Owner:`; `Owner:<Name>` says whose an item is), `status_prefix` (default `Status:`), `waiting_on_owner` (default `Status:waiting-owner`: the owner's turn) and `waiting_external` (default `Status:waiting-external`: nobody's). |
 | `relay` | no | Where `forge-router` posts wakes, and `forge-merger` its stall messages (`merge.stall_alert`): `url`, the xmpp-webhook-relay's base (default `http://127.0.0.1:8788`), `token_file`, its environment file holding `WEBHOOK_TOKEN` (default `~/.config/xmpp-webhook-relay/token`), `remind_seconds`, how long before a turn is woken again (default 7200), and `room`, the room the agents share. |
-| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, `merge_notice` their merge notice, and `stuck` their rules for stuck pull requests (all below). Every key is checked. |
+| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, `merge_notice` their merge notice, `stuck` their rules for stuck pull requests, and `owners` their reading of whose an issue is (all below). Every key is checked. |
 | `closing_keywords` | no | How `forge-closing-keywords` words a refusal: `enforced_by`, what refuses a pull request it fails (default `the Merger`), and `rerun`, how to run it again once GitHub's `closingIssuesReferences` catches up with a body edit (default `run the check again (the Merger does, on its next tick)`). A project that runs it in CI names its workflow and `gh run rerun --failed <run>`. The issues it judges are `repo`'s, and its default range starts at `default_branch`. The Merger runs it as a gate: `["forge-closing-keywords", "--pr", "{pr}", "--include-subject"]`. |
 
 ### An agent
@@ -369,6 +369,26 @@ reasons.
 | `retarget` | `false` | A pull request based on a branch other than the default, when no open pull request has that branch as its head: retarget it to the default branch. Said once per base. A project that bases pull requests on long-lived branches with no pull request of their own (release branches, say) leaves it off. |
 | `self_blocked` | `false` | A pull request whose `Blocked-by: #N` line names an issue it closes: replace the line with `Closes #N`. Said once per edit of its body. |
 | `draft_hours` | none | Hours a draft may go without a new commit, a body edit or a comment or review by its author before it is asked to be un-drafted or to record what it waits for. A draft records a wait with a `Blocked-by:` line naming an open item, a `Defer-until:` time still to come, or a label starting with `labels.status_prefix` and `waiting-` (`Status:waiting-*`), and is then left alone. Asked once per idle stretch. At least 1. |
+
+### `router.owners`
+
+Without it, an issue is an agent's when an `Owner:<Name>` label names
+the agent, and some rules (answered by the owner, unblocked) fall back
+to the issue's author while others (answered by anyone, the idle offer)
+don't. With it, every rule reads an issue's owner the same way: the
+agent the label names, else the author when the author is an agent,
+else nobody. A label naming no agent is passed over. An issue nobody
+owns, and not waiting on someone outside, is rule 18: `triage`'s turn,
+"label it", said once for when it was opened or its `Owner:` labels
+last changed, or surfaced when `triage` isn't set. `{}` turns on the
+reading alone. Pull requests are unchanged: they are their author's or
+a reviewer's, never by label.
+[designs/0008](designs/0008-every-issue-has-an-owner.md) has the
+reasons.
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `triage` | none | The agent asked to label an issue nobody owns, usually whoever plans the work. Without it such issues are surfaced instead. |
 
 ### `checks`
 

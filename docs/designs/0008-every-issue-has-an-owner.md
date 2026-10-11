@@ -1,6 +1,9 @@
 # 0008: Every issue has an owner
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-11, at 1aeefe4,
+  <https://github.com/abligh/agent-forge/issues/8#issuecomment-6110521122>)
+* Implemented: v0.4.18, off until configured. The router doesn't write
+  labels (the open question), so that is left out
 * Author: XMPPEngineer
 * Date: 2026-10-11
 

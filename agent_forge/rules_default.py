@@ -142,6 +142,17 @@ With `router.merge_notice`, a run also tells authors of their merges
     when the merges couldn't be read: unknown is never "nothing
     merged".
 
+With `router.owners` (designs/0008), "the item owner" in rules 10, 12,
+14 and 15 is the agent an `Owner:<Name>` label names, else the author
+when an agent, else nobody; a label naming no agent is passed over.
+Rule 13 then never applies, and an issue with no owner, past rule 9 and
+not waiting on the owner, is rule 18's:
+
+18. an unowned issue: `owners.triage`'s turn, "label it", or surfaced
+    without `triage`. The event is the later of its creation and its
+    `Owner:` labels' last change, so it is said once and said again if
+    its label is taken off.
+
 **Who wrote something is read from its login**, never its text (but
 for rule 10's exception): an App's bot login (`<slug>[bot]`) maps to
 its name through the configuration, the Merger's under `machinery`,
@@ -201,6 +212,9 @@ SELF_BLOCKED = False
 DRAFT_HOURS = None
 # A label recording what a draft waits for starts with this.
 WAITING_PREFIX = "Status:waiting-"
+# `router.owners` (designs/0008), or None: off. `triage` is the agent
+# an unowned issue goes to, or None: surfaced.
+OWNERS = None
 
 # What the rules read of each open item, besides its number.
 graphql = {
@@ -230,6 +244,14 @@ graphql = {
           nodes { databaseId author { login } createdAt body }
         }""",
 }
+ISSUE_FIELDS = graphql["Issue"]
+# With `router.owners`: when labels went on and off, for rule 18's event.
+OWNER_LABEL_EVENTS = """
+        ownerLabels: timelineItems(last:30,
+                                   itemTypes:[LABELED_EVENT, UNLABELED_EVENT]) {
+          nodes { ... on LabeledEvent { createdAt label { name } }
+                  ... on UnlabeledEvent { createdAt label { name } } }
+        }"""
 # Read as lists; `commits` and `headCommit` keep their nodes.
 flatten = ("labels", "reviews", "comments", "files")
 
@@ -240,7 +262,7 @@ def configure(project, merger_tool):
     global merger, MERGER, OWNER, WAITING_OWNER, WAITING_EXTERNAL
     global OWNER_PREFIX, STATUS_CONTEXT, IDLE_OFFER, wants_directory
     global MERGE_NOTICE, merged_window
-    global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX
+    global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
     merger = merger_tool
     labels = project.section("labels")
     MERGER = merger.ACT_AS
@@ -265,6 +287,9 @@ def configure(project, merger_tool):
     SELF_BLOCKED = stuck.get("self_blocked") is True
     DRAFT_HOURS = stuck.get("draft_hours")
     WAITING_PREFIX = labels.get("status_prefix", "Status:") + "waiting-"
+    owners = project.section("router").get("owners")
+    OWNERS = None if owners is None else {"triage": owners.get("triage")}
+    graphql["Issue"] = ISSUE_FIELDS + (OWNER_LABEL_EVENTS if OWNERS else "")
 
 
 # --- who is who -------------------------------------------------------------
@@ -358,6 +383,40 @@ def owner_of(item):
         if name.startswith(OWNER_PREFIX) and name[len(OWNER_PREFIX):].strip():
             return name[len(OWNER_PREFIX):].strip()
     return None
+
+
+def issue_owner(issue, roster):
+    """Whose issue it is. Without `router.owners`, the `Owner:` label's
+    name, whoever it names (or None). With it (designs/0008): the agent
+    the label names, else the author when an agent, else None: unowned.
+    A label naming no agent is passed over."""
+    labelled = owner_of(issue)
+    if OWNERS is None:
+        return labelled
+    if labelled and roster.is_agent(labelled):
+        return labelled
+    author = roster.who(author_of(issue))
+    return author if roster.is_agent(author) else None
+
+
+def unowned(issue, roster):
+    """Rule 18: an unowned issue is `owners.triage`'s turn, or surfaced
+    without one. The event is when it was created or its `Owner:`
+    labels last changed, so a label taken off asks again."""
+    n = issue["number"]
+    labelled = owner_of(issue)
+    why = ("its %s label names nobody" % (OWNER_PREFIX + labelled)
+           if labelled else "has no owner")
+    triage = OWNERS["triage"]
+    if not triage:
+        return nobody(n, 18, why, kind="surface")
+    changed = [e.get("createdAt") or "" for e in (
+        (issue.get("ownerLabels") or {}).get("nodes") or [])
+        if ((e or {}).get("label") or {}).get("name", "").startswith(
+            OWNER_PREFIX)]
+    event = max([issue.get("createdAt") or ""] + changed)
+    return turn(n, triage, 18, event, "%s: label it %s<Name>" % (
+        why, OWNER_PREFIX))
 
 
 def last_by(items, logins, stamp="createdAt"):
@@ -646,7 +705,7 @@ def route_issue(issue, roster):
     n = issue["number"]
     labels = labels_of(issue)
     comments = issue.get("comments") or []
-    owner = owner_of(issue)
+    owner = issue_owner(issue, roster)
     # Rule 9.
     if WAITING_EXTERNAL in labels:
         return nobody(n, 9, WAITING_EXTERNAL)
@@ -655,6 +714,9 @@ def route_issue(issue, roster):
         answered = owner_answered(n, issue, owner, comments, roster, 10)
         # Rule 11.
         return answered or nobody(n, 11, WAITING_OWNER)
+    # Rule 18, with `router.owners`: nothing below can wake anyone.
+    if OWNERS is not None and owner is None:
+        return unowned(issue, roster)
     # Rule 12.
     if owner:
         mine = {roster.login_of(owner)}
@@ -852,7 +914,7 @@ def owned_issues(agent, ctx):
             in_hand |= referenced_by(pr)
     actionable, held, waiting = [], 0, 0
     for issue in ctx.issues:
-        if owner_of(issue) != agent:
+        if issue_owner(issue, ctx.roster) != agent:
             continue
         labels = labels_of(issue)
         if WAITING_OWNER in labels or WAITING_EXTERNAL in labels:
@@ -939,7 +1001,8 @@ def unblocked_by_merge(number, ctx):
     out = []
     for issue in sorted(ctx.issues, key=lambda i: i["number"]):
         if number in merger.blockers_of(issue) and not blocked(issue):
-            out.append("#%d (%s)" % (issue["number"], owner_of(issue)
+            out.append("#%d (%s)" % (issue["number"],
+                                     issue_owner(issue, ctx.roster)
                                      or ctx.roster.who(author_of(issue))))
     return out
 
