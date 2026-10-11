@@ -151,13 +151,22 @@ slot's caches as it finishes, while it still holds the slot:
    the default branch's last green run in the slot didn't write;
 2. directories directly in an `incremental` directory with nothing in
    them touched for 7 days;
-3. then the oldest files, until the slot's caches hold at most
-   `cache_limit`.
+3. then, until the slot's caches hold at most `cache_limit`, whole
+   directories, each aged by its newest file, oldest first: those
+   directly in an `incremental` directory, then those directly in a
+   cache (a build profile such as `debug`, or a target with its
+   profiles).
+
+Pass 3 never removes a single file. A build tool trusts what it
+recorded about the files it wrote, so a file missing from a directory
+it still uses can break the build: removing the oldest files one by one
+hollowed out Cargo's incremental sessions, and rustc crashed. A missing
+directory only makes it build that part afresh, so pruning costs time,
+never a wrong verdict.
 
 Links are never followed, so nothing outside the caches is touched.
 What went is logged in `verdicts.log` as `CACHE-PRUNED`, with the bytes
-freed and left. A build tool rebuilds whatever it finds missing, so
-pruning costs time, never a wrong verdict.
+freed and left.
 
 ### Checking the merge with the default branch
 

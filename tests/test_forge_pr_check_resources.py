@@ -257,21 +257,54 @@ class PruneCaches(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.inc)), ["b-2"])
         self.assertEqual((gone["incremental"], gone["freed"]), (1, 5))
 
-    def test_then_the_oldest_files_until_under_the_limit(self):
-        first = make(self.path("a"), 40, 0.5)
-        second = make(self.path("b"), 40, 0.4)
-        third = make(self.path("c"), 40, 0.3)
-        gone = pc.prune_caches([self.root], 90, NOW)
-        self.assertEqual([os.path.exists(p) for p in (first, second, third)],
+    def test_over_the_limit_whole_incremental_sessions_go_first(self):
+        older = make(self.path("debug", "incremental", "a-1", "s", "f"), 40, 0.5)
+        newer = make(self.path("debug", "incremental", "b-2", "f"), 40, 0.1)
+        ancient = make(self.path("debug", "incremental", "b-2", "g"), 40, 0.9)
+        lib = make(self.path("debug", "deps", "libx.rlib"), 40, 0.9)
+        gone = pc.prune_caches([self.root], 130, NOW)
+        self.assertEqual(sorted(os.listdir(self.inc)), ["b-2"])
+        for kept in (newer, ancient, lib):
+            self.assertTrue(os.path.exists(kept), kept)
+        self.assertFalse(os.path.exists(older))
+        self.assertEqual((gone["units"], gone["left"]), (1, 120))
+
+    def test_never_a_single_file_from_a_directory_still_in_use(self):
+        # agent-forge #15: removing the oldest files one by one hollowed
+        # out incremental sessions Cargo still used, and rustc crashed.
+        make(self.path("debug", "incremental", "a-1", "old"), 40, 0.9)
+        make(self.path("debug", "incremental", "a-1", "new"), 40, 0.1)
+        make(self.path("debug", "deps", "libx.rlib"), 40, 0.8)
+        make(self.path("debug", "deps", "liby.rlib"), 40, 0.05)
+        pc.prune_caches([self.root], 150, NOW)
+        self.assertEqual(sorted(os.listdir(self.inc)), [])
+        self.assertEqual(sorted(os.listdir(self.deps)),
+                         ["libx.rlib", "liby.rlib"])
+
+    def test_then_whole_top_directories_oldest_first(self):
+        debug = make(self.path("debug", "deps", "libx.rlib"), 40, 0.5)
+        wasm = make(self.path("wasm32", "debug", "deps", "liby.rlib"), 40, 0.3)
+        tag = make(self.path("CACHEDIR.TAG"), 1, 0.9)
+        gone = pc.prune_caches([self.root], 50, NOW)
+        self.assertEqual([os.path.exists(p) for p in (debug, wasm, tag)],
                          [False, True, True])
-        self.assertEqual((gone["files"], gone["left"]), (1, 80))
+        self.assertFalse(os.path.exists(self.path("debug")))
+        self.assertEqual((gone["units"], gone["left"]), (1, 41))
+
+    def test_a_directory_is_aged_by_its_newest_file(self):
+        make(self.path("debug", "old"), 40, 0.9)
+        recent = make(self.path("debug", "new"), 1, 0.01)
+        other = make(self.path("release", "x"), 40, 0.5)
+        pc.prune_caches([self.root], 50, NOW)
+        self.assertTrue(os.path.exists(recent))
+        self.assertFalse(os.path.exists(other))
 
     def test_the_limit_spans_the_slots_caches(self):
         other = os.path.join(self._tmp.name, "node-cache")
-        make(self.path("a"), 40, 0.5)
-        make(os.path.join(other, "b"), 40, 0.6)
+        make(self.path("debug", "a"), 40, 0.5)
+        make(os.path.join(other, "pkg", "b"), 40, 0.6)
         gone = pc.prune_caches([self.root, other], 50, NOW)
-        self.assertEqual((gone["files"], gone["left"]), (1, 40))
+        self.assertEqual((gone["units"], gone["left"]), (1, 40))
         self.assertEqual(os.listdir(other), [])
 
     def test_links_are_never_followed(self):
@@ -305,16 +338,16 @@ class PruneSlotCaches(StateCase):
 
     def test_the_slots_own_caches_and_a_log_line(self):
         now = pc.time.time()
-        mine = make(os.path.join(self.state_dir, "cargo-target-2", "a"), 60,
-                    0.5, now=now)
-        theirs = make(os.path.join(self.state_dir, "cargo-target", "a"), 60,
-                      0.5, now=now)
+        mine = make(os.path.join(self.state_dir, "cargo-target-2", "d", "a"),
+                    60, 0.5, now=now)
+        theirs = make(os.path.join(self.state_dir, "cargo-target", "d", "a"),
+                      60, 0.5, now=now)
         gone = pc.prune_slot_caches(self.state_dir, 2, self.lines.append)
         self.assertFalse(os.path.exists(mine))
         self.assertTrue(os.path.exists(theirs))
         self.assertEqual(gone["freed"], 60)
         self.assertIn("CACHE-PRUNED slot 2: freed 60 bytes (0 executables, "
-                      "0 incremental directories, 1 files over the limit); "
+                      "0 incremental directories, 1 directories over the limit); "
                       "0 bytes left", self.lines[-1])
 
     def test_off_without_a_limit(self):

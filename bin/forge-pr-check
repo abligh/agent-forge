@@ -1765,7 +1765,7 @@ def newest_mtime(path):
 
 def prune_caches(roots, limit, now, main_since=None):
     """Prune a slot's build caches, `roots`, in three passes, and return
-    what went: {"executables", "incremental", "files", "freed", "left"}.
+    what went: {"executables", "incremental", "units", "freed", "left"}.
 
     1. Executables directly in any `deps` directory older than
        STALE_EXECUTABLE that the default branch's last green run in
@@ -1773,11 +1773,17 @@ def prune_caches(roots, limit, now, main_since=None):
        each head's rebuilt test binaries, which nothing runs again.
     2. Directories directly in any `incremental` directory with nothing
        in them touched for STALE_INCREMENTAL.
-    3. Then the oldest files, until the caches hold at most `limit`.
+    3. Then, until the caches hold at most `limit`, whole directories,
+       each aged by its newest file, oldest first: those directly in an
+       `incremental` directory, then those directly in a root. Never a
+       single file: a build tool trusts what it recorded about the
+       files it wrote, so one missing from a directory it still uses
+       can break a build (a hollow incremental session crashed rustc),
+       where a missing directory only makes it start that part afresh.
 
     `now` and `main_since` are epoch seconds. A root that is a link, or
     isn't there, is left alone."""
-    gone = {"executables": 0, "incremental": 0, "files": 0, "freed": 0}
+    gone = {"executables": 0, "incremental": 0, "units": 0, "freed": 0}
     roots = [r for r in roots if os.path.isdir(r) and not os.path.islink(r)]
     stale = now - STALE_EXECUTABLE.total_seconds()
     if main_since is not None:
@@ -1818,17 +1824,50 @@ def prune_caches(roots, limit, now, main_since=None):
                     dirs.remove(entry)
                     gone["incremental"] += 1
                     gone["freed"] += size
-    every = [f for root in roots for f in files_under(root)]
-    total = sum(st.st_size for _, st in every)
-    if limit is not None and total > limit:
-        for path, st in sorted(every, key=lambda f: f[1].st_mtime):
+    total = sum(st.st_size for root in roots for _, st in files_under(root))
+    if limit is not None:
+        for units in (lambda: incremental_sessions(roots),
+                      lambda: top_directories(roots)):
             if total <= limit:
                 break
-            before = gone["freed"]
-            remove(path, st.st_size, "files")
-            total -= gone["freed"] - before
+            for path in sorted(units(), key=newest_mtime):
+                if total <= limit:
+                    break
+                size = sum(st.st_size for _, st in files_under(path))
+                try:
+                    shutil.rmtree(path)
+                except OSError:
+                    continue
+                gone["units"] += 1
+                gone["freed"] += size
+                total -= size
     gone["left"] = total
     return gone
+
+
+def incremental_sessions(roots):
+    """Every directory directly in an `incremental` directory under
+    roots: one crate's incremental state, which is used whole or not
+    at all."""
+    found = []
+    for root in roots:
+        for top, dirs, files in os.walk(root):
+            if os.path.basename(top) == "incremental":
+                found += [os.path.join(top, d) for d in dirs
+                          if not os.path.islink(os.path.join(top, d))]
+                dirs.clear()
+    return found
+
+
+def top_directories(roots):
+    """Every directory directly in a root: a build profile, or a target
+    with its profiles."""
+    found = []
+    for root in roots:
+        for entry in os.scandir(root):
+            if entry.is_dir(follow_symlinks=False):
+                found.append(entry.path)
+    return found
 
 
 def prune_slot_caches(state_dir, slot, out=print):
@@ -1849,9 +1888,10 @@ def prune_slot_caches(state_dir, slot, out=print):
         return None
     if gone["freed"]:
         log(state_dir, "CACHE-PRUNED %s: freed %d bytes (%d executables, %d "
-            "incremental directories, %d files over the limit); %d bytes "
-            "left" % (slot_label(slot), gone["freed"], gone["executables"],
-                      gone["incremental"], gone["files"], gone["left"]),
+            "incremental directories, %d directories over the limit); %d "
+            "bytes left" % (slot_label(slot), gone["freed"],
+                            gone["executables"], gone["incremental"],
+                            gone["units"], gone["left"]),
             now_utc(), out)
     return gone
 
