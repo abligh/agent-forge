@@ -76,7 +76,8 @@ class Interface(unittest.TestCase):
 
     def test_what_it_asks_github_for(self):
         self.assertEqual(sorted(rules.graphql), ["Issue", "PullRequest"])
-        self.assertEqual([l.name for l in rules.lookups], ["blockers"])
+        self.assertEqual([l.name for l in rules.lookups],
+                         ["blockers", "bases"])
 
 
 if __name__ == "__main__":

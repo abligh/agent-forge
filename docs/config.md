@@ -56,7 +56,7 @@ starts with `_` is a comment, at any level.
 | `checks` | no | The build check, `forge-pr-check`; see below. |
 | `labels` | no | The labels tools read: `owner_prefix` (default `Owner:`; `Owner:<Name>` says whose an item is), `status_prefix` (default `Status:`), `waiting_on_owner` (default `Status:waiting-owner`: the owner's turn) and `waiting_external` (default `Status:waiting-external`: nobody's). |
 | `relay` | no | Where `forge-router` posts wakes, and `forge-merger` its stall messages (`merge.stall_alert`): `url`, the xmpp-webhook-relay's base (default `http://127.0.0.1:8788`), `token_file`, its environment file holding `WEBHOOK_TOKEN` (default `~/.config/xmpp-webhook-relay/token`), `remind_seconds`, how long before a turn is woken again (default 7200), and `room`, the room the agents share. |
-| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, and `merge_notice` their merge notice (both below). Every key is checked. |
+| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, `merge_notice` their merge notice, and `stuck` their rules for stuck pull requests (all below). Every key is checked. |
 | `closing_keywords` | no | How `forge-closing-keywords` words a refusal: `enforced_by`, what refuses a pull request it fails (default `the Merger`), and `rerun`, how to run it again once GitHub's `closingIssuesReferences` catches up with a body edit (default `run the check again (the Merger does, on its next tick)`). A project that runs it in CI names its workflow and `gh run rerun --failed <run>`. The issues it judges are `repo`'s, and its default range starts at `default_branch`. The Merger runs it as a gate: `["forge-closing-keywords", "--pr", "{pr}", "--include-subject"]`. |
 
 ### An agent
@@ -280,6 +280,27 @@ Merges that can't be read are not taken as none. Off without the key;
 | Key | Default | What it is |
 | --- | --- | --- |
 | `window_minutes` | `30` | How far back each run looks for merges. Longer than the router's interval, so a run that fails or is late misses none; a merge older than this when the router first sees it is not announced. |
+
+### `router.stuck`
+
+Some pull requests are stuck in ways no other rule notices, so nobody
+is woken for them: one stacked on a branch whose pull request has
+merged, which the Merger holds as based on the wrong branch; one
+blocked by the issue it closes, which the Merger can never take; and a
+draft left idle with nothing saying what it waits for. Each key turns
+on one rule that makes such a pull request its author's turn, with
+what to do, said once for its event and never reminded. They come
+before the other pull request rules, so they apply to drafts too.
+Each is off without its key. `agent_forge/rules_default.py` (rules
+0a, 0b and 0c) has the detail, and
+[designs/0004](designs/0004-pull-requests-nobody-is-woken-for.md) the
+reasons.
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `retarget` | `false` | A pull request based on a branch other than the default, when no open pull request has that branch as its head: retarget it to the default branch. Said once per base. A project that bases pull requests on long-lived branches with no pull request of their own (release branches, say) leaves it off. |
+| `self_blocked` | `false` | A pull request whose `Blocked-by: #N` line names an issue it closes: replace the line with `Closes #N`. Said once per edit of its body. |
+| `draft_hours` | none | Hours a draft may go without a new commit, a body edit or a comment or review by its author before it is asked to be un-drafted or to record what it waits for. A draft records a wait with a `Blocked-by:` line naming an open item, a `Defer-until:` time still to come, or a label starting with `labels.status_prefix` and `waiting-` (`Status:waiting-*`), and is then left alone. Asked once per idle stretch. At least 1. |
 
 ### `checks`
 

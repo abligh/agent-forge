@@ -6,14 +6,43 @@ and keeps state; this says whose turn an item is, from GitHub alone.
 docs/router.md is the interface between the two.
 
 The labels are the configuration's `labels`: `owner_prefix` (default
-`Owner:`), `waiting_on_owner` (default `Status:waiting-owner`) and
-`waiting_external` (default `Status:waiting-external`). "The owner" is
-the person whose login is the configuration's `owner`.
+`Owner:`), `status_prefix` (default `Status:`), `waiting_on_owner`
+(default `Status:waiting-owner`) and `waiting_external` (default
+`Status:waiting-external`). "The owner" is the person whose login is
+the configuration's `owner`.
 
 **Whose turn it is.** The first rule that matches decides; none means
 nobody's.
 
 Pull requests:
+
+With `router.stuck` in the configuration, three rules come first, so
+they apply to drafts and waiting pull requests too, each off until its
+key is set (designs/0004). Each is the author's turn, and is said once
+for its event, never reminded:
+
+0a. `retarget`: its base is not the default branch (the Merger's), and
+    no open pull request has that base as its head branch: what it was
+    stacked on has merged or closed, or never was. "Retarget it". The
+    event is the base, so it is said once until the base changes. A
+    base whose open pull requests couldn't be read wakes nobody;
+0b. `self_blocked`: a `Blocked-by: #N` line (the Merger's notation, as
+    for rule 14) names one of its closing references
+    (`closingIssuesReferences`: `Closes #N` and the like). #N stays
+    open until it merges, so the Merger can never take it. "Replace the
+    line with `Closes #N`". The event is the body's last edit;
+0c. `draft_hours: H`: a draft with no new commit (the head's commit
+    date), no body edit and no comment or review by its author for H
+    hours, that records no wait: no `Blocked-by:` line naming an open
+    item (a number naming nothing is left out, as for rule 14), no
+    newest `Defer-until:` (as the Merger reads it) whose time is still
+    to come (one that is not a time is no wait here), and no label
+    starting with the labels' `status_prefix` and `waiting-`
+    (`Status:waiting-*`). "Un-draft it, or record what it waits for".
+    The event is that last activity, so it is asked once per idle
+    stretch.
+
+Then:
 
 1. a draft, or waiting on the owner or on someone outside: nobody's;
 2. a Merger hand-back of the current head is the newest thing said (a
@@ -73,7 +102,7 @@ agents with nothing to do (off without it):
 
 15. an agent the relay's directory shows idle (status `idle`, every
     entry of its session name, for at least `idle_minutes`, default 10),
-    with no turn from rules 1-14, which owns an actionable issue: the
+    with no turn from rules 0a-14, which owns an actionable issue: the
     agent's, offered the oldest such issue by creation. An issue is
     actionable when it is labelled `Owner:<Name>`, is waiting neither
     on the owner nor on someone outside, every item its `Blocked-by:`
@@ -156,10 +185,18 @@ MERGE_NOTICE = None
 DEFAULT_MERGE_WINDOW = 30
 # How far back, in minutes, the engine reads merges: 0, none.
 merged_window = 0
+# `router.stuck`: rules 0a, 0b and 0c, each off until set.
+RETARGET = False
+SELF_BLOCKED = False
+# Hours a draft sits before it is asked about, or None: off.
+DRAFT_HOURS = None
+# A label recording what a draft waits for starts with this.
+WAITING_PREFIX = "Status:waiting-"
 
 # What the rules read of each open item, besides its number.
 graphql = {
     "PullRequest": """isDraft headRefOid author { login } body
+        baseRefName headRefName createdAt lastEditedAt
         closingIssuesReferences(first:20) { nodes { number } }
         labels(first:30) { nodes { name } }
         files(first:100) { nodes { path additions deletions } }
@@ -174,7 +211,7 @@ graphql = {
           nodes { commit { oid parents { totalCount } } }
         }
         headCommit: commits(last:1) {
-          nodes { commit { oid
+          nodes { commit { oid committedDate
             status { contexts { context state createdAt
                                 creator { login } } } } }
         }""",
@@ -194,6 +231,7 @@ def configure(project, merger_tool):
     global merger, MERGER, OWNER, WAITING_OWNER, WAITING_EXTERNAL
     global OWNER_PREFIX, STATUS_CONTEXT, IDLE_OFFER, wants_directory
     global MERGE_NOTICE, merged_window
+    global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX
     merger = merger_tool
     labels = project.section("labels")
     MERGER = merger.ACT_AS
@@ -213,6 +251,11 @@ def configure(project, merger_tool):
         "window_minutes": notice.get("window_minutes",
                                      DEFAULT_MERGE_WINDOW)}
     merged_window = MERGE_NOTICE["window_minutes"] if MERGE_NOTICE else 0
+    stuck = project.section("router").get("stuck") or {}
+    RETARGET = stuck.get("retarget") is True
+    SELF_BLOCKED = stuck.get("self_blocked") is True
+    DRAFT_HOURS = stuck.get("draft_hours")
+    WAITING_PREFIX = labels.get("status_prefix", "Status:") + "waiting-"
 
 
 # --- who is who -------------------------------------------------------------
@@ -366,9 +409,9 @@ def signed_by_agent(comment, roster):
     return bool(lines) and lines[-1] in roster.signatures()
 
 
-def turn(number, who, rule, event, line):
+def turn(number, who, rule, event, line, reminder=None):
     return {"item": number, "who": who, "rule": rule, "event": event,
-            "line": "#%d %s" % (number, line)}
+            "line": "#%d %s" % (number, line), "reminder": reminder}
 
 
 def nobody(number, rule, why, kind="turn"):
@@ -376,10 +419,15 @@ def nobody(number, rule, why, kind="turn"):
             "kind": kind}
 
 
-def route_pr(pr, roster):
-    """The turn for one pull request, as `turn` or `nobody` builds it."""
+def route_pr(pr, roster, when=None):
+    """The turn for one pull request, as `turn` or `nobody` builds it.
+    `when` is the run's clock, for rule 0c; it defaults to now."""
     n, head = pr["number"], pr.get("headRefOid") or ""
     labels = labels_of(pr)
+    # Rules 0a, 0b and 0c, before rule 1: a draft can be stuck too.
+    stuck = stuck_pr(pr, roster, when or merger.now_utc())
+    if stuck:
+        return stuck
     # Rule 1.
     if pr.get("isDraft"):
         return nobody(n, 1, "draft")
@@ -455,6 +503,109 @@ def route_pr(pr, roster):
         return turn(n, reviewer, 8, max(status.get("createdAt") or "", spoke),
                     "needs your review (green at %s)" % head[:7])
     return nobody(n, None, "no rule matched")
+
+
+# --- stuck pull requests (rules 0a, 0b and 0c) ------------------------------
+
+
+def stuck_pr(pr, roster, when):
+    """Rules 0a, 0b and 0c, each when `router.stuck` turns it on: the
+    author's turn for a pull request nothing else would wake anyone
+    for, said once for its event, else None."""
+    n = pr["number"]
+    author = roster.who(author_of(pr))
+    # Rule 0a. `baseOpen` is the `bases` lookup's: False only when
+    # GitHub said no open pull request has the base as its head.
+    base = pr.get("baseRefName") or ""
+    if (RETARGET and base and base != merger.MAIN
+            and pr.get("baseOpen") is False):
+        return turn(n, author, "0a", "base " + base,
+                    "is based on %s, and no open pull request has %s as "
+                    "its head: what it was stacked on has merged or "
+                    "closed, or never was. Retarget it to %s, merging %s "
+                    "into it first "
+                    "if needed." % (base, base, merger.MAIN, merger.MAIN),
+                    reminder=ONCE)
+    # Rule 0b.
+    if SELF_BLOCKED:
+        both = sorted(merger.blockers_of(pr) & closing_of(pr))
+        if both:
+            k = both[0]
+            return turn(n, author, "0b",
+                        pr.get("lastEditedAt") or pr.get("createdAt") or "",
+                        "says Blocked-by: #%d, which it closes: #%d stays "
+                        "open until it merges, so the Merger can never take "
+                        "it. Replace the line with `Closes #%d`." % (k, k, k),
+                        reminder=ONCE)
+    # Rule 0c. A last activity that can't be read is never idle.
+    if DRAFT_HOURS and pr.get("isDraft"):
+        last = last_activity(pr)
+        since = parse_stamp(last)
+        if since is None or waits(pr, when):
+            return None
+        hours = int((when - since).total_seconds() // 3600)
+        if hours >= DRAFT_HOURS:
+            return turn(n, author, "0c", last,
+                        "has been a draft with nothing new for %s (since "
+                        "%s), and records no wait. Un-draft it, or record "
+                        "what it waits for: a Blocked-by: line, a "
+                        "Defer-until: line or a %s* label." % (
+                            counted(hours, "hour", "hours"),
+                            since_text(last, when), WAITING_PREFIX),
+                        reminder=ONCE)
+    return None
+
+
+def closing_of(pr):
+    """The issue numbers GitHub says the pull request closes."""
+    refs = pr.get("closingIssuesReferences") or {}
+    nodes = refs.get("nodes") if isinstance(refs, dict) else refs
+    return {n.get("number") for n in nodes or [] if isinstance(n, dict)}
+
+
+def last_activity(pr):
+    """The newest of the head's commit date, the body's last edit (or
+    the pull request's creation) and anything its author said."""
+    nodes = (pr.get("headCommit") or {}).get("nodes") or []
+    commit = ((nodes[-1] or {}).get("commit") or {}) if nodes else {}
+    mine = {author_of(pr)}
+    reviews = [r for r in pr.get("reviews") or [] if r.get("submittedAt")]
+    return max(commit.get("committedDate") or "",
+               pr.get("lastEditedAt") or pr.get("createdAt") or "",
+               last_by(pr.get("comments") or [], mine),
+               last_by(reviews, mine, "submittedAt"))
+
+
+def waits(pr, when):
+    """Whether a pull request records what it waits for at `when`: a
+    `Blocked-by:` item still open (as `blocked` reads it), a
+    `Defer-until:` still to come, or a `Status:waiting-*` label."""
+    if any(l.startswith(WAITING_PREFIX) for l in labels_of(pr)):
+        return True
+    if blocked(pr):
+        return True
+    until = deferred_until(pr)
+    return until is not None and until > when
+
+
+def deferred_until(pr):
+    """The time of the newest `Defer-until:` line on the pull request,
+    found as the Merger finds it (the body, then comments and reviews
+    by time), or None when there is none or it is not a time."""
+    texts = [("", pr.get("body"))]
+    texts += [(c.get("createdAt") or "", c.get("body"))
+              for c in pr.get("comments") or []]
+    texts += [(r.get("submittedAt") or "", r.get("body"))
+              for r in pr.get("reviews") or [] if r.get("submittedAt")]
+    latest = None
+    for _, text in sorted(texts, key=lambda t: t[0]):
+        found = merger.DEFER_ANY_RE.findall(merger.markers_of(text))
+        if found:
+            latest = found[-1]
+    return None if latest is None else merger.parse_defer(latest)
+
+
+# --- issues -----------------------------------------------------------------
 
 
 def route_issue(issue, roster):
@@ -541,14 +692,15 @@ def as_decision(d):
     if d["who"] is None:
         return Decision(d["item"], None, d["rule"], None, None,
                         kind=d["kind"], suppressed=d["why"])
-    return Decision(d["item"], d["who"], d["rule"], d["event"], d["line"])
+    return Decision(d["item"], d["who"], d["rule"], d["event"], d["line"],
+                    reminder=d.get("reminder"))
 
 
 def decide(item, ctx):
     """The one decision for an open item."""
-    route = route_pr if item.get("__typename") == "PullRequest" \
-        else route_issue
-    return [as_decision(route(item, ctx.roster))]
+    if item.get("__typename") == "PullRequest":
+        return [as_decision(route_pr(item, ctx.roster, ctx.when))]
+    return [as_decision(route_issue(item, ctx.roster))]
 
 
 # A decision rests on nothing a later fetch could change but GitHub.
@@ -681,11 +833,12 @@ def owned_issues(agent, ctx):
 
 
 def has_turn(agent, ctx):
-    """Whether rules 1-14 make any open item the agent's turn."""
+    """Whether rules 0a-14 make any open item the agent's turn."""
     for item in ctx.prs + ctx.issues:
-        route = route_pr if item.get("__typename") == "PullRequest" \
-            else route_issue
-        if route(item, ctx.roster)["who"] == agent:
+        decided = route_pr(item, ctx.roster, ctx.when) \
+            if item.get("__typename") == "PullRequest" \
+            else route_issue(item, ctx.roster)
+        if decided["who"] == agent:
             return True
     return False
 
@@ -797,8 +950,9 @@ def merge_notices(ctx):
 # --- lookups ----------------------------------------------------------------
 
 
-# What each number named in an open issue's `Blocked-by:` lines is now,
-# for those that aren't open issues or pull requests themselves.
+# What each number named in an open issue's `Blocked-by:` lines (or a
+# draft's, for rule 0c) is now, for those that aren't open issues or
+# pull requests themselves.
 BLOCKER_QUERY = """
 query($owner:String!, $name:String!) {
   repository(owner:$owner, name:$name) {
@@ -813,12 +967,14 @@ BLOCKER_FIELD = ("    n%d: issueOrPullRequest(number:%d) {\n"
 
 def attach_blockers(github, repo, prs, issues):
     """Give each open issue a `blockedBy` map, {number: {"state",
-    "closedAt"} or None}, for the numbers its `Blocked-by:` lines name.
-    An open item is known from the listing; the rest are asked for in
-    one more query, only when there are any. None: names nothing."""
+    "closedAt"} or None}, for the numbers its `Blocked-by:` lines name,
+    and each draft too when rule 0c is on. An open item is known from
+    the listing; the rest are asked for in one more query, only when
+    there are any. None: names nothing."""
     owner, name = repo.split("/")
     open_now = {i["number"] for i in prs + issues}
-    named = {i["number"]: merger.blockers_of(i) for i in issues}
+    covered = issues + [p for p in prs if DRAFT_HOURS and p.get("isDraft")]
+    named = {i["number"]: merger.blockers_of(i) for i in covered}
     ask = sorted(set().union(*named.values()) - open_now) if named else []
     def look_up(numbers):
         query = BLOCKER_QUERY % "\n".join(BLOCKER_FIELD % (b, b)
@@ -840,11 +996,57 @@ def attach_blockers(github, repo, prs, issues):
                     found.update(look_up([b]))
                 except Exception:  # noqa: BLE001
                     found[b] = None
-    for issue in issues:
-        issue["blockedBy"] = {
+    for item in covered:
+        item["blockedBy"] = {
             b: {"state": "OPEN", "closedAt": None} if b in open_now
-            else found.get(b) for b in named[issue["number"]]}
+            else found.get(b) for b in named[item["number"]]}
 
 
+# Whether any open pull request has each base as its head branch, for
+# those no pull request in the listing has: one count per base, the
+# names passed as variables.
+BASE_QUERY = """
+query($owner:String!, $name:String!%s) {
+  repository(owner:$owner, name:$name) {
+%s
+  }
+}"""
+BASE_FIELD = ("    b%d: pullRequests(states:OPEN, headRefName:$b%d, "
+              "first:1) { totalCount }")
 
-lookups = (Lookup("blockers", attach_blockers),)
+
+def attach_bases(github, repo, prs, issues):
+    """Rule 0a's lookup, when it is on: give each pull request based on
+    another branch than the default `baseOpen`, whether an open pull
+    request has that branch as its head. One in the listing answers
+    it; the rest are asked for in one more query, only when there are
+    any. None: GitHub couldn't say, which wakes nobody."""
+    if not RETARGET:
+        return
+    stacked = [p for p in prs
+               if p.get("baseRefName") not in (None, "", merger.MAIN)]
+    heads = {p.get("headRefName") for p in prs}
+    ask = sorted({p["baseRefName"] for p in stacked} - heads)
+    found = {}
+    if ask:
+        owner, name = repo.split("/")
+        query = BASE_QUERY % (
+            "".join(", $b%d:String!" % i for i in range(len(ask))),
+            "\n".join(BASE_FIELD % (i, i) for i in range(len(ask))))
+        args = ["graphql", "-f", "query=" + query,
+                "-F", "owner=" + owner, "-F", "name=" + name]
+        for i, base in enumerate(ask):
+            args += ["-f", "b%d=%s" % (i, base)]
+        try:
+            answer = github.api(*args)["data"]["repository"]
+            found = {base: ((answer.get("b%d" % i) or {}).get("totalCount")
+                            or 0) > 0 for i, base in enumerate(ask)}
+        except Exception:  # noqa: BLE001 - gh's failures vary
+            pass  # unknown: `baseOpen` None
+    for pr in stacked:
+        base = pr["baseRefName"]
+        pr["baseOpen"] = True if base in heads else found.get(base)
+
+
+lookups = (Lookup("blockers", attach_blockers),
+           Lookup("bases", attach_bases))

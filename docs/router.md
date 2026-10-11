@@ -12,7 +12,7 @@ turn is, and who it falls to.
 
 ## What the two routers do differently
 
-The rules shipped here (the "default" rules, 1–14 in
+The rules shipped here (the "default" rules, 0a–14 in
 `agent_forge/rules_default.py`) read everything from GitHub: who wrote
 something by login, what a review saw by commit. A turn is a decision
 about one open item, edge triggered: a new event starts it, and it is
@@ -228,9 +228,11 @@ journal as it is. **Nobody's** turn has no event or line, and says why
 in `suppressed`.
 
 **A lookup attaches what it finds to the items it covers**, as the
-default rules' `blockers` gives each issue a `blockedBy` map, rather
-than into `ctx`: a rule reads it with the item, and the item can be
-routed on its own (`--only`) without a second place to look.
+default rules' `blockers` gives each issue a `blockedBy` map, and their
+`bases` tells a stacked pull request whether an open one has its base
+as its head (`baseOpen`, for `router.stuck`), rather than into
+`ctx`: a rule reads it with the item, and the item can be routed on
+its own (`--only`) without a second place to look.
 
 **The roster** is the module's, since what makes a login a name is a
 rule. The engine asks it two things: whether a name is an agent (only

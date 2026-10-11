@@ -78,9 +78,11 @@ LABELS = {"owner_prefix": str, "status_prefix": str,
           "waiting_on_owner": str, "waiting_external": str}
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
-ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict}
+ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
+          "stuck": dict}
 IDLE_OFFER = {"idle_minutes": int, "report_to": str}
 MERGE_NOTICE = {"window_minutes": int}
+STUCK = {"retarget": bool, "self_blocked": bool, "draft_hours": int}
 RECEIVER = {"address": str, "port": int, "path": str, "secret_file": str,
             "max_body": int, "ticks": dict, "route": list}
 # The webhook events forge-receiver reads; `receiver.ticks` keys are
@@ -217,6 +219,8 @@ def check(data):
                               problems)
         if isinstance(router.get("merge_notice"), dict):
             _check_merge_notice(router["merge_notice"], problems)
+        if isinstance(router.get("stuck"), dict):
+            _check_stuck(router["stuck"], problems)
     merge = data.get("merge", {})
     if _fields("merge", merge, MERGE, problems):
         for i, argv in enumerate(merge.get("gate", [])):
@@ -417,6 +421,15 @@ def _check_merge_notice(notice, problems):
     if _is(notice.get("window_minutes"), int) and \
             notice["window_minutes"] < 1:
         problems.append("%s.window_minutes must be at least 1" % where)
+
+
+def _check_stuck(stuck, problems):
+    """router.stuck: which of the default rules' stuck pull request
+    rules are on, and how long a draft sits before it is asked about."""
+    where = "router.stuck"
+    _fields(where, stuck, STUCK, problems)
+    if _is(stuck.get("draft_hours"), int) and stuck["draft_hours"] < 1:
+        problems.append("%s.draft_hours must be at least 1" % where)
 
 
 def _check_receiver(receiver, problems):
