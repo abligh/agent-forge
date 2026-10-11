@@ -860,7 +860,9 @@ class PrepareRealGit(unittest.TestCase):
         self.head = self.commit("feature")
         git("push", "-q", self.origin, "feature:refs/pull/7/head",
             cwd=self.seed)
-        git("clone", "-q", self.origin, self.repo, cwd=root)
+        # Not a local clone, which would bring refs/pull/7/head's
+        # objects along: the head isn't here until prepare fetches it.
+        git("clone", "-q", "file://" + self.origin, self.repo, cwd=root)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -895,8 +897,21 @@ class PrepareRealGit(unittest.TestCase):
         self.assertEqual(pc.prepare(self.repo, self.wt, self.head, 7),
                          ("moved", newer))
 
+    def test_a_head_already_here_is_not_fetched(self):
+        # agent-forge #13: the fetch was up to 1.6 s of every run.
+        git("fetch", "-q", "origin", "refs/pull/7/head", cwd=self.repo)
+        calls = []
+
+        def run(args, **kw):
+            calls.append(args)
+            return pc.sh(args, **kw)
+        self.assertEqual(pc.prepare(self.repo, self.wt, self.head, 7, run),
+                         ("ready", ""))
+        self.assertFalse([a for a in calls if "fetch" in a])
+        self.assertEqual(git("rev-parse", "HEAD", cwd=self.wt), self.head)
+
     def test_a_pull_request_that_does_not_exist_is_an_error(self):
-        status, detail = pc.prepare(self.repo, self.wt, self.head, 99)
+        status, detail = pc.prepare(self.repo, self.wt, "e" * 40, 99)
         self.assertEqual(status, "error")
         self.assertIn("pull/99", detail)
 
@@ -1044,11 +1059,17 @@ class MemoryCapRealScope(unittest.TestCase):
 class Worker(StateCase):
     """The worker with `prepare`'s git and the steps faked."""
 
-    def run_for(self, fetched=SHA_A, failing=(), fail_git=None):
+    def run_for(self, fetched=SHA_A, failing=(), fail_git=None, here=True):
+        """`here`: whether the head is in the object store already, so
+        `prepare` doesn't fetch it."""
         def is_failing_step(args):
             return args[0] in ("make", "npm") and args[-1] in failing
         rules = [(lambda a: "FETCH_HEAD" in a, done([], 0, fetched + "\n")),
                  (is_failing_step, done([], 1, "", "it broke\n"))]
+        if not here:
+            rules.insert(0, (lambda a: "cat-file" in a
+                             and a[-1] == SHA_A + "^{commit}",
+                             done([], 128, "", "fatal: not a commit")))
         if fail_git:
             rules.insert(0, (lambda a: fail_git in a,
                              done([], 128, "", "fatal: no")))
@@ -1117,7 +1138,7 @@ class Worker(StateCase):
 
     def test_a_moved_head_is_dropped_and_nothing_runs(self):
         self.queue()
-        run = self.run_for(fetched=SHA_B)
+        run = self.run_for(fetched=SHA_B, here=False)
         self.assertEqual(self.work(run), 0)
         self.assertEqual(self.state()["waiting"], {})
         self.assertFalse([c for c in run.calls if c["args"][0] == "make"])
@@ -1126,7 +1147,7 @@ class Worker(StateCase):
     def test_a_prepare_failure_counts_an_error_and_runs_nothing(self):
         self.queue()
         posts, chained = [], []
-        rc = self.work(self.run_for(fail_git="fetch"),
+        rc = self.work(self.run_for(fail_git="fetch", here=False),
                        post=lambda *a: posts.append(a) or True,
                        chain=lambda: chained.append(1) or ["x", "y"])
         self.assertEqual(rc, 2)
@@ -1137,7 +1158,7 @@ class Worker(StateCase):
     def test_the_last_allowed_failure_gives_up_and_posts_error(self):
         self.queue(errors=pc.MAX_ERRORS - 1)
         posts = []
-        self.work(self.run_for(fail_git="fetch"),
+        self.work(self.run_for(fail_git="fetch", here=False),
                   post=lambda *a: posts.append(a) or True)
         self.assertEqual([p[1] for p in posts], ["error"])
         self.assertIn("could not check the head out 3 times", posts[0][2])
@@ -1879,8 +1900,8 @@ class WorkerAhead(Worker):
     nowhere; a head whose tree is green already is posted green unrun."""
 
     def run_for(self, fetched=SHA_A, failing=(), fail_git=None,
-                tree=TREE_1):
-        run = super().run_for(fetched, failing, fail_git)
+                tree=TREE_1, here=True):
+        run = super().run_for(fetched, failing, fail_git, here)
         run.rules.insert(0, (lambda a: a[-1].endswith("^{tree}"),
                              done([], 0, tree + "\n")))
         return run

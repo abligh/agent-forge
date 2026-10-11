@@ -37,8 +37,11 @@ worker is never reported as running.
 **Oldest-waiting first.** A head waits from when a tick first sees it.
 Drafts are not checked. A head whose worktree can't be prepared goes
 behind every other, and after MAX_ERRORS failures it is given up on,
-so one unfetchable ref can't hold the queue. A head that moved before
-its check started is dropped; the new head is queued in its place.
+so one unfetchable ref can't hold the queue. A head already in the
+object store is checked out without fetching its ref. One that had to
+be fetched and turned out to have moved before its check started is
+dropped; the new head is queued in its place. Any other head that
+moved is stopped by the next tick (below).
 
 **A run the host broke is no verdict.** A failed step that exited 126
 or 127 (its command can't be run: a tool missing from the host's
@@ -1476,7 +1479,13 @@ def prepare(repo, wt, sha, pr, run=sh):
     """Check pull request pr's head out, clean and detached, at wt,
     creating that worktree of repo the first time. Returns (status,
     detail): "ready", "moved" with the head it found instead, or
-    "error"."""
+    "error".
+
+    A head already in the object store is not fetched (agent-forge
+    #13: the fetch was up to 1.6 s of every run), so whether it has
+    moved is only seen when it had to be fetched. A head that moved
+    while it ran is stopped by the next tick (`SUPERSEDED`) either
+    way."""
     if not os.path.exists(os.path.join(wt, ".git")):
         for args in (["git", "-C", repo, "worktree", "prune"],
                      ["git", "-C", repo, "worktree", "add", "-q", "--detach",
@@ -1485,16 +1494,19 @@ def prepare(repo, wt, sha, pr, run=sh):
             if got.returncode != 0:
                 return "error", "%s: %s" % (" ".join(args[3:5]),
                                             got.stderr.strip())
-    got = run(["git", "-C", wt, "fetch", "-q", "origin",
-               "+refs/pull/%d/head" % pr])
-    if got.returncode != 0:
-        return "error", "fetch pull/%d/head: %s" % (pr, got.stderr.strip())
-    got = run(["git", "-C", wt, "rev-parse", "FETCH_HEAD"])
-    fetched = got.stdout.strip()
-    if got.returncode != 0 or len(fetched) != 40:
-        return "error", "rev-parse FETCH_HEAD: %s" % got.stderr.strip()
-    if fetched != sha:
-        return "moved", fetched
+    if run(["git", "-C", wt, "cat-file", "-e",
+            sha + "^{commit}"]).returncode != 0:
+        got = run(["git", "-C", wt, "fetch", "-q", "origin",
+                   "+refs/pull/%d/head" % pr])
+        if got.returncode != 0:
+            return "error", "fetch pull/%d/head: %s" % (pr,
+                                                       got.stderr.strip())
+        got = run(["git", "-C", wt, "rev-parse", "FETCH_HEAD"])
+        fetched = got.stdout.strip()
+        if got.returncode != 0 or len(fetched) != 40:
+            return "error", "rev-parse FETCH_HEAD: %s" % got.stderr.strip()
+        if fetched != sha:
+            return "moved", fetched
     for args in (["git", "-C", wt, "checkout", "-q", "--detach", "--force",
                   sha],
                  ["git", "-C", wt, "clean", "-q", "-ffdx"]):
