@@ -107,6 +107,27 @@ project's own test runner can narrow further:
 Neither is set when every step runs because nothing could be selected:
 such a step must test everything.
 
+### The fast lane
+
+With `fast_lane`, each tick works out, in the cron checkout, the steps
+each waiting pull request's head would run, as the worker would
+(fetching the head there first if it isn't), and keeps the answer with
+the head. A step's cost is the median of its last 20 runs on this host,
+from the verdicts (`step_seconds`, each step's seconds); a step with
+fewer than 5 runs has no cost. A head is cheap when every step it would
+run has a cost and they add up to at most `max_seconds`. A head whose
+steps can't be worked out yet (no record, a fetch or diff that fails)
+is not cheap, and waits in the ordinary queue.
+
+The lane is one more slot, `worker-lane.lock`, with its own worktree
+(`wt-lane`) and build caches (`<directory>-lane`), and the same memory
+limit and CPU weight. It runs only cheap heads, oldest first. An
+ordinary slot takes a cheap head only when no other head waits.
+`worker.log` names the lane (`=== ... fast lane ===`). A lane run whose
+steps take more than three times `max_seconds` is not stopped, but
+logged as `SLOW-LANE` with each step's time. What is posted is the same
+as for any run.
+
 ### `merge.stall_alert`
 
 Without it, a stalled queue is a `STALLED` line in the Merger's log and
@@ -340,6 +361,8 @@ reasons.
 | `depends` | `false` | Run each new head of the default branch in full under a tracer, recording what each step reads, and run a pull request's head with only the steps that read what it changes (designs/0005; see below). |
 | `depends_minutes` | `30` | How long the newest default-branch head waits behind pull requests' heads before it goes first. |
 | `tracer` | `preload` | How `depends` traces: `preload`, an `LD_PRELOAD` library built from lib/forge-trace.c with the host's C compiler (no root, cheap, blind to statically linked programs), or `strace` (everything, slower; needs strace installed). |
+| `fast_lane` | none | `{"max_seconds": 60}`: one more slot, for heads whose chosen steps are cheap (designs/0006; see below). Refused without `depends`. |
+| `fast_lane.max_seconds` | `60` | The most a head's chosen steps may together have taken here for it to be cheap. At least 1. |
 
 Only these keys are checked; the section may hold others, for tools
 not here yet.
