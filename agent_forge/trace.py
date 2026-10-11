@@ -39,13 +39,18 @@ KEEP = datetime.timedelta(days=14)
 RECORDS = "depends"
 
 
+# How the library is compiled; part of its name, so a change rebuilds it.
+CFLAGS = ("-shared", "-fPIC", "-O2")
+
+
 def build(dest_dir, run=sh, source=SOURCE):
     """The tracer library, built into `dest_dir` the first time for
-    this source (its name carries the source's digest), or None if the
-    compiler is missing or fails."""
+    this source and CFLAGS (its name carries their digest), or None if
+    the compiler is missing or fails."""
     try:
         with open(source, "rb") as handle:
-            digest = hashlib.sha256(handle.read()).hexdigest()[:16]
+            digest = hashlib.sha256(handle.read() + " ".join(
+                CFLAGS).encode()).hexdigest()[:16]
     except OSError:
         return None
     os.makedirs(dest_dir, exist_ok=True)
@@ -55,7 +60,7 @@ def build(dest_dir, run=sh, source=SOURCE):
     fd, tmp = tempfile.mkstemp(dir=dest_dir, prefix=".forge-trace.",
                                suffix=".so")
     os.close(fd)
-    got = run(["cc", "-shared", "-fPIC", "-O2", "-o", tmp, source, "-ldl"])
+    got = run(["cc", *CFLAGS, "-o", tmp, source, "-ldl"])
     if got.returncode != 0:
         os.unlink(tmp)
         return None

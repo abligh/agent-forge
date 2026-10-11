@@ -22,7 +22,7 @@
  * is why forge-pr-check checks that a record is plausible.
  *
  * Built by forge-pr-check with: cc -shared -fPIC -O2 -o forge-trace.so
- * forge-trace.c -ldl
+ * forge-trace.c -ldl (agent_forge/trace.py's CFLAGS)
  */
 
 #define _GNU_SOURCE
@@ -58,6 +58,13 @@ static int active;
 static int trace_fd = -1;
 static dev_t trace_dev;
 static ino_t trace_ino;
+
+/* `p`, which the compiler may no longer assume isn't null. The C
+ * library declares many of the calls wrapped here `nonnull`, and the
+ * wrappers inherit that, so a plain test of the path is optimised
+ * away; but a program may pass null on purpose (Rust's standard
+ * library calls statx(0, NULL, ...) to learn whether statx works). */
+#define OPAQUE(p) ({ __typeof__(p) _p = (p); __asm__("" : "+r"(_p)); _p; })
 
 #define REAL(name) real_##name
 #define DECLARE(ret, name, ...) static ret (*real_##name)(__VA_ARGS__)
@@ -166,6 +173,7 @@ static int trace_descriptor(void)
  * directory). No allocation: it runs in vfork children too. */
 static void record(char kind, int dirfd, const char *path)
 {
+    path = OPAQUE(path);
     if (!active || !path || !*path)
         return;
     int saved = errno;
@@ -552,9 +560,13 @@ int statx(int dirfd, const char *path, int flags, unsigned int mask,
           struct statx *buf)
 {
     RESOLVE(statx);
-    /* An empty path with AT_EMPTY_PATH is a descriptor, not a lookup. */
-    if (*path)
-        record('o', dirfd, path);
+    /* An empty path with AT_EMPTY_PATH is a descriptor, not a lookup.
+     * A null one is Rust's standard library asking, after a failed
+     * stat, whether statx works at all: it expects EFAULT, not a crash
+     * here (cargo did, looking for a config file that isn't there). */
+    const char *p = OPAQUE(path);
+    if (p && *p)
+        record('o', dirfd, p);
     return real_statx(dirfd, path, flags, mask, buf);
 }
 

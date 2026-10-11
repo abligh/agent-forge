@@ -165,6 +165,33 @@ class Library(unittest.TestCase):
         self.assertIn("A", trace.relative(trace.read_preload(self.record),
                                           self.wt))
 
+    def test_a_null_path_is_passed_on_not_followed(self):
+        # Rust's standard library calls statx(0, NULL, ...) after a
+        # failed stat to learn whether statx works, and wants EFAULT:
+        # cargo crashed whenever a config file it looked for was absent.
+        with open(os.path.join(self.wt, "probe.c"), "w") as handle:
+            handle.write(textwrap.dedent("""\
+                #define _GNU_SOURCE
+                #include <errno.h>
+                #include <fcntl.h>
+                #include <stdio.h>
+                #include <sys/stat.h>
+                int main(void)
+                {
+                    struct statx buf;
+                    int rc = statx(0, NULL, 0, STATX_BASIC_STATS, &buf);
+                    printf("%d %d\\n", rc, errno == EFAULT);
+                    return 0;
+                }
+                """))
+        subprocess.run(["cc", "-o", "probe", "probe.c"], cwd=self.wt,
+                       check=True)
+        env = trace.preload_env(dict(os.environ), self.lib, self.record)
+        got = subprocess.run(["./probe"], cwd=self.wt, env=env,
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual((got.returncode, got.stdout), (0, "-1 1\n"),
+                         got.stderr)
+
     def test_without_a_record_named_it_does_nothing(self):
         env = dict(os.environ, LD_PRELOAD=self.lib)
         env.pop(trace.TRACE_VAR, None)
