@@ -2,6 +2,7 @@
 
 * Status: approved (Alex, 2026-10-11, at 8be7570,
   <https://github.com/abligh/agent-forge/issues/4#issuecomment-6105751563>)
+* Implemented: v0.4.10 (7f1c89a), each key off until configured
 * Author: XMPPEngineer
 * Date: 2026-10-11
 
