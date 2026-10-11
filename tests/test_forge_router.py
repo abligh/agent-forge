@@ -285,6 +285,30 @@ class PullRequestRules(unittest.TestCase):
                                               T1)]))
         self.assertTurn(d, "Reviewer", 8)
 
+    def test_3_a_request_stands_across_the_mergers_merges_of_main(self):
+        # #458: asked for changes at OLD, then main merged in.
+        d = decide_pr(pr_node(
+            reviews=[review(REVIEWER, "CHANGES_REQUESTED", T1, 55, oid=OLD)],
+            commits=((OLD, 1), (HEAD, 2))))
+        self.assertTurn(d, "LeadDev", 3, T1)
+        self.assertIn("Reviewer asked for changes (review 55)", d["line"])
+
+    def test_3_a_pushed_fix_makes_it_the_reviewers_again(self):
+        d = decide_pr(pr_node(
+            reviews=[review(REVIEWER, "CHANGES_REQUESTED", T1, 55, oid=OLD)],
+            statuses=[status("SUCCESS", T2)]))
+        self.assertTurn(d, "Reviewer", 8, T2)
+        self.assertIn("you asked for changes (review 55)", d["line"])
+
+    def test_3_the_owners_request_is_the_authors_until_answered(self):
+        d = decide_pr(pr_node(reviews=[review(OWNER, "CHANGES_REQUESTED",
+                                              T1)]))
+        self.assertTurn(d, "LeadDev", 3, T1)
+        d = decide_pr(pr_node(reviews=[review(OWNER, "CHANGES_REQUESTED",
+                                              T1)],
+                              comments=[comment(LEADDEV, T2)]))
+        self.assertNobody(d, 8)
+
     # Rule 4.
     def test_4_a_red_check_is_the_authors(self):
         for state in ("FAILURE", "ERROR"):
@@ -627,6 +651,21 @@ class TwoReviewers(unittest.TestCase):
                                                T2)]))
         self.assertEqual((d["who"], d["rule"]), ("LeadDev", 3))
         self.assertIn("RenderReviewer asked for changes", d["line"])
+
+    def test_3_another_reviewers_approval_does_not_lift_a_request(self):
+        # #458 exactly: changes asked at the old head, the other
+        # reviewer's approval four seconds later, then main merged in.
+        node = pr_node(
+            reviews=[review(RENDER, "CHANGES_REQUESTED", T1, 55, oid=OLD),
+                     review(REVIEWER, "APPROVED", T2, 56, oid=OLD)],
+            commits=((OLD, 1), (HEAD, 2)))
+        d = decide_two(node)
+        self.assertEqual((d["who"], d["rule"]), ("LeadDev", 3))
+        self.assertIn("RenderReviewer asked for changes", d["line"])
+        # Answered: RenderReviewer's to review again, never the Merger's.
+        node["comments"]["nodes"].append(comment(LEADDEV, T3))
+        d = decide_two(node)
+        self.assertEqual((d["who"], d["rule"]), ("RenderReviewer", 8))
 
     def test_6_either_reviewers_approval_is_the_mergers(self):
         d = decide_two(pr_node(reviews=[review(RENDER, "APPROVED", T2)]))

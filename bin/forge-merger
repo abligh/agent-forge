@@ -118,6 +118,13 @@ code-owner approval. A plain hold carries no marker, so anything else
 said after the approval makes the pull request its reviewer's again,
 until a newer approval.
 
+**A standing request for changes holds it.** A reviewer's (or the
+owner's) newest verdict, `APPROVED`, `CHANGES_REQUESTED` or
+`DISMISSED`, that is `CHANGES_REQUESTED` stands until that reviewer
+reviews again or it is dismissed, whatever another reviewer approved
+since: GitHub refuses the merge while it stands, so taking the pull
+request would only be refused every tick.
+
 **A `Defer-until:` holds it too**: the newest such line anywhere on the
 pull request, `Not-a-review` comments included. A time in the future,
 or a value that is not a time, holds it.
@@ -308,6 +315,9 @@ APPROVERS = {}
 # Authors whose comments don't count as "said since the approval": the
 # Merger's own App, whose hand-back must not hold what it hands back.
 QUIET_LOGINS = frozenset()
+# The logins whose request for changes holds a pull request: the
+# reviewers' Apps and the owner (see `changes_requested`).
+CHANGERS = frozenset()
 # The App a tick reads and writes with, dry run or not.
 ACT_AS = "Merger"
 SIGNATURE = "— Merger"
@@ -429,7 +439,7 @@ def configure(project):
     global STALL_TO_OWNER, STALL_TITLE, STALL_LABELS, WAITING_OWNER
     global TEST_AHEAD, AHEAD_DEPTH, HOLD_CONFLICTING, YIELD_PLACES
     global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
-    global ROW_FOR, CODE_OWNERS
+    global ROW_FOR, CODE_OWNERS, CHANGERS
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -437,6 +447,7 @@ def configure(project):
     SIGNATURE = "— " + ACT_AS
     APPROVERS = {project.slug(n): n for n in project.reviewers()}
     QUIET_LOGINS = frozenset((project.slug(ACT_AS),))
+    CHANGERS = frozenset(APPROVERS) | {project.owner}
     STATUS_CONTEXT = checks.get("context", DEFAULT_CONTEXT)
     STATUS_CREATOR = project.bot_login(checks.get("poster", ACT_AS))
     BUILD_HOST = project.host
@@ -539,6 +550,30 @@ def approval_of(pr, approvers=None):
     return best
 
 
+def changes_requested(pr, changers=None):
+    """The reviews whose request for changes still stands, oldest first:
+    for each login in CHANGERS (or `changers`) other than the author,
+    its newest `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED` review,
+    when that is `CHANGES_REQUESTED`. GitHub refuses to merge while one
+    stands, whatever another reviewer approved since, and a push or a
+    comment doesn't lift it: only that reviewer's next verdict or a
+    dismissal does."""
+    changers = {c.lower() for c in (CHANGERS if changers is None
+                                    else changers)}
+    latest = {}
+    for review in pr["reviews"]:
+        who = login(review).lower()
+        if (who in changers and who != login(pr).lower()
+                and review.get("state") in ("APPROVED", "CHANGES_REQUESTED",
+                                            "DISMISSED")
+                and (who not in latest or (review.get("submittedAt") or "")
+                     > (latest[who].get("submittedAt") or ""))):
+            latest[who] = review
+    return sorted((r for r in latest.values()
+                   if r["state"] == "CHANGES_REQUESTED"),
+                  key=lambda r: r.get("submittedAt") or "")
+
+
 def said_since(pr, approval):
     """Comments and reviews after `approval`, as (login, time, kind),
     less those marked `Not-a-review`, those by QUIET_LOGINS and bare
@@ -633,6 +668,10 @@ def eligible(pr, open_numbers, now=None):
     if said:
         who, when, kind = said[0]
         return None, "%s by %s at %s, after the approval" % (kind, who, when)
+    standing = changes_requested(pr)
+    if standing:
+        return None, "changes requested by %s at %s" % (
+            login(standing[0]), standing[0].get("submittedAt"))
     still = sorted(blockers_of(pr) & set(open_numbers))
     if still:
         return None, "Blocked-by: %s" % ", ".join("#%d" % n for n in still)

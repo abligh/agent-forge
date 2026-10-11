@@ -189,6 +189,36 @@ class Eligible(unittest.TestCase):
                         "comment by %s at %s" % (AUTHOR, T2))
         self.assertHeld(pr(body="Blocked-by: #7"), {7}, "Blocked-by: #7")
 
+    def test_a_standing_request_for_changes_holds_it(self):
+        # #458's case: one reviewer asked for changes, another approved
+        # four seconds later. GitHub refuses the merge while it stands.
+        other = "uireviewerwidgetagent"
+        self.assertHeld(pr(reviews=[review(other, "CHANGES_REQUESTED", T1),
+                                    review(REVIEWER, at=T2)]), set(),
+                        "changes requested by %s at %s" % (other, T1))
+        self.assertHeld(pr(reviews=[review(REVIEWER, at=T1),
+                                    review("example-owner",
+                                           "CHANGES_REQUESTED", T0)]), set(),
+                        "changes requested by example-owner")
+
+    def test_a_request_lifts_with_its_reviewers_next_verdict(self):
+        other = "uireviewerwidgetagent"
+        for verdict in ("APPROVED", "DISMISSED"):
+            self.assertIsNotNone(m.eligible(pr(reviews=[
+                review(other, "CHANGES_REQUESTED", T0),
+                review(other + "[bot]", verdict, T1),
+                review(REVIEWER, at=T2)]), set())[0], verdict)
+        # A comment-only review is no verdict.
+        self.assertHeld(pr(reviews=[review(other, "CHANGES_REQUESTED", T0),
+                                    review(other, "COMMENTED", T1),
+                                    review(REVIEWER, at=T1)]), set(),
+                        "changes requested")
+
+    def test_only_reviewers_and_the_owner_hold_by_asking(self):
+        self.assertIsNotNone(m.eligible(pr(reviews=[
+            review(PEER, "CHANGES_REQUESTED", T0), review(REVIEWER)]),
+            set())[0])
+
     def test_a_closed_blocker_blocks_nothing(self):
         self.assertIsNotNone(m.eligible(pr(body="Blocked-by: #7"), {8})[0])
 

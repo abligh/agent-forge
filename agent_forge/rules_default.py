@@ -49,20 +49,29 @@ Then:
    comment by the Merger, "Not merging <head>:", newer than every review
    and every author comment): the approving reviewer's if it starts
    `Not-a-review`, otherwise the author's;
-3. a reviewer's newest review is at the head, is `CHANGES_REQUESTED` or
-   `COMMENTED`, and has no author comment after it: the author's;
+3. a request for changes stands (a reviewer's or the owner's newest
+   verdict, `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED`, is
+   `CHANGES_REQUESTED`, as `forge-merger` reads it) and the author has
+   not answered it: no author comment after it, and only merges since
+   its commit (it covers the head). Or a reviewer's newest review is
+   `COMMENTED`, at the head, with no author comment after it. Either is
+   the author's. A request stands until its reviewer's next verdict,
+   so neither the Merger's merges of main nor another reviewer's
+   approval lift it;
 4. the build check's status (`checks.context`) is `failure` or `error`
    on the head: the author's;
 5. it is `pending` or absent on the head: nobody's;
-6. a reviewer's newest review is `APPROVED`, covers the head, and
-   nothing has been said after it (by `forge-merger`'s own test):
-   nobody's, it is the Merger's;
+6. no request for changes stands, a reviewer's newest review is
+   `APPROVED`, covers the head, and nothing has been said after it (by
+   `forge-merger`'s own test): nobody's, it is the Merger's;
 7. green and authored by the only reviewer: nobody's, and surfaced
    (printed on every run, sending or not: it is a problem in the
    configuration, not anyone's turn);
-8. green, and no reviewer has reviewed it: no reviewer's review at the
-   head (or approval covering it), or an author comment after the
-   newest one: the pull request's reviewer's.
+8. green, and a request for changes stands that the author has
+   answered: the reviewer's who asked, to review again (nobody's when
+   the owner asked). Otherwise green, and no reviewer has reviewed it:
+   no reviewer's review at the head (or approval covering it), or an
+   author comment after the newest one: the pull request's reviewer's.
 
 **A reviewer** is an agent the configuration marks `"kind":
 "reviewer"`. **A pull request's reviewer** is the one, other than its
@@ -464,18 +473,30 @@ def route_pr(pr, roster, when=None):
                       else roster.reviewer_for(pr) or roster.reviewers()[0])
             return turn(n, to, 2, when, "the Merger handed it back "
                         "(comment %s)" % back.get("databaseId"))
-    # Rule 3.
+    # Rule 3. A request for changes stands until its reviewer's next
+    # verdict, whatever else is said or pushed: the Merger's merges of
+    # main after it, and another reviewer's approval, don't lift it.
     theirs = [r for r in reviews
               if strip_bot(author_of(r)) in reviewer_logins]
     newest = max(theirs, key=lambda r: r["submittedAt"]) if theirs else None
+    standing = merger.changes_requested(
+        dict(pr, reviews=reviews),
+        reviewer_logins | ({OWNER} if OWNER else set()))
+    answered = [r for r in standing
+                if spoke > r["submittedAt"] or not covers_head(r, pr)]
+    for request in standing:
+        if request not in answered:
+            return turn(n, author, 3, request["submittedAt"],
+                        "%s asked for changes (review %s)" % (
+                            roster.who(author_of(request)),
+                            request.get("databaseId")))
     if (newest is not None and at_head(newest, pr)
-            and newest.get("state") in ("CHANGES_REQUESTED", "COMMENTED")
+            and newest.get("state") == "COMMENTED"
             and spoke <= newest["submittedAt"]):
-        said = ("asked for changes" if newest["state"] == "CHANGES_REQUESTED"
-                else "commented")
         return turn(n, author, 3, newest["submittedAt"],
-                    "%s %s (review %s)" % (roster.who(author_of(newest)), said,
-                                           newest.get("databaseId")))
+                    "%s commented (review %s)" % (
+                        roster.who(author_of(newest)),
+                        newest.get("databaseId")))
     state = ((status or {}).get("state") or "").lower()
     # Rule 4.
     if state in ("failure", "error"):
@@ -485,7 +506,8 @@ def route_pr(pr, roster, when=None):
     if state != "success":
         return nobody(n, 5, "%s is %s" % (STATUS_CONTEXT, state or "absent"))
     # Rule 6.
-    if (newest is not None and newest.get("state") == "APPROVED"
+    if (not standing and newest is not None
+            and newest.get("state") == "APPROVED"
             and covers_head(newest, pr)
             and not merger.said_since(dict(pr, reviews=reviews,
                                            comments=comments), newest)):
@@ -495,7 +517,18 @@ def route_pr(pr, roster, when=None):
     if reviewer is None:
         return nobody(n, 7, "green, and %s's own: no second reviewer"
                       % author, kind="surface")
-    # Rule 8.
+    # Rule 8. A standing request the author has answered (a comment, or
+    # a commit that isn't a merge) is its reviewer's to review again.
+    if standing:
+        request = standing[0]
+        who = roster.who(author_of(request))
+        if strip_bot(author_of(request)) not in reviewer_logins:
+            return nobody(n, 8, "answered %s's request for changes" % who)
+        return turn(n, who, 8, max(status.get("createdAt") or "", spoke,
+                                   request["submittedAt"]),
+                    "needs your review again: you asked for changes "
+                    "(review %s), green at %s" % (request.get("databaseId"),
+                                                  head[:7]))
     seen = [r for r in theirs if at_head(r, pr) or (
         r.get("state") == "APPROVED" and covers_head(r, pr))]
     last = max((r["submittedAt"] for r in seen), default=None)
