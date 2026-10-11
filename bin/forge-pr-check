@@ -1725,8 +1725,9 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None):
         started = time.monotonic()
         got = run(step_args, cwd=wt, env=step_env_,
                   timeout=STEP_TIMEOUT_S)
+        wall = time.monotonic() - started
         result = {"name": name, "rc": got.returncode,
-                  "seconds": int(time.monotonic() - started),
+                  "seconds": int(wall), "wall": round(wall, 2),
                   "tail": tail((got.stdout or "") + (got.stderr or ""))}
         if folder is not None:
             result["results_bytes"], dropped = keep_results(folder)
@@ -2614,6 +2615,25 @@ def start_next_tick(popen=None, checkout=None):
     return argv
 
 
+class Phases:
+    """Where a run's wall time goes outside its steps (agent-forge #13):
+    seconds by phase, each mark charging the time since the last one."""
+
+    def __init__(self, timer=time.monotonic):
+        self.timer = timer
+        self.last = timer()
+        self.spent = {}
+
+    def mark(self, phase):
+        now = self.timer()
+        self.spent[phase] = round(self.spent.get(phase, 0) + now - self.last,
+                                  2)
+        self.last = now
+
+    def text(self):
+        return ", ".join("%s %.1fs" % kv for kv in self.spent.items())
+
+
 def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
            post=None, chain=None, slot=1, memory_max=None, ahead=False,
            main=False):
@@ -2628,8 +2648,13 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     that commit, and when green its dependency record written. With
     DEPENDS, a pull request's head runs only the steps that read what
     it changes. With MERGE_DEFAULT, a pull request's head is checked
-    merged with the default branch's tip (`merge_default`)."""
+    merged with the default branch's tip (`merge_default`).
+
+    Where the run's own time went, outside its steps, is logged as
+    `overhead:` and kept in the verdict as `overhead`, seconds by phase
+    (`Phases`; agent-forge #13)."""
     os.makedirs(state_dir, exist_ok=True)
+    phases = Phases()
     started = clock()
     # The wall clock, which the caches' mtimes are read against.
     begun = time.time()
@@ -2649,6 +2674,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     # Only then is the next tick started, since a chained tick would at
     # once pick a head that is still waiting.
     settled = False
+    phases.mark("lock")
     wt = os.path.join(state_dir, slot_name("wt", slot))
     if ahead:
         # A prediction is no pull request's head: it gets no status.
@@ -2659,6 +2685,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             status, detail = prepare_ahead(repo, wt, sha, run)
         else:
             status, detail = prepare(repo, wt, sha, pr, run)
+        phases.mark("prepare")
         merge = {}
         if status == "ready" and MERGE_DEFAULT and not (ahead or main):
             merge = merge_default(wt, sha, pr, run)
@@ -2687,6 +2714,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             else:
                 out("NO-WORKTREE %s %s: %s" % (name, sha[:10], detail))
             return 2
+        phases.mark("merge")
         if "conflicts" in merge:
             settled = True
             return conflicted(state_dir, sha, pr, merge, started, clock(),
@@ -2717,6 +2745,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                    selection["record"][:10],
                    "; stale: " + ", ".join(selection["stale"])
                    if selection["stale"] else ""))
+        phases.mark("choose")
         tree = tree_of(wt, checked, run) if TEST_AHEAD or main else None
         if tree and not ahead and not main:
             with state_lock(state_dir):
@@ -2726,9 +2755,11 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 settled = True
                 return matched(state_dir, sha, pr, same, tree, started,
                                post, out)
+        phases.mark("match")
         if post is not None:
             post(sha, "pending", "running%s since %s" % (on_host(),
                                                         iso(started)))
+            phases.mark("post-pending")
         env = step_env(state_dir, slot=slot)
         steps, wrap, tracer, files = None, None, None, {}
         composed = None
@@ -2782,9 +2813,11 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 wrap = trace_wrapper(state_dir, slot, tracer, files)
         kept = os.path.join(state_dir, RESULTS_DIR, sha)
         shutil.rmtree(kept, ignore_errors=True)
+        phases.mark("setup")
         ok, results = check(wt, env, run, steps=steps,
                             prefix=memory_cap(memory_max, env, run, out),
                             wrap=wrap, kept=kept)
+        phases.mark("steps")
         for r in results:
             out("  %-20s rc=%-3d %4ds" % (r["name"], r["rc"], r["seconds"]))
             if r["rc"] != 0:
@@ -2868,6 +2901,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             state["results"][sha] = record
             save(state_dir, state)
         settled = True
+        phases.mark("verdict")
         if main:
             log(state_dir, "%s %s %s: %s waited=%ds ran=%ds"
                 % ("MAIN-GREEN" if ok else "MAIN-RED", MAIN, sha[:10],
@@ -2915,13 +2949,26 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 "#%d %s" % (tree[:10], ",".join(red.get("failed", [])),
                             red.get("pr"), other[:10], pr, sha[:10]),
                 finished, out)
+        phases.mark("record")
+        posted = None
         if post is not None:
             posted = post(sha, *final_status(record))
-            with state_lock(state_dir):
-                state = load(state_dir)
-                if sha in state["results"]:
+            phases.mark("post")
+        # The steps' own time is in step_seconds; what the run spent
+        # around them is kept beside it (agent-forge #13).
+        spent = dict(phases.spent)
+        # Around the steps but not in them: preparing and keeping each
+        # step's results, and starting its process.
+        spent["between"] = round(max(0, spent.get("steps", 0) - sum(
+            r.get("wall", r["seconds"]) for r in results)), 2)
+        out("  overhead: %s" % phases.text())
+        with state_lock(state_dir):
+            state = load(state_dir)
+            if sha in state["results"]:
+                if posted is not None:
                     state["results"][sha]["posted"] = posted
-                    save(state_dir, state)
+                state["results"][sha]["overhead"] = spent
+                save(state_dir, state)
         return 0 if ok else 1
     except Stopped:
         with state_lock(state_dir):

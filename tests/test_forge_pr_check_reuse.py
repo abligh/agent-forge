@@ -301,6 +301,12 @@ class Worker(DigestCase):
         self.assertEqual(record["reused"], {"a": {
             "reused": one, "pr": 7, "finished": first["finished"]}})
         self.assertNotIn("a", record["step_seconds"])
+        # Where the run's own time went, by phase (agent-forge #13).
+        for phase in ("lock", "prepare", "choose", "steps", "verdict",
+                      "post", "between"):
+            self.assertIn(phase, first["overhead"])
+        self.assertTrue(any(line.startswith("  overhead: lock ")
+                            for line in self.lines))
         self.assertEqual(self.posts[-1], (
             two, "success", "green on build.example.org: a as #7 at %s, "
                             "same inputs; 0 of 3 steps ran" % one[:7]))
@@ -377,3 +383,16 @@ class Worker(DigestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Overhead(unittest.TestCase):
+    """agent-forge #13: where a run's time goes outside its steps."""
+
+    def test_each_mark_charges_the_time_since_the_last(self):
+        ticks = iter([10.0, 10.5, 12.0, 12.25, 13.0])
+        phases = pc.Phases(lambda: next(ticks))
+        for name in ("lock", "prepare", "lock", "steps"):
+            phases.mark(name)
+        self.assertEqual(phases.spent, {"lock": 0.75, "prepare": 1.5,
+                                        "steps": 0.75})
+        self.assertEqual(phases.text(), "lock 0.8s, prepare 1.5s, steps 0.8s")
