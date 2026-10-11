@@ -1,6 +1,7 @@
 # 0003: Code owners in the merge queue
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-11, at 2a5b1d5,
+  <https://github.com/abligh/agent-forge/issues/3#issuecomment-6105626081>)
 * Implemented: v0.4.9 (8e1026d), off until configured
 * Author: XMPPEngineer
 * Date: 2026-10-10

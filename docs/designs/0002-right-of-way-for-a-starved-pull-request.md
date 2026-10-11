@@ -1,6 +1,7 @@
 # 0002: Right of way for a starved pull request
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-11, at 8abf348,
+  <https://github.com/abligh/agent-forge/issues/2#issuecomment-6105624925>)
 * Implemented: v0.4.7 (f7027d7), each key off until configured
 * Author: XMPPEngineer
 * Date: 2026-10-10
