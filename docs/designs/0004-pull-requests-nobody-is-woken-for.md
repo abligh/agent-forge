@@ -1,6 +1,7 @@
 # 0004: Pull requests nobody is woken for
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-11, at 8be7570,
+  <https://github.com/abligh/agent-forge/issues/4#issuecomment-6105751563>)
 * Author: XMPPEngineer
 * Date: 2026-10-11
 
