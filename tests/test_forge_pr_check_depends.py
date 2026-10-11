@@ -141,6 +141,22 @@ class QueueMain(StateCase):
                       busy={SHA_B})
         self.assertEqual(sorted(state["waiting"]), [SHA_B, SHA_C, "d" * 40])
 
+    def test_a_newer_head_waits_from_when_the_one_it_replaces_did(self):
+        # Otherwise a default branch that moves more often than
+        # depends_minutes never goes first, and nothing is recorded.
+        state = self.state()
+        state["waiting"] = {
+            SHA_A: {"pr": 0, "main": True, "since": pc.iso(T0)}}
+        later = T0 + datetime.timedelta(minutes=20)
+        pc.queue_main(state, (SHA_C, TREE), later, self.state_dir)
+        self.assertEqual(state["waiting"][SHA_C]["since"], pc.iso(T0))
+        # A head being run isn't replaced, so its time isn't taken.
+        state["waiting"] = {
+            SHA_A: {"pr": 0, "main": True, "since": pc.iso(T0)}}
+        pc.queue_main(state, (SHA_C, TREE), later, self.state_dir,
+                      busy={SHA_A})
+        self.assertEqual(state["waiting"][SHA_C]["since"], pc.iso(later))
+
     def test_note_heads_keeps_it(self):
         state = self.state()
         state["waiting"][SHA_A] = {"pr": 0, "main": True,

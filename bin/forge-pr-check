@@ -687,17 +687,21 @@ def queue_main(state, head, when, state_dir, busy=()):
     """Queue the default branch's head (sha, tree) for a traced full run,
     unless it has a verdict, is queued, or its tree has a record. An
     older default-branch head no slot is running is dropped: the newest
-    serves every pull request based on it or later. Whether it was
+    serves every pull request based on it or later. It waits from when
+    the oldest it replaces did, or a default branch that moves more
+    often than DEPENDS_WAIT would never go first. Whether it was
     queued."""
     sha, tree = head
     if sha in state["results"] or sha in state["waiting"] or \
             os.path.exists(os.path.join(trace.records_dir(state_dir),
                                         tree + ".json")):
         return False
+    since = iso(when)
     for other, entry in list(state["waiting"].items()):
         if entry.get("main") and other not in busy:
+            since = min(since, entry.get("since", since))
             del state["waiting"][other]
-    state["waiting"][sha] = {"pr": 0, "since": iso(when), "main": True}
+    state["waiting"][sha] = {"pr": 0, "since": since, "main": True}
     return True
 
 
