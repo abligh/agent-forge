@@ -291,7 +291,8 @@ steps get the records chosen as one file, `depends/.selection-<slot>.json`,
 as CHECK_DEPENDS. The default branch's head is queued only when a step
 is stale at its tree or no record has it (`QUEUED ... stale: ...`); it
 goes first while a waiting head, estimated against the tip, runs a
-step only because it is stale, and otherwise as before. Such a head
+step only because it is stale (though not before the Merger's head
+when that has no stale step), and otherwise as before. Such a head
 waits (`HELD`, and `held` in `state.json`) while the tip waits for its
 run or is running it, for at most `wait_minutes` from when it was
 first seen, then runs as now. Each tick estimates every waiting head
@@ -930,7 +931,10 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
     A default-branch head (checks.depends, pr 0) goes after every pull
     request's, except the newest, which goes first of all once it has
     waited DEPENDS_WAIT, or at once when `urgent` (checks.fresh: a
-    waiting head runs a step only because its record is stale).
+    waiting head runs a step only because its record is stale). Urgent
+    is not reason enough to go before the Merger's pull request when
+    its head has no stale step: the default branch's run would not
+    shorten it, only delay the merge.
 
     With the fast lane, a head in `cheap` is picked only when no other
     head could be: the lane is for it (`lane_head`)."""
@@ -943,6 +947,9 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
         live = dear
     mains = [s for s in live if waiting[s].get("main")]
     heads = [s for s in live if not waiting[s].get("main")]
+    mine = [s for s in heads if waiting[s]["pr"] == first_pr]
+    if urgent and any(not waiting[s].get("stale_steps") for s in mine):
+        urgent = False
     if mains:
         newest = max(mains, key=lambda s: (waiting[s]["since"], s))
         try:
@@ -952,7 +959,6 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
             due = True
         if due or urgent or not heads:
             return newest, 0
-    mine = [s for s in heads if waiting[s]["pr"] == first_pr]
     # checks.first_authors go even before the Merger's pull request,
     # unless they failed to prepare.
     top = [s for s in heads

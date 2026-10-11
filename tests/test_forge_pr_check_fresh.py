@@ -337,6 +337,14 @@ class Held(unittest.TestCase):
         self.assertEqual(pc.next_head(self.state, {SHA_A}, when=T0,
                                       urgent=True), (SHA_C, 0))
 
+    def test_but_not_before_the_mergers_head_with_nothing_stale(self):
+        self.assertEqual(pc.next_head(self.state, {SHA_A}, first_pr=8,
+                                      when=T0, urgent=True), (SHA_B, 8))
+
+    def test_still_first_when_the_mergers_head_is_stale(self):
+        self.assertEqual(pc.next_head(self.state, {SHA_B}, first_pr=7,
+                                      when=T0, urgent=True), (SHA_C, 0))
+
 
 class Tick(StateCase):
     """The tick with fresh: what the tip needs and each head's estimate

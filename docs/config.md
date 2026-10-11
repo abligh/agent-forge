@@ -252,8 +252,10 @@ changed for every pull request. With `fresh` (and `depends`):
   as one file (`depends/.selection-<slot>.json`, with `from`).
 * **The default branch's head is traced only when it needs to be:**
   when a step is stale at its tree, or no record has it. It goes first
-  while a waiting head runs a step only because it is stale, and
-  otherwise once it has waited `depends_minutes`, as before.
+  while a waiting head runs a step only because it is stale (but not
+  before the Merger's head when that has no stale step: the traced run
+  would only delay the merge), and otherwise once it has waited
+  `depends_minutes`, as before.
 * **A head that would run a step only because it is stale waits**
   (`HELD` in the tick's output, `held` in `state.json`) while the
   default branch's head waits for its traced run or is running it, for
