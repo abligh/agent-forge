@@ -74,7 +74,7 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
           "tracer": str, "cpu_weight": int, "fast_lane": dict,
           "merge_default": bool, "cache_limit": str, "reuse": dict,
-          "fresh": dict}
+          "fresh": dict, "first_authors": list}
 # checks.cache_limit: a size in systemd's style, at least one byte.
 SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 # checks.fast_lane: a slot for heads whose chosen steps are cheap.
@@ -290,6 +290,12 @@ def check(data):
         _check_reuse(checks, problems)
     if isinstance(checks.get("fresh"), dict):
         _check_fresh(checks, problems)
+    if isinstance(checks.get("first_authors"), list):
+        agents = data.get("agents", {})
+        for name in checks["first_authors"]:
+            if not isinstance(name, str) or name not in agents:
+                problems.append("checks.first_authors: %r is not an agent"
+                                % (name,))
     if isinstance(checks.get("cache_limit"), str) \
             and not SIZE_RE.match(checks["cache_limit"]):
         problems.append("checks.cache_limit must be a size such as 40G "

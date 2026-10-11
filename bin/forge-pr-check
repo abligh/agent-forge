@@ -73,6 +73,12 @@ stamps `started` on its waiting entry, under the state lock, and
 that dies before taking its lock leaves its head pickable again once
 the grace is up.
 
+**With `checks.first_authors`, those agents' pull requests go first**:
+a waiting head of a pull request by one of them is started before any
+other pull request's, the Merger's included, and so is a cheap one in
+the fast lane. The pulls API's author (`user.login`) is kept with the
+head. A head that failed to prepare still goes behind.
+
 **With `checks.merger_first` on, the Merger's pull request goes first**
 (default off). The Merger writes `next.json` in its state directory
 each tick, naming the pull request it is waiting on (`--merger-dir`,
@@ -460,6 +466,8 @@ NEXT_TICK = ("forge-pr-check", "--post")
 # Whether the head of the pull request the Merger waits on goes first.
 # It only orders: no slot is ever kept for it.
 DEFAULT_MERGER_FIRST = False
+# checks.first_authors: the bot logins whose pull requests go first.
+FIRST_AUTHORS = frozenset()
 MERGER_FIRST = DEFAULT_MERGER_FIRST
 # How old the Merger's next.json and ahead.json may be and still be
 # read. An older one means the Merger has stopped, and a stopped Merger
@@ -519,7 +527,7 @@ def configure(project):
     (`context`, `poster`, `steps`, `caches`, `slots`, `memory_max`,
     `step_timeout_minutes`, `merger_first`, `depends`,
     `depends_minutes`, `tracer`, `fast_lane`, `merge_default`,
-    `cache_limit`, `reuse`, `fresh`, each step's `always` and `version`),
+    `cache_limit`, `reuse`, `fresh`, `first_authors`, each step's `always` and `version`),
     each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
     implies `merger_first`."""
@@ -529,6 +537,7 @@ def configure(project):
     global TEST_AHEAD, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
+    global FIRST_AUTHORS
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -559,6 +568,10 @@ def configure(project):
     FAST_LANE_S = checks["fast_lane"].get("max_seconds", DEFAULT_FAST_LANE_S) \
         if "fast_lane" in checks else None
     MERGE_DEFAULT = checks.get("merge_default", False)
+    # Their Apps' logins, as the pulls API reports a pull request's
+    # author; the configuration refuses a name that isn't an agent.
+    FIRST_AUTHORS = frozenset(project.bot_login(name).lower()
+                              for name in checks.get("first_authors", []))
     # The configuration refuses fresh without depends.
     FRESH_WAIT = datetime.timedelta(minutes=checks["fresh"].get(
         "wait_minutes", DEFAULT_FRESH_MINUTES)) if "fresh" in checks else None
@@ -734,21 +747,24 @@ def gh(args, token, run=sh):
 
 
 def open_heads(token, run=sh):
-    """[(pr, sha, head repository, draft)] for every open pull request,
-    or None if GitHub could not be read. A head whose repository is gone
-    reports "" for it."""
+    """[(pr, sha, head repository, draft, author)] for every open pull
+    request, or None if GitHub could not be read. A head whose
+    repository is gone reports "" for it, and so does an author GitHub
+    didn't give."""
     got = gh(["--paginate", "repos/%s/pulls?state=open&per_page=100"
               % REPO_SLUG, "--jq", '.[] | [.number, .head.sha, '
-              '(.head.repo.full_name // ""), .draft] | @tsv'], token, run)
+              '(.head.repo.full_name // ""), .draft, (.user.login // "")] '
+              '| @tsv'], token, run)
     if got.returncode != 0:
         return None
     heads = []
     for line in got.stdout.splitlines():
         fields = line.split("\t")
-        if len(fields) != 4 or not fields[0].isdigit() or len(fields[1]) != 40:
+        if len(fields) not in (4, 5) or not fields[0].isdigit() \
+                or len(fields[1]) != 40:
             return None
         heads.append((int(fields[0]), fields[1], fields[2],
-                      fields[3] == "true"))
+                      fields[3] == "true", (fields[4:] or [""])[0]))
     return heads
 
 
@@ -762,7 +778,8 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
     request was waiting all along, and a push, by its author or the
     Merger's update, must not send it to the back of the queue."""
     current, new = set(), []
-    for pr, sha, repo, draft in heads:
+    for pr, sha, repo, draft, *author in heads:
+        author = author[0] if author else ""
         if draft or sha in state["results"]:
             continue
         if repo != REPO_SLUG:
@@ -782,6 +799,8 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
             new.append(sha)
         state["waiting"].setdefault(sha, {"pr": pr, "since": iso(when)})
         state["waiting"][sha]["pr"] = pr
+        if author:
+            state["waiting"][sha]["author"] = author
     replaced = {}
     for sha in list(state["waiting"]):
         entry = state["waiting"][sha]
@@ -868,10 +887,18 @@ def live_heads(state, busy=(), when=None):
             and not just_started(w, when)]
 
 
+def first(entry):
+    """Whether a waiting head's pull request is by one of
+    `checks.first_authors`."""
+    return entry.get("author", "").lower() in FIRST_AUTHORS
+
+
 def order(waiting, sha):
     """A head's place in the queue: one that failed to prepare goes
-    behind every one that has not, then the oldest first."""
-    return waiting[sha].get("errors", 0), waiting[sha]["since"], sha
+    behind every one that has not, then one by `checks.first_authors`
+    before one that isn't, then the oldest first."""
+    return (waiting[sha].get("errors", 0), not first(waiting[sha]),
+            waiting[sha]["since"], sha)
 
 
 def lane_head(state, cheap, busy=(), when=None):
@@ -925,7 +952,11 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
         if due or urgent or not heads:
             return newest, 0
     mine = [s for s in heads if waiting[s]["pr"] == first_pr]
-    sha = min(mine or heads, key=lambda s: order(waiting, s))
+    # checks.first_authors go even before the Merger's pull request,
+    # unless they failed to prepare.
+    top = [s for s in heads
+           if first(waiting[s]) and not waiting[s].get("errors")]
+    sha = min(top or mine or heads, key=lambda s: order(waiting, s))
     return sha, waiting[sha]["pr"]
 
 
@@ -1191,7 +1222,7 @@ def verdict_word(r):
 def repost(state, heads, post, out=print):
     """Post again, oldest first, up to POST_BATCH verdicts on open heads
     whose status never reached GitHub."""
-    open_shas = {sha for _, sha, _, _ in heads}
+    open_shas = {head[1] for head in heads}
     todo = sorted((r["finished"], sha) for sha, r in state["results"].items()
                   if sha in open_shas and r.get("posted") is not True)
     for _, sha in todo[:POST_BATCH]:
@@ -1264,7 +1295,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         save(state_dir, state)
         prune_results(state_dir, state, when)
         queued = set(state["waiting"])
-    current = {sha for _, sha, _, _ in heads}
+    current = {head[1] for head in heads}
     for slot, holder in holders.items():
         if holder is None:
             continue
