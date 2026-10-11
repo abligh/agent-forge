@@ -45,9 +45,10 @@ or 127 (its command can't be run: a tool missing from the host's
 `PATH`, say) or whose output says `No space left on device` (or
 `ENOSPC`) failed for the host, not the head. Such a run records no
 verdict and posts nothing more: the head stays waiting, `pending`, its
-errors counted as for a head that can't be checked out, and
-`verdicts.log` says `HOST-FAULT` with the step and why. It is tried
-again at cron's next tick, not at once, and after MAX_ERRORS it is
+faults counted (`faults`, apart from a checkout's `errors`), and
+`verdicts.log` says `HOST-FAULT` with the step and why. It keeps its
+place in the queue, since the fault was not its own, and is tried
+again from cron's next tick, not at once; after MAX_ERRORS it is
 given up on with `error`. A red verdict says the head is broken, and
 its author would otherwise be sent to fix what isn't hers.
 
@@ -519,10 +520,11 @@ def just_started(entry, when):
 
 def next_head(state, busy=(), first_pr=None, when=None):
     """(sha, pr) of the head that has waited longest, or None. A head
-    that failed to prepare goes behind every head that has not, one
-    that failed MAX_ERRORS times is not picked at all, and nor is one a
-    slot is running (`busy`) or one a tick started less than
-    START_GRACE before `when`.
+    that failed to prepare goes behind every head that has not; one
+    whose run the host broke keeps its place, since the fault was not
+    its own. One that failed either way MAX_ERRORS times is not picked
+    at all, and nor is one a slot is running (`busy`) or one a tick
+    started less than START_GRACE before `when`.
 
     `first_pr` is the pull request the Merger is waiting on, or None.
     A head of it that could be picked goes before every other. It only
@@ -533,7 +535,8 @@ def next_head(state, busy=(), first_pr=None, when=None):
     def order(sha):
         return waiting[sha].get("errors", 0), waiting[sha]["since"], sha
     live = [s for s, w in waiting.items()
-            if w.get("errors", 0) < MAX_ERRORS and s not in busy
+            if w.get("errors", 0) < MAX_ERRORS
+            and w.get("faults", 0) < MAX_ERRORS and s not in busy
             and not just_started(w, when)]
     if not live:
         return None
@@ -725,9 +728,11 @@ def host_fault(results):
     return None
 
 
-def count_error(state_dir, sha, ahead):
+def count_error(state_dir, sha, ahead, key="errors"):
     """One more error for `sha`, waiting or (`ahead`) predicted; the
-    count so far, 0 for a head no longer waiting."""
+    count so far, 0 for a head no longer waiting. A waiting head counts
+    failures to prepare it as `errors` and host faults as `faults`:
+    only the first send it to the back of the queue (`next_head`)."""
     with state_lock(state_dir):
         state = load(state_dir)
         entry = state["waiting"].get(sha)
@@ -736,7 +741,7 @@ def count_error(state_dir, sha, ahead):
             counts = state.setdefault("ahead_errors", {})
             errors = counts[sha] = counts.get(sha, 0) + 1
         elif entry is not None:
-            errors = entry["errors"] = entry.get("errors", 0) + 1
+            errors = entry[key] = entry.get(key, 0) + 1
         save(state_dir, state)
     return errors
 
@@ -1145,7 +1150,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         finished = clock()
         fault = host_fault(results)
         if fault is not None:
-            errors = count_error(state_dir, sha, ahead)
+            errors = count_error(state_dir, sha, ahead, "faults")
             why = "%s: %s" % fault
             if errors >= MAX_ERRORS:
                 log(state_dir, "GAVE-UP%s #%d %s after %d host faults; the "

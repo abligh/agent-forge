@@ -275,6 +275,16 @@ class NextHead(unittest.TestCase):
         state["waiting"][SHA_A]["errors"] = pc.MAX_ERRORS
         self.assertIsNone(pc.next_head(state))
 
+    def test_a_head_the_host_failed_keeps_its_place(self):
+        # A run killed by a full disk was not the pull request's fault:
+        # it sat behind 14 later heads for half an hour.
+        state = {"waiting": {
+            SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z", "faults": 2},
+            SHA_B: {"pr": 2, "since": "2026-10-09T10:00:00Z"}}}
+        self.assertEqual(pc.next_head(state), (SHA_A, 1))
+        state["waiting"][SHA_A]["faults"] = pc.MAX_ERRORS
+        self.assertEqual(pc.next_head(state), (SHA_B, 2))
+
     def test_a_head_just_started_is_skipped_until_the_grace_is_up(self):
         state = {"waiting": {
             SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z",
@@ -974,10 +984,12 @@ class Worker(StateCase):
                          self.lines.append, lambda: next(clock), post, chain,
                          slot=slot)
 
-    def queue(self, errors=0):
+    def queue(self, errors=0, faults=0):
         entry = {"pr": 7, "since": pc.iso(T0 - datetime.timedelta(minutes=3))}
         if errors:
             entry["errors"] = errors
+        if faults:
+            entry["faults"] = faults
         self.write_state({"waiting": {SHA_A: entry}})
 
     def test_green_records_a_verdict_and_leaves_the_queue(self):
@@ -1069,7 +1081,8 @@ class Worker(StateCase):
         self.assertEqual(rc, 2)
         state = self.state()
         self.assertNotIn(SHA_A, state.get("results", {}))
-        self.assertEqual(state["waiting"][SHA_A]["errors"], 1)
+        self.assertEqual(state["waiting"][SHA_A]["faults"], 1)
+        self.assertNotIn("errors", state["waiting"][SHA_A])
         self.assertEqual([p[1] for p in posts], ["pending"])
         self.assertEqual(chained, [])
         logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
@@ -1086,7 +1099,7 @@ class Worker(StateCase):
             self.state_dir, "verdicts.log").read_text())
 
     def test_repeated_host_faults_give_up_with_error(self):
-        self.queue(errors=pc.MAX_ERRORS - 1)
+        self.queue(faults=pc.MAX_ERRORS - 1)
         posts, chained = [], []
         self.work(self.faulty(rc=126),
                   post=lambda *a: posts.append(a) or True,
@@ -1794,10 +1807,10 @@ class WorkerAhead(Worker):
                              done([], 0, tree + "\n")))
         return run
 
-    def queue(self, errors=0):
+    def queue(self, errors=0, faults=0):
         """As Worker's, keeping the verdicts already written."""
         results = self.state()["results"]
-        super().queue(errors)
+        super().queue(errors, faults)
         state = self.state()
         state["results"] = results
         self.write_state(state)
