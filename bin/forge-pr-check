@@ -262,6 +262,7 @@ import json
 import os
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -347,6 +348,19 @@ DEPENDS_WAIT = datetime.timedelta(minutes=DEFAULT_DEPENDS_MINUTES)
 TRACER = trace.DEFAULT_TRACER
 # The steps that run whatever changed (`always`).
 ALWAYS = frozenset()
+# checks.fast_lane (designs/0006): one more slot, for heads whose chosen
+# steps have together taken at most FAST_LANE_S here; None is off.
+DEFAULT_FAST_LANE_S = 60
+FAST_LANE_S = None
+# A step's cost is the median of its last COST_RUNS runs here; with
+# fewer than COST_MIN_RUNS it has none, and counts as expensive.
+COST_RUNS = 20
+COST_MIN_RUNS = 5
+# The fast lane's slot: its lock, worktree and caches end in -lane.
+LANE = 0
+# A run in the lane longer than this many times FAST_LANE_S is logged
+# SLOW-LANE, and not stopped.
+SLOW_LANE = 3
 
 
 def configure(project):
@@ -354,13 +368,15 @@ def configure(project):
     its repository and default branch, and the `checks` section
     (`context`, `poster`, `steps`, `caches`, `slots`, `memory_max`,
     `step_timeout_minutes`, `merger_first`, `depends`,
-    `depends_minutes`, `tracer`, each step's `always`), each with the
+    `depends_minutes`, `tracer`, `fast_lane`, each step's `always`),
+    each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
     implies `merger_first`."""
     global REPO_SLUG, MAIN, CONFIG_PATH, STATUS_CONTEXT, POSTER, HOST
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
     global CPU_WEIGHT
     global TEST_AHEAD, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
+    global FAST_LANE_S
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -376,6 +392,9 @@ def configure(project):
     DEPENDS_WAIT = datetime.timedelta(minutes=checks.get(
         "depends_minutes", DEFAULT_DEPENDS_MINUTES))
     TRACER = checks.get("tracer", trace.DEFAULT_TRACER)
+    # The configuration refuses fast_lane without depends.
+    FAST_LANE_S = checks["fast_lane"].get("max_seconds", DEFAULT_FAST_LANE_S) \
+        if "fast_lane" in checks else None
     CACHES = dict(checks.get("caches", {}))
     SLOTS = checks.get("slots", DEFAULT_SLOTS)
     MEMORY_MAX = checks.get("memory_max", DEFAULT_MEMORY_MAX)
@@ -1219,11 +1238,22 @@ def tail(text, lines=TAIL_LINES):
     return "\n".join(text.rstrip("\n").splitlines()[-lines:])
 
 
-def applicable(wt, steps=None):
-    """The steps that apply to the head: those whose `only_if` it has."""
+def applicable(wt, steps=None, has=None):
+    """The steps that apply to the head: those whose `only_if` it has,
+    as a path in worktree wt, or as has(path) says."""
+    if has is None:
+        def has(path):
+            return os.path.exists(os.path.join(wt, path))
     return [(name, args, only_if)
             for name, args, only_if in (STEPS if steps is None else steps)
-            if not only_if or os.path.exists(os.path.join(wt, only_if))]
+            if not only_if or has(only_if)]
+
+
+def applicable_at(repo, sha, run=sh):
+    """`applicable` for commit sha in repo, without checking it out."""
+    return applicable(repo, has=lambda path: run(
+        ["git", "-C", repo, "cat-file", "-e",
+         "%s:%s" % (sha, path)]).returncode == 0)
 
 
 def check(wt, env, run=sh, steps=None, prefix=(), wrap=None):
@@ -1245,13 +1275,18 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None):
     return all(r["rc"] == 0 for r in results), results
 
 
-def choose(wt, sha, state_dir, run=sh):
+def choose(wt, sha, state_dir, run=sh, names=None):
     """The steps head `sha` needs, from the newest dependency record
     that answers for its merge base (checks.depends): {"base", "record"
     (the recorded commit), "depends" (the record's path), "ran" ({step:
     why}), "skipped": [steps]}, or {"every": why} when every step must
-    run (see the module docstring)."""
-    names = [name for name, _, _ in applicable(wt)]
+    run (see the module docstring).
+
+    wt is the head's worktree, or, with `names` (the steps that apply
+    to it), any checkout that has the commit and the default branch's
+    remote ref, such as the cron checkout: nothing here reads files."""
+    if names is None:
+        names = [name for name, _, _ in applicable(wt)]
     ref = "refs/remotes/origin/" + MAIN
     got = run(["git", "-C", wt, "merge-base", sha, ref])
     base = (got.stdout or "").strip()
@@ -1292,6 +1327,97 @@ def choose(wt, sha, state_dir, run=sh):
     ran, skipped = trace.select(names, ALWAYS, record, changed, touched)
     return {"base": base, "record": record["commit"], "depends": path,
             "ran": ran, "skipped": skipped}
+
+
+def step_costs(state):
+    """{step: seconds}, each step's cost here: the median of its last
+    COST_RUNS runs in the verdicts kept, newest by `finished`. A step
+    with fewer than COST_MIN_RUNS runs is left out, so it counts as
+    expensive."""
+    runs = {}
+    for r in sorted(state["results"].values(),
+                    key=lambda r: str(r.get("finished", ""))):
+        seconds = r.get("step_seconds")
+        if not isinstance(seconds, dict):
+            continue
+        for name, took in seconds.items():
+            if isinstance(took, (int, float)) and not isinstance(took, bool):
+                runs.setdefault(name, []).append(took)
+    return {name: statistics.median(took[-COST_RUNS:])
+            for name, took in runs.items() if len(took) >= COST_MIN_RUNS}
+
+
+def lane_steps(checkout, sha, pr, state_dir, run=sh):
+    """The steps pull request pr's head sha would run (`choose`), worked
+    out in the cron checkout without a worktree, fetching the head
+    first if the checkout doesn't have it. The fetch writes no
+    FETCH_HEAD, which the checkout's other users may read. As `choose`
+    returns, with {"every": why} when the steps can't be worked out."""
+    def have():
+        return run(["git", "-C", checkout, "cat-file", "-e",
+                    sha + "^{commit}"]).returncode == 0
+    if not have():
+        got = run(["git", "-C", checkout, "fetch", "-q",
+                   "--no-write-fetch-head", "origin",
+                   "refs/pull/%d/head" % pr])
+        if got.returncode != 0:
+            return {"every": "could not fetch pull/%d/head: %s"
+                    % (pr, (got.stderr or "").strip())}
+        if not have():
+            return {"every": "pull/%d/head is no longer %s" % (pr, sha[:10])}
+    names = [name for name, _, _ in applicable_at(checkout, sha, run)]
+    return choose(checkout, sha, state_dir, run, names)
+
+
+def estimate(state_dir, checkout, busy=(), run=sh):
+    """Work out, in the cron checkout, the steps each waiting pull
+    request head would run that has no estimate yet (checks.fast_lane),
+    and keep them with the head as `lane_steps`. Only an answer is
+    kept: a head whose steps can't be worked out yet is tried again
+    next tick. A head being run, or given up on, needs none."""
+    with state_lock(state_dir):
+        waiting = load(state_dir)["waiting"]
+        todo = sorted((w["since"], sha, w["pr"]) for sha, w in waiting.items()
+                      if "lane_steps" not in w and not w.get("main")
+                      and sha not in busy
+                      and w.get("errors", 0) < MAX_ERRORS
+                      and w.get("faults", 0) < MAX_ERRORS)
+    found = {}
+    for _, sha, pr in todo:
+        selection = lane_steps(checkout, sha, pr, state_dir, run)
+        if "ran" in selection:
+            found[sha] = sorted(selection["ran"])
+    if found:
+        with state_lock(state_dir):
+            state = load(state_dir)
+            for sha, steps in found.items():
+                if sha in state["waiting"]:
+                    state["waiting"][sha]["lane_steps"] = steps
+            save(state_dir, state)
+
+
+def lane_cost(entry, costs):
+    """A waiting head's estimated seconds, the sum of its chosen steps'
+    costs, or None when it has no estimate or a step has no cost."""
+    steps = entry.get("lane_steps")
+    if not isinstance(steps, list) or entry.get("main") \
+            or any(name not in costs for name in steps):
+        return None
+    return sum(costs[name] for name in steps)
+
+
+def cheap_heads(state, costs=None):
+    """{sha: estimated seconds} of the waiting heads that are cheap: whose
+    chosen steps have together taken at most FAST_LANE_S here."""
+    if FAST_LANE_S is None:
+        return {}
+    costs = step_costs(state) if costs is None else costs
+    cheap = {}
+    for sha, entry in state["waiting"].items():
+        cost = lane_cost(entry, costs)
+        if cost is not None and cost <= FAST_LANE_S:
+            cheap[sha] = cost
+    return cheap
 
 
 def covers(selection):
@@ -1533,6 +1659,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 "finished": iso(finished), "ok": ok,
                 "failed": [r["name"] for r in results if r["rc"] != 0],
                 "seconds": sum(r["seconds"] for r in results),
+                # What the fast lane's estimates come from (step_costs).
+                "step_seconds": {r["name"]: r["seconds"] for r in results},
             }
             if TEST_AHEAD:
                 # What a later head with the same tree is matched by.
