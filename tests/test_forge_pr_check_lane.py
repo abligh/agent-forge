@@ -73,6 +73,32 @@ class Configure(unittest.TestCase):
         self.assertEqual(self.lane({}), 60)
 
 
+class Names(unittest.TestCase):
+
+    def test_the_lane_has_its_own_lock_worktree_and_caches(self):
+        self.assertEqual(pc.slot_name("wt", pc.LANE), "wt-lane")
+        self.assertEqual(os.path.basename(pc.lock_path("/s", pc.LANE)),
+                         "worker-lane.lock")
+        with mock.patch.object(pc, "CACHES", {"CARGO_TARGET_DIR": "cargo"}):
+            self.assertEqual(
+                pc.step_env("/s", {}, slot=pc.LANE)["CARGO_TARGET_DIR"],
+                "/s/cargo-lane")
+        self.assertEqual(pc.slot_name("wt", 2), "wt-2")
+
+    def test_the_worker_log_names_the_lane(self):
+        with tempfile.TemporaryDirectory() as state_dir, \
+                mock.patch.object(pc.subprocess, "Popen") as popen:
+            pc.spawn_worker(state_dir, SHA_A, 7, slot=pc.LANE,
+                            checkout="/repo")
+            pc.spawn_worker(state_dir, SHA_B, 8, slot=2)
+            text = pathlib.Path(state_dir, "worker.log").read_text()
+        first, second = text.splitlines()
+        self.assertTrue(first.endswith(" worker #7 %s fast lane ===" % SHA_A))
+        self.assertTrue(second.endswith(" worker #8 %s slot 2 ===" % SHA_B))
+        argv = popen.call_args_list[0][0][0]
+        self.assertEqual(argv[argv.index("--slot") + 1], str(pc.LANE))
+
+
 class StepCosts(unittest.TestCase):
 
     def test_the_median_of_the_last_twenty_runs(self):
@@ -146,6 +172,162 @@ class CheapHeads(unittest.TestCase):
         state = {"waiting": {SHA_A: waits(7, 5, [])}}
         with mock.patch.object(pc, "FAST_LANE_S", None):
             self.assertEqual(pc.cheap_heads(state, self.costs), {})
+
+
+class Picking(unittest.TestCase):
+
+    def setUp(self):
+        lane_on(self)
+        self.state = {"waiting": {
+            SHA_A: waits(7, 30, ["build"]),
+            SHA_B: waits(8, 20, ["docs"]),
+            SHA_C: waits(9, 40, ["docs"])}}
+        self.cheap = {SHA_B: 3, SHA_C: 3}
+
+    def test_the_lane_takes_the_oldest_cheap_head(self):
+        self.assertEqual(pc.lane_head(self.state, self.cheap, when=T0),
+                         (SHA_C, 9))
+        self.assertEqual(pc.lane_head(self.state, self.cheap, {SHA_C}, T0),
+                         (SHA_B, 8))
+
+    def test_the_lane_takes_no_expensive_head(self):
+        self.assertIsNone(pc.lane_head(self.state, self.cheap,
+                                       {SHA_B, SHA_C}, T0))
+
+    def test_an_ordinary_slot_takes_an_expensive_head_first(self):
+        self.assertEqual(pc.next_head(self.state, when=T0, cheap=self.cheap),
+                         (SHA_A, 7))
+
+    def test_and_a_cheap_one_when_no_expensive_one_waits(self):
+        self.assertEqual(pc.next_head(self.state, {SHA_A}, when=T0,
+                                      cheap=self.cheap), (SHA_C, 9))
+
+    def test_a_given_up_expensive_head_does_not_hold_cheap_ones_back(self):
+        self.state["waiting"][SHA_A]["errors"] = pc.MAX_ERRORS
+        self.assertEqual(pc.next_head(self.state, when=T0, cheap=self.cheap),
+                         (SHA_C, 9))
+
+    def test_the_default_branch_counts_as_expensive(self):
+        self.state["waiting"][SHA_A] = waits(0, 60, main=True)
+        self.assertEqual(pc.next_head(self.state, when=T0, cheap=self.cheap),
+                         (SHA_A, 0))
+
+    def test_without_the_lane_nothing_changes(self):
+        self.assertEqual(pc.next_head(self.state, when=T0), (SHA_C, 9))
+
+
+class Tick(StateCase):
+
+    def setUp(self):
+        super().setUp()
+        lane_on(self)
+
+    def tick(self, waiting, heads=None, slots=1, checkout="/repo"):
+        heads = heads if heads is not None else [
+            (w["pr"], sha, REPO, "false") for sha, w in waiting.items()]
+        self.write_state({"waiting": waiting,
+                          "results": history({"docs": 3, "build": 300})})
+        self.run = FakeRun((is_pulls, done([], 0, heads_tsv(*heads))))
+        self.spawned = []
+        return pc.tick(self.state_dir, "tok", self.run,
+                       lambda *a, **k: self.spawned.append(a),
+                       self.lines.append, when=T0, slots=slots,
+                       checkout=checkout)
+
+    def hold(self, slot, holder=None):
+        held = pc.try_lock(pc.lock_path(self.state_dir, slot), holder)
+        self.addCleanup(held.close)
+        return held
+
+    def test_the_lane_starts_a_cheap_head_beside_an_expensive_one(self):
+        self.tick({SHA_A: waits(7, 30, ["build"]),
+                   SHA_B: waits(8, 10, ["docs"])})
+        self.assertEqual(self.spawned, [
+            (self.state_dir, SHA_B, 8, False, pc.LANE, "/repo"),
+            (self.state_dir, SHA_A, 7, False, 1, "/repo")])
+        self.assertEqual(self.lines, [
+            "STARTED #8 bbbbbbbbbb in the fast lane, its steps ~3s here; "
+            "1 waiting",
+            "STARTED #7 aaaaaaaaaa; 0 waiting"])
+        waiting = self.state()["waiting"]
+        self.assertEqual(waiting[SHA_B]["started"], pc.iso(T0))
+
+    def test_the_lane_takes_the_oldest_cheap_head(self):
+        self.tick({SHA_B: waits(8, 10, ["docs"]),
+                   SHA_C: waits(9, 20, ["docs"])}, slots=1)
+        self.assertEqual([a[1:5] for a in self.spawned],
+                         [(SHA_C, 9, False, pc.LANE), (SHA_B, 8, False, 1)])
+
+    def test_a_busy_lane_leaves_cheap_heads_waiting_behind_expensive(self):
+        self.hold(pc.LANE, "#9 %s %s pid=1" % (SHA_C, pc.iso(T0)))
+        self.tick({SHA_A: waits(7, 5, ["build"]),
+                   SHA_B: waits(8, 30, ["docs"]),
+                   SHA_C: waits(9, 40, ["docs"])})
+        self.assertEqual([a[1:5] for a in self.spawned],
+                         [(SHA_A, 7, False, 1)])
+        self.assertIn("RUNNING #9 cccccccccc since %s in the fast lane; "
+                      "2 waiting" % pc.iso(T0), self.lines)
+
+    def test_a_busy_lane_with_no_expensive_head_lets_a_slot_take_it(self):
+        self.hold(pc.LANE, "#9 %s %s pid=1" % (SHA_C, pc.iso(T0)))
+        self.tick({SHA_B: waits(8, 30, ["docs"]),
+                   SHA_C: waits(9, 40, ["docs"])})
+        self.assertEqual([a[1:5] for a in self.spawned],
+                         [(SHA_B, 8, False, 1)])
+
+    def test_a_head_not_worked_out_waits_in_the_ordinary_queue(self):
+        self.tick({SHA_A: waits(7, 30)})
+        self.assertEqual([a[1:5] for a in self.spawned],
+                         [(SHA_A, 7, False, 1)])
+
+    def test_ordinary_slots_all_busy_the_lane_still_starts(self):
+        self.hold(1, "#7 %s %s pid=1" % (SHA_A, pc.iso(T0)))
+        self.tick({SHA_A: waits(7, 30, ["build"]),
+                   SHA_B: waits(8, 10, ["docs"])})
+        self.assertEqual([a[1:5] for a in self.spawned],
+                         [(SHA_B, 8, False, pc.LANE)])
+
+    def test_nothing_cheap_the_lane_stays_free(self):
+        self.tick({SHA_A: waits(7, 30, ["build"])}, slots=1)
+        self.assertEqual([a[4] for a in self.spawned], [1])
+        self.assertIsNone(pc.running(self.state_dir, pc.LANE))
+
+    def test_without_a_checkout_there_is_no_lane(self):
+        self.tick({SHA_B: waits(8, 10, ["docs"])}, checkout=None)
+        self.assertEqual([a[1:5] for a in self.spawned],
+                         [(SHA_B, 8, False, 1)])
+
+    def test_off_there_is_no_lane(self):
+        with mock.patch.object(pc, "FAST_LANE_S", None):
+            self.tick({SHA_A: waits(7, 30, ["build"]),
+                       SHA_B: waits(8, 10, ["docs"])})
+        self.assertEqual([a[1:5] for a in self.spawned],
+                         [(SHA_A, 7, False, 1)])
+
+    def test_a_superseded_lane_run_is_stopped(self):
+        self.hold(pc.LANE, "#9 %s %s pid=4242" % (SHA_C, pc.iso(T0)))
+        stopped = []
+        self.write_state({"waiting": {}})
+        pc.tick(self.state_dir, "tok",
+                FakeRun((is_pulls, done([], 0, ""))),
+                lambda *a, **k: None, self.lines.append, when=T0, slots=1,
+                checkout="/repo", stop=lambda pid: stopped.append(pid) or True)
+        self.assertEqual(stopped, [4242])
+        self.assertIn("in the fast lane (pid 4242)", self.lines[0])
+
+    def test_a_head_without_an_estimate_is_worked_out(self):
+        calls = []
+
+        def steps(checkout, sha, pr, state_dir, run):
+            calls.append((checkout, sha, pr))
+            return {"ran": {"docs": "x"}, "base": SHA_D}
+        with mock.patch.object(pc, "lane_steps", steps):
+            self.tick({SHA_A: waits(7, 30, ["build"]),
+                       SHA_B: waits(8, 10)})
+        self.assertEqual(calls, [("/repo", SHA_B, 8)])
+        self.assertEqual(self.state()["waiting"][SHA_B]["lane_steps"],
+                         ["docs"])
+        self.assertEqual(self.spawned[0][1:5], (SHA_B, 8, False, pc.LANE))
 
 
 class Estimate(StateCase):
@@ -269,14 +451,14 @@ class Estimate(StateCase):
 
 
 class Worker(StateCase):
-    """The worker records each step's time."""
+    """The worker records each step's time, and logs a slow lane run."""
 
     def setUp(self):
         super().setUp()
         lane_on(self, 10)
         self.write_state({"waiting": {SHA_A: waits(7, 3)}})
 
-    def work(self, seconds, slot=1):
+    def work(self, seconds, slot=pc.LANE):
         os.makedirs(os.path.join(self.state_dir, pc.slot_name("wt", slot),
                                  ".git"), exist_ok=True)
         results = [{"name": name, "rc": 0, "seconds": took, "tail": ""}
@@ -296,6 +478,21 @@ class Worker(StateCase):
         record = self.state()["results"][SHA_A]
         self.assertEqual(record["step_seconds"], {"docs": 4, "fmt": 1})
         self.assertEqual(record["seconds"], 5)
+
+    def test_a_lane_run_over_three_times_max_seconds_is_slow(self):
+        self.work({"docs": 25, "fmt": 6})
+        self.assertIn("SLOW-LANE #7 aaaaaaaaaa: ran 31s in the fast lane, "
+                      "over 3 times its 10s; docs 25s, fmt 6s", self.logged())
+        # Not stopped: the verdict stands.
+        self.assertTrue(self.state()["results"][SHA_A]["ok"])
+
+    def test_three_times_is_not(self):
+        self.work({"docs": 30})
+        self.assertNotIn("SLOW-LANE", self.logged())
+
+    def test_nor_is_a_long_run_in_an_ordinary_slot(self):
+        self.work({"docs": 300}, slot=1)
+        self.assertNotIn("SLOW-LANE", self.logged())
 
 
 if __name__ == "__main__":

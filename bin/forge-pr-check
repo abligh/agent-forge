@@ -187,6 +187,23 @@ skipped), and the status says it: `green on <host>: 2 of 6 steps
 reused for another head only if it ran every step that head needs,
 from the same merge base; a match keeps the selection it stands for.
 
+**`checks.fast_lane` (`{"max_seconds": 60}`) adds a slot for cheap
+heads** (designs/0006; only with `depends`). Each tick works out, in
+the cron checkout, the steps each waiting head would run, as the
+worker does, fetching the head there if it hasn't it; the answer is
+kept with the head in `state.json` (`lane_steps`). A step's cost is
+the median of its last COST_RUNS runs here, from the verdicts'
+`step_seconds`; with fewer than COST_MIN_RUNS it has none. A head is
+cheap when every step it would run has a cost and they add up to at
+most `max_seconds`; one whose steps can't be worked out is not. The
+lane runs only cheap heads, oldest first, under the same memory limit
+and CPU weight, with its own lock, worktree and caches
+(`worker-lane.lock`, `wt-lane`, `<cache>-lane`). An ordinary slot
+takes a cheap head only when no other head waits. A lane run whose
+steps take over SLOW_LANE times `max_seconds` is not stopped, but
+logged `SLOW-LANE` with each step's time. `worker.log` names the lane
+(`=== ... fast lane ===`); what is posted is the same.
+
 **A head from another repository is refused.** The steps run the pull
 request's own code with this user's access to the host, so only
 branches of this repository are run.
@@ -471,8 +488,16 @@ try_lock = locks.try_lock
 
 
 def slot_name(name, slot):
-    """`name` for slot 1, which keeps the one-slot names, else name-N."""
+    """`name` for slot 1, which keeps the one-slot names, name-lane for
+    the fast lane, else name-N."""
+    if slot == LANE:
+        return name + "-lane"
     return name if slot == 1 else "%s-%d" % (name, slot)
+
+
+def slot_label(slot):
+    """How the logs name a slot."""
+    return "the fast lane" if slot == LANE else "slot %d" % slot
 
 
 def lock_path(state_dir, slot=1):
@@ -658,7 +683,34 @@ def just_started(entry, when):
         return False
 
 
-def next_head(state, busy=(), first_pr=None, when=None):
+def live_heads(state, busy=(), when=None):
+    """The waiting heads that could be picked: not given up on, not
+    running (`busy`), and not started less than START_GRACE before
+    `when`."""
+    return [s for s, w in state["waiting"].items()
+            if w.get("errors", 0) < MAX_ERRORS
+            and w.get("faults", 0) < MAX_ERRORS and s not in busy
+            and not just_started(w, when)]
+
+
+def order(waiting, sha):
+    """A head's place in the queue: one that failed to prepare goes
+    behind every one that has not, then the oldest first."""
+    return waiting[sha].get("errors", 0), waiting[sha]["since"], sha
+
+
+def lane_head(state, cheap, busy=(), when=None):
+    """(sha, pr) of the cheap head (checks.fast_lane) that has waited
+    longest, in next_head's order, or None."""
+    waiting = state["waiting"]
+    live = [s for s in live_heads(state, busy, when) if s in cheap]
+    if not live:
+        return None
+    sha = min(live, key=lambda s: order(waiting, s))
+    return sha, waiting[sha]["pr"]
+
+
+def next_head(state, busy=(), first_pr=None, when=None, cheap=()):
     """(sha, pr) of the head that has waited longest, or None. A head
     that failed to prepare goes behind every head that has not; one
     whose run the host broke keeps its place, since the fault was not
@@ -673,17 +725,17 @@ def next_head(state, busy=(), first_pr=None, when=None):
 
     A default-branch head (checks.depends, pr 0) goes after every pull
     request's, except the newest, which goes first of all once it has
-    waited DEPENDS_WAIT."""
-    waiting = state["waiting"]
+    waited DEPENDS_WAIT.
 
-    def order(sha):
-        return waiting[sha].get("errors", 0), waiting[sha]["since"], sha
-    live = [s for s, w in waiting.items()
-            if w.get("errors", 0) < MAX_ERRORS
-            and w.get("faults", 0) < MAX_ERRORS and s not in busy
-            and not just_started(w, when)]
+    With the fast lane, a head in `cheap` is picked only when no other
+    head could be: the lane is for it (`lane_head`)."""
+    waiting = state["waiting"]
+    live = live_heads(state, busy, when)
     if not live:
         return None
+    dear = [s for s in live if s not in cheap]
+    if dear:
+        live = dear
     mains = [s for s in live if waiting[s].get("main")]
     heads = [s for s in live if not waiting[s].get("main")]
     if mains:
@@ -696,7 +748,7 @@ def next_head(state, busy=(), first_pr=None, when=None):
         if due or not heads:
             return newest, 0
     mine = [s for s in heads if waiting[s]["pr"] == first_pr]
-    sha = min(mine or heads, key=order)
+    sha = min(mine or heads, key=lambda s: order(waiting, s))
     return sha, waiting[sha]["pr"]
 
 
@@ -946,8 +998,9 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
     nothing, but a posting one still chains the next tick. `main` is a
     default-branch head's traced full run (checks.depends)."""
     wlog = open(os.path.join(state_dir, "worker.log"), "a")
-    wlog.write("=== %s worker %s %s slot %d%s ===\n"
-               % (iso(now_utc()), who(pr, main), sha, slot,
+    wlog.write("=== %s worker %s %s %s%s ===\n"
+               % (iso(now_utc()), who(pr, main), sha,
+                  "fast lane" if slot == LANE else "slot %d" % slot,
                   " ahead" if ahead else ""))
     wlog.flush()
     subprocess.Popen(
@@ -968,14 +1021,17 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     """Queue the open heads and start the next one in a free slot. With
     `merger_dir` (only with MERGER_FIRST), the Merger's pull request goes
     first; with TEST_AHEAD too, its predictions come next (see the
-    module docstring)."""
+    module docstring). With FAST_LANE_S, `depends` and a checkout, the
+    fast lane is one more slot, which starts the oldest cheap head."""
     when = when or now_utc()
     heads = open_heads(token, run)
     if heads is None:
         out("NO-PULLS: could not list %s's open pull requests" % REPO_SLUG)
         return 2
     slots = slots or slots_from_env()
-    holders = {slot: running(state_dir, slot) for slot in range(1, slots + 1)}
+    lane = FAST_LANE_S is not None and DEPENDS and bool(checkout)
+    holders = {slot: running(state_dir, slot)
+               for slot in list(range(1, slots + 1)) + ([LANE] if lane else [])}
     fields = {slot: holder_fields(h) for slot, h in holders.items()}
     busy = {f[1] for f in fields.values() if f}
     head_of_main = main_head(checkout, run) if DEPENDS and checkout else None
@@ -1002,51 +1058,75 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             log(state_dir, "SUPERSEDED #%d %s: no longer the head of any "
                 "open pull request; %s the run in %s (pid %d), since %s"
                 % (pr, sha[:10], "stopping" if sent else "could not stop",
-                   "slot %d" % slot, pid, since), when, out)
+                   slot_label(slot), pid, since), when, out)
         elif got:
-            out("RUNNING #%d %s since %s; %d waiting"
-                % (got[0], got[1][:10], got[2], len(queued - busy)))
+            out("RUNNING #%d %s since %s%s; %d waiting"
+                % (got[0], got[1][:10], got[2],
+                   " in the fast lane" if slot == LANE else "",
+                   len(queued - busy)))
         else:
             out("BUSY: %s is held; %d waiting"
                 % ("the worker lock" if slot == 1
                    else os.path.basename(lock_path(state_dir, slot)),
                    len(queued - busy)))
-    free = [slot for slot, holder in holders.items() if holder is None]
-    if not free:
+    free = [slot for slot, holder in holders.items()
+            if holder is None and slot != LANE]
+    lane_free = lane and holders[LANE] is None
+    if not free and not lane_free:
         return 0
+    if lane:
+        estimate(state_dir, checkout, busy, run)
     first_pr = merger_first(merger_dir, when)
     ahead = (merger_ahead(merger_dir, when, checkout)
              if TEST_AHEAD and merger_dir else [])
-    predicted = None
+    predicted = pick = fast = None
     with state_lock(state_dir):
         state = load(state_dir)
-        pick = next_head(state, busy, first_pr, when)
-        if TEST_AHEAD:
-            forget_ahead(state, ahead)
-            if pick is None or pick[1] != first_pr:
-                predicted = next_ahead(state, ahead, busy, when)
-        if predicted is not None:
-            state.setdefault("ahead_started", {})[predicted[0]] = iso(when)
-            save(state_dir, state)
-        elif pick is not None:
-            state["waiting"][pick[0]]["started"] = iso(when)
-            save(state_dir, state)
-        elif TEST_AHEAD:
-            save(state_dir, state)
+        cheap = cheap_heads(state) if lane else {}
+        if lane_free:
+            fast = lane_head(state, cheap, busy, when)
+            if fast is not None:
+                state["waiting"][fast[0]]["started"] = iso(when)
+                save(state_dir, state)
+        # What the lane just took is as good as running.
+        taken = set(busy) | ({fast[0]} if fast else set())
+        if free:
+            pick = next_head(state, taken, first_pr, when, cheap)
+            if TEST_AHEAD:
+                forget_ahead(state, ahead)
+                if pick is None or pick[1] != first_pr:
+                    predicted = next_ahead(state, ahead, taken, when)
+            if predicted is not None:
+                state.setdefault("ahead_started", {})[predicted[0]] = \
+                    iso(when)
+                save(state_dir, state)
+            elif pick is not None:
+                state["waiting"][pick[0]]["started"] = iso(when)
+                save(state_dir, state)
+            elif TEST_AHEAD:
+                save(state_dir, state)
         starting = sum(1 for s, w in state["waiting"].items()
-                       if s not in busy and just_started(w, when))
+                       if s not in taken and just_started(w, when))
+    if fast is not None:
+        sha, pr = fast
+        spawn(state_dir, sha, pr, post is not None, LANE, checkout)
+        out("STARTED #%d %s in the fast lane, its steps ~%ds here; "
+            "%d waiting" % (pr, sha[:10], cheap[sha], len(queued - taken)))
+    if not free:
+        return 0
     if predicted is not None:
         sha, pr = predicted
         spawn(state_dir, sha, pr, post is not None, free[0], checkout, True)
         out("STARTED-AHEAD #%d %s%s, the Merger's prediction; %d waiting"
             % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
-               len(queued - busy)))
+               len(queued - taken)))
         return 0
     if pick is None:
-        if starting:
+        # A start in the lane has said what this tick did.
+        if fast is None and starting:
             out("STARTING: %d just started, not yet running; %d waiting"
-                % (starting, len(queued - busy) - starting))
-        elif len(free) == slots:
+                % (starting, len(queued - taken) - starting))
+        elif fast is None and len(free) == slots and (lane_free or not lane):
             out("IDLE: no open head is waiting" if not queued else
                 "IDLE: %d waiting, each given up on after %d failures"
                 % (len(queued), MAX_ERRORS))
@@ -1057,7 +1137,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
               main=True)
         out("STARTED %s %s%s, every step traced; %d waiting"
             % (MAIN, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
-               len(queued - busy) - 1))
+               len(queued - taken) - 1))
         return 0
     if checkout:
         spawn(state_dir, sha, pr, post is not None, free[0], checkout)
@@ -1065,7 +1145,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         spawn(state_dir, sha, pr, post is not None, free[0])
     out("STARTED #%d %s%s; %d waiting%s"
         % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
-           len(queued - busy) - 1,
+           len(queued - taken) - 1,
            ", first: the Merger waits on it" if pr == first_pr else ""))
     return 0
 
@@ -1543,7 +1623,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                                             " main" if main else ""))
     if held is None:
         out("BUSY: another check holds the worker lock"
-            + ("" if slot == 1 else " for slot %d" % slot))
+            + ("" if slot == 1 else " for " + slot_label(slot)))
         return 0
     # A tick that finds this head superseded stops it (see the module
     # docstring); signal handlers can only be set in the main thread.
@@ -1698,6 +1778,15 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                    verdict_word(record),
                    (started - parse(seen)).total_seconds(),
                    record["seconds"]), finished, out)
+        if slot == LANE and FAST_LANE_S is not None \
+                and record["seconds"] > SLOW_LANE * FAST_LANE_S:
+            # Not stopped: an estimate is an estimate. Logged, so a bad
+            # one can be seen.
+            log(state_dir, "SLOW-LANE %s %s: ran %ds in the fast lane, over "
+                "%d times its %ds; %s"
+                % (name, sha[:10], record["seconds"], SLOW_LANE, FAST_LANE_S,
+                   ", ".join("%s %ds" % (r["name"], r["seconds"])
+                             for r in results)), finished, out)
         for other in flaked:
             red = state["results"].get(other) or {}
             log(state_dir, "FLAKE tree %s: red(%s) on #%s %s, then green on "
@@ -1748,7 +1837,8 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
     parser.add_argument("--pr", type=int,
                         help="with --worker: the pull request SHA heads")
     parser.add_argument("--slot", type=int, default=1,
-                        help="with --worker: the slot to run in (default 1)")
+                        help="with --worker: the slot to run in (default 1; "
+                        "%d is the fast lane)" % LANE)
     parser.add_argument("--post", action="store_true",
                         help="post each verdict as the commit status")
     parser.add_argument("--ahead", action="store_true",
