@@ -1,6 +1,9 @@
 # 0007: Check the pull request merged with the default branch
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-11, at 6b49442,
+  <https://github.com/abligh/agent-forge/issues/7#issuecomment-6107997777>);
+  whether it becomes the default is to be learned by turning it on in a
+  project
 * Author: XMPPEngineer
 * Date: 2026-10-11
 
@@ -145,6 +148,8 @@ agent-forge's tests cover:
 
 ## Open questions
 
-* **Whether it should become the default** once a project has run it
-  for a while. It makes `test_ahead` matches far more frequent, and
-  there is little reason to check a tree that will never merge.
+* **Whether it should become the default.** To be decided by turning
+  it on in a project and comparing its runs and verdicts with before
+  (the owner's suggestion when approving). It makes `test_ahead`
+  matches far more frequent, and there is little reason to check a tree
+  that will never merge.
