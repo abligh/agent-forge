@@ -92,6 +92,7 @@ every `FORGE_` setting) and its build caches, each step gets:
 
 | Variable | What it is |
 | --- | --- |
+| `CHECK_RESULTS` | An empty directory of the step's own, for results such as per-shard timings: `results/<head>/<step>` in the state directory, kept as long as the verdict, which names it (`results`). More than 10 MB from one step and none of it is kept (`RESULTS-DROPPED` in `verdicts.log`). |
 | `CHECK_CPUS` | The slot's share of the CPUs: those the check may run on, divided by `slots` (plus one with `fast_lane`), at least 1. A test runner sizes its processes or threads from it, so slots running at once fit the host. |
 
 A value the host already sets wins.

@@ -250,6 +250,13 @@ the step fails with that test's output, rather than systemd stopping
 the whole step without a word. A worker that can't start a user scope
 says so in `worker.log` and runs its steps without the limit.
 
+**Each step gets `CHECK_RESULTS`, an empty directory of its own** to
+leave results in, such as a test runner's per-shard times. It is
+`results/<head>/<step>` in the state directory, kept as long as the
+verdict (KEEP), and the verdict's `results` names it. A step that
+leaves more than RESULTS_MAX bytes keeps none, logged as
+`RESULTS-DROPPED`; one that leaves nothing has no directory.
+
 **Each step gets `CHECK_CPUS`, its slot's share of the CPUs**: those
 this process may run on, divided by the slots (the fast lane counting
 as one more), and at least 1. A test runner that starts a process or a
@@ -303,6 +310,8 @@ import datetime
 import hashlib
 import json
 import os
+import re
+import shutil
 import signal
 import socket
 import statistics
@@ -346,6 +355,13 @@ CPU_WEIGHT = DEFAULT_CPU_WEIGHT
 TAIL_LINES = 40
 # Verdicts older than this are dropped from state.json.
 KEEP = datetime.timedelta(days=21)
+# Each run's CHECK_RESULTS directories, by head, in the state directory:
+# kept as long as the run's verdict, each step's at most RESULTS_MAX
+# bytes. One with no verdict (a run stopped, or the host's fault) goes
+# once it is RESULTS_ORPHAN_AGE old, which no run takes.
+RESULTS_DIR = "results"
+RESULTS_MAX = 10 * 1024 * 1024
+RESULTS_ORPHAN_AGE = datetime.timedelta(days=1)
 # Failures to prepare a head's worktree before it is given up on.
 MAX_ERRORS = 3
 # How long a head just started is left to its worker before another
@@ -1108,6 +1124,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             repost(state, heads, post, out)
         prune(state, when)
         save(state_dir, state)
+        prune_results(state_dir, state, when)
         queued = set(state["waiting"])
     current = {sha for _, sha, _, _ in heads}
     for slot, holder in holders.items():
@@ -1493,23 +1510,87 @@ def applicable_at(repo, sha, run=sh):
          "%s:%s" % (sha, path)]).returncode == 0)
 
 
-def check(wt, env, run=sh, steps=None, prefix=(), wrap=None):
+def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None):
     """Every step that applies to the head, each run even if an earlier
     one failed, and none retried, each after `prefix` (memory_cap).
     `wrap(name, prefix, argv, env)` gives a traced step's (argv, env).
-    Returns (ok, results)."""
+    With `kept`, the run's results directory, each step gets an empty
+    one of its own there as CHECK_RESULTS (`keep_results`). Returns
+    (ok, results)."""
     results = []
     for name, args, only_if in applicable(wt, steps):
-        step_args, step_env_ = list(prefix) + args, env
+        step_env_, folder = env, None
+        if kept is not None:
+            folder = os.path.join(kept, results_name(name))
+            shutil.rmtree(folder, ignore_errors=True)
+            os.makedirs(folder)
+            step_env_ = dict(env, CHECK_RESULTS=folder)
+        step_args = list(prefix) + args
         if wrap is not None:
-            step_args, step_env_ = wrap(name, list(prefix), args, env)
+            step_args, step_env_ = wrap(name, list(prefix), args, step_env_)
         started = time.monotonic()
         got = run(step_args, cwd=wt, env=step_env_,
                   timeout=STEP_TIMEOUT_S)
-        results.append({"name": name, "rc": got.returncode,
-                        "seconds": int(time.monotonic() - started),
-                        "tail": tail((got.stdout or "") + (got.stderr or ""))})
+        result = {"name": name, "rc": got.returncode,
+                  "seconds": int(time.monotonic() - started),
+                  "tail": tail((got.stdout or "") + (got.stderr or ""))}
+        if folder is not None:
+            result["results_bytes"], dropped = keep_results(folder)
+            if dropped is not None:
+                result["results_dropped"] = dropped
+        results.append(result)
     return all(r["rc"] == 0 for r in results), results
+
+
+def results_name(step):
+    """A step's results directory's name: its name, safe as one."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", step).lstrip(".") or "_"
+
+
+def tree_size(path):
+    """The bytes of the files under path, never following a link."""
+    total = 0
+    for top, dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(top, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def keep_results(folder):
+    """(bytes kept, bytes dropped or None) for a step's results
+    directory once it has run: over RESULTS_MAX, what it left is
+    dropped whole, since part of a record could mislead; empty, the
+    directory goes."""
+    size = tree_size(folder)
+    if size > RESULTS_MAX:
+        shutil.rmtree(folder, ignore_errors=True)
+        return 0, size
+    if size == 0:
+        shutil.rmtree(folder, ignore_errors=True)
+    return size, None
+
+
+def prune_results(state_dir, state, when):
+    """Each results directory whose head has no verdict in `state`,
+    once it is RESULTS_ORPHAN_AGE old: its verdict was pruned (KEEP),
+    or never came."""
+    top = os.path.join(state_dir, RESULTS_DIR)
+    try:
+        names = os.listdir(top)
+    except OSError:
+        return
+    cutoff = (when - RESULTS_ORPHAN_AGE).timestamp()
+    for name in names:
+        path = os.path.join(top, name)
+        try:
+            old = os.lstat(path).st_mtime < cutoff
+        except OSError:
+            continue
+        if name not in state["results"] and old:
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def choose(wt, sha, state_dir, run=sh, names=None):
@@ -1873,15 +1954,25 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                     % (MAIN, sha[:10], TRACER), started, out)
             else:
                 wrap = trace_wrapper(state_dir, slot, tracer, files)
+        kept = os.path.join(state_dir, RESULTS_DIR, sha)
+        shutil.rmtree(kept, ignore_errors=True)
         ok, results = check(wt, env, run, steps=steps,
                             prefix=memory_cap(memory_max, env, run, out),
-                            wrap=wrap)
+                            wrap=wrap, kept=kept)
         for r in results:
             out("  %-20s rc=%-3d %4ds" % (r["name"], r["rc"], r["seconds"]))
             if r["rc"] != 0:
                 for line in r["tail"].splitlines():
                     out("    | " + line)
         finished = clock()
+        for r in results:
+            if "results_dropped" in r:
+                log(state_dir, "RESULTS-DROPPED %s %s: %s left %d bytes in "
+                    "CHECK_RESULTS, over %d; none kept"
+                    % (name, sha[:10], r["name"], r["results_dropped"],
+                       RESULTS_MAX), finished, out)
+        if not any(r.get("results_bytes") for r in results):
+            shutil.rmtree(kept, ignore_errors=True)
         fault = host_fault(results)
         if fault is not None:
             errors = count_error(state_dir, sha, ahead, "faults")
@@ -1915,6 +2006,12 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 # What the fast lane's estimates come from (step_costs).
                 "step_seconds": {r["name"]: r["seconds"] for r in results},
             }
+            if any(r.get("results_bytes") for r in results):
+                # What the steps left in CHECK_RESULTS, by step.
+                record["results"] = {
+                    "dir": os.path.join(RESULTS_DIR, sha),
+                    "steps": {r["name"]: results_name(r["name"])
+                              for r in results if r.get("results_bytes")}}
             if TEST_AHEAD:
                 # What a later head with the same tree is matched by.
                 record.update(tree=tree, host=socket.gethostname(),
