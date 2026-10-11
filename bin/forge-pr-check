@@ -373,6 +373,8 @@ DEFAULT_REUSE_DAYS = 7
 # Each step's `version` command, by name, and its configuration entry
 # as canonical JSON, both part of its input digest.
 VERSIONS = {}
+# Steps whose digest leaves CHECK_BASE out (`"reads_base": false`).
+NO_BASE = frozenset()
 STEP_ENTRIES = {}
 # How long a step's `version` command may take.
 VERSION_TIMEOUT_S = 60
@@ -487,7 +489,7 @@ def configure(project):
     global CPU_WEIGHT
     global TEST_AHEAD, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
-    global REUSE_AGE, VERSIONS, STEP_ENTRIES
+    global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -501,6 +503,10 @@ def configure(project):
                        if s.get("always"))
     VERSIONS = {s["name"]: list(s["version"])
                 for s in checks.get("steps", []) if s.get("version")}
+    # Steps that say they never read CHECK_BASE: their digests leave the
+    # base out, so they can be reused across the default branch moving.
+    NO_BASE = frozenset(s["name"] for s in checks.get("steps", [])
+                        if s.get("reads_base") is False)
     STEP_ENTRIES = {s["name"]: json.dumps(s, sort_keys=True)
                     for s in checks.get("steps", [])}
     # The configuration refuses reuse without depends.
@@ -1973,7 +1979,8 @@ def step_digests(wt, commit, record, env, run=sh, names=None):
     A digest covers what the step read, at commit: each path's mode and
     blob (or "absent": a path it looked for, or one a step wrote), the
     names each directory it listed holds, CHECK_BASE's tree when the
-    step is given one, its configuration entry, and its `version`
+    step is given one (unless it says `"reads_base": false`), its
+    configuration entry, and its `version`
     command's output. The worktree is cleaned before any step runs, so
     a path the step read that commit doesn't have was either not there
     or written by a step; when there is one, the digests of every
@@ -2008,7 +2015,8 @@ def step_digests(wt, commit, record, env, run=sh, names=None):
             add("read", path, meta or "absent")
         for folder in sorted(record.get("dirs", {}).get(name, ())):
             add("dir", folder, children.get(folder))
-        add("base", base_tree)
+        if name not in NO_BASE:
+            add("base", base_tree)
         if written:
             if None in earlier:
                 earlier.append(None)

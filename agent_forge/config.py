@@ -81,7 +81,7 @@ FAST_LANE = {"max_seconds": int}
 # checks.reuse: a step's green verdict reused for unchanged inputs.
 REUSE = {"max_age_days": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool,
-        "version": list}
+        "version": list, "reads_base": bool}
 # checks.tracer's values (docs/designs/0005).
 TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.

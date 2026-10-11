@@ -249,6 +249,12 @@ class Digests(DigestCase):
         got = self.digests(self.first, env={"CHECK_BASE": tip})
         self.assertNotEqual(got["a"], self.base["a"])
 
+    def test_a_step_that_never_reads_the_base_leaves_it_out(self):
+        tip = self.commit({"Z": "z\n"})
+        with mock.patch.object(pc, "NO_BASE", frozenset({"a"})):
+            got = self.digests(self.first, env={"CHECK_BASE": tip})
+            self.assertEqual(got["a"], self.digests(self.first)["a"])
+
     def test_the_configuration_entry_counts(self):
         with mock.patch.object(pc, "STEP_ENTRIES", {"a": '{"name": "a"}'}):
             self.assertNotEqual(self.digests(self.first)["a"],

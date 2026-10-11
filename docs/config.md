@@ -193,7 +193,10 @@ chosen by:
 * each path the step read, at the tree checked (the merge, with
   `merge_default`): its mode and blob, or that it is absent;
 * the names in each directory it listed;
-* `CHECK_BASE`'s tree;
+* `CHECK_BASE`'s tree, unless the step's entry says
+  `"reads_base": false`. Whether a step reads the variable can't be
+  traced, so a step is assumed to read it, and is reused only against
+  the same tip of the default branch, until it says it doesn't;
 * its entry in `steps`;
 * its `version` command's output, when it has one: a command, run in
   the worktree with the step's environment, that prints the versions
@@ -212,7 +215,8 @@ run: a step marked `always`, one the record doesn't know, one whose
 `version` command fails, one that read another step's output when an
 earlier step has no digest, and one whose newest verdict is red (a
 timeout or an unclean exit included). The default branch's own runs
-never reuse, and since they get no `CHECK_BASE`, nothing reuses them.
+never reuse, and since they get no `CHECK_BASE`, nothing reuses them
+unless the step says `"reads_base": false`.
 
 ### `merge.stall_alert`
 
@@ -457,7 +461,7 @@ reasons.
 | --- | --- | --- |
 | `context` | `vm/build-and-test` | The commit status the build check posts and the Merger requires. |
 | `poster` | `merge.merger` | The App that posts it; the Merger counts only its statuses. |
-| `steps` | one step, `make test` | What runs on each head, in order: `{"name": ..., "run": [argv], "only_if": path, "always": bool, "version": [argv]}`, `only_if` a file the head must have; with `depends`, `always` runs the step whatever changed, for a cheap step or one that depends on more than files (a statically linked tool the tracer can't see). |
+| `steps` | one step, `make test` | What runs on each head, in order: `{"name": ..., "run": [argv], "only_if": path, "always": bool, "version": [argv], "reads_base": bool}`, `only_if` a file the head must have; with `depends`, `always` runs the step whatever changed, for a cheap step or one that depends on more than files (a statically linked tool the tracer can't see). |
 | `caches` | none | `{variable: directory name}`: each slot's own build cache, kept in the state directory, such as `{"CARGO_TARGET_DIR": "cargo-target"}`. |
 | `cache_limit` | none | The most a slot's `caches` may hold after a run, as a size such as `40G` (`K`, `M`, `G` or `T`); with it each run prunes its slot's caches (see below). Without it nothing is pruned. |
 | `slots` | `2` | Checks run at once (`$FORGE_PR_CHECK_SLOTS` overrides). |
