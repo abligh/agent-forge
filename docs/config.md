@@ -140,6 +140,25 @@ steps take more than three times `max_seconds` is not stopped, but
 logged as `SLOW-LANE` with each step's time. What is posted is the same
 as for any run.
 
+### Pruning the build caches
+
+The caches `caches` names only grow: a build tool such as Cargo keeps
+every test executable it has ever linked, one per change of its
+inputs, and never removes them. With `cache_limit`, each run prunes its
+slot's caches as it finishes, while it still holds the slot:
+
+1. executables directly in a `deps` directory, older than a day, that
+   the default branch's last green run in the slot didn't write;
+2. directories directly in an `incremental` directory with nothing in
+   them touched for 7 days;
+3. then the oldest files, until the slot's caches hold at most
+   `cache_limit`.
+
+Links are never followed, so nothing outside the caches is touched.
+What went is logged in `verdicts.log` as `CACHE-PRUNED`, with the bytes
+freed and left. A build tool rebuilds whatever it finds missing, so
+pruning costs time, never a wrong verdict.
+
 ### Checking the merge with the default branch
 
 With `merge_default`, the worker merges a pull request's head with the
@@ -410,6 +429,7 @@ reasons.
 | `poster` | `merge.merger` | The App that posts it; the Merger counts only its statuses. |
 | `steps` | one step, `make test` | What runs on each head, in order: `{"name": ..., "run": [argv], "only_if": path, "always": bool}`, `only_if` a file the head must have; with `depends`, `always` runs the step whatever changed, for a cheap step or one that depends on more than files (a statically linked tool the tracer can't see). |
 | `caches` | none | `{variable: directory name}`: each slot's own build cache, kept in the state directory, such as `{"CARGO_TARGET_DIR": "cargo-target"}`. |
+| `cache_limit` | none | The most a slot's `caches` may hold after a run, as a size such as `40G` (`K`, `M`, `G` or `T`); with it each run prunes its slot's caches (see below). Without it nothing is pruned. |
 | `slots` | `2` | Checks run at once (`$FORGE_PR_CHECK_SLOTS` overrides). |
 | `memory_max` | `16G` | Each step's memory limit, in systemd's syntax, or `off` (`$FORGE_PR_CHECK_MEMORY_MAX` overrides). |
 | `cpu_weight` | `1000` | Each step's scope's `CPUWeight` (systemd's default is 100), so the check gets most of the CPU when agents on the same host build too; `0` sets none. |

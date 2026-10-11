@@ -250,6 +250,16 @@ the step fails with that test's output, rather than systemd stopping
 the whole step without a word. A worker that can't start a user scope
 says so in `worker.log` and runs its steps without the limit.
 
+**With `checks.cache_limit` (say `"40G"`), each run prunes its slot's
+build caches** while it still holds the slot, since nothing else trims
+them and a build tool rarely does: test executables directly in a
+`deps` directory older than a day that the default branch's last green
+run in the slot didn't write go first, then `incremental` directories
+untouched for 7 days, then the oldest files until the slot's caches
+hold at most the limit. Links are never followed. What went is logged
+as `CACHE-PRUNED`; a failure to prune is logged and changes nothing
+else. Without it, nothing is pruned.
+
 **Each step gets `CHECK_RESULTS`, an empty directory of its own** to
 leave results in, such as a test runner's per-shard times. It is
 `results/<head>/<step>` in the state directory, kept as long as the
@@ -342,6 +352,16 @@ DEFAULT_STEPS = [("test", ["make", "test"], None)]
 STEPS = DEFAULT_STEPS
 # {environment variable: directory name} for each slot's build caches.
 CACHES = {}
+# checks.cache_limit: the most a slot's caches may hold, in bytes, after
+# a run prunes them (`prune_caches`); None: never pruned.
+CACHE_LIMIT = None
+# What pruning takes first: executables under a `deps` directory older
+# than this that neither this run nor the default branch's last green
+# run in the slot wrote, and `incremental` directories untouched for
+# longer than this.
+STALE_EXECUTABLE = datetime.timedelta(days=1)
+STALE_INCREMENTAL = datetime.timedelta(days=7)
+SIZE_UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 DEFAULT_STEP_TIMEOUT_S = 30 * 60
 STEP_TIMEOUT_S = DEFAULT_STEP_TIMEOUT_S
 # Each step's memory limit, in systemd's syntax; FORGE_PR_CHECK_MEMORY_MAX
@@ -433,8 +453,8 @@ def configure(project):
     its repository and default branch, and the `checks` section
     (`context`, `poster`, `steps`, `caches`, `slots`, `memory_max`,
     `step_timeout_minutes`, `merger_first`, `depends`,
-    `depends_minutes`, `tracer`, `fast_lane`, `merge_default`, each
-    step's `always`),
+    `depends_minutes`, `tracer`, `fast_lane`, `merge_default`,
+    `cache_limit`, each step's `always`),
     each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
     implies `merger_first`."""
@@ -442,7 +462,7 @@ def configure(project):
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
     global CPU_WEIGHT
     global TEST_AHEAD, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
-    global FAST_LANE_S, MERGE_DEFAULT
+    global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -463,6 +483,8 @@ def configure(project):
         if "fast_lane" in checks else None
     MERGE_DEFAULT = checks.get("merge_default", False)
     CACHES = dict(checks.get("caches", {}))
+    CACHE_LIMIT = size_bytes(checks["cache_limit"]) \
+        if "cache_limit" in checks else None
     SLOTS = checks.get("slots", DEFAULT_SLOTS)
     MEMORY_MAX = checks.get("memory_max", DEFAULT_MEMORY_MAX)
     CPU_WEIGHT = checks.get("cpu_weight", DEFAULT_CPU_WEIGHT)
@@ -475,6 +497,13 @@ def configure(project):
     # The configuration refuses test_ahead with merger_first false.
     MERGER_FIRST = checks.get("merger_first", DEFAULT_MERGER_FIRST) \
         or TEST_AHEAD
+
+
+def size_bytes(text):
+    """A size in systemd's style ("40G", "512M", "100") as bytes."""
+    text = text.strip().upper()
+    unit = text[-1:] if text[-1:] in SIZE_UNITS else ""
+    return int(text[:len(text) - len(unit)]) * SIZE_UNITS[unit]
 
 
 def sh(args, cwd=None, env=None, timeout=None):
@@ -1573,6 +1602,126 @@ def keep_results(folder):
     return size, None
 
 
+def files_under(root):
+    """(path, lstat) for every file under root, never following a link:
+    a link is neither counted nor removed, and nothing outside root is
+    reached."""
+    for top, dirs, files in os.walk(root):
+        for name in files:
+            path = os.path.join(top, name)
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if not os.path.islink(path):
+                yield path, st
+
+
+def newest_mtime(path):
+    """The newest mtime of path and of anything under it."""
+    newest = os.lstat(path).st_mtime
+    for top, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                newest = max(newest, os.lstat(os.path.join(top, name)).st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
+def prune_caches(roots, limit, now, main_since=None):
+    """Prune a slot's build caches, `roots`, in three passes, and return
+    what went: {"executables", "incremental", "files", "freed", "left"}.
+
+    1. Executables directly in any `deps` directory older than
+       STALE_EXECUTABLE that the default branch's last green run in
+       the slot didn't write (mtime before `main_since`, its start):
+       each head's rebuilt test binaries, which nothing runs again.
+    2. Directories directly in any `incremental` directory with nothing
+       in them touched for STALE_INCREMENTAL.
+    3. Then the oldest files, until the caches hold at most `limit`.
+
+    `now` and `main_since` are epoch seconds. A root that is a link, or
+    isn't there, is left alone."""
+    gone = {"executables": 0, "incremental": 0, "files": 0, "freed": 0}
+    roots = [r for r in roots if os.path.isdir(r) and not os.path.islink(r)]
+    stale = now - STALE_EXECUTABLE.total_seconds()
+    if main_since is not None:
+        stale = min(stale, main_since)
+    old = now - STALE_INCREMENTAL.total_seconds()
+
+    def remove(path, size, kind):
+        try:
+            os.unlink(path)
+        except OSError:
+            return
+        gone[kind] += 1
+        gone["freed"] += size
+
+    for root in roots:
+        for top, dirs, files in os.walk(root):
+            name = os.path.basename(top)
+            if name == "deps":
+                for entry in files:
+                    path = os.path.join(top, entry)
+                    try:
+                        st = os.lstat(path)
+                    except OSError:
+                        continue
+                    if (not os.path.islink(path) and st.st_mode & 0o111
+                            and st.st_mtime < stale):
+                        remove(path, st.st_size, "executables")
+            elif name == "incremental":
+                for entry in list(dirs):
+                    path = os.path.join(top, entry)
+                    try:
+                        if os.path.islink(path) or newest_mtime(path) >= old:
+                            continue
+                        size = sum(st.st_size for _, st in files_under(path))
+                        shutil.rmtree(path)
+                    except OSError:
+                        continue
+                    dirs.remove(entry)
+                    gone["incremental"] += 1
+                    gone["freed"] += size
+    every = [f for root in roots for f in files_under(root)]
+    total = sum(st.st_size for _, st in every)
+    if limit is not None and total > limit:
+        for path, st in sorted(every, key=lambda f: f[1].st_mtime):
+            if total <= limit:
+                break
+            before = gone["freed"]
+            remove(path, st.st_size, "files")
+            total -= gone["freed"] - before
+    gone["left"] = total
+    return gone
+
+
+def prune_slot_caches(state_dir, slot, out=print):
+    """With CACHE_LIMIT, prune the slot's caches after a run, and log
+    what went as CACHE-PRUNED. Never raises: a failure is logged, and
+    the run's verdict stands."""
+    if CACHE_LIMIT is None or not CACHES:
+        return None
+    try:
+        since = load(state_dir).get("cache_main", {}).get(str(slot))
+        gone = prune_caches(
+            [os.path.join(state_dir, slot_name(folder, slot))
+             for folder in CACHES.values()],
+            CACHE_LIMIT, time.time(), since)
+    except Exception as err:
+        log(state_dir, "CACHE-PRUNE-FAILED %s: %s: %s"
+            % (slot_label(slot), type(err).__name__, err), now_utc(), out)
+        return None
+    if gone["freed"]:
+        log(state_dir, "CACHE-PRUNED %s: freed %d bytes (%d executables, %d "
+            "incremental directories, %d files over the limit); %d bytes "
+            "left" % (slot_label(slot), gone["freed"], gone["executables"],
+                      gone["incremental"], gone["files"], gone["left"]),
+            now_utc(), out)
+    return gone
+
+
 def prune_results(state_dir, state, when):
     """Each results directory whose head has no verdict in `state`,
     once it is RESULTS_ORPHAN_AGE old: its verdict was pruned (KEEP),
@@ -1855,6 +2004,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     merged with the default branch's tip (`merge_default`)."""
     os.makedirs(state_dir, exist_ok=True)
     started = clock()
+    # The wall clock, which the caches' mtimes are read against.
+    begun = time.time()
     held = try_lock(lock_path(state_dir, slot),
                     "#%d %s %s pid=%d%s" % (pr, sha, iso(started),
                                             os.getpid(),
@@ -2020,6 +2171,9 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 record["ahead"] = True
             if main:
                 record["main"] = True
+                if ok:
+                    # What this slot's cache pruning keeps (prune_caches).
+                    state.setdefault("cache_main", {})[str(slot)] = begun
             if selection is not None:
                 record["selection"] = selection
             if merge:
@@ -2093,6 +2247,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         # A second SIGTERM must not cut the chain short. A handler, not
         # SIG_IGN, which the chained tick would inherit.
         signal.signal(signal.SIGTERM, lambda signum, frame: None)
+        # Under the slot's lock, so no run in it is building meanwhile.
+        prune_slot_caches(state_dir, slot, out)
         held.close()
         # After the lock is free, so the started tick can take it.
         if chain is not None and settled:

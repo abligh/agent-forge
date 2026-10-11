@@ -73,7 +73,9 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "slots": int, "memory_max": str, "step_timeout_minutes": int,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
           "tracer": str, "cpu_weight": int, "fast_lane": dict,
-          "merge_default": bool}
+          "merge_default": bool, "cache_limit": str}
+# checks.cache_limit: a size in systemd's style, at least one byte.
+SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 # checks.fast_lane: a slot for heads whose chosen steps are cheap.
 FAST_LANE = {"max_seconds": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool}
@@ -278,6 +280,10 @@ def check(data):
         problems.append("checks.cpu_weight must be 0 (none) or 1 to 10000")
     if isinstance(checks.get("fast_lane"), dict):
         _check_fast_lane(checks, problems)
+    if isinstance(checks.get("cache_limit"), str) \
+            and not SIZE_RE.match(checks["cache_limit"]):
+        problems.append("checks.cache_limit must be a size such as 40G "
+                        "(K, M, G or T)")
     if isinstance(checks.get("tracer"), str) \
             and checks["tracer"] not in TRACERS:
         problems.append("checks.tracer must be one of %s"
