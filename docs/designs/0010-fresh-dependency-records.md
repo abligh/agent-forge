@@ -2,6 +2,18 @@
 
 * Status: approved (Alex, 2026-10-11, at 2c73757,
   <https://github.com/abligh/agent-forge/issues/14#issuecomment-6111010104>)
+* Implemented: v0.4.21, off until configured. A step is chosen from a
+  record whose tree differs from the base's in nothing it read, an
+  ancestor or not, since a `merge_default` merge is never one; the
+  base's tree's records are tried first, then the newest 20. Runs of
+  predictions write records too. A head waits only while the default
+  branch's head waits for its traced run or is running it, and only
+  when it was estimated against the tip, so without `merge_default`
+  only a head based on the tip waits; the Merger's head and a cheap
+  head never do. A step no record has makes the default branch's head
+  traced, but no head wait. A step reused under design 0009 gives the
+  new record nothing, and a default-branch head that needs no step
+  traced gets no record of its own.
 * Author: XMPPEngineer
 * Date: 2026-10-11
 

@@ -73,13 +73,16 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "slots": int, "memory_max": str, "step_timeout_minutes": int,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
           "tracer": str, "cpu_weight": int, "fast_lane": dict,
-          "merge_default": bool, "cache_limit": str, "reuse": dict}
+          "merge_default": bool, "cache_limit": str, "reuse": dict,
+          "fresh": dict}
 # checks.cache_limit: a size in systemd's style, at least one byte.
 SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 # checks.fast_lane: a slot for heads whose chosen steps are cheap.
 FAST_LANE = {"max_seconds": int}
 # checks.reuse: a step's green verdict reused for unchanged inputs.
 REUSE = {"max_age_days": int}
+# checks.fresh: records from every run, and heads that wait for one.
+FRESH = {"wait_minutes": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool,
         "version": list, "reads_base": bool}
 # checks.tracer's values (docs/designs/0005).
@@ -285,6 +288,8 @@ def check(data):
         _check_fast_lane(checks, problems)
     if isinstance(checks.get("reuse"), dict):
         _check_reuse(checks, problems)
+    if isinstance(checks.get("fresh"), dict):
+        _check_fresh(checks, problems)
     if isinstance(checks.get("cache_limit"), str) \
             and not SIZE_RE.match(checks["cache_limit"]):
         problems.append("checks.cache_limit must be a size such as 40G "
@@ -447,6 +452,20 @@ def _check_fast_lane(checks, problems):
     if checks.get("depends") is not True:
         problems.append("%s needs checks.depends: without it every head "
                         "runs every step, and none is cheap" % where)
+
+
+def _check_fresh(checks, problems):
+    """checks.fresh (designs/0010): dependency records from every green
+    run, and how long a head waits for a fresh one. Records are what
+    `depends` writes, so it needs it."""
+    where = "checks.fresh"
+    fresh = checks["fresh"]
+    _fields(where, fresh, FRESH, problems)
+    if _is(fresh.get("wait_minutes"), int) and fresh["wait_minutes"] < 1:
+        problems.append("%s.wait_minutes must be at least 1" % where)
+    if checks.get("depends") is not True:
+        problems.append("%s needs checks.depends: it keeps the dependency "
+                        "records depends writes fresh" % where)
 
 
 def _check_reuse(checks, problems):

@@ -264,6 +264,35 @@ green, at most `max_age_days` ago, is recorded as reused from that run
 know always run. The description names the first reuse. Runs of the
 default branch never reuse.
 
+**With `checks.fresh` (`{"wait_minutes": 15}`), every green run keeps
+the records fresh** (designs/0010; only with `depends`). A pull
+request's run, and a prediction's, is traced too, and when green
+writes a record for the tree it checked (the merge, with
+`merge_default`), marked `"source": "run"`, with `from` saying where
+each step's paths came from: a step it ran gives its trace, a step it
+skipped the paths of the record it was chosen from, and a step that
+doesn't say `"reads_base": false` nothing, since one given CHECK_BASE
+may narrow its run. Such a record may lack steps. It never replaces the
+default branch's own record for its tree, and adds to another run's.
+Records are kept as before, and at most the newest FRESH_KEEP of each
+step. Each step is then chosen from its own record (`choose_fresh`):
+the first, of the base's tree's records and then the newest
+FRESH_CANDIDATES others, in which nothing the step read changed
+between that record's tree and the base's, an ancestor or not; the
+head's own changes are counted against it. A step no record answers
+for is stale, and runs; the selection lists it in `stale`, and the
+steps get the records chosen as one file, `depends/.selection-<slot>.json`,
+as CHECK_DEPENDS. The default branch's head is queued only when a step
+is stale at its tree or no record has it (`QUEUED ... stale: ...`); it
+goes first while a waiting head, estimated against the tip, runs a
+step only because it is stale, and otherwise as before. Such a head
+waits (`HELD`, and `held` in `state.json`) while the tip waits for its
+run or is running it, for at most `wait_minutes` from when it was
+first seen, then runs as now. Each tick estimates every waiting head
+again whenever the tip or the records change, so a held head is
+chosen again once a fresh record is written, and goes to the fast lane
+if it is then cheap. The Merger's head and a cheap head never wait.
+
 **With `checks.cache_limit` (say `"40G"`), each run prunes its slot's
 build caches** while it still holds the slot, since nothing else trims
 them and a build tool rarely does: test executables directly in a
@@ -470,6 +499,16 @@ SLOW_LANE = 3
 # merged with the default branch's tip. The merge is a local commit
 # with a fixed identity and date, so the same inputs give the same SHA.
 MERGE_DEFAULT = False
+# checks.fresh (designs/0010): every green run is traced and writes a
+# record, each step is chosen from its own freshest record, and a head
+# that would run a step only because its record is stale waits up to
+# FRESH_WAIT for a fresh one. None is off.
+DEFAULT_FRESH_MINUTES = 15
+FRESH_WAIT = None
+# With fresh, how many of the newest records each step keeps, and how
+# many of the newest records a step may be chosen from.
+FRESH_KEEP = 20
+FRESH_CANDIDATES = 20
 MERGE_DATE = "2000-01-01T00:00:00Z"
 MERGE_IDENTITY = ("forge-pr-check", "pr-check@agent-forge.invalid")
 
@@ -480,7 +519,7 @@ def configure(project):
     (`context`, `poster`, `steps`, `caches`, `slots`, `memory_max`,
     `step_timeout_minutes`, `merger_first`, `depends`,
     `depends_minutes`, `tracer`, `fast_lane`, `merge_default`,
-    `cache_limit`, `reuse`, each step's `always` and `version`),
+    `cache_limit`, `reuse`, `fresh`, each step's `always` and `version`),
     each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
     implies `merger_first`."""
@@ -489,7 +528,7 @@ def configure(project):
     global CPU_WEIGHT
     global TEST_AHEAD, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
-    global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE
+    global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -520,6 +559,9 @@ def configure(project):
     FAST_LANE_S = checks["fast_lane"].get("max_seconds", DEFAULT_FAST_LANE_S) \
         if "fast_lane" in checks else None
     MERGE_DEFAULT = checks.get("merge_default", False)
+    # The configuration refuses fresh without depends.
+    FRESH_WAIT = datetime.timedelta(minutes=checks["fresh"].get(
+        "wait_minutes", DEFAULT_FRESH_MINUTES)) if "fresh" in checks else None
     CACHES = dict(checks.get("caches", {}))
     CACHE_LIMIT = size_bytes(checks["cache_limit"]) \
         if "cache_limit" in checks else None
@@ -773,16 +815,28 @@ def main_head(checkout, run=sh):
     return words[0], words[1]
 
 
-def queue_main(state, head, when, state_dir, busy=()):
+def queue_main(state, head, when, state_dir, busy=(), needs=False):
     """Queue the default branch's head (sha, tree) for a traced full run,
     unless it has a verdict, is queued, or its tree has a record. An
     older default-branch head no slot is running is dropped: the newest
     serves every pull request based on it or later. It waits from when
     the oldest it replaces did, or a default branch that moves more
     often than DEPENDS_WAIT would never go first. Whether it was
-    queued."""
+    queued.
+
+    With checks.fresh, `needs` is what `main_needs` said instead of
+    the record's file: a head that needs no step traced isn't queued,
+    and nor is an older one kept waiting, since every record holds."""
     sha, tree = head
-    if sha in state["results"] or sha in state["waiting"] or \
+    if needs is not False:
+        if needs == []:
+            for other, entry in list(state["waiting"].items()):
+                if entry.get("main") and other not in busy:
+                    del state["waiting"][other]
+            return False
+        if sha in state["results"] or sha in state["waiting"]:
+            return False
+    elif sha in state["results"] or sha in state["waiting"] or \
             os.path.exists(os.path.join(trace.records_dir(state_dir),
                                         tree + ".json")):
         return False
@@ -831,7 +885,8 @@ def lane_head(state, cheap, busy=(), when=None):
     return sha, waiting[sha]["pr"]
 
 
-def next_head(state, busy=(), first_pr=None, when=None, cheap=()):
+def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
+              urgent=False):
     """(sha, pr) of the head that has waited longest, or None. A head
     that failed to prepare goes behind every head that has not; one
     whose run the host broke keeps its place, since the fault was not
@@ -846,7 +901,8 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=()):
 
     A default-branch head (checks.depends, pr 0) goes after every pull
     request's, except the newest, which goes first of all once it has
-    waited DEPENDS_WAIT.
+    waited DEPENDS_WAIT, or at once when `urgent` (checks.fresh: a
+    waiting head runs a step only because its record is stale).
 
     With the fast lane, a head in `cheap` is picked only when no other
     head could be: the lane is for it (`lane_head`)."""
@@ -866,7 +922,7 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=()):
                 when - parse(waiting[newest]["since"]) >= DEPENDS_WAIT
         except (TypeError, ValueError):
             due = True
-        if due or not heads:
+        if due or urgent or not heads:
             return newest, 0
     mine = [s for s in heads if waiting[s]["pr"] == first_pr]
     sha = min(mine or heads, key=lambda s: order(waiting, s))
@@ -1189,13 +1245,19 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     fields = {slot: holder_fields(h) for slot, h in holders.items()}
     busy = {f[1] for f in fields.values() if f}
     head_of_main = main_head(checkout, run) if DEPENDS and checkout else None
+    fresh = FRESH_WAIT is not None and head_of_main is not None
+    # With checks.fresh, what the default branch's head needs traced,
+    # worked out outside the lock: it reads git.
+    needs = main_needs(checkout, head_of_main, state_dir, run) \
+        if fresh else False
     with state_lock(state_dir):
         state = load(state_dir)
         note_heads(state, heads, when, state_dir, out, post)
         if head_of_main and queue_main(state, head_of_main, when, state_dir,
-                                       busy):
-            out("QUEUED %s %s: a traced run of every step"
-                % (MAIN, head_of_main[0][:10]))
+                                       busy, needs):
+            out("QUEUED %s %s: a traced run of every step%s"
+                % (MAIN, head_of_main[0][:10],
+                   "" if not needs else "; stale: " + ", ".join(needs)))
         if post is not None:
             repost(state, heads, post, out)
         prune(state, when)
@@ -1229,15 +1291,34 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     lane_free = lane and holders[LANE] is None
     if not free and not lane_free:
         return 0
-    if lane:
-        estimate(state_dir, checkout, busy, run)
+    if lane or fresh:
+        estimate(state_dir, checkout, busy, run,
+                 head_of_main[0] if fresh else None)
     first_pr = merger_first(merger_dir, when)
     ahead = (merger_ahead(merger_dir, when, checkout)
              if TEST_AHEAD and merger_dir else [])
     predicted = pick = fast = None
+    held = {}
     with state_lock(state_dir):
         state = load(state_dir)
         cheap = cheap_heads(state) if lane else {}
+        if fresh:
+            held = held_heads(state, head_of_main[0], busy, when, first_pr,
+                              cheap)
+            # Why each held head waits, kept with it; dropped once it
+            # doesn't.
+            for sha, entry in state["waiting"].items():
+                if sha in held:
+                    entry["held"] = held[sha]
+                else:
+                    entry.pop("held", None)
+            save(state_dir, state)
+        # The default branch goes first while a head runs a step only
+        # because its record is stale.
+        urgent = fresh and any(w.get("stale_steps")
+                               and w.get("lane_base") == head_of_main[0]
+                               for w in state["waiting"].values()
+                               if not w.get("main"))
         if lane_free:
             fast = lane_head(state, cheap, busy, when)
             if fast is not None:
@@ -1246,7 +1327,9 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         # What the lane just took is as good as running.
         taken = set(busy) | ({fast[0]} if fast else set())
         if free:
-            pick = next_head(state, taken, first_pr, when, cheap)
+            pick = next_head(state, taken | set(held), first_pr, when,
+                             cheap, urgent) if fresh else \
+                next_head(state, taken, first_pr, when, cheap)
             if TEST_AHEAD:
                 forget_ahead(state, ahead)
                 if pick is None or pick[1] != first_pr:
@@ -1262,6 +1345,9 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 save(state_dir, state)
         starting = sum(1 for s, w in state["waiting"].items()
                        if s not in taken and just_started(w, when))
+    for sha in sorted(held, key=lambda s: order(state["waiting"], s)):
+        out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
+                                 held[sha]))
     if fast is not None:
         sha, pr = fast
         spawn(state_dir, sha, pr, post is not None, LANE, checkout)
@@ -1281,7 +1367,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         if fast is None and starting:
             out("STARTING: %d just started, not yet running; %d waiting"
                 % (starting, len(queued - taken) - starting))
-        elif fast is None and len(free) == slots and (lane_free or not lane):
+        elif fast is None and len(free) == slots and (lane_free or not lane) \
+                and not held:
             out("IDLE: no open head is waiting" if not queued else
                 "IDLE: %d waiting, each given up on after %d failures"
                 % (len(queued), MAX_ERRORS))
@@ -1843,6 +1930,191 @@ def choose(wt, sha, state_dir, run=sh, names=None):
             "ran": ran, "skipped": skipped}
 
 
+# (wt, old, new) -> (changed, touched) or None: a diff between two
+# commits or trees never changes, so a tick or a run works it out once.
+_DIFFS = {}
+
+
+def diff_of(wt, old, new, run=sh):
+    """(changed, touched) between two commits or trees (trace.changes),
+    or None if git can't say, such as when one has been collected."""
+    key = (wt, old, new)
+    if key not in _DIFFS:
+        got = run(["git", "-C", wt, "diff", "--name-status", "--no-renames",
+                   old, new])
+        _DIFFS[key] = trace.changes(got.stdout) if got.returncode == 0 \
+            else None
+    return _DIFFS[key]
+
+
+def choose_fresh(wt, sha, state_dir, run=sh, names=None, onto=None):
+    """`choose` with checks.fresh (designs/0010): each step from its own
+    record. As `choose` returns, plus "records" ({step: the record's
+    path}) and "stale" (the steps that run only because their record
+    is stale). "record" and "depends" are the newest record chosen.
+
+    The base is the merge base with the default branch, or `onto` (the
+    default branch's tip, for an estimate with MERGE_DEFAULT, where the
+    head will be checked merged with it). The head's own changes are
+    from its merge base.
+
+    A record answers for a step at the base when nothing the step read
+    or listed changed between the record's tree and the base's: a step
+    reads what its inputs lead it to, so it reads the same at both.
+    That holds for any record, an ancestor or not, so the candidates
+    are the records of the base's tree and the newest FRESH_CANDIDATES
+    others; each step is chosen from the first, of those with the
+    step, that answers for it (the base's tree first, then newest). A
+    step none answers for is stale: it is chosen from the first that
+    has it, and runs, for its own changes or else because it is stale.
+    A step no record has runs."""
+    if names is None:
+        names = [name for name, _, _ in applicable(wt)]
+    ref = "refs/remotes/origin/" + MAIN
+    got = run(["git", "-C", wt, "merge-base", sha, ref])
+    merged = (got.stdout or "").strip()
+    if got.returncode != 0 or len(merged) != 40:
+        return {"every": "no merge base with %s" % MAIN}
+    base = onto or merged
+    digest = steps_digest()
+    records = [(path, r) for path, r in trace.load_records(state_dir)
+               if r.get("steps") == digest]
+    if not records:
+        return {"every": "no dependency record for these steps"}
+    tree = tree_of(wt, base, run)
+    if tree is None:
+        return {"every": "could not read %s's tree" % base[:10]}
+    own = diff_of(wt, merged, sha, run)
+    if own is None:
+        return {"every": "could not list what changed since %s" % merged[:10]}
+    exact = [(p, r) for p, r in records if r.get("tree") == tree]
+    others = [(p, r) for p, r in records if r.get("tree") != tree]
+    candidates = [(p, r, (set(), set())) for p, r in exact]
+    for path, record in others[:FRESH_CANDIDATES]:
+        since = diff_of(wt, record.get("tree") or record["commit"], tree, run)
+        if since is not None:
+            candidates.append((path, record, since))
+    if not candidates:
+        return {"every": "could not list what changed since any record"}
+    ran, skipped, stale, chosen = {}, [], [], {}
+    for name in names:
+        having = [c for c in candidates if name in c[1]["reads"]]
+        answers = next((c for c in having
+                        if trace.why_runs(name, c[1], *c[2]) is None), None)
+        path, record, since = answers or (having[0] if having else
+                                          (None, None, None))
+        if path is not None:
+            chosen[name] = path
+        if name in ALWAYS:
+            ran[name] = "always"
+        elif record is None:
+            ran[name] = "not in any record"
+        else:
+            why = trace.why_runs(name, record, *own)
+            if why is None and answers is None:
+                why = "%s since its record" % \
+                    trace.why_runs(name, record, *since)
+                stale.append(name)
+            if why is None:
+                skipped.append(name)
+            else:
+                ran[name] = why
+    used = set(chosen.values())
+    path, record = next(((p, r) for p, r, _ in candidates if p in used),
+                        candidates[0][:2])
+    return {"base": base, "record": record["commit"], "depends": path,
+            "ran": ran, "skipped": skipped, "records": chosen,
+            "stale": stale}
+
+
+def compose(state_dir, selection, slot, when):
+    """The record a fresh selection chose each step from, as one record
+    ({"reads", "dirs", "from": {step: path}}), written as
+    depends/.selection-<slot>.json for CHECK_DEPENDS and the steps'
+    digests: (path, record). A step whose record has been pruned since
+    is left out, as a step no record has."""
+    loaded, reads, dirs = {}, {}, {}
+    for name, path in sorted(selection["records"].items()):
+        if path not in loaded:
+            try:
+                with open(path) as handle:
+                    loaded[path] = json.load(handle)
+            except (OSError, ValueError):
+                loaded[path] = None
+        record = loaded[path]
+        if not isinstance(record, dict) or \
+                name not in (record.get("reads") or {}):
+            continue
+        reads[name] = record["reads"][name]
+        dirs[name] = (record.get("dirs") or {}).get(name, [])
+    sources = {name: selection["records"][name] for name in reads}
+    record = {"reads": reads, "dirs": dirs, "from": sources}
+    path = trace.write_record(state_dir, "", selection["record"],
+                              steps_digest(), iso(when), "", reads, dirs,
+                              source="selection", sources=sources,
+                              name=".selection-%d.json" % slot)
+    return path, record
+
+
+def records_key(state_dir, tip):
+    """What a fresh estimate depends on besides the head: the default
+    branch's tip and the records there are. A head is estimated again
+    when it changes."""
+    folder = trace.records_dir(state_dir)
+    try:
+        names = sorted(n for n in os.listdir(folder)
+                       if n.endswith(".json") and not n.startswith("."))
+        stamps = [os.stat(os.path.join(folder, n)).st_mtime_ns
+                  for n in names]
+    except OSError:
+        names, stamps = [], []
+    return "%s %d %d" % (tip or "", len(names), max(stamps or [0]))
+
+
+def main_needs(checkout, head, state_dir, run=sh):
+    """The steps the default branch's head (sha, tree) needs traced
+    (checks.fresh): those whose record is stale at its tree, or that
+    no record has. None means every step (no record answers at all).
+    A head that needs none isn't traced: every record still holds."""
+    sha, _ = head
+    names = [name for name, _, _ in applicable_at(checkout, sha, run)]
+    selection = choose_fresh(checkout, sha, state_dir, run, names)
+    if "every" in selection:
+        return None
+    return sorted(n for n, why in selection["ran"].items()
+                  if n in selection["stale"] or why == "not in any record")
+
+
+def held_heads(state, tip, busy, when, first_pr=None, cheap=()):
+    """{sha: why} of the waiting heads that wait for a fresh record
+    (checks.fresh): whose estimate, against the default branch's tip,
+    runs a step only because its record is stale, while the tip waits
+    for its traced run or is running it, for at most FRESH_WAIT from
+    when the head was first seen. Not the Merger's head, nor a cheap
+    one, which run now."""
+    if FRESH_WAIT is None or tip is None:
+        return {}
+    coming = tip in busy or (state["waiting"].get(tip) or {}).get("main")
+    if not coming:
+        return {}
+    held = {}
+    for sha, entry in state["waiting"].items():
+        stale = entry.get("stale_steps")
+        if not stale or entry.get("main") or sha in cheap \
+                or entry.get("lane_base") != tip \
+                or (first_pr is not None and entry.get("pr") == first_pr):
+            continue
+        try:
+            waited = when - parse(entry["since"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if waited < FRESH_WAIT:
+            held[sha] = "%s stale; waits for %s %s's record, at most %dm" \
+                % (", ".join(stale), MAIN, tip[:10],
+                   FRESH_WAIT.total_seconds() // 60)
+    return held
+
+
 def step_costs(state):
     """{step: seconds}, each step's cost here: the median of its last
     COST_RUNS runs in the verdicts kept, newest by `finished`. A step
@@ -1861,10 +2133,11 @@ def step_costs(state):
             for name, took in runs.items() if len(took) >= COST_MIN_RUNS}
 
 
-def lane_steps(checkout, sha, pr, state_dir, run=sh):
-    """The steps pull request pr's head sha would run (`choose`), worked
-    out in the cron checkout without a worktree, fetching the head
-    first if the checkout doesn't have it. The fetch writes no
+def lane_steps(checkout, sha, pr, state_dir, run=sh, tip=None):
+    """The steps pull request pr's head sha would run (`choose`, or
+    `choose_fresh` with checks.fresh, against `tip` with MERGE_DEFAULT),
+    worked out in the cron checkout without a worktree, fetching the
+    head first if the checkout doesn't have it. The fetch writes no
     FETCH_HEAD, which the checkout's other users may read. As `choose`
     returns, with {"every": why} when the steps can't be worked out."""
     def have():
@@ -1880,33 +2153,50 @@ def lane_steps(checkout, sha, pr, state_dir, run=sh):
         if not have():
             return {"every": "pull/%d/head is no longer %s" % (pr, sha[:10])}
     names = [name for name, _, _ in applicable_at(checkout, sha, run)]
+    if FRESH_WAIT is not None:
+        return choose_fresh(checkout, sha, state_dir, run, names,
+                            tip if MERGE_DEFAULT else None)
     return choose(checkout, sha, state_dir, run, names)
 
 
-def estimate(state_dir, checkout, busy=(), run=sh):
+def estimate(state_dir, checkout, busy=(), run=sh, tip=None):
     """Work out, in the cron checkout, the steps each waiting pull
     request head would run that has no estimate yet (checks.fast_lane),
     and keep them with the head as `lane_steps`. Only an answer is
     kept: a head whose steps can't be worked out yet is tried again
-    next tick. A head being run, or given up on, needs none."""
+    next tick. A head being run, or given up on, needs none.
+
+    With checks.fresh, `tip` is the default branch's tip, and a head is
+    estimated again whenever it or the records change (`records_key`);
+    the steps that would run only because their record is stale are
+    kept as `stale_steps`, and the base they were chosen against as
+    `lane_base`."""
+    key = records_key(state_dir, tip) if FRESH_WAIT is not None else None
     with state_lock(state_dir):
         waiting = load(state_dir)["waiting"]
         todo = sorted((w["since"], sha, w["pr"]) for sha, w in waiting.items()
-                      if "lane_steps" not in w and not w.get("main")
+                      if ("lane_steps" not in w if key is None
+                          else w.get("lane_key") != key)
+                      and not w.get("main")
                       and sha not in busy
                       and w.get("errors", 0) < MAX_ERRORS
                       and w.get("faults", 0) < MAX_ERRORS)
     found = {}
     for _, sha, pr in todo:
-        selection = lane_steps(checkout, sha, pr, state_dir, run)
+        selection = lane_steps(checkout, sha, pr, state_dir, run, tip) \
+            if key is not None else \
+            lane_steps(checkout, sha, pr, state_dir, run)
         if "ran" in selection:
-            found[sha] = sorted(selection["ran"])
+            found[sha] = {"lane_steps": sorted(selection["ran"])}
+            if key is not None:
+                found[sha].update(stale_steps=selection["stale"],
+                                  lane_base=selection["base"], lane_key=key)
     if found:
         with state_lock(state_dir):
             state = load(state_dir)
-            for sha, steps in found.items():
+            for sha, got in found.items():
                 if sha in state["waiting"]:
-                    state["waiting"][sha]["lane_steps"] = steps
+                    state["waiting"][sha].update(got)
             save(state_dir, state)
 
 
@@ -2152,7 +2442,87 @@ def record_depends(state_dir, wt, sha, tree, files, env, tracer, when,
         return None
     path = trace.write_record(state_dir, tree, sha, steps_digest(),
                               iso(when), kind, reads, dirs)
-    trace.prune_records(state_dir, when, parse)
+    trace.prune_records(state_dir, when, parse,
+                        FRESH_KEEP if FRESH_WAIT is not None else None)
+    out("  recorded what %d steps read: %s"
+        % (len(reads), os.path.basename(path)))
+    return path
+
+
+def record_run(state_dir, wt, sha, checked, tree, files, env, tracer, when,
+               selection, composed, name, out=print):
+    """With checks.fresh, writes the dependency record of a pull
+    request's green traced run (designs/0010), for the tree it checked
+    (`checked`: the head, or its merge with the default branch), and
+    returns its path, or None. Only steps that say `"reads_base":
+    false` are recorded: one given CHECK_BASE may narrow its run to
+    what changed since the base, so its trace isn't what a full run
+    reads. Of those, a step that ran gives what its trace read, and a
+    skipped one what its chosen record (`composed`) says, which still
+    holds: it read nothing that changed. A step reused (designs/0009)
+    or given no record gives nothing, so the record may lack steps.
+
+    A step whose trace is implausible makes the whole record unusable,
+    as for the default branch. A record of the default branch's own
+    for this tree is never replaced; one of another run is added to,
+    its steps kept. The trace files are removed either way."""
+    kind, _ = tracer
+    programs = {step: args[0] for step, args, _ in applicable(wt)}
+    inside = [os.path.relpath(env[v], wt) for v in CACHES if v in env
+              and os.path.abspath(env[v]).startswith(
+                  os.path.abspath(wt) + os.sep)]
+    reads, dirs, sources, implausible = {}, {}, {}, []
+    for step, path in files.items():
+        entries = None
+        if step in NO_BASE:
+            entries = trace.read_strace(path, wt) if kind == "strace" \
+                else trace.read_preload(path)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        if entries is None:
+            continue
+        if not trace.plausible(entries, programs.get(step, ""),
+                               env.get("PATH")):
+            implausible.append(step)
+            continue
+        reads[step] = trace.relative(entries, wt, inside)
+        dirs[step] = trace.directories(reads[step], wt)
+        sources[step] = "run"
+    if implausible:
+        log(state_dir, "DEPENDS-UNUSABLE %s %s: %s recorded nothing, not "
+            "even its own program; nothing recorded"
+            % (name, sha[:10], ", ".join(sorted(implausible))), when, out)
+        return None
+    skipped = (selection or {}).get("skipped", ())
+    for step in skipped:
+        if step in NO_BASE and composed and step in composed["reads"]:
+            reads[step] = composed["reads"][step]
+            dirs[step] = composed["dirs"].get(step, [])
+            sources[step] = composed["from"][step]
+    if not reads or not tree:
+        return None
+    path = os.path.join(trace.records_dir(state_dir), tree + ".json")
+    try:
+        with open(path) as handle:
+            earlier = json.load(handle)
+    except (OSError, ValueError):
+        earlier = None
+    if isinstance(earlier, dict) and earlier.get("steps") == steps_digest() \
+            and isinstance(earlier.get("reads"), dict):
+        if earlier.get("source") is None:
+            # The default branch's own traced run: every step, in full.
+            return None
+        for step, read in earlier["reads"].items():
+            if step not in reads:
+                reads[step] = read
+                dirs[step] = (earlier.get("dirs") or {}).get(step, [])
+                sources[step] = (earlier.get("from") or {}).get(step, "run")
+    path = trace.write_record(state_dir, tree, checked, steps_digest(),
+                              iso(when), kind, reads, dirs, source="run",
+                              sources=sources)
+    trace.prune_records(state_dir, when, parse, FRESH_KEEP)
     out("  recorded what %d steps read: %s"
         % (len(reads), os.path.basename(path)))
     return path
@@ -2256,15 +2626,26 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         if checked != sha:
             out("  merged with %s at %s as %s"
                 % (MAIN, merge["base"][:10], checked[:10]))
-        selection = choose(wt, checked, state_dir, run) \
-            if DEPENDS and not main else None
+        fresh = FRESH_WAIT is not None and DEPENDS and not main
+        if fresh:
+            selection = choose_fresh(wt, checked, state_dir, run)
+        else:
+            selection = choose(wt, checked, state_dir, run) \
+                if DEPENDS and not main else None
         if selection is not None:
             out("  every step: %s" % selection["every"]
                 if "every" in selection else
                 "  %d of %d steps, from the record of %s"
                 % (len(selection["ran"]),
                    len(selection["ran"]) + len(selection["skipped"]),
-                   selection["record"][:10]))
+                   selection["record"][:10]) if not fresh else
+                "  %d of %d steps, from %d records, the newest of %s%s"
+                % (len(selection["ran"]),
+                   len(selection["ran"]) + len(selection["skipped"]),
+                   len(set(selection["records"].values())),
+                   selection["record"][:10],
+                   "; stale: " + ", ".join(selection["stale"])
+                   if selection["stale"] else ""))
         tree = tree_of(wt, checked, run) if TEST_AHEAD or main else None
         if tree and not ahead and not main:
             with state_lock(state_dir):
@@ -2279,17 +2660,26 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                                                         iso(started)))
         env = step_env(state_dir, slot=slot)
         steps, wrap, tracer, files = None, None, None, {}
+        composed = None
         if selection is not None and "ran" in selection:
+            depends = selection["depends"]
+            if fresh:
+                # Each step's own record, as one file.
+                depends, composed = compose(state_dir, selection, slot,
+                                            started)
             env = dict(env, CHECK_BASE=selection["base"],
-                       CHECK_DEPENDS=selection["depends"])
+                       CHECK_DEPENDS=depends)
             steps = [s for s in applicable(wt) if s[0] in selection["ran"]]
         digests, reused = {}, {}
         if REUSE_AGE is not None and steps is not None:
             # designs/0009: a step whose inputs a green run here
             # already tested isn't run again.
             try:
-                with open(selection["depends"]) as handle:
-                    read = json.load(handle)
+                if composed is not None:
+                    read = composed
+                else:
+                    with open(selection["depends"]) as handle:
+                        read = json.load(handle)
             except (OSError, ValueError):
                 # Pruned since it was chosen: every chosen step runs.
                 read = {}
@@ -2308,6 +2698,15 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 log(state_dir, "NO-TRACE %s %s: the %s tracer can't be used "
                     "here; every step runs untraced and nothing is recorded"
                     % (MAIN, sha[:10], TRACER), started, out)
+            else:
+                wrap = trace_wrapper(state_dir, slot, tracer, files)
+        elif fresh:
+            # designs/0010: a pull request's run is traced too, and when
+            # green records what its steps read.
+            tracer = tracer_for(state_dir, run)
+            if tracer is None:
+                out("  untraced: the %s tracer can't be used here; nothing "
+                    "is recorded" % TRACER)
             else:
                 wrap = trace_wrapper(state_dir, slot, tracer, files)
         kept = os.path.join(state_dir, RESULTS_DIR, sha)
@@ -2420,6 +2819,16 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                    verdict_word(record),
                    (started - parse(seen)).total_seconds(),
                    record["seconds"]), finished, out)
+            if ok and tracer is not None:
+                record_run(state_dir, wt, sha, checked,
+                           tree_of(wt, checked, run), files, env, tracer,
+                           finished, selection, composed, name, out)
+            else:
+                for path in files.values():
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
         if slot == LANE and FAST_LANE_S is not None \
                 and record["seconds"] > SLOW_LANE * FAST_LANE_S:
             # Not stopped: an estimate is an estimate. Logged, so a bad

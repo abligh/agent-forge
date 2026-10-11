@@ -218,6 +218,44 @@ timeout or an unclean exit included). The default branch's own runs
 never reuse, and since they get no `CHECK_BASE`, nothing reuses them
 unless the step says `"reads_base": false`.
 
+### Keeping the records fresh
+
+Without `fresh`, only the default branch's traced runs write records,
+so everything the default branch changed since its last one counts as
+changed for every pull request. With `fresh` (and `depends`):
+
+* **Every green run writes a record** for the tree it checked (the
+  merge, with `merge_default`), marked `"source": "run"`, its `from`
+  saying where each step's paths came from. A step it ran gives what
+  its trace read; a step it skipped gives the paths of the record it
+  was chosen from, which still hold. A step that doesn't say
+  `"reads_base": false` gives nothing, since one given `CHECK_BASE`
+  may narrow its run, so the record lacks it. Such a record never
+  replaces the default branch's own record for its tree. Each step
+  keeps at most its newest 20 records.
+* **Each step is chosen from its own record:** the first in which
+  nothing the step read or listed changed between that record's tree
+  and the base's, from the base's tree's records and then the newest
+  20 others. That holds whether or not the record's commit is an
+  ancestor: a merge checked with `merge_default` never is. A step no
+  record answers for is stale and runs; the verdict's `selection`
+  lists it under `stale`. `CHECK_DEPENDS` is then the records chosen,
+  as one file (`depends/.selection-<slot>.json`, with `from`).
+* **The default branch's head is traced only when it needs to be:**
+  when a step is stale at its tree, or no record has it. It goes first
+  while a waiting head runs a step only because it is stale, and
+  otherwise once it has waited `depends_minutes`, as before.
+* **A head that would run a step only because it is stale waits**
+  (`HELD` in the tick's output, `held` in `state.json`) while the
+  default branch's head waits for its traced run or is running it, for
+  at most `wait_minutes` from when the head was first seen; then it
+  runs as now. Heads are estimated again whenever the tip or the
+  records change, so a held head is chosen again once a fresh record is
+  written, and goes to the fast lane if that is then cheap. The
+  Merger's head and a cheap head never wait. Without `merge_default`,
+  only a head whose merge base is the tip waits, since only then can
+  the tip's record help it.
+
 ### `merge.stall_alert`
 
 Without it, a stalled queue is a `STALLED` line in the Merger's log and
@@ -477,6 +515,8 @@ reasons.
 | `merge_default` | `false` | Check a pull request's head merged with the default branch's tip, the tree GitHub's update makes, instead of the head alone (designs/0007; see below). |
 | `reuse` | none | `{"max_age_days": 7}`: don't run a step on inputs a green run here already passed (designs/0009; see below). Refused without `depends`. |
 | `reuse.max_age_days` | `7` | How long a step's green verdict stands for the same inputs, counted from the run that ran it. At least 1. |
+| `fresh` | none | `{"wait_minutes": 15}`: every green run writes a dependency record, each step is chosen from its own freshest record, and a head that runs a step only because its record is stale waits for a fresh one (designs/0010; see below). Refused without `depends`. |
+| `fresh.wait_minutes` | `15` | The longest a head waits for a fresh record before it runs as it would without `fresh`. At least 1. |
 
 Only these keys are checked; the section may hold others, for tools
 not here yet.

@@ -186,17 +186,26 @@ def records_dir(state_dir):
     return os.path.join(state_dir, RECORDS)
 
 
-def write_record(state_dir, tree, commit, steps, at, tracer, reads, dirs):
-    """Writes depends/<tree>.json, whole and renamed into place; its
-    path. `reads` and `dirs` map each step to its paths."""
+def write_record(state_dir, tree, commit, steps, at, tracer, reads, dirs,
+                 source=None, sources=None, name=None):
+    """Writes depends/<tree>.json (or `name`), whole and renamed into
+    place; its path. `reads` and `dirs` map each step to its paths.
+    `source` is "run" for a record a pull request's run wrote
+    (designs/0010), which may lack steps; `sources` says, by step,
+    where each one's paths came from. A default-branch run's record
+    has neither."""
     folder = records_dir(state_dir)
     os.makedirs(folder, exist_ok=True)
     record = {"tree": tree, "commit": commit, "steps": steps, "at": at,
               "tracer": tracer, "reads": reads, "dirs": dirs}
+    if source is not None:
+        record["source"] = source
+    if sources is not None:
+        record["from"] = sources
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=".record.")
     with os.fdopen(fd, "w") as handle:
         json.dump(record, handle, indent=1, sort_keys=True)
-    path = os.path.join(folder, tree + ".json")
+    path = os.path.join(folder, name or tree + ".json")
     os.replace(tmp, path)
     return path
 
@@ -226,16 +235,26 @@ def load_records(state_dir):
     return found
 
 
-def prune_records(state_dir, when, parse):
+def prune_records(state_dir, when, parse, per_step=None):
     """Drops records older than KEEP, keeping the newest whatever its
-    age. `parse` reads a record's `at`."""
+    age. `parse` reads a record's `at`. With `per_step`, a record is
+    also dropped unless it is one of the newest `per_step` that have
+    one of its steps (designs/0010: every run writes one)."""
     records = load_records(state_dir)
+    wanted = None
+    if per_step is not None:
+        wanted, counts = set(), {}
+        for path, record in records:
+            for name in record["reads"]:
+                if counts.get(name, 0) < per_step:
+                    counts[name] = counts.get(name, 0) + 1
+                    wanted.add(path)
     for path, record in records[1:]:
         try:
             old = when - parse(record["at"]) > KEEP
         except (TypeError, ValueError):
             old = True
-        if old:
+        if old or (wanted is not None and path not in wanted):
             try:
                 os.unlink(path)
             except OSError:
