@@ -85,6 +85,28 @@ letter.
 Only these keys are checked; the section may hold others, for tools
 not here yet.
 
+### What `depends` records and passes on
+
+A green traced run of the default branch's head writes
+`depends/<tree>.json` in the build check's state directory:
+`{"tree", "commit", "steps", "at", "tracer", "reads": {step: [path]},
+"dirs": {step: [directory]}}`, paths relative to the worktree, `.` for
+its top. `reads` is every path the step opened, executed or looked for
+(found or not), less `.git` and build caches; `dirs` is each read
+path's directory and each read path that is a directory. Records are
+kept 14 days, and the newest always.
+
+A pull request's steps that run with a record get two variables, so a
+project's own test runner can narrow further:
+
+| Variable | What it is |
+| --- | --- |
+| `CHECK_BASE` | The merge base the head was compared with. |
+| `CHECK_DEPENDS` | The record's path. |
+
+Neither is set when every step runs because nothing could be selected:
+such a step must test everything.
+
 ### `merge.stall_alert`
 
 Without it, a stalled queue is a `STALLED` line in the Merger's log and
@@ -308,12 +330,15 @@ reasons.
 | --- | --- | --- |
 | `context` | `vm/build-and-test` | The commit status the build check posts and the Merger requires. |
 | `poster` | `merge.merger` | The App that posts it; the Merger counts only its statuses. |
-| `steps` | one step, `make test` | What runs on each head, in order: `{"name": ..., "run": [argv], "only_if": path}`, `only_if` a file the head must have. |
+| `steps` | one step, `make test` | What runs on each head, in order: `{"name": ..., "run": [argv], "only_if": path, "always": bool}`, `only_if` a file the head must have; with `depends`, `always` runs the step whatever changed, for a cheap step or one that depends on more than files (a statically linked tool the tracer can't see). |
 | `caches` | none | `{variable: directory name}`: each slot's own build cache, kept in the state directory, such as `{"CARGO_TARGET_DIR": "cargo-target"}`. |
 | `slots` | `2` | Checks run at once (`$FORGE_PR_CHECK_SLOTS` overrides). |
 | `memory_max` | `16G` | Each step's memory limit, in systemd's syntax, or `off` (`$FORGE_PR_CHECK_MEMORY_MAX` overrides). |
 | `step_timeout_minutes` | `30` | When a step is stopped. |
 | `merger_first` | `false` | Start first a waiting head of the pull request the Merger waits on (its `next.json`, read while under 10 minutes old), since the next merge waits on its verdict; every other head is then started oldest first, as without it. It only orders: a free slot is never kept empty for the Merger, whose wait may be on something no check here ends. `merge.test_ahead` turns it on, and refuses `false`. |
+| `depends` | `false` | Run each new head of the default branch in full under a tracer, recording what each step reads, and run a pull request's head with only the steps that read what it changes (designs/0005; see below). |
+| `depends_minutes` | `30` | How long the newest default-branch head waits behind pull requests' heads before it goes first. |
+| `tracer` | `preload` | How `depends` traces: `preload`, an `LD_PRELOAD` library built from lib/forge-trace.c with the host's C compiler (no root, cheap, blind to statically linked programs), or `strace` (everything, slower; needs strace installed). |
 
 Only these keys are checked; the section may hold others, for tools
 not here yet.

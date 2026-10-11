@@ -150,6 +150,43 @@ What that guarantees, and what it doesn't:
 * **The step digest can't see a toolchain upgrade** on the host, which
   is why a verdict counts for `max_age_hours` and no longer.
 
+**With `checks.depends`, a pull request runs only the steps that read
+what it changes** (docs/designs/0005; default off). Each new head of
+the default branch, as the cron checkout last fetched it, is queued
+(`QUEUED main <sha>`) and run with every step under a tracer
+(`checks.tracer`): `preload`, agent-forge's lib/forge-trace.c built
+with the host's C compiler into the state directory and loaded with
+`LD_PRELOAD`, or `strace`. It is posted on that commit and logged
+`MAIN-GREEN` or `MAIN-RED`. A green run writes `depends/<tree>.json`:
+for each step, the paths inside the worktree it opened, executed or
+looked for (`reads`) and the directories it read from or listed
+(`dirs`), with the commit, the step digest and the time. Records are
+kept 14 days, and the newest always. A red run records nothing; so does
+one where a step's trace doesn't even show its own program
+(`DEPENDS-UNUSABLE`), or where the tracer can't be used (`NO-TRACE`).
+A default-branch head waits behind pull requests' heads, except the
+newest, which goes first once it has waited `checks.depends_minutes`
+(default 30); an older one no slot is running is dropped when a newer
+is queued, since the newest serves every pull request based on it or
+later.
+
+A pull request's head is compared with its merge base with the
+default branch. The record for that base's tree is used, or else the
+newest record of an ancestor of it, with what changed between the two
+counted as changed too. A step runs when it read a changed path (or
+one under a changed directory), when a path was added or deleted in a
+directory it read from or listed, when it is marked `always`, or when
+the record doesn't know it. Every step runs, and the status says why,
+when there is no merge base, no record for these steps or for an
+ancestor, or the diff fails. The steps that run get `CHECK_BASE`, the
+merge base, and `CHECK_DEPENDS`, the record's path, so a project's own
+runner can narrow further; a step run because every step runs gets
+neither. The verdict records `selection` (what ran and why, what was
+skipped), and the status says it: `green on <host>: 2 of 6 steps
+(docs: designs/0042.md; ...)`. A green verdict on the same tree is
+reused for another head only if it ran every step that head needs,
+from the same merge base; a match keeps the selection it stands for.
+
 **A head from another repository is refused.** The steps run the pull
 request's own code with this user's access to the host, so only
 branches of this repository are run.
@@ -226,7 +263,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-from agent_forge import config, locks  # noqa: E402
+from agent_forge import config, locks, trace  # noqa: E402
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 
@@ -291,18 +328,30 @@ MERGER_FRESH = datetime.timedelta(minutes=10)
 TEST_AHEAD = False
 DEFAULT_MATCH_MAX_HOURS = 24
 MATCH_MAX_AGE = datetime.timedelta(hours=DEFAULT_MATCH_MAX_HOURS)
+# `checks.depends` (docs/designs/0005): each new head of the default
+# branch is run in full under a tracer, recording what each step
+# reads, and a pull request runs the steps that read what it changes.
+DEPENDS = False
+# How long the newest default-branch head waits behind pull requests
+# before it goes first.
+DEFAULT_DEPENDS_MINUTES = 30
+DEPENDS_WAIT = datetime.timedelta(minutes=DEFAULT_DEPENDS_MINUTES)
+TRACER = trace.DEFAULT_TRACER
+# The steps that run whatever changed (`always`).
+ALWAYS = frozenset()
 
 
 def configure(project):
     """Set the module's settings from `project`, a loaded configuration:
     its repository and default branch, and the `checks` section
     (`context`, `poster`, `steps`, `caches`, `slots`, `memory_max`,
-    `step_timeout_minutes`, `merger_first`), each with the default
-    above, and `merge.test_ahead` (`max_age_hours`), which implies
-    `merger_first`."""
+    `step_timeout_minutes`, `merger_first`, `depends`,
+    `depends_minutes`, `tracer`, each step's `always`), each with the
+    default above, and `merge.test_ahead` (`max_age_hours`), which
+    implies `merger_first`."""
     global REPO_SLUG, MAIN, CONFIG_PATH, STATUS_CONTEXT, POSTER, HOST
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
-    global TEST_AHEAD, MATCH_MAX_AGE
+    global TEST_AHEAD, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -312,6 +361,12 @@ def configure(project):
     HOST = project.host
     STEPS = [(s["name"], list(s["run"]), s.get("only_if"))
              for s in checks["steps"]] if "steps" in checks else DEFAULT_STEPS
+    ALWAYS = frozenset(s["name"] for s in checks.get("steps", [])
+                       if s.get("always"))
+    DEPENDS = checks.get("depends", False)
+    DEPENDS_WAIT = datetime.timedelta(minutes=checks.get(
+        "depends_minutes", DEFAULT_DEPENDS_MINUTES))
+    TRACER = checks.get("tracer", trace.DEFAULT_TRACER)
     CACHES = dict(checks.get("caches", {}))
     SLOTS = checks.get("slots", DEFAULT_SLOTS)
     MEMORY_MAX = checks.get("memory_max", DEFAULT_MEMORY_MAX)
@@ -412,7 +467,9 @@ def running(state_dir, slot=1):
 def holder_fields(line):
     """(pr, sha, started, pid, ahead) from a worker's lock line, or None
     for a line that doesn't name a check. pid is None in a line from
-    before lock lines named it."""
+    before lock lines named it. `ahead` is true for any run that is no
+    pull request's head, a prediction or a default-branch head, which
+    nothing supersedes."""
     parts = (line or "").split()
     if len(parts) < 3 or not parts[0].startswith("#") \
             or not parts[0][1:].isdigit():
@@ -421,7 +478,8 @@ def holder_fields(line):
     for part in parts[3:]:
         if part.startswith("pid=") and part[4:].isdigit():
             pid = int(part[4:])
-    return int(parts[0][1:]), parts[1], parts[2], pid, "ahead" in parts[3:]
+    return (int(parts[0][1:]), parts[1], parts[2], pid,
+            "ahead" in parts[3:] or "main" in parts[3:])
 
 
 def stop_worker(pid):
@@ -505,8 +563,44 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
         state["waiting"].setdefault(sha, {"pr": pr, "since": iso(when)})
         state["waiting"][sha]["pr"] = pr
     for sha in list(state["waiting"]):
-        if sha not in current:
+        # A default-branch head (checks.depends) is no pull request's.
+        if sha not in current and not state["waiting"][sha].get("main"):
             del state["waiting"][sha]
+
+
+def who(pr, main=False):
+    """How a run is named in the logs: its pull request, or `main`."""
+    return MAIN if main else "#%d" % pr
+
+
+def main_head(checkout, run=sh):
+    """(sha, tree) of the default branch's head as the cron checkout
+    last fetched it, or None if git can't say."""
+    ref = "refs/remotes/origin/" + MAIN
+    got = run(["git", "-C", checkout, "rev-parse", ref, ref + "^{tree}"])
+    words = (got.stdout or "").split()
+    if got.returncode != 0 or len(words) != 2 \
+            or not all(len(w) == 40 for w in words):
+        return None
+    return words[0], words[1]
+
+
+def queue_main(state, head, when, state_dir, busy=()):
+    """Queue the default branch's head (sha, tree) for a traced full run,
+    unless it has a verdict, is queued, or its tree has a record. An
+    older default-branch head no slot is running is dropped: the newest
+    serves every pull request based on it or later. Whether it was
+    queued."""
+    sha, tree = head
+    if sha in state["results"] or sha in state["waiting"] or \
+            os.path.exists(os.path.join(trace.records_dir(state_dir),
+                                        tree + ".json")):
+        return False
+    for other, entry in list(state["waiting"].items()):
+        if entry.get("main") and other not in busy:
+            del state["waiting"][other]
+    state["waiting"][sha] = {"pr": 0, "since": iso(when), "main": True}
+    return True
 
 
 def just_started(entry, when):
@@ -529,7 +623,11 @@ def next_head(state, busy=(), first_pr=None, when=None):
     `first_pr` is the pull request the Merger is waiting on, or None.
     A head of it that could be picked goes before every other. It only
     orders: when none of its heads can be picked, the rest are picked
-    as if it were None (see the module docstring)."""
+    as if it were None (see the module docstring).
+
+    A default-branch head (checks.depends, pr 0) goes after every pull
+    request's, except the newest, which goes first of all once it has
+    waited DEPENDS_WAIT."""
     waiting = state["waiting"]
 
     def order(sha):
@@ -540,8 +638,19 @@ def next_head(state, busy=(), first_pr=None, when=None):
             and not just_started(w, when)]
     if not live:
         return None
-    mine = [s for s in live if waiting[s]["pr"] == first_pr]
-    sha = min(mine or live, key=order)
+    mains = [s for s in live if waiting[s].get("main")]
+    heads = [s for s in live if not waiting[s].get("main")]
+    if mains:
+        newest = max(mains, key=lambda s: (waiting[s]["since"], s))
+        try:
+            due = when is not None and \
+                when - parse(waiting[newest]["since"]) >= DEPENDS_WAIT
+        except (TypeError, ValueError):
+            due = True
+        if due or not heads:
+            return newest, 0
+    mine = [s for s in heads if waiting[s]["pr"] == first_pr]
+    sha = min(mine or heads, key=order)
     return sha, waiting[sha]["pr"]
 
 
@@ -589,11 +698,16 @@ def merger_ahead(merger_dir, when, repo=None):
         return []
 
 
-def steps_digest(steps=None):
-    """A short digest of the step list, so a verdict stands for another
-    commit's only while the steps that made it are still the ones run."""
+def steps_digest(steps=None, always=None):
+    """A short digest of the step list, so a verdict or a dependency
+    record stands for another commit's only while the steps that made it
+    are still the ones run. The steps marked `always` count too, when
+    there are any, so a list without them digests as it always has."""
     listed = [[name, list(args), only_if]
               for name, args, only_if in (STEPS if steps is None else steps)]
+    always = ALWAYS if always is None else always
+    if always:
+        listed.append(["always", sorted(always)])
     return hashlib.sha256(json.dumps(listed).encode()).hexdigest()[:16]
 
 
@@ -606,11 +720,12 @@ def verdict_age(record, when):
         return None
 
 
-def tested(state, tree, when, ok=None):
+def tested(state, tree, when, ok=None, accept=None):
     """The sha of the newest verdict on `tree` from this host and step
-    list, green only when `ok`, or None. A verdict that finished more
-    than MATCH_MAX_AGE before `when`, or after it, doesn't count: the
-    step digest can't see a toolchain upgrade."""
+    list, green only when `ok`, and only one `accept(record)` takes when
+    given, or None. A verdict that finished more than MATCH_MAX_AGE
+    before `when`, or after it, doesn't count: the step digest can't see
+    a toolchain upgrade."""
     host, steps = socket.gethostname(), steps_digest()
     best = None
     for sha, r in state["results"].items():
@@ -618,6 +733,7 @@ def tested(state, tree, when, ok=None):
         if (tree and r.get("tree") == tree and r.get("host") == host
                 and r.get("steps") == steps
                 and (ok is None or r.get("ok") is ok)
+                and (accept is None or accept(r))
                 and age is not None
                 and datetime.timedelta(0) <= age <= MATCH_MAX_AGE
                 and (best is None or r["finished"] > best[1]["finished"])):
@@ -699,15 +815,29 @@ def on_host():
 def final_status(r):
     """(state, description) for a verdict, naming the first failed step:
     where its author starts reading, or for a matched one where its
-    tree was tested."""
+    tree was tested. With checks.depends, it says how many steps ran
+    and what made each run, or why every step ran."""
+    selection = r.get("selection") or {}
+    ran, skipped = selection.get("ran", {}), selection.get("skipped", [])
     if r["ok"] and r.get("matched"):
         return "success", "green%s: tree tested as %s (%s)" % (
             on_host(), r["matched"][:10], r.get("matched_as", "another head"))
+    if r["ok"] and skipped:
+        why = "; ".join("%s: %s" % (n, w) for n, w in ran.items()) \
+            or "nothing reads what changed"
+        return "success", "green%s: %d of %d steps (%s)" % (
+            on_host(), len(ran), len(ran) + len(skipped), why)
+    if r["ok"] and selection.get("every"):
+        return "success", "green%s in %ds (every step: %s)" % (
+            on_host(), r["seconds"], selection["every"])
     if r["ok"]:
         return "success", "green%s in %ds" % (on_host(), r["seconds"])
     failed = r["failed"]
     rest = " (then %s)" % ", ".join(failed[1:]) if failed[1:] else ""
-    return "failure", "red%s: %s failed%s" % (on_host(), failed[0], rest)
+    of = " (%d of %d steps)" % (len(ran), len(ran) + len(skipped)) \
+        if skipped else ""
+    return "failure", "red%s: %s failed%s%s" % (on_host(), failed[0], rest,
+                                               of)
 
 
 # What a failed step's output says when the host, not the head, broke.
@@ -764,20 +894,23 @@ def repost(state, heads, post, out=print):
 
 
 def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
-                 ahead=False):
+                 ahead=False, main=False):
     """Start the check detached; see the module docstring on the cron
     lock. Its output goes to worker.log. A prediction (`ahead`) posts
-    nothing, but a posting one still chains the next tick."""
+    nothing, but a posting one still chains the next tick. `main` is a
+    default-branch head's traced full run (checks.depends)."""
     wlog = open(os.path.join(state_dir, "worker.log"), "a")
-    wlog.write("=== %s worker #%d %s slot %d%s ===\n"
-               % (iso(now_utc()), pr, sha, slot, " ahead" if ahead else ""))
+    wlog.write("=== %s worker %s %s slot %d%s ===\n"
+               % (iso(now_utc()), who(pr, main), sha, slot,
+                  " ahead" if ahead else ""))
     wlog.flush()
     subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--worker", sha,
          "--pr", str(pr), "--state-dir", state_dir, "--slot", str(slot)]
         + (["--checkout", checkout] if checkout else [])
         + (["--post"] if posting else [])
-        + (["--ahead"] if ahead else []),
+        + (["--ahead"] if ahead else [])
+        + (["--main"] if main else []),
         cwd=state_dir, stdin=subprocess.DEVNULL, stdout=wlog,
         stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
     wlog.close()
@@ -795,18 +928,23 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     if heads is None:
         out("NO-PULLS: could not list %s's open pull requests" % REPO_SLUG)
         return 2
+    slots = slots or slots_from_env()
+    holders = {slot: running(state_dir, slot) for slot in range(1, slots + 1)}
+    fields = {slot: holder_fields(h) for slot, h in holders.items()}
+    busy = {f[1] for f in fields.values() if f}
+    head_of_main = main_head(checkout, run) if DEPENDS and checkout else None
     with state_lock(state_dir):
         state = load(state_dir)
         note_heads(state, heads, when, state_dir, out, post)
+        if head_of_main and queue_main(state, head_of_main, when, state_dir,
+                                       busy):
+            out("QUEUED %s %s: a traced run of every step"
+                % (MAIN, head_of_main[0][:10]))
         if post is not None:
             repost(state, heads, post, out)
         prune(state, when)
         save(state_dir, state)
         queued = set(state["waiting"])
-    slots = slots or slots_from_env()
-    holders = {slot: running(state_dir, slot) for slot in range(1, slots + 1)}
-    fields = {slot: holder_fields(h) for slot, h in holders.items()}
-    busy = {f[1] for f in fields.values() if f}
     current = {sha for _, sha, _, _ in heads}
     for slot, holder in holders.items():
         if holder is None:
@@ -868,6 +1006,13 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 % (len(queued), MAX_ERRORS))
         return 0
     sha, pr = pick
+    if pr == 0:
+        spawn(state_dir, sha, pr, post is not None, free[0], checkout,
+              main=True)
+        out("STARTED %s %s%s, every step traced; %d waiting"
+            % (MAIN, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
+               len(queued - busy) - 1))
+        return 0
     if checkout:
         spawn(state_dir, sha, pr, post is not None, free[0], checkout)
     else:
@@ -976,6 +1121,9 @@ def matched(state_dir, sha, pr, same, tree, started, post, out=print):
                            if source.get("ahead")
                            else "#%s's head" % source.get("pr")),
         }
+        if source.get("selection"):
+            # A match is as narrow as the run it stands in for.
+            record["selection"] = source["selection"]
         state["results"][sha] = record
         save(state_dir, state)
     log(state_dir, "MATCHED #%d %s: its tree tested green as %s %s; not run "
@@ -1040,21 +1188,164 @@ def tail(text, lines=TAIL_LINES):
     return "\n".join(text.rstrip("\n").splitlines()[-lines:])
 
 
-def check(wt, env, run=sh, steps=None, prefix=()):
+def applicable(wt, steps=None):
+    """The steps that apply to the head: those whose `only_if` it has."""
+    return [(name, args, only_if)
+            for name, args, only_if in (STEPS if steps is None else steps)
+            if not only_if or os.path.exists(os.path.join(wt, only_if))]
+
+
+def check(wt, env, run=sh, steps=None, prefix=(), wrap=None):
     """Every step that applies to the head, each run even if an earlier
     one failed, and none retried, each after `prefix` (memory_cap).
+    `wrap(name, prefix, argv, env)` gives a traced step's (argv, env).
     Returns (ok, results)."""
     results = []
-    for name, args, only_if in STEPS if steps is None else steps:
-        if only_if and not os.path.exists(os.path.join(wt, only_if)):
-            continue
+    for name, args, only_if in applicable(wt, steps):
+        step_args, step_env_ = list(prefix) + args, env
+        if wrap is not None:
+            step_args, step_env_ = wrap(name, list(prefix), args, env)
         started = time.monotonic()
-        got = run(list(prefix) + args, cwd=wt, env=env,
+        got = run(step_args, cwd=wt, env=step_env_,
                   timeout=STEP_TIMEOUT_S)
         results.append({"name": name, "rc": got.returncode,
                         "seconds": int(time.monotonic() - started),
                         "tail": tail((got.stdout or "") + (got.stderr or ""))})
     return all(r["rc"] == 0 for r in results), results
+
+
+def choose(wt, sha, state_dir, run=sh):
+    """The steps head `sha` needs, from the newest dependency record
+    that answers for its merge base (checks.depends): {"base", "record"
+    (the recorded commit), "depends" (the record's path), "ran" ({step:
+    why}), "skipped": [steps]}, or {"every": why} when every step must
+    run (see the module docstring)."""
+    names = [name for name, _, _ in applicable(wt)]
+    ref = "refs/remotes/origin/" + MAIN
+    got = run(["git", "-C", wt, "merge-base", sha, ref])
+    base = (got.stdout or "").strip()
+    if got.returncode != 0 or len(base) != 40:
+        return {"every": "no merge base with %s" % MAIN}
+    digest = steps_digest()
+    records = [(path, r) for path, r in trace.load_records(state_dir)
+               if r.get("steps") == digest]
+    if not records:
+        return {"every": "no dependency record for these steps"}
+    tree = tree_of(wt, base, run)
+    chosen = next(((path, r) for path, r in records
+                   if tree and r.get("tree") == tree), None)
+    if chosen is None:
+        for path, r in records:
+            if run(["git", "-C", wt, "merge-base", "--is-ancestor",
+                    r["commit"], base]).returncode == 0:
+                chosen = (path, r)
+                break
+    if chosen is None:
+        return {"every": "no dependency record for %s or before it"
+                % base[:10]}
+    path, record = chosen
+    changed, touched = set(), set()
+    pairs = [(base, sha)]
+    if record.get("tree") != tree:
+        # What changed between the record and the base counts too.
+        pairs.append((record["commit"], base))
+    for old, new in pairs:
+        got = run(["git", "-C", wt, "diff", "--name-status", "--no-renames",
+                   old, new])
+        if got.returncode != 0:
+            return {"every": "could not list what changed since %s"
+                    % old[:10]}
+        more, added = trace.changes(got.stdout)
+        changed |= more
+        touched |= added
+    ran, skipped = trace.select(names, ALWAYS, record, changed, touched)
+    return {"base": base, "record": record["commit"], "depends": path,
+            "ran": ran, "skipped": skipped}
+
+
+def covers(selection):
+    """accept(record) for `tested`: whether an earlier verdict ran every
+    step this head would, under the same base. A verdict that ran every
+    step covers any head; a narrower one only a head that needs no more
+    of them, compared with the same base."""
+    def accept(record):
+        earlier = record.get("selection") or {}
+        if "ran" not in earlier:
+            return True
+        if "ran" not in (selection or {}):
+            return False
+        return earlier.get("base") == selection["base"] \
+            and set(selection["ran"]) <= set(earlier["ran"])
+    return accept
+
+
+def tracer_for(state_dir, run=sh):
+    """("preload", library) or ("strace", None) for checks.tracer, or
+    None when it can't be used: no strace, or no library built."""
+    if TRACER == "strace":
+        return ("strace", None) if trace.have_strace() else None
+    lib = trace.build(os.path.join(state_dir, "tracer"), run)
+    return ("preload", lib) if lib else None
+
+
+def trace_wrapper(state_dir, slot, tracer, files):
+    """wrap() for `check`: each step traced into its own file, noted in
+    `files` ({step: path})."""
+    kind, lib = tracer
+    folder = trace.records_dir(state_dir)
+    os.makedirs(folder, exist_ok=True)
+
+    def wrap(name, prefix, args, env):
+        path = os.path.join(folder, ".trace-%d-%d" % (slot, len(files)))
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        files[name] = path
+        if kind == "strace":
+            return prefix + trace.strace_prefix(path) + args, env
+        return prefix + args, trace.preload_env(env, lib, path)
+    return wrap
+
+
+def record_depends(state_dir, wt, sha, tree, files, env, tracer, when,
+                   out=print):
+    """Writes the dependency record of a green traced run, or says why
+    not: a step whose trace is implausible (it recorded nothing, not
+    even its own program) makes the record unusable. Returns its path,
+    or None. The trace files are removed either way."""
+    kind, _ = tracer
+    programs = {name: args[0] for name, args, _ in applicable(wt)}
+    inside = [os.path.relpath(env[v], wt) for v in CACHES if v in env
+              and os.path.abspath(env[v]).startswith(
+                  os.path.abspath(wt) + os.sep)]
+    reads, dirs, implausible = {}, {}, []
+    for name, path in files.items():
+        entries = trace.read_strace(path, wt) if kind == "strace" \
+            else trace.read_preload(path)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        if not trace.plausible(entries, programs.get(name, ""),
+                               env.get("PATH")):
+            implausible.append(name)
+            continue
+        reads[name] = trace.relative(entries, wt, inside)
+        dirs[name] = trace.directories(reads[name], wt)
+    if implausible:
+        log(state_dir, "DEPENDS-UNUSABLE %s %s: %s recorded nothing, not "
+            "even its own program; nothing recorded"
+            % (MAIN, sha[:10], ", ".join(implausible)), when, out)
+        return None
+    if not tree:
+        return None
+    path = trace.write_record(state_dir, tree, sha, steps_digest(),
+                              iso(when), kind, reads, dirs)
+    trace.prune_records(state_dir, when, parse)
+    out("  recorded what %d steps read: %s"
+        % (len(reads), os.path.basename(path)))
+    return path
 
 
 def start_next_tick(popen=None, checkout=None):
@@ -1073,18 +1364,26 @@ def start_next_tick(popen=None, checkout=None):
 
 
 def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
-           post=None, chain=None, slot=1, memory_max=None, ahead=False):
+           post=None, chain=None, slot=1, memory_max=None, ahead=False,
+           main=False):
     """Check sha, pull request pr's head, now, in this process, in
     `slot`, each step limited to memory_max (None: no limit). With
     `ahead`, sha is the Merger's prediction for pr: checked out without
     a fetch, recorded with `ahead`, and posted nowhere. With TEST_AHEAD,
-    a head whose tree is green here already is posted green unrun."""
+    a head whose tree is green here already is posted green unrun.
+
+    With `main`, sha is the default branch's head (checks.depends): run
+    in full under the tracer, logged MAIN-GREEN or MAIN-RED, posted on
+    that commit, and when green its dependency record written. With
+    DEPENDS, a pull request's head runs only the steps that read what
+    it changes."""
     os.makedirs(state_dir, exist_ok=True)
     started = clock()
     held = try_lock(lock_path(state_dir, slot),
                     "#%d %s %s pid=%d%s" % (pr, sha, iso(started),
                                             os.getpid(),
-                                            " ahead" if ahead else ""))
+                                            " ahead" if ahead else
+                                            " main" if main else ""))
     if held is None:
         out("BUSY: another check holds the worker lock"
             + ("" if slot == 1 else " for slot %d" % slot))
@@ -1100,8 +1399,9 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     if ahead:
         # A prediction is no pull request's head: it gets no status.
         post = None
+    name = who(pr, main)
     try:
-        if ahead:
+        if ahead or main:
             status, detail = prepare_ahead(repo, wt, sha, run)
         else:
             status, detail = prepare(repo, wt, sha, pr, run)
@@ -1117,21 +1417,31 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         if status != "ready":
             errors = count_error(state_dir, sha, ahead)
             if errors >= MAX_ERRORS:
-                log(state_dir, "GAVE-UP%s #%d %s after %d failures to "
+                log(state_dir, "GAVE-UP%s %s %s after %d failures to "
                     "prepare it; the last: %s"
-                    % (" AHEAD" if ahead else "", pr, sha[:10], errors,
+                    % (" AHEAD" if ahead else "", name, sha[:10], errors,
                        detail), started, out)
                 if post is not None:
                     post(sha, "error", "not run: could not check the head "
                          "out %d times; the last: %s" % (errors, detail))
                 settled = True
             else:
-                out("NO-WORKTREE #%d %s: %s" % (pr, sha[:10], detail))
+                out("NO-WORKTREE %s %s: %s" % (name, sha[:10], detail))
             return 2
-        tree = tree_of(wt, sha, run) if TEST_AHEAD else None
-        if tree and not ahead:
+        selection = choose(wt, sha, state_dir, run) \
+            if DEPENDS and not main else None
+        if selection is not None:
+            out("  every step: %s" % selection["every"]
+                if "every" in selection else
+                "  %d of %d steps, from the record of %s"
+                % (len(selection["ran"]),
+                   len(selection["ran"]) + len(selection["skipped"]),
+                   selection["record"][:10]))
+        tree = tree_of(wt, sha, run) if TEST_AHEAD or main else None
+        if tree and not ahead and not main:
             with state_lock(state_dir):
-                same = tested(load(state_dir), tree, started, ok=True)
+                same = tested(load(state_dir), tree, started, ok=True,
+                              accept=covers(selection))
             if same is not None and same != sha:
                 settled = True
                 return matched(state_dir, sha, pr, same, tree, started,
@@ -1140,8 +1450,22 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             post(sha, "pending", "running%s since %s" % (on_host(),
                                                         iso(started)))
         env = step_env(state_dir, slot=slot)
-        ok, results = check(wt, env, run,
-                            prefix=memory_cap(memory_max, env, run, out))
+        steps, wrap, tracer, files = None, None, None, {}
+        if selection is not None and "ran" in selection:
+            env = dict(env, CHECK_BASE=selection["base"],
+                       CHECK_DEPENDS=selection["depends"])
+            steps = [s for s in applicable(wt) if s[0] in selection["ran"]]
+        if main:
+            tracer = tracer_for(state_dir, run)
+            if tracer is None:
+                log(state_dir, "NO-TRACE %s %s: the %s tracer can't be used "
+                    "here; every step runs untraced and nothing is recorded"
+                    % (MAIN, sha[:10], TRACER), started, out)
+            else:
+                wrap = trace_wrapper(state_dir, slot, tracer, files)
+        ok, results = check(wt, env, run, steps=steps,
+                            prefix=memory_cap(memory_max, env, run, out),
+                            wrap=wrap)
         for r in results:
             out("  %-20s rc=%-3d %4ds" % (r["name"], r["rc"], r["seconds"]))
             if r["rc"] != 0:
@@ -1152,17 +1476,22 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         if fault is not None:
             errors = count_error(state_dir, sha, ahead, "faults")
             why = "%s: %s" % fault
+            for path in files.values():
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
             if errors >= MAX_ERRORS:
-                log(state_dir, "GAVE-UP%s #%d %s after %d host faults; the "
-                    "last: %s" % (" AHEAD" if ahead else "", pr, sha[:10],
+                log(state_dir, "GAVE-UP%s %s %s after %d host faults; the "
+                    "last: %s" % (" AHEAD" if ahead else "", name, sha[:10],
                                   errors, why), finished, out)
                 if post is not None:
                     post(sha, "error", "not run: the host failed %d times; "
                          "the last: %s" % (errors, why))
                 settled = True
             else:
-                log(state_dir, "HOST-FAULT%s #%d %s: %s; no verdict, tried "
-                    "again later" % (" AHEAD" if ahead else "", pr, sha[:10],
+                log(state_dir, "HOST-FAULT%s %s %s: %s; no verdict, tried "
+                    "again later" % (" AHEAD" if ahead else "", name, sha[:10],
                                      why), finished, out)
             return 2
         with state_lock(state_dir):
@@ -1180,14 +1509,36 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                               steps=steps_digest())
             if ahead:
                 record["ahead"] = True
+            if main:
+                record["main"] = True
+            if selection is not None:
+                record["selection"] = selection
             flaked = flakes_of(state, sha, record)
             state["results"][sha] = record
             save(state_dir, state)
         settled = True
-        log(state_dir, "VERDICT%s #%d %s: %s waited=%ds ran=%ds"
-            % (" AHEAD" if ahead else "", pr, sha[:10], verdict_word(record),
-               (started - parse(seen)).total_seconds(), record["seconds"]),
-            finished, out)
+        if main:
+            log(state_dir, "%s %s %s: %s waited=%ds ran=%ds"
+                % ("MAIN-GREEN" if ok else "MAIN-RED", MAIN, sha[:10],
+                   verdict_word(record),
+                   (started - parse(seen)).total_seconds(),
+                   record["seconds"]), finished, out)
+            if ok and tracer is not None:
+                record_depends(state_dir, wt, sha, tree, files, env, tracer,
+                               finished, out)
+            else:
+                # A red run records nothing: the last green record stays.
+                for path in files.values():
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+        else:
+            log(state_dir, "VERDICT%s %s %s: %s waited=%ds ran=%ds"
+                % (" AHEAD" if ahead else "", name, sha[:10],
+                   verdict_word(record),
+                   (started - parse(seen)).total_seconds(),
+                   record["seconds"]), finished, out)
         for other in flaked:
             red = state["results"].get(other) or {}
             log(state_dir, "FLAKE tree %s: red(%s) on #%s %s, then green on "
@@ -1208,8 +1559,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             state["waiting"].pop(sha, None)
             save(state_dir, state)
         stopped = clock()
-        log(state_dir, "STOPPED #%d %s after %ds: superseded; no verdict"
-            % (pr, sha[:10], (stopped - started).total_seconds()),
+        log(state_dir, "STOPPED %s %s after %ds: superseded; no verdict"
+            % (name, sha[:10], (stopped - started).total_seconds()),
             stopped, out)
         settled = True
         return 3
@@ -1245,6 +1596,10 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
                         help="with --worker: SHA is the Merger's predicted "
                         "commit for pull request --pr, checked and recorded "
                         "but never posted (merge.test_ahead)")
+    parser.add_argument("--main", action="store_true",
+                        help="with --worker: SHA is the default branch's "
+                        "head, run in full under the tracer and its "
+                        "dependency record written (checks.depends)")
     parser.add_argument("--state-dir", default=None,
                         help="where the queue, the verdicts and the logs "
                         "live (default ~/.local/state/agent-forge/"
@@ -1259,6 +1614,8 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
         "FORGE_CRON_CHECKOUT"), help="the checkout kept at the default "
         "branch (default $FORGE_CRON_CHECKOUT)")
     args = parser.parse_args(argv)
+    if args.worker and args.main and args.pr is None:
+        args.pr = 0
     if args.worker and args.pr is None:
         parser.error("--worker needs --pr")
     if not args.checkout:
@@ -1285,7 +1642,7 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
         return worker(repo, state_dir, args.worker, args.pr, run, out,
                       post=post, chain=chain, slot=args.slot,
                       memory_max=memory_max_from_env(environ),
-                      ahead=args.ahead)
+                      ahead=args.ahead, main=args.main)
     token = mint(run)
     if token is None:
         out("NO-TOKEN: could not mint %s's token" % POSTER)

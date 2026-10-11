@@ -4,6 +4,8 @@
   <https://github.com/abligh/agent-forge/issues/5#issuecomment-6106223095>),
   on condition that programs run under a fork or an `exec` keep the
   tracer
+* Implemented: steps 1 and 2 (forge-pr-check, lib/forge-trace.c,
+  agent_forge/trace.py), off until configured
 * Author: XMPPEngineer
 * Date: 2026-10-11
 
