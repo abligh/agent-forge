@@ -275,6 +275,32 @@ class NextHead(unittest.TestCase):
         state["waiting"][SHA_A]["errors"] = pc.MAX_ERRORS
         self.assertIsNone(pc.next_head(state))
 
+    def test_a_new_head_keeps_the_place_of_the_one_it_replaces(self):
+        # Every push sent a pull request to the back of the queue, so
+        # one that was updated while it waited never reached a slot.
+        state = {"waiting": {
+            SHA_A: {"pr": 1, "since": "2026-10-09T09:00:00Z", "errors": 1},
+            SHA_B: {"pr": 2, "since": "2026-10-09T10:00:00Z"}},
+            "results": {}, "refused": {}}
+        when = pc.parse("2026-10-09T11:00:00Z")
+        pc.note_heads(state, [(1, SHA_C, pc.REPO_SLUG, False),
+                              (2, SHA_B, pc.REPO_SLUG, False)],
+                      when, tempfile.mkdtemp(), out=lambda *a: None)
+        self.assertNotIn(SHA_A, state["waiting"])
+        self.assertEqual(state["waiting"][SHA_C],
+                         {"pr": 1, "since": "2026-10-09T09:00:00Z"})
+        self.assertEqual(pc.next_head(state), (SHA_C, 1))
+
+    def test_a_head_after_a_verdict_waits_from_when_it_came(self):
+        # Nothing of the pull request was waiting: it starts afresh.
+        state = {"waiting": {}, "results": {SHA_A: {"pr": 1}},
+                 "refused": {}}
+        when = pc.parse("2026-10-09T11:00:00Z")
+        pc.note_heads(state, [(1, SHA_C, pc.REPO_SLUG, False)],
+                      when, tempfile.mkdtemp(), out=lambda *a: None)
+        self.assertEqual(state["waiting"][SHA_C]["since"],
+                         "2026-10-09T11:00:00Z")
+
     def test_a_head_the_host_failed_keeps_its_place(self):
         # A run killed by a full disk was not the pull request's fault:
         # it sat behind 14 later heads for half an hour.
@@ -899,6 +925,14 @@ class MemoryCap(unittest.TestCase):
         for off in ("off", "OFF", ""):
             self.assertIsNone(pc.memory_max_from_env(
                 {"FORGE_PR_CHECK_MEMORY_MAX": off}))
+
+    def test_the_scope_gets_the_cpu_first(self):
+        # Agents building on the same host must not starve the check
+        # every merge waits on.
+        self.assertIn("CPUWeight=1000", pc.scope_prefix("16G"))
+        self.assertIn("CPUWeight=50", pc.scope_prefix("16G", 50))
+        self.assertFalse([w for w in pc.scope_prefix("16G", 0)
+                          if w.startswith("CPUWeight")])
 
     def test_the_scope_kills_only_what_ran_out_and_never_swaps(self):
         prefix = pc.scope_prefix("16G")
