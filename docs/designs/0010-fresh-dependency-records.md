@@ -1,6 +1,7 @@
 # 0010: Fresh dependency records
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-11, at 2c73757,
+  <https://github.com/abligh/agent-forge/issues/14#issuecomment-6111010104>)
 * Author: XMPPEngineer
 * Date: 2026-10-11
 
