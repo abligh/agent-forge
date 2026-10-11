@@ -128,6 +128,31 @@ steps take more than three times `max_seconds` is not stopped, but
 logged as `SLOW-LANE` with each step's time. What is posted is the same
 as for any run.
 
+### Checking the merge with the default branch
+
+With `merge_default`, the worker merges a pull request's head with the
+default branch's tip, as the cron checkout last fetched it, and runs
+the steps on that merge. So the steps, which come from the default
+branch, and the files they run on are of one snapshot: a change to the
+steps can't break heads based before it. The merge is a local commit,
+never pushed, with both as parents and a fixed identity and date, so
+the same inputs give the same commit. A head that already contains the
+tip is checked as itself.
+
+The verdict is the head's, posted on the head as without it, and also
+records the tip (`base`) and the merge (`merged`). Its `tree` is the
+merge's, so with `merge.test_ahead` the head the Merger's update makes
+is posted green unrun, while the tip hasn't moved. With `depends`, the
+steps are chosen against the tip, which is `CHECK_BASE`. The
+description says `with <branch> at <sha>`, and `(itself red here)`
+when it is red and the tip's own run here was red too.
+
+A head that conflicts with the tip runs nothing. It is recorded red
+(`failed` is `merge`, `conflicts` the paths) and posted as `conflicts
+with <branch> at <sha>`, with the first few paths; its author must
+merge the default branch either way. The Merger's predictions and the
+default branch's own heads are checked as they are.
+
 ### `merge.stall_alert`
 
 Without it, a stalled queue is a `STALLED` line in the Merger's log and
@@ -363,6 +388,7 @@ reasons.
 | `tracer` | `preload` | How `depends` traces: `preload`, an `LD_PRELOAD` library built from lib/forge-trace.c with the host's C compiler (no root, cheap, blind to statically linked programs), or `strace` (everything, slower; needs strace installed). |
 | `fast_lane` | none | `{"max_seconds": 60}`: one more slot, for heads whose chosen steps are cheap (designs/0006; see below). Refused without `depends`. |
 | `fast_lane.max_seconds` | `60` | The most a head's chosen steps may together have taken here for it to be cheap. At least 1. |
+| `merge_default` | `false` | Check a pull request's head merged with the default branch's tip, the tree GitHub's update makes, instead of the head alone (designs/0007; see below). |
 
 Only these keys are checked; the section may hold others, for tools
 not here yet.

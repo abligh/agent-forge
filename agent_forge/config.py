@@ -72,7 +72,8 @@ STALL_ALERT = {"tell": list, "retell_minutes": int,
 CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "slots": int, "memory_max": str, "step_timeout_minutes": int,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
-          "tracer": str, "cpu_weight": int, "fast_lane": dict}
+          "tracer": str, "cpu_weight": int, "fast_lane": dict,
+          "merge_default": bool}
 # checks.fast_lane: a slot for heads whose chosen steps are cheap.
 FAST_LANE = {"max_seconds": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool}

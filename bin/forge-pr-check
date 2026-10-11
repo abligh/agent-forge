@@ -204,6 +204,25 @@ steps take over SLOW_LANE times `max_seconds` is not stopped, but
 logged `SLOW-LANE` with each step's time. `worker.log` names the lane
 (`=== ... fast lane ===`); what is posted is the same.
 
+**With `checks.merge_default`, a pull request's head is checked merged
+with the default branch's tip** (designs/0007; default off), the tip
+as the cron checkout last fetched it. Unless the head already contains
+the tip, the worker commits `git merge-tree --write-tree` of the two,
+with both as parents and a fixed identity and date (`merge_default`),
+checks that out, and runs the steps there: so the steps and the tree
+they run on are of one snapshot, and the tree is the one GitHub's
+`update-branch` makes. The verdict is still the head's and posted on
+it; it records the tip as `base` and the merge as `merged`, and its
+`tree` is the merge's, so with `test_ahead` the Merger's update of the
+head is matched to it, unrun, while the tip hasn't moved. With
+`depends`, the steps are chosen from the tip, which is `CHECK_BASE`.
+The description says `with <branch> at <sha>`, and `(itself red
+here)` on a red verdict when the tip's own run here was red. A head
+that conflicts with the tip runs nothing: it is recorded red
+(`failed` is `merge`, `conflicts` the paths) and posted `conflicts
+with <branch> at <sha>`, naming the first few paths. Predictions and
+the default branch's own heads are checked as they are.
+
 **A head from another repository is refused.** The steps run the pull
 request's own code with this user's access to the host, so only
 branches of this repository are run.
@@ -378,6 +397,12 @@ LANE = 0
 # A run in the lane longer than this many times FAST_LANE_S is logged
 # SLOW-LANE, and not stopped.
 SLOW_LANE = 3
+# checks.merge_default (designs/0007): a pull request's head is checked
+# merged with the default branch's tip. The merge is a local commit
+# with a fixed identity and date, so the same inputs give the same SHA.
+MERGE_DEFAULT = False
+MERGE_DATE = "2000-01-01T00:00:00Z"
+MERGE_IDENTITY = ("forge-pr-check", "pr-check@agent-forge.invalid")
 
 
 def configure(project):
@@ -385,7 +410,8 @@ def configure(project):
     its repository and default branch, and the `checks` section
     (`context`, `poster`, `steps`, `caches`, `slots`, `memory_max`,
     `step_timeout_minutes`, `merger_first`, `depends`,
-    `depends_minutes`, `tracer`, `fast_lane`, each step's `always`),
+    `depends_minutes`, `tracer`, `fast_lane`, `merge_default`, each
+    step's `always`),
     each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
     implies `merger_first`."""
@@ -393,7 +419,7 @@ def configure(project):
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
     global CPU_WEIGHT
     global TEST_AHEAD, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
-    global FAST_LANE_S
+    global FAST_LANE_S, MERGE_DEFAULT
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -412,6 +438,7 @@ def configure(project):
     # The configuration refuses fast_lane without depends.
     FAST_LANE_S = checks["fast_lane"].get("max_seconds", DEFAULT_FAST_LANE_S) \
         if "fast_lane" in checks else None
+    MERGE_DEFAULT = checks.get("merge_default", False)
     CACHES = dict(checks.get("caches", {}))
     SLOTS = checks.get("slots", DEFAULT_SLOTS)
     MEMORY_MAX = checks.get("memory_max", DEFAULT_MEMORY_MAX)
@@ -914,27 +941,51 @@ def final_status(r):
     """(state, description) for a verdict, naming the first failed step:
     where its author starts reading, or for a matched one where its
     tree was tested. With checks.depends, it says how many steps ran
-    and what made each run, or why every step ran."""
+    and what made each run, or why every step ran. With
+    checks.merge_default, it names the tip the head was merged with, or
+    the paths that conflict with it."""
     selection = r.get("selection") or {}
     ran, skipped = selection.get("ran", {}), selection.get("skipped", [])
+    if r.get("conflicts") is not None:
+        paths = r["conflicts"]
+        return "failure", "red%s: conflicts with %s at %s%s" % (
+            on_host(), MAIN, r["base"][:10],
+            ": " + ", ".join(paths[:CONFLICTS_SHOWN])
+            + (" and %d more" % (len(paths) - CONFLICTS_SHOWN)
+               if len(paths) > CONFLICTS_SHOWN else "") if paths else "")
+    # checks.merge_default: what the head was merged with, and whether
+    # that tip was red here itself, early, since GitHub cuts the end.
+    where = on_host()
+    if r.get("base") and not r.get("matched"):
+        where += " with %s at %s" % (MAIN, r["base"][:10])
+        if not r["ok"] and r.get("base_red"):
+            where += " (itself red here)"
+    return _final_status(r, selection, ran, skipped, where)
+
+
+# How many conflicting paths a description names.
+CONFLICTS_SHOWN = 3
+
+
+def _final_status(r, selection, ran, skipped, where):
     if r["ok"] and r.get("matched"):
         return "success", "green%s: tree tested as %s (%s)" % (
-            on_host(), r["matched"][:10], r.get("matched_as", "another head"))
+            where, r["matched"][:10], r.get("matched_as", "another head"))
     if r["ok"] and skipped:
         why = "; ".join("%s: %s" % (n, w) for n, w in ran.items()) \
             or "nothing reads what changed"
         return "success", "green%s: %d of %d steps (%s)" % (
-            on_host(), len(ran), len(ran) + len(skipped), why)
+            where, len(ran), len(ran) + len(skipped), why)
     if r["ok"] and selection.get("every"):
         return "success", "green%s in %ds (every step: %s)" % (
-            on_host(), r["seconds"], selection["every"])
+            where, r["seconds"], selection["every"])
     if r["ok"]:
-        return "success", "green%s in %ds" % (on_host(), r["seconds"])
+        return "success", "green%s in %ds" % (where, r["seconds"])
     failed = r["failed"]
     rest = " (then %s)" % ", ".join(failed[1:]) if failed[1:] else ""
     of = " (%d of %d steps)" % (len(ran), len(ran) + len(skipped)) \
         if skipped else ""
-    return "failure", "red%s: %s failed%s%s" % (on_host(), failed[0], rest,
+    return "failure", "red%s: %s failed%s%s" % (where, failed[0], rest,
                                                of)
 
 
@@ -1205,6 +1256,81 @@ def prepare_ahead(repo, wt, sha, run=sh):
             return "error", "%s: %s" % (" ".join(args[3:5]),
                                         got.stderr.strip())
     return "ready", ""
+
+
+def merge_default(wt, sha, pr, run=sh):
+    """checks.merge_default (designs/0007): check pull request pr's head
+    sha, already checked out at wt, out merged with the default
+    branch's tip, as the checkout wt shares refs with last fetched it.
+    The merge is `git merge-tree --write-tree` of the tip and the head,
+    committed with both as parents and a fixed identity and date: the
+    tree GitHub's `update-branch` makes, as the Merger predicts it.
+
+    Returns {"base": tip, "commit": what is now checked out}, which is
+    sha itself when it already contains the tip; {"base": tip,
+    "conflicts": [paths]} when the merge conflicts; or {"error": why}."""
+    ref = "refs/remotes/origin/" + MAIN
+    got = run(["git", "-C", wt, "rev-parse", "--verify", "-q",
+               ref + "^{commit}"])
+    tip = (got.stdout or "").strip()
+    if got.returncode != 0 or len(tip) != 40:
+        return {"error": "no %s to merge with" % ref}
+    if run(["git", "-C", wt, "merge-base", "--is-ancestor", tip,
+            sha]).returncode == 0:
+        return {"base": tip, "commit": sha}
+    got = run(["git", "-C", wt, "merge-tree", "--write-tree", "--name-only",
+               "--no-messages", tip, sha])
+    lines = [line for line in (got.stdout or "").splitlines() if line]
+    if got.returncode == 1 and lines:
+        return {"base": tip, "conflicts": lines[1:]}
+    if got.returncode != 0 or not lines:
+        return {"error": "merge-tree with %s: %s"
+                % (MAIN, (got.stderr or "").strip())}
+    name, email = MERGE_IDENTITY
+    env = dict(os.environ, GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
+               GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email,
+               GIT_AUTHOR_DATE=MERGE_DATE, GIT_COMMITTER_DATE=MERGE_DATE)
+    made = run(["git", "-C", wt, "commit-tree", "--no-gpg-sign", lines[0],
+                "-p", tip, "-p", sha, "-m",
+                "forge-pr-check: #%d merged with %s" % (pr, MAIN)], env=env)
+    commit = (made.stdout or "").strip()
+    if made.returncode != 0 or len(commit) != 40:
+        return {"error": "commit-tree: %s" % (made.stderr or "").strip()}
+    got = run(["git", "-C", wt, "checkout", "-q", "--detach", "--force",
+               commit])
+    if got.returncode != 0:
+        return {"error": "checkout the merge: %s" % got.stderr.strip()}
+    return {"base": tip, "commit": commit}
+
+
+def conflicted(state_dir, sha, pr, merge, started, finished, post,
+               out=print):
+    """Record and post pull request pr's head sha red, with no step
+    run, because it conflicts with the default branch's tip (`merge`,
+    from `merge_default`). Its author must merge the default branch
+    either way."""
+    with state_lock(state_dir):
+        state = load(state_dir)
+        seen = state["waiting"].pop(sha, {}).get("since", iso(started))
+        record = {
+            "pr": pr, "seen": seen, "started": iso(started),
+            "finished": iso(finished), "ok": False, "failed": ["merge"],
+            "seconds": 0, "step_seconds": {}, "base": merge["base"],
+            "conflicts": merge["conflicts"],
+        }
+        state["results"][sha] = record
+        save(state_dir, state)
+    log(state_dir, "VERDICT #%d %s: %s conflicts with %s at %s: %s"
+        % (pr, sha[:10], verdict_word(record), MAIN, merge["base"][:10],
+           ", ".join(merge["conflicts"]) or "?"), finished, out)
+    if post is not None:
+        posted = post(sha, *final_status(record))
+        with state_lock(state_dir):
+            state = load(state_dir)
+            if sha in state["results"]:
+                state["results"][sha]["posted"] = posted
+                save(state_dir, state)
+    return 1
 
 
 def tree_of(wt, sha, run=sh):
@@ -1613,7 +1739,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     in full under the tracer, logged MAIN-GREEN or MAIN-RED, posted on
     that commit, and when green its dependency record written. With
     DEPENDS, a pull request's head runs only the steps that read what
-    it changes."""
+    it changes. With MERGE_DEFAULT, a pull request's head is checked
+    merged with the default branch's tip (`merge_default`)."""
     os.makedirs(state_dir, exist_ok=True)
     started = clock()
     held = try_lock(lock_path(state_dir, slot),
@@ -1642,6 +1769,11 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             status, detail = prepare_ahead(repo, wt, sha, run)
         else:
             status, detail = prepare(repo, wt, sha, pr, run)
+        merge = {}
+        if status == "ready" and MERGE_DEFAULT and not (ahead or main):
+            merge = merge_default(wt, sha, pr, run)
+            if "error" in merge:
+                status, detail = "error", merge["error"]
         if status == "moved":
             with state_lock(state_dir):
                 state = load(state_dir)
@@ -1665,7 +1797,17 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             else:
                 out("NO-WORKTREE %s %s: %s" % (name, sha[:10], detail))
             return 2
-        selection = choose(wt, sha, state_dir, run) \
+        if "conflicts" in merge:
+            settled = True
+            return conflicted(state_dir, sha, pr, merge, started, clock(),
+                              post, out)
+        # What is checked out and run: the head, or with MERGE_DEFAULT
+        # its merge with the default branch's tip.
+        checked = merge.get("commit", sha)
+        if checked != sha:
+            out("  merged with %s at %s as %s"
+                % (MAIN, merge["base"][:10], checked[:10]))
+        selection = choose(wt, checked, state_dir, run) \
             if DEPENDS and not main else None
         if selection is not None:
             out("  every step: %s" % selection["every"]
@@ -1674,7 +1816,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 % (len(selection["ran"]),
                    len(selection["ran"]) + len(selection["skipped"]),
                    selection["record"][:10]))
-        tree = tree_of(wt, sha, run) if TEST_AHEAD or main else None
+        tree = tree_of(wt, checked, run) if TEST_AHEAD or main else None
         if tree and not ahead and not main:
             with state_lock(state_dir):
                 same = tested(load(state_dir), tree, started, ok=True,
@@ -1752,6 +1894,13 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 record["main"] = True
             if selection is not None:
                 record["selection"] = selection
+            if merge:
+                record["base"] = merge["base"]
+                if checked != sha:
+                    record["merged"] = checked
+                tip = state["results"].get(merge["base"]) or {}
+                if tip.get("main") and not tip.get("ok"):
+                    record["base_red"] = True
             flaked = flakes_of(state, sha, record)
             state["results"][sha] = record
             save(state_dir, state)
