@@ -72,7 +72,7 @@ STALL_ALERT = {"tell": list, "retell_minutes": int,
 CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "slots": int, "memory_max": str, "step_timeout_minutes": int,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
-          "tracer": str}
+          "tracer": str, "cpu_weight": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool}
 # checks.tracer's values (docs/designs/0005).
 TRACERS = ("preload", "strace")
@@ -267,6 +267,9 @@ def check(data):
     for key in ("slots", "step_timeout_minutes", "depends_minutes"):
         if _is(checks.get(key), int) and checks[key] < 1:
             problems.append("checks.%s must be at least 1" % key)
+    if _is(checks.get("cpu_weight"), int) \
+            and not 0 <= checks["cpu_weight"] <= 10000:
+        problems.append("checks.cpu_weight must be 0 (none) or 1 to 10000")
     if isinstance(checks.get("tracer"), str) \
             and checks["tracer"] not in TRACERS:
         problems.append("checks.tracer must be one of %s"

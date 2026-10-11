@@ -259,6 +259,17 @@ class Check(unittest.TestCase):
             "checks.tracer must be one of preload, strace",
             "checks.steps[0].always must be true or false"])
 
+    def test_cpu_weight(self):
+        for weight in (0, 1, 1000, 10000):
+            self.assertEqual(self.problems(checks={"cpu_weight": weight}),
+                             [], weight)
+        for weight in (-1, 10001):
+            self.assertEqual(self.problems(checks={"cpu_weight": weight}),
+                             ["checks.cpu_weight must be 0 (none) or 1 to "
+                              "10000"])
+        self.assertEqual(self.problems(checks={"cpu_weight": "high"}),
+                         ["checks.cpu_weight must be an integer"])
+
     def test_labels_and_relay(self):
         self.assertEqual(self.problems(
             labels={"owner_prefix": 1, "other": "kept"},

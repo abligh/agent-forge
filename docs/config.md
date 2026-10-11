@@ -334,6 +334,7 @@ reasons.
 | `caches` | none | `{variable: directory name}`: each slot's own build cache, kept in the state directory, such as `{"CARGO_TARGET_DIR": "cargo-target"}`. |
 | `slots` | `2` | Checks run at once (`$FORGE_PR_CHECK_SLOTS` overrides). |
 | `memory_max` | `16G` | Each step's memory limit, in systemd's syntax, or `off` (`$FORGE_PR_CHECK_MEMORY_MAX` overrides). |
+| `cpu_weight` | `1000` | Each step's scope's `CPUWeight` (systemd's default is 100), so the check gets most of the CPU when agents on the same host build too; `0` sets none. |
 | `step_timeout_minutes` | `30` | When a step is stopped. |
 | `merger_first` | `false` | Start first a waiting head of the pull request the Merger waits on (its `next.json`, read while under 10 minutes old), since the next merge waits on its verdict; every other head is then started oldest first, as without it. It only orders: a free slot is never kept empty for the Merger, whose wait may be on something no check here ends. `merge.test_ahead` turns it on, and refuses `false`. |
 | `depends` | `false` | Run each new head of the default branch in full under a tracer, recording what each step reads, and run a pull request's head with only the steps that read what it changes (designs/0005; see below). |
