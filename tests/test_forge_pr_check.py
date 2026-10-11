@@ -904,7 +904,8 @@ class StepEnv(unittest.TestCase):
         self.assertEqual(env, {"PATH": "/b",
                                "CARGO_TARGET_DIR": "/s/cargo-target",
                                "XDG_RUNTIME_DIR": "/run/user/%d"
-                               % os.getuid()})
+                               % os.getuid(),
+                               "CHECK_CPUS": str(pc.check_cpus())})
 
     def test_keeps_the_hosts_cargo_target_dir(self):
         env = pc.step_env("/s", {"CARGO_TARGET_DIR": "/t"})

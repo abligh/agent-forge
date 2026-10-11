@@ -250,6 +250,13 @@ the step fails with that test's output, rather than systemd stopping
 the whole step without a word. A worker that can't start a user scope
 says so in `worker.log` and runs its steps without the limit.
 
+**Each step gets `CHECK_CPUS`, its slot's share of the CPUs**: those
+this process may run on, divided by the slots (the fast lane counting
+as one more), and at least 1. A test runner that starts a process or a
+thread per CPU would otherwise start that many in every slot at once,
+and with the agents' own builds, oversubscribe the host. A value the
+host already sets wins.
+
 **Each step's scope has a high CPU weight** (`checks.cpu_weight`,
 default 1000 against systemd's 100; 0 for none), so on a host where
 the agents build too, the check, which every merge waits on, gets most
@@ -1395,14 +1402,34 @@ def matched(state_dir, sha, pr, same, tree, started, post, out=print):
     return 0
 
 
+def online_cpus():
+    """The CPUs this process may run on, else the host's count."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def check_cpus(online=None, slots=None):
+    """CHECK_CPUS: the online CPUs shared between the slots, the fast
+    lane counting as one more, and at least 1."""
+    online = online_cpus() if online is None else online
+    slots = slots_from_env() if slots is None else slots
+    if FAST_LANE_S is not None:
+        slots += 1
+    return max(1, online // max(1, slots))
+
+
 def step_env(state_dir, base=None, slot=1):
     """The steps' environment: `base` (os.environ) less STEP_DROP_ENV
     and every FORGE_ setting, with the slot's build caches (CACHES)
-    outside the worktree unless the host set them."""
+    outside the worktree and the slot's share of the CPUs
+    (CHECK_CPUS), unless the host set them."""
     env = {k: v for k, v in (os.environ if base is None else base).items()
            if k not in STEP_DROP_ENV and not k.startswith(STEP_DROP_PREFIX)}
     for name, folder in CACHES.items():
         env.setdefault(name, os.path.join(state_dir, slot_name(folder, slot)))
+    env.setdefault("CHECK_CPUS", str(check_cpus()))
     # systemd-run --user finds the user's manager through it, and cron
     # doesn't set it.
     env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())

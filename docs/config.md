@@ -85,6 +85,17 @@ letter.
 Only these keys are checked; the section may hold others, for tools
 not here yet.
 
+### What every step gets
+
+Besides the host's environment (less `GH_TOKEN`, `GITHUB_TOKEN` and
+every `FORGE_` setting) and its build caches, each step gets:
+
+| Variable | What it is |
+| --- | --- |
+| `CHECK_CPUS` | The slot's share of the CPUs: those the check may run on, divided by `slots` (plus one with `fast_lane`), at least 1. A test runner sizes its processes or threads from it, so slots running at once fit the host. |
+
+A value the host already sets wins.
+
 ### What `depends` records and passes on
 
 A green traced run of the default branch's head writes
