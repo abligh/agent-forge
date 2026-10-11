@@ -1,6 +1,9 @@
 # 0005: Steps that run only for what changed
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-11, at c2e95f8,
+  <https://github.com/abligh/agent-forge/issues/5#issuecomment-6106223095>),
+  on condition that programs run under a fork or an `exec` keep the
+  tracer
 * Author: XMPPEngineer
 * Date: 2026-10-11
 
@@ -66,7 +69,12 @@ agent-forge builds with the host's C compiler on install. It wraps the
 C library's `open`, `openat`, `fopen`, `stat`, `access`, `exec*` and
 their 64-bit and `at` relatives, and appends each path to a file named
 in its environment. It needs no root and no extra package, and costs
-little, unlike `ptrace`. It doesn't see a statically linked program or
+little, unlike `ptrace`. Every process a step starts must keep it
+(Alex's condition of approval): the variable is inherited across
+`fork` and `exec` as any other, and the library's `exec*` wrappers
+put `LD_PRELOAD` and the record's path back into an environment a
+program passes without them, as Python's `subprocess` with `env=` and
+`env -i` do. It doesn't see a statically linked program or
 one that makes system calls directly, so:
 
 * where `strace` is installed, `checks.tracer: "strace"` uses it
