@@ -459,12 +459,55 @@ class Posting(unittest.TestCase):
             "-f", "state=failure", "-f", "context=vm/build-and-test",
             "-f", "description=" + "x" * pc.DESCRIPTION_MAX])
 
-    def test_each_post_mints_its_own_token(self):
+    def test_a_token_is_reused_until_it_may_be_near_expiry(self):
+        # agent-forge #13: a mint per post cost a run about a second.
+        now = [0.0]
         run = FakeRun((is_mint, done([], 0, "tok\n")))
-        post = pc.make_poster(run, lambda line: None)
+        post = pc.make_poster(run, lambda line: None, timer=lambda: now[0])
         post(SHA_A, "pending", "p")
         post(SHA_A, "success", "s")
+        self.assertEqual(sum(is_mint(c["args"]) for c in run.calls), 1)
+        now[0] = pc.TOKEN_REUSE_S
+        post(SHA_B, "success", "s")
         self.assertEqual(sum(is_mint(c["args"]) for c in run.calls), 2)
+
+    def test_with_the_project_it_posts_in_process(self):
+        calls = []
+
+        def call(url, token, scheme="Bearer", method="GET", body=None):
+            calls.append((url, token, method, body))
+            if url.endswith("/access_tokens"):
+                return 201, {"token": "tok"}
+            if url.endswith("/app"):
+                return 200, {"slug": "x"}
+            return 201, {}
+        project = pc.config.Project(example(), None)
+        with mock.patch.object(pc.github, "assertion_for",
+                               return_value=("jwt", {})):
+            post = pc.make_poster(None, lambda line: None, project, call)
+            self.assertTrue(post(SHA_A, "success", "x" * 200))
+            self.assertTrue(post(SHA_A, "success", "y"))
+        statuses = [c for c in calls if "/statuses/" in c[0]]
+        self.assertEqual(len(calls) - len(statuses), 1)
+        self.assertEqual(statuses[0][1:], ("tok", "POST", {
+            "state": "success", "context": "vm/build-and-test",
+            "description": "x" * pc.DESCRIPTION_MAX}))
+        self.assertTrue(statuses[0][0].endswith(
+            "/repos/%s/statuses/%s" % (REPO, SHA_A)))
+
+    def test_in_process_a_refusal_is_false_and_said(self):
+        lines = []
+
+        def call(url, token, scheme="Bearer", method="GET", body=None):
+            if url.endswith("/access_tokens"):
+                return 201, {"token": "tok"}
+            return 403, {"message": "Resource not accessible"}
+        project = pc.config.Project(example(), None)
+        with mock.patch.object(pc.github, "assertion_for",
+                               return_value=("jwt", {})):
+            post = pc.make_poster(None, lines.append, project, call)
+            self.assertFalse(post(SHA_A, "success", "s"))
+        self.assertIn("HTTP 403 Resource not accessible", lines[0])
 
     def test_a_failed_mint_or_post_is_false_and_said(self):
         lines = []

@@ -377,10 +377,11 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-from agent_forge import config, locks, trace  # noqa: E402
+from agent_forge import config, github, locks, trace  # noqa: E402
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 
@@ -1092,20 +1093,62 @@ def prune(state, when):
                 del state[key][sha]
 
 
-def make_poster(run=sh, out=print):
+# How long a minted token is used for. GitHub's last an hour; a check
+# that runs longer than this mints a fresh one for its verdict.
+TOKEN_REUSE_S = 30 * 60
+
+
+def make_poster(run=sh, out=print, project=None, call=None,
+                timer=time.monotonic):
     """A post(sha, state, description) that writes STATUS_CONTEXT on sha
-    as POSTER's App and returns whether GitHub took it. The token is
-    minted for each post: one minted before a long check could expire."""
+    as POSTER's App and returns whether GitHub took it. Safe to call
+    from another thread.
+
+    With `project`, the token is minted and the status written in this
+    process (agent_forge.github, through `call`); otherwise through
+    forge-app-token and `gh`, each a process of its own, which cost a
+    run about a second a post (agent-forge #13). Either way a token is
+    reused for TOKEN_REUSE_S, so the pending post and the verdict's
+    usually share one."""
+    held = {}
+    guard = threading.Lock()
+
+    def token():
+        with guard:
+            if held and timer() - held["at"] < TOKEN_REUSE_S:
+                return held["token"]
+            if project is not None:
+                try:
+                    got = github.token(project, POSTER,
+                                       call or github.api_call)
+                except (github.MintError, OSError, KeyError):
+                    got = None
+            else:
+                got = mint(run)
+            if got:
+                held.update(token=got, at=timer())
+            return got
+
     def post(sha, state, description):
-        token = mint(run)
-        if token is None:
+        tok = token()
+        if tok is None:
             out("POST-FAILED %s %s: could not mint %s's token"
                 % (sha[:10], state, POSTER))
             return False
+        description = description[:DESCRIPTION_MAX]
+        if project is not None:
+            status, body = github.rest(
+                tok, "POST", "/repos/%s/statuses/%s" % (REPO_SLUG, sha),
+                {"state": state, "context": STATUS_CONTEXT,
+                 "description": description}, call or github.api_call)
+            if status != 201:
+                out("POST-FAILED %s %s: HTTP %s %s"
+                    % (sha[:10], state, status, body.get("message", "")))
+                return False
+            return True
         got = gh(["-X", "POST", "repos/%s/statuses/%s" % (REPO_SLUG, sha),
                   "-f", "state=" + state, "-f", "context=" + STATUS_CONTEXT,
-                  "-f", "description=" + description[:DESCRIPTION_MAX]],
-                 token, run)
+                  "-f", "description=" + description], tok, run)
         if got.returncode != 0:
             out("POST-FAILED %s %s: %s" % (sha[:10], state,
                                            got.stderr.strip()))
@@ -2756,10 +2799,22 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 return matched(state_dir, sha, pr, same, tree, started,
                                post, out)
         phases.mark("match")
+        pending = None
         if post is not None:
-            post(sha, "pending", "running%s since %s" % (on_host(),
-                                                        iso(started)))
-            phases.mark("post-pending")
+            # Posted while the steps run: nothing waits on it but the
+            # verdict's post, which must not be overwritten by it.
+            pending = threading.Thread(
+                target=post, daemon=True,
+                args=(sha, "pending", "running%s since %s"
+                      % (on_host(), iso(started))))
+            pending.start()
+            first_post = post
+
+            def post(*args):
+                # Every later post, the verdict's or a host fault's,
+                # lands after the pending one.
+                pending.join()
+                return first_post(*args)
         env = step_env(state_dir, slot=slot)
         steps, wrap, tracer, files = None, None, None, {}
         composed = None
@@ -2952,6 +3007,9 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         phases.mark("record")
         posted = None
         if post is not None:
+            if pending is not None:
+                pending.join()
+                phases.mark("post-pending")
             posted = post(sha, *final_status(record))
             phases.mark("post")
         # The steps' own time is in step_seconds; what the run spent
@@ -3056,7 +3114,7 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
     state_dir = args.state_dir or locks.state_dir(project.name, "pr-check",
                                                   environ)
     os.makedirs(state_dir, exist_ok=True)
-    post = make_poster(run, out) if args.post else None
+    post = make_poster(run, out, project) if args.post else None
     if args.worker:
         chain = (lambda: start_next_tick(checkout=repo)) if args.post else None
         return worker(repo, state_dir, args.worker, args.pr, run, out,
