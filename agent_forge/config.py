@@ -73,12 +73,15 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "slots": int, "memory_max": str, "step_timeout_minutes": int,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
           "tracer": str, "cpu_weight": int, "fast_lane": dict,
-          "merge_default": bool, "cache_limit": str}
+          "merge_default": bool, "cache_limit": str, "reuse": dict}
 # checks.cache_limit: a size in systemd's style, at least one byte.
 SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 # checks.fast_lane: a slot for heads whose chosen steps are cheap.
 FAST_LANE = {"max_seconds": int}
-STEP = {"name": str, "run": list, "only_if": str, "always": bool}
+# checks.reuse: a step's green verdict reused for unchanged inputs.
+REUSE = {"max_age_days": int}
+STEP = {"name": str, "run": list, "only_if": str, "always": bool,
+        "version": list}
 # checks.tracer's values (docs/designs/0005).
 TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.
@@ -280,6 +283,8 @@ def check(data):
         problems.append("checks.cpu_weight must be 0 (none) or 1 to 10000")
     if isinstance(checks.get("fast_lane"), dict):
         _check_fast_lane(checks, problems)
+    if isinstance(checks.get("reuse"), dict):
+        _check_reuse(checks, problems)
     if isinstance(checks.get("cache_limit"), str) \
             and not SIZE_RE.match(checks["cache_limit"]):
         problems.append("checks.cache_limit must be a size such as 40G "
@@ -300,6 +305,12 @@ def check(data):
                     and all(isinstance(a, str) for a in run)):
                 problems.append("%s.run must be a non-empty list of strings"
                                 % where)
+            version = step.get("version")
+            if "version" in step and not (
+                    isinstance(version, list) and version
+                    and all(isinstance(a, str) for a in version)):
+                problems.append("%s.version must be a non-empty list of "
+                                "strings" % where)
     if isinstance(checks.get("caches"), dict) and not all(
             isinstance(v, str) and v and "/" not in v
             for v in checks["caches"].values()):
@@ -436,6 +447,20 @@ def _check_fast_lane(checks, problems):
     if checks.get("depends") is not True:
         problems.append("%s needs checks.depends: without it every head "
                         "runs every step, and none is cheap" % where)
+
+
+def _check_reuse(checks, problems):
+    """checks.reuse (designs/0009): how old a step's green verdict may
+    be to stand for unchanged inputs. The inputs are read from the
+    dependency record, so it needs `depends`."""
+    where = "checks.reuse"
+    reuse = checks["reuse"]
+    _fields(where, reuse, REUSE, problems)
+    if _is(reuse.get("max_age_days"), int) and reuse["max_age_days"] < 1:
+        problems.append("%s.max_age_days must be at least 1" % where)
+    if checks.get("depends") is not True:
+        problems.append("%s needs checks.depends: a step's inputs are "
+                        "what its dependency record says it read" % where)
 
 
 def _check_idle_offer(offer, agents, problems):

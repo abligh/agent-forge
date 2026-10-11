@@ -3,6 +3,14 @@
 * Status: approved (Alex, 2026-10-11, on the issue; he confirmed in
   session that it covers this design,
   <https://github.com/abligh/agent-forge/issues/9#issuecomment-6110608808>)
+* Implemented: v0.4.20, off until configured. The record doesn't say
+  which steps read `CHECK_BASE` or which wrote a path, so every
+  step's digest has `CHECK_BASE`'s tree (reuse is between heads
+  checked against the same tip; default-branch runs, which get none,
+  are never reused), and a step that read a path the tree lacks
+  counts every earlier step's digest. The fast lane still estimates
+  without reuse, since a digest needs the `version` commands run in a
+  worktree, and a reused step adds nothing to its step costs
 * Author: XMPPEngineer
 * Date: 2026-10-11
 * Issue: <https://github.com/abligh/agent-forge/issues/9>

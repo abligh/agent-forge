@@ -250,6 +250,20 @@ the step fails with that test's output, rather than systemd stopping
 the whole step without a word. A worker that can't start a user scope
 says so in `worker.log` and runs its steps without the limit.
 
+**With `checks.reuse`, a step isn't run on inputs it has passed on**
+(designs/0009). Each step that applies to a pull request's head gets an
+input digest from the dependency record its steps were chosen by: what
+it read at the tested tree (the merge, with `merge_default`), what the
+directories it listed hold, CHECK_BASE's tree, its configuration entry
+and its `version` command's output, and the earlier steps' digests when
+it read a path the tree doesn't have (a step's output, or nothing). A
+chosen step whose digest the newest verdict here with that digest ran
+green, at most `max_age_days` ago, is recorded as reused from that run
+(`reused`, the run it stands for) and not run; red, a step marked
+`always`, a failing `version` command and a step the record doesn't
+know always run. The description names the first reuse. Runs of the
+default branch never reuse.
+
 **With `checks.cache_limit` (say `"40G"`), each run prunes its slot's
 build caches** while it still holds the slot, since nothing else trims
 them and a build tool rarely does: test executables directly in a
@@ -352,6 +366,16 @@ DEFAULT_STEPS = [("test", ["make", "test"], None)]
 STEPS = DEFAULT_STEPS
 # {environment variable: directory name} for each slot's build caches.
 CACHES = {}
+# checks.reuse (designs/0009): how old a step's green verdict may be to
+# stand for the same inputs, or None: never reused.
+REUSE_AGE = None
+DEFAULT_REUSE_DAYS = 7
+# Each step's `version` command, by name, and its configuration entry
+# as canonical JSON, both part of its input digest.
+VERSIONS = {}
+STEP_ENTRIES = {}
+# How long a step's `version` command may take.
+VERSION_TIMEOUT_S = 60
 # checks.cache_limit: the most a slot's caches may hold, in bytes, after
 # a run prunes them (`prune_caches`); None: never pruned.
 CACHE_LIMIT = None
@@ -454,7 +478,7 @@ def configure(project):
     (`context`, `poster`, `steps`, `caches`, `slots`, `memory_max`,
     `step_timeout_minutes`, `merger_first`, `depends`,
     `depends_minutes`, `tracer`, `fast_lane`, `merge_default`,
-    `cache_limit`, each step's `always`),
+    `cache_limit`, `reuse`, each step's `always` and `version`),
     each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
     implies `merger_first`."""
@@ -463,6 +487,7 @@ def configure(project):
     global CPU_WEIGHT
     global TEST_AHEAD, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
+    global REUSE_AGE, VERSIONS, STEP_ENTRIES
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -474,6 +499,13 @@ def configure(project):
              for s in checks["steps"]] if "steps" in checks else DEFAULT_STEPS
     ALWAYS = frozenset(s["name"] for s in checks.get("steps", [])
                        if s.get("always"))
+    VERSIONS = {s["name"]: list(s["version"])
+                for s in checks.get("steps", []) if s.get("version")}
+    STEP_ENTRIES = {s["name"]: json.dumps(s, sort_keys=True)
+                    for s in checks.get("steps", [])}
+    # The configuration refuses reuse without depends.
+    REUSE_AGE = datetime.timedelta(days=checks["reuse"].get(
+        "max_age_days", DEFAULT_REUSE_DAYS)) if "reuse" in checks else None
     DEPENDS = checks.get("depends", False)
     DEPENDS_WAIT = datetime.timedelta(minutes=checks.get(
         "depends_minutes", DEFAULT_DEPENDS_MINUTES))
@@ -997,7 +1029,8 @@ def final_status(r):
     """(state, description) for a verdict, naming the first failed step:
     where its author starts reading, or for a matched one where its
     tree was tested. With checks.depends, it says how many steps ran
-    and what made each run, or why every step ran. With
+    and what made each run, or why every step ran; with checks.reuse,
+    the first step reused and where it ran. With
     checks.merge_default, it names the tip the head was merged with, or
     the paths that conflict with it."""
     selection = r.get("selection") or {}
@@ -1027,6 +1060,14 @@ def _final_status(r, selection, ran, skipped, where):
     if r["ok"] and r.get("matched"):
         return "success", "green%s: tree tested as %s (%s)" % (
             where, r["matched"][:10], r.get("matched_as", "another head"))
+    if r["ok"] and r.get("reused"):
+        # designs/0009: the first reused step, where it was run, early.
+        reused = r["reused"]
+        first = next(iter(reused))
+        return "success", "green%s: %s, same inputs%s; %d of %d steps ran" % (
+            where, reuse_text(first, reused[first]),
+            " (and %d more)" % (len(reused) - 1) if len(reused) > 1 else "",
+            len(ran) - len(reused), len(ran) + len(skipped))
     if r["ok"] and skipped:
         why = "; ".join("%s: %s" % (n, w) for n, w in ran.items()) \
             or "nothing reads what changed"
@@ -1903,6 +1944,143 @@ def covers(selection):
     return accept
 
 
+def tree_entries(wt, commit, run=sh):
+    """({path: "mode type oid"} for every file and directory in commit's
+    tree, {directory: sorted entry names}), or None if git can't say.
+    "." is the top."""
+    got = run(["git", "-C", wt, "ls-tree", "-r", "-t", "-z", "--full-tree",
+               commit])
+    if got.returncode != 0:
+        return None
+    entries, children = {}, {}
+    for item in (got.stdout or "").split("\0"):
+        meta, _, path = item.partition("\t")
+        if not path:
+            continue
+        entries[path] = meta
+        parent, _, name = path.rpartition("/")
+        children.setdefault(parent or ".", []).append(name)
+    return entries, {d: sorted(names) for d, names in children.items()}
+
+
+def step_digests(wt, commit, record, env, run=sh, names=None):
+    """{step: input digest} (designs/0009) for the steps that apply to
+    the worktree, at `commit` (the head, or its merge with the default
+    branch), from dependency record `record`. A step gets none when the
+    record doesn't know it, its `version` command fails, or it read a
+    path an earlier step may have written and an earlier step has none.
+
+    A digest covers what the step read, at commit: each path's mode and
+    blob (or "absent": a path it looked for, or one a step wrote), the
+    names each directory it listed holds, CHECK_BASE's tree when the
+    step is given one, its configuration entry, and its `version`
+    command's output. The worktree is cleaned before any step runs, so
+    a path the step read that commit doesn't have was either not there
+    or written by a step; when there is one, the digests of every
+    earlier step count too, since which step wrote it isn't recorded."""
+    if names is None:
+        names = [name for name, _, _ in applicable(wt)]
+    listed = tree_entries(wt, commit, run)
+    if listed is None:
+        return {}
+    entries, children = listed
+    base = env.get("CHECK_BASE")
+    base_tree = tree_of(wt, base, run) if base else None
+    if base and base_tree is None:
+        return {}
+    steps = {name: (name, args, only_if) for name, args, only_if in STEPS}
+    digests, earlier = {}, []
+    for name in names:
+        reads = record.get("reads", {}).get(name)
+        if reads is None:
+            earlier.append(None)
+            continue
+        h = hashlib.sha256()
+
+        def add(*parts):
+            h.update(json.dumps(parts).encode() + b"\n")
+        add("entry", STEP_ENTRIES.get(name) or list(steps.get(name, ())))
+        written = False
+        for path in sorted(reads):
+            meta = entries.get(path)
+            if meta is None and path != ".":
+                written = True
+            add("read", path, meta or "absent")
+        for folder in sorted(record.get("dirs", {}).get(name, ())):
+            add("dir", folder, children.get(folder))
+        add("base", base_tree)
+        if written:
+            if None in earlier:
+                earlier.append(None)
+                continue
+            add("earlier", earlier)
+        version = VERSIONS.get(name)
+        if version:
+            got = run(version, cwd=wt, env=env, timeout=VERSION_TIMEOUT_S)
+            if got.returncode != 0:
+                earlier.append(None)
+                continue
+            add("version", got.stdout or "")
+        digests[name] = h.hexdigest()
+        earlier.append(digests[name])
+    return digests
+
+
+def reusable(state, name, digest, when):
+    """What step `name`'s verdict for these inputs can be taken from:
+    {"reused": sha, "pr", "finished"} of the run that ran it green, or
+    None. That is the newest verdict here (this host, these steps) with
+    the same digest for the step that ran it or reused it; a red one, or
+    one older than REUSE_AGE, gives nothing. A reuse points at the run
+    it reuses, and ages from it."""
+    host, steps = socket.gethostname(), steps_digest()
+    found = []
+    for sha, r in state["results"].items():
+        if (r.get("digests") or {}).get(name) != digest \
+                or r.get("host") != host or r.get("steps") != steps:
+            continue
+        if name in (r.get("reused") or {}):
+            found.append((r.get("finished", ""), r["reused"][name]))
+        elif name in (r.get("step_seconds") or {}):
+            green = name not in r.get("failed", [])
+            found.append((r.get("finished", ""), {
+                "reused": sha, "pr": r.get("pr"),
+                "finished": r.get("finished")} if green else None))
+    if not found:
+        return None
+    _, origin = max(found, key=lambda f: f[0])
+    if origin is None:
+        return None
+    try:
+        if when - parse(origin["finished"]) > REUSE_AGE:
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    return dict(origin)
+
+
+def reuse_steps(state_dir, digests, names, when):
+    """{step: what it reuses} for those of `names` whose verdict can be
+    reused (`reusable`); never a step marked always."""
+    with state_lock(state_dir):
+        state = load(state_dir)
+    found = {}
+    for name in names:
+        if name in ALWAYS or name not in digests:
+            continue
+        origin = reusable(state, name, digests[name], when)
+        if origin is not None:
+            found[name] = origin
+    return found
+
+
+def reuse_text(name, origin):
+    """"test as #7 at 1a2b3c4": where a reused step's verdict is from."""
+    pr = origin.get("pr")
+    return "%s as %s at %s" % (name, "#%s" % pr if pr else MAIN,
+                               (origin.get("reused") or "")[:7])
+
+
 def tracer_for(state_dir, run=sh):
     """("preload", library) or ("strace", None) for checks.tracer, or
     None when it can't be used: no strace, or no library built."""
@@ -2097,6 +2275,25 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             env = dict(env, CHECK_BASE=selection["base"],
                        CHECK_DEPENDS=selection["depends"])
             steps = [s for s in applicable(wt) if s[0] in selection["ran"]]
+        digests, reused = {}, {}
+        if REUSE_AGE is not None and steps is not None:
+            # designs/0009: a step whose inputs a green run here
+            # already tested isn't run again.
+            try:
+                with open(selection["depends"]) as handle:
+                    read = json.load(handle)
+            except (OSError, ValueError):
+                # Pruned since it was chosen: every chosen step runs.
+                read = {}
+            digests = step_digests(wt, checked, read, env, run)
+            reused = reuse_steps(state_dir, digests, [s[0] for s in steps],
+                                 started)
+            steps = [s for s in steps if s[0] not in reused]
+            out("  steps: %s" % "; ".join(
+                "%s %s" % (name, "reused (%s)" % reuse_text(name, reused[name])
+                           if name in reused else "ran" if name in
+                           selection["ran"] else "skipped")
+                for name, _, _ in applicable(wt)))
         if main:
             tracer = tracer_for(state_dir, run)
             if tracer is None:
@@ -2167,6 +2364,12 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 # What a later head with the same tree is matched by.
                 record.update(tree=tree, host=socket.gethostname(),
                               steps=steps_digest())
+            if digests:
+                # What a later head's steps are reused by (`reusable`).
+                record.update(digests=digests, host=socket.gethostname(),
+                              steps=steps_digest())
+            if reused:
+                record["reused"] = reused
             if ahead:
                 record["ahead"] = True
             if main:
