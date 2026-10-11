@@ -72,7 +72,9 @@ STALL_ALERT = {"tell": list, "retell_minutes": int,
 CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "slots": int, "memory_max": str, "step_timeout_minutes": int,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
-          "tracer": str, "cpu_weight": int}
+          "tracer": str, "cpu_weight": int, "fast_lane": dict}
+# checks.fast_lane: a slot for heads whose chosen steps are cheap.
+FAST_LANE = {"max_seconds": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool}
 # checks.tracer's values (docs/designs/0005).
 TRACERS = ("preload", "strace")
@@ -270,6 +272,8 @@ def check(data):
     if _is(checks.get("cpu_weight"), int) \
             and not 0 <= checks["cpu_weight"] <= 10000:
         problems.append("checks.cpu_weight must be 0 (none) or 1 to 10000")
+    if isinstance(checks.get("fast_lane"), dict):
+        _check_fast_lane(checks, problems)
     if isinstance(checks.get("tracer"), str) \
             and checks["tracer"] not in TRACERS:
         problems.append("checks.tracer must be one of %s"
@@ -408,6 +412,20 @@ def _check_test_ahead(ahead, checks, problems):
     if isinstance(checks, dict) and checks.get("merger_first") is False:
         problems.append("%s puts the Merger's pull request first, so "
                         "checks.merger_first must not be false" % where)
+
+
+def _check_fast_lane(checks, problems):
+    """checks.fast_lane: a slot of its own for heads whose chosen steps
+    have taken at most max_seconds here. Only `depends` chooses steps,
+    so without it nothing could be cheap."""
+    where = "checks.fast_lane"
+    lane = checks["fast_lane"]
+    _fields(where, lane, FAST_LANE, problems)
+    if _is(lane.get("max_seconds"), int) and lane["max_seconds"] < 1:
+        problems.append("%s.max_seconds must be at least 1" % where)
+    if checks.get("depends") is not True:
+        problems.append("%s needs checks.depends: without it every head "
+                        "runs every step, and none is cheap" % where)
 
 
 def _check_idle_offer(offer, agents, problems):

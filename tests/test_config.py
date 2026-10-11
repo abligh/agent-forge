@@ -270,6 +270,30 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(checks={"cpu_weight": "high"}),
                          ["checks.cpu_weight must be an integer"])
 
+    def test_fast_lane(self):
+        # designs/0006.
+        self.assertEqual(self.problems(checks={
+            "depends": True, "fast_lane": {"max_seconds": 60}}), [])
+        self.assertEqual(self.problems(checks={
+            "depends": True, "fast_lane": {}}), [])
+        self.assertEqual(self.problems(checks={
+            "depends": True,
+            "fast_lane": {"max_seconds": 0, "slots": 2}}), [
+            "checks.fast_lane: unknown key 'slots'",
+            "checks.fast_lane.max_seconds must be at least 1"])
+        self.assertEqual(self.problems(checks={
+            "depends": True, "fast_lane": {"max_seconds": True}}), [
+            "checks.fast_lane.max_seconds must be an integer"])
+        self.assertEqual(self.problems(checks={"fast_lane": 60}), [
+            "checks.fast_lane must be an object"])
+
+    def test_fast_lane_is_refused_without_depends(self):
+        for checks in ({"fast_lane": {"max_seconds": 60}},
+                       {"depends": False, "fast_lane": {}}):
+            self.assertEqual(self.problems(checks=checks), [
+                "checks.fast_lane needs checks.depends: without it every "
+                "head runs every step, and none is cheap"])
+
     def test_labels_and_relay(self):
         self.assertEqual(self.problems(
             labels={"owner_prefix": 1, "other": "kept"},
