@@ -71,8 +71,11 @@ STALL_ALERT = {"tell": list, "retell_minutes": int,
 # checked.
 CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "slots": int, "memory_max": str, "step_timeout_minutes": int,
-          "merger_first": bool}
-STEP = {"name": str, "run": list, "only_if": str}
+          "merger_first": bool, "depends": bool, "depends_minutes": int,
+          "tracer": str}
+STEP = {"name": str, "run": list, "only_if": str, "always": bool}
+# checks.tracer's values (docs/designs/0005).
+TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.
 LABELS = {"owner_prefix": str, "status_prefix": str,
           "waiting_on_owner": str, "waiting_external": str}
@@ -261,9 +264,13 @@ def check(data):
     for key, kinds in CHECKS.items():
         if key in checks and not _is(checks[key], kinds):
             problems.append("checks.%s must be %s" % (key, _type_name(kinds)))
-    for key in ("slots", "step_timeout_minutes"):
+    for key in ("slots", "step_timeout_minutes", "depends_minutes"):
         if _is(checks.get(key), int) and checks[key] < 1:
             problems.append("checks.%s must be at least 1" % key)
+    if isinstance(checks.get("tracer"), str) \
+            and checks["tracer"] not in TRACERS:
+        problems.append("checks.tracer must be one of %s"
+                        % ", ".join(TRACERS))
     if isinstance(checks.get("steps"), list):
         for i, step in enumerate(checks["steps"]):
             where = "checks.steps[%d]" % i

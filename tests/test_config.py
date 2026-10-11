@@ -246,6 +246,19 @@ class Check(unittest.TestCase):
             "checks.caches must map variables to directory names",
             "checks.poster 'Nobody' is no App in the configuration"])
 
+    def test_depends(self):
+        # designs/0005.
+        self.assertEqual(self.problems(checks={
+            "depends": True, "depends_minutes": 30, "tracer": "strace",
+            "steps": [{"name": "a", "run": ["make"], "always": True}]}), [])
+        self.assertEqual(self.problems(checks={
+            "depends": "yes", "depends_minutes": 0, "tracer": "ptrace",
+            "steps": [{"name": "a", "run": ["make"], "always": 1}]}), [
+            "checks.depends must be true or false",
+            "checks.depends_minutes must be at least 1",
+            "checks.tracer must be one of preload, strace",
+            "checks.steps[0].always must be true or false"])
+
     def test_labels_and_relay(self):
         self.assertEqual(self.problems(
             labels={"owner_prefix": 1, "other": "kept"},
