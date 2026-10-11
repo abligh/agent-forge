@@ -4,6 +4,10 @@
   <https://github.com/abligh/agent-forge/issues/7#issuecomment-6107997777>);
   whether it becomes the default is to be learned by turning it on in a
   project
+* Implemented: v0.4.14 (ecedf07), off until configured. The tip is the
+  one the cron checkout last fetched, so the worker fetches nothing;
+  the fast lane still estimates from the head alone, which errs
+  towards more steps
 * Author: XMPPEngineer
 * Date: 2026-10-11
 
