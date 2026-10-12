@@ -538,6 +538,12 @@ MERGE_DEFAULT = False
 # FRESH_WAIT for a fresh one. None is off.
 DEFAULT_FRESH_MINUTES = 15
 FRESH_WAIT = None
+# checks.main "every" (designs/0011): every new default-branch head is
+# run, depends or not; otherwise only when a dependency record needs it.
+MAIN_EVERY = False
+# checks.main_red_issue (designs/0011): {"label", "title"}, or None.
+MAIN_RED_ISSUE = None
+DEFAULT_RED_TITLE = "The default branch is red at {sha}"
 # With fresh, how many of the newest records each step keeps, and how
 # many of the newest records a step may be chosen from.
 FRESH_KEEP = 20
@@ -563,7 +569,7 @@ def configure(project):
     global TEST_AHEAD, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
-    global FIRST_AUTHORS, MAX_WAIT
+    global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -600,6 +606,9 @@ def configure(project):
                               for name in checks.get("first_authors", []))
     MAX_WAIT = datetime.timedelta(minutes=checks["max_wait_minutes"]) \
         if "max_wait_minutes" in checks else None
+    MAIN_EVERY = checks.get("main", "needed") == "every"
+    MAIN_RED_ISSUE = dict(checks["main_red_issue"]) \
+        if "main_red_issue" in checks else None
     # The configuration refuses fresh without depends.
     FRESH_WAIT = datetime.timedelta(minutes=checks["fresh"].get(
         "wait_minutes", DEFAULT_FRESH_MINUTES)) if "fresh" in checks else None
@@ -875,7 +884,12 @@ def queue_main(state, head, when, state_dir, busy=(), needs=False):
     the record's file: a head that needs no step traced isn't queued,
     and nor is an older one kept waiting, since every record holds."""
     sha, tree = head
-    if needs is not False:
+    if MAIN_EVERY:
+        # designs/0011: every head, whatever any record says. A head whose
+        # tree a green run here already passed is matched by the worker.
+        if sha in state["results"] or sha in state["waiting"]:
+            return False
+    elif needs is not False:
         if needs == []:
             for other, entry in list(state["waiting"].items()):
                 if entry.get("main") and other not in busy:
@@ -1209,6 +1223,127 @@ def make_poster(run=sh, out=print, project=None, call=None,
     return post
 
 
+def make_writer(project, out=print, call=None):
+    """A write(method, path, body) -> (status, body) to GitHub's REST API
+    as POSTER's App (checks.poster), minting its token when first used.
+    A token that can't be minted is status 0."""
+    held = {}
+
+    def write(method, path, body=None):
+        if "token" not in held:
+            try:
+                held["token"] = github.token(project, POSTER,
+                                             call or github.api_call)
+            except (github.MintError, OSError, KeyError) as err:
+                out("REPORT-FAILED: could not mint %s's token: %s"
+                    % (POSTER, err))
+                return 0, {}
+        return github.rest(held["token"], method, path, body,
+                           call or github.api_call)
+    return write
+
+
+def red_text(sha, failed, commits, green):
+    """The body of the issue a red default-branch head opens."""
+    lines = ["`%s` is red at %s%s: %s." % (
+        MAIN, sha[:10], on_host(), ", ".join(n for n, _ in failed)
+        or "a step failed")]
+    if green:
+        lines.append("")
+        lines.append("Commits since the last green head, %s:" % green[:10])
+        lines.append("")
+        lines += ["* %s" % c for c in commits] or ["* (none listed)"]
+    for name, text in failed:
+        lines += ["", "**%s**, the end of its output:" % name, "",
+                  "```", text.rstrip(), "```"]
+    lines += ["", "Every pull request's check is against this tip until "
+              "it is green again; this issue is closed then.", "",
+              "— forge-pr-check"]
+    return "\n".join(lines)
+
+
+def report_main(state_dir, repo, sha, ok, failed, same, write, out=print,
+                run=sh):
+    """checks.main_red_issue (designs/0011): keep one issue open while
+    the default branch is red. The first red head opens it (labelled,
+    with the failed steps and the commits since the last green head),
+    each further red head comments once, and the first green head closes
+    it, naming the run whose tree it matched (`same`) if it wasn't run.
+    A write GitHub refuses is logged REPORT-FAILED and tried again on the
+    next verdict, never dropped."""
+    with state_lock(state_dir):
+        state = load(state_dir)
+        red = dict(state.get("main_red") or {})
+        green = state.get("main_green")
+    when = now_utc()
+    if ok:
+        if red.get("issue"):
+            number = red["issue"]
+            how = ("its tree tested green as %s" % same[:10]) if same \
+                else "its check passed"
+            got, _ = write("POST", "/repos/%s/issues/%d/comments"
+                           % (REPO_SLUG, number), {"body": "Green again at "
+                           "%s: %s.\n\n— forge-pr-check" % (sha[:10], how)})
+            shut, _ = write("PATCH", "/repos/%s/issues/%d"
+                            % (REPO_SLUG, number), {"state": "closed"})
+            if shut != 200:
+                log(state_dir, "REPORT-FAILED %s %s: closing #%d: HTTP %s"
+                    % (MAIN, sha[:10], number, shut), when, out)
+                with state_lock(state_dir):
+                    state = load(state_dir)
+                    state["main_green"] = sha
+                    save(state_dir, state)
+                return
+            log(state_dir, "CLOSED #%d: %s green at %s"
+                % (number, MAIN, sha[:10]), when, out)
+            red = {}
+        with state_lock(state_dir):
+            state = load(state_dir)
+            state["main_green"] = sha
+            state.pop("main_red", None) if not red else None
+            save(state_dir, state)
+        return
+    if red.get("issue"):
+        if sha in red.get("told", []):
+            return
+        number = red["issue"]
+        got, _ = write("POST", "/repos/%s/issues/%d/comments"
+                       % (REPO_SLUG, number), {"body": "Still red at %s: %s."
+                       "\n\n— forge-pr-check" % (sha[:10], ", ".join(
+                           n for n, _ in failed) or "a step failed")})
+        if got != 201:
+            log(state_dir, "REPORT-FAILED %s %s: commenting on #%d: HTTP %s"
+                % (MAIN, sha[:10], number, got), when, out)
+            return
+        red["told"] = red.get("told", []) + [sha]
+        log(state_dir, "COMMENTED #%d: %s still red at %s"
+            % (number, MAIN, sha[:10]), when, out)
+    else:
+        commits = []
+        if green:
+            got = run(["git", "-C", repo, "log", "--format=%h %s",
+                       "%s..%s" % (green, sha)])
+            if got.returncode == 0:
+                commits = got.stdout.splitlines()[:50]
+        title = MAIN_RED_ISSUE.get("title", DEFAULT_RED_TITLE).replace(
+            "{sha}", sha[:10])
+        body = {"title": title, "body": red_text(sha, failed, commits, green)}
+        if MAIN_RED_ISSUE.get("label"):
+            body["labels"] = [MAIN_RED_ISSUE["label"]]
+        got, made = write("POST", "/repos/%s/issues" % REPO_SLUG, body)
+        if got != 201 or "number" not in made:
+            log(state_dir, "REPORT-FAILED %s %s: opening an issue: HTTP %s %s"
+                % (MAIN, sha[:10], got, made.get("message", "")), when, out)
+            return
+        red = {"issue": made["number"], "since": sha, "told": [sha]}
+        log(state_dir, "FILED #%d: %s red at %s"
+            % (red["issue"], MAIN, sha[:10]), when, out)
+    with state_lock(state_dir):
+        state = load(state_dir)
+        state["main_red"] = red
+        save(state_dir, state)
+
+
 def on_host():
     return " on " + HOST if HOST else ""
 
@@ -1374,8 +1509,10 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                for slot in list(range(1, slots + 1)) + ([LANE] if lane else [])}
     fields = {slot: holder_fields(h) for slot, h in holders.items()}
     busy = {f[1] for f in fields.values() if f}
-    head_of_main = main_head(checkout, run) if DEPENDS and checkout else None
-    fresh = FRESH_WAIT is not None and head_of_main is not None
+    head_of_main = main_head(checkout, run) \
+        if (DEPENDS or MAIN_EVERY) and checkout else None
+    fresh = FRESH_WAIT is not None and DEPENDS and head_of_main is not None \
+        and not MAIN_EVERY
     # With checks.fresh, what the default branch's head needs traced,
     # worked out outside the lock: it reads git.
     needs = main_needs(checkout, head_of_main, state_dir, run) \
@@ -1385,8 +1522,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         note_heads(state, heads, when, state_dir, out, post)
         if head_of_main and queue_main(state, head_of_main, when, state_dir,
                                        busy, needs):
-            out("QUEUED %s %s: a traced run of every step%s"
-                % (MAIN, head_of_main[0][:10],
+            out("QUEUED %s %s: a %srun of every step%s"
+                % (MAIN, head_of_main[0][:10], "traced " if DEPENDS else "",
                    "" if not needs else "; stale: " + ", ".join(needs)))
         if post is not None:
             repost(state, heads, post, out)
@@ -1521,8 +1658,9 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     if pr == 0:
         spawn(state_dir, sha, pr, post is not None, free[0], checkout,
               main=True)
-        out("STARTED %s %s%s, every step traced; %d waiting"
+        out("STARTED %s %s%s, every step%s; %d waiting"
             % (MAIN, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
+               " traced" if DEPENDS else "",
                len(queued - taken) - 1))
         return 0
     if checkout:
@@ -1700,7 +1838,8 @@ def flakes_of(state, sha, record):
                   and r.get("steps") == record["steps"])
 
 
-def matched(state_dir, sha, pr, same, tree, started, post, out=print):
+def matched(state_dir, sha, pr, same, tree, started, post, out=print,
+            main=False):
     """Record and post green for head sha without running it: its tree
     has a green verdict here already, as `same`. Only a green verdict is
     reused; a red one is always run again."""
@@ -1723,11 +1862,18 @@ def matched(state_dir, sha, pr, same, tree, started, post, out=print):
         if source.get("selection"):
             # A match is as narrow as the run it stands in for.
             record["selection"] = source["selection"]
+        if main:
+            record["main"] = True
         state["results"][sha] = record
         save(state_dir, state)
-    log(state_dir, "MATCHED #%d %s: its tree tested green as %s %s; not run "
-        "again" % (pr, sha[:10], record["matched_as"], same[:10]), started,
-        out)
+    if main:
+        log(state_dir, "MAIN-GREEN %s %s: matched; its tree tested green as "
+            "%s %s, not run again" % (MAIN, sha[:10], record["matched_as"],
+                                      same[:10]), started, out)
+    else:
+        log(state_dir, "MATCHED #%d %s: its tree tested green as %s %s; not "
+            "run again" % (pr, sha[:10], record["matched_as"], same[:10]),
+            started, out)
     if post is not None:
         posted = post(sha, *final_status(record))
         with state_lock(state_dir):
@@ -2813,7 +2959,7 @@ class Phases:
 
 def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
            post=None, chain=None, slot=1, memory_max=None, ahead=False,
-           main=False):
+           main=False, report=None):
     """Check sha, pull request pr's head, now, in this process, in
     `slot`, each step limited to memory_max (None: no limit). With
     `ahead`, sha is the Merger's prediction for pr: checked out without
@@ -2935,6 +3081,21 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 settled = True
                 return matched(state_dir, sha, pr, same, tree, started,
                                post, out)
+        if main and MAIN_EVERY and tree and (not DEPENDS or os.path.exists(
+                os.path.join(trace.records_dir(state_dir), tree + ".json"))):
+            # designs/0011: a default-branch head whose tree a green run
+            # here already passed (usually the Merger's prediction) isn't
+            # run again. With depends, only once its tree has a record,
+            # since writing that is what the traced run is for.
+            with state_lock(state_dir):
+                same = tested(load(state_dir), tree, started, ok=True)
+            if same is not None and same != sha:
+                settled = True
+                matched(state_dir, sha, 0, same, tree, started, None, out,
+                        main=True)
+                if report is not None:
+                    report(sha, True, [], same)
+                return 0
         phases.mark("match")
         pending = None
         if post is not None:
@@ -2986,7 +3147,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                            if name in reused else "ran" if name in
                            selection["ran"] else "skipped")
                 for name, _, _ in applicable(wt)))
-        if main:
+        if main and DEPENDS:
             tracer = tracer_for(state_dir, run)
             if tracer is None:
                 log(state_dir, "NO-TRACE %s %s: the %s tracer can't be used "
@@ -3104,6 +3265,9 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                    verdict_word(record),
                    (started - parse(seen)).total_seconds(),
                    record["seconds"]), finished, out)
+            if report is not None:
+                report(sha, ok, [(r["name"], r.get("tail", ""))
+                                 for r in results if r["rc"] != 0], None)
             if ok and tracer is not None:
                 record_depends(state_dir, wt, sha, tree, files, env, tracer,
                                finished, out)
@@ -3258,10 +3422,15 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
     post = make_poster(run, out, project) if args.post else None
     if args.worker:
         chain = (lambda: start_next_tick(checkout=repo)) if args.post else None
+        report = None
+        if args.main and args.post and MAIN_RED_ISSUE is not None:
+            write = make_writer(project, out)
+            report = lambda sha, ok, failed, same: report_main(
+                state_dir, repo, sha, ok, failed, same, write, out, run)
         return worker(repo, state_dir, args.worker, args.pr, run, out,
                       post=post, chain=chain, slot=args.slot,
                       memory_max=memory_max_from_env(environ),
-                      ahead=args.ahead, main=args.main)
+                      ahead=args.ahead, main=args.main, report=report)
     token = mint(run)
     if token is None:
         out("NO-TOKEN: could not mint %s's token" % POSTER)

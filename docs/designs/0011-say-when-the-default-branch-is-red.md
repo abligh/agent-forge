@@ -2,6 +2,10 @@
 
 * Status: approved (Alex, 2026-10-12, at f3bd070,
   <https://github.com/abligh/agent-forge/issues/20#issuecomment-6120521112>)
+* Implemented: v0.4.37, off until configured. A matched head is
+  logged `MAIN-GREEN … matched`; the issue's state is `main_red` and
+  `main_green` in state.json; issues are written only by a posting
+  (`--post`) run.
 * Author: XMPPEngineer
 * Date: 2026-10-12
 

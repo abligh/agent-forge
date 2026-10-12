@@ -75,7 +75,11 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
           "tracer": str, "cpu_weight": int, "fast_lane": dict,
           "merge_default": bool, "cache_limit": str, "reuse": dict,
-          "fresh": dict, "first_authors": list, "max_wait_minutes": int}
+          "fresh": dict, "first_authors": list, "max_wait_minutes": int,
+          "main": str, "main_red_issue": dict}
+# checks.main: which default-branch heads are run (designs/0011).
+MAIN_MODES = ("needed", "every")
+MAIN_RED_ISSUE = {"label": str, "title": str}
 # checks.cache_limit: a size in systemd's style, at least one byte.
 SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 # checks.fast_lane: a slot for heads whose chosen steps are cheap.
@@ -292,6 +296,18 @@ def check(data):
         _check_reuse(checks, problems)
     if isinstance(checks.get("fresh"), dict):
         _check_fresh(checks, problems)
+    if isinstance(checks.get("main"), str) \
+            and checks["main"] not in MAIN_MODES:
+        problems.append("checks.main must be one of %s"
+                        % ", ".join(MAIN_MODES))
+    if isinstance(checks.get("main_red_issue"), dict):
+        _fields("checks.main_red_issue", checks["main_red_issue"],
+                MAIN_RED_ISSUE, problems)
+        if checks.get("main", "needed") != "every" \
+                and not checks.get("depends"):
+            problems.append("checks.main_red_issue needs checks.main "
+                            "\"every\" (or checks.depends): otherwise the "
+                            "default branch is never checked")
     if isinstance(checks.get("first_authors"), list):
         agents = data.get("agents", {})
         for name in checks["first_authors"]:
