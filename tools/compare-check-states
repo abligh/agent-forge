@@ -21,9 +21,9 @@ verdict on one the trial reaches later can be from before the trial.
 
 For each head both checked, it prints those whose verdict differs.
 Then it counts the heads only one of them checked, which is expected
-for a check that started later or prunes sooner. The steps' names may differ between the two, so a
-difference in the failed steps alone is shown but not counted as a
-disagreement.
+for a check that started later or prunes sooner. The steps' names may
+differ between the two, so a difference in the failed steps alone is
+shown but not counted as a disagreement.
 
 Exit status: 0 the verdicts agree; 1 at least one head was green in one
 and red in the other; 2 a file could not be read.
