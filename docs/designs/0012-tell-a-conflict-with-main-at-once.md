@@ -1,6 +1,8 @@
 # 0012: Tell a conflict with the default branch at once
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-12, at 8a5b2cd,
+  <https://github.com/abligh/agent-forge/issues/21#issuecomment-6121146422>)
+* Implemented: v0.4.36, off until configured.
 * Author: XMPPEngineer
 * Date: 2026-10-12
 
