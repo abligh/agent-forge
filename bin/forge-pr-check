@@ -505,6 +505,9 @@ MERGER_FRESH = datetime.timedelta(minutes=10)
 # head whose tree is green here already is posted green without a run,
 # and for how long a verdict counts for another commit with its tree.
 TEST_AHEAD = False
+# merge.test_ahead.spare_slots_only (designs/0014): predictions only when
+# no ordinary head is waiting.
+SPARE_ONLY = False
 DEFAULT_MATCH_MAX_HOURS = 24
 MATCH_MAX_AGE = datetime.timedelta(hours=DEFAULT_MATCH_MAX_HOURS)
 # `checks.depends` (docs/designs/0005): each new head of the default
@@ -569,7 +572,7 @@ def configure(project):
     global REPO_SLUG, MAIN, CONFIG_PATH, STATUS_CONTEXT, POSTER, HOST
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
     global CPU_WEIGHT
-    global TEST_AHEAD, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
+    global TEST_AHEAD, SPARE_ONLY, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE
@@ -629,6 +632,7 @@ def configure(project):
                                      DEFAULT_STEP_TIMEOUT_S // 60)
     ahead = project.section("merge").get("test_ahead")
     TEST_AHEAD = ahead is not None
+    SPARE_ONLY = bool((ahead or {}).get("spare_slots_only"))
     MATCH_MAX_AGE = datetime.timedelta(hours=(ahead or {}).get(
         "max_age_hours", DEFAULT_MATCH_MAX_HOURS))
     # The configuration refuses test_ahead with merger_first false.
@@ -1627,8 +1631,9 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 # The Merger's predictions go before an ordinary pick,
                 # but not before a head that has waited max_wait, nor
                 # before the default branch's run while heads wait on
-                # its record (urgent, or held).
-                if pick is None or not (
+                # its record (urgent, or held). With spare_slots_only
+                # (designs/0014), never before an ordinary pick.
+                if pick is None or not SPARE_ONLY and not (
                         pick[1] == first_pr
                         or overdue(state["waiting"][pick[0]], when)
                         or (pick[1] == 0 and (urgent or held))):

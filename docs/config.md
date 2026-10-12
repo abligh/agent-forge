@@ -312,6 +312,7 @@ turns it on with the defaults.
 | --- | --- | --- |
 | `depth` | `3` | How many pull requests behind the one the Merger acts on are predicted, so `depth` + 1 commits in all. Deeper keeps more slots busy, but tests further into a queue that new approvals reorder. |
 | `max_age_hours` | `24` | How long a green verdict counts for another commit with the same tree, on the same host with the same steps. The steps' digest can't see a toolchain upgrade on the host. |
+| `spare_slots_only` | `false` | Whether a prediction runs only when no ordinary head is waiting, in a slot that would otherwise stay idle. Without it, predictions go before every head but the Merger's own and one that has waited `checks.max_wait_minutes`. For a host whose slots are mostly full and whose queue reorders often, where most predictions go unused. designs/0014. |
 
 How it works, and why it is safe:
 

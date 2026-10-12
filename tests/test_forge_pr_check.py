@@ -1876,6 +1876,18 @@ class TickAhead(Tick):
         self.tick([(8, SHA_B, REPO, "false")], merger_dir=merger)
         self.assertEqual(self.spawned, [(self.state_dir, SHA_B, 8, False, 1)])
 
+    def test_spare_slots_only_puts_any_waiting_head_first(self):
+        # designs/0014: predictions only in a slot nothing else wants.
+        self.write_state({"waiting": {SHA_B: {"pr": 8, "since": pc.iso(T0)}}})
+        with mock.patch.object(pc, "SPARE_ONLY", True):
+            self.tick([(8, SHA_B, REPO, "false")], merger_dir=self.merger())
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_B, 8, False, 1)])
+
+    def test_spare_slots_only_still_predicts_into_an_idle_slot(self):
+        with mock.patch.object(pc, "SPARE_ONLY", True):
+            self.tick([], merger_dir=self.merger())
+        self.assertEqual(self.spawned[0][1], SHA_P)
+
     def test_a_head_that_has_waited_max_wait_goes_before_predictions(self):
         # checks.max_wait_minutes: priority can't starve a head.
         self.write_state({"waiting": {SHA_B: {

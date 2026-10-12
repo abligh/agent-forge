@@ -46,6 +46,13 @@ class Check(unittest.TestCase):
                 data[key] = value
         return config.check(data)
 
+    def test_test_ahead_spare_slots_only_is_a_boolean(self):
+        data = example()
+        data.setdefault("merge", {})["test_ahead"] = {"spare_slots_only": True}
+        self.assertEqual(config.check(data), [])
+        data["merge"]["test_ahead"] = {"spare_slots_only": "yes"}
+        self.assertEqual(len(config.check(data)), 1)
+
     def test_drop_env_takes_names_and_prefixes(self):
         data = example()
         data["checks"]["drop_env"] = ["A_B", "RECEIVER_*"]

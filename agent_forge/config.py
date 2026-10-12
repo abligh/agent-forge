@@ -65,7 +65,7 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "right_of_way": dict, "code_owners": bool,
          "early_conflicts": bool}
 RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int}
-TEST_AHEAD = {"depth": int, "max_age_hours": int}
+TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool}
 STALL_ALERT = {"tell": list, "retell_minutes": int,
                "owner_after_minutes": int, "title": str, "labels": list}
 # checks is shared with tools not here yet, so only these keys are
