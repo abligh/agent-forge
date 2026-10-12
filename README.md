@@ -62,6 +62,7 @@ Documentation and hosts:
 | --- | --- |
 | `forge-doc-format`, `forge-doc-width`, `forge-doc-links` | Check Markdown: whitespace and headings, line width, links and anchors. |
 | `forge-install` | Moves this installation to the commit the project pins, between jobs. |
+| `forge-stats` | Reports how fast work lands: check waits and slot use, the merge queue, approval to merge per author. |
 | `forge-host-settings` | Compares a host's agent settings with the project's tracked copy, or installs it. |
 | `forge-session-start` | A SessionStart hook: tells a restarted session what died and what it owns. |
 | `forge-config` | Checks and reads the project's configuration. |

@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""How fast work lands: the build check, the merge queue and each author.
+
+    forge-stats [--since TIME] [--until TIME] [--hours H] [--json]
+                [--no-github] [--checkout DIR]
+
+Reads what forge-pr-check and forge-merger already record on this host,
+and asks GitHub when each merged pull request was approved. It changes
+nothing. TIME is ISO 8601 in UTC (`2026-10-12T09:00Z`); the window
+defaults to the last `--hours` (24) up to now.
+
+**The build check** (`verdicts.log`):
+- runs by kind: pull-request heads, the Merger's predictions (AHEAD) and
+  the default branch;
+- verdicts posted without a run (MATCHED);
+- the time each run spent waiting for a slot, and running;
+- how busy the slots were: the run time of runs that finished in the
+  window, over `checks.slots` times the window. The fast lane's runs
+  count, but not its slot, so near 100% means heads queue.
+
+**The merge queue** (`merger.jsonl`):
+- merges in the window, and per hour;
+- for each merge, the time since its head last joined the queue;
+- hand-backs by cause, each (pull request, head, cause) counted once.
+
+**Approval to merge** (GitHub): for each merged pull request, from the
+latest approval before its merge to the merge.
+
+**Each author**: merges, and the hours in the window during which she had
+at least one approved pull request not yet merged. That is time her own
+work was waiting for the queue, though not necessarily time she was
+idle. This host keeps no history of idleness.
+
+Exit status: 0 the report was written; 2 no configuration or no records.
+"""
+
+import argparse
+import collections
+import datetime
+import json
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+from agent_forge import config, github, locks  # noqa: E402
+
+VERDICT_RE = re.compile(
+    r"^(\S+) VERDICT (AHEAD )?(#\d+|main) ([0-9a-f]+): (green|red)(\S*)"
+    r"(?: waited=(\d+)s ran=(\d+)s)?")
+MAIN_RE = re.compile(r"^(\S+) MAIN-(GREEN|RED) main ([0-9a-f]+): \S+ "
+                     r"waited=(\d+)s ran=(\d+)s")
+MATCHED_RE = re.compile(r"^(\S+) MATCHED ")
+DEFAULT_SLOTS = 2
+BATCH = 40
+
+CAUSES = (
+    ("conflict", ("conflicts with", "merges nothing from")),
+    ("red", ("is failure", "is error")),
+    ("approval", ("after the approval", "approved commit",
+                  "not the clean merge")),
+    ("closing keywords", ("closing-keywords",)),
+)
+
+
+def parse_time(text):
+    """A UTC datetime from ISO 8601 (`Z`, an offset, or neither, read as
+    UTC); minutes without seconds are accepted."""
+    text = text.strip().replace("Z", "+00:00")
+    when = datetime.datetime.fromisoformat(text)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return when.astimezone(datetime.timezone.utc)
+
+
+def stamp(when):
+    return when.strftime("%Y-%m-%dT%H:%MZ")
+
+
+def percentile(values, p):
+    """Nearest-rank percentile; None for no values."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, -(-p * len(ordered) // 100))
+    return ordered[int(rank) - 1]
+
+
+def summary(values):
+    """{n, median, p90, max} of a list of numbers."""
+    return {"n": len(values), "median": percentile(values, 50),
+            "p90": percentile(values, 90),
+            "max": max(values) if values else None}
+
+
+def cause_of(reason):
+    for cause, needles in CAUSES:
+        if any(n in reason for n in needles):
+            return cause
+    return "other"
+
+
+def read_lines(path):
+    try:
+        with open(path) as handle:
+            return handle.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def check_stats(lines, since, until, slots):
+    """The build check's figures from verdicts.log's lines."""
+    runs = collections.Counter()
+    red = collections.Counter()
+    waited, ran, pr_total = [], [], []
+    matched = 0
+    busy = 0
+    for line in lines:
+        got = VERDICT_RE.match(line) or MAIN_RE.match(line)
+        if got is None:
+            hit = MATCHED_RE.match(line)
+            if hit and since <= parse_time(hit.group(1)) < until:
+                matched += 1
+            continue
+        when = parse_time(got.group(1))
+        if not since <= when < until:
+            continue
+        if got.re is MAIN_RE:
+            kind, colour = "main", got.group(2).lower()
+            w, r = int(got.group(4)), int(got.group(5))
+        else:
+            kind = "main" if got.group(3) == "main" else (
+                "prediction" if got.group(2) else "pull request")
+            colour = got.group(5)
+            if got.group(7) is None:
+                # Red at once for a conflict: nothing ran.
+                red[kind] += 1
+                runs["conflict"] += 1
+                continue
+            w, r = int(got.group(7)), int(got.group(8))
+        runs[kind] += 1
+        if colour == "red":
+            red[kind] += 1
+        waited.append(w)
+        ran.append(r)
+        busy += r
+        if kind == "pull request":
+            pr_total.append(w + r)
+    capacity = slots * (until - since).total_seconds()
+    return {"runs": dict(runs), "red": dict(red), "matched": matched,
+            "waited": summary(waited), "ran": summary(ran),
+            "pull_request_seen_to_verdict": summary(pr_total),
+            "slots": slots, "busy_seconds": busy,
+            "busy_share": round(busy / capacity, 3) if capacity else None}
+
+
+def queue_stats(records, since, until):
+    """Merges, queue times and hand-backs from merger.jsonl's records."""
+    entered, previous = {}, set()
+    merges, in_queue, handed = [], [], set()
+    for record in records:
+        at = parse_time(record["at"])
+        queue = set(record.get("queue") or [])
+        for pr in queue - previous:
+            entered[pr] = at
+        previous = queue
+        for decision in record.get("decisions") or []:
+            pr = decision.get("pr")
+            action = decision.get("action")
+            if not since <= at < until:
+                continue
+            if action == "MERGE" and decision.get("result", "done") == "done":
+                merges.append((pr, at))
+                if pr in entered:
+                    in_queue.append((at - entered[pr]).total_seconds())
+            elif action == "HAND-BACK":
+                handed.add((pr, decision.get("head"),
+                            cause_of(decision.get("reason") or "")))
+    hours = collections.Counter(at.strftime("%Y-%m-%dT%H") for _, at in merges)
+    causes = collections.Counter(c for _, _, c in handed)
+    return {"merges": len(merges), "merged": [pr for pr, _ in merges],
+            "merged_at": {pr: at for pr, at in merges},
+            "per_hour": dict(sorted(hours.items())),
+            "queue_to_merge": summary(in_queue),
+            "hand_backs": dict(causes)}
+
+
+QUERY = """query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) { %s }
+}"""
+FIELDS = ("number author { login } mergedAt "
+          "reviews(states: APPROVED, last: 30) { nodes { submittedAt } }")
+
+
+def fetch_merged(token, repo, numbers, call=github.api_call):
+    """{number: {author, merged, approved}} for merged pull requests,
+    approved being the latest approval before the merge (or None)."""
+    owner, name = repo.split("/", 1)
+    found = {}
+    numbers = sorted(set(numbers))
+    for start in range(0, len(numbers), BATCH):
+        part = numbers[start:start + BATCH]
+        body = " ".join("p%d: pullRequest(number: %d) { %s }"
+                        % (n, n, FIELDS) for n in part)
+        status, got = github.graphql(token, QUERY % body,
+                                     {"owner": owner, "name": name},
+                                     call=call)
+        repo_data = ((got or {}).get("data") or {}).get("repository") or {}
+        if status != 200 or not repo_data:
+            raise RuntimeError("GitHub answered %s: %s"
+                               % (status, json.dumps(got)[:200]))
+        for n in part:
+            pr = repo_data.get("p%d" % n)
+            if not pr or not pr.get("mergedAt"):
+                continue
+            merged = parse_time(pr["mergedAt"])
+            approvals = [parse_time(r["submittedAt"])
+                         for r in (pr.get("reviews") or {}).get("nodes") or []
+                         if r.get("submittedAt")
+                         and parse_time(r["submittedAt"]) <= merged]
+            found[n] = {"author": ((pr.get("author") or {}).get("login")
+                                   or "?"),
+                        "merged": merged,
+                        "approved": max(approvals) if approvals else None}
+    return found
+
+
+def union_seconds(spans, since, until):
+    """Seconds of [since, until) covered by any of `spans`."""
+    clipped = sorted((max(a, since), min(b, until)) for a, b in spans
+                     if b > since and a < until)
+    total, end = 0.0, None
+    for a, b in clipped:
+        if end is None or a > end:
+            total += (b - a).total_seconds()
+            end = b
+        elif b > end:
+            total += (b - end).total_seconds()
+            end = b
+    return total
+
+
+def author_stats(merged, since, until, name_of=lambda login: login):
+    """Approval to merge overall, and per author: merges, approval to
+    merge, and hours holding approved, unmerged work."""
+    waits, spans = [], collections.defaultdict(list)
+    per = collections.defaultdict(list)
+    for number, pr in merged.items():
+        author = name_of(pr["author"]) or pr["author"]
+        per[author].append(number)
+        if pr["approved"] is None:
+            continue
+        waits.append((pr["merged"] - pr["approved"]).total_seconds())
+        spans[author].append((pr["approved"], pr["merged"]))
+    authors = {}
+    for author, numbers in sorted(per.items()):
+        own = [(b - a).total_seconds() for a, b in spans[author]]
+        authors[author] = {
+            "merges": len(numbers),
+            "approval_to_merge": summary(own),
+            "hours_with_approved_work_waiting": round(
+                union_seconds(spans[author], since, until) / 3600, 1)}
+    return summary(waits), authors
+
+
+def seconds_text(value):
+    if value is None:
+        return "-"
+    if value < 120:
+        return "%d s" % value
+    if value < 7200:
+        return "%.1f min" % (value / 60)
+    return "%.1f h" % (value / 3600)
+
+
+def spread(s):
+    return "median %s, p90 %s, max %s (%d)" % (
+        seconds_text(s["median"]), seconds_text(s["p90"]),
+        seconds_text(s["max"]), s["n"])
+
+
+def report(name, since, until, check, queue, approval, authors):
+    hours = (until - since).total_seconds() / 3600
+    lines = ["forge-stats: %s, %s to %s (%.1f h)"
+             % (name, stamp(since), stamp(until), hours), "",
+             "Build check"]
+    runs = check["runs"]
+    lines.append("  runs: %d (%s); posted without a run: %d; red at once "
+                 "for a conflict: %d" % (
+                     sum(v for k, v in runs.items() if k != "conflict"),
+                     ", ".join("%s %d" % kv for kv in sorted(runs.items())
+                               if kv[0] != "conflict") or "none",
+                     check["matched"], runs.get("conflict", 0)))
+    lines.append("  red: %s" % (", ".join(
+        "%s %d" % kv for kv in sorted(check["red"].items())) or "none"))
+    lines.append("  ran: " + spread(check["ran"]))
+    lines.append("  waited for a slot: " + spread(check["waited"]))
+    lines.append("  pull-request head, waiting and run: "
+                 + spread(check["pull_request_seen_to_verdict"]))
+    if check["busy_share"] is not None:
+        lines.append("  slots busy: %.0f%% of %d slots (%.1f slot-hours)"
+                     % (100 * check["busy_share"], check["slots"],
+                        check["busy_seconds"] / 3600))
+    lines += ["", "Merge queue"]
+    lines.append("  merges: %d (%.1f an hour)"
+                 % (queue["merges"], queue["merges"] / hours if hours else 0))
+    if queue["per_hour"]:
+        lines.append("  per hour: " + " ".join(
+            "%s:%d" % (h[-2:], n) for h, n in queue["per_hour"].items()))
+    lines.append("  joined the queue to merged: "
+                 + spread(queue["queue_to_merge"]))
+    lines.append("  hand-backs: %s" % (", ".join(
+        "%s %d" % kv for kv in sorted(queue["hand_backs"].items()))
+        or "none"))
+    if approval is not None:
+        lines += ["", "Approval to merge", "  " + spread(approval), "",
+                  "Authors (merges; approval to merge; hours with approved "
+                  "work waiting)"]
+        for author, s in authors.items():
+            lines.append("  %s: %d; %s; %.1f h" % (
+                author, s["merges"],
+                spread(s["approval_to_merge"]),
+                s["hours_with_approved_work_waiting"]))
+    return "\n".join(lines)
+
+
+def jsonable(value):
+    if isinstance(value, datetime.datetime):
+        return stamp(value)
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    return value
+
+
+def main(argv=None, out=print, environ=None, now=None,
+         call=github.api_call, token=None):
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(
+        prog="forge-stats", description=__doc__.splitlines()[0])
+    parser.add_argument("--since", help="start of the window (UTC)")
+    parser.add_argument("--until", help="end of the window (default now)")
+    parser.add_argument("--hours", type=float, default=24,
+                        help="the window's length when --since is not "
+                        "given (default %(default)s)")
+    parser.add_argument("--checkout", default=environ.get(
+        "FORGE_CRON_CHECKOUT"), help="where the configuration is found "
+        "(default $FORGE_CRON_CHECKOUT, else the current directory)")
+    parser.add_argument("--no-github", action="store_true",
+                        help="leave out approval to merge and the authors")
+    parser.add_argument("--json", action="store_true",
+                        help="the figures as JSON")
+    args = parser.parse_args(argv)
+    try:
+        project = config.load(None, environ, cwd=os.path.expanduser(
+            args.checkout) if args.checkout else None)
+    except config.ConfigError as err:
+        out("NO-CONFIG: %s" % err)
+        return 2
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    until = parse_time(args.until) if args.until else now
+    since = parse_time(args.since) if args.since else \
+        until - datetime.timedelta(hours=args.hours)
+    checks = project.section("checks")
+    # The fast lane is left out: it runs only cheap heads, so counting
+    # it would hide ordinary slots that are full.
+    slots = checks.get("slots", DEFAULT_SLOTS)
+    pr_dir = locks.state_dir(project.name, "pr-check", environ)
+    merger_dir = locks.state_dir(project.name, "merger", environ)
+    verdicts = read_lines(os.path.join(pr_dir, "verdicts.log"))
+    records = []
+    for line in read_lines(os.path.join(merger_dir, "merger.jsonl")):
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            continue
+    if not verdicts and not records:
+        out("NO-RECORDS: nothing in %s or %s" % (pr_dir, merger_dir))
+        return 2
+    check = check_stats(verdicts, since, until, slots)
+    queue = queue_stats(records, since, until)
+    approval, authors = None, {}
+    if not args.no_github and queue["merged"]:
+        token = token or github.read_token(project, environ)
+        merged = fetch_merged(token, project.repo, queue["merged"], call)
+        approval, authors = author_stats(
+            merged, since, until,
+            lambda login: project.by_login(login) or login)
+    if args.json:
+        out(json.dumps(jsonable({
+            "project": project.name, "since": since, "until": until,
+            "check": check,
+            "queue": {k: v for k, v in queue.items() if k != "merged_at"},
+            "approval_to_merge": approval, "authors": authors}),
+            indent=1, sort_keys=True))
+    else:
+        out(report(project.name, since, until, check, queue, approval,
+                   authors))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
