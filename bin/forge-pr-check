@@ -82,6 +82,15 @@ other pull request's, the Merger's included, and so is a cheap one in
 the fast lane. The pulls API's author (`user.login`) is kept with the
 head. A head that failed to prepare still goes behind.
 
+**With `checks.max_wait_minutes`, no head waits on priority for ever**:
+a pull request's head that has waited that long goes before every
+other pull request's, the oldest first, the first_authors', the
+Merger's own head and its predictions included, and the `STARTED` line
+ends `, first: it has waited N minutes`. A head that failed to prepare
+is never overdue, and the default branch's traced run still goes first
+when due or urgent. Without it, a queue kept busy by the Merger's head
+and predictions could leave an ordinary head waiting for hours.
+
 **With `checks.merger_first` on, the Merger's pull request goes first**
 (default off). The Merger writes `next.json` in its state directory
 each tick, naming the pull request it is waiting on (`--merger-dir`,
@@ -295,7 +304,9 @@ as CHECK_DEPENDS. The default branch's head is queued only when a step
 is stale at its tree or no record has it (`QUEUED ... stale: ...`); it
 goes first while a waiting head, estimated against the tip, runs a
 step only because it is stale (though not before the Merger's head
-when that has no stale step), and otherwise as before. Such a head
+when that has no stale step), and otherwise as before; while a head
+is held for it, or one is urgent, the Merger's predictions don't go
+before it either. Such a head
 waits (`HELD`, and `held` in `state.json`) while the tip waits for its
 run or is running it, for at most `wait_minutes` from when it was
 first seen, then runs as now. Each tick estimates every waiting head
@@ -473,6 +484,9 @@ NEXT_TICK = ("forge-pr-check", "--post")
 DEFAULT_MERGER_FIRST = False
 # checks.first_authors: the bot logins whose pull requests go first.
 FIRST_AUTHORS = frozenset()
+# checks.max_wait_minutes: how long a pull request's head waits behind
+# others' priority before it goes first itself, or None.
+MAX_WAIT = None
 MERGER_FIRST = DEFAULT_MERGER_FIRST
 # How old the Merger's next.json and ahead.json may be and still be
 # read. An older one means the Merger has stopped, and a stopped Merger
@@ -532,7 +546,8 @@ def configure(project):
     (`context`, `poster`, `steps`, `caches`, `slots`, `memory_max`,
     `step_timeout_minutes`, `merger_first`, `depends`,
     `depends_minutes`, `tracer`, `fast_lane`, `merge_default`,
-    `cache_limit`, `reuse`, `fresh`, `first_authors`, each step's `always` and `version`),
+    `cache_limit`, `reuse`, `fresh`, `first_authors`, `max_wait_minutes`,
+    each step's `always` and `version`),
     each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
     implies `merger_first`."""
@@ -542,7 +557,7 @@ def configure(project):
     global TEST_AHEAD, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
-    global FIRST_AUTHORS
+    global FIRST_AUTHORS, MAX_WAIT
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -577,6 +592,8 @@ def configure(project):
     # author; the configuration refuses a name that isn't an agent.
     FIRST_AUTHORS = frozenset(project.bot_login(name).lower()
                               for name in checks.get("first_authors", []))
+    MAX_WAIT = datetime.timedelta(minutes=checks["max_wait_minutes"]) \
+        if "max_wait_minutes" in checks else None
     # The configuration refuses fresh without depends.
     FRESH_WAIT = datetime.timedelta(minutes=checks["fresh"].get(
         "wait_minutes", DEFAULT_FRESH_MINUTES)) if "fresh" in checks else None
@@ -898,6 +915,19 @@ def first(entry):
     return entry.get("author", "").lower() in FIRST_AUTHORS
 
 
+def overdue(entry, when):
+    """Whether a waiting pull request's head has waited MAX_WAIT
+    (checks.max_wait_minutes) or longer by `when`. One that failed to
+    prepare never is: it goes behind for a reason of its own."""
+    if MAX_WAIT is None or when is None or entry.get("main") \
+            or entry.get("errors"):
+        return False
+    try:
+        return when - parse(entry["since"]) >= MAX_WAIT
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def order(waiting, sha):
     """A head's place in the queue: one that failed to prepare goes
     behind every one that has not, then one by `checks.first_authors`
@@ -962,6 +992,13 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
             due = True
         if due or urgent or not heads:
             return newest, 0
+    # checks.max_wait_minutes: a head that has waited that long goes
+    # before every other pull request's, the oldest first, so priority
+    # can't starve it.
+    late = [s for s in heads if overdue(waiting[s], when)]
+    if late:
+        sha = min(late, key=lambda s: (waiting[s]["since"], s))
+        return sha, waiting[sha]["pr"]
     # checks.first_authors go even before the Merger's pull request,
     # unless they failed to prepare.
     top = [s for s in heads
@@ -1415,7 +1452,14 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 next_head(state, taken, first_pr, when, cheap)
             if TEST_AHEAD:
                 forget_ahead(state, ahead)
-                if pick is None or pick[1] != first_pr:
+                # The Merger's predictions go before an ordinary pick,
+                # but not before a head that has waited max_wait, nor
+                # before the default branch's run while heads wait on
+                # its record (urgent, or held).
+                if pick is None or not (
+                        pick[1] == first_pr
+                        or overdue(state["waiting"][pick[0]], when)
+                        or (pick[1] == 0 and (urgent or held))):
                     predicted = next_ahead(state, ahead, taken, when)
             if predicted is not None:
                 state.setdefault("ahead_started", {})[predicted[0]] = \
@@ -1471,7 +1515,10 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     out("STARTED #%d %s%s; %d waiting%s"
         % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
            len(queued - taken) - 1,
-           ", first: the Merger waits on it" if pr == first_pr else ""))
+           ", first: the Merger waits on it" if pr == first_pr else
+           ", first: it has waited %d minutes"
+           % (MAX_WAIT.total_seconds() // 60)
+           if overdue(state["waiting"].get(sha, {}), when) else ""))
     return 0
 
 

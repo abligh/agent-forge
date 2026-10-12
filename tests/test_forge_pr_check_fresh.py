@@ -368,7 +368,8 @@ class Tick(StateCase):
                     state["waiting"][sha].update(got)
             pc.save(state_dir, state)
 
-    def tick(self, heads=(), when=T0, slots=2, running=None):
+    def tick(self, heads=(), when=T0, slots=2, running=None,
+             merger_dir=None):
         run = FakeRun((is_pulls, done([], 0, heads_tsv(*heads))),
                       (lambda a: "rev-parse" in a,
                        done([], 0, SHA_C + "\n" + TREE + "\n")))
@@ -381,7 +382,7 @@ class Tick(StateCase):
             return pc.tick(self.state_dir, "tok", run,
                            lambda *a, **k: self.spawned.append((a, k)),
                            self.lines.append, when=when, slots=slots,
-                           checkout="/repo")
+                           checkout="/repo", merger_dir=merger_dir)
 
     def test_the_tip_goes_first_and_the_stale_head_waits(self):
         self.assertEqual(self.tick([(7, SHA_A, REPO, "false")]), 0)
@@ -395,6 +396,17 @@ class Tick(StateCase):
         self.assertEqual(self.state()["waiting"][SHA_A]["held"],
                          "list stale; waits for main cccccccccc's record, "
                          "at most 15m")
+
+    def test_the_tip_goes_before_the_mergers_predictions_too(self):
+        # A held head waits on the tip's record; a prediction run first
+        # would only make it wait out wait_minutes for nothing.
+        prediction = {"pr": 2, "sha": "d" * 40, "tree": "e" * 40}
+        with mock.patch.object(pc, "TEST_AHEAD", True), \
+                mock.patch.object(pc, "merger_first", lambda *a: None), \
+                mock.patch.object(pc, "merger_ahead",
+                                  lambda *a: [prediction]):
+            self.tick([(7, SHA_A, REPO, "false")], merger_dir="/merger")
+        self.assertEqual([a[1:3] for a, _ in self.spawned], [(SHA_C, 0)])
 
     def test_a_head_that_needs_no_fresh_record_runs_beside_it(self):
         self.estimates[SHA_A]["stale_steps"] = []

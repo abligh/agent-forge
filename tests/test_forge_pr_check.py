@@ -1848,6 +1848,25 @@ class TickAhead(Tick):
         self.tick([(8, SHA_B, REPO, "false")], merger_dir=merger)
         self.assertEqual(self.spawned, [(self.state_dir, SHA_B, 8, False, 1)])
 
+    def test_a_head_that_has_waited_max_wait_goes_before_predictions(self):
+        # checks.max_wait_minutes: priority can't starve a head.
+        self.write_state({"waiting": {SHA_B: {
+            "pr": 8, "since": pc.iso(T0 - datetime.timedelta(minutes=31))}}})
+        with mock.patch.object(pc, "MAX_WAIT",
+                               datetime.timedelta(minutes=30)):
+            self.tick([(8, SHA_B, REPO, "false")], merger_dir=self.merger())
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_B, 8, False, 1)])
+        self.assertEqual(self.lines[-1], "STARTED #8 %s; 0 waiting, first: "
+                         "it has waited 30 minutes" % SHA_B[:10])
+
+    def test_one_that_has_not_yet_still_goes_after_them(self):
+        self.write_state({"waiting": {SHA_B: {
+            "pr": 8, "since": pc.iso(T0 - datetime.timedelta(minutes=29))}}})
+        with mock.patch.object(pc, "MAX_WAIT",
+                               datetime.timedelta(minutes=30)):
+            self.tick([(8, SHA_B, REPO, "false")], merger_dir=self.merger())
+        self.assertEqual(self.spawned[0][1], SHA_P)
+
     def test_nothing_to_predict_and_nothing_waiting_is_idle(self):
         self.write_state(dict(empty(), results={SHA_P: verdict(pr=2)}))
         self.tick([], merger_dir=self.merger())

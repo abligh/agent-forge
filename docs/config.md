@@ -255,7 +255,8 @@ changed for every pull request. With `fresh` (and `depends`):
   while a waiting head runs a step only because it is stale (but not
   before the Merger's head when that has no stale step: the traced run
   would only delay the merge), and otherwise once it has waited
-  `depends_minutes`, as before.
+  `depends_minutes`, as before. While a head waits on it like that,
+  the Merger's predictions (`merge.test_ahead`) don't go before it.
 * **A head that would run a step only because it is stale waits**
   (`HELD` in the tick's output, `held` in `state.json`) while the
   default branch's head waits for its traced run or is running it, for
@@ -520,6 +521,7 @@ reasons.
 | `merger_first` | `false` | Start first a waiting head of the pull request the Merger waits on (its `next.json`, read while under 10 minutes old), since the next merge waits on its verdict; every other head is then started oldest first, as without it. It only orders: a free slot is never kept empty for the Merger, whose wait may be on something no check here ends. `merge.test_ahead` turns it on, and refuses `false`. |
 | `first_authors` | none | Agent names whose pull requests are checked first: a waiting head of one goes before every other pull request's, in the slots (even before the Merger's) and in the fast lane, the oldest of them first. A head that failed to prepare still goes behind, and the default branch's traced run still goes first when it is due. For a project's own build and tooling work, which speeds up every other check. |
 | `depends` | `false` | Run each new head of the default branch in full under a tracer, recording what each step reads, and run a pull request's head with only the steps that read what it changes (designs/0005; see below). |
+| `max_wait_minutes` | none | A pull request's head that has waited this long goes before every other pull request's, the oldest first: before `first_authors`, the Merger's own head and the Merger's predictions (`merge.test_ahead`). So priority can't starve an ordinary head beyond about this plus one run. A head that failed to prepare is never overdue; the default branch's traced run still goes first when due or urgent. At least 1. |
 | `depends_minutes` | `30` | How long the newest default-branch head waits behind pull requests' heads before it goes first. |
 | `tracer` | `preload` | How `depends` traces: `preload`, an `LD_PRELOAD` library built from lib/forge-trace.c with the host's C compiler (no root, cheap, blind to statically linked programs), or `strace` (everything, slower; needs strace installed). |
 | `fast_lane` | none | `{"max_seconds": 60}`: one more slot, for heads whose chosen steps are cheap (designs/0006; see below). Refused without `depends`. |

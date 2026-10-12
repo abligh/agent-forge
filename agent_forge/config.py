@@ -74,7 +74,7 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
           "tracer": str, "cpu_weight": int, "fast_lane": dict,
           "merge_default": bool, "cache_limit": str, "reuse": dict,
-          "fresh": dict, "first_authors": list}
+          "fresh": dict, "first_authors": list, "max_wait_minutes": int}
 # checks.cache_limit: a size in systemd's style, at least one byte.
 SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 # checks.fast_lane: a slot for heads whose chosen steps are cheap.
@@ -278,7 +278,8 @@ def check(data):
     for key, kinds in CHECKS.items():
         if key in checks and not _is(checks[key], kinds):
             problems.append("checks.%s must be %s" % (key, _type_name(kinds)))
-    for key in ("slots", "step_timeout_minutes", "depends_minutes"):
+    for key in ("slots", "step_timeout_minutes", "depends_minutes",
+                "max_wait_minutes"):
         if _is(checks.get(key), int) and checks[key] < 1:
             problems.append("checks.%s must be at least 1" % key)
     if _is(checks.get("cpu_weight"), int) \
