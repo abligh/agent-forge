@@ -61,6 +61,7 @@ Documentation and hosts:
 | Tool | What it does |
 | --- | --- |
 | `forge-doc-format`, `forge-doc-width`, `forge-doc-links` | Check Markdown: whitespace and headings, line width, links and anchors. |
+| `forge-install` | Moves this installation to the commit the project pins, between jobs. |
 | `forge-host-settings` | Compares a host's agent settings with the project's tracked copy, or installs it. |
 | `forge-session-start` | A SessionStart hook: tells a restarted session what died and what it owns. |
 | `forge-config` | Checks and reads the project's configuration. |
@@ -81,7 +82,13 @@ To hold a host to a version, the project commits `.agent-forge/pin`:
 the full commit SHA it approved, optionally followed by the tag.
 `forge-cron-run` then runs nothing while the installation's `HEAD` is
 any other commit ([docs/config.md](docs/config.md#the-pin)). A tag can
-be moved; a commit can't.
+be moved; a commit can't. `forge-install`, run from cron every few
+minutes, moves the installation to the pin once it changes, between
+jobs:
+
+```sh
+*/5 * * * * FORGE_CRON_CHECKOUT=$HOME/my-project-cron $HOME/.local/share/agent-forge/bin/forge-install
+```
 
 ## Tests
 

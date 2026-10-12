@@ -89,3 +89,50 @@ def locked(path):
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+# The installation lock (agent-forge's own code, not a project's state).
+# forge-cron-run holds it shared for the whole of every job, and hands it
+# down to what the job starts (a forge-pr-check worker outlives its
+# tick), so a job never runs part on one release and part on another.
+# forge-install takes it exclusively to move the installation, after
+# leaving the "wanted" marker that stops new jobs starting, so that a
+# host whose checks never all stop at once still drains for it.
+INSTALL_LOCK_FD = "FORGE_INSTALL_LOCK_FD"
+# A marker older than this was left by an installer that died; ignored.
+INSTALL_WANTED_MAX_S = 3600
+
+
+def install_lock_path(install):
+    """`<install>.lock`, beside the installation rather than in it, so a
+    fresh clone renamed into place keeps the same lock."""
+    return os.path.abspath(install).rstrip("/") + ".lock"
+
+
+def install_wanted_path(install):
+    return os.path.abspath(install).rstrip("/") + ".install-wanted"
+
+
+def install_wanted(install, now=None):
+    """Whether an installer is waiting to move `install`: its marker
+    exists and is younger than INSTALL_WANTED_MAX_S."""
+    import time
+    try:
+        age = (time.time() if now is None else now) - os.stat(
+            install_wanted_path(install)).st_mtime
+    except OSError:
+        return False
+    return age < INSTALL_WANTED_MAX_S
+
+
+def inherited_install_lock(environ=None):
+    """The descriptor of the installation lock this process was handed
+    (`$FORGE_INSTALL_LOCK_FD`), to pass on to a process it starts, or
+    None when it has none."""
+    environ = os.environ if environ is None else environ
+    try:
+        fd = int(environ.get(INSTALL_LOCK_FD, ""))
+        os.fstat(fd)
+    except (ValueError, OSError):
+        return None
+    return fd

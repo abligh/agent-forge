@@ -1339,6 +1339,9 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
                   "fast lane" if slot == LANE else "slot %d" % slot,
                   " ahead" if ahead else ""))
     wlog.flush()
+    # The installation lock forge-cron-run handed this tick goes on to
+    # the worker, which outlives it: the release can't move under a run.
+    held = locks.inherited_install_lock()
     subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--worker", sha,
          "--pr", str(pr), "--state-dir", state_dir, "--slot", str(slot)]
@@ -1347,7 +1350,8 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
         + (["--ahead"] if ahead else [])
         + (["--main"] if main else []),
         cwd=state_dir, stdin=subprocess.DEVNULL, stdout=wlog,
-        stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+        stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
+        pass_fds=() if held is None else (held,))
     wlog.close()
 
 

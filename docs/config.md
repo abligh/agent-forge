@@ -553,6 +553,22 @@ they are held to it too. A project that wants a pin bump reviewed as
 carefully as a change of who may approve should give the file the same
 code owner as the configuration.
 
+`forge-install` keeps the installation at the pin. Run it directly from
+cron (not through `forge-cron-run`, which would refuse it for the very
+mismatch it is there to end). It checks out only the pinned commit,
+never a tag. It refuses an installation with local changes or another
+`origin`. It moves the installation only between jobs:
+* `forge-cron-run` holds the installation's lock (`<install>.lock`,
+  beside it) shared for each whole job, and hands it on to what the job
+  starts. A forge-pr-check worker outlives its tick, so a check never
+  runs part on one release and part on another.
+* `forge-install` first leaves `<install>.install-wanted`, which stops
+  new jobs starting (`INSTALL-PENDING`), then takes the lock
+  exclusively. It waits up to `--wait` seconds (default 240), and
+  otherwise exits 1 for the next run to wait again.
+* A marker over an hour old was left by an installer that died, and is
+  ignored.
+
 ## Where state lives
 
 Each tool keeps its state in

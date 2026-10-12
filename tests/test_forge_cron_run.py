@@ -66,9 +66,11 @@ class CronRun(unittest.TestCase):
                           "HEAD").stdout.strip()
 
     def run_tool(self, *argv, env=None, mint=None):
+        # Not the real installation: its lock file would land beside it.
         return tool.main(list(argv), dict(self.env, **(env or {})),
                          mint or (lambda repo, app: "ghs_" + app),
-                         err=self.err.append)
+                         err=self.err.append,
+                         install=os.path.join(self.r.dir, "install"))
 
     def log(self, name="report"):
         with open(os.path.join(self.logs, name + ".log")) as handle:
@@ -171,6 +173,53 @@ class CronRun(unittest.TestCase):
 
     def test_no_pin_checks_nothing(self):
         self.assertEqual(self.run_installed(os.path.join(self.r.dir, "x")), 0)
+
+    # The installation's lock (forge-install moves it only between jobs).
+
+    HOLDS = """#!/bin/sh
+echo "fd=${FORGE_INSTALL_LOCK_FD:-none}"
+if flock -n -x "$LOCK" true; then echo lock=free; else echo lock=held; fi
+"""
+
+    def test_the_tool_holds_the_installations_lock_for_its_run(self):
+        install, sha = self.install_at()
+        self.add_tool("holds", self.HOLDS)
+        self.pin("%s v0.1.0\n" % sha)
+        lock = install + ".lock"
+        self.assertEqual(tool.main(["holds"], dict(self.env, LOCK=lock),
+                                   lambda repo, app: "x",
+                                   err=self.err.append, install=install), 0)
+        log = self.log("holds")
+        self.assertIn("lock=held\n", log)
+        self.assertNotIn("fd=none", log)
+        # And lets it go when the run ends.
+        with open(lock) as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_nothing_starts_while_an_install_is_wanted(self):
+        install, sha = self.install_at()
+        self.pin("%s v0.1.0\n" % sha)
+        open(install + ".install-wanted", "w").close()
+        self.assertEqual(self.run_installed(install), 2)
+        log = self.log()
+        self.assertIn("INSTALL-PENDING", log)
+        self.assertNotIn("cwd=", log)
+
+    def test_a_stale_install_marker_is_ignored(self):
+        install, sha = self.install_at()
+        self.pin("%s v0.1.0\n" % sha)
+        marker = install + ".install-wanted"
+        open(marker, "w").close()
+        os.utime(marker, (1, 1))
+        self.assertEqual(self.run_installed(install), 0)
+
+    def test_an_install_in_progress_is_waited_for_then_given_up_on(self):
+        install, sha = self.install_at()
+        self.pin("%s v0.1.0\n" % sha)
+        with open(install + ".lock", "a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertEqual(self.run_installed(install), 2)
+        self.assertIn("LOCK-TIMEOUT: forge-install held", self.log())
 
     def test_no_checkout_is_2_and_says_so(self):
         self.assertEqual(self.run_tool("report", env={

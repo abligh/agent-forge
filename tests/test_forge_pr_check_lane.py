@@ -99,6 +99,26 @@ class Names(unittest.TestCase):
         self.assertEqual(argv[argv.index("--slot") + 1], str(pc.LANE))
 
 
+    def test_the_worker_inherits_the_installations_lock(self):
+        # forge-cron-run hands the tick the lock; the worker outlives the
+        # tick, so it must hold it too, or forge-install could move the
+        # release under a running check.
+        with tempfile.TemporaryDirectory() as state_dir, \
+                open(os.path.join(state_dir, "x.lock"), "a") as held, \
+                mock.patch.dict(os.environ, {
+                    "FORGE_INSTALL_LOCK_FD": str(held.fileno())}), \
+                mock.patch.object(pc.subprocess, "Popen") as popen:
+            pc.spawn_worker(state_dir, SHA_A, 7)
+            fd = held.fileno()
+        self.assertEqual(popen.call_args.kwargs["pass_fds"], (fd,))
+
+    def test_a_worker_without_the_lock_is_still_started(self):
+        with tempfile.TemporaryDirectory() as state_dir, \
+                mock.patch.dict(os.environ, {"FORGE_INSTALL_LOCK_FD": "x"}), \
+                mock.patch.object(pc.subprocess, "Popen") as popen:
+            pc.spawn_worker(state_dir, SHA_A, 7)
+        self.assertEqual(popen.call_args.kwargs["pass_fds"], ())
+
 class StepCosts(unittest.TestCase):
 
     def test_the_median_of_the_last_twenty_runs(self):

@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Keep this agent-forge installation at the commit a project pins.
+
+    forge-install [--checkout DIR] [--install DIR] [--wait SECONDS]
+    forge-install --dry-run
+
+`forge-cron-run` runs a tool only when the installation it runs from is
+a git checkout whose `HEAD` is the commit the project's
+`.agent-forge/pin` names; otherwise every job exits `PIN-MISMATCH`.
+Run from cron every few minutes (directly, not through forge-cron-run,
+which would refuse it for the very mismatch it is there to end), this
+makes the installation follow the pin:
+
+**Only ever the pinned commit.** The pin's first word is a full commit
+SHA, and that SHA is the only thing checked out, detached: never a tag
+or a branch, since a tag can move. So it never installs ahead of the
+pin.
+
+**Never under a running job.** forge-cron-run holds the installation's
+lock (`<install>.lock`, beside it) shared for each whole job, and hands
+it on to what the job starts, such as a forge-pr-check worker. This
+takes it exclusively to move the installation. First it leaves a marker
+(`<install>.install-wanted`) that stops forge-cron-run starting
+anything new (`INSTALL-PENDING`), so running jobs drain even on a host
+whose checks never all stop at once. It waits up to `--wait` seconds
+(default 240); if they haven't drained, it exits 1, leaving the marker,
+and the next run waits again. The marker is removed once the
+installation is moved, and one older than an hour (an installer that
+died) is ignored.
+
+**It refuses rather than guesses.** An installation whose `origin`
+isn't `--url`, or that has local changes, or a pin that isn't a full
+SHA: exit 2, nothing touched. A fetch or checkout that fails leaves
+the installation where it was: exit 1. A missing installation is cloned
+beside its path and renamed into place, so a half-made clone is never
+the installation.
+
+Exit status: 0 at the pin, now installed, or no pin; 1 a step failed or
+the jobs didn't drain in time (nothing changed); 2 refused.
+"""
+
+import argparse
+import fcntl
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+from agent_forge import config, locks  # noqa: E402
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+DEFAULT_URL = "https://github.com/abligh/agent-forge.git"
+PIN_NAME = os.path.join(config.CONFIG_DIR, "pin")
+GIT_TIMEOUT_S = 120
+
+
+class Refused(Exception):
+    """Exit 2: something here isn't what this tool may change."""
+
+
+class Failed(Exception):
+    """Exit 1: a step failed or timed out, and nothing was changed."""
+
+
+def git(args, cwd=None):
+    """git; a timeout comes back as exit 124, as timeout(1) reports it."""
+    try:
+        return subprocess.run(["git"] + args, cwd=cwd, capture_output=True,
+                              text=True, timeout=GIT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            ["git"] + args, 124, "", "timed out after %ss" % GIT_TIMEOUT_S)
+
+
+def read_pin(checkout):
+    """The pinned SHA, or None when the checkout has no pin."""
+    try:
+        with open(os.path.join(checkout, PIN_NAME)) as handle:
+            words = handle.read().split()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise Refused("BAD-PIN: can't read %s: %s" % (PIN_NAME, e.strerror))
+    pin = words[0].lower() if words else ""
+    if not SHA_RE.match(pin):
+        raise Refused("BAD-PIN: %s must start with a full 40-character "
+                      "commit SHA, not %r" % (PIN_NAME, pin[:50]))
+    return pin
+
+
+def same_url(a, b):
+    def norm(u):
+        u = u.strip().rstrip("/")
+        return u[:-4] if u.endswith(".git") else u
+    return norm(a) == norm(b)
+
+
+def head(install, run=git):
+    got = run(["-C", install, "rev-parse", "HEAD"])
+    return got.stdout.strip().lower() if got.returncode == 0 else ""
+
+
+def check_clone(install, url, run=git):
+    """Refuse an installation that isn't a clean clone of `url`."""
+    got = run(["-C", install, "remote", "get-url", "origin"])
+    if got.returncode != 0 or not same_url(got.stdout, url):
+        raise Refused("FOREIGN: %s's origin is %r, not %s; not touching it"
+                      % (install, got.stdout.strip(), url))
+    got = run(["-C", install, "status", "--porcelain"])
+    if got.returncode != 0:
+        raise Failed("git status in %s: %s" % (install, got.stderr.strip()))
+    if got.stdout.strip():
+        raise Refused("DIRTY: %s has local changes; not touching it:\n%s"
+                      % (install, got.stdout.rstrip()))
+
+
+def has_commit(repo, sha, run=git):
+    return run(["-C", repo, "cat-file", "-e", sha + "^{commit}"]) \
+        .returncode == 0
+
+
+def fetch_pin(repo, url, pin, run=git):
+    """Make `pin` present in `repo`: by SHA first, which GitHub serves for
+    a reachable commit, then every ref, for a server that won't."""
+    for args in (["fetch", "-q", "origin", pin], ["fetch", "-q", "origin"]):
+        if has_commit(repo, pin, run):
+            return
+        run(["-C", repo] + args)
+    if not has_commit(repo, pin, run):
+        raise Failed("can't fetch %s from %s" % (pin, url))
+
+
+def checkout(repo, pin, run=git):
+    got = run(["-C", repo, "checkout", "-q", "--detach", pin])
+    if got.returncode != 0:
+        raise Failed("git checkout %s: %s" % (pin, got.stderr.strip()))
+    now = head(repo, run)
+    if now != pin:
+        raise Failed("%s is at %s after checking out %s"
+                     % (repo, now[:12] or "nothing", pin[:12]))
+
+
+def clone_into_place(install, url, pin, run=git):
+    """A new installation: cloned beside `install` and renamed into place
+    only once it is at the pin."""
+    temp = install.rstrip("/") + ".new"
+    shutil.rmtree(temp, ignore_errors=True)
+    got = run(["clone", "-q", "--no-checkout", url, temp])
+    if got.returncode != 0:
+        shutil.rmtree(temp, ignore_errors=True)
+        raise Failed("git clone %s: %s" % (url, got.stderr.strip()))
+    try:
+        fetch_pin(temp, url, pin, run)
+        checkout(temp, pin, run)
+        os.rename(temp, install)
+    except (Failed, OSError):
+        shutil.rmtree(temp, ignore_errors=True)
+        raise
+
+
+def drained(install, wait, clock=time.monotonic, nap=time.sleep):
+    """The installation's lock, held exclusively, once every job holding
+    it shared has finished; None if they haven't within `wait` seconds.
+    The wanted marker is left first, so no new job starts meanwhile."""
+    with open(locks.install_wanted_path(install), "a"):
+        pass
+    os.utime(locks.install_wanted_path(install))
+    handle = open(locks.install_lock_path(install), "a")
+    deadline = clock() + wait
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except OSError:
+            if clock() >= deadline:
+                handle.close()
+                return None
+            nap(1)
+
+
+def install_pin(install, url, pin, wait, run=git, dry_run=False,
+                clock=time.monotonic, nap=time.sleep):
+    """Bring `install` to `pin`; the line that says what was done."""
+    fresh = not os.path.exists(install)
+    if not fresh:
+        check_clone(install, url, run)
+        was = head(install, run)
+        if was == pin:
+            if os.path.exists(locks.install_wanted_path(install)):
+                os.unlink(locks.install_wanted_path(install))
+            return "AT-PIN: %s is at %s" % (install, pin[:12])
+    if dry_run:
+        return ("WOULD-CLONE: %s into %s at %s" % (url, install, pin[:12])
+                if fresh else "WOULD-INSTALL: %s from %s to %s"
+                % (install, was[:12] or "nothing", pin[:12]))
+    if fresh:
+        clone_into_place(install, url, pin, run)
+        return "INSTALLED: %s cloned at %s" % (install, pin[:12])
+    # Fetched before waiting for the lock: jobs keep running meanwhile.
+    fetch_pin(install, url, pin, run)
+    held = drained(install, wait, clock, nap)
+    if held is None:
+        raise Failed("jobs still hold %s after %gs (new ones are held off; "
+                     "the next run waits again)"
+                     % (locks.install_lock_path(install), wait))
+    with held:
+        checkout(install, pin, run)
+        os.unlink(locks.install_wanted_path(install))
+    return "INSTALLED: %s from %s to %s" % (install, was[:12], pin[:12])
+
+
+def main(argv=None, run=git, out=print, err=None, environ=None,
+         clock=time.monotonic, nap=time.sleep):
+    environ = os.environ if environ is None else environ
+    err = err or (lambda line: print(line, file=sys.stderr))
+    parser = argparse.ArgumentParser(
+        prog="forge-install", description=__doc__.splitlines()[0])
+    parser.add_argument("--checkout", default=environ.get(
+        "FORGE_CRON_CHECKOUT"), help="the project's cron checkout, whose "
+        "pin is followed (default $FORGE_CRON_CHECKOUT)")
+    parser.add_argument("--install", default=os.path.dirname(HERE),
+                        help="the installation to move (default this one)")
+    parser.add_argument("--url", default=DEFAULT_URL,
+                        help="where agent-forge is cloned from "
+                        "(default %(default)s)")
+    parser.add_argument("--wait", type=float, default=240,
+                        help="seconds to wait for running jobs to finish "
+                        "(default %(default)s)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="say what would be done, change nothing")
+    args = parser.parse_args(argv)
+    if not args.checkout:
+        err("forge-install: no --checkout, and FORGE_CRON_CHECKOUT is not "
+            "set")
+        return 2
+    install = os.path.abspath(os.path.expanduser(args.install))
+    try:
+        pin = read_pin(os.path.expanduser(args.checkout))
+        if pin is None:
+            out("NO-PIN: %s has no %s; nothing to install"
+                % (args.checkout, PIN_NAME))
+            return 0
+        out(install_pin(install, args.url, pin, args.wait, run, args.dry_run,
+                        clock, nap))
+        return 0
+    except Refused as why:
+        err("forge-install: %s" % why)
+        return 2
+    except Failed as why:
+        err("forge-install: FAILED: %s; %s is unchanged" % (why, install))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

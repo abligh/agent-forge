@@ -82,7 +82,7 @@ import time
 HERE = os.path.dirname(os.path.realpath(__file__))
 INSTALL = os.path.dirname(HERE)
 sys.path.insert(0, INSTALL)
-from agent_forge import config, github  # noqa: E402
+from agent_forge import config, github, locks  # noqa: E402
 
 
 class Stop(Exception):
@@ -247,6 +247,7 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
     repo_lock = open(os.path.expanduser(environ.get("FORGE_CRON_LOCK") or
                      os.path.join(logdir, ".forge-cron.%s.lock" % key)), "a")
     started = []
+    handles = []
 
     def write(line):
         log.write(line + "\n")
@@ -297,6 +298,14 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
                     return give_up("another job held the checkout's lock")
             write("at %s" % git(repo, "rev-parse", "--short",
                                 "HEAD").stdout.strip())
+            if locks.install_wanted(install):
+                raise Stop("INSTALL-PENDING: forge-install is waiting to "
+                           "move %s; nothing new starts until it has"
+                           % install)
+            install_lock = open(locks.install_lock_path(install), "a")
+            handles.append(install_lock)
+            if not lock(install_lock, False, deadline, clock, nap):
+                return give_up("forge-install held the installation's lock")
             check_pin(repo, install)
             path = tool_path(repo, tool)
             app = environ.get("FORGE_CRON_APP")
@@ -307,17 +316,21 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
             write(str(e))
             write("exit=2")
             return 2
-        # The locks stay with this process: a child that outlived the run
-        # holding copies would hold them too.
+        # The checkout's and the tool's locks stay with this process: a
+        # child that outlived the run holding copies would hold them too.
+        # The installation's goes with the tool, and on to what it starts
+        # (a worker outlives its tick), so no part of the job runs on a
+        # release other than the one it was started on.
+        env[locks.INSTALL_LOCK_FD] = str(install_lock.fileno())
         rc = subprocess.call([path] + args, cwd=repo, env=env, stdout=log,
                              stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                             close_fds=True)
+                             close_fds=True, pass_fds=(install_lock.fileno(),))
         if rc < 0:
             rc = 128 - rc   # killed by a signal, as a shell reports it
         write("exit=%d" % rc)
         return rc
     finally:
-        for handle in (repo_lock, tool_lock, log):
+        for handle in handles + [repo_lock, tool_lock, log]:
             handle.close()
 
 
