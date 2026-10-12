@@ -2246,6 +2246,75 @@ class YieldPlaces(unittest.TestCase):
                          ([1, 2, 3], {}))
 
 
+class YieldsSpent(unittest.TestCase):
+    """A yield is spent by the merges that overtake it."""
+
+    def setUp(self):
+        m.configure(project(yield_after_hand_back=2))
+        self.addCleanup(m.configure, project())
+
+    @staticmethod
+    def hand_back(pr, head="h", reason="red", queue=()):
+        return {"at": "t", "queue": list(queue),
+                "decisions": [{"action": "HAND-BACK", "pr": pr, "head": head,
+                               "reason": reason, "to": "author",
+                               "result": "done"}]}
+
+    @staticmethod
+    def merge(pr, queue):
+        return {"at": "t", "queue": list(queue),
+                "decisions": [{"action": "MERGE", "pr": pr,
+                               "result": "done"}]}
+
+    def test_each_merge_while_it_is_queued_is_a_place_spent(self):
+        records = [self.hand_back(1),
+                   self.merge(2, [2, 3, 1]), self.merge(3, [3, 4, 1])]
+        self.assertEqual(m.yields_spent(records), {1: 2})
+
+    def test_merges_while_it_is_not_a_candidate_spend_nothing(self):
+        records = [self.hand_back(1), self.merge(2, [2, 3]),
+                   self.merge(3, [3, 1])]
+        self.assertEqual(m.yields_spent(records), {1: 1})
+
+    def test_a_new_hand_back_starts_the_count_again(self):
+        records = [self.hand_back(1), self.merge(2, [2, 1]),
+                   self.hand_back(1, head="h2"), self.merge(3, [3, 1])]
+        self.assertEqual(m.yields_spent(records), {1: 1})
+
+    def test_a_refused_merge_or_ones_own_merge_spends_nothing(self):
+        refused = self.merge(2, [2, 1])
+        refused["decisions"][0]["result"] = "refused: 405"
+        records = [self.hand_back(1), refused, self.merge(1, [1, 2])]
+        self.assertEqual(m.yields_spent(records), {1: 0})
+
+    def test_a_conflict_left_out_is_not_a_start(self):
+        records = [self.hand_back(1, reason=m.CONFLICT_REASON),
+                   self.merge(2, [2, 1])]
+        self.assertEqual(m.yields_spent(records, conflicts=False), {})
+
+    def test_the_oldest_candidate_reaches_the_front(self):
+        """The case that found it: the oldest candidate, handed back once
+        and approved again, behind a queue that never drains below
+        three. Taken afresh each tick, its yield kept it third for three
+        hours while fifteen others merged; spent, it goes first once two
+        have."""
+        queue = [pr(n) for n in (1, 2, 3, 4)]
+        records = [self.hand_back(1)]
+        newcomer = 5
+        for _ in range(2):
+            got, _ = m.yield_places(list(queue), queue, {1: 1},
+                                    spent=m.yields_spent(records))
+            self.assertNotEqual(got[0]["number"], 1)
+            first = got[0]["number"]
+            records.append(self.merge(first, [p["number"] for p in got]))
+            queue = [p for p in queue if p["number"] != first]
+            queue.append(pr(newcomer))
+            newcomer += 1
+        got, moved = m.yield_places(list(queue), queue, {1: 1},
+                                    spent=m.yields_spent(records))
+        self.assertEqual((got[0]["number"], moved), (1, {}))
+
+
 class YieldAfterHandBack(RepoCase):
     """The tick: history read from this state directory's record."""
 

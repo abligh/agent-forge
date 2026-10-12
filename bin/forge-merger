@@ -65,7 +65,10 @@ every prediction behind it wasted. With it, a candidate handed back K
 times in the last 24 hours (to its author, distinct heads and reasons
 in this state directory's record, K at most `merge.yield_cap`, default
 3) is moved
-back N times K places after the order above, within its group: a pull
+back N times K places after the order above, less one for each other
+pull request that has merged while it was a candidate since its latest
+such hand-back (so the yield is spent, not a standing penalty), within
+its group: a pull
 request another is blocked by is never moved behind one that isn't,
 and none past the group's end. A hand-back to the approving reviewer
 (a fresh review is wanted), holds, waits and stall alerts don't count. With `test_ahead`, the pull request a run is in flight for
@@ -777,14 +780,44 @@ def conflict_hand_backs(records):
     return counts
 
 
-def yield_places(queue, everyone, counts, keep=None):
+def yields_spent(records, conflicts=True):
+    """{pr: how many other pull requests merged while it was a candidate,
+    since its latest hand-back to its author} in `records` (oldest
+    first; see `author_hand_backs` for what counts as a hand-back, and
+    `hand_backs` for `conflicts`). Each such merge is a place it has
+    already yielded: `yield_places` moves it back only by what it still
+    owes. Without this, a yield taken afresh from every tick's order is
+    a standing penalty, and the oldest candidate, first in that order,
+    can't reach the front while enough others are ready."""
+    last, spent = {}, {}
+    for record in records:
+        for d in record.get("decisions") or ():
+            if not isinstance(d, dict) or d.get("action") != "HAND-BACK" \
+                    or d.get("to") != "author" \
+                    or str(d.get("result") or "").startswith("refused"):
+                continue
+            if conflicts or d.get("reason") != CONFLICT_REASON:
+                last[d.get("pr")] = record
+                spent[d.get("pr")] = 0
+        queue = record.get("queue") or ()
+        merged = {d.get("pr") for d in record.get("decisions") or ()
+                  if isinstance(d, dict) and d.get("action") == "MERGE"
+                  and d.get("result") == "done"}
+        for pr in spent:
+            if record is not last[pr] and pr in queue:
+                spent[pr] += len(merged - {pr})
+    return spent
+
+
+def yield_places(queue, everyone, counts, keep=None, spent=None):
     """(`queue` reordered, {pr: places moved back}): each pull request
     handed back K times (`counts`, K at most YIELD_CAP) moved back
-    YIELD_PLACES times K places within its group, those another open
-    pull request is blocked by being one group and the rest the other.
-    `keep`, the pull request a run is in flight for, never moves. Later
-    ones are moved first, so one yielding never takes a place another
-    yielded."""
+    YIELD_PLACES times K places within its group, less the places it
+    has already yielded (`spent`, see `yields_spent`), those another
+    open pull request is blocked by being one group and the rest the
+    other. `keep`, the pull request a run is in flight for, never moves.
+    Later ones are moved first, so one yielding never takes a place
+    another yielded."""
     named = set()
     for pr in everyone:
         named |= blockers_of(pr)
@@ -795,9 +828,10 @@ def yield_places(queue, everyone, counts, keep=None):
         for i in range(len(group) - 1, -1, -1):
             pr = group[i]
             k = min(counts.get(pr["number"], 0), YIELD_CAP)
-            if not k or pr["number"] == keep:
+            owed = YIELD_PLACES * k - (spent or {}).get(pr["number"], 0)
+            if owed <= 0 or pr["number"] == keep:
                 continue
-            to = min(i + YIELD_PLACES * k, len(group) - 1)
+            to = min(i + owed, len(group) - 1)
             if to > i:
                 group.insert(to, group.pop(i))
                 moved[pr["number"]] = to - i
@@ -1780,7 +1814,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                                  when - YIELD_WINDOW)
     if YIELD_PLACES:
         counts = hand_backs(records, not YIELD_IGNORES_CONFLICTS)
-        queue, yielded = yield_places(queue, prs, counts, in_flight)
+        spent = yields_spent(records, not YIELD_IGNORES_CONFLICTS)
+        queue, yielded = yield_places(queue, prs, counts, in_flight, spent)
     if in_flight is not None:
         # The pull request the last tick updated or waited on keeps its
         # place: a blocker promoted past it would spend the run it is

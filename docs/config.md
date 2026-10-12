@@ -378,7 +378,13 @@ it is fixed and approved again. If it fails again, everything behind it
 waits another update and build, and with `test_ahead` every prediction
 behind it is spent too. With `yield_after_hand_back: N`, a candidate
 handed back to its author K times in the last 24 hours is moved back N
-times K places after that order, K at most `yield_cap` (default 3). The
+times K places after that order, K at most `yield_cap` (default 3),
+less one place for each other pull request that has merged while it
+was a candidate since its latest hand-back. So the yield is spent:
+once N times K others have merged ahead of it, it takes its place in
+the order again. (Before v0.4.34 the yield was taken afresh from every
+tick's order, so the oldest candidate, first in that order, could not
+reach the front while N others were ready, for a whole 24 hours.) The
 count is of distinct heads and reasons in the Merger's own record
 (`merger.jsonl`, or `dry-run.jsonl` for a dry run), so a hand-back a
 tick repeats counts once. A hand-back to the approving reviewer (the
