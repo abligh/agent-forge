@@ -71,6 +71,18 @@ class Compare(unittest.TestCase):
                          "test")
         self.assertTrue(self.out[1].startswith("both checked 1 trees"))
 
+    def test_since_limits_the_new_side_only(self):
+        # The old check never checks a head again: its verdict on one
+        # the trial reaches later can predate the trial.
+        tool.main(self.paths + ["--since", "2026-10-12T02"], self.out.append)
+        self.assertEqual(self.out[-1], "both checked 1: 0 disagree, 1 red "
+                         "with different steps; only old 2, only new 1")
+        self.out.clear()
+        tool.main(self.paths + ["--since", "2026-10-12T02", "--old-since",
+                                "2026-10-12T03"], self.out.append)
+        self.assertEqual(self.out[-1], "both checked 0: 0 disagree, 0 red "
+                         "with different steps; only old 1, only new 2")
+
     def test_an_unreadable_file_is_2(self):
         self.assertEqual(tool.main([self.paths[0], "/nonexistent"],
                                    self.out.append), 2)

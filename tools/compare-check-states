@@ -3,7 +3,7 @@
 trial before a cutover.
 
     compare-check-states OLD/state.json NEW/state.json [--since TIME]
-                         [--by-tree]
+                         [--old-since TIME] [--by-tree]
 
 Both files are forge-pr-check's `state.json` or a predecessor's of the
 same shape: `results` maps a head's SHA to a record with `ok`, `failed`
@@ -14,8 +14,12 @@ Each check makes its own commits for the Merger's predictions, so the
 same tree has a different SHA in each. When a key has several verdicts,
 the newest is compared.
 
-For each head both checked (finished at or after --since, if given),
-it prints those whose verdict differs. Then it counts the heads only
+`--since` limits the new check's verdicts, from when the trial started.
+The old check's verdicts are all kept unless `--old-since` is given: it
+never checks again a head or tree it has already checked, so its
+verdict on one the trial reaches later can be from before the trial.
+
+For each head both checked, it prints those whose verdict differs. Then it counts the heads only
 one of them checked, which is expected for a check that started later
 or prunes sooner. The steps' names may differ between the two, so a
 difference in the failed steps alone is shown but not counted as a
@@ -63,11 +67,13 @@ def main(argv=None, out=print):
     parser.add_argument("--by-tree", action="store_true",
                         help="pair verdicts by tree, not by commit")
     parser.add_argument("--since", default="",
-                        help="only heads finished at or after this time "
-                        "(ISO 8601, compared as text)")
+                        help="only the new check's verdicts finished at or "
+                        "after this time (ISO 8601, compared as text)")
+    parser.add_argument("--old-since", default="",
+                        help="the same for the old check's (default: all)")
     args = parser.parse_args(argv)
     try:
-        old = results(args.old, args.since, args.by_tree)
+        old = results(args.old, args.old_since, args.by_tree)
         new = results(args.new, args.since, args.by_tree)
     except (OSError, ValueError) as err:
         out("compare-check-states: %s" % err)
