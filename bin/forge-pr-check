@@ -2713,7 +2713,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
 
     Where the run's own time went, outside its steps, is logged as
     `overhead:` and kept in the verdict as `overhead`, seconds by phase
-    (`Phases`; agent-forge #13)."""
+    (`Phases`; agent-forge #13). Each step's own time is kept twice:
+    `step_seconds`, whole seconds, and `step_wall`, to the hundredth."""
     os.makedirs(state_dir, exist_ok=True)
     phases = Phases()
     started = clock()
@@ -2937,6 +2938,10 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 "seconds": sum(r["seconds"] for r in results),
                 # What the fast lane's estimates come from (step_costs).
                 "step_seconds": {r["name"]: r["seconds"] for r in results},
+                # The same, unrounded: whole seconds lose about half a
+                # second a step to anyone summing them (agent-forge #13).
+                "step_wall": {r["name"]: r.get("wall", r["seconds"])
+                              for r in results},
             }
             if any(r.get("results_bytes") for r in results):
                 # What the steps left in CHECK_RESULTS, by step.

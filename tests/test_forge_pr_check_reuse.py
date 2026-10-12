@@ -305,6 +305,11 @@ class Worker(DigestCase):
         for phase in ("lock", "prepare", "choose", "steps", "verdict",
                       "post", "between"):
             self.assertIn(phase, first["overhead"])
+        # Each step's time unrounded too, beside the whole seconds.
+        self.assertEqual(set(first["step_wall"]), {"a"})
+        self.assertIsInstance(first["step_wall"]["a"], float)
+        self.assertLessEqual(first["step_seconds"]["a"],
+                             first["step_wall"]["a"])
         self.assertTrue(any(line.startswith("  overhead: lock ")
                             for line in self.lines))
         self.assertEqual(self.posts[-1], (
