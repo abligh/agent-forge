@@ -965,6 +965,20 @@ class StepEnv(unittest.TestCase):
                                % os.getuid(),
                                "CHECK_CPUS": str(pc.check_cpus())})
 
+    def test_drops_what_the_project_names(self):
+        # agent-forge #18: checks.drop_env, names and prefixes.
+        data = example()
+        data["checks"]["drop_env"] = ["INVOCATION_ID", "RECEIVER_*"]
+        pc.configure(config.Project(data, None))
+        self.addCleanup(pc.configure, config.Project(example(), None))
+        env = pc.step_env("/s", {"INVOCATION_ID": "1", "RECEIVER_PORT": "2",
+                                 "RECEIVER": "3", "GH_TOKEN": "x",
+                                 "PATH": "/b"})
+        self.assertNotIn("INVOCATION_ID", env)
+        self.assertNotIn("RECEIVER_PORT", env)
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertEqual((env["RECEIVER"], env["PATH"]), ("3", "/b"))
+
     def test_keeps_the_hosts_cargo_target_dir(self):
         env = pc.step_env("/s", {"CARGO_TARGET_DIR": "/t"})
         self.assertEqual(env["CARGO_TARGET_DIR"], "/t")

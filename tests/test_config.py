@@ -46,6 +46,13 @@ class Check(unittest.TestCase):
                 data[key] = value
         return config.check(data)
 
+    def test_drop_env_takes_names_and_prefixes(self):
+        data = example()
+        data["checks"]["drop_env"] = ["A_B", "RECEIVER_*"]
+        self.assertEqual(config.check(data), [])
+        data["checks"]["drop_env"] = ["*", "A-B", 3, "X*Y"]
+        self.assertEqual(len(config.check(data)), 4)
+
     def test_the_example_is_good(self):
         self.assertEqual(config.check(example()), [])
 

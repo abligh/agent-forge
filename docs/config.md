@@ -87,8 +87,9 @@ not here yet.
 
 ### What every step gets
 
-Besides the host's environment (less `GH_TOKEN`, `GITHUB_TOKEN` and
-every `FORGE_` setting) and its build caches, each step gets:
+Besides the host's environment (less `GH_TOKEN`, `GITHUB_TOKEN`,
+every `FORGE_` setting and whatever `drop_env` names) and its build
+caches, each step gets:
 
 | Variable | What it is |
 | --- | --- |
@@ -542,8 +543,9 @@ reasons.
 | `max_wait_minutes` | none | A pull request's head that has waited this long goes before every other pull request's, the oldest first: before `first_authors`, the Merger's own head and the Merger's predictions (`merge.test_ahead`). So priority can't starve an ordinary head beyond about this plus one run. A head that failed to prepare is never overdue; the default branch's traced run still goes first when due or urgent. At least 1. |
 | `main` | `needed` | Which default-branch heads are checked: `needed`, only a head a `depends` record needs traced (none without `depends`); `every`, every new head, in full (traced with `depends`), except one whose tree a green run here already passed, which is recorded green as matched (`MAIN-GREEN … matched`) without a run. With `depends`, a head is matched only once its tree has a record. designs/0011. |
 | `main_red_issue` | none | `{"labels": [...], "title": ...}` (or one `label`): while the default branch is red, one issue is open about it, written by `poster` and signed `— <poster>` on its last line, after a line saying forge-pr-check wrote it. The first red head opens it, with the labels, naming the failed steps (with the end of their output) and the commits since the last green head; `title` is a template with `{sha}` (default "The default branch is red at {sha}"). Each further red head comments once; the first green head closes it. A write GitHub refuses is logged `REPORT-FAILED` and tried again on the next verdict. Refused unless `main` is `every` or `depends` is on. designs/0011. |
+| `drop_env` | none | Variables never passed to the steps, beyond `GH_TOKEN`, `GITHUB_TOKEN` and every `FORGE_` setting: each a name, or a prefix ending in `*` (`["INVOCATION_ID", "RECEIVER_*"]`). For variables a host's service passes on that a test must not see. |
 | `depends_minutes` | `30` | How long the newest default-branch head waits behind pull requests' heads before it goes first. |
-| `tracer` | `preload` | How `depends` traces: `preload`, an `LD_PRELOAD` library built from lib/forge-trace.c with the host's C compiler (no root, cheap, blind to statically linked programs), or `strace` (everything, slower; needs strace installed). |
+| `tracer` | `preload` | How `depends` traces: `preload`, an `LD_PRELOAD` library built from lib/forge-trace.c with the host's C compiler (no root, cheap, blind to statically linked programs), or `strace` (everything, slower; needs strace installed). Go is the common case `preload` can't see: its toolchain and test binaries are statically linked, so a Go step would record almost nothing it reads and be skipped wrongly. A Go project uses `strace`. |
 | `fast_lane` | none | `{"max_seconds": 60}`: one more slot, for heads whose chosen steps are cheap (designs/0006; see below). Refused without `depends`. |
 | `fast_lane.max_seconds` | `60` | The most a head's chosen steps may together have taken here for it to be cheap. At least 1. |
 | `merge_default` | `false` | Check a pull request's head merged with the default branch's tip, the tree GitHub's update makes, instead of the head alone (designs/0007; see below). |

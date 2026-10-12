@@ -482,6 +482,9 @@ POST_BATCH = 10
 # variable starting STEP_DROP_PREFIX.
 STEP_DROP_ENV = ("GH_TOKEN", "GITHUB_TOKEN")
 STEP_DROP_PREFIX = "FORGE_"
+# checks.drop_env: the project's own, added to those.
+DROP_NAMES = frozenset()
+DROP_PREFIXES = ()
 CRON_RUN = os.path.join(BIN, "forge-cron-run")
 # What a posting worker starts when it is done: its own cron line.
 NEXT_TICK = ("forge-pr-check", "--post")
@@ -570,6 +573,7 @@ def configure(project):
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE
+    global DROP_NAMES, DROP_PREFIXES
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -613,6 +617,9 @@ def configure(project):
     FRESH_WAIT = datetime.timedelta(minutes=checks["fresh"].get(
         "wait_minutes", DEFAULT_FRESH_MINUTES)) if "fresh" in checks else None
     CACHES = dict(checks.get("caches", {}))
+    drop = checks.get("drop_env", [])
+    DROP_NAMES = frozenset(d for d in drop if not d.endswith("*"))
+    DROP_PREFIXES = tuple(d[:-1] for d in drop if d.endswith("*"))
     CACHE_LIMIT = size_bytes(checks["cache_limit"]) \
         if "cache_limit" in checks else None
     SLOTS = checks.get("slots", DEFAULT_SLOTS)
@@ -1914,12 +1921,13 @@ def check_cpus(online=None, slots=None):
 
 
 def step_env(state_dir, base=None, slot=1):
-    """The steps' environment: `base` (os.environ) less STEP_DROP_ENV
-    and every FORGE_ setting, with the slot's build caches (CACHES)
+    """The steps' environment: `base` (os.environ) less STEP_DROP_ENV,
+    every FORGE_ setting and what checks.drop_env names, with the slot's build caches (CACHES)
     outside the worktree and the slot's share of the CPUs
     (CHECK_CPUS), unless the host set them."""
     env = {k: v for k, v in (os.environ if base is None else base).items()
-           if k not in STEP_DROP_ENV and not k.startswith(STEP_DROP_PREFIX)}
+           if k not in STEP_DROP_ENV and k not in DROP_NAMES
+           and not k.startswith((STEP_DROP_PREFIX,) + DROP_PREFIXES)}
     for name, folder in CACHES.items():
         env.setdefault(name, os.path.join(state_dir, slot_name(folder, slot)))
     env.setdefault("CHECK_CPUS", str(check_cpus()))
