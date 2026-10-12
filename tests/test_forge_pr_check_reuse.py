@@ -273,6 +273,19 @@ class Digests(DigestCase):
             self.assertNotIn("a", self.digests(self.first))
 
 
+    def test_a_version_command_steps_share_runs_once(self):
+        # On a loaded host each run is a quarter of a second, and every
+        # step usually names the same command (agent-forge #13).
+        counter = os.path.join(self._tmp.name, "count")
+        command = ["sh", "-c", "echo x >> %s; echo tool 1.0" % counter]
+        with mock.patch.object(pc, "VERSIONS", {"a": command, "b": command,
+                                                "c": ["echo", "other"]}):
+            got = self.digests(self.first)
+        self.assertEqual(sorted(got), ["a", "b", "c"])
+        with open(counter) as handle:
+            self.assertEqual(handle.read(), "x\n")
+
+
 class Worker(DigestCase):
     """Reuse through the worker: two pull requests with the same change."""
 

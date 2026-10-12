@@ -2467,6 +2467,9 @@ def step_digests(wt, commit, record, env, run=sh, names=None):
         return {}
     steps = {name: (name, args, only_if) for name, args, only_if in STEPS}
     digests, earlier = {}, []
+    # Each distinct version command runs once: steps usually share one,
+    # and on a loaded host a run is a quarter of a second.
+    versions = {}
     for name in names:
         reads = record.get("reads", {}).get(name)
         if reads is None:
@@ -2494,11 +2497,16 @@ def step_digests(wt, commit, record, env, run=sh, names=None):
             add("earlier", earlier)
         version = VERSIONS.get(name)
         if version:
-            got = run(version, cwd=wt, env=env, timeout=VERSION_TIMEOUT_S)
-            if got.returncode != 0:
+            key = tuple(version)
+            if key not in versions:
+                got = run(version, cwd=wt, env=env,
+                          timeout=VERSION_TIMEOUT_S)
+                versions[key] = (got.stdout or "") \
+                    if got.returncode == 0 else None
+            if versions[key] is None:
                 earlier.append(None)
                 continue
-            add("version", got.stdout or "")
+            add("version", versions[key])
         digests[name] = h.hexdigest()
         earlier.append(digests[name])
     return digests
