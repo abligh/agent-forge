@@ -35,12 +35,12 @@ class RealChainReached(BaseException):
     as CHAIN-FAILED and carries on, which would let a test pass."""
 
 
-def _refuse_real_chain(popen=None, checkout=None):
+def _refuse_real_chain(popen=None, checkout=None, **dirs):
     """Stands in for start_next_tick in every test: the real one starts
     a real cron tick on this host. A test passes its own popen."""
     if popen is None:
         raise RealChainReached("a test reached the real start_next_tick")
-    return _real_start_next_tick(popen=popen, checkout=checkout)
+    return _real_start_next_tick(popen=popen, checkout=checkout, **dirs)
 
 
 pc.start_next_tick = _refuse_real_chain
@@ -1447,6 +1447,17 @@ class StartNextTick(unittest.TestCase):
         self.assertTrue(kw["start_new_session"] and kw["close_fds"])
 
 
+    def test_carries_the_cron_lines_state_and_merger_dirs(self):
+        # A chained tick on the default directories would be a second
+        # queue posting to the same context.
+        argv = _real_start_next_tick(popen=lambda argv, **kw: None,
+                                     checkout="/cron", state_dir="/s",
+                                     merger_dir="/m")
+        self.assertEqual(argv[1:], ["forge-pr-check", "--post",
+                                    "--state-dir", "/s", "--merger-dir",
+                                    "/m"])
+
+
 class Main(StateCase):
 
     def setUp(self):
@@ -1536,7 +1547,20 @@ class Main(StateCase):
         with mock.patch.object(pc, "start_next_tick",
                                lambda **kw: started.append(kw)):
             chain()
-        self.assertEqual(started, [{"checkout": self.checkout}])
+        self.assertEqual(started, [{"checkout": self.checkout,
+                                    "state_dir": self.state_dir,
+                                    "merger_dir": None}])
+
+    def test_the_chained_tick_reads_the_cron_lines_merger(self):
+        self.addCleanup(setattr, pc, "MERGER_DIR_ARG", None)
+        with mock.patch.object(pc, "worker", return_value=0) as worker:
+            self.main("--worker", SHA_A, "--pr", "7", "--post",
+                      "--merger-dir", "/m")
+        started = []
+        with mock.patch.object(pc, "start_next_tick",
+                               lambda **kw: started.append(kw)):
+            worker.call_args.kwargs["chain"]()
+        self.assertEqual(started[0]["merger_dir"], "/m")
 
     def test_the_worker_takes_its_memory_limit_from_the_environment(self):
         for environ, limit in (({}, "16G"),

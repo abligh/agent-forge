@@ -112,6 +112,18 @@ class Names(unittest.TestCase):
             fd = held.fileno()
         self.assertEqual(popen.call_args.kwargs["pass_fds"], (fd,))
 
+    def test_the_worker_is_given_the_ticks_merger_dir(self):
+        # So the tick it chains reads the same Merger.
+        with tempfile.TemporaryDirectory() as state_dir, \
+                mock.patch.object(pc, "MERGER_DIR_ARG", "/m"), \
+                mock.patch.object(pc.subprocess, "Popen") as popen:
+            pc.spawn_worker(state_dir, SHA_A, 7)
+            pc.MERGER_DIR_ARG = None
+            pc.spawn_worker(state_dir, SHA_A, 7)
+        with_dir, without = (c[0][0] for c in popen.call_args_list)
+        self.assertEqual(with_dir[with_dir.index("--merger-dir") + 1], "/m")
+        self.assertNotIn("--merger-dir", without)
+
     def test_a_worker_without_the_lock_is_still_started(self):
         with tempfile.TemporaryDirectory() as state_dir, \
                 mock.patch.dict(os.environ, {"FORGE_INSTALL_LOCK_FD": "x"}), \

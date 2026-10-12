@@ -488,6 +488,9 @@ DROP_PREFIXES = ()
 CRON_RUN = os.path.join(BIN, "forge-cron-run")
 # What a posting worker starts when it is done: its own cron line.
 NEXT_TICK = ("forge-pr-check", "--post")
+# The tick's own --merger-dir, when its cron line names one: handed to
+# each worker, so the tick a worker chains reads the same Merger.
+MERGER_DIR_ARG = None
 # Whether the head of the pull request the Merger waits on goes first.
 # It only orders: no slot is ever kept for it.
 DEFAULT_MERGER_FIRST = False
@@ -1515,7 +1518,8 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
         + (["--checkout", checkout] if checkout else [])
         + (["--post"] if posting else [])
         + (["--ahead"] if ahead else [])
-        + (["--main"] if main else []),
+        + (["--main"] if main else [])
+        + (["--merger-dir", MERGER_DIR_ARG] if MERGER_DIR_ARG else []),
         cwd=state_dir, stdin=subprocess.DEVNULL, stdout=wlog,
         stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
         pass_fds=() if held is None else (held,))
@@ -2969,13 +2973,18 @@ def record_run(state_dir, wt, sha, checked, tree, files, env, tracer, when,
     return path
 
 
-def start_next_tick(popen=None, checkout=None):
+def start_next_tick(popen=None, checkout=None, state_dir=None,
+                    merger_dir=None):
     """Start one `forge-pr-check --post` tick through forge-cron-run,
     detached, and return its argv. Not waited for: the caller is about
-    to exit. The tick uses the default state directory, as cron's do,
-    and the checkout this worker checked from."""
+    to exit. The tick uses the checkout this worker checked from, and
+    the `--state-dir` and `--merger-dir` the cron line gave, if it gave
+    them: a chained tick on the default directories would be a second
+    queue posting to the same status context."""
     popen = popen or subprocess.Popen
-    argv = [CRON_RUN] + list(NEXT_TICK)
+    argv = [CRON_RUN] + list(NEXT_TICK) \
+        + (["--state-dir", state_dir] if state_dir else []) \
+        + (["--merger-dir", merger_dir] if merger_dir else [])
     env = dict(os.environ)
     if checkout:
         env["FORGE_CRON_CHECKOUT"] = checkout
@@ -3462,12 +3471,16 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
         out("NO-CONFIG: %s" % err)
         return 2
     configure(project)
+    global MERGER_DIR_ARG
+    MERGER_DIR_ARG = args.merger_dir
     state_dir = args.state_dir or locks.state_dir(project.name, "pr-check",
                                                   environ)
     os.makedirs(state_dir, exist_ok=True)
     post = make_poster(run, out, project) if args.post else None
     if args.worker:
-        chain = (lambda: start_next_tick(checkout=repo)) if args.post else None
+        chain = (lambda: start_next_tick(
+            checkout=repo, state_dir=args.state_dir,
+            merger_dir=args.merger_dir)) if args.post else None
         report = None
         if args.main and args.post and MAIN_RED_ISSUE is not None:
             write = make_writer(project, out)
