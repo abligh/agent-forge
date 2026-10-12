@@ -135,6 +135,34 @@ class Approvals(unittest.TestCase):
                               call=lambda *a, **k: (401, {"message": "no"}))
 
 
+class Idle(unittest.TestCase):
+
+    LINES = [json.dumps(l) for l in (
+        {"at": "2026-10-12T00:10:00Z", "name": "WidgetLeadDev",
+         "status": "idle", "since": "2026-10-12T00:00:00Z"},
+        {"at": "2026-10-12T00:20:00Z", "name": "WidgetLeadDev",
+         "status": "busy", "since": None},
+        {"at": "2026-10-12T01:00:00Z", "name": "WidgetLeadDev",
+         "status": "idle", "since": "2026-10-12T01:00:00Z"})] + ["junk"]
+
+    def test_idle_from_since_to_the_next_change_or_the_end(self):
+        spans = tool.idle_spans(self.LINES, UNTIL)
+        self.assertEqual(spans["WidgetLeadDev"], [
+            (SINCE, T("2026-10-12T00:20Z")),
+            (T("2026-10-12T01:00Z"), UNTIL)])
+
+    def test_idle_while_approved_work_waits(self):
+        merged = {7: {"author": "x", "merged": T("2026-10-12T01:30Z"),
+                      "approved": T("2026-10-12T00:10Z")}}
+        idle = {"LeadDev": tool.idle_spans(self.LINES,
+                                           UNTIL)["WidgetLeadDev"]}
+        _, authors = tool.author_stats(merged, SINCE, UNTIL,
+                                       lambda login: "LeadDev", idle)
+        # Waiting 00:10-01:30; idle 00:10-00:20 and 01:00-01:30.
+        self.assertEqual(authors["LeadDev"]
+                         ["hours_idle_with_approved_work_waiting"], 0.7)
+
+
 class Spans(unittest.TestCase):
 
     def test_overlaps_count_once_and_are_clipped(self):

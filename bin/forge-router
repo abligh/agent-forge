@@ -90,7 +90,10 @@ rules' idle offer, `router.idle_offer`) are handed the relay's `GET
 and busy or idle since when. It is read once a run, with the same
 token as a post, sending or not. An answer that isn't a complete
 directory is printed (`NO-DIRECTORY: …`) and handed over as None,
-which the rules read as unknown, never as idle.
+which the rules read as unknown, never as idle. A sending run also
+appends each session whose status changed to `presence.jsonl` in the
+state directory (`{"at", "name", "status", "since"}`), the history of
+who was busy and idle that `forge-stats` reads.
 
 **What merged.** When the rules' `merged_window` is above 0 (the
 default rules' merge notice, `router.merge_notice`), a run that isn't
@@ -746,6 +749,45 @@ def recheck(github, ctx, wakes):
     return holding, withdrawn, []
 
 
+PRESENCE_LOG = "presence.jsonl"
+PRESENCE_LAST = "presence-last.json"
+
+
+def record_presence(state_dir, listing, when):
+    """Append to presence.jsonl each session whose status or idle-since
+    changed since the last run that recorded: `{"at", "name",
+    "status", "since"}`, `status` "gone" for one no longer listed. Only
+    a complete directory is recorded. forge-stats reads it to tell
+    waiting from working."""
+    if not isinstance(listing, dict) or listing.get("complete") is not True \
+            or not isinstance(listing.get("agents"), list):
+        return
+    now = {}
+    for entry in listing["agents"]:
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+            now[entry["name"]] = [entry.get("status") or "unknown",
+                                  entry.get("idle_since")]
+    os.makedirs(state_dir, exist_ok=True)
+    last_path = os.path.join(state_dir, PRESENCE_LAST)
+    last = merger.load_json(last_path, {})
+    if not isinstance(last, dict):
+        last = {}
+    lines = []
+    at = when.strftime("%Y-%m-%dT%H:%M:%SZ")
+    for name in sorted(set(now) | set(last)):
+        state = now.get(name, ["gone", None])
+        if last.get(name) != state and not (
+                state[0] == "gone" and (last.get(name) or [""])[0] == "gone"):
+            lines.append({"at": at, "name": name, "status": state[0],
+                          "since": state[1]})
+    if lines:
+        with open(os.path.join(state_dir, PRESENCE_LOG), "a") as handle:
+            for line in lines:
+                handle.write(json.dumps(line, sort_keys=True) + "\n")
+    if now != last:
+        merger.save_json(last_path, now)
+
+
 def run(github, roster, state_dir, send, post=None, only=None, out=print,
         when=None, remind_s=None, directory=None):
     """One run: decide every open item, or `only` those numbers, and
@@ -763,6 +805,8 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
         listing, why = directory()
         if listing is None:
             out("NO-DIRECTORY: %s; nobody is taken to be idle" % why)
+        elif send:
+            record_presence(state_dir, listing, when)
     merged = None
     if RULES.merged_window and not only:
         try:

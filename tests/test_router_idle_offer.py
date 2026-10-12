@@ -392,6 +392,35 @@ class Engine(unittest.TestCase):
         self.assertIn("NO-DIRECTORY: HTTP 503, not a complete directory; "
                       "nobody is taken to be idle", self.lines)
 
+    def presence(self):
+        path = os.path.join(self.dir, "presence.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path) as handle:
+            return [json.loads(line) for line in handle]
+
+    def test_each_change_of_status_is_recorded_once(self):
+        self.run_router([])
+        self.run_router([], when=NOW + datetime.timedelta(minutes=1))
+        self.listing = (directory(entry("WidgetLeadDev", "busy"),
+                                  entry("WidgetUIDev")), None)
+        self.run_router([], when=NOW + datetime.timedelta(minutes=2))
+        self.listing = (directory(entry("WidgetUIDev")), None)
+        self.run_router([], when=NOW + datetime.timedelta(minutes=3))
+        self.run_router([], when=NOW + datetime.timedelta(minutes=4))
+        got = [(p["name"], p["status"]) for p in self.presence()]
+        self.assertEqual(got, [("WidgetLeadDev", "idle"),
+                               ("WidgetLeadDev", "busy"),
+                               ("WidgetUIDev", "idle"),
+                               ("WidgetLeadDev", "gone")])
+        self.assertEqual(self.presence()[0]["since"], IDLE)
+
+    def test_a_dry_run_or_an_unreadable_directory_records_nothing(self):
+        self.run_router([], send=False)
+        self.listing = (None, "HTTP 503, not a complete directory")
+        self.run_router([])
+        self.assertEqual(self.presence(), [])
+
     def test_a_dry_run_reads_it_and_sends_nothing(self):
         self.assertEqual(self.run_router([owned(30)], send=False), 0)
         self.assertEqual(self.posts, [])

@@ -27,9 +27,11 @@ defaults to the last `--hours` (24) up to now.
 latest approval before its merge to the merge.
 
 **Each author**: merges, and the hours in the window during which she had
-at least one approved pull request not yet merged. That is time her own
-work was waiting for the queue, though not necessarily time she was
-idle. This host keeps no history of idleness.
+at least one approved pull request not yet merged: time her own work
+was waiting for the queue. Where forge-router has recorded who was busy
+and idle (`presence.jsonl`, from v0.4.41), also the part of those hours
+she was idle: waiting on her own work, not merely working on something
+else meanwhile.
 
 Exit status: 0 the report was written; 2 no configuration or no records.
 """
@@ -242,9 +244,59 @@ def union_seconds(spans, since, until):
     return total
 
 
-def author_stats(merged, since, until, name_of=lambda login: login):
+def idle_spans(lines, until):
+    """{session name: [(start, end)]} of idle periods from forge-router's
+    presence.jsonl lines: from `since` (else `at`) of an idle line to the
+    next line for that name, or `until`."""
+    spans, open_at = {}, {}
+    for line in lines:
+        try:
+            rec = json.loads(line)
+            name, at = rec["name"], parse_time(rec["at"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if name in open_at:
+            spans.setdefault(name, []).append((open_at.pop(name), at))
+        if rec.get("status") == "idle":
+            start = at
+            if rec.get("since"):
+                try:
+                    start = min(at, parse_time(rec["since"]))
+                except ValueError:
+                    pass
+            open_at[name] = start
+    for name, start in open_at.items():
+        spans.setdefault(name, []).append((start, until))
+    return spans
+
+
+def overlap_seconds(a, b, since, until):
+    """Seconds of [since, until) inside both a span of `a` and of `b`."""
+    total = 0.0
+    for a0, a1 in a:
+        for b0, b1 in b:
+            lo, hi = max(a0, b0, since), min(a1, b1, until)
+            if hi > lo:
+                total += (hi - lo).total_seconds()
+    return total
+
+
+def merge_spans(spans):
+    """The spans, overlapping ones joined."""
+    out = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def author_stats(merged, since, until, name_of=lambda login: login,
+                 idle=None):
     """Approval to merge overall, and per author: merges, approval to
-    merge, and hours holding approved, unmerged work."""
+    merge, hours holding approved, unmerged work and, given `idle`
+    ({author: spans}), the hours of those she was idle."""
     waits, spans = [], collections.defaultdict(list)
     per = collections.defaultdict(list)
     for number, pr in merged.items():
@@ -262,6 +314,11 @@ def author_stats(merged, since, until, name_of=lambda login: login):
             "approval_to_merge": summary(own),
             "hours_with_approved_work_waiting": round(
                 union_seconds(spans[author], since, until) / 3600, 1)}
+        if idle is not None:
+            authors[author]["hours_idle_with_approved_work_waiting"] = round(
+                overlap_seconds(merge_spans(spans[author]),
+                                merge_spans(idle.get(author, [])),
+                                since, until) / 3600, 1)
     return summary(waits), authors
 
 
@@ -317,12 +374,17 @@ def report(name, since, until, check, queue, approval, authors):
     if approval is not None:
         lines += ["", "Approval to merge", "  " + spread(approval), "",
                   "Authors (merges; approval to merge; hours with approved "
-                  "work waiting)"]
+                  "work waiting%s)" % (
+                      ", idle meanwhile" if any(
+                          "hours_idle_with_approved_work_waiting" in a
+                          for a in authors.values()) else "")]
         for author, s in authors.items():
-            lines.append("  %s: %d; %s; %.1f h" % (
+            idle = s.get("hours_idle_with_approved_work_waiting")
+            lines.append("  %s: %d; %s; %.1f h%s" % (
                 author, s["merges"],
                 spread(s["approval_to_merge"]),
-                s["hours_with_approved_work_waiting"]))
+                s["hours_with_approved_work_waiting"],
+                "" if idle is None else ", %.1f h idle" % idle))
     return "\n".join(lines)
 
 
@@ -383,12 +445,20 @@ def main(argv=None, out=print, environ=None, now=None,
     check = check_stats(verdicts, since, until, slots)
     queue = queue_stats(records, since, until)
     approval, authors = None, {}
+    presence = read_lines(os.path.join(
+        locks.state_dir(project.name, "router", environ), "presence.jsonl"))
+    idle = None
+    if presence:
+        sessions = {project.session_name(a): a for a in project.agents}
+        idle = {}
+        for name, spans in idle_spans(presence, until).items():
+            idle.setdefault(sessions.get(name, name), []).extend(spans)
     if not args.no_github and queue["merged"]:
         token = token or github.read_token(project, environ)
         merged = fetch_merged(token, project.repo, queue["merged"], call)
         approval, authors = author_stats(
             merged, since, until,
-            lambda login: project.by_login(login) or login)
+            lambda login: project.by_login(login) or login, idle)
     if args.json:
         out(json.dumps(jsonable({
             "project": project.name, "since": since, "until": until,
