@@ -52,6 +52,25 @@ class Compare(unittest.TestCase):
         self.assertEqual(tool.main(self.paths + ["--since", "2026-10-12T02"],
                                    self.out.append), 0)
 
+    def test_by_tree_pairs_two_commits_of_one_tree(self):
+        # Each check makes its own commit for a prediction: one tree,
+        # two SHAs.
+        for path, sha, ok in ((self.paths[0], "1" * 40, True),
+                              (self.paths[1], "2" * 40, False)):
+            with open(path, "w") as handle:
+                json.dump({"results": {
+                    "9" * 40: {"ok": True, "tree": "t" * 40,
+                               "finished": "2026-10-12T00"},
+                    sha: {"ok": ok, "tree": "t" * 40, "pr": 7,
+                          "failed": [] if ok else ["test"],
+                          "finished": "2026-10-12T01"}}}, handle)
+        self.assertEqual(tool.main(self.paths + ["--by-tree"],
+                                   self.out.append), 1)
+        self.assertEqual(self.out[0], "DISAGREE #7 tree tttttttttt (old "
+                         "1111111111, new 2222222222): old green , new red "
+                         "test")
+        self.assertTrue(self.out[1].startswith("both checked 1 trees"))
+
     def test_an_unreadable_file_is_2(self):
         self.assertEqual(tool.main([self.paths[0], "/nonexistent"],
                                    self.out.append), 2)

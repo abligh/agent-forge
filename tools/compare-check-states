@@ -3,10 +3,16 @@
 trial before a cutover.
 
     compare-check-states OLD/state.json NEW/state.json [--since TIME]
+                         [--by-tree]
 
 Both files are forge-pr-check's `state.json` or a predecessor's of the
 same shape: `results` maps a head's SHA to a record with `ok`, `failed`
 (a list of step names, or of [name, output] pairs) and `finished`.
+
+`--by-tree` pairs verdicts by the tree checked instead of the commit.
+Each check makes its own commits for the Merger's predictions, so the
+same tree has a different SHA in each. When a key has several verdicts,
+the newest is compared.
 
 For each head both checked (finished at or after --since, if given),
 it prints those whose verdict differs. Then it counts the heads only
@@ -31,11 +37,22 @@ def failed_names(record):
     return sorted(str(n) for n in names)
 
 
-def results(path, since):
+def results(path, since, by_tree=False):
+    """{key: (sha, record)}: the newest verdict for each commit, or for
+    each tree with `by_tree`, finished at or after `since`."""
     with open(path) as handle:
         data = json.load(handle)
-    return {sha: r for sha, r in (data.get("results") or {}).items()
-            if isinstance(r, dict) and (r.get("finished") or "") >= since}
+    found = {}
+    for sha, r in (data.get("results") or {}).items():
+        if not isinstance(r, dict) or (r.get("finished") or "") < since:
+            continue
+        key = r.get("tree") if by_tree else sha
+        if not key:
+            continue
+        if key not in found or (r.get("finished") or "") > \
+                (found[key][1].get("finished") or ""):
+            found[key] = (sha, r)
+    return found
 
 
 def main(argv=None, out=print):
@@ -43,37 +60,42 @@ def main(argv=None, out=print):
         prog="compare-check-states", description=__doc__.splitlines()[0])
     parser.add_argument("old")
     parser.add_argument("new")
+    parser.add_argument("--by-tree", action="store_true",
+                        help="pair verdicts by tree, not by commit")
     parser.add_argument("--since", default="",
                         help="only heads finished at or after this time "
                         "(ISO 8601, compared as text)")
     args = parser.parse_args(argv)
     try:
-        old = results(args.old, args.since)
-        new = results(args.new, args.since)
+        old = results(args.old, args.since, args.by_tree)
+        new = results(args.new, args.since, args.by_tree)
     except (OSError, ValueError) as err:
         out("compare-check-states: %s" % err)
         return 2
     both = sorted(set(old) & set(new),
-                  key=lambda s: old[s].get("finished") or "")
+                  key=lambda k: old[k][1].get("finished") or "")
     disagree = steps = 0
-    for sha in both:
-        a, b = old[sha], new[sha]
+    for key in both:
+        (sha, a), (new_sha, b) = old[key], new[key]
         pr = a.get("pr", b.get("pr", "?"))
+        label = ("tree %s (old %s, new %s)" % (key[:10], sha[:10],
+                                               new_sha[:10])
+                 if args.by_tree else sha[:10])
         if bool(a.get("ok")) != bool(b.get("ok")):
             disagree += 1
             out("DISAGREE #%s %s: old %s %s, new %s %s" % (
-                pr, sha[:10], "green" if a.get("ok") else "red",
+                pr, label, "green" if a.get("ok") else "red",
                 ",".join(failed_names(a)), "green" if b.get("ok") else "red",
                 ",".join(failed_names(b))))
         elif failed_names(a) != failed_names(b):
             steps += 1
             out("STEPS #%s %s: both red; old %s, new %s" % (
-                pr, sha[:10], ",".join(failed_names(a)),
+                pr, label, ",".join(failed_names(a)),
                 ",".join(failed_names(b))))
-    out("both checked %d: %d disagree, %d red with different steps; "
+    out("both checked %d%s: %d disagree, %d red with different steps; "
         "only old %d, only new %d" % (
-            len(both), disagree, steps, len(set(old) - set(new)),
-            len(set(new) - set(old))))
+            len(both), " trees" if args.by_tree else "", disagree, steps,
+            len(set(old) - set(new)), len(set(new) - set(old))))
     return 1 if disagree else 0
 
 
