@@ -203,7 +203,9 @@ neither. The verdict records `selection` (what ran and why, what was
 skipped), and the status says it: `green on <host>: 2 of 6 steps
 (docs: designs/0042.md; ...)`. A green verdict on the same tree is
 reused for another head only if it ran every step that head needs,
-from the same merge base; a match keeps the selection it stands for.
+from the same merge base or an ancestor of the head's (a run from an
+older base counted more as changed, so it ran a superset: the Merger's
+second prediction and on); a match keeps the selection it stands for.
 
 **`checks.fast_lane` (`{"max_seconds": 60}`) adds a slot for cheap
 heads** (designs/0006; only with `depends`). Each tick works out, in
@@ -2404,19 +2406,32 @@ def cheap_heads(state, costs=None):
     return cheap
 
 
-def covers(selection):
+def covers(selection, older=None):
     """accept(record) for `tested`: whether an earlier verdict ran every
-    step this head would, under the same base. A verdict that ran every
-    step covers any head; a narrower one only a head that needs no more
-    of them, compared with the same base."""
+    step this head would, under the same base or an older one. A verdict
+    that ran every step covers any head; a narrower one only a head that
+    needs no more of them, compared with the same base, or with one
+    `older(its base, this head's)` says is an ancestor of this head's.
+
+    Same tree, older base: the earlier run counted everything since its
+    base as changed, which takes in all this head counts, so its steps,
+    and what each narrowed to by CHECK_BASE, were a superset. That is
+    the Merger's second prediction and on: predicted on top of the
+    prediction before it, it was run against the default branch before
+    that merged, while the head the Merger updates later, with the same
+    tree, is based on the merge itself."""
     def accept(record):
         earlier = record.get("selection") or {}
         if "ran" not in earlier:
             return True
         if "ran" not in (selection or {}):
             return False
-        return earlier.get("base") == selection["base"] \
-            and set(selection["ran"]) <= set(earlier["ran"])
+        if not set(selection["ran"]) <= set(earlier["ran"]):
+            return False
+        base, theirs = selection["base"], earlier.get("base")
+        return theirs == base or (
+            older is not None and isinstance(theirs, str)
+            and older(theirs, base))
     return accept
 
 
@@ -2867,7 +2882,9 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         if tree and not ahead and not main:
             with state_lock(state_dir):
                 same = tested(load(state_dir), tree, started, ok=True,
-                              accept=covers(selection))
+                              accept=covers(selection, lambda a, b: run(
+                                  ["git", "-C", wt, "merge-base",
+                                   "--is-ancestor", a, b]).returncode == 0))
             if same is not None and same != sha:
                 settled = True
                 return matched(state_dir, sha, pr, same, tree, started,

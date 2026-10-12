@@ -265,6 +265,21 @@ class Covers(unittest.TestCase):
         self.assertFalse(pc.covers(head)(self.narrow("b")))
         self.assertFalse(pc.covers(head)(self.narrow("a", base="0" * 40)))
 
+    def test_or_on_an_older_base_its_own_descends_from(self):
+        # The Merger's second prediction: run against the default branch
+        # before the first merged; the head it becomes, same tree, is
+        # based on that merge.
+        head = self.narrow("a")["selection"]
+        older = "0" * 40
+        ancestry = {(older, self.BASE)}
+        self.assertTrue(pc.covers(head, lambda a, b: (a, b) in ancestry)(
+            self.narrow("a", "b", base=older)))
+        # Not one whose base isn't an ancestor, nor one that ran less.
+        self.assertFalse(pc.covers(head, lambda a, b: False)(
+            self.narrow("a", "b", base=older)))
+        self.assertFalse(pc.covers(head, lambda a, b: True)(
+            self.narrow("b", base=older)))
+
     def test_nor_a_head_that_runs_everything(self):
         self.assertFalse(pc.covers({"every": "why"})(self.narrow("a")))
         self.assertFalse(pc.covers(None)(self.narrow("a")))
