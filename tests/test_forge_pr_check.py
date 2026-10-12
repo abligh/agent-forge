@@ -1925,6 +1925,27 @@ class TickAhead(Tick):
             self.tick([], merger_dir=self.merger())
         self.assertEqual(self.spawned[0][1], SHA_P)
 
+    def test_a_default_branch_head_due_goes_before_predictions(self):
+        # checks.main: once its head has waited depends_minutes, the
+        # default branch goes first, before the Merger's predictions too.
+        self.write_state({"waiting": {
+            SHA_B: {"pr": 8, "since": pc.iso(T0)},
+            SHA_C: {"pr": 0, "main": True, "since": pc.iso(
+                T0 - pc.DEPENDS_WAIT - datetime.timedelta(minutes=1))}}})
+        spawned = []
+        pc.tick(self.state_dir, "tok", FakeRun((is_pulls, done(
+            [], 0, heads_tsv((8, SHA_B, REPO, "false"))))),
+            lambda *a, **k: spawned.append((a, k)), self.lines.append,
+            when=T0, slots=2, merger_dir=self.merger())
+        self.assertEqual(spawned, [((self.state_dir, SHA_C, 0, False, 1,
+                                     None), {"main": True})])
+
+    def test_a_default_branch_head_not_yet_due_waits_for_predictions(self):
+        self.write_state({"waiting": {SHA_C: {"pr": 0, "main": True,
+                                              "since": pc.iso(T0)}}})
+        self.tick([], merger_dir=self.merger())
+        self.assertEqual(self.spawned[0][1], SHA_P)
+
     def test_a_head_that_has_waited_max_wait_goes_before_predictions(self):
         # checks.max_wait_minutes: priority can't starve a head.
         self.write_state({"waiting": {SHA_B: {

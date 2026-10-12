@@ -931,6 +931,15 @@ def queue_main(state, head, when, state_dir, busy=(), needs=False):
     return True
 
 
+def main_due(entry, when):
+    """Whether a waiting default-branch head has waited DEPENDS_WAIT. An
+    unreadable stamp counts as due, as in next_head."""
+    try:
+        return when - parse(entry["since"]) >= DEPENDS_WAIT
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
 def just_started(entry, when):
     """Whether a waiting entry was started less than START_GRACE before
     `when`. An unreadable stamp counts as not started."""
@@ -1643,13 +1652,15 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 forget_ahead(state, ahead)
                 # The Merger's predictions go before an ordinary pick,
                 # but not before a head that has waited max_wait, nor
-                # before the default branch's run while heads wait on
-                # its record (urgent, or held). With spare_slots_only
+                # before the default branch's run once it has waited
+                # depends_minutes or while heads wait on its record
+                # (urgent, or held). With spare_slots_only
                 # (designs/0014), never before an ordinary pick.
                 if pick is None or not SPARE_ONLY and not (
                         pick[1] == first_pr
                         or overdue(state["waiting"][pick[0]], when)
-                        or (pick[1] == 0 and (urgent or held))):
+                        or (pick[1] == 0 and (urgent or held or main_due(
+                            state["waiting"][pick[0]], when)))):
                     predicted = next_ahead(state, ahead, taken, when,
                                            busy_trees(taken, checkout, run))
             if predicted is not None:
