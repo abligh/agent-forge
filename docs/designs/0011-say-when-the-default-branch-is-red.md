@@ -1,6 +1,7 @@
 # 0011: Check every default-branch head, and say when it is red
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-12, at f3bd070,
+  <https://github.com/abligh/agent-forge/issues/20#issuecomment-6120521112>)
 * Author: XMPPEngineer
 * Date: 2026-10-12
 
