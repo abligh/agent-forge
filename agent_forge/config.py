@@ -62,7 +62,8 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_minutes": int, "stall_alert": dict, "test_ahead": dict,
          "hold_conflicting": bool, "yield_after_hand_back": int,
          "yield_cap": int, "yield_ignores_conflicts": bool,
-         "right_of_way": dict, "code_owners": bool}
+         "right_of_way": dict, "code_owners": bool,
+         "early_conflicts": bool}
 RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int}
 TEST_AHEAD = {"depth": int, "max_age_hours": int}
 STALL_ALERT = {"tell": list, "retell_minutes": int,

@@ -409,6 +409,10 @@ YIELD_CAP = 3
 YIELD_WINDOW = datetime.timedelta(hours=24)
 # merge.yield_ignores_conflicts: a conflict with main doesn't count.
 YIELD_IGNORES_CONFLICTS = False
+# merge.early_conflicts: a candidate behind the one the tick stopped at
+# that conflicts with main is handed back now, not when it reaches the
+# front (designs/0012).
+EARLY_CONFLICTS = False
 # merge.code_owners: hold one that changes a path CODEOWNERS gives an
 # owner until an owner has approved its head.
 CODE_OWNERS = False
@@ -442,7 +446,7 @@ def configure(project):
     global STALL_TO_OWNER, STALL_TITLE, STALL_LABELS, WAITING_OWNER
     global TEST_AHEAD, AHEAD_DEPTH, HOLD_CONFLICTING, YIELD_PLACES
     global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
-    global ROW_FOR, CODE_OWNERS, CHANGERS
+    global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -478,6 +482,7 @@ def configure(project):
     YIELD_IGNORES_CONFLICTS = merge.get("yield_ignores_conflicts",
                                         False) is True
     CODE_OWNERS = merge.get("code_owners", False) is True
+    EARLY_CONFLICTS = merge.get("early_conflicts", False) is True
     row = merge.get("right_of_way")
     RIGHT_OF_WAY = row is not None
     ROW_AFTER = (row or {}).get("after_conflicts", 2)
@@ -1450,6 +1455,35 @@ def conflict_hand_back(pr, approval, github, said, live):
     return decision
 
 
+def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
+                    run=sh):
+    """merge.early_conflicts: the hand-backs for the candidates the tick
+    didn't reach (`rest`, behind the one it stopped at) whose heads
+    conflict with main. Without it, such a pull request is told only
+    when it reaches the front, which in a busy queue can be hours after
+    the merge that made the conflict, hours its author could have spent
+    on the fix. One already told for this approval and head is skipped,
+    and so is one git can't compare (it is decided when it is reached,
+    as before)."""
+    decisions = []
+    for pr in rest:
+        approval = approvals[pr["number"]]
+        if said.get(str(pr["number"])) == hand_back_key(
+                approval, pr["headRefOid"], CONFLICT_REASON):
+            continue
+        have_head(repo, pr, run)
+        if is_ancestor(repo, main_tip, pr["headRefOid"], run):
+            continue
+        if git(repo, "merge-tree", "--write-tree", "--name-only",
+               "--no-messages", main_tip, pr["headRefOid"],
+               run=run).returncode != 1:
+            continue
+        decision = conflict_hand_back(pr, approval, github, said, live)
+        decision["early"] = True
+        decisions.append(decision)
+    return decisions
+
+
 def handed_back(said, pr, approval):
     """Whether `pr` was handed back under the approval it has now, at the
     head it has now: it would only be handed back again, so it is not
@@ -1856,7 +1890,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                                      {**held_by, **row_held}, live,
                                      row_held)
     waiting_on = waiting = None
-    for pr in queue:
+    stopped = len(queue)
+    for at, pr in enumerate(queue):
         approval = approvals[pr["number"]]
         decision = decide(pr, approval, repo, main_tip, github, github.env,
                           run)
@@ -1890,7 +1925,12 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if (decision["action"] == "WAIT"
                     or decision.get("result", "").startswith("refused")):
                 waiting = decision
+            stopped = at + 1
             break
+    if EARLY_CONFLICTS:
+        record["decisions"] += early_conflicts(
+            repo, main_tip, queue[stopped:], approvals, github, said, live,
+            run)
     if live:
         minutes = stalled_for(state_dir, waiting, when)
         if minutes is not None:

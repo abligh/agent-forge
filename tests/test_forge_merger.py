@@ -2533,6 +2533,73 @@ class HoldConflicting(RepoCase):
             self.repo.path, [self.item(), self.rival()], run), {})
 
 
+class EarlyConflicts(RepoCase):
+    """merge.early_conflicts: a candidate the tick doesn't reach that
+    conflicts with main is handed back now (designs/0012). Tick's and
+    HoldConflicting's helpers, without their tests."""
+
+    item = Decide.item
+    tick = Tick.tick
+    other_pr = Tick.other_pr
+    rival = HoldConflicting.rival
+    comments = HoldConflicting.comments
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        m.configure(project(early_conflicts=True))
+        self.addCleanup(m.configure, project())
+
+    def behind(self):
+        """#6, approved, made on main's g.txt, which main then changes:
+        a conflict with main, none with #5."""
+        six = self.rival(files=(("g.txt", "six\n"),))
+        self.advance_main("g.txt", "main moved g\n")
+        return six
+
+    def test_the_configuration(self):
+        self.assertIs(m.EARLY_CONFLICTS, True)
+        m.configure(project())
+        self.assertIs(m.EARLY_CONFLICTS, False)
+
+    def test_one_behind_that_conflicts_with_main_is_told_now(self):
+        six = self.behind()
+        record, _ = self.tick([self.item(), six], conclusions=(None,),
+                              live=True)
+        acted = [(d["pr"], d["action"], d.get("early")) for d in
+                 record["decisions"]]
+        self.assertEqual(acted[0][0], 5)
+        self.assertIn((6, "HAND-BACK", True), acted)
+        (where, body), = [c for c in self.comments() if "/6/" in c[0]]
+        self.assertTrue(body.startswith("Not merging %s"
+                                        % six["headRefOid"][:10]))
+        # Said once per approval and head.
+        record, _ = self.tick([self.item(), six], conclusions=(None,),
+                              live=True, minutes=1)
+        self.assertNotIn(6, [d["pr"] for d in record["decisions"]])
+        self.assertEqual([c for c in self.comments() if "/6/" in c[0]], [])
+
+    def test_one_behind_that_is_clean_is_left_alone(self):
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,), live=True)
+        self.assertEqual([d["pr"] for d in record["decisions"]], [5])
+
+    def test_without_the_key_it_waits_to_be_reached(self):
+        m.configure(project())
+        six = self.behind()
+        record, _ = self.tick([self.item(), six], conclusions=(None,),
+                              live=True)
+        self.assertNotIn(6, [d["pr"] for d in record["decisions"]])
+
+    def test_a_dry_tick_says_nothing(self):
+        six = self.behind()
+        record, _ = self.tick([self.item(), six], conclusions=(None,))
+        self.assertIn(6, [d["pr"] for d in record["decisions"]])
+        self.assertEqual(self.comments(), [])
+
+
 class YieldIgnoresConflicts(unittest.TestCase):
 
     def test_hand_backs_without_conflicts(self):
