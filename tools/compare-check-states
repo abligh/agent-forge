@@ -19,9 +19,9 @@ The old check's verdicts are all kept unless `--old-since` is given: it
 never checks again a head or tree it has already checked, so its
 verdict on one the trial reaches later can be from before the trial.
 
-For each head both checked, it prints those whose verdict differs. Then it counts the heads only
-one of them checked, which is expected for a check that started later
-or prunes sooner. The steps' names may differ between the two, so a
+For each head both checked, it prints those whose verdict differs.
+Then it counts the heads only one of them checked, which is expected
+for a check that started later or prunes sooner. The steps' names may differ between the two, so a
 difference in the failed steps alone is shown but not counted as a
 disagreement.
 
