@@ -1723,6 +1723,20 @@ class NextAhead(unittest.TestCase):
         self.assertEqual(pc.next_ahead(empty(), self.AHEAD, when=T0),
                          (SHA_P, 2))
 
+    def test_an_entry_whose_tree_a_slot_is_checking_is_skipped(self):
+        # Two predictions can differ only in their parents: #674's ran
+        # side by side at 09:00Z on 2026-10-12.
+        self.assertEqual(pc.next_ahead(empty(), self.AHEAD, when=T0,
+                                       busy_trees={TREE_1}), (SHA_Q, 3))
+
+    def test_busy_trees_asks_git_for_each_running_commit(self):
+        run = FakeRun((lambda a: SHA_P + "^{tree}" in a,
+                       done([], 0, TREE_1 + "\n")),
+                      (lambda a: True, done([], 128, "", "bad")))
+        self.assertEqual(pc.busy_trees({SHA_P, SHA_Q}, "/repo", run),
+                         frozenset({TREE_1}))
+        self.assertEqual(pc.busy_trees({SHA_P}, None, run), frozenset())
+
     def test_an_entry_with_a_verdict_is_not_run_again(self):
         state = empty()
         state["results"][SHA_P] = dict(verdict(pr=2), ahead=True)

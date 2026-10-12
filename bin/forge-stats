@@ -13,6 +13,8 @@ defaults to the last `--hours` (24) up to now.
 - runs by kind: pull-request heads, the Merger's predictions (AHEAD) and
   the default branch;
 - verdicts posted without a run (MATCHED);
+- the Merger's predictions: how many a later head was matched to (so
+  posted without running), and the run time of those that were not;
 - the time each run spent waiting for a slot, and running;
 - how busy the slots were: the run time of runs that finished in the
   window, over `checks.slots` times the window. The fast lane's runs
@@ -55,6 +57,7 @@ VERDICT_RE = re.compile(
 MAIN_RE = re.compile(r"^(\S+) MAIN-(GREEN|RED) main ([0-9a-f]+): \S+ "
                      r"waited=(\d+)s ran=(\d+)s")
 MATCHED_RE = re.compile(r"^(\S+) MATCHED ")
+USED_RE = re.compile(r"prediction for #(\d+) ([0-9a-f]{10})")
 DEFAULT_SLOTS = 2
 BATCH = 40
 
@@ -119,7 +122,11 @@ def check_stats(lines, since, until, slots):
     waited, ran, pr_total = [], [], []
     matched = 0
     busy = 0
+    predictions = {}
+    used = set()
     for line in lines:
+        for hit in USED_RE.finditer(line):
+            used.add((hit.group(1), hit.group(2)))
         got = VERDICT_RE.match(line) or MAIN_RE.match(line)
         if got is None:
             hit = MATCHED_RE.match(line)
@@ -143,6 +150,8 @@ def check_stats(lines, since, until, slots):
                 continue
             w, r = int(got.group(7)), int(got.group(8))
         runs[kind] += 1
+        if kind == "prediction":
+            predictions[(got.group(3).lstrip("#"), got.group(4)[:10])] = r
         if colour == "red":
             red[kind] += 1
         waited.append(w)
@@ -151,7 +160,13 @@ def check_stats(lines, since, until, slots):
         if kind == "pull request":
             pr_total.append(w + r)
     capacity = slots * (until - since).total_seconds()
+    hits = [k for k in predictions if k in used]
     return {"runs": dict(runs), "red": dict(red), "matched": matched,
+            "predictions": {
+                "run": len(predictions), "used": len(hits),
+                "seconds": sum(predictions.values()),
+                "unused_seconds": sum(v for k, v in predictions.items()
+                                      if k not in used)},
             "waited": summary(waited), "ran": summary(ran),
             "pull_request_seen_to_verdict": summary(pr_total),
             "slots": slots, "busy_seconds": busy,
@@ -356,6 +371,12 @@ def report(name, since, until, check, queue, approval, authors):
     lines.append("  waited for a slot: " + spread(check["waited"]))
     lines.append("  pull-request head, waiting and run: "
                  + spread(check["pull_request_seen_to_verdict"]))
+    pred = check["predictions"]
+    if pred["run"]:
+        lines.append("  predictions: %d run, %d used by a later head; "
+                     "%.1f slot-hours, %.1f of them on ones never used"
+                     % (pred["run"], pred["used"], pred["seconds"] / 3600,
+                        pred["unused_seconds"] / 3600))
     if check["busy_share"] is not None:
         lines.append("  slots busy: %.0f%% of %d slots (%.1f slot-hours)"
                      % (100 * check["busy_share"], check["slots"],

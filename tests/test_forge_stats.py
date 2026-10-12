@@ -71,6 +71,17 @@ class Check(unittest.TestCase):
         self.assertEqual(self.got["waited"]["max"], 600)
         self.assertEqual(self.got["pull_request_seen_to_verdict"]["max"], 360)
         self.assertEqual(self.got["busy_seconds"], 720)
+
+    def test_predictions_used_and_not(self):
+        lines = VERDICTS + [
+            "2026-10-12T01:20:00Z VERDICT AHEAD #8 3333333333: green "
+            "waited=0s ran=200s",
+            "2026-10-12T01:30:00Z MATCHED #8 4444444444: its tree tested "
+            "green as the Merger's prediction for #8 3333333333; not run "
+            "again"]
+        got = tool.check_stats(lines, SINCE, UNTIL, 2)["predictions"]
+        self.assertEqual(got, {"run": 2, "used": 1, "seconds": 320,
+                               "unused_seconds": 120})
         self.assertEqual(self.got["busy_share"], round(720 / 14400, 3))
 
 
