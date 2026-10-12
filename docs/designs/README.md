@@ -24,6 +24,8 @@ project's rule, not agent-forge's.
 
 ## Lifecycle
 
+0. **Draft**: an idea written down to be examined or measured
+   against. It is not up for approval, and nothing is built from it.
 1. **Proposed**: written, with the evidence that motivates it.
 2. **Approved**: the owner's comment on the approval issue, cited in
    the status line.
