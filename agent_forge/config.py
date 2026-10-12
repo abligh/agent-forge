@@ -79,7 +79,7 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "main": str, "main_red_issue": dict}
 # checks.main: which default-branch heads are run (designs/0011).
 MAIN_MODES = ("needed", "every")
-MAIN_RED_ISSUE = {"label": str, "title": str}
+MAIN_RED_ISSUE = {"label": str, "labels": list, "title": str}
 # checks.cache_limit: a size in systemd's style, at least one byte.
 SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 # checks.fast_lane: a slot for heads whose chosen steps are cheap.

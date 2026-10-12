@@ -1243,6 +1243,14 @@ def make_writer(project, out=print, call=None):
     return write
 
 
+def signature():
+    """How an issue or comment forge-pr-check writes ends: a line saying
+    the machinery wrote it, then `— <poster>`, the App it writes as, the
+    last line, which is where a project's own tools read the owner."""
+    return ("Written by forge-pr-check, agent-forge's build check.\n\n— %s"
+            % POSTER)
+
+
 def red_text(sha, failed, commits, green):
     """The body of the issue a red default-branch head opens."""
     lines = ["`%s` is red at %s%s: %s." % (
@@ -1258,7 +1266,7 @@ def red_text(sha, failed, commits, green):
                   "```", text.rstrip(), "```"]
     lines += ["", "Every pull request's check is against this tip until "
               "it is green again; this issue is closed then.", "",
-              "— forge-pr-check"]
+              signature()]
     return "\n".join(lines)
 
 
@@ -1283,7 +1291,7 @@ def report_main(state_dir, repo, sha, ok, failed, same, write, out=print,
                 else "its check passed"
             got, _ = write("POST", "/repos/%s/issues/%d/comments"
                            % (REPO_SLUG, number), {"body": "Green again at "
-                           "%s: %s.\n\n— forge-pr-check" % (sha[:10], how)})
+                           "%s: %s.\n\n%s" % (sha[:10], how, signature())})
             shut, _ = write("PATCH", "/repos/%s/issues/%d"
                             % (REPO_SLUG, number), {"state": "closed"})
             if shut != 200:
@@ -1309,8 +1317,9 @@ def report_main(state_dir, repo, sha, ok, failed, same, write, out=print,
         number = red["issue"]
         got, _ = write("POST", "/repos/%s/issues/%d/comments"
                        % (REPO_SLUG, number), {"body": "Still red at %s: %s."
-                       "\n\n— forge-pr-check" % (sha[:10], ", ".join(
-                           n for n, _ in failed) or "a step failed")})
+                       "\n\n%s" % (sha[:10], ", ".join(
+                           n for n, _ in failed) or "a step failed",
+                           signature())})
         if got != 201:
             log(state_dir, "REPORT-FAILED %s %s: commenting on #%d: HTTP %s"
                 % (MAIN, sha[:10], number, got), when, out)
@@ -1328,8 +1337,10 @@ def report_main(state_dir, repo, sha, ok, failed, same, write, out=print,
         title = MAIN_RED_ISSUE.get("title", DEFAULT_RED_TITLE).replace(
             "{sha}", sha[:10])
         body = {"title": title, "body": red_text(sha, failed, commits, green)}
-        if MAIN_RED_ISSUE.get("label"):
-            body["labels"] = [MAIN_RED_ISSUE["label"]]
+        labels = list(MAIN_RED_ISSUE.get("labels", [])) + (
+            [MAIN_RED_ISSUE["label"]] if MAIN_RED_ISSUE.get("label") else [])
+        if labels:
+            body["labels"] = labels
         got, made = write("POST", "/repos/%s/issues" % REPO_SLUG, body)
         if got != 201 or "number" not in made:
             log(state_dir, "REPORT-FAILED %s %s: opening an issue: HTTP %s %s"

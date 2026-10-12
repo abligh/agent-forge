@@ -46,8 +46,10 @@ class MainConfig(unittest.TestCase):
         self.assertEqual(self.problems(depends=True,
                                        main_red_issue={}), [])
         self.assertEqual(len(self.problems(main_red_issue={})), 1)
-        self.assertIn("unknown key 'labels'", self.problems(
-            main="every", main_red_issue={"labels": []})[0])
+        self.assertEqual(self.problems(
+            main="every", main_red_issue={"labels": ["bug", "x"]}), [])
+        self.assertIn("unknown key 'tags'", self.problems(
+            main="every", main_red_issue={"tags": []})[0])
 
     def test_off_unless_configured(self):
         self.assertFalse(pc.MAIN_EVERY)
@@ -209,6 +211,26 @@ class RedIssue(unittest.TestCase):
         self.assertNotIn("* %s green" % self.green[:7], body["body"])
         self.assertEqual(pc.load(self.state_dir)["main_red"]["issue"], 42)
         self.assertIn("FILED #42", self.lines[0])
+        # Signed as the poster, on the last line, where a project's tools
+        # read the owner from.
+        self.assertEqual(body["body"].splitlines()[-1],
+                         "— %s" % pc.POSTER)
+
+    def test_labels_as_a_list_and_every_write_signed(self):
+        configured(main="every", main_red_issue={
+            "labels": ["bug", "Notify:Reviewer"]})
+        write = Writer()
+        self.report(self.red, False, write)
+        self.report(self.commit("three"), False, write)
+        self.report(self.commit("fix"), True, write)
+        self.assertEqual(write.writes[0][2]["labels"],
+                         ["bug", "Notify:Reviewer"])
+        self.assertEqual(write.writes[0][2]["title"],
+                         "The default branch is red at %s" % self.red[:10])
+        for method, _, body in write.writes:
+            if "body" in body:
+                self.assertTrue(body["body"].endswith(
+                    "build check.\n\n— %s" % pc.POSTER), body["body"])
 
     def test_each_further_red_head_comments_once(self):
         write = Writer()
