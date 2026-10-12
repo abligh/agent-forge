@@ -201,6 +201,18 @@ class OpenHeads(unittest.TestCase):
         run = FakeRun((is_pulls, done([], 1, "", "HTTP 502")))
         self.assertIsNone(pc.open_heads("t", run))
 
+    def test_a_failure_says_why(self):
+        # A transient error and a token problem look alike without it.
+        why = []
+        run = FakeRun((is_pulls, done([], 1, "", "warning\n"
+                                      "gh: Server Error (HTTP 502)\n")))
+        self.assertIsNone(pc.open_heads("t", run, why))
+        self.assertEqual(why, ["gh exited 1: gh: Server Error (HTTP 502)"])
+        why = []
+        run = FakeRun((is_pulls, done([], 0, "7\tabc\n")))
+        self.assertIsNone(pc.open_heads("t", run, why))
+        self.assertEqual(why, ["an unreadable line: '7\\tabc'"])
+
     def test_a_malformed_line_or_short_sha_is_none(self):
         for text in ("7\t%s\t%s\n" % (SHA_A, REPO),
                      heads_tsv((7, "abc", REPO, "false"))):
@@ -580,6 +592,7 @@ class Tick(StateCase):
         self.assertEqual(self.tick(fail=True), 2)
         self.assertEqual(self.spawned, [])
         self.assertTrue(self.lines[0].startswith("NO-PULLS"))
+        self.assertIn("gh exited", self.lines[0])
 
     def test_idle_when_nothing_waits(self):
         self.assertEqual(self.tick(), 0)

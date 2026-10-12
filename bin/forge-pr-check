@@ -794,22 +794,29 @@ def gh(args, token, run=sh):
     return run(["gh", "api"] + args, env=dict(os.environ, GH_TOKEN=token))
 
 
-def open_heads(token, run=sh):
+def open_heads(token, run=sh, why=None):
     """[(pr, sha, head repository, draft, author)] for every open pull
-    request, or None if GitHub could not be read. A head whose
-    repository is gone reports "" for it, and so does an author GitHub
-    didn't give."""
+    request, or None if GitHub could not be read, with the reason
+    appended to `why` (a list) when given. A head whose repository is
+    gone reports "" for it, and so does an author GitHub didn't give."""
     got = gh(["--paginate", "repos/%s/pulls?state=open&per_page=100"
               % REPO_SLUG, "--jq", '.[] | [.number, .head.sha, '
               '(.head.repo.full_name // ""), .draft, (.user.login // "")] '
               '| @tsv'], token, run)
     if got.returncode != 0:
+        if why is not None:
+            said = [l.strip() for l in (got.stderr or "").splitlines()
+                    if l.strip()]
+            why.append("gh exited %d: %s" % (
+                got.returncode, said[-1][:200] if said else "no message"))
         return None
     heads = []
     for line in got.stdout.splitlines():
         fields = line.split("\t")
         if len(fields) not in (4, 5) or not fields[0].isdigit() \
                 or len(fields[1]) != 40:
+            if why is not None:
+                why.append("an unreadable line: %r" % line[:100])
             return None
         heads.append((int(fields[0]), fields[1], fields[2],
                       fields[3] == "true", (fields[4:] or [""])[0]))
@@ -1524,9 +1531,11 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     module docstring). With FAST_LANE_S, `depends` and a checkout, the
     fast lane is one more slot, which starts the oldest cheap head."""
     when = when or now_utc()
-    heads = open_heads(token, run)
+    why = []
+    heads = open_heads(token, run, why)
     if heads is None:
-        out("NO-PULLS: could not list %s's open pull requests" % REPO_SLUG)
+        out("NO-PULLS: could not list %s's open pull requests: %s"
+            % (REPO_SLUG, why[0] if why else "no reason given"))
         return 2
     slots = slots or slots_from_env()
     lane = FAST_LANE_S is not None and DEPENDS and bool(checkout)
