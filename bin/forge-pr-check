@@ -144,6 +144,10 @@ naming that commit, logs `MATCHED`, and posts `success` as `green on
 <host>: tree tested as <sha> (<whose>)`, naming the Merger's
 prediction or the other head. A matched verdict is dated from the run
 it stands in for, so a match of a match still ages out after that run.
+A head whose tree a slot is checking right now as the Merger's
+prediction for the same pull request isn't started beside it: it waits
+(`HELD ...: its tree is being checked now as the Merger's prediction`)
+and is matched once that verdict is in.
 This is what turns a prediction into a merge: when GitHub's update
 produces the predicted tree, the head is posted green at once and the
 Merger merges it on its next tick.
@@ -1424,6 +1428,10 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     with state_lock(state_dir):
         state = load(state_dir)
         cheap = cheap_heads(state) if lane else {}
+        # A head whose own prediction, the same tree, is running waits
+        # for its verdict rather than checking the tree a second time.
+        twins = twin_heads(state, fields.values(), checkout, run) \
+            if TEST_AHEAD else {}
         if fresh:
             held = held_heads(state, head_of_main[0], busy, when, first_pr,
                               cheap)
@@ -1442,12 +1450,12 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                                for w in state["waiting"].values()
                                if not w.get("main"))
         if lane_free:
-            fast = lane_head(state, cheap, busy, when)
+            fast = lane_head(state, cheap, set(busy) | set(twins), when)
             if fast is not None:
                 state["waiting"][fast[0]]["started"] = iso(when)
                 save(state_dir, state)
         # What the lane just took is as good as running.
-        taken = set(busy) | ({fast[0]} if fast else set())
+        taken = set(busy) | set(twins) | ({fast[0]} if fast else set())
         if free:
             pick = next_head(state, taken | set(held), first_pr, when,
                              cheap, urgent) if fresh else \
@@ -1477,6 +1485,9 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     for sha in sorted(held, key=lambda s: order(state["waiting"], s)):
         out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
                                  held[sha]))
+    for sha in sorted(twins, key=lambda s: order(state["waiting"], s)):
+        out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
+                                 twins[sha]))
     if fast is not None:
         sha, pr = fast
         spawn(state_dir, sha, pr, post is not None, LANE, checkout)
@@ -2265,6 +2276,37 @@ def main_needs(checkout, head, state_dir, run=sh):
         return None
     return sorted(n for n, why in selection["ran"].items()
                   if n in selection["stale"] or why == "not in any record")
+
+
+def twin_heads(state, running, checkout, run=sh):
+    """{sha: why} of the waiting heads whose tree a slot is checking now
+    as the Merger's prediction for the same pull request (`running`:
+    holder_fields of each slot). Run beside it, a head would only check
+    the same tree twice; held until the prediction's verdict is in, it
+    is matched to it at once (or, if that is red, is no worse off)."""
+    if not checkout:
+        return {}
+    predictions = [(f[0], f[1]) for f in running if f and f[4] and f[0]]
+    if not predictions:
+        return {}
+    trees = {}
+
+    def tree(sha):
+        if sha not in trees:
+            trees[sha] = tree_of(checkout, sha, run)
+        return trees[sha]
+    twins = {}
+    for sha, entry in state["waiting"].items():
+        if entry.get("main"):
+            continue
+        for pr, predicted in predictions:
+            if entry.get("pr") == pr and tree(sha) is not None \
+                    and tree(sha) == tree(predicted):
+                twins[sha] = ("its tree is being checked now as the "
+                              "Merger's prediction %s; waits to be "
+                              "matched to it" % predicted[:10])
+                break
+    return twins
 
 
 def held_heads(state, tip, busy, when, first_pr=None, cheap=()):

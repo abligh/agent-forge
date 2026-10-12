@@ -1867,6 +1867,19 @@ class TickAhead(Tick):
             self.tick([(8, SHA_B, REPO, "false")], merger_dir=self.merger())
         self.assertEqual(self.spawned[0][1], SHA_P)
 
+    def test_a_head_whose_prediction_is_running_waits_to_be_matched(self):
+        # #621 at 06:23Z: its head ran beside its own prediction.
+        self.hold(1, "#8 %s %s pid=5 ahead" % (SHA_P, pc.iso(T0)))
+        self.write_state({"waiting": {SHA_B: {
+            "pr": 8, "since": pc.iso(T0 - datetime.timedelta(hours=1))}}})
+        why = "its tree is being checked now as the Merger's prediction"
+        with mock.patch.object(pc, "twin_heads",
+                               lambda *a: {SHA_B: why}):
+            self.tick([(8, SHA_B, REPO, "false")], merger_dir=self.merger(
+                entries=[]))
+        self.assertEqual(self.spawned, [])
+        self.assertIn("HELD #8 %s: %s" % (SHA_B[:10], why), self.lines)
+
     def test_nothing_to_predict_and_nothing_waiting_is_idle(self):
         self.write_state(dict(empty(), results={SHA_P: verdict(pr=2)}))
         self.tick([], merger_dir=self.merger())
@@ -1881,6 +1894,41 @@ class TickAhead(Tick):
         self.tick([], merger_dir=self.merger())
         self.assertEqual(self.spawned, [])
         self.assertNotIn("ahead_started", self.state())
+
+
+class TwinHeads(unittest.TestCase):
+    """A waiting head whose tree a slot is checking as its own pull
+    request's prediction is held for that verdict."""
+
+    def run_with(self, trees):
+        return FakeRun((lambda a: a[-1].endswith("^{tree}"),
+                        lambda a: done(a, 0, trees[a[-1][:-7]] + "\n")))
+
+    def state(self):
+        return {"waiting": {SHA_A: {"pr": 7, "since": pc.iso(T0)},
+                            SHA_B: {"pr": 8, "since": pc.iso(T0)},
+                            SHA_C: {"pr": 0, "main": True,
+                                    "since": pc.iso(T0)}}}
+
+    def test_the_same_tree_under_the_same_pull_request_waits(self):
+        running = [(7, SHA_P, pc.iso(T0), 5, True)]
+        run = self.run_with({SHA_P: TREE_1, SHA_A: TREE_1, SHA_B: TREE_1,
+                             SHA_C: TREE_1})
+        self.assertEqual(list(pc.twin_heads(self.state(), running, "/repo",
+                                            run)), [SHA_A])
+
+    def test_not_another_tree_nor_a_head_running_nor_without_a_checkout(
+            self):
+        run = self.run_with({SHA_P: TREE_1, SHA_A: TREE_2})
+        self.assertEqual(pc.twin_heads(
+            self.state(), [(7, SHA_P, pc.iso(T0), 5, True)], "/repo", run), {})
+        # A slot running a pull request's head isn't a prediction.
+        self.assertEqual(pc.twin_heads(
+            self.state(), [(7, SHA_P, pc.iso(T0), 5, False)], "/repo",
+            self.run_with({SHA_P: TREE_1, SHA_A: TREE_1})), {})
+        self.assertEqual(pc.twin_heads(
+            self.state(), [(7, SHA_P, pc.iso(T0), 5, True)], None,
+            self.run_with({SHA_P: TREE_1, SHA_A: TREE_1})), {})
 
 
 class PrepareAhead(unittest.TestCase):
