@@ -183,6 +183,178 @@ class Spans(unittest.TestCase):
         self.assertEqual(tool.union_seconds(spans, SINCE, UNTIL), 5400)
 
 
+def job(start, end, status="completed", attempt=1, name="test",
+        labels=("ubuntu-latest",)):
+    return {"status": status, "started_at": start, "completed_at": end,
+            "run_attempt": attempt, "name": name, "labels": list(labels)}
+
+
+class JobMinutes(unittest.TestCase):
+    """GitHub bills each job's run time rounded up to a whole minute."""
+
+    def test_an_exact_minute_is_one(self):
+        self.assertEqual(tool.job_minutes(
+            job("2026-10-12T00:00:00Z", "2026-10-12T00:01:00Z")), 1)
+
+    def test_a_second_over_rounds_up(self):
+        self.assertEqual(tool.job_minutes(
+            job("2026-10-12T00:00:00Z", "2026-10-12T00:01:01Z")), 2)
+        self.assertEqual(tool.job_minutes(
+            job("2026-10-12T00:00:00Z", "2026-10-12T00:00:01Z")), 1)
+
+    def test_a_job_that_never_started_is_zero(self):
+        self.assertEqual(tool.job_minutes(
+            job(None, "2026-10-12T00:01:00Z")), 0)
+        # A skipped job: started and completed in the same instant.
+        self.assertEqual(tool.job_minutes(
+            job("2026-10-12T00:00:00Z", "2026-10-12T00:00:00Z")), 0)
+
+    def test_a_job_that_ends_before_it_begins_is_zero(self):
+        self.assertEqual(tool.job_minutes(
+            job("2026-10-12T00:02:00Z", "2026-10-12T00:00:30Z")), 0)
+
+    def test_a_job_still_running_is_none(self):
+        self.assertIsNone(tool.job_minutes(
+            job("2026-10-12T00:00:00Z", None, status="in_progress")))
+        self.assertIsNone(tool.job_minutes(
+            job(None, None, status="queued")))
+
+
+RUNS = [
+    {"id": 1, "name": "ci", "event": "pull_request", "conclusion": "success",
+     "triggering_actor": {"login": "leaddevwidgetagent[bot]"}},
+    {"id": 2, "name": "ci", "event": "push", "conclusion": "cancelled",
+     "actor": {"login": "someone"}},
+    {"id": 3, "name": "docs", "event": "schedule", "conclusion": None},
+]
+JOBS = {
+    1: [job("2026-10-12T00:00:00Z", "2026-10-12T00:04:30Z"),
+        job("2026-10-12T00:00:00Z", "2026-10-12T00:01:00Z", name="lint"),
+        job("2026-10-12T00:10:00Z", "2026-10-12T00:12:00Z", attempt=2)],
+    2: [job("2026-10-12T00:00:00Z", "2026-10-12T00:00:10Z"),
+        job("2026-10-12T00:00:00Z", "2026-10-12T00:30:00Z",
+            labels=("self-hosted", "linux"))],
+    3: [job("2026-10-12T00:00:00Z", None, status="in_progress")],
+}
+
+
+class Actions(unittest.TestCase):
+
+    def setUp(self):
+        self.got = tool.actions_stats(RUNS, JOBS)
+
+    def test_totals(self):
+        self.assertEqual((self.got["runs"], self.got["jobs"],
+                          self.got["minutes"], self.got["still_running"],
+                          self.got["self_hosted"]), (3, 4, 9, 1, 1))
+
+    def test_breakdowns(self):
+        by = self.got["by"]
+        self.assertEqual(by["workflow"], {"ci": 9})
+        self.assertEqual(by["job"], {"ci / test": 8, "ci / lint": 1})
+        self.assertEqual(by["event"], {"pull_request": 8, "push": 1})
+        self.assertEqual(by["conclusion"], {"success": 8, "cancelled": 1})
+        self.assertEqual(by["attempt"], {"first": 7, "rerun": 2})
+        # The triggering actor, else the run's actor.
+        self.assertEqual(by["triggered_by"],
+                         {"leaddevwidgetagent[bot]": 8, "someone": 1})
+
+    def test_a_run_without_jobs_counts_as_a_run(self):
+        got = tool.actions_stats(RUNS[:1], {})
+        self.assertEqual((got["runs"], got["jobs"], got["minutes"]),
+                         (1, 0, 0))
+
+    def test_the_text(self):
+        text = "\n".join(tool.actions_text(self.got, top=1))
+        self.assertIn("9 min in 4 jobs of 3 runs; 1 still running, left "
+                      "out; 1 self-hosted, not billed", text)
+        self.assertIn("by job: ci / test 8; 1 more", text)
+        self.assertIn("by attempt: first 7; 1 more", text)
+
+
+class FakeActions:
+    """GitHub's runs and jobs endpoints over `runs` (each with `created`)
+    and `jobs` ({run id: [job]}), paging at `per_page`."""
+
+    def __init__(self, runs, jobs, per_page=100, refuse=None):
+        self.runs, self.jobs, self.per_page = runs, jobs, per_page
+        self.refuse, self.urls = refuse, []
+
+    def __call__(self, url, token, scheme=None, method=None, body=None):
+        import urllib.parse
+        self.urls.append(url)
+        parsed = urllib.parse.urlparse(url)
+        if parsed.path.endswith("/graphql"):
+            # Approval to merge: the merged pull requests are not asked of.
+            return 200, {"data": {"repository": {"none": None}}}
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        page = int(query["page"])
+        if self.refuse and self.refuse in parsed.path:
+            return 403, {"message": "no"}
+        if parsed.path.endswith("/jobs"):
+            self.assertion = query.get("filter")
+            items = self.jobs.get(int(parsed.path.split("/")[-2]), [])
+            key = "jobs"
+        else:
+            lo, hi = query["created"].split("..")
+            items = [r for r in self.runs if lo <= r["created"] <= hi]
+            key = "workflow_runs"
+            # GitHub answers no more than 1000 runs to one filtered query.
+            total, items = len(items), items[:1000]
+            start = (page - 1) * 100
+            return 200, {"total_count": total,
+                         key: items[start:start + 100]}
+        start = (page - 1) * 100
+        return 200, {"total_count": len(items),
+                     key: items[start:start + 100]}
+
+
+def runs_at(n, start=SINCE, every=datetime.timedelta(seconds=5)):
+    return [{"id": i, "name": "ci",
+             "created": tool.iso(start + every * i)} for i in range(n)]
+
+
+class Fetch(unittest.TestCase):
+
+    def test_runs_are_paged(self):
+        fake = FakeActions(runs_at(250), {})
+        got = tool.fetch_runs("tok", "example/widget", SINCE, UNTIL, fake)
+        self.assertEqual(len(got), 250)
+        self.assertEqual(len(fake.urls), 3)
+        self.assertIn("created=2026-10-12T00:00:00Z..2026-10-12T01:59:59Z",
+                      fake.urls[0])
+
+    def test_a_window_at_the_cap_is_split(self):
+        fake = FakeActions(runs_at(1200), {})
+        got = tool.fetch_runs("tok", "example/widget", SINCE, UNTIL, fake)
+        self.assertEqual(sorted(r["id"] for r in got), list(range(1200)))
+
+    def test_a_window_of_exactly_the_cap_is_split(self):
+        fake = FakeActions(runs_at(1000), {})
+        got = tool.fetch_runs("tok", "example/widget", SINCE, UNTIL, fake)
+        self.assertEqual(len(got), 1000)
+        self.assertNotIn("page=11", " ".join(fake.urls))
+
+    def test_the_window_end_is_left_out(self):
+        fake = FakeActions([{"id": 1, "created": tool.iso(UNTIL)}], {})
+        self.assertEqual(tool.fetch_runs("tok", "o/r", SINCE, UNTIL, fake),
+                         [])
+
+    def test_jobs_of_every_attempt_are_paged(self):
+        fake = FakeActions([], {7: [job(None, None)] * 130})
+        got = tool.fetch_jobs("tok", "example/widget", 7, fake)
+        self.assertEqual(len(got), 130)
+        self.assertEqual(fake.assertion, "all")
+
+    def test_a_refusal_is_an_error(self):
+        with self.assertRaises(RuntimeError):
+            tool.fetch_runs("tok", "o/r", SINCE, UNTIL,
+                            FakeActions([], {}, refuse="/runs"))
+        with self.assertRaises(RuntimeError):
+            tool.fetch_jobs("tok", "o/r", 7,
+                            FakeActions([], {}, refuse="/jobs"))
+
+
 class Main(unittest.TestCase):
 
     def setUp(self):
@@ -220,6 +392,45 @@ class Main(unittest.TestCase):
         self.assertIn("merges: 2 (1.0 an hour)", text)
         self.assertIn("hand-backs: conflict 1", text)
         self.assertNotIn("Approval to merge", text)
+
+    def fake(self):
+        runs = [dict(r, created="2026-10-12T00:30:00Z") for r in RUNS]
+        return FakeActions(runs, JOBS)
+
+    def test_actions(self):
+        self.write()
+        self.assertEqual(tool.main(
+            ["--since", "2026-10-12T00:00Z", "--until", "2026-10-12T02:00Z",
+             "--actions"], self.out.append, self.env, call=self.fake(),
+            token="tok"), 0)
+        self.assertIn("9 min in 4 jobs of 3 runs", self.out[0])
+        self.assertIn("by workflow: ci 9", self.out[0])
+
+    def test_actions_needs_no_local_records(self):
+        self.assertEqual(tool.main(
+            ["--since", "2026-10-12T00:00Z", "--until", "2026-10-12T02:00Z",
+             "--actions", "--json"], self.out.append, self.env,
+            call=self.fake(), token="tok"), 0)
+        self.assertEqual(json.loads(self.out[0])["actions"]["minutes"], 9)
+
+    def test_no_github_leaves_actions_out(self):
+        self.write()
+        fake = self.fake()
+        self.assertEqual(tool.main(
+            ["--since", "2026-10-12T00:00Z", "--until", "2026-10-12T02:00Z",
+             "--no-github", "--actions"], self.out.append, self.env,
+            call=fake, token="tok"), 0)
+        self.assertNotIn("Actions", self.out[0])
+        self.assertEqual(fake.urls, [])
+
+    def test_without_the_flag_actions_are_not_fetched(self):
+        self.write()
+        fake = FakeActions([], {})
+        self.assertEqual(tool.main(
+            ["--since", "2026-10-12T00:00Z", "--until", "2026-10-12T02:00Z",
+             "--json"], self.out.append, self.env, call=fake, token="tok"), 0)
+        self.assertIsNone(json.loads(self.out[0])["actions"])
+        self.assertFalse(any("/actions/" in u for u in fake.urls))
 
     def test_json(self):
         self.write()

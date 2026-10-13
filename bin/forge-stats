@@ -35,6 +35,16 @@ and idle (`presence.jsonl`, from v0.4.41), also the part of those hours
 she was idle: waiting on her own work, not merely working on something
 else meanwhile.
 
+**GitHub Actions minutes** (`--actions`, GitHub): the workflow runs
+created in the window, and every job of every attempt of each, from the
+runs and jobs APIs. The billing API is never read. A job's minutes are
+its run time rounded up to a whole minute, as GitHub bills (`job_minutes`).
+A job that never started counts zero, and one still running is left out
+and counted apart. Jobs on self-hosted runners are counted but not
+billed. The minutes are broken down by workflow, by job, by the event
+that started the run, by run conclusion, by attempt (first run or
+rerun) and by who triggered the run. `--no-github` leaves it out.
+
 Exit status: 0 the report was written; 2 no configuration or no records.
 """
 
@@ -244,6 +254,108 @@ def fetch_merged(token, repo, numbers, call=github.api_call):
     return found
 
 
+# The runs API answers at most this many runs to one filtered query, so
+# a window with more is split until each part has fewer.
+RUNS_CAP = 1000
+SELF_HOSTED = "self-hosted"
+
+
+def job_minutes(job):
+    """The billed minutes of one job, as GitHub bills them: its run time
+    rounded up to a whole minute; 0 when it never started (skipped, or
+    cancelled while queued) or its clock says it ended before it began.
+    None while it has no completion time (still running), which the
+    caller leaves out and counts apart."""
+    if not job.get("completed_at"):
+        return None
+    if not job.get("started_at"):
+        return 0
+    seconds = (parse_time(job["completed_at"])
+               - parse_time(job["started_at"])).total_seconds()
+    if seconds <= 0:
+        return 0
+    return int(-(-seconds // 60))
+
+
+def iso(when):
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fetch_runs(token, repo, since, until, call=github.api_call):
+    """Every workflow run created in [since, until), splitting the window
+    while a part holds RUNS_CAP or more runs (GitHub answers no more)."""
+    runs, page = [], 1
+    path = "/repos/%s/actions/runs?created=%s..%s&per_page=100" % (
+        repo, iso(since), iso(until - datetime.timedelta(seconds=1)))
+    while True:
+        status, body = github.rest(token, "GET", "%s&page=%d" % (path, page),
+                                   call=call)
+        if status != 200 or not isinstance(body, dict):
+            raise RuntimeError("GitHub answered %s for the runs: %s"
+                               % (status, json.dumps(body)[:200]))
+        if page == 1 and body.get("total_count", 0) >= RUNS_CAP \
+                and until - since > datetime.timedelta(minutes=1):
+            middle = since + (until - since) / 2
+            return (fetch_runs(token, repo, since, middle, call)
+                    + fetch_runs(token, repo, middle, until, call))
+        got = body.get("workflow_runs") or []
+        runs.extend(got)
+        if len(got) < 100:
+            return runs
+        page += 1
+
+
+def fetch_jobs(token, repo, run_id, call=github.api_call):
+    """Every job of every attempt of one run."""
+    jobs, page = [], 1
+    while True:
+        status, body = github.rest(
+            token, "GET", "/repos/%s/actions/runs/%s/jobs?filter=all"
+            "&per_page=100&page=%d" % (repo, run_id, page), call=call)
+        if status != 200 or not isinstance(body, dict):
+            raise RuntimeError("GitHub answered %s for run %s's jobs: %s"
+                               % (status, run_id, json.dumps(body)[:200]))
+        got = body.get("jobs") or []
+        jobs.extend(got)
+        if len(got) < 100:
+            return jobs
+        page += 1
+
+
+def actions_stats(runs, jobs_of):
+    """The minutes of `runs` (the runs API's records), whose jobs are
+    `jobs_of[run id]`."""
+    total = billed_jobs = running = self_hosted = 0
+    by = {k: collections.Counter() for k in (
+        "workflow", "job", "event", "conclusion", "attempt", "triggered_by")}
+    for run in runs:
+        workflow = run.get("name") or "?"
+        who = ((run.get("triggering_actor") or run.get("actor") or {})
+               .get("login") or "?")
+        for job in jobs_of.get(run.get("id"), []):
+            minutes = job_minutes(job)
+            if minutes is None:
+                running += 1
+                continue
+            if SELF_HOSTED in (job.get("labels") or []):
+                self_hosted += 1
+                continue
+            billed_jobs += 1
+            total += minutes
+            by["workflow"][workflow] += minutes
+            by["job"]["%s / %s" % (workflow, job.get("name") or "?")] += \
+                minutes
+            by["event"][run.get("event") or "?"] += minutes
+            by["conclusion"][run.get("conclusion") or "unfinished"] += \
+                minutes
+            by["attempt"]["first" if (job.get("run_attempt") or 1) == 1
+                          else "rerun"] += minutes
+            by["triggered_by"][who] += minutes
+    return {"runs": len(runs), "jobs": billed_jobs, "minutes": total,
+            "still_running": running, "self_hosted": self_hosted,
+            "by": {k: dict(v.most_common()) for k, v in by.items()}}
+
+
 def union_seconds(spans, since, until):
     """Seconds of [since, until) covered by any of `spans`."""
     clipped = sorted((max(a, since), min(b, until)) for a, b in spans
@@ -353,7 +465,28 @@ def spread(s):
         seconds_text(s["max"]), s["n"])
 
 
-def report(name, since, until, check, queue, approval, authors):
+def actions_text(actions, top=10):
+    """The Actions section of the report."""
+    lines = ["", "GitHub Actions minutes (each job rounded up to a minute)",
+             "  %d min in %d jobs of %d runs; %d still running, left out; "
+             "%d self-hosted, not billed" % (
+                 actions["minutes"], actions["jobs"], actions["runs"],
+                 actions["still_running"], actions["self_hosted"])]
+    for key, title in (("workflow", "by workflow"), ("job", "by job"),
+                       ("event", "by event"),
+                       ("conclusion", "by run conclusion"),
+                       ("attempt", "by attempt"),
+                       ("triggered_by", "by who triggered the run")):
+        parts = list(actions["by"][key].items())
+        more = len(parts) - top
+        lines.append("  %s: %s%s" % (title, ", ".join(
+            "%s %d" % kv for kv in parts[:top]) or "none",
+            "; %d more" % more if more > 0 else ""))
+    return lines
+
+
+def report(name, since, until, check, queue, approval, authors,
+           actions=None):
     hours = (until - since).total_seconds() / 3600
     lines = ["forge-stats: %s, %s to %s (%.1f h)"
              % (name, stamp(since), stamp(until), hours), "",
@@ -406,6 +539,8 @@ def report(name, since, until, check, queue, approval, authors):
                 spread(s["approval_to_merge"]),
                 s["hours_with_approved_work_waiting"],
                 "" if idle is None else ", %.1f h idle" % idle))
+    if actions is not None:
+        lines += actions_text(actions)
     return "\n".join(lines)
 
 
@@ -433,7 +568,11 @@ def main(argv=None, out=print, environ=None, now=None,
         "FORGE_CRON_CHECKOUT"), help="where the configuration is found "
         "(default $FORGE_CRON_CHECKOUT, else the current directory)")
     parser.add_argument("--no-github", action="store_true",
-                        help="leave out approval to merge and the authors")
+                        help="leave out approval to merge, the authors "
+                        "and the Actions minutes")
+    parser.add_argument("--actions", action="store_true",
+                        help="add the GitHub Actions minutes of the runs "
+                        "created in the window")
     parser.add_argument("--json", action="store_true",
                         help="the figures as JSON")
     args = parser.parse_args(argv)
@@ -460,7 +599,8 @@ def main(argv=None, out=print, environ=None, now=None,
             records.append(json.loads(line))
         except ValueError:
             continue
-    if not verdicts and not records:
+    want_actions = args.actions and not args.no_github
+    if not verdicts and not records and not want_actions:
         out("NO-RECORDS: nothing in %s or %s" % (pr_dir, merger_dir))
         return 2
     check = check_stats(verdicts, since, until, slots)
@@ -480,16 +620,24 @@ def main(argv=None, out=print, environ=None, now=None,
         approval, authors = author_stats(
             merged, since, until,
             lambda login: project.by_login(login) or login, idle)
+    actions = None
+    if want_actions:
+        token = token or github.read_token(project, environ)
+        runs = fetch_runs(token, project.repo, since, until, call)
+        actions = actions_stats(runs, {
+            run["id"]: fetch_jobs(token, project.repo, run["id"], call)
+            for run in runs})
     if args.json:
         out(json.dumps(jsonable({
             "project": project.name, "since": since, "until": until,
             "check": check,
             "queue": {k: v for k, v in queue.items() if k != "merged_at"},
-            "approval_to_merge": approval, "authors": authors}),
+            "approval_to_merge": approval, "authors": authors,
+            "actions": actions}),
             indent=1, sort_keys=True))
     else:
         out(report(project.name, since, until, check, queue, approval,
-                   authors))
+                   authors, actions))
     return 0
 
 
