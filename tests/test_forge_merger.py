@@ -66,6 +66,56 @@ def pr(number=1, created=T0, reviews=None, comments=None, body="",
             "comments": comments or []}
 
 
+def urgent_project(**merge):
+    data = example()
+    data["merge"] = dict({"gate": GATE}, **merge)
+    data.setdefault("labels", {})["urgent"] = "Priority:urgent"
+    return config.Project(data, None)
+
+
+def labelled(p, *names):
+    p["labels"] = {"nodes": [{"name": n} for n in names]}
+    return p
+
+
+class Urgent(unittest.TestCase):
+    """labels.urgent: a pull request carrying it goes first."""
+
+    def setUp(self):
+        m.configure(urgent_project(yield_after_hand_back=2))
+        self.addCleanup(m.configure, project())
+
+    def test_before_older_ones_and_blockers(self):
+        waiting = pr(1, T0, body="Blocked-by: #2")
+        hot = labelled(pr(5, T3), "Priority:urgent")
+        got = m.order([waiting, pr(2, T2), pr(3, T1), hot])
+        self.assertEqual([p["number"] for p in got], [5, 2, 1, 3])
+
+    def test_several_oldest_first(self):
+        got = m.order([labelled(pr(5, T3), "Priority:urgent"), pr(3, T0),
+                       labelled(pr(4, T1), "Priority:urgent")])
+        self.assertEqual([p["number"] for p in got], [4, 5, 3])
+
+    def test_another_label_is_nothing(self):
+        got = m.order([pr(3, T0), labelled(pr(5, T3), "bug")])
+        self.assertEqual([p["number"] for p in got], [3, 5])
+
+    def test_off_without_the_setting(self):
+        m.configure(project())
+        got = m.order([pr(3, T0), labelled(pr(5, T3), "Priority:urgent")])
+        self.assertEqual([p["number"] for p in got], [3, 5])
+
+    def test_an_urgent_one_never_yields(self):
+        hot = labelled(pr(5, T0), "Priority:urgent")
+        queue = [hot, pr(6, T1), pr(7, T2)]
+        got, moved = m.yield_places(queue, queue, {5: 3})
+        self.assertEqual([p["number"] for p in got], [5, 6, 7])
+        self.assertEqual(moved, {})
+
+    def test_the_query_reads_labels(self):
+        self.assertIn("labels(first:50) { nodes { name } }", m.PR_QUERY)
+
+
 class LoginAndMarkers(unittest.TestCase):
 
     def test_bot_suffix_is_dropped(self):

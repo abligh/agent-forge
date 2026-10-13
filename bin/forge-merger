@@ -7,8 +7,10 @@ it at a head the approval
 still covers, nobody has spoken since, and nothing it names in a
 `Blocked-by:` line is still open. The Merger takes those in order:
 
-* the pull requests another open one is blocked by come first, held
-  or not;
+* with `labels.urgent`, the pull requests carrying that label come
+  first, oldest-opened first (a person's call: it goes before
+  blockers);
+* then the pull requests another open one is blocked by, held or not;
 * then the rest, oldest-opened first;
 * with `merge.yield_after_hand_back`, each that was handed back lately
   then lets others in its group go first (below).
@@ -382,6 +384,8 @@ STALL_TO_OWNER = datetime.timedelta(
 STALL_TITLE = DEFAULT_STALL_TITLE
 STALL_LABELS = ()
 WAITING_OWNER = DEFAULT_WAITING_OWNER
+# labels.urgent: the label that puts a pull request first, or None.
+URGENT_LABEL = None
 STALL_ALERT_NAME = "stall-alert.json"
 # `merge.test_ahead`: whether the next pull requests' commits are
 # predicted for the build check to test ahead, and how many behind the
@@ -439,14 +443,15 @@ def configure(project):
     (default none: nobody has it; `after_conflicts`, default 2, and
     `minutes`, default 60) and `code_owners` (default false). The
     `checks` section: `context` and `poster` (default the merger).
-    `labels.waiting_on_owner` is the label a long stall gets."""
+    `labels.waiting_on_owner` is the label a long stall gets, and
+    `labels.urgent` the label that puts a pull request first."""
     global REPO_SLUG, MAIN, APPROVERS, QUIET_LOGINS, ACT_AS, SIGNATURE
     global STATUS_CONTEXT, STATUS_CREATOR, BUILD_HOST, GATE, CI_WORKFLOW
     global STALL_AFTER, STALL_ALERT, STALL_TELL, STALL_RETELL
     global STALL_TO_OWNER, STALL_TITLE, STALL_LABELS, WAITING_OWNER
     global TEST_AHEAD, AHEAD_DEPTH, HOLD_CONFLICTING, YIELD_PLACES
     global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
-    global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS
+    global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS, URGENT_LABEL
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -473,6 +478,7 @@ def configure(project):
     STALL_LABELS = tuple(alert.get("labels", ()))
     WAITING_OWNER = project.section("labels").get("waiting_on_owner",
                                                   DEFAULT_WAITING_OWNER)
+    URGENT_LABEL = project.section("labels").get("urgent")
     ahead = merge.get("test_ahead")
     TEST_AHEAD = ahead is not None
     AHEAD_DEPTH = (ahead or {}).get("depth", DEFAULT_AHEAD_DEPTH)
@@ -504,6 +510,7 @@ query($owner:String!, $name:String!, $cursor:String) {
       nodes {
         number createdAt isDraft baseRefName headRefName headRefOid body
         author { login }
+        labels(first:50) { nodes { name } }
         reviews(last:100) {
           nodes { author { login } state submittedAt body commit { oid }
                   comments { totalCount } }
@@ -689,10 +696,18 @@ def eligible(pr, open_numbers, now=None):
     return approval, None
 
 
+def urgent(pr):
+    """Whether `pr` carries `labels.urgent`."""
+    return bool(URGENT_LABEL) and URGENT_LABEL in [
+        (n or {}).get("name") for n in
+        ((pr.get("labels") or {}).get("nodes") or [])]
+
+
 def order(candidates, everyone=None):
     """`candidates` in the order the Merger takes them. First come those
-    that another open pull request is blocked by, then the rest, each
-    group oldest first by `createdAt`, then by number.
+    carrying `labels.urgent`, then those that another open pull request
+    is blocked by, then the rest, each group oldest first by
+    `createdAt`, then by number.
 
     `everyone` is every open pull request, candidates or not, and
     defaults to `candidates`. It has to include the ineligible ones: a
@@ -701,7 +716,8 @@ def order(candidates, everyone=None):
     named = set()
     for pr in candidates if everyone is None else everyone:
         named |= blockers_of(pr)
-    key = lambda pr: (pr["number"] not in named, pr["createdAt"], pr["number"])
+    key = lambda pr: (not urgent(pr), pr["number"] not in named,
+                      pr["createdAt"], pr["number"])
     return sorted(candidates, key=key)
 
 
@@ -826,8 +842,13 @@ def yield_places(queue, everyone, counts, keep=None, spent=None):
     named = set()
     for pr in everyone:
         named |= blockers_of(pr)
-    groups = ([pr for pr in queue if pr["number"] in named],
-              [pr for pr in queue if pr["number"] not in named])
+    # Urgent ones (labels.urgent) stay first and never yield: a person
+    # put them there.
+    hot = [pr for pr in queue if urgent(pr)]
+    groups = ([pr for pr in queue if pr["number"] in named
+               and not urgent(pr)],
+              [pr for pr in queue if pr["number"] not in named
+               and not urgent(pr)])
     moved = {}
     for group in groups:
         for i in range(len(group) - 1, -1, -1):
@@ -840,7 +861,7 @@ def yield_places(queue, everyone, counts, keep=None, spent=None):
             if to > i:
                 group.insert(to, group.pop(i))
                 moved[pr["number"]] = to - i
-    return groups[0] + groups[1], moved
+    return hot + groups[0] + groups[1], moved
 
 
 def git(repo, *args, run=sh):

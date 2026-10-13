@@ -87,7 +87,7 @@ class Authors(unittest.TestCase):
         text = "7\t%s\t%s\tfalse\t%s\n" % (SHA_A, REPO, LEAD)
         run = FakeRun((is_pulls, done([], 0, text)))
         self.assertEqual(pc.open_heads("t", run),
-                         [(7, SHA_A, REPO, False, LEAD)])
+                         [(7, SHA_A, REPO, False, LEAD, [])])
 
     def test_note_heads_keeps_it_with_the_head(self):
         state = {"waiting": {}, "results": {}, "refused": {}}

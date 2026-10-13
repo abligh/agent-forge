@@ -187,7 +187,8 @@ class OpenHeads(unittest.TestCase):
         run = FakeRun((is_pulls, done([], 0, heads_tsv(
             (7, SHA_A, REPO, "false"), (8, SHA_B, "", "true")))))
         self.assertEqual(pc.open_heads("tok", run),
-                         [(7, SHA_A, REPO, False, ""), (8, SHA_B, "", True, "")])
+                         [(7, SHA_A, REPO, False, "", []),
+                          (8, SHA_B, "", True, "", [])])
         call = run.calls[0]
         self.assertEqual(call["env"]["GH_TOKEN"], "tok")
         self.assertIn("--paginate", call["args"])

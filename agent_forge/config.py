@@ -102,7 +102,7 @@ STEP = {"name": str, "run": list, "only_if": str, "always": bool,
 TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.
 LABELS = {"owner_prefix": str, "status_prefix": str,
-          "waiting_on_owner": str, "waiting_external": str}
+          "waiting_on_owner": str, "waiting_external": str, "urgent": str}
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,

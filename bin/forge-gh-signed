@@ -12,6 +12,11 @@ every other way of supplying a body is refused, --body, --fill and any
 flag gh adds later, because a check that lists known-bad flags goes
 stale the moment one is added.
 
+**A command that takes no body needs none.** `pr ready` (and
+`pr ready --undo`) has no body to sign, and gh refuses --body-file for
+it, so it runs without one, still as the agent's App. Any body flag on
+it is refused as before.
+
 **It sends as the agent.** gh's own login may be shared, or a human's,
 so the call is made with the agent's App token (agent_forge.github),
 and GitHub records the agent's bot. If no token can be minted this
@@ -32,6 +37,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from agent_forge import config, github, signing  # noqa: E402
 
 
+# gh commands that take no body: run without --body-file.
+BODILESS = (["pr", "ready"],)
+
+
 def body_file(args):
     """The path after the last --body-file (or --body-file=PATH), or None."""
     path = None
@@ -47,12 +56,15 @@ def main(argv=None, err=None, environ=None, mint=None, execvpe=os.execvpe):
     argv = sys.argv[1:] if argv is None else argv
     environ = dict(os.environ if environ is None else environ)
     err = err or (lambda line: print(line, file=sys.stderr))
-    path = body_file(argv)
-    if not path:
+    bodiless = argv[:2] in BODILESS and not any(
+        a.startswith("-b") or a.startswith("--body") or a == "--fill"
+        or a.startswith("-F") for a in argv[2:])
+    path = None if bodiless else body_file(argv)
+    if not path and not bodiless:
         err("forge-gh-signed: refusing: no --body-file (an inline body "
             "bypasses the check)")
         return 2
-    if not os.path.isfile(path):
+    if path and not os.path.isfile(path):
         err("forge-gh-signed: %s does not exist" % path)
         return 2
     try:
@@ -60,18 +72,19 @@ def main(argv=None, err=None, environ=None, mint=None, execvpe=os.execvpe):
     except signing.SigningError as e:
         err("forge-gh-signed: %s" % e)
         return e.status
-    with open(path) as handle:
-        body = handle.read()
-    if not signing.is_signed(body, agent):
-        err("forge-gh-signed: refusing: %s has no '%s' line"
-            % (path, signing.sign_off(agent)))
-        return 3
-    found = signing.mentions(body)
-    if found:
-        err("forge-gh-signed: refusing: %s contains an @-mention, which "
-            "resolves to a real stranger's GitHub account: %s"
-            % (path, ", ".join(handle for _, handle in found)))
-        return 5
+    if path:
+        with open(path) as handle:
+            body = handle.read()
+        if not signing.is_signed(body, agent):
+            err("forge-gh-signed: refusing: %s has no '%s' line"
+                % (path, signing.sign_off(agent)))
+            return 3
+        found = signing.mentions(body)
+        if found:
+            err("forge-gh-signed: refusing: %s contains an @-mention, which "
+                "resolves to a real stranger's GitHub account: %s"
+                % (path, ", ".join(handle for _, handle in found)))
+            return 5
     try:
         token = (mint or (lambda a: github.token(config.load_reviewed(), a)))(agent)
     except (config.ConfigError, github.MintError) as e:

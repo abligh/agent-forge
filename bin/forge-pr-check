@@ -82,6 +82,13 @@ other pull request's, the Merger's included, and so is a cheap one in
 the fast lane. The pulls API's author (`user.login`) is kept with the
 head. A head that failed to prepare still goes behind.
 
+**With `labels.urgent`, a pull request carrying that label goes first**,
+before `first_authors` and before overdue heads (`max_wait_minutes`),
+the oldest of several first, in the slots and in the fast lane. The
+pulls API's labels are kept with the head; taking the label off puts it
+back in its ordinary place. A head that failed to prepare still goes
+behind, and the default branch's traced run still goes first when due.
+
 **With `checks.max_wait_minutes`, no head waits on priority for ever**:
 a pull request's head that has waited that long goes before every
 other pull request's, the oldest first, the first_authors', the
@@ -497,6 +504,8 @@ MERGER_DIR_ARG = None
 DEFAULT_MERGER_FIRST = False
 # checks.first_authors: the bot logins whose pull requests go first.
 FIRST_AUTHORS = frozenset()
+# labels.urgent: the label that puts a pull request first, or None.
+URGENT_LABEL = None
 # checks.max_wait_minutes: how long a pull request's head waits behind
 # others' priority before it goes first itself, or None.
 MAX_WAIT = None
@@ -579,7 +588,7 @@ def configure(project):
     global TEST_AHEAD, SPARE_ONLY, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
-    global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE
+    global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
     global DROP_NAMES, DROP_PREFIXES
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
@@ -617,6 +626,7 @@ def configure(project):
                               for name in checks.get("first_authors", []))
     MAX_WAIT = datetime.timedelta(minutes=checks["max_wait_minutes"]) \
         if "max_wait_minutes" in checks else None
+    URGENT_LABEL = project.section("labels").get("urgent")
     MAIN_EVERY = checks.get("main", "needed") == "every"
     MAIN_RED_ISSUE = dict(checks["main_red_issue"]) \
         if "main_red_issue" in checks else None
@@ -799,14 +809,15 @@ def gh(args, token, run=sh):
 
 
 def open_heads(token, run=sh, why=None):
-    """[(pr, sha, head repository, draft, author)] for every open pull
-    request, or None if GitHub could not be read, with the reason
+    """[(pr, sha, head repository, draft, author, labels)] for every open
+    pull request, or None if GitHub could not be read, with the reason
     appended to `why` (a list) when given. A head whose repository is
-    gone reports "" for it, and so does an author GitHub didn't give."""
+    gone reports "" for it, and so does an author GitHub didn't give.
+    `labels` is the list of the pull request's label names."""
     got = gh(["--paginate", "repos/%s/pulls?state=open&per_page=100"
               % REPO_SLUG, "--jq", '.[] | [.number, .head.sha, '
-              '(.head.repo.full_name // ""), .draft, (.user.login // "")] '
-              '| @tsv'], token, run)
+              '(.head.repo.full_name // ""), .draft, (.user.login // ""), '
+              '([(.labels // [])[].name] | tojson)] | @tsv'], token, run)
     if got.returncode != 0:
         if why is not None:
             said = [l.strip() for l in (got.stderr or "").splitlines()
@@ -817,13 +828,20 @@ def open_heads(token, run=sh, why=None):
     heads = []
     for line in got.stdout.splitlines():
         fields = line.split("\t")
-        if len(fields) not in (4, 5) or not fields[0].isdigit() \
+        if len(fields) not in (4, 5, 6) or not fields[0].isdigit() \
                 or len(fields[1]) != 40:
             if why is not None:
                 why.append("an unreadable line: %r" % line[:100])
             return None
+        try:
+            labels = json.loads(fields[5]) if len(fields) > 5 else []
+        except ValueError:
+            labels = []
+        if not isinstance(labels, list):
+            labels = []
         heads.append((int(fields[0]), fields[1], fields[2],
-                      fields[3] == "true", (fields[4:] or [""])[0]))
+                      fields[3] == "true", (fields[4:] or [""])[0],
+                      [str(name) for name in labels]))
     return heads
 
 
@@ -837,8 +855,9 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
     request was waiting all along, and a push, by its author or the
     Merger's update, must not send it to the back of the queue."""
     current, new = set(), []
-    for pr, sha, repo, draft, *author in heads:
-        author = author[0] if author else ""
+    for pr, sha, repo, draft, *extra in heads:
+        author = extra[0] if extra else ""
+        labels = extra[1] if len(extra) > 1 else []
         if draft or sha in state["results"]:
             continue
         if repo != REPO_SLUG:
@@ -860,6 +879,10 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
         state["waiting"][sha]["pr"] = pr
         if author:
             state["waiting"][sha]["author"] = author
+        if URGENT_LABEL and URGENT_LABEL in labels:
+            state["waiting"][sha]["urgent"] = True
+        else:
+            state["waiting"][sha].pop("urgent", None)
     replaced = {}
     for sha in list(state["waiting"]):
         entry = state["waiting"][sha]
@@ -981,10 +1004,11 @@ def overdue(entry, when):
 
 def order(waiting, sha):
     """A head's place in the queue: one that failed to prepare goes
-    behind every one that has not, then one by `checks.first_authors`
-    before one that isn't, then the oldest first."""
-    return (waiting[sha].get("errors", 0), not first(waiting[sha]),
-            waiting[sha]["since"], sha)
+    behind every one that has not, then an urgent one (`labels.urgent`)
+    before one that isn't, then one by `checks.first_authors` before one
+    that isn't, then the oldest first."""
+    return (waiting[sha].get("errors", 0), not waiting[sha].get("urgent"),
+            not first(waiting[sha]), waiting[sha]["since"], sha)
 
 
 def lane_head(state, cheap, busy=(), when=None):
@@ -1043,6 +1067,12 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
             due = True
         if due or urgent or not heads:
             return newest, 0
+    # labels.urgent: a person has put this pull request first.
+    hot = [s for s in heads
+           if waiting[s].get("urgent") and not waiting[s].get("errors")]
+    if hot:
+        sha = min(hot, key=lambda s: order(waiting, s))
+        return sha, waiting[sha]["pr"]
     # checks.max_wait_minutes: a head that has waited that long goes
     # before every other pull request's, the oldest first, so priority
     # can't starve it.

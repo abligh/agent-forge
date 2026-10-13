@@ -56,6 +56,22 @@ class GhSigned(unittest.TestCase):
         self.assertEqual(self.run_tool("x", "--body-file", self.body), 3)
         self.assertEqual(self.execs, [])
 
+    def test_pr_ready_needs_no_body_and_sends_as_the_app(self):
+        self.assertEqual(self.run_tool("pr", "ready", "1049", "-R", "o/r"),
+                         127)
+        (prog, argv, env), = self.execs
+        self.assertEqual(argv, ["gh", "pr", "ready", "1049", "-R", "o/r"])
+        self.assertEqual(env["GH_TOKEN"], "ghs_Reviewer")
+
+    def test_a_body_flag_on_pr_ready_is_still_refused(self):
+        self.assertEqual(self.run_tool("pr", "ready", "7", "--body", "x"), 2)
+        self.assertEqual(self.execs, [])
+
+    def test_other_commands_still_need_a_body_file(self):
+        self.assertEqual(self.run_tool("pr", "close", "7"), 2)
+        self.assertEqual(self.run_tool("issue", "ready", "7"), 2)
+        self.assertEqual(self.execs, [])
+
     def test_a_mention_is_5_and_not_sent(self):
         self.write("Thanks @LeadDev.\n\n— Reviewer\n")
         self.assertEqual(self.run_tool("pr", "comment", "7", "--body-file",
