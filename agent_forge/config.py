@@ -56,7 +56,8 @@ TOP = {
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
        "slug": str, "key": str}
-AGENT = dict(APP, session_name=str, twins=list, kind=str, reviews=list)
+AGENT = dict(APP, session_name=str, twins=list, kind=str, reviews=list,
+             away=str)
 IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list}
 # forge-memory-sync, -check and -trim (agent_forge/memory.py).
@@ -457,6 +458,21 @@ def check(data):
                             "the relay wakes a name only when one session "
                             "holds it" % (session,
                                           ", ".join(holders[session])))
+    for name, entry in data["agents"].items():
+        away = entry.get("away") if isinstance(entry, dict) else None
+        if not isinstance(away, str):
+            continue
+        where = "agents.%s.away" % name
+        other = data["agents"].get(away)
+        if away == name or not isinstance(other, dict):
+            problems.append("%s: %r is not another agent" % (where, away))
+        elif other.get("away"):
+            problems.append("%s: %s is away too; a stand-in must be here"
+                            % (where, away))
+        elif entry.get("kind", "developer") == "reviewer" \
+                and other.get("kind", "developer") != "reviewer":
+            problems.append("%s: %s reviews, so her stand-in must be a "
+                            "reviewer" % (where, name))
     for name, entry in data.get("machinery", {}).items():
         where = "machinery.%s" % name
         if _fields(where, entry, APP, problems) and "slug" not in entry \
@@ -708,6 +724,11 @@ class Project:
         account), in the configuration's order."""
         return [self.session_name(name)] \
             + list(self.agents[name].get("twins", []))
+
+    def stand_in(self, name):
+        """The agent who works for `name`: her `away` stand-in, else
+        herself."""
+        return self.agents.get(name, {}).get("away") or name
 
     def by_session(self):
         """{session name: agent} for every agent's sessions, twins

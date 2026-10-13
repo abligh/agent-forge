@@ -333,8 +333,13 @@ class Roster:
         return self.project.session_name(who)
 
     def sessions(self, who):
-        """Her session, then her twins'."""
-        return self.project.sessions(who)
+        """Where her turns go: her session, then her twins', or her
+        stand-in's when she is `away`."""
+        return self.project.sessions(self.stand_in(who))
+
+    def stand_in(self, who):
+        """Who works for her: her `away` stand-in, else herself."""
+        return self.project.stand_in(who) if self.is_agent(who) else who
 
     def reviewers(self):
         """Every agent of kind `reviewer`, in the configuration's order."""
@@ -349,24 +354,31 @@ class Roster:
         reviewer's globs match, go to the first listed. Reviewers with
         the same globs share that work: the pull request goes to one of
         them by its number, so each takes every other one and a pull
-        request keeps its reviewer. None when no reviewer but the author
-        exists."""
+        request keeps its reviewer. A reviewer who is `away` is left
+        out, and her stand-in reviews her globs too. None when no
+        reviewer but the author exists."""
         author = self.who(author_of(pr))
-        names = [n for n in self.reviewers() if n != author]
+        names = [n for n in self.reviewers()
+                 if n != author and self.stand_in(n) == n]
         if not names:
             return None
+
+        def globs_of(name):
+            return sorted({g for n in self.reviewers()
+                           if self.stand_in(n) == name
+                           for g in self.agents[n].get("reviews") or []})
+        globs_by = {n: globs_of(n) for n in names}
         score = dict.fromkeys(names, 0)
         for f in pr.get("files") or []:
             lines = (f.get("additions") or 0) + (f.get("deletions") or 0)
             path = f.get("path") or ""
             owner = next((n for n in names if any(
-                fnmatch.fnmatchcase(path, glob)
-                for glob in self.agents[n].get("reviews") or [])), names[0])
+                fnmatch.fnmatchcase(path, glob) for glob in globs_by[n])),
+                names[0])
             score[owner] += lines
         best = max(names, key=lambda n: (score[n], -names.index(n)))
-        globs = sorted(self.agents[best].get("reviews") or [])
-        peers = [n for n in names if globs
-                 and sorted(self.agents[n].get("reviews") or []) == globs]
+        globs = globs_by[best]
+        peers = [n for n in names if globs and globs_by[n] == globs]
         if not peers:
             return best
         return peers[(pr.get("number") or 0) % len(peers)]
@@ -866,7 +878,9 @@ def idle_agents(ctx):
     if not isinstance(listing, dict) or listing.get("complete") is not True \
             or not isinstance(listing.get("agents"), list):
         return {}
+    # An agent who is away isn't offered work: her stand-in is.
     sessions = {s: a for a in ctx.roster.agents
+                if ctx.roster.stand_in(a) == a
                 for s in ctx.roster.sessions(a)}
     seen = {}
     for entry in listing["agents"]:
@@ -991,7 +1005,7 @@ def idle_offers(ctx):
                     since_text(stamp, ctx.when)),
                 reminder=ONCE))
             continue
-        if not report_to or agent == report_to or \
+        if not report_to or agent == ctx.roster.stand_in(report_to) or \
                 ctx.roster.project.kind(agent) == "reviewer":
             continue
         mine = ctx.roster.login_of(agent)

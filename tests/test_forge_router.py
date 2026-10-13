@@ -747,6 +747,43 @@ class SharedReviewers(unittest.TestCase):
         self.assertEqual((d["who"], d["rule"]), ("Reviewer2", 8))
 
 
+class AwayReviewers(unittest.TestCase):
+    """A reviewer who is away is passed over; her stand-in takes her
+    globs as well as her own."""
+
+    AWAY = roster({
+        "LeadDev": {},
+        "Reviewer": {"kind": "reviewer", "reviews": ["designs/**"],
+                     "away": "Reviewer2"},
+        "Reviewer2": {"kind": "reviewer", "reviews": ["designs/**"]},
+        "RenderReviewer": {"kind": "reviewer", "reviews": ["crates/**"],
+                           "away": "Reviewer2"},
+    })
+
+    def who(self, number, files):
+        prs, _ = r.fetch(FakeGitHub(response(
+            [pr_node(number, files=list(files))], [])))
+        return self.AWAY.reviewer_for(prs[0])
+
+    def test_every_review_goes_to_the_one_here(self):
+        for number in (40, 41):
+            for files in ([("designs/a.md", 10)], [("crates/x.rs", 10)],
+                          [("Makefile", 10)]):
+                self.assertEqual(self.who(number, files), "Reviewer2")
+
+    def test_her_globs_follow_her_to_her_stand_in(self):
+        mixed = roster({
+            "LeadDev": {},
+            "Reviewer": {"kind": "reviewer", "reviews": ["designs/**"]},
+            "RenderReviewer": {"kind": "reviewer", "reviews": ["crates/**"],
+                               "away": "Reviewer2"},
+            "Reviewer2": {"kind": "reviewer", "reviews": ["web/**"]},
+        })
+        prs, _ = r.fetch(FakeGitHub(response(
+            [pr_node(41, files=[("crates/x.rs", 10)])], [])))
+        self.assertEqual(mixed.reviewer_for(prs[0]), "Reviewer2")
+
+
 class Fetch(unittest.TestCase):
 
     def test_pages_each_connection_until_done(self):
@@ -999,6 +1036,41 @@ class Twins(StateCase):
             def session_name(self, who):
                 return "Team" + who
         self.assertEqual(r.sessions_of(Plain(), "Ann"), ["TeamAnn"])
+
+
+class Away(StateCase):
+    """An agent who is `away`: her stand-in is woken for her."""
+
+    AWAY = roster(dict(
+        {name: example()["agents"][name] for name in ("LeadDev", "Helper")},
+        Reviewer=dict(example()["agents"]["Reviewer"], away="Reviewer2"),
+        Reviewer2=dict(example()["agents"]["Reviewer"])))
+
+    def run_router(self, prs=(), send=True, when=NOW):
+        return r.run(FakeGitHub(response(list(prs), [])), self.AWAY,
+                     self.dir, send, self.post, None, self.lines.append,
+                     when=when, remind_s=r.DEFAULT_REMIND_S)
+
+    def test_a_new_review_goes_to_her_stand_in(self):
+        self.assertEqual(self.run_router([pr_node(41)]), 0)
+        self.assertEqual([p[0] for p in self.posts], ["WidgetReviewer2"])
+        self.assertNotIn("who is away", self.posts[0][1])
+
+    def test_her_own_turn_reaches_her_stand_in_saying_so(self):
+        asked = pr_node(41, reviews=[review(REVIEWER, "CHANGES_REQUESTED",
+                                               T1)])
+        self.assertEqual(self.run_router([asked]), 0)
+        self.assertEqual([p[0] for p in self.posts], ["WidgetLeadDev"])
+        del self.posts[:]
+        later = pr_node(41, reviews=[review(REVIEWER, "CHANGES_REQUESTED",
+                                            T1)],
+                        comments=[comment(LEADDEV, T3)])
+        self.assertEqual(self.run_router([later]), 0)
+        ((session, text),) = self.posts
+        self.assertEqual(session, "WidgetReviewer2")
+        self.assertTrue(text.startswith(
+            "From: Router\nFor Reviewer, who is away; Reviewer2 stands "
+            "in.\nYour turn:\n"), text)
 
 
 class Only(StateCase):

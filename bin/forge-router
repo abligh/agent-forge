@@ -918,6 +918,11 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
         text = message(*[[w["line"] for w in batches[who]
                           if w["d"].kind == kind]
                          for kind in ("turn", "notice", "relook")])
+        stand_in = getattr(roster, "stand_in", lambda n: n)(who)
+        if stand_in != who:
+            head, _, rest = text.partition("\n")
+            text = "%s\nFor %s, who is away; %s stands in.\n%s" % (
+                head, who, stand_in, rest)
         if not send:
             out("WOULD SEND to %s:\n%s" % (", ".join(sessions_of(roster, who)),
                                            text.rstrip("\n")))

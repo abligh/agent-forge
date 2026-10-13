@@ -64,6 +64,30 @@ class Check(unittest.TestCase):
         data["agents"]["LeadDev"]["twins"] = "WidgetLeadDev2"
         self.assertEqual(len(config.check(data)), 1)
 
+    def test_away_names_another_agent_who_is_here(self):
+        data = example()
+        data["agents"]["UIDev"]["away"] = "LeadDev"
+        self.assertEqual(config.check(data), [])
+        for other, problem in (
+                ("UIDev", "agents.UIDev.away: 'UIDev' is not another agent"),
+                ("Nobody", "agents.UIDev.away: 'Nobody' is not another "
+                           "agent"),
+                ("Merger", "agents.UIDev.away: 'Merger' is not another "
+                           "agent")):
+            data["agents"]["UIDev"]["away"] = other
+            self.assertEqual(config.check(data), [problem])
+        data["agents"]["UIDev"]["away"] = "LeadDev"
+        data["agents"]["LeadDev"]["away"] = "Helper"
+        self.assertIn("agents.UIDev.away: LeadDev is away too; a stand-in "
+                      "must be here", config.check(data))
+
+    def test_a_reviewers_stand_in_reviews(self):
+        data = example()
+        data["agents"]["Reviewer"]["away"] = "LeadDev"
+        self.assertEqual(config.check(data),
+                         ["agents.Reviewer.away: Reviewer reviews, so her "
+                          "stand-in must be a reviewer"])
+
     def test_no_session_name_belongs_to_two_agents(self):
         data = example()
         data["agents"]["LeadDev"]["twins"] = ["WidgetUIDev"]
@@ -562,6 +586,16 @@ class ProjectQueries(unittest.TestCase):
                          ["WidgetLeadDev", "WidgetLeadDev2", "Spare"])
         self.assertEqual(p.by_session()["WidgetLeadDev2"], "LeadDev")
         self.assertEqual(p.by_session()["Helper"], "Helper")
+
+    def test_a_stand_in_works_for_an_agent_who_is_away(self):
+        self.assertEqual(self.p.stand_in("LeadDev"), "LeadDev")
+        data = example()
+        data["agents"]["UIDev"]["away"] = "LeadDev"
+        p = config.Project(data, None)
+        self.assertEqual(p.stand_in("UIDev"), "LeadDev")
+        # Her own sessions stay hers: forge-stats still names them.
+        self.assertEqual(p.sessions("UIDev"), ["WidgetUIDev"])
+        self.assertEqual(p.by_session()["WidgetUIDev"], "UIDev")
 
     def test_an_app_not_yet_made(self):
         self.assertTrue(self.p.exists("LeadDev"))

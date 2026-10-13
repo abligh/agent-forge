@@ -185,6 +185,14 @@ class Idle(unittest.TestCase):
         self.assertEqual(rules.idle_agents(router.Context(
             twin, NOW, [], [], directory=listing)), {})
 
+    def test_an_agent_who_is_away_is_never_idle(self):
+        data = example()
+        data["agents"]["UIDev"]["away"] = "LeadDev"
+        away = rules.Roster(config.Project(data, None))
+        listing = directory(entry("WidgetLeadDev"), entry("WidgetUIDev"))
+        self.assertEqual(rules.idle_agents(router.Context(
+            away, NOW, [], [], directory=listing)), {"LeadDev": IDLE})
+
     def test_listed_twice_idle_only_if_both_are_since_the_later(self):
         self.assertEqual(self.idle(entry("WidgetLeadDev"),
                                    entry("WidgetLeadDev", "busy")), {})

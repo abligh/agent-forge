@@ -1435,7 +1435,8 @@ def relay_sender(project, environ, opener=None):
     """A function (agent name, text) -> None when the relay took the
     message, else why not: the router's own poster, configured from the
     same `relay` section and addressed to each of the agent's sessions
-    (hers and her twins'), so the two can't diverge. Taken by any one
+    (hers and her twins', or her stand-in's when she is `away`), so the
+    two can't diverge. Taken by any one
     session is taken."""
     router = load_router()
     router.configure(project, rules=False)
@@ -1445,7 +1446,8 @@ def relay_sender(project, environ, opener=None):
 
     def send(name, text):
         problems = []
-        for session in project.sessions(name):
+        for session in project.sessions(project.stand_in(name)
+                                        if name in project.agents else name):
             why = post(session, text)
             if why is None:
                 return None

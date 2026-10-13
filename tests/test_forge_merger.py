@@ -1797,6 +1797,21 @@ class RelaySender(unittest.TestCase):
                                 "http://relay:8788/agent/WidgetLeadDev2"])
 
 
+    def test_her_stand_in_hears_while_she_is_away(self):
+        data = example()
+        data["agents"]["UIDev"]["away"] = "LeadDev"
+        data["relay"] = {"url": "http://relay:8788",
+                         "token_file": self.token_file}
+        seen = []
+
+        def opener(req, timeout):
+            seen.append(req.full_url)
+            return self.Response()
+        send = m.relay_sender(config.Project(data, None), {}, opener)
+        self.assertIsNone(send("UIDev", "From: Merger\nx"))
+        self.assertEqual(seen, ["http://relay:8788/agent/WidgetLeadDev"])
+
+
 class Configure(unittest.TestCase):
     """What the configuration decides."""
 
