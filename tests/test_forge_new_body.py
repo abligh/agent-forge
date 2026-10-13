@@ -50,6 +50,22 @@ class NewBody(unittest.TestCase):
         self.assertIn("1: @LeadDev", self.err[-1])
         self.assertEqual(self.out, [])
 
+    def path(self, name):
+        return os.path.join(self.tmp.name, "agent-forge-bodies", "Reviewer",
+                            name + ".md")
+
+    def test_a_refused_body_is_never_written(self):
+        # A refusal followed by `forge-gh-signed --body-file` once posted
+        # the refused text.
+        self.assertEqual(self.run_tool("r1", "thanks @LeadDev\n"), 4)
+        self.assertFalse(os.path.exists(self.path("r1")))
+
+    def test_a_refusal_removes_an_older_draft_of_that_name(self):
+        self.assertEqual(self.run_tool("r1", "An older draft.\n"), 0)
+        self.assertTrue(os.path.exists(self.path("r1")))
+        self.assertEqual(self.run_tool("r1", "thanks @LeadDev\n"), 4)
+        self.assertFalse(os.path.exists(self.path("r1")))
+
     def test_a_backticked_handle_warns_and_writes(self):
         self.assertEqual(self.run_tool("x", "never write `@LeadDev`\n"), 0)
         self.assertIn("backticked handles: `@LeadDev`", self.err[0])

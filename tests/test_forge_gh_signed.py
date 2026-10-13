@@ -56,6 +56,17 @@ class GhSigned(unittest.TestCase):
         self.assertEqual(self.run_tool("x", "--body-file", self.body), 3)
         self.assertEqual(self.execs, [])
 
+    def test_a_mention_is_5_and_not_sent(self):
+        self.write("Thanks @LeadDev.\n\n— Reviewer\n")
+        self.assertEqual(self.run_tool("pr", "comment", "7", "--body-file",
+                                       self.body), 5)
+        self.assertEqual(self.execs, [])
+        self.assertIn("@LeadDev", self.err[0])
+        # In code it is inert, and goes.
+        self.write("Never write `@LeadDev`.\n\n— Reviewer\n")
+        self.run_tool("pr", "comment", "7", "--body-file", self.body)
+        self.assertEqual(len(self.execs), 1)
+
     def test_no_token_is_4_never_the_ambient_login(self):
         def mint(agent):
             raise github.MintError(3, "refused")

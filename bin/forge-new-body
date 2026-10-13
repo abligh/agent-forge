@@ -14,6 +14,10 @@ Per agent, so two agents writing `body` don't post each other's text
 over their own signatures. Not a temporary directory: drafts persist so
 they can be found again. `NAME.md` and `NAME` both write NAME.md.
 
+**A refused body is never written**, and an older file of the same name
+is removed, so a `forge-gh-signed ... --body-file` that follows a
+refusal fails instead of posting the refused text or an older draft.
+
 Exit: 0 written (the path on stdout); 1 could not write; 2 usage or a
 bad FORGE_AGENT; 3 the sign-off postcondition failed; 4 an @-mention.
 """
@@ -48,6 +52,31 @@ def main(argv=None, stdin=None, out=print, err=None, environ=None):
     name = argv[0][:-3] if argv[0].endswith(".md") else argv[0]
     path = os.path.join(directory, name + ".md")
     body = signing.signed(stdin.read(), agent)
+
+    def refuse(status):
+        # Nothing of this name may be left for forge-gh-signed to post.
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            err("forge-new-body: could not remove the older %s: %s"
+                % (path, e))
+        return status
+    found = signing.mentions(body)
+    if found:
+        err("forge-new-body: the body for %s contains an @-mention; these "
+            "resolve to real strangers' GitHub accounts. Nothing written. "
+            "Write the name plain:" % path)
+        for number, handle in found:
+            err("    %d: %s" % (number, handle))
+        return refuse(4)
+    lines = body.splitlines()
+    if lines.count(signing.sign_off(agent)) != 1 or \
+            lines[-1] != signing.sign_off(agent):
+        err("forge-new-body: the body for %s does not end with exactly one "
+            "sign-off. Nothing written." % path)
+        return refuse(3)
     try:
         os.makedirs(directory, exist_ok=True)
         with open(path, "w") as handle:
@@ -55,25 +84,12 @@ def main(argv=None, stdin=None, out=print, err=None, environ=None):
     except OSError as e:
         err("forge-new-body: %s" % e)
         return 1
-    found = signing.mentions(body)
-    if found:
-        err("forge-new-body: %s contains an @-mention; these resolve to real "
-            "strangers' GitHub accounts. Write the name plain:" % path)
-        for number, handle in found:
-            err("    %d: %s" % (number, handle))
-        return 4
     handles = signing.code_handles(body)
     if handles:
         err("forge-new-body: NOTE %s has backticked handles: %s. Inert in a "
             "comment, NOT in a commit message, which isn't rendered as "
             "markdown: a single-commit pull request's squash message carries "
             "them live." % (path, " ".join(handles)))
-    lines = body.splitlines()
-    if lines.count(signing.sign_off(agent)) != 1 or \
-            lines[-1] != signing.sign_off(agent):
-        err("forge-new-body: %s does not end with exactly one sign-off"
-            % path)
-        return 3
     out(path)
     return 0
 

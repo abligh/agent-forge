@@ -18,8 +18,12 @@ and GitHub records the agent's bot. If no token can be minted this
 refuses rather than fall back to the ambient login. The token goes only
 into gh's environment.
 
-Exit: 2 no body file, 3 not signed by $FORGE_AGENT, 4 no App token;
-otherwise gh's.
+**No @-mentions.** A body with an @-mention outside code is refused
+here too (forge-new-body refuses to write one): they resolve to real
+strangers' GitHub accounts.
+
+Exit: 2 no body file, 3 not signed by $FORGE_AGENT, 4 no App token,
+5 an @-mention; otherwise gh's.
 """
 import os
 import sys
@@ -57,10 +61,17 @@ def main(argv=None, err=None, environ=None, mint=None, execvpe=os.execvpe):
         err("forge-gh-signed: %s" % e)
         return e.status
     with open(path) as handle:
-        if not signing.is_signed(handle.read(), agent):
-            err("forge-gh-signed: refusing: %s has no '%s' line"
-                % (path, signing.sign_off(agent)))
-            return 3
+        body = handle.read()
+    if not signing.is_signed(body, agent):
+        err("forge-gh-signed: refusing: %s has no '%s' line"
+            % (path, signing.sign_off(agent)))
+        return 3
+    found = signing.mentions(body)
+    if found:
+        err("forge-gh-signed: refusing: %s contains an @-mention, which "
+            "resolves to a real stranger's GitHub account: %s"
+            % (path, ", ".join(handle for _, handle in found)))
+        return 5
     try:
         token = (mint or (lambda a: github.token(config.load_reviewed(), a)))(agent)
     except (config.ConfigError, github.MintError) as e:
