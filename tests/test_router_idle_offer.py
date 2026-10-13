@@ -232,6 +232,12 @@ class Actionable(unittest.TestCase):
             owned(30, labels=["Status:waiting-owner"]),
             owned(31, labels=["Status:waiting-external"])]), [])
 
+    def test_not_waiting_on_anything_else(self):
+        # A parked item (Status:waiting-backlog) is a wait too: it was
+        # offered as idle work.
+        self.assertEqual(self.offer([
+            owned(30, labels=["Status:waiting-backlog"])]), [])
+
     def test_not_while_a_blocker_is_open(self):
         self.assertEqual(self.offer([owned(30, body="Blocked-by: #31\n"),
                                      owned(31, owner="UIDev")]), [])

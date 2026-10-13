@@ -948,7 +948,10 @@ def owned_issues(agent, ctx):
         if issue_owner(issue, ctx.roster) != agent:
             continue
         labels = labels_of(issue)
-        if WAITING_OWNER in labels or WAITING_EXTERNAL in labels:
+        # Any waiting label, not only the two named in the offer: a
+        # project's own, such as one for the backlog, is a wait too.
+        if WAITING_OWNER in labels or WAITING_EXTERNAL in labels \
+                or any(l.startswith(WAITING_PREFIX) for l in labels):
             waiting += 1
         elif blocked(issue):
             held += 1
