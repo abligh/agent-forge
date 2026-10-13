@@ -37,7 +37,8 @@ the open issues and pull requests labeled `<labels.owner_prefix><agent>`
 `Status:`).
 
 **Then the agent's own role**: its `## <Name>` section of the roles
-file (`docs.roles`, default docs/roles.md). Read from the cron checkout
+file (`docs.roles`, default docs/roles.md). One section can brief
+several agents that share a role: `## LeadDev, LeadDev2`. Read from the cron checkout
 ($FORGE_CRON_CHECKOUT) when there is one, which is kept at the default
 branch, else from the configuration found from `cwd`; so a restarted
 session gets its brief back. An agent with no section is told so.
@@ -129,8 +130,9 @@ def open_items(project, agent, token, call=github.api_call):
 
 
 def role_of(agent, path):
-    """The body of `agent`'s `## <agent>` section of the roles file, or
-    None when it has none or the file can't be read."""
+    """The body of `agent`'s section of the roles file: the one headed
+    `## <agent>`, or `## <agent>, <another>` for agents sharing it. None
+    when it has none or the file can't be read."""
     try:
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
@@ -141,7 +143,7 @@ def role_of(agent, path):
         if line.startswith("## "):
             if inside:
                 break
-            inside = line[3:].strip() == agent
+            inside = agent in [n.strip() for n in line[3:].split(",")]
         elif inside:
             body.append(line)
     return "\n".join(body).strip() or None

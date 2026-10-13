@@ -127,6 +127,17 @@ class Brief(Checkout):
         self.assertIsNone(mod.role_of("C", handle.name))
         self.assertIsNone(mod.role_of("A", "/nonexistent/roles.md"))
 
+    def test_one_section_briefs_the_agents_it_names(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".md",
+                                         delete=False) as handle:
+            handle.write("# Roles\n\n## A, A2\n\nA's brief.\n\n## AB\n\n"
+                         "AB's.\n")
+        self.addCleanup(os.unlink, handle.name)
+        self.assertEqual(mod.role_of("A", handle.name), "A's brief.")
+        self.assertEqual(mod.role_of("A2", handle.name), "A's brief.")
+        self.assertEqual(mod.role_of("AB", handle.name), "AB's.")
+        self.assertIsNone(mod.role_of("A, A2", handle.name))
+
     def test_no_section_says_so(self):
         text = mod.brief("startup", "Nobody", [], role=None)
         self.assertIn("docs/roles.md has no section for Nobody", text)
