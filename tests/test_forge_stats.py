@@ -259,6 +259,27 @@ class Actions(unittest.TestCase):
         self.assertEqual(by["triggered_by"],
                          {"leaddevwidgetagent[bot]": 8, "someone": 1})
 
+    def test_by_runner_os_and_weighted(self):
+        jobs = {1: [job("2026-10-12T00:00:00Z", "2026-10-12T00:03:00Z",
+                        labels=("macos-14",)),
+                    job("2026-10-12T00:00:00Z", "2026-10-12T00:02:00Z",
+                        labels=("Windows-latest",)),
+                    job("2026-10-12T00:00:00Z", "2026-10-12T00:01:00Z")]}
+        got = tool.actions_stats(RUNS[:1], jobs)
+        self.assertEqual(got["by"]["runner_os"],
+                         {"macOS": 3, "Windows": 2, "Linux": 1})
+        self.assertEqual(got["minutes"], 6)
+        self.assertEqual(got["weighted"], 3 * 10 + 2 * 2 + 1)
+
+    def test_a_public_repository_has_no_weighted_total(self):
+        got = tool.actions_stats(RUNS, JOBS, private=False)
+        self.assertIsNone(got["weighted"])
+        self.assertNotIn("weighted", "\n".join(tool.actions_text(got)))
+
+    def test_the_multipliers_are_githubs(self):
+        self.assertEqual(tool.RUNNER_MULTIPLIERS,
+                         {"Linux": 1, "Windows": 2, "macOS": 10})
+
     def test_a_run_without_jobs_counts_as_a_run(self):
         got = tool.actions_stats(RUNS[:1], {})
         self.assertEqual((got["runs"], got["jobs"], got["minutes"]),
@@ -270,15 +291,18 @@ class Actions(unittest.TestCase):
                       "out; 1 self-hosted, not billed", text)
         self.assertIn("by job: ci / test 8; 1 more", text)
         self.assertIn("by attempt: first 7; 1 more", text)
+        self.assertIn("by runner OS: Linux 9", text)
+        self.assertIn("weighted for a private repository's billing "
+                      "(Windows x2, macOS x10): 9 min", text)
 
 
 class FakeActions:
     """GitHub's runs and jobs endpoints over `runs` (each with `created`)
     and `jobs` ({run id: [job]}), paging at `per_page`."""
 
-    def __init__(self, runs, jobs, per_page=100, refuse=None):
+    def __init__(self, runs, jobs, per_page=100, refuse=None, private=True):
         self.runs, self.jobs, self.per_page = runs, jobs, per_page
-        self.refuse, self.urls = refuse, []
+        self.refuse, self.urls, self.private = refuse, [], private
 
     def __call__(self, url, token, scheme=None, method=None, body=None):
         import urllib.parse
@@ -287,6 +311,10 @@ class FakeActions:
         if parsed.path.endswith("/graphql"):
             # Approval to merge: the merged pull requests are not asked of.
             return 200, {"data": {"repository": {"none": None}}}
+        if parsed.path.count("/") == 3:
+            if self.refuse == "repo":
+                return 404, {"message": "Not Found"}
+            return 200, {"private": self.private}
         query = dict(urllib.parse.parse_qsl(parsed.query))
         page = int(query["page"])
         if self.refuse and self.refuse in parsed.path:
@@ -345,6 +373,14 @@ class Fetch(unittest.TestCase):
         got = tool.fetch_jobs("tok", "example/widget", 7, fake)
         self.assertEqual(len(got), 130)
         self.assertEqual(fake.assertion, "all")
+
+    def test_whether_the_repository_is_private(self):
+        self.assertTrue(tool.fetch_private("tok", "o/r", FakeActions([], {})))
+        self.assertFalse(tool.fetch_private(
+            "tok", "o/r", FakeActions([], {}, private=False)))
+        with self.assertRaises(RuntimeError):
+            tool.fetch_private("tok", "o/r",
+                               FakeActions([], {}, refuse="repo"))
 
     def test_a_refusal_is_an_error(self):
         with self.assertRaises(RuntimeError):
@@ -405,6 +441,15 @@ class Main(unittest.TestCase):
             token="tok"), 0)
         self.assertIn("9 min in 4 jobs of 3 runs", self.out[0])
         self.assertIn("by workflow: ci 9", self.out[0])
+
+    def test_a_public_repository_reports_no_weighted_total(self):
+        runs = [dict(r, created="2026-10-12T00:30:00Z") for r in RUNS]
+        self.assertEqual(tool.main(
+            ["--since", "2026-10-12T00:00Z", "--until", "2026-10-12T02:00Z",
+             "--actions", "--json"], self.out.append, self.env,
+            call=FakeActions(runs, JOBS, private=False), token="tok"), 0)
+        got = json.loads(self.out[0])["actions"]
+        self.assertEqual((got["minutes"], got["weighted"]), (9, None))
 
     def test_actions_needs_no_local_records(self):
         self.assertEqual(tool.main(

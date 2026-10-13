@@ -43,7 +43,11 @@ A job that never started counts zero, and one still running is left out
 and counted apart. Jobs on self-hosted runners are counted but not
 billed. The minutes are broken down by workflow, by job, by the event
 that started the run, by run conclusion, by attempt (first run or
-rerun) and by who triggered the run. `--no-github` leaves it out.
+rerun), by runner OS and by who triggered the run. For a private
+repository there is also a total weighted by `RUNNER_MULTIPLIERS`, the
+rates GitHub bills private repositories' macOS and Windows minutes at;
+a public repository's standard runners cost nothing, so it has none.
+`--no-github` leaves it out.
 
 Exit status: 0 the report was written; 2 no configuration or no records.
 """
@@ -258,6 +262,20 @@ def fetch_merged(token, repo, numbers, call=github.api_call):
 # a window with more is split until each part has fewer.
 RUNS_CAP = 1000
 SELF_HOSTED = "self-hosted"
+# What a private repository is billed per minute on each runner OS, as
+# multiples of a Linux minute. GitHub changes these; this is the one place.
+RUNNER_MULTIPLIERS = {"Linux": 1, "Windows": 2, "macOS": 10}
+
+
+def runner_os(job):
+    """The OS a hosted job ran on, from its runner labels: macOS,
+    Windows, else Linux."""
+    labels = [label.lower() for label in job.get("labels") or []]
+    if any(label.startswith("macos") for label in labels):
+        return "macOS"
+    if any(label.startswith("windows") for label in labels):
+        return "Windows"
+    return "Linux"
 
 
 def job_minutes(job):
@@ -305,6 +323,16 @@ def fetch_runs(token, repo, since, until, call=github.api_call):
         page += 1
 
 
+def fetch_private(token, repo, call=github.api_call):
+    """Whether the repository is private, which decides whether its
+    minutes are billed."""
+    status, body = github.rest(token, "GET", "/repos/%s" % repo, call=call)
+    if status != 200 or not isinstance(body, dict) or "private" not in body:
+        raise RuntimeError("GitHub answered %s for the repository: %s"
+                           % (status, json.dumps(body)[:200]))
+    return bool(body["private"])
+
+
 def fetch_jobs(token, repo, run_id, call=github.api_call):
     """Every job of every attempt of one run."""
     jobs, page = [], 1
@@ -322,12 +350,14 @@ def fetch_jobs(token, repo, run_id, call=github.api_call):
         page += 1
 
 
-def actions_stats(runs, jobs_of):
+def actions_stats(runs, jobs_of, private=True):
     """The minutes of `runs` (the runs API's records), whose jobs are
-    `jobs_of[run id]`."""
-    total = billed_jobs = running = self_hosted = 0
+    `jobs_of[run id]`. `weighted` is the total by RUNNER_MULTIPLIERS for
+    a `private` repository, and None for a public one."""
+    total = billed_jobs = running = self_hosted = weighted = 0
     by = {k: collections.Counter() for k in (
-        "workflow", "job", "event", "conclusion", "attempt", "triggered_by")}
+        "workflow", "job", "event", "conclusion", "attempt", "runner_os",
+        "triggered_by")}
     for run in runs:
         workflow = run.get("name") or "?"
         who = ((run.get("triggering_actor") or run.get("actor") or {})
@@ -342,6 +372,9 @@ def actions_stats(runs, jobs_of):
                 continue
             billed_jobs += 1
             total += minutes
+            system = runner_os(job)
+            by["runner_os"][system] += minutes
+            weighted += minutes * RUNNER_MULTIPLIERS[system]
             by["workflow"][workflow] += minutes
             by["job"]["%s / %s" % (workflow, job.get("name") or "?")] += \
                 minutes
@@ -352,6 +385,7 @@ def actions_stats(runs, jobs_of):
                           else "rerun"] += minutes
             by["triggered_by"][who] += minutes
     return {"runs": len(runs), "jobs": billed_jobs, "minutes": total,
+            "weighted": weighted if private else None,
             "still_running": running, "self_hosted": self_hosted,
             "by": {k: dict(v.most_common()) for k, v in by.items()}}
 
@@ -472,10 +506,16 @@ def actions_text(actions, top=10):
              "%d self-hosted, not billed" % (
                  actions["minutes"], actions["jobs"], actions["runs"],
                  actions["still_running"], actions["self_hosted"])]
+    if actions.get("weighted") is not None:
+        lines.append("  weighted for a private repository's billing (%s): "
+                     "%d min" % (", ".join(
+                         "%s x%d" % kv for kv in RUNNER_MULTIPLIERS.items()
+                         if kv[1] != 1), actions["weighted"]))
     for key, title in (("workflow", "by workflow"), ("job", "by job"),
                        ("event", "by event"),
                        ("conclusion", "by run conclusion"),
                        ("attempt", "by attempt"),
+                       ("runner_os", "by runner OS"),
                        ("triggered_by", "by who triggered the run")):
         parts = list(actions["by"][key].items())
         more = len(parts) - top
@@ -626,7 +666,7 @@ def main(argv=None, out=print, environ=None, now=None,
         runs = fetch_runs(token, project.repo, since, until, call)
         actions = actions_stats(runs, {
             run["id"]: fetch_jobs(token, project.repo, run["id"], call)
-            for run in runs})
+            for run in runs}, fetch_private(token, project.repo, call))
     if args.json:
         out(json.dumps(jsonable({
             "project": project.name, "since": since, "until": until,
