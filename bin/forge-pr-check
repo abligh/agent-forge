@@ -391,6 +391,7 @@ import hashlib
 import json
 import os
 import re
+import resource
 import shutil
 import signal
 import socket
@@ -2027,13 +2028,24 @@ def applicable_at(repo, sha, run=sh):
          "%s:%s" % (sha, path)]).returncode == 0)
 
 
-def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None):
+def children_cpu():
+    """CPU seconds, user and system, of every child this process has
+    reaped: a step's whole process tree once it has finished, since
+    each process in it is waited for by its parent."""
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return usage.ru_utime + usage.ru_stime
+
+
+def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
+          cpu=children_cpu):
     """Every step that applies to the head, each run even if an earlier
     one failed, and none retried, each after `prefix` (memory_cap).
     `wrap(name, prefix, argv, env)` gives a traced step's (argv, env).
     With `kept`, the run's results directory, each step gets an empty
-    one of its own there as CHECK_RESULTS (`keep_results`). Returns
-    (ok, results)."""
+    one of its own there as CHECK_RESULTS (`keep_results`). Each
+    result has its wall time and its CPU time (`cpu()` before and
+    after: user and system seconds of the step's process tree), so a
+    step's work can be told from its waiting. Returns (ok, results)."""
     results = []
     for name, args, only_if in applicable(wt, steps):
         step_env_, folder = env, None
@@ -2045,12 +2057,13 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None):
         step_args = list(prefix) + args
         if wrap is not None:
             step_args, step_env_ = wrap(name, list(prefix), args, step_env_)
-        started = time.monotonic()
+        started, used = time.monotonic(), cpu()
         got = run(step_args, cwd=wt, env=step_env_,
                   timeout=STEP_TIMEOUT_S)
         wall = time.monotonic() - started
         result = {"name": name, "rc": got.returncode,
                   "seconds": int(wall), "wall": round(wall, 2),
+                  "cpu": round(max(0.0, cpu() - used), 2),
                   "tail": tail((got.stdout or "") + (got.stderr or ""))}
         if folder is not None:
             result["results_bytes"], dropped = keep_results(folder)
@@ -3042,7 +3055,9 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     Where the run's own time went, outside its steps, is logged as
     `overhead:` and kept in the verdict as `overhead`, seconds by phase
     (`Phases`; agent-forge #13). Each step's own time is kept twice:
-    `step_seconds`, whole seconds, and `step_wall`, to the hundredth."""
+    `step_seconds`, whole seconds, and `step_wall`, to the hundredth;
+    and its CPU time, user and system seconds of its process tree, as
+    `step_cpu`."""
     os.makedirs(state_dir, exist_ok=True)
     phases = Phases()
     started = clock()
@@ -3287,6 +3302,10 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 # second a step to anyone summing them (agent-forge #13).
                 "step_wall": {r["name"]: r.get("wall", r["seconds"])
                               for r in results},
+                # CPU seconds of each step's process tree: beside
+                # step_wall, what was work and what was waiting.
+                "step_cpu": {r["name"]: r["cpu"] for r in results
+                             if "cpu" in r},
             }
             if any(r.get("results_bytes") for r in results):
                 # What the steps left in CHECK_RESULTS, by step.

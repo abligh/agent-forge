@@ -323,6 +323,9 @@ class Worker(DigestCase):
         self.assertIsInstance(first["step_wall"]["a"], float)
         self.assertLessEqual(first["step_seconds"]["a"],
                              first["step_wall"]["a"])
+        # And its CPU seconds, to tell work from waiting.
+        self.assertEqual(set(first["step_cpu"]), {"a"})
+        self.assertGreaterEqual(first["step_cpu"]["a"], 0.0)
         self.assertTrue(any(line.startswith("  overhead: lock ")
                             for line in self.lines))
         self.assertEqual(self.posts[-1], (

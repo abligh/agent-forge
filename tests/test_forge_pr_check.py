@@ -1061,6 +1061,26 @@ class MemoryCap(unittest.TestCase):
             for target in ("fmt-check", "vet", "test", "doc-check")])
 
 
+class StepCpu(unittest.TestCase):
+    """Each step's CPU seconds beside its wall time (#394: work or
+    waiting?)."""
+
+    def test_each_step_gets_what_its_tree_used(self):
+        used = iter([1.0, 3.5, 3.5, 3.5, 10.0, 10.25, 10.25, 20.0])
+        with tempfile.TemporaryDirectory() as wt:
+            _, results = pc.check(wt, {}, FakeRun(), cpu=lambda: next(used))
+        self.assertEqual([(r["name"], r["cpu"]) for r in results],
+                         [("fmt-check", 2.5), ("vet", 0.0), ("test", 0.25),
+                          ("doc-check", 9.75)])
+
+    def test_a_reaped_childs_cpu_counts(self):
+        before = pc.children_cpu()
+        pc.sh([sys.executable, "-c",
+               "import time\nt = time.process_time()\n"
+               "while time.process_time() - t < 0.2: pass"])
+        self.assertGreaterEqual(pc.children_cpu() - before, 0.15)
+
+
 class MemoryCapRealScope(unittest.TestCase):
     """The real systemd, where this user has a manager (the build check's
     host does): only the process that ran out dies, and the step goes
