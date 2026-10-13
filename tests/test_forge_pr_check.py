@@ -2050,6 +2050,72 @@ class TwinHeads(unittest.TestCase):
             self.run_with({SHA_P: TREE_1, SHA_A: TREE_1})), {})
 
 
+TIP = "9" * 40
+
+
+class SettledHeads(StateCase):
+    """A head that a worker would only match is matched by the tick, with
+    no slot: one waited 38 minutes behind six runs for a slot to match
+    it."""
+
+    hold, merger_says, merger = Tick.hold, Tick.merger_says, TickAhead.merger
+
+    def run_with(self, contains=True, trees=None):
+        trees = trees or {SHA_A: TREE_1}
+        return FakeRun(
+            (is_pulls, done([], 0, heads_tsv((7, SHA_A, REPO, "false")))),
+            (lambda a: "refs/remotes/origin/" + pc.MAIN in a,
+             done([], 0, "%s\n%s\n" % (TIP, TREE_2))),
+            (lambda a: a[-1].endswith("^{tree}"),
+             lambda a: done(a, 0, trees.get(a[-1][:-7], "") + "\n")),
+            (lambda a: "--is-ancestor" in a,
+             done([], 0 if contains else 1)))
+
+    def settle(self, result, contains=True, busy=True):
+        self.write_state({"waiting": {SHA_A: {"pr": 7, "since": pc.iso(
+            T0 - datetime.timedelta(minutes=5))}},
+            "results": {SHA_P: result}})
+        if busy:
+            self.hold(1, "#8 %s %s" % (SHA_B, pc.iso(T0)))
+            self.hold(2, "#9 %s %s" % (SHA_C, pc.iso(T0)))
+        self.spawned, posted = [], []
+        pc.tick(self.state_dir, "tok", self.run_with(contains),
+                lambda *a: self.spawned.append(a), self.lines.append,
+                when=T0, post=lambda *a: posted.append(a) or True, slots=2,
+                checkout="/repo", merger_dir=self.merger(
+                    entries=[entry(7, SHA_P, TREE_1)]))
+        return posted
+
+    def test_the_mergers_head_on_its_predicted_tree_is_matched_at_once(self):
+        posted = self.settle(verdict(pr=7, ahead=True))
+        state = self.state()
+        self.assertNotIn(SHA_A, state["waiting"])
+        self.assertEqual(state["results"][SHA_A]["matched"], SHA_P)
+        self.assertEqual([p[:2] for p in posted], [(SHA_A, "success")])
+        self.assertEqual(self.spawned, [])
+        self.assertTrue(any("MATCHED #7 %s" % SHA_A[:10] in line
+                            for line in self.lines))
+
+    def test_a_head_without_the_tip_is_left_to_a_worker(self):
+        # It would be checked merged with the tip: another tree.
+        self.settle(verdict(pr=7, ahead=True), contains=False)
+        self.assertIn(SHA_A, self.state()["waiting"])
+
+    def test_a_red_verdict_is_not_matched(self):
+        self.settle(verdict(pr=7, ok=False, ahead=True))
+        self.assertIn(SHA_A, self.state()["waiting"])
+
+    def test_one_that_ran_fewer_steps_is_not_matched(self):
+        self.settle(verdict(pr=7, ahead=True,
+                            selection={"ran": [], "base": TIP}))
+        self.assertIn(SHA_A, self.state()["waiting"])
+
+    def test_with_a_free_slot_it_is_matched_and_the_slot_goes_on(self):
+        self.settle(verdict(pr=7, ahead=True), busy=False)
+        self.assertIn(SHA_A, self.state()["results"])
+        self.assertNotIn(SHA_A, [s[1] for s in self.spawned])
+
+
 class PrepareAhead(unittest.TestCase):
 
     def test_checks_the_commit_out_without_fetching(self):

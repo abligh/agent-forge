@@ -157,7 +157,11 @@ prediction for the same pull request isn't started beside it: it waits
 and is matched once that verdict is in.
 This is what turns a prediction into a merge: when GitHub's update
 produces the predicted tree, the head is posted green at once and the
-Merger merges it on its next tick.
+Merger merges it on its next tick. The tick itself makes that match,
+whether or not a slot is free, for a head that already contains the
+default branch's tip and whose tree has a green verdict that ran every
+step (`settled_heads`); a worker would only have matched it, and in a
+queue it waits behind every run started first.
 
 What that guarantees, and what it doesn't:
 
@@ -1631,6 +1635,11 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 % ("the worker lock" if slot == 1
                    else os.path.basename(lock_path(state_dir, slot)),
                    len(queued - busy)))
+    # A head that would only be matched is matched now, slot or none.
+    for sha, pr, same, tree in settled_heads(state, checkout, busy, when,
+                                             run):
+        matched(state_dir, sha, pr, same, tree, when, post, out)
+        queued.discard(sha)
     free = [slot for slot, holder in holders.items()
             if holder is None and slot != LANE]
     lane_free = lane and holders[LANE] is None
@@ -2561,6 +2570,40 @@ def twin_heads(state, running, checkout, run=sh):
                               "matched to it" % predicted[:10])
                 break
     return twins
+
+
+def settled_heads(state, checkout, busy=(), when=None, run=sh):
+    """[(sha, pr, same, tree)] of the waiting heads a worker would only
+    match, never run: each already contains the default branch's tip,
+    so it is checked as itself, and its tree has a green verdict here
+    (`same`) that ran every step under that tip or an older one. A
+    match costs no run, so the tick makes it at once instead of queueing
+    it for a slot: the Merger's head, updated to its prediction's tree,
+    otherwise waits behind every run started before it. Not one a slot
+    is running or a tick has just started."""
+    if not TEST_AHEAD or not checkout:
+        return []
+    tip = main_head(checkout, run)
+    if tip is None:
+        return []
+    tip = tip[0]
+
+    def older(a, b):
+        return run(["git", "-C", checkout, "merge-base", "--is-ancestor",
+                    a, b]).returncode == 0
+    accept = covers({"ran": [name for name, _, _ in STEPS], "base": tip},
+                    older)
+    found = []
+    for sha, entry in sorted(state["waiting"].items()):
+        if entry.get("main") or sha in busy or just_started(entry, when) \
+                or not older(tip, sha):
+            continue
+        tree = tree_of(checkout, sha, run)
+        same = tested(state, tree, when, ok=True, accept=accept) \
+            if tree else None
+        if same is not None and same != sha:
+            found.append((sha, entry["pr"], same, tree))
+    return found
 
 
 def held_heads(state, tip, busy, when, first_pr=None, cheap=()):
