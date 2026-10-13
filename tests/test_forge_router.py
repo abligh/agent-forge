@@ -700,6 +700,53 @@ class TwoReviewers(unittest.TestCase):
             self.assertEqual(who(path), reviewer, path)
 
 
+REVIEWER2 = "reviewer2widgetagent[bot]"
+SHARED = roster({
+    "LeadDev": {},
+    "Reviewer": {"kind": "reviewer", "reviews": ["designs/**", "web/**"]},
+    "Reviewer2": {"kind": "reviewer", "reviews": ["web/**", "designs/**"]},
+    "RenderReviewer": {"kind": "reviewer", "reviews": ["crates/**"]},
+})
+
+
+class SharedReviewers(unittest.TestCase):
+    """Reviewers with the same globs share the work by pull request."""
+
+    def who(self, number, files=(("designs/a.md", 10),), author=LEADDEV):
+        prs, _ = r.fetch(FakeGitHub(response(
+            [pr_node(number, author=author, files=list(files))], [])))
+        return SHARED.reviewer_for(prs[0])
+
+    def test_by_number_in_the_configurations_order(self):
+        self.assertEqual([self.who(n) for n in (40, 41, 42, 43)],
+                         ["Reviewer", "Reviewer2", "Reviewer", "Reviewer2"])
+
+    def test_a_pull_request_keeps_its_reviewer(self):
+        self.assertEqual(self.who(41), self.who(41, [("web/a.ts", 500)]))
+
+    def test_only_the_area_that_wins_is_shared(self):
+        self.assertEqual([self.who(n, [("crates/x.rs", 10)])
+                          for n in (40, 41)],
+                         ["RenderReviewer", "RenderReviewer"])
+
+    def test_a_sharers_own_goes_to_the_other(self):
+        self.assertEqual([self.who(n, author=REVIEWER2) for n in (40, 41)],
+                         ["Reviewer", "Reviewer"])
+
+    def test_reviewers_without_globs_do_not_share(self):
+        plain = roster({"LeadDev": {}, "A": {"kind": "reviewer"},
+                        "B": {"kind": "reviewer"}})
+        prs, _ = r.fetch(FakeGitHub(response(
+            [pr_node(41, files=[("x", 1)])], [])))
+        self.assertEqual(plain.reviewer_for(prs[0]), "A")
+
+    def test_8_the_turn_goes_to_the_sharer_by_number(self):
+        prs, _ = r.fetch(FakeGitHub(response(
+            [pr_node(43, files=[("designs/a.md", 10)])], [])))
+        d = rules.route_pr(prs[0], SHARED)
+        self.assertEqual((d["who"], d["rule"]), ("Reviewer2", 8))
+
+
 class Fetch(unittest.TestCase):
 
     def test_pages_each_connection_until_done(self):

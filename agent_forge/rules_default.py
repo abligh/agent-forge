@@ -346,8 +346,11 @@ class Roster:
     def reviewer_for(self, pr):
         """The reviewer whose `reviews` globs match the most changed
         lines of `pr`, leaving out its author. A tie, and lines no
-        reviewer's globs match, go to the first listed. None when no
-        reviewer but the author exists."""
+        reviewer's globs match, go to the first listed. Reviewers with
+        the same globs share that work: the pull request goes to one of
+        them by its number, so each takes every other one and a pull
+        request keeps its reviewer. None when no reviewer but the author
+        exists."""
         author = self.who(author_of(pr))
         names = [n for n in self.reviewers() if n != author]
         if not names:
@@ -360,7 +363,13 @@ class Roster:
                 fnmatch.fnmatchcase(path, glob)
                 for glob in self.agents[n].get("reviews") or [])), names[0])
             score[owner] += lines
-        return max(names, key=lambda n: (score[n], -names.index(n)))
+        best = max(names, key=lambda n: (score[n], -names.index(n)))
+        globs = sorted(self.agents[best].get("reviews") or [])
+        peers = [n for n in names if globs
+                 and sorted(self.agents[n].get("reviews") or []) == globs]
+        if not peers:
+            return best
+        return peers[(pr.get("number") or 0) % len(peers)]
 
 
 def strip_bot(login):
