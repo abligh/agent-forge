@@ -167,6 +167,23 @@ class Check(unittest.TestCase):
             "host_settings.files[1]: unknown key 'colour'",
             "host_settings.files[1]: missing 'from'"])
 
+    def test_memory(self):
+        self.assertEqual(self.problems(memory={
+            "dir": "", "git_dir": 3, "labels": ["bug", ""], "limit": 0,
+            "colour": "red"}), [
+            "memory.git_dir must be a string",
+            "memory: unknown key 'colour'",
+            "memory: missing 'remote'",
+            "memory.dir must not be empty",
+            "memory.labels must be a list of label names",
+            "memory.limit must be at least 1"])
+        self.assertEqual(self.problems(memory=[]),
+                         ["'memory' must be an object"])
+        self.assertEqual(self.problems(memory={
+            "dir": "~/m", "remote": "git@example.org:o/m.git",
+            "ssh_key": "~/.ssh/m", "branch": "main", "labels": ["bug"],
+            "limit": 25000, "long_line": 200}), [])
+
     def test_merge(self):
         self.assertEqual(self.problems(merge={
             "merger": "Nobody", "gate": [["ok"], [], "x", [1]],

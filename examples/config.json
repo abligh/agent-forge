@@ -59,6 +59,9 @@
     ],
     "host_keys": ["skipWorkflowUsageWarning"]
   },
+  "memory": {"dir": "~/.claude/projects/-home-agent-widget/memory",
+             "remote": "git@github.com:example/widget-memory.git",
+             "ssh_key": "~/.ssh/widget-memory"},
   "receiver": {
     "address": "0.0.0.0", "port": 8789, "path": "/hook",
     "secret_file": "~/.config/agent-forge/widget/receiver-secret",

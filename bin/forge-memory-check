@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Assert the agents' shared memory index still loads in full.
+
+`MEMORY.md` is read into every session at start. When it grows past the
+harness limit the read does not fail: it **truncates**, and the warning
+says so in a system reminder that a reader is least likely to act on:
+
+    WARNING: MEMORY.md is 25.4KB (limit: 24.4KB) -- index entries are
+    too long. Only part of it was loaded.
+
+**The failure is invisible by construction.** Entries are dropped from
+the end, so the newest go first: the memories least likely to have been
+taken in already. And the evidence that memories are missing is itself
+a memory that got dropped. Nobody sees a break; sessions simply stop
+knowing things.
+
+**The growth mechanism is why this check fires again.** Index lines get
+long the same way: somebody learns a refinement and appends
+`**Added <date>**: ...` to the one-line hook, so it is visible at
+session start. Every append is correct, small and an improvement. The
+format says the index is a pointer and detail belongs in the topic
+file, and nothing else enforces it.
+
+**Why not CI.** `MEMORY.md` is not in the project's repository: it
+lives under `~/.claude/projects/<slug>/memory/`, one copy per host. A CI
+runner has no such file, so this runs from cron on the host that has
+one, under forge-cron-run. The directory is `--dir`, else
+$FORGE_MEMORY_DIR, else the configuration's `memory.dir`; the limit is
+`--limit`, else `memory.limit`.
+
+Exit status:
+
+    0   under the limit, index and files coupled; or no memory
+        directory on this host, reported loudly
+    1   over the limit; the index and the files disagree; or the index
+        is gone while topic files remain
+    2   no directory named: no --dir, no variable, no configuration
+
+Warnings don't change the status: the index nearing the limit, or one
+index line longer than `--long-line` bytes, which names the topic file
+its detail belongs in.
+
+A missing memory **directory** is not a failure: a check that cannot
+see its subject must not report on it. It says so on stdout rather than
+passing quietly. A missing **index** inside a directory that has topic
+files is the opposite: the subject is visible and every memory in it is
+unreachable.
+"""
+
+import argparse
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, memory  # noqa: E402
+
+PROG = "forge-memory-check"
+DEFAULT_LIMIT = memory.DEFAULT_LIMIT
+LONG_LINE = memory.LONG_LINE
+
+# **Only a FALL in the harness limit is dangerous.** If it rises this
+# check is merely conservative and fails early, which a reader can see
+# and dismiss. If it falls, the file truncates while this reports clean.
+
+# Warn before failing, because the fix is editorial: moving detail into
+# topic files takes a person, and the useful moment to say so is before
+# the file is already truncating.
+WARN_FRACTION = 0.85
+
+LINK = re.compile(r"\(([-A-Za-z0-9_]+\.md)\)")
+
+
+def long_lines(index, threshold):
+    """(line number, bytes, topic file) for every index line over threshold.
+
+    Counted in bytes, like the limit: an em dash is three bytes. The
+    topic file is the first link on the line, or "(no link)" for a line
+    that points nowhere.
+    """
+    out = []
+    for number, raw in enumerate(index.splitlines(), 1):
+        size = len(raw.encode())
+        if size > threshold:
+            m = LINK.search(raw)
+            out.append((number, size, m.group(1) if m else "(no link)"))
+    return out
+
+
+def check(path, limit, long_line=LONG_LINE):
+    """Report on one memory directory. Returns (exit status, lines)."""
+    said = []
+    index_path = os.path.join(path, "MEMORY.md")
+    size = os.path.getsize(index_path)
+
+    with open(index_path, errors="replace") as fh:
+        index = fh.read()
+    linked = set(LINK.findall(index))
+    present = {f for f in os.listdir(path)
+               if f.endswith(".md") and f != "MEMORY.md"}
+
+    # **Headroom in entries, not bytes.** "3897 bytes left" and "91%
+    # full" both describe a level, and a level with no denominator does
+    # not say how long anyone has. "21 more entries at your current
+    # mean" does. It also shows the binding constraint: the MEAN hook
+    # across every entry, not the handful of long ones.
+    lines = [line for line in index.splitlines() if line.strip()]
+    entries = len(present)
+    mean_line = (sum(len(line) + 1 for line in lines) / len(lines)) \
+        if lines else 0
+    room = int((limit - size) // mean_line) if mean_line else 0
+
+    status = 0
+    if size > limit:
+        said.append("memory: MEMORY.md is %d bytes, over the %d-byte limit "
+                    "-- it is being TRUNCATED on load and the newest entries "
+                    "are the ones being dropped" % (size, limit))
+        status = 1
+    elif size > limit * WARN_FRACTION:
+        said.append("memory: MEMORY.md is %d bytes, %d%% of the %d-byte "
+                    "limit -- move detail out of index lines into the topic "
+                    "files they point at" % (size, size * 100 // limit, limit))
+
+    # A warning, so status is left alone: the fix is editorial, and
+    # nothing is lost until the total passes the limit, which fails.
+    grown = long_lines(index, long_line)
+    if grown:
+        said.append("memory: %d index line(s) over %d bytes -- the detail "
+                    "belongs in the topic file each points at:"
+                    % (len(grown), long_line))
+        for number, line_size, target in grown[:10]:
+            said.append("  L%d  %d  %s" % (number, line_size, target))
+        if len(grown) > 10:
+            said.append("  ... and %d more" % (len(grown) - 10))
+
+    dangling = sorted(linked - present)
+    unindexed = sorted(present - linked)
+    if dangling:
+        said.append("memory: %d index entr(ies) point at no file: %s"
+                    % (len(dangling), ", ".join(dangling[:5])))
+        status = 1
+    if unindexed:
+        # An unindexed topic file is not loaded at session start, so it
+        # is written and never read: the same silent loss as truncation,
+        # arriving by a different route.
+        said.append("memory: %d file(s) are in no index entry: %s"
+                    % (len(unindexed), ", ".join(unindexed[:5])))
+        status = 1
+
+    if not said:
+        said.append("memory: clean (%d bytes of %d, %d topics, all indexed) "
+                    "-- room for about %d more at the current mean of %.0f "
+                    "bytes per entry" % (size, limit, entries, room,
+                                         mean_line))
+    else:
+        # Said on the warning path too: the reader who most needs the
+        # denominator is the one who has just been told the level.
+        said.append("memory: room for about %d more entr(ies) at the "
+                    "current mean of %.0f bytes per entry" % (room, mean_line))
+    return status, said
+
+
+def main(argv=None, environ=None, out=None, err=None, project=None):
+    environ = os.environ if environ is None else environ
+    out = out or sys.stdout
+    err = err or sys.stderr
+    ap = argparse.ArgumentParser(prog=PROG,
+                                 description=__doc__.splitlines()[0])
+    ap.add_argument("--limit", type=int,
+                    help="byte limit for MEMORY.md (default memory.limit, "
+                         "else %d)" % DEFAULT_LIMIT)
+    ap.add_argument("--dir", help="memory directory (default "
+                    "$FORGE_MEMORY_DIR, else memory.dir)")
+    ap.add_argument("--long-line", type=int,
+                    help="bytes past which one index line is reported "
+                         "(default memory.long_line, else %d)" % LONG_LINE)
+    args = ap.parse_args(argv)
+
+    section = {}
+    path = args.dir
+    if not path:
+        try:
+            project = project or config.load(environ=environ)
+        except config.ConfigError as exc:
+            if not environ.get("FORGE_MEMORY_DIR"):
+                print("%s: no --dir, and %s" % (PROG, exc), file=err)
+                return 2
+            project = None
+        path = memory.directory(project, environ)
+        section = project.section("memory") if project is not None else {}
+        if not path:
+            print("%s: no --dir, no FORGE_MEMORY_DIR, and the configuration "
+                  "has no memory.dir" % PROG, file=err)
+            return 2
+    limit = args.limit or section.get("limit") or DEFAULT_LIMIT
+    long_line = args.long_line or section.get("long_line") or LONG_LINE
+
+    if not os.path.isdir(path):
+        print("memory: no memory directory on this host (%s) -- nothing "
+              "checked" % path, file=out)
+        return 0
+
+    # **A missing index is not a missing subject.** Reporting it as
+    # "nothing checked" would pass a directory whose every memory is
+    # unreachable. It is reachable, not theoretical: the repair for an
+    # over-long index reads `MEMORY.md`, transforms it and writes it
+    # back, and a crash between the two leaves exactly this.
+    if not os.path.isfile(os.path.join(path, "MEMORY.md")):
+        orphans = [f for f in os.listdir(path) if f.endswith(".md")]
+        if orphans:
+            print("memory: MEMORY.md is MISSING from %s -- %d topic file(s) "
+                  "are unreachable, which is every memory lost rather than "
+                  "some" % (path, len(orphans)), file=out)
+            return 1
+        print("memory: no memory directory on this host (%s) -- nothing "
+              "checked" % path, file=out)
+        return 0
+
+    status, said = check(path, limit, long_line)
+    for line in said:
+        print(line, file=out)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

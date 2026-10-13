@@ -65,6 +65,7 @@ Documentation and hosts:
 | `forge-stats` | Reports how fast work lands: check waits and slot use, the merge queue, approval to merge per author. |
 | `forge-host-settings` | Compares a host's agent settings with the project's tracked copy, or installs it. |
 | `forge-session-start` | A SessionStart hook: tells a restarted session what died and what it owns. |
+| `forge-memory-sync`, `forge-memory-check`, `forge-memory-trim` | Share the agents' memory between hosts through a git repository; check the index still loads in full; shorten its lines safely ([docs/memory-sync.md](docs/memory-sync.md)). |
 | `forge-config` | Checks and reads the project's configuration. |
 
 ## Installing

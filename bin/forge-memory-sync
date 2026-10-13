@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""Share the agents' memory directory between hosts through a git repository.
+
+docs/memory-sync.md. Each host's memory directory (the configuration's
+`memory.dir`) is the working tree of the repository `memory.remote`.
+The git directory lives outside it (`memory.git_dir`), so nothing a
+session reads moves, and no `.git` appears beside the memories. A run
+commits what changed, rebases onto what the other hosts pushed, and
+pushes. It runs from cron under forge-cron-run.
+
+**`MEMORY.md` merges as a union** (the repository's `.gitattributes`):
+its lines are independent pointers, so keeping both sides' lines is
+right. **Any other conflict is never resolved here.** The rebase is
+aborted, which leaves the working tree as it was, the local commit is
+kept, and the run exits 1. With `--file` it's reported on one GitHub
+issue. A person reconciles the files; docs/memory-sync.md says how.
+
+**Authentication is the host's.** Over SSH, `memory.ssh_key` (or
+$FORGE_MEMORY_SSH_KEY) names a key used for this repository alone,
+typically a deploy key: GitHub lets a deploy key serve one repository,
+so it can't be the key the host already uses for the project. Over
+HTTPS, git asks a credential helper given with `-c`, which reads
+$GH_TOKEN from the environment when git asks, as forge-cron-run sets it
+with $FORGE_CRON_APP. **The token never appears in an argument list, a
+file or a log**, and any helper configured for the user is cleared
+first, so a `store` helper can't write it to disk.
+
+`--seed` sets a host up once. On a host whose remote is empty, it
+commits the directory as it is and pushes. On a host whose remote has
+content, it merges what the host already has into it: `MEMORY.md` as a
+union, a topic file the repository lacks committed, and a topic file
+with the same name and different contents moved to `memory.seed_dir`
+and listed. Nothing is overwritten without a copy being kept.
+
+Exit status:
+
+    0   synced, or nothing to do
+    1   something needs a person: a conflict, a push refused twice, a
+        rebase already in progress, or a seed that set files aside
+    2   this run could not ask its question: no configuration, no
+        memory directory, not seeded, git or the network failing, or an
+        unexpected error
+"""
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import sys
+import traceback
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, github, memory, proc  # noqa: E402
+
+PROG = "forge-memory-sync"
+INDEX = memory.INDEX
+ATTRIBUTES = "MEMORY.md merge=union\n"
+# Git asks this for a password when it pushes over HTTPS. The token is
+# read from the environment at that moment, so only this text, never the
+# token, is in the argument list.
+HELPER = ("!f() { echo username=x-access-token; "
+          "echo \"password=$GH_TOKEN\"; }; f")
+# What a refused push says when the other host pushed first, as against
+# a push refused for want of access, which no retry mends.
+BEHIND = ("fetch first", "non-fast-forward", "[rejected]")
+# One git command's bound: a network that stops answering would
+# otherwise hold the cron job, and its lock, indefinitely.
+GIT_TIMEOUT_S = 120
+
+NEEDS_PERSON = 1
+COULD_NOT_ASK = 2
+
+
+class Stop(Exception):
+    """A run ends here, with `status` and a message saying why."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+class Git:
+    """Git on the memory repository: its git directory and working tree."""
+
+    def __init__(self, cfg, run=proc.sh, environ=None):
+        self.cfg = cfg
+        self.run = run
+        self.environ = dict(os.environ if environ is None else environ)
+
+    def argv(self, *args):
+        out = ["git", "--git-dir", self.cfg["git_dir"],
+               "--work-tree", self.cfg["dir"],
+               "-c", "credential.helper=",
+               "-c", "credential.helper=" + HELPER,
+               "-c", "user.name=" + PROG,
+               "-c", "user.email=%s@%s" % (PROG, self.cfg["host"])]
+        if self.cfg.get("ssh_key"):
+            out += ["-c", "core.sshCommand=ssh -i %s -o IdentitiesOnly=yes"
+                    % shlex.quote(self.cfg["ssh_key"])]
+        return out + list(args)
+
+    def __call__(self, *args, check=True):
+        r = self.run(self.argv(*args), cwd=self.cfg["dir"], env=self.environ,
+                     timeout=GIT_TIMEOUT_S)
+        if check and r.returncode != 0:
+            raise Stop(COULD_NOT_ASK, "git %s failed: %s" % (
+                args[0], (r.stderr or r.stdout or "").strip()[:300]))
+        return r
+
+
+def memory_dir(cfg):
+    """The memory directory, or Stop(2): it must exist and hold the index."""
+    path = cfg["dir"]
+    if not os.path.isfile(os.path.join(path, INDEX)):
+        raise Stop(COULD_NOT_ASK, "no %s in %s; nothing to sync (set "
+                   "memory.dir, or FORGE_MEMORY_DIR, if the memories are "
+                   "elsewhere)" % (INDEX, path))
+    return path
+
+
+def rebase_in_progress(cfg):
+    return any(os.path.exists(os.path.join(cfg["git_dir"], d))
+               for d in ("rebase-merge", "rebase-apply"))
+
+
+def commit_local(git, cfg):
+    """Commit every change in the directory. True if there was one.
+
+    A deletion is committed like anything else, so a memory removed as
+    wrong is removed on every host.
+    """
+    git("add", "-A")
+    if git("diff", "--cached", "--quiet", check=False).returncode == 0:
+        return False
+    changed = git("diff", "--cached", "--name-only").stdout.split()
+    git("commit", "-q", "-m", "%s: %d file(s)\n\n%s" % (
+        cfg["host"], len(changed), "\n".join(changed)))
+    return True
+
+
+def rebase(git, cfg):
+    """Rebase onto the remote. Returns the conflicting files, [] if none.
+
+    On a conflict the rebase is aborted, which restores the working tree
+    and keeps the local commit, so nothing written on this host is lost.
+    """
+    git("fetch", "-q", "origin", cfg["branch"])
+    r = git("rebase", "-q", "origin/" + cfg["branch"], check=False)
+    if r.returncode == 0:
+        return []
+    files = git("diff", "--name-only", "--diff-filter=U",
+                check=False).stdout.split()
+    git("rebase", "--abort")
+    return sorted(files) or ["(git named none: %s)"
+                             % (r.stderr or r.stdout).strip()[:200]]
+
+
+def push(git, cfg):
+    """Push. "behind" when the other host pushed first, else "pushed"."""
+    r = git("push", "-q", "origin", "HEAD:" + cfg["branch"], check=False)
+    if r.returncode == 0:
+        return "pushed"
+    said = r.stderr or ""
+    if any(marker in said for marker in BEHIND):
+        return "behind"
+    raise Stop(COULD_NOT_ASK, "push failed: %s" % said.strip()[:300])
+
+
+def ahead(git, cfg):
+    """Whether HEAD has commits the remote lacks."""
+    r = git("rev-list", "--count", "origin/%s..HEAD" % cfg["branch"])
+    return int(r.stdout.strip() or "0") > 0
+
+
+def sync(git, cfg):
+    """One sync. Returns a line saying what happened; raises Stop."""
+    memory_dir(cfg)
+    if not os.path.isdir(cfg["git_dir"]):
+        raise Stop(COULD_NOT_ASK, "%s doesn't exist: this host isn't seeded "
+                   "(run %s --seed)" % (cfg["git_dir"], PROG))
+    if rebase_in_progress(cfg):
+        # Somebody is resolving a conflict by hand. Committing now would
+        # write a half-resolved file into their rebase.
+        raise Stop(NEEDS_PERSON, "a rebase is in progress in %s; leaving it "
+                   "to whoever started it" % cfg["git_dir"])
+    committed = commit_local(git, cfg)
+    for _attempt in (1, 2):
+        conflicts = rebase(git, cfg)
+        if conflicts:
+            raise Stop(NEEDS_PERSON, "conflict with the other hosts in: "
+                       + ", ".join(conflicts))
+        if not ahead(git, cfg):
+            return "in step with origin (%s)" % (
+                "committed and already pushed" if committed
+                else "nothing to commit")
+        if push(git, cfg) == "pushed":
+            return "pushed"
+    raise Stop(NEEDS_PERSON, "push refused twice: another host kept pushing "
+               "first; the next run retries")
+
+
+def union_lines(theirs, ours):
+    """The repository's index, then this host's lines it lacks, once each."""
+    have = set(theirs.splitlines())
+    out = theirs if theirs.endswith("\n") or not theirs else theirs + "\n"
+    for line in ours.splitlines():
+        if line not in have:
+            out += line + "\n"
+            have.add(line)
+    return out
+
+
+def seed(git, cfg):
+    """Set this host up. Returns (line, files set aside); raises Stop."""
+    path = memory_dir(cfg)
+    branch = cfg["branch"]
+    if os.path.exists(cfg["git_dir"]):
+        raise Stop(COULD_NOT_ASK, "%s already exists: this host is seeded"
+                   % cfg["git_dir"])
+    # With --work-tree, init records core.bare=false and core.worktree, so
+    # a person resolving a conflict needs only --git-dir.
+    git("init", "-q", "-b", branch)
+    attributes = os.path.join(path, ".gitattributes")
+    before = None
+    if os.path.isfile(attributes):
+        with open(attributes, encoding="utf-8") as fh:
+            before = fh.read()
+    try:
+        git("remote", "add", "origin", cfg["remote"])
+        remote = git("ls-remote", "origin", branch).stdout.strip()
+        if not remote:
+            with open(attributes, "w", encoding="utf-8") as fh:
+                fh.write(ATTRIBUTES)
+            commit_local(git, cfg)
+            git("push", "-q", "origin", "HEAD:" + branch)
+            return "seeded an empty repository from %s" % cfg["host"], []
+        git("fetch", "-q", "origin", branch)
+        # HEAD and the index at the remote; the working tree untouched.
+        git("reset", "-q", "origin/" + branch)
+    except BaseException:
+        # Nothing but .gitattributes has changed in the memory directory yet,
+        # so undo the seed and leave the host as it was: otherwise --seed
+        # refuses a git directory that exists, and a sync can't fetch a
+        # repository that is still empty. Past this point the tree is
+        # merged, and a failed push is left for the next sync to retry.
+        shutil.rmtree(cfg["git_dir"], ignore_errors=True)
+        if before is None:
+            if os.path.exists(attributes):
+                os.remove(attributes)
+        else:
+            with open(attributes, "w", encoding="utf-8") as fh:
+                fh.write(before)
+        raise
+    aside = []
+    for name in git("ls-tree", "-r", "--name-only",
+                    "origin/" + branch).stdout.splitlines():
+        local = os.path.join(path, name)
+        if name == INDEX:
+            theirs = git("show", "origin/%s:%s" % (branch, name)).stdout
+            ours = ""
+            if os.path.isfile(local):
+                with open(local, encoding="utf-8") as fh:
+                    ours = fh.read()
+            with open(local, "w", encoding="utf-8") as fh:
+                fh.write(union_lines(theirs, ours))
+            continue
+        if not os.path.exists(local):
+            git("checkout", "origin/" + branch, "--", name)
+            continue
+        # The index holds the repository's copy now, so this compares
+        # bytes, whatever the file's encoding.
+        if git("diff", "--quiet", "--", name, check=False).returncode == 0:
+            continue
+        kept = os.path.join(cfg["seed_dir"], name)
+        os.makedirs(os.path.dirname(kept), exist_ok=True)
+        shutil.move(local, kept)
+        git("checkout", "origin/" + branch, "--", name)
+        aside.append(name)
+    commit_local(git, cfg)
+    if ahead(git, cfg) and push(git, cfg) != "pushed":
+        raise Stop(NEEDS_PERSON, "seeded, but another host pushed first; "
+                   "the next sync rebases and pushes")
+    line = "seeded %s over the repository" % cfg["host"]
+    if aside:
+        line += "; set aside in %s: %s" % (cfg["seed_dir"], ", ".join(aside))
+    return line, aside
+
+
+def title(cfg):
+    return "%s: %s has stopped syncing" % (PROG, cfg["host"])
+
+
+class Reporter:
+    """The GitHub issue a stopped sync is reported on, in the project's
+    repository, as whoever $GH_TOKEN (or $FORGE_AGENT's App) is."""
+
+    def __init__(self, project, cfg, environ, call=github.api_call):
+        self.cfg = cfg
+        self.call = call
+        self.token = github.read_token(project, environ, call)
+        self.base = "/repos/%s/issues" % cfg["repo"]
+
+    def open_issue(self):
+        """The open issue for this host, or None. Raises on a failed read,
+        so a read error never files a second issue."""
+        query = "?state=open"
+        if self.cfg["labels"]:
+            query += "&labels=" + ",".join(self.cfg["labels"])
+        status, items = github.paged(self.token, self.base + query,
+                                     call=self.call)
+        if status != 200:
+            raise RuntimeError("could not list open issues: HTTP %s" % status)
+        numbers = [i["number"] for i in items
+                   if isinstance(i, dict) and "pull_request" not in i
+                   and i.get("title") == title(self.cfg)
+                   and isinstance(i.get("number"), int)]
+        return min(numbers) if numbers else None
+
+    def create(self, body):
+        status, got = github.rest(self.token, "POST", self.base, {
+            "title": title(self.cfg), "body": body,
+            "labels": self.cfg["labels"]}, call=self.call)
+        if status != 201:
+            raise RuntimeError("could not file the issue: HTTP %s" % status)
+        return "filed %s" % got.get("html_url", "#%s" % got.get("number"))
+
+    def comment(self, number, body):
+        status, _ = github.rest(self.token, "POST", "%s/%d/comments" % (
+            self.base, number), {"body": body}, call=self.call)
+        if status != 201:
+            raise RuntimeError("could not comment on #%d: HTTP %s"
+                               % (number, status))
+        return "commented on #%d" % number
+
+
+def load_filed(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def report(message, reporter, cfg, filed):
+    """Put a stopped sync in front of a person, once per distinct problem.
+
+    Files the issue if none is open, and otherwise comments only when the
+    message differs from the one last reported. Never closes anything:
+    whoever resolves the conflict closes the issue.
+    """
+    number = reporter.open_issue()
+    if number is not None and load_filed(filed) == message:
+        return "already reported on #%d" % number
+    text = "\n".join([
+        "`%s` on %s stopped: %s" % (PROG, cfg["host"], message), "",
+        "Until someone resolves it, this host still commits its own "
+        "memories on every run, so nothing written here is lost, but "
+        "none of them reach the other hosts. agent-forge's "
+        "docs/memory-sync.md says how to resolve a conflict. Close this "
+        "issue once the next run pushes.", "",
+        "Filed by cron; nobody typed this. While this issue is open, "
+        "cron comments here only when the problem changes.", "",
+        "— %s" % PROG])
+    done = reporter.create(text) if number is None \
+        else reporter.comment(number, text)
+    os.makedirs(os.path.dirname(filed), exist_ok=True)
+    with open(filed, "w") as fh:
+        json.dump(message, fh)
+    return done
+
+
+def main(argv=None, environ=None, run=proc.sh, call=github.api_call,
+         out=None, err=None, project=None):
+    environ = os.environ if environ is None else environ
+    out = out or sys.stdout
+    err = err or sys.stderr
+    parser = argparse.ArgumentParser(prog=PROG,
+                                     description=__doc__.splitlines()[0])
+    parser.add_argument("--seed", action="store_true",
+                        help="set this host up once (docs/memory-sync.md)")
+    parser.add_argument("--file", action="store_true",
+                        help="report a run that needs a person on a "
+                             "GitHub issue in the project's repository")
+    args = parser.parse_args(argv)
+    try:
+        project = project or config.load(environ=environ)
+        cfg = memory.settings(project, environ)
+    except (config.ConfigError, memory.NotConfigured) as exc:
+        print("%s: %s" % (PROG, exc), file=err)
+        return COULD_NOT_ASK
+    git = Git(cfg, run, environ)
+    status, message = 0, ""
+    try:
+        if args.seed:
+            message, aside = seed(git, cfg)
+            status = NEEDS_PERSON if aside else 0
+        else:
+            message = sync(git, cfg)
+    except Stop as stop:
+        status, message = stop.status, str(stop)
+    print("%s: %s" % (PROG, message), file=err if status else out)
+    if args.file:
+        filed = memory.filed_path(project.name, environ)
+        try:
+            if status == NEEDS_PERSON:
+                reporter = Reporter(project, cfg, environ, call)
+                print("%s: %s" % (PROG, report(message, reporter, cfg,
+                                               filed)), file=out)
+            elif status == 0 and load_filed(filed) is not None:
+                # All clear: forget what was reported, so the next stop is
+                # reported even if it is the same one.
+                os.remove(filed)
+        except (RuntimeError, OSError) as exc:
+            print("%s: could not report on GitHub: %s" % (PROG, exc),
+                  file=err)
+    return status
+
+
+def run(argv=None):
+    """main, with an unexpected exception turned into exit 2.
+
+    Python exits 1 on a traceback, and 1 here means a run that asked and
+    found something for a person. A run that died asked nothing.
+    """
+    try:
+        return main(argv)
+    except SystemExit:
+        raise
+    except BaseException:
+        traceback.print_exc()
+        print("%s: exiting 2; this run could not ask its question" % PROG,
+              file=sys.stderr)
+        return COULD_NOT_ASK
+
+
+if __name__ == "__main__":
+    sys.exit(run())

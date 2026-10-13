@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Shorten MEMORY.md's index lines by REMOVING detail already in the topic files.
+
+**"Removing", in the first line, because this line is the one read
+before the decision**: argparse prints it as `--help`'s description.
+"Moving" would invite the reader to assume the text is put somewhere.
+Nothing is written to any topic file.
+
+forge-memory-check reports that the index is near the harness limit.
+This is the repair it names, and it exists because the repair is
+otherwise an ad-hoc script, and the ad-hoc repair is a character cap:
+it cuts lines at a column, mid-sentence and sometimes mid-markup, and
+nobody can later say which run did it.
+
+**Never truncates, and that is the point.** A bound in characters cuts
+at a column and knows nothing about where the meaning is. The index
+line is the only thing a session reads when deciding whether a memory
+is relevant, so a hook cut off mid-sentence loses the operative half,
+invisibly from either end.
+
+**What it removes.** The index grows one way: somebody learns a
+refinement and appends `**Added <date>**: ...` to the hook. So the
+clause from `**Added ...**` or `**<year>...**` on is what comes off.
+
+**Verify before removing, the step a cap skips.** The clause is dropped
+only when its substance is already in the topic file it points at.
+Where it is not, this refuses and names the line: the alternative is
+deleting the only copy. Substance rather than an exact string, because
+the clause is usually rephrased when it lands in the file: every long
+word must be present, since long words carry the content and survive
+rewording, and a lower bar would pass on shared vocabulary alone.
+
+The directory is `--dir`, else $FORGE_MEMORY_DIR, else the
+configuration's `memory.dir`.
+
+Exit status:
+
+    0   nothing needed removing, or --apply removed it
+    1   at least one line could not be shortened safely (with --check,
+        also when a line COULD be and has not been)
+    2   the memory directory or its index could not be read, or --apply
+        was given nothing it could do
+"""
+
+import argparse
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, memory  # noqa: E402
+
+PROG = "forge-memory-trim"
+
+# The appended clause, in the two forms agents actually write.
+CLAUSE_RE = re.compile(r"\s*\*\*(?:Added\b|20\d\d[-,])")
+INDEX_RE = re.compile(r"^- \[(?P<title>.*?)\]\((?P<file>[^)]+)\) — (?P<hook>.*)$")
+
+# **A line an earlier cap already cut.** Detection is mechanical even
+# though repair is not: the text is gone, and only somebody who knows
+# the memory can write the hook again. Anchored on the ellipsis followed
+# by nothing but sentence punctuation, not on a final ellipsis: a cut
+# line sometimes gained a full stop after it, and an ellipsis inside a
+# line ("00:17/03:17/...") is an "and so on", not damage.
+TRUNCATED_RE = re.compile(r"…\s*[.]?\s*$")
+
+# **A clause that replaces something rather than adding to it.** Purely
+# advisory, since supersession is editorial, but it puts the dangerous
+# case in front of whoever is choosing. Deliberately generous: a false
+# positive costs one line of output, a false negative the newest half of
+# an entry.
+SUPERSEDES_RE = re.compile(
+    r"\b(replacement|replaces|supersed\w*|instead|no longer|resolved"
+    r"|correcti\w*|revised|rather than)\b", re.IGNORECASE)
+
+# Words shorter than this are shared by any two English sentences and
+# say nothing about whether the content travelled.
+MIN_WORD = 6
+# Every content word must be present; see the module docstring.
+REQUIRED = 1.0
+
+
+def content_words(text):
+    """The long words of a clause, lowercased. `added` is the marker
+    itself, not what it introduces, so it is left out."""
+    return {w for w in re.findall(r"[a-z]{%d,}" % MIN_WORD, text.lower())
+            if w != "added"}
+
+
+def coverage(clause, body):
+    """How much of a clause's substance is already in a topic file."""
+    words = content_words(clause)
+    if not words:
+        # **Nothing to verify means refuse, not accept.** A clause with
+        # no content words can't be checked, and an unverifiable clause
+        # is exactly where dropping it loses the only copy:
+        # `**Added 2026-01-02**: see #123.` still carries a fact.
+        # Deny by default is the only safe direction for a function
+        # whose failure mode is deletion.
+        return (0, 1, ["<no content words to verify>"])
+    body = body.lower()
+    missing = sorted(w for w in words if w not in body)
+    return (len(words) - len(missing), len(words), missing)
+
+
+def split_hook(hook):
+    """(what stays on the index line, what is already in the topic file)."""
+    m = CLAUSE_RE.search(hook)
+    if not m:
+        return (hook, "")
+    return (hook[:m.start()].rstrip().rstrip(";").rstrip(),
+            hook[m.start():].strip())
+
+
+def plan(path):
+    """(removable, refused, index lines, raw lines, already cut)."""
+    with open(path) as fh:
+        raw = [line.rstrip("\n") for line in fh]
+    movable, blocked, count, cut = [], [], 0, []
+    for i, line in enumerate(raw):
+        m = INDEX_RE.match(line)
+        if not m:
+            continue
+        count += 1
+        if TRUNCATED_RE.search(line):
+            cut.append((i, m.group("file")))
+        kept, clause = split_hook(m.group("hook"))
+        if not clause:
+            continue
+        target = os.path.join(os.path.dirname(path), m.group("file"))
+        try:
+            with open(target) as fh:
+                body = fh.read()
+        except OSError as exc:
+            blocked.append((i, m.group("file"), "cannot read: %s" % exc,
+                            clause))
+            continue
+        have, want, missing = coverage(clause, body)
+        new = "- [%s](%s) — %s" % (m.group("title"), m.group("file"), kept)
+        if want and have / want < REQUIRED:
+            blocked.append((i, m.group("file"),
+                            "%d/%d content words in the topic file, missing "
+                            "%s" % (have, want, missing), clause))
+            continue
+        movable.append((i, m.group("file"), new, len(line) - len(new),
+                        bool(SUPERSEDES_RE.search(clause))))
+    return movable, blocked, count, raw, cut
+
+
+def main(argv=None, environ=None, out=None, err=None, project=None):
+    environ = os.environ if environ is None else environ
+    out = out or sys.stdout
+    err = err or sys.stderr
+    ap = argparse.ArgumentParser(prog=PROG,
+                                 description=__doc__.splitlines()[0])
+    ap.add_argument("--dir", help="memory directory (default "
+                    "$FORGE_MEMORY_DIR, else memory.dir)")
+    ap.add_argument("--apply", action="store_true",
+                    help="rewrite MEMORY.md; requires --entry, no bulk mode")
+    ap.add_argument("--entry", action="append", default=[], metavar="FILE",
+                    help="the topic file whose index line may be shortened; "
+                         "repeatable, and required by --apply")
+    ap.add_argument("--check", action="store_true",
+                    help="exit 1 if any line has a removal candidate")
+    args = ap.parse_args(argv)
+
+    path = args.dir
+    if not path:
+        try:
+            project = project or config.load(environ=environ)
+        except config.ConfigError:
+            project = None
+        path = memory.directory(project, environ)
+    if not path:
+        print("%s: no --dir, no FORGE_MEMORY_DIR, and no memory.dir in a "
+              "configuration" % PROG, file=err)
+        return 2
+
+    index = os.path.join(path, "MEMORY.md")
+    if not os.path.isfile(index):
+        print("%s: no index at %s" % (PROG, index), file=err)
+        return 2
+
+    movable, blocked, count, raw, cut = plan(index)
+
+    for _i, fn, why, clause in blocked:
+        print("REFUSED  %s: %s" % (fn, why), file=err)
+        print("         clause: %s" % clause[:100], file=err)
+    for _i, fn, _new, saved, sup in movable:
+        flag = "  <-- AND LOOKS LIKE IT SUPERSEDES THE REST OF THE LINE" \
+            if sup else ""
+        print("CANDIDATE  %s: %d bytes, safe to lose from the index%s"
+              % (fn, saved, flag), file=out)
+    for _i, fn in cut:
+        print("TRUNCATED  %s: this index line was cut by an earlier "
+              "character cap. The text is gone; rewrite the hook from the "
+              "topic file. This tool will not guess at it." % fn, file=err)
+
+    total = sum(s for _i, _f, _n, s, _u in movable)
+    sup_n = sum(1 for _i, _f, _n, _s, u in movable if u)
+    print("\n%d index lines, %d candidate(s) (%d bytes), %d of those appear "
+          "to supersede the rest of their line, %d refused, %d already "
+          "truncated" % (count, len(movable), total, sup_n, len(blocked),
+                         len(cut)), file=err)
+    if movable:
+        # **"Candidate", never "removable".** This computes one property:
+        # nothing would be lost. Whether the hook still tells a reader to
+        # open the file is editorial, and `**Added <date>**` marks the
+        # NEWEST content, which is both what this keys on and what a
+        # reader most needs to see.
+        print("%s: these are candidates, not recommendations. This checks "
+              "only that nothing would be lost -- not that the hook still "
+              "tells a reader to open the file, which is the index's whole "
+              "job. `**Added <date>**` marks the NEWEST content, so the "
+              "marker this keys on is often the sentence most worth "
+              "keeping. Read the line." % PROG, file=err)
+    if blocked:
+        print("%s: refusing to drop a clause whose substance is not already "
+              "in its topic file -- append it there first, then re-run. "
+              "Deleting the only copy is the harm this exists to avoid."
+              % PROG, file=err)
+
+    if args.apply:
+        # **No bulk mode, deliberately.** The safety test says nothing
+        # would be lost; it can't say the line is still useful
+        # afterwards, so each line is named by somebody who read it.
+        if not args.entry:
+            print("%s: --apply needs --entry FILE for each line to shorten. "
+                  "There is no bulk mode: removing a clause is an editorial "
+                  "judgement about whether the hook still tells a reader to "
+                  "open the file, and this tool cannot make it." % PROG,
+                  file=err)
+            return 2
+        wanted = set(args.entry)
+        chosen = [m for m in movable if m[1] in wanted]
+        unknown = wanted - {m[1] for m in movable}
+        for u in sorted(unknown):
+            print("%s: --entry %s has nothing removable" % (PROG, u),
+                  file=err)
+        if not chosen:
+            return 2
+        for i, _fn, new, _saved, _sup in chosen:
+            raw[i] = new
+        with open(index, "w") as fh:
+            fh.write("\n".join(raw) + "\n")
+        saved = sum(s for _i, _f, _n, s, _u in chosen)
+        print("%s: rewrote %s, %d line(s), %d bytes removed from the index "
+              "(the topic files are unchanged -- this deletes, having "
+              "checked the text survives there)"
+              % (PROG, index, len(chosen), saved), file=out)
+        return 1 if (blocked or cut or unknown) else 0
+
+    if args.check and (movable or cut):
+        return 1
+    return 1 if (blocked or cut) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

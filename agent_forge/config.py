@@ -51,6 +51,7 @@ TOP = {
     "merge": (dict, False),
     "receiver": (dict, False),
     "closing_keywords": (dict, False),
+    "memory": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
@@ -58,6 +59,10 @@ APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
 AGENT = dict(APP, session_name=str, twins=list, kind=str, reviews=list)
 IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list}
+# forge-memory-sync, -check and -trim (agent_forge/memory.py).
+MEMORY = {"dir": str, "remote": str, "git_dir": str, "seed_dir": str,
+          "ssh_key": str, "branch": str, "labels": list, "limit": int,
+          "long_line": int}
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_minutes": int, "stall_alert": dict, "test_ahead": dict,
          "hold_conflicting": bool, "yield_after_hand_back": int,
@@ -209,6 +214,24 @@ def _fields(where, entry, allowed, problems):
             problems.append("%s.%s must be %s"
                             % (where, key, _type_name(allowed[key])))
     return True
+
+
+def _check_memory(memory, present, problems):
+    """The `memory` section: where the agents' memories are shared."""
+    if not _fields("memory", memory, MEMORY, problems) or not present:
+        return
+    for key in ("dir", "remote"):
+        if key not in memory:
+            problems.append("memory: missing %r" % key)
+    for key in ("dir", "remote", "git_dir", "seed_dir", "ssh_key", "branch"):
+        if isinstance(memory.get(key), str) and not memory[key].strip():
+            problems.append("memory.%s must not be empty" % key)
+    if isinstance(memory.get("labels"), list) and not all(
+            isinstance(x, str) and x for x in memory["labels"]):
+        problems.append("memory.labels must be a list of label names")
+    for key in ("limit", "long_line"):
+        if _is(memory.get(key), int) and memory[key] < 1:
+            problems.append("memory.%s must be at least 1" % key)
 
 
 def check(data):
@@ -380,6 +403,7 @@ def check(data):
         if not all(isinstance(k, str) for k in settings.get("host_keys", [])):
             problems.append("host_settings.host_keys must be a list of "
                             "strings")
+    _check_memory(data.get("memory", {}), "memory" in data, problems)
     docs = data.get("docs", {})
     for key, kinds in DOCS.items():
         if key in docs and not _is(docs[key], kinds):
