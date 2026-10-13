@@ -470,7 +470,7 @@ def main(argv=None, out=print, environ=None, now=None,
         locks.state_dir(project.name, "router", environ), "presence.jsonl"))
     idle = None
     if presence:
-        sessions = {project.session_name(a): a for a in project.agents}
+        sessions = project.by_session()
         idle = {}
         for name, spans in idle_spans(presence, until).items():
             idle.setdefault(sessions.get(name, name), []).extend(spans)

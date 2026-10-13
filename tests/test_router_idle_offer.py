@@ -166,6 +166,25 @@ class Idle(unittest.TestCase):
                                    entry("WidgetMerger"), entry("alice")),
                          {"Helper": IDLE})
 
+    def test_a_twin_idle_makes_her_idle_since_the_longest_idle(self):
+        data = example()
+        data["agents"]["LeadDev"]["twins"] = ["WidgetLeadDev2"]
+        twin = rules.Roster(config.Project(data, None))
+        listing = directory(entry("WidgetLeadDev", "busy"),
+                            entry("WidgetLeadDev2"))
+        got = rules.idle_agents(router.Context(twin, NOW, [], [],
+                                               directory=listing))
+        self.assertEqual(got, {"LeadDev": IDLE})
+        listing = directory(entry("WidgetLeadDev", since=T1),
+                            entry("WidgetLeadDev2"))
+        got = rules.idle_agents(router.Context(twin, NOW, [], [],
+                                               directory=listing))
+        self.assertEqual(got, {"LeadDev": min(T1, IDLE)})
+        listing = directory(entry("WidgetLeadDev", "busy"),
+                            entry("WidgetLeadDev2", "busy"))
+        self.assertEqual(rules.idle_agents(router.Context(
+            twin, NOW, [], [], directory=listing)), {})
+
     def test_listed_twice_idle_only_if_both_are_since_the_later(self):
         self.assertEqual(self.idle(entry("WidgetLeadDev"),
                                    entry("WidgetLeadDev", "busy")), {})

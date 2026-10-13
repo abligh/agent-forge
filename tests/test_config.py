@@ -53,6 +53,24 @@ class Check(unittest.TestCase):
         data["merge"]["test_ahead"] = {"spare_slots_only": "yes"}
         self.assertEqual(len(config.check(data)), 1)
 
+    def test_twins_are_session_names(self):
+        data = example()
+        data["agents"]["LeadDev"]["twins"] = ["WidgetLeadDev2"]
+        self.assertEqual(config.check(data), [])
+        data["agents"]["LeadDev"]["twins"] = ["", 3]
+        self.assertEqual(config.check(data),
+                         ["agents.LeadDev.twins must be a list of session "
+                          "names"])
+        data["agents"]["LeadDev"]["twins"] = "WidgetLeadDev2"
+        self.assertEqual(len(config.check(data)), 1)
+
+    def test_no_session_name_belongs_to_two_agents(self):
+        data = example()
+        data["agents"]["LeadDev"]["twins"] = ["WidgetUIDev"]
+        (problem,) = config.check(data)
+        self.assertIn("session WidgetUIDev is named more than once "
+                      "(LeadDev, UIDev)", problem)
+
     def test_drop_env_takes_names_and_prefixes(self):
         data = example()
         data["checks"]["drop_env"] = ["A_B", "RECEIVER_*"]
@@ -517,6 +535,16 @@ class ProjectQueries(unittest.TestCase):
     def test_session_names(self):
         self.assertEqual(self.p.session_name("LeadDev"), "WidgetLeadDev")
         self.assertEqual(self.p.session_name("Helper"), "Helper")
+
+    def test_sessions_are_hers_then_her_twins(self):
+        self.assertEqual(self.p.sessions("LeadDev"), ["WidgetLeadDev"])
+        data = example()
+        data["agents"]["LeadDev"]["twins"] = ["WidgetLeadDev2", "Spare"]
+        p = config.Project(data, None)
+        self.assertEqual(p.sessions("LeadDev"),
+                         ["WidgetLeadDev", "WidgetLeadDev2", "Spare"])
+        self.assertEqual(p.by_session()["WidgetLeadDev2"], "LeadDev")
+        self.assertEqual(p.by_session()["Helper"], "Helper")
 
     def test_an_app_not_yet_made(self):
         self.assertTrue(self.p.exists("LeadDev"))

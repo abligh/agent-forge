@@ -889,6 +889,71 @@ class FailedRelay(StateCase):
                          {"not sent: relay unreachable: refused"})
 
 
+class Twins(StateCase):
+    """An agent with twins: sessions sharing her App."""
+
+    TWINS = roster(dict(
+        {name: example()["agents"][name] for name in ("LeadDev", "Helper")},
+        Reviewer=dict(example()["agents"]["Reviewer"],
+                      twins=["WidgetReviewer2"])))
+
+    def run_router(self, prs=(), send=True, when=NOW):
+        return r.run(FakeGitHub(response(list(prs), [])), self.TWINS,
+                     self.dir, send, self.post, None, self.lines.append,
+                     when=when, remind_s=r.DEFAULT_REMIND_S)
+
+    def test_a_wake_goes_to_her_and_her_twins(self):
+        self.assertEqual(self.run_router([pr_node(41)]), 0)
+        self.assertEqual([p[0] for p in self.posts],
+                         ["WidgetReviewer", "WidgetReviewer2"])
+        self.assertEqual(self.posts[0][1], self.posts[1][1])
+        self.assertIn("woken_at", self.state()["items"]["41"])
+
+    def test_taken_by_one_is_delivered(self):
+        def post(session, text):
+            self.posts.append(session)
+            return "HTTP 404 unknown-name" if session == "WidgetReviewer" \
+                else None
+        self.post = post
+        self.assertEqual(self.run_router([pr_node(41)]), 0)
+        self.assertIn("woken_at", self.state()["items"]["41"])
+        (wake,) = self.wakes()
+        self.assertEqual((wake["outcome"], wake["session"]),
+                         ("sent", "WidgetReviewer2"))
+        self.assertIn("NOT TAKEN by WidgetReviewer: HTTP 404 unknown-name; "
+                      "WidgetReviewer2 took it", self.lines)
+
+    def test_taken_by_none_stays_due(self):
+        self.refuse = "HTTP 404 unknown-name"
+        self.assertEqual(self.run_router([pr_node(41)]), 2)
+        self.assertEqual(self.state()["items"], {})
+        self.assertIn("NOT SENT to WidgetReviewer, WidgetReviewer2: "
+                      "WidgetReviewer: HTTP 404 unknown-name; "
+                      "WidgetReviewer2: HTTP 404 unknown-name; #41 stay due",
+                      self.lines)
+
+    def test_an_unreachable_relay_is_not_asked_for_the_twin(self):
+        def post(session, text):
+            self.posts.append(session)
+            return r.UNREACHABLE + ": refused"
+        self.post = post
+        self.assertEqual(self.run_router([pr_node(41)]), 2)
+        self.assertEqual(self.posts, ["WidgetReviewer"])
+
+    def test_a_dry_run_names_every_session(self):
+        self.run_router([pr_node(41)], send=False)
+        self.assertEqual(self.posts, [])
+        self.assertTrue(any(line.startswith(
+            "WOULD SEND to WidgetReviewer, WidgetReviewer2:")
+            for line in self.lines), self.lines)
+
+    def test_a_roster_without_sessions_wakes_her_session_alone(self):
+        class Plain:
+            def session_name(self, who):
+                return "Team" + who
+        self.assertEqual(r.sessions_of(Plain(), "Ann"), ["TeamAnn"])
+
+
 class Only(StateCase):
 
     def test_only_routes_the_named_items_and_keeps_the_rest(self):

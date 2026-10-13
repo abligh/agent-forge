@@ -55,7 +55,7 @@ TOP = {
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
        "slug": str, "key": str}
-AGENT = dict(APP, session_name=str, kind=str, reviews=list)
+AGENT = dict(APP, session_name=str, twins=list, kind=str, reviews=list)
 IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list}
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
@@ -410,9 +410,29 @@ def check(data):
             elif not all(isinstance(g, str) and g for g in entry["reviews"]):
                 problems.append("%s.reviews must be a list of path globs"
                                 % where)
+        if "twins" in entry and not all(isinstance(s, str) and s
+                                        for s in entry["twins"]):
+            problems.append("%s.twins must be a list of session names"
+                            % where)
         if "slug" not in entry and not suffix:
             problems.append("%s: no slug, and no naming.app_slug_suffix to "
                             "make one" % where)
+    prefix = data.get("naming", {}).get("session_prefix", "")
+    holders = {}
+    for name, entry in data["agents"].items():
+        if not isinstance(entry, dict):
+            continue
+        twins = entry.get("twins", [])
+        for session in [entry.get("session_name") or prefix + name] \
+                + (twins if isinstance(twins, list) else []):
+            if isinstance(session, str):
+                holders.setdefault(session, []).append(name)
+    for session in sorted(holders):
+        if len(holders[session]) > 1:
+            problems.append("session %s is named more than once (%s): "
+                            "the relay wakes a name only when one session "
+                            "holds it" % (session,
+                                          ", ".join(holders[session])))
     for name, entry in data.get("machinery", {}).items():
         where = "machinery.%s" % name
         if _fields(where, entry, APP, problems) and "slug" not in entry \
@@ -657,6 +677,18 @@ class Project:
     def session_name(self, name):
         """The name the agent's session is woken by."""
         return self.agents[name].get("session_name") or self._prefix + name
+
+    def sessions(self, name):
+        """Every session that works as the agent: hers, then her twins'
+        (sessions that share her App, such as one on a second host or
+        account), in the configuration's order."""
+        return [self.session_name(name)] \
+            + list(self.agents[name].get("twins", []))
+
+    def by_session(self):
+        """{session name: agent} for every agent's sessions, twins
+        included."""
+        return {s: a for a in self.agents for s in self.sessions(a)}
 
     def exists(self, name):
         """Whether the App and its installation exist: null ids mean an

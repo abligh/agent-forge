@@ -1434,14 +1434,24 @@ def load_router():
 def relay_sender(project, environ, opener=None):
     """A function (agent name, text) -> None when the relay took the
     message, else why not: the router's own poster, configured from the
-    same `relay` section and addressed to the agent's session name, so
-    the two can't diverge."""
+    same `relay` section and addressed to each of the agent's sessions
+    (hers and her twins'), so the two can't diverge. Taken by any one
+    session is taken."""
     router = load_router()
     router.configure(project, rules=False)
     post = router.make_poster(environ.get("FORGE_ROUTER_RELAY", router.RELAY),
                               router.relay_token(),
                               *([opener] if opener else []))
-    return lambda name, text: post(project.session_name(name), text)
+
+    def send(name, text):
+        problems = []
+        for session in project.sessions(name):
+            why = post(session, text)
+            if why is None:
+                return None
+            problems.append(why)
+        return "; ".join(problems)
+    return send
 
 
 def conflict_hand_back(pr, approval, github, said, live):

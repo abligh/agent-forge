@@ -332,6 +332,10 @@ class Roster:
     def session_name(self, who):
         return self.project.session_name(who)
 
+    def sessions(self, who):
+        """Her session, then her twins'."""
+        return self.project.sessions(who)
+
     def reviewers(self):
         """Every agent of kind `reviewer`, in the configuration's order."""
         return self.project.reviewers()
@@ -843,34 +847,38 @@ def parse_stamp(stamp):
 
 def idle_agents(ctx):
     """{agent: when its idle period began (the directory's string)} for
-    each agent the directory shows idle for at least `idle_minutes`. An
-    agent is matched by its session name; one listed more than once is
-    idle only when every entry is, since the latest of them. Nobody is
+    each agent the directory shows idle for at least `idle_minutes`. A
+    session is matched by its name; one listed more than once is idle
+    only when every entry is, since the latest of them. An agent with
+    twins is idle when any of her sessions is, since the longest idle
+    of them: an offer then reaches the one with nothing to do. Nobody is
     idle when the directory is unknown."""
     listing = ctx.directory
     if not isinstance(listing, dict) or listing.get("complete") is not True \
             or not isinstance(listing.get("agents"), list):
         return {}
-    sessions = {ctx.roster.session_name(a): a for a in ctx.roster.agents}
+    sessions = {s: a for a in ctx.roster.agents
+                for s in ctx.roster.sessions(a)}
     seen = {}
     for entry in listing["agents"]:
         if not isinstance(entry, dict):
             continue
-        agent = sessions.get(entry.get("name"))
-        if agent is None:
+        name = entry.get("name")
+        if name not in sessions:
             continue
         since = parse_stamp(entry.get("idle_since")) \
             if entry.get("status") == "idle" else None
-        seen.setdefault(agent, []).append((since, entry.get("idle_since")))
+        seen.setdefault(name, []).append((since, entry.get("idle_since")))
     cutoff = ctx.when - datetime.timedelta(minutes=IDLE_OFFER["idle_minutes"])
     idle = {}
-    for agent, entries in seen.items():
+    for name, entries in seen.items():
         if any(since is None for since, _ in entries):
             continue
         since, stamp = max(entries)
-        if since <= cutoff:
-            idle[agent] = stamp
-    return idle
+        agent = sessions[name]
+        if since <= cutoff and (agent not in idle or since < idle[agent][0]):
+            idle[agent] = (since, stamp)
+    return {agent: stamp for agent, (_, stamp) in idle.items()}
 
 
 # A pull request body's reference to an issue: `#N`, or its URL.

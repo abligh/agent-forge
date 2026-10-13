@@ -70,6 +70,7 @@ letter.
 | `slug` | The App's slug, where it isn't the name followed by `naming.app_slug_suffix`, lower case. |
 | `key` | The private key's file in `key_dir`, where it isn't `<name>.pem`. |
 | `session_name` | The name the agent's session is woken by, where it isn't `naming.session_prefix` followed by the name. |
+| `twins` | More sessions that work as the agent, by session name: twins sharing her App, such as sessions on a second host or a second account. Wakes and the Merger's messages go to each of them as well as to her, and are delivered when any one takes them. An idle offer goes out when any of them is idle. No session name may belong to two agents, since the relay only wakes a name one session holds. |
 | `kind` | `developer` (the default) or `reviewer`. A reviewer's approval is what the Merger merges on. |
 | `reviews` | A reviewer's path globs (`fnmatch`, so `*` crosses `/`): which pull requests are theirs to review. |
 

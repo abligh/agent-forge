@@ -235,8 +235,10 @@ as its head (`baseOpen`, for `router.stuck`), rather than into
 its own (`--only`) without a second place to look.
 
 **The roster** is the module's, since what makes a login a name is a
-rule. The engine asks it two things: whether a name is an agent (only
-agents are woken) and its session name.
+rule. The engine asks it whether a name is an agent (only agents are
+woken), its session name, and, when the roster has `sessions`, every
+session that works as the agent: hers, then her twins'. A wake goes to
+each of them, and counts as delivered when any one takes it.
 
 `ctx` carries the clock, the roster, every fetched item (so a rule
 can read other items: a blocker's state, a reviewer's load),

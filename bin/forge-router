@@ -36,6 +36,8 @@ configuration's `agents`, such as the owner's own pull request, is
 printed and logged once, and not sent. Nobody's turn is forgotten, and
 printed in a dry run. A wake is addressed to the agent's session name:
 the entry's `session_name`, else `naming.session_prefix` and its name.
+It also goes to each of her `twins` (sessions sharing her App), and is
+delivered when any one session takes it.
 
 **Once per turn.** A turn's key is (agent, item, the event that started
 it, as the rules say); a decision about no item has "-" and its rule in
@@ -495,6 +497,12 @@ def relay_token(path=None):
     return None
 
 
+def sessions_of(roster, who):
+    """Every session that works as `who`: hers, then her twins'."""
+    sessions = getattr(roster, "sessions", None)
+    return list(sessions(who)) if sessions else [roster.session_name(who)]
+
+
 def delivery_id(session, text, stamp):
     """X-Webhook-Delivery: the same for a retry within one run, different
     for the next run's wake of the same text."""
@@ -871,8 +879,8 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
             would.append((d, d.line, "withheld: not an agent"))
             continue
         line = d.line + (" (reminder)" if why == "reminder" else "")
-        would.append((d, line, "would send to %s" % roster.session_name(
-            d.agent)))
+        would.append((d, line, "would send to %s" % ", ".join(
+            sessions_of(roster, d.agent))))
         wakes.append({"d": d, "line": line, "why": why, "entry": entry})
     # Item keys with a wake that stays due, and how much was delivered.
     held, delivered, stayed, withdrawn_n, unchecked_n = set(), 0, 0, 0, 0
@@ -891,9 +899,10 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
             unchecked_n += 1
             held.add(item_key(d))
             out("NOT SENT %s to %s: %s; it stays due" % (
-                label(d), roster.session_name(d.agent), why))
+                label(d), ", ".join(sessions_of(roster, d.agent)), why))
             log.append(journal(d, w["line"], "not sent: " + why,
-                               session=roster.session_name(d.agent)))
+                               session=", ".join(sessions_of(roster,
+                                                             d.agent))))
     for d, rec in acting:
         if d.actions:
             rec["actions"] = act(github, d, send, out)
@@ -905,18 +914,32 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
         batches.setdefault(w["d"].agent, []).append(w)
     failed, down = 0, None
     for who in sorted(batches):
-        session = roster.session_name(who)
         numbers = ", ".join(label(w["d"]) for w in batches[who])
         text = message(*[[w["line"] for w in batches[who]
                           if w["d"].kind == kind]
                          for kind in ("turn", "notice", "relook")])
         if not send:
-            out("WOULD SEND to %s:\n%s" % (session, text.rstrip("\n")))
+            out("WOULD SEND to %s:\n%s" % (", ".join(sessions_of(roster, who)),
+                                           text.rstrip("\n")))
             continue
-        # A relay that didn't answer isn't asked again this run.
-        problem = down or post(session, text)
-        if problem.startswith(UNREACHABLE) if problem else False:
-            down = problem
+        # Every session working as the agent gets it: her twins share
+        # her App, so any of them may be the one holding the item. Taken
+        # by one is delivered; the rest are only reported.
+        took, problems = [], []
+        for name in sessions_of(roster, who):
+            # A relay that didn't answer isn't asked again this run.
+            why = down or post(name, text)
+            if why.startswith(UNREACHABLE) if why else False:
+                down = why
+            if why:
+                problems.append("%s: %s" % (name, why) if len(
+                    sessions_of(roster, who)) > 1 else why)
+            else:
+                took.append(name)
+        session = ", ".join(took or sessions_of(roster, who))
+        problem = None if took else "; ".join(problems)
+        if took and problems:
+            out("NOT TAKEN by %s; %s took it" % ("; ".join(problems), session))
         if problem:
             failed += 1
             out("NOT SENT to %s: %s; %s stay due" % (session, problem,

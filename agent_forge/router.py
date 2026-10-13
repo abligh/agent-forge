@@ -16,7 +16,9 @@ A rules module is a Python module with:
                  rather than {"nodes": [...]}
     lookups      the `Lookup`s the engine runs after the query
     Roster       Roster(project): who is who. The engine asks it only
-                 `is_agent(name)` and `session_name(name)`
+                 `is_agent(name)`, `session_name(name)` and, when it
+                 has one, `sessions(name)`: every session that works as
+                 the agent, hers first (absent: her session name alone)
     configure(project, merger)
                  set the module up for a project; `merger` is
                  bin/forge-merger, so a rule can use its tests

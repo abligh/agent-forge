@@ -10,11 +10,13 @@ a fake: no test reaches the network or mints a token.
 
 import datetime
 import fcntl
+import io
 import json
 import os
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 from agent_forge import config
@@ -1774,6 +1776,25 @@ class RelaySender(unittest.TestCase):
     def test_the_routers_override_of_the_relay_applies(self):
         _, (req,) = self.send({"FORGE_ROUTER_RELAY": "http://other:1"})
         self.assertEqual(req.full_url, "http://other:1/agent/WidgetLeadDev")
+
+    def test_a_twin_takes_it_when_she_cannot(self):
+        data = example()
+        data["agents"]["LeadDev"]["twins"] = ["WidgetLeadDev2"]
+        data["relay"] = {"url": "http://relay:8788",
+                         "token_file": self.token_file}
+        seen = []
+
+        def opener(req, timeout):
+            seen.append(req.full_url)
+            if req.full_url.endswith("/WidgetLeadDev"):
+                raise urllib.error.HTTPError(
+                    req.full_url, 404, "Not Found", {},
+                    io.BytesIO(b'{"error": "unknown-name"}'))
+            return self.Response()
+        send = m.relay_sender(config.Project(data, None), {}, opener)
+        self.assertIsNone(send("LeadDev", "From: Merger\nx"))
+        self.assertEqual(seen, ["http://relay:8788/agent/WidgetLeadDev",
+                                "http://relay:8788/agent/WidgetLeadDev2"])
 
 
 class Configure(unittest.TestCase):
