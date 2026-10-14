@@ -2202,6 +2202,40 @@ class PrepareAhead(unittest.TestCase):
                  SHA_P],
                 ["git", "-C", wt, "clean", "-q", "-ffdx"]])
 
+    def test_keep_ignored_paths_survive_the_clean(self):
+        # checks.keep_ignored: a build's own output, updated in place,
+        # so a step embedding it isn't rebuilt from nothing every head.
+        with tempfile.TemporaryDirectory() as wt:
+            os.mkdir(os.path.join(wt, ".git"))
+            run = FakeRun()
+            with mock.patch.object(pc, "KEEP_IGNORED",
+                                   ("web/dist", "/out/")):
+                pc.prepare_ahead("/repo", wt, SHA_P, run)
+            self.assertEqual(run.calls[-1]["args"], [
+                "git", "-C", wt, "clean", "-q", "-ffdx",
+                "-e", "/web/dist/", "-e", "/out/"])
+
+    def test_keep_ignored_keeps_the_files_for_real(self):
+        with tempfile.TemporaryDirectory() as wt:
+            for args in (["init", "-q"], ["config", "user.name", "t"],
+                         ["config", "user.email", "t@t"]):
+                subprocess.run(["git", "-C", wt] + args, check=True)
+            with open(os.path.join(wt, ".gitignore"), "w") as handle:
+                handle.write("dist/\nnode/\n")
+            subprocess.run(["git", "-C", wt, "add", ".gitignore"], check=True)
+            subprocess.run(["git", "-C", wt, "commit", "-qm", "i"],
+                           check=True)
+            for path in ("web/dist/x", "web/node/y", "stray"):
+                os.makedirs(os.path.dirname(os.path.join(wt, path)) or wt,
+                            exist_ok=True)
+                open(os.path.join(wt, path), "w").close()
+            with mock.patch.object(pc, "KEEP_IGNORED", ("web/dist",)):
+                subprocess.run(pc.clean_args(wt), check=True)
+            left = sorted(os.path.relpath(os.path.join(r, f), wt)
+                          for r, _, fs in os.walk(wt) if "/.git" not in r
+                          and not r.endswith(".git") for f in fs)
+            self.assertEqual(left, [".gitignore", "web/dist/x"])
+
     def test_a_missing_commit_is_an_error_and_nothing_is_checked_out(self):
         with tempfile.TemporaryDirectory() as wt:
             os.mkdir(os.path.join(wt, ".git"))

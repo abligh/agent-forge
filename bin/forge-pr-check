@@ -441,6 +441,10 @@ DEFAULT_STEPS = [("test", ["make", "test"], None)]
 STEPS = DEFAULT_STEPS
 # {environment variable: directory name} for each slot's build caches.
 CACHES = {}
+# checks.keep_ignored: paths, relative to the worktree, that the clean
+# before each head leaves alone although they are ignored, so a build
+# can find its own last output there (`git clean -e`).
+KEEP_IGNORED = ()
 # checks.reuse (designs/0009): how old a step's green verdict may be to
 # stand for the same inputs, or None: never reused.
 REUSE_AGE = None
@@ -593,7 +597,7 @@ def configure(project):
     `step_timeout_minutes`, `merger_first`, `depends`,
     `depends_minutes`, `tracer`, `fast_lane`, `merge_default`,
     `cache_limit`, `reuse`, `fresh`, `first_authors`, `max_wait_minutes`,
-    each step's `always` and `version`),
+    `keep_ignored`, each step's `always` and `version`),
     each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
     implies `merger_first`."""
@@ -604,7 +608,7 @@ def configure(project):
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
-    global DROP_NAMES, DROP_PREFIXES
+    global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
@@ -649,6 +653,7 @@ def configure(project):
     FRESH_WAIT = datetime.timedelta(minutes=checks["fresh"].get(
         "wait_minutes", DEFAULT_FRESH_MINUTES)) if "fresh" in checks else None
     CACHES = dict(checks.get("caches", {}))
+    KEEP_IGNORED = tuple(checks.get("keep_ignored", ()))
     drop = checks.get("drop_env", [])
     DROP_NAMES = frozenset(d for d in drop if not d.endswith("*"))
     DROP_PREFIXES = tuple(d[:-1] for d in drop if d.endswith("*"))
@@ -1781,6 +1786,15 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     return 0
 
 
+def clean_args(wt):
+    """The command that removes everything git does not track from wt,
+    ignored files too, except the checks.keep_ignored paths."""
+    args = ["git", "-C", wt, "clean", "-q", "-ffdx"]
+    for path in KEEP_IGNORED:
+        args += ["-e", "/" + path.strip("/") + "/"]
+    return args
+
+
 def prepare(repo, wt, sha, pr, run=sh):
     """Check pull request pr's head out, clean and detached, at wt,
     creating that worktree of repo the first time. Returns (status,
@@ -1815,7 +1829,7 @@ def prepare(repo, wt, sha, pr, run=sh):
             return "moved", fetched
     for args in (["git", "-C", wt, "checkout", "-q", "--detach", "--force",
                   sha],
-                 ["git", "-C", wt, "clean", "-q", "-ffdx"]):
+                 clean_args(wt)):
         got = run(args)
         if got.returncode != 0:
             return "error", "%s: %s" % (" ".join(args[3:5]),
@@ -1839,7 +1853,7 @@ def prepare_ahead(repo, wt, sha, run=sh):
     for args in (["git", "-C", wt, "cat-file", "-e", sha + "^{commit}"],
                  ["git", "-C", wt, "checkout", "-q", "--detach", "--force",
                   sha],
-                 ["git", "-C", wt, "clean", "-q", "-ffdx"]):
+                 clean_args(wt)):
         got = run(args)
         if got.returncode != 0:
             return "error", "%s: %s" % (" ".join(args[3:5]),

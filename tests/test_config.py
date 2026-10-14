@@ -102,6 +102,13 @@ class Check(unittest.TestCase):
         data["checks"]["drop_env"] = ["*", "A-B", 3, "X*Y"]
         self.assertEqual(len(config.check(data)), 4)
 
+    def test_keep_ignored_takes_plain_paths_inside_the_worktree(self):
+        data = example()
+        data["checks"]["keep_ignored"] = ["web/dist", "/out/"]
+        self.assertEqual(config.check(data), [])
+        data["checks"]["keep_ignored"] = ["", "/", "../x", "a/*", 3]
+        self.assertEqual(len(config.check(data)), 5)
+
     def test_the_example_is_good(self):
         self.assertEqual(config.check(example()), [])
 

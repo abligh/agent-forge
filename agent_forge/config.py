@@ -82,7 +82,8 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "tracer": str, "cpu_weight": int, "fast_lane": dict,
           "merge_default": bool, "cache_limit": str, "reuse": dict,
           "fresh": dict, "first_authors": list, "max_wait_minutes": int,
-          "main": str, "main_red_issue": dict, "drop_env": list}
+          "main": str, "main_red_issue": dict, "drop_env": list,
+          "keep_ignored": list}
 # checks.drop_env: a variable's name, or a prefix ending in `*`.
 DROP_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\*?$")
 # checks.main: which default-branch heads are run (designs/0011).
@@ -334,6 +335,13 @@ def check(data):
             problems.append("checks.main_red_issue needs checks.main "
                             "\"every\" (or checks.depends): otherwise the "
                             "default branch is never checked")
+    if isinstance(checks.get("keep_ignored"), list):
+        for path in checks["keep_ignored"]:
+            if not (isinstance(path, str) and path.strip("/")
+                    and ".." not in path.split("/")
+                    and not any(c in path for c in "*?[!\\")):
+                problems.append("checks.keep_ignored: %r is not a path "
+                                "inside the worktree" % (path,))
     if isinstance(checks.get("drop_env"), list):
         for entry in checks["drop_env"]:
             if not isinstance(entry, str) or not DROP_ENV_RE.match(entry):
