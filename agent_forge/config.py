@@ -83,7 +83,7 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "merge_default": bool, "cache_limit": str, "reuse": dict,
           "fresh": dict, "first_authors": list, "max_wait_minutes": int,
           "main": str, "main_red_issue": dict, "drop_env": list,
-          "keep_ignored": list}
+          "keep_ignored": list, "red_comment": bool}
 # checks.drop_env: a variable's name, or a prefix ending in `*`.
 DROP_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\*?$")
 # checks.main: which default-branch heads are run (designs/0011).

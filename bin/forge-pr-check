@@ -581,6 +581,13 @@ FRESH_WAIT = None
 MAIN_EVERY = False
 # checks.main_red_issue (designs/0011): {"label", "title"}, or None.
 MAIN_RED_ISSUE = None
+# checks.red_comment: say on a pull request why its head is red, with
+# the end of each failed step's output, for those who can't read
+# worker.log on the host.
+RED_COMMENT = False
+# The most of each failed step's output a red comment quotes.
+RED_COMMENT_CHARS = 12000
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 DEFAULT_RED_TITLE = "The default branch is red at {sha}"
 # With fresh, how many of the newest records each step keeps, and how
 # many of the newest records a step may be chosen from.
@@ -608,6 +615,7 @@ def configure(project):
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
+    global RED_COMMENT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED
     checks = project.section("checks")
     REPO_SLUG, MAIN = project.repo, project.default_branch
@@ -649,6 +657,7 @@ def configure(project):
     MAIN_EVERY = checks.get("main", "needed") == "every"
     MAIN_RED_ISSUE = dict(checks["main_red_issue"]) \
         if "main_red_issue" in checks else None
+    RED_COMMENT = bool(checks.get("red_comment", False))
     # The configuration refuses fresh without depends.
     FRESH_WAIT = datetime.timedelta(minutes=checks["fresh"].get(
         "wait_minutes", DEFAULT_FRESH_MINUTES)) if "fresh" in checks else None
@@ -1354,6 +1363,46 @@ def red_text(sha, failed, commits, green):
               "it is green again; this issue is closed then.", "",
               signature()]
     return "\n".join(lines)
+
+
+def fence(text):
+    """A code fence longer than any run of backticks in text."""
+    runs = [len(r) for r in re.findall(r"`+", text)]
+    return "`" * max([3] + [n + 1 for n in runs])
+
+
+def red_comment_text(sha, failed):
+    """The comment a red pull request head gets (checks.red_comment):
+    which steps failed, and the end of each one's output, colour codes
+    removed and cut to RED_COMMENT_CHARS."""
+    lines = ["%s is red at %s%s: %s." % (
+        STATUS_CONTEXT, sha[:10], on_host(),
+        ", ".join(n for n, _ in failed) or "a step failed")]
+    for name, text in failed:
+        text = ANSI_RE.sub("", text).rstrip()
+        if len(text) > RED_COMMENT_CHARS:
+            text = "[…]\n" + text[-RED_COMMENT_CHARS:]
+        mark = fence(text)
+        lines += ["", "**%s**, the end of its output:" % name, "",
+                  mark, text, mark]
+    lines += ["", signature()]
+    return "\n".join(lines)
+
+
+def report_pr(state_dir, pr, sha, failed, write, out=print):
+    """checks.red_comment: comment once on pull request pr that its
+    head sha is red, quoting each failed step's tail. A write GitHub
+    refuses is logged REPORT-FAILED, not retried."""
+    when = now_utc()
+    got, body = write("POST", "/repos/%s/issues/%d/comments"
+                      % (REPO_SLUG, pr), {"body": red_comment_text(
+                          sha, failed)})
+    if got != 201:
+        log(state_dir, "REPORT-FAILED #%d %s: commenting: HTTP %s %s"
+            % (pr, sha[:10], got, (body or {}).get("message", "")),
+            when, out)
+        return
+    log(state_dir, "COMMENTED #%d: red at %s" % (pr, sha[:10]), when, out)
 
 
 def report_main(state_dir, repo, sha, ok, failed, same, write, out=print,
@@ -3485,6 +3534,9 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                    verdict_word(record),
                    (started - parse(seen)).total_seconds(),
                    record["seconds"]), finished, out)
+            if report is not None and not ok and not ahead:
+                report(sha, ok, [(r["name"], r.get("tail", ""))
+                                 for r in results if r["rc"] != 0], None)
             if ok and tracer is not None:
                 record_run(state_dir, wt, sha, checked,
                            tree_of(wt, checked, run), files, env, tracer,
@@ -3632,6 +3684,11 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
             write = make_writer(project, out)
             report = lambda sha, ok, failed, same: report_main(
                 state_dir, repo, sha, ok, failed, same, write, out, run)
+        elif RED_COMMENT and args.post and not args.main \
+                and not args.ahead and args.pr:
+            write = make_writer(project, out)
+            report = lambda sha, ok, failed, same: report_pr(
+                state_dir, args.pr, sha, failed, write, out)
         return worker(repo, state_dir, args.worker, args.pr, run, out,
                       post=post, chain=chain, slot=args.slot,
                       memory_max=memory_max_from_env(environ),
