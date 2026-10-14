@@ -388,6 +388,12 @@ class PullRequestRules(unittest.TestCase):
         d = decide_pr(pr_node(comments=[comment(LEADDEV, T3)]))
         self.assertTurn(d, "Reviewer", 8, T3)
 
+    def test_8_the_owners_later_review_is_the_event(self):
+        # A reviewer who waits for the owner's approval on a code-owned
+        # path was never woken by it.
+        d = decide_pr(pr_node(reviews=[review(OWNER, "APPROVED", T3)]))
+        self.assertTurn(d, "Reviewer", 8, T3)
+
     def test_8_falls_to_someone_not_an_agent(self):
         d = decide_pr(pr_node(author=OWNER))
         self.assertTurn(d, "Reviewer", 8)

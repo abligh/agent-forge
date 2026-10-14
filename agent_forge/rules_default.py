@@ -617,7 +617,11 @@ def route_pr(pr, roster, when=None):
         r.get("state") == "APPROVED" and covers_head(r, pr))]
     last = max((r["submittedAt"] for r in seen), default=None)
     if last is None or spoke > last:
-        return turn(n, reviewer, 8, max(status.get("createdAt") or "", spoke),
+        # The owner's review is an event too: a reviewer who waits for
+        # the owner's approval on a code-owned path is woken by it.
+        owned = last_by(reviews, {OWNER}, "submittedAt") if OWNER else ""
+        return turn(n, reviewer, 8, max(status.get("createdAt") or "", spoke,
+                                        owned),
                     "needs your review (green at %s)" % head[:7])
     return nobody(n, None, "no rule matched")
 
