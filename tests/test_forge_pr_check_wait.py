@@ -1,6 +1,7 @@
 """Tests for `checks.max_wait_minutes`: a pull request's head that has
-waited that long goes before every other pull request's, so priority
-(first_authors, the Merger's head, its predictions) can't starve it."""
+waited that long goes before every other pull request's but the
+Merger's own head, so priority (first_authors, the Merger's
+predictions) can't starve it."""
 
 import datetime
 import unittest
@@ -60,9 +61,16 @@ class MaxWaitOrder(unittest.TestCase):
     def test_an_overdue_head_goes_before_first_authors(self):
         self.assertEqual(pc.next_head(self.state(), when=T0), (SHA_A, 1))
 
-    def test_and_before_the_mergers_pull_request(self):
+    def test_but_not_before_the_mergers_pull_request(self):
+        # Ten heads waited, all overdue, and the Merger's (just updated
+        # onto main) went behind each: nothing merged for half an hour.
+        state = self.state()
+        del state["waiting"][SHA_B]["author"]
+        self.assertEqual(pc.next_head(state, first_pr=3, when=T0),
+                         (SHA_C, 3))
+        # first_authors still go before the Merger's, as without the cap.
         self.assertEqual(pc.next_head(self.state(), first_pr=3, when=T0),
-                         (SHA_A, 1))
+                         (SHA_B, 2))
 
     def test_otherwise_the_order_is_as_before(self):
         self.assertEqual(pc.next_head(self.state(), when=T0 - 15 * MINUTE),

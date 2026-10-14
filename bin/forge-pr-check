@@ -91,9 +91,12 @@ behind, and the default branch's traced run still goes first when due.
 
 **With `checks.max_wait_minutes`, no head waits on priority for ever**:
 a pull request's head that has waited that long goes before every
-other pull request's, the oldest first, the first_authors', the
-Merger's own head and its predictions included, and the `STARTED` line
-ends `, first: it has waited N minutes`. A head that failed to prepare
+other pull request's, the oldest first, the first_authors' and the
+Merger's predictions included, and the `STARTED` line ends `, first:
+it has waited N minutes`. While a head of the Merger's pull request is
+waiting, though, overdue heads go after it (and the first_authors'):
+nothing merges while it waits, so in a deep queue every head falls due
+and a cap ahead of it would stop merging until the queue drained. A head that failed to prepare
 is never overdue, and the default branch's traced run still goes first
 when due or urgent. Without it, a queue kept busy by the Merger's head
 and predictions could leave an ordinary head waiting for hours.
@@ -1087,9 +1090,11 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
         return sha, waiting[sha]["pr"]
     # checks.max_wait_minutes: a head that has waited that long goes
     # before every other pull request's, the oldest first, so priority
-    # can't starve it.
+    # can't starve it. Not before the Merger's pull request, though: it
+    # is one head in one slot, and while it waits nothing merges, so in
+    # a deep queue every head falls due and the cap would keep it last.
     late = [s for s in heads if overdue(waiting[s], when)]
-    if late:
+    if late and not mine:
         sha = min(late, key=lambda s: (waiting[s]["since"], s))
         return sha, waiting[sha]["pr"]
     # checks.first_authors go even before the Merger's pull request,
