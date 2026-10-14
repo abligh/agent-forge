@@ -966,6 +966,78 @@ class Check(unittest.TestCase):
         self.assertEqual(results[0]["tail"].splitlines()[0],
                          "line %d" % (100 - pc.TAIL_LINES))
 
+    def test_an_early_failure_line_is_kept_above_the_tail(self):
+        text = ("--- FAIL: TestX (0.00s)\n"
+                + "".join("line %d\n" % i for i in range(100)))
+        run = FakeRun((lambda a: True, done([], 1, text)))
+        _, results = pc.check(self.wt, {}, run)
+        self.assertEqual(results[0]["tail"].splitlines()[0],
+                         "--- FAIL: TestX (0.00s)")
+
+
+class Tail(unittest.TestCase):
+
+    def test_short_output_is_all_kept(self):
+        self.assertEqual(pc.tail("a\nb\n", lines=3), "a\nb")
+
+    def test_nothing_left_out_says_nothing_was(self):
+        self.assertEqual(pc.tail("--- FAIL: TestA\nx\ny\n", lines=2),
+                         "--- FAIL: TestA\nx\ny")
+
+    def test_no_failure_line_before_the_tail_keeps_only_the_tail(self):
+        text = "".join("line %d\n" % i for i in range(10))
+        self.assertEqual(pc.tail(text, lines=3), "line 7\nline 8\nline 9")
+
+    def test_a_go_test_failure_above_the_tail_is_kept(self):
+        # A package that logs much pushes the failed test's name and
+        # message out of the last TAIL_LINES lines.
+        text = ("=== RUN   TestOther\n"
+                "--- FAIL: TestAHoldExpires (0.02s)\n"
+                "    hold_test.go:88: got 2 attempts, want 1\n"
+                + "".join('time=x level=INFO msg="treatment_held" n=%d\n' % i
+                          for i in range(60))
+                + "FAIL\nFAIL\texample.com/pkg\t8.591s\n")
+        got = pc.tail(text).splitlines()
+        self.assertEqual(got[:3], [
+            "--- FAIL: TestAHoldExpires (0.02s)",
+            "    hold_test.go:88: got 2 attempts, want 1",
+            "[23 earlier lines left out]"])
+        self.assertEqual(got[3:], text.splitlines()[-pc.TAIL_LINES:])
+
+    def test_a_subtest_failure_and_a_panic_are_kept(self):
+        text = ("    --- FAIL: TestX/sub (0.00s)\n"
+                "panic: runtime error: index out of range\n"
+                "goroutine 7 [running]:\n"
+                + "".join("filler\n" for _ in range(5)))
+        self.assertEqual(pc.tail(text, lines=2).splitlines(), [
+            "    --- FAIL: TestX/sub (0.00s)",
+            "panic: runtime error: index out of range",
+            "[4 earlier lines left out]", "filler", "filler"])
+
+    def test_one_line_left_out_is_singular(self):
+        text = "--- FAIL: TestX (0.00s)\nnoise\na\nb\n"
+        self.assertEqual(pc.tail(text, lines=2).splitlines()[1],
+                         "[1 earlier line left out]")
+
+    def test_failure_lines_inside_the_tail_are_not_repeated(self):
+        text = "noise\n--- FAIL: TestX (0.00s)\nFAIL\n"
+        self.assertEqual(pc.tail(text, lines=2),
+                         "--- FAIL: TestX (0.00s)\nFAIL")
+
+    def test_failure_lines_are_capped_and_the_rest_counted(self):
+        text = ("".join("--- FAIL: Test%d (0.00s)\n" % i for i in range(5))
+                + "end\n")
+        self.assertEqual(pc.tail(text, lines=1, failures=2).splitlines(), [
+            "--- FAIL: Test0 (0.00s)", "--- FAIL: Test1 (0.00s)",
+            "[3 earlier lines left out, 3 of them naming a failure]",
+            "end"])
+
+    def test_lines_that_only_mention_a_failure_are_not_kept(self):
+        for line in ("ok  \tgithub.com/x/y\t0.1s", "FAIL",
+                     "msg=\"--- FAIL is a word here\"",
+                     "x.go:12: not a test file", "a panic: later"):
+            self.assertIsNone(pc.FAILURE_LINE.search(line), line)
+
 
 class StepEnv(unittest.TestCase):
 

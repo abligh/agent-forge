@@ -386,8 +386,11 @@ The state directory (`--state-dir`, default
 queue, and each verdict for KEEP), `verdicts.log` (one line per
 verdict, refusal and give-up), and `worker.log`, each worker's output:
 every step's exit status and time, and under a failed step its last
-TAIL_LINES lines, each prefixed `    | `. The status names the failed
-step and nothing more; why it failed is in `worker.log`.
+TAIL_LINES lines, each prefixed `    | `. Lines before those that name a
+failure (FAILURE_LINE: `go test`'s `--- FAIL` and `_test.go:N:` lines,
+and `panic:`) come first, up to FAILURE_LINES of them, so a test that
+failed early in a package's output is still named. The status names
+the failed step and nothing more; why it failed is in `worker.log`.
 
 The checkout is the cron checkout (`--checkout`, default
 `$FORGE_CRON_CHECKOUT`), kept at the default branch.
@@ -468,6 +471,11 @@ DEFAULT_CPU_WEIGHT = 1000
 CPU_WEIGHT = DEFAULT_CPU_WEIGHT
 # Lines of a failed step's output kept in worker.log.
 TAIL_LINES = 40
+# Lines before the tail that name a failure, kept above it: go test
+# prints a failed test's name and messages before the rest of its
+# package's output.
+FAILURE_LINE = re.compile(r"^\s*--- FAIL\b|_test\.go:\d+:|^panic: ")
+FAILURE_LINES = 40
 # Verdicts older than this are dropped from state.json.
 KEEP = datetime.timedelta(days=21)
 # Each run's CHECK_RESULTS directories, by head, in the state directory:
@@ -2045,8 +2053,24 @@ def memory_cap(memory_max, env, run=sh, out=print):
     return prefix
 
 
-def tail(text, lines=TAIL_LINES):
-    return "\n".join(text.rstrip("\n").splitlines()[-lines:])
+def tail(text, lines=TAIL_LINES, failures=FAILURE_LINES):
+    """The last `lines` lines of text, after the first `failures` of the
+    earlier lines that match FAILURE_LINE, with a line saying how many
+    lines were left out between them."""
+    every = text.rstrip("\n").splitlines()
+    before, last = every[:-lines], every[-lines:]
+    named = [line for line in before if FAILURE_LINE.search(line)]
+    if not named:
+        return "\n".join(last)
+    kept = named[:failures]
+    gone = len(before) - len(kept)
+    if not gone:
+        return "\n".join(kept + last)
+    return "\n".join(
+        kept + ["[%d earlier line%s left out%s]" % (
+            gone, "" if gone == 1 else "s", "" if len(kept) == len(named)
+            else ", %d of them naming a failure" % (len(named) - len(kept)))]
+        + last)
 
 
 def applicable(wt, steps=None, has=None):
