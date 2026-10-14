@@ -936,7 +936,8 @@ def blocked(issue):
 def owned_issues(agent, ctx):
     """(actionable, blocked, waiting): the agent's issues (`Owner:<Name>`)
     that it can act on, oldest first, and how many it can't, because
-    something they name is open, or they wait on someone, or its own
+    something they name is open, or they wait on someone or until a
+    `Defer-until:` time still to come, or its own
     open pull request already references them."""
     mine = ctx.roster.login_of(agent)
     in_hand = set()
@@ -950,8 +951,10 @@ def owned_issues(agent, ctx):
         labels = labels_of(issue)
         # Any waiting label, not only the two named in the offer: a
         # project's own, such as one for the backlog, is a wait too.
+        until = deferred_until(issue)
         if WAITING_OWNER in labels or WAITING_EXTERNAL in labels \
-                or any(l.startswith(WAITING_PREFIX) for l in labels):
+                or any(l.startswith(WAITING_PREFIX) for l in labels) \
+                or (until is not None and until > ctx.when):
             waiting += 1
         elif blocked(issue):
             held += 1

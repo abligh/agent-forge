@@ -232,6 +232,14 @@ class Actionable(unittest.TestCase):
             owned(30, labels=["Status:waiting-owner"]),
             owned(31, labels=["Status:waiting-external"])]), [])
 
+    def test_not_deferred_until_a_time_still_to_come(self):
+        # Defer-until on an issue is a timed wait: it was named as the
+        # owner's oldest item before its date.
+        self.assertEqual(self.offer([
+            owned(30, body="Defer-until: 2099-01-01\n")]), [])
+        self.assertEqual(len(self.offer([
+            owned(30, body="Defer-until: 2000-01-01\n")])), 1)
+
     def test_not_waiting_on_anything_else(self):
         # A parked item (Status:waiting-backlog) is a wait too: it was
         # offered as idle work.
