@@ -4,6 +4,7 @@ import fcntl
 import os
 import subprocess
 import unittest
+from unittest import mock
 
 from agent_forge import locks
 from tests.helpers import Repo, load_tool
@@ -140,6 +141,128 @@ class Install(unittest.TestCase):
     def test_no_checkout_is_2(self):
         self.assertEqual(tool.main(["--install", self.install], self.git,
                                    self.out.append, self.err.append, {}), 2)
+
+
+
+class Versions(Install):
+    """--versions (designs/0015): each release beside the last, and the
+    installation a symlink that moves between them."""
+
+    def main(self, *argv, wait="0"):
+        return super().main("--versions", *argv, wait=wait)
+
+    def release(self, sha):
+        return os.path.join(self.install + ".d", sha)
+
+    def test_a_new_pin_goes_beside_and_the_link_moves(self):
+        self.pin("%s v1\n" % self.v1)
+        self.assertEqual(self.main(), 0)
+        self.assertTrue(os.path.islink(self.install))
+        self.assertEqual(os.path.realpath(self.install),
+                         self.release(self.v1))
+        self.pin("%s v2\n" % self.v2)
+        self.assertEqual(self.main(), 0)
+        self.assertIn("INSTALLED", self.out[0])
+        self.assertEqual(os.path.realpath(self.install),
+                         self.release(self.v2))
+        self.assertEqual(self.head(), self.v2)
+        # The release a job may still run is left as it was.
+        self.assertEqual(self.r.git(self.release(self.v1), "rev-parse",
+                                    "HEAD").stdout.strip(), self.v1)
+        self.assertEqual(self.r.git(self.release(self.v2), "remote",
+                                    "get-url", "origin").stdout.strip(),
+                         self.url)
+        self.assertEqual(self.main(), 0)
+        self.assertIn("AT-PIN", self.out[0])
+
+    def test_a_running_job_is_not_waited_for(self):
+        self.pin("%s v1\n" % self.v1)
+        self.main()
+        self.pin("%s v2\n" % self.v2)
+        old = self.release(self.v1)
+        with open(locks.install_lock_path(old), "a") as job:
+            fcntl.flock(job, fcntl.LOCK_SH)
+            self.assertEqual(self.main(), 0)
+            self.assertEqual(self.head(), self.v2)
+            self.assertEqual(self.naps, [])
+            # Nothing is held off: there is no marker in this layout.
+            self.assertFalse(locks.install_wanted(self.install))
+            self.assertFalse(locks.install_wanted(old))
+            with mock.patch.object(tool, "RETIRE_AFTER_S", 0):
+                self.main()
+            self.assertTrue(os.path.isdir(old), "pruned under its job")
+        with mock.patch.object(tool, "RETIRE_AFTER_S", 0):
+            self.assertEqual(self.main(), 0)
+        self.assertIn("deleted %s" % self.v1[:12], self.out[0])
+        self.assertFalse(os.path.exists(old))
+        self.assertFalse(os.path.exists(old + ".retired"))
+        self.assertTrue(os.path.isdir(self.release(self.v2)))
+
+    def test_a_retired_release_is_kept_for_a_while(self):
+        self.pin("%s v1\n" % self.v1)
+        self.main()
+        self.pin("%s v2\n" % self.v2)
+        self.main()
+        self.main()
+        self.assertTrue(os.path.isdir(self.release(self.v1)))
+
+    def test_a_directory_is_moved_once_the_old_way(self):
+        self.pin("%s v1\n" % self.v1)
+        self.assertEqual(super().main(), 0)
+        self.assertFalse(os.path.islink(self.install))
+        self.pin("%s v2\n" % self.v2)
+        with open(locks.install_lock_path(self.install), "a") as job:
+            fcntl.flock(job, fcntl.LOCK_SH)
+            self.assertEqual(self.main(), 1)
+            self.assertTrue(locks.install_wanted(self.install))
+            self.assertFalse(os.path.islink(self.install))
+        self.assertEqual(self.main(), 0)
+        self.assertIn("moved into", self.out[0])
+        self.assertTrue(os.path.islink(self.install))
+        self.assertEqual(self.head(), self.v2)
+        self.assertTrue(os.path.isdir(self.release(self.v1)))
+        self.assertFalse(locks.install_wanted(self.install))
+
+    def test_without_versions_a_symlink_is_refused(self):
+        self.pin("%s v1\n" % self.v1)
+        self.main()
+        self.pin("%s v2\n" % self.v2)
+        self.assertEqual(super().main(), 2)
+        self.assertIn("VERSIONED", self.err[0])
+        self.assertEqual(self.head(), self.v1)
+
+    def test_a_failed_clone_leaves_the_link_where_it_was(self):
+        self.pin("%s v1\n" % self.v1)
+        self.main()
+        self.pin("%s v9\n" % ("1" * 40))
+        self.assertEqual(self.main(), 1)
+        self.assertEqual(os.path.realpath(self.install),
+                         self.release(self.v1))
+        self.assertFalse(os.path.exists(self.release("1" * 40) + ".new"))
+
+    def test_the_installation_is_the_link_from_inside_a_release(self):
+        self.pin("%s v1\n" % self.v1)
+        self.main()
+        here = os.path.join(self.release(self.v1), "bin")
+        with mock.patch.object(tool, "HERE", here):
+            self.assertEqual(tool.default_install(), self.install)
+        with mock.patch.object(tool, "HERE", os.path.join(self.r.dir, "x",
+                                                          "bin")):
+            self.assertEqual(tool.default_install(),
+                             os.path.join(self.r.dir, "x"))
+
+    # Inherited tests that describe the in-place layout.
+    test_a_running_job_is_waited_for_and_new_ones_are_held_off = None
+
+    def test_dry_run_changes_nothing(self):
+        self.pin("%s v1\n" % self.v1)
+        self.assertEqual(self.main("--dry-run"), 0)
+        self.assertFalse(os.path.lexists(self.install))
+        self.main()
+        self.pin("%s v2\n" % self.v2)
+        self.assertEqual(self.main("--dry-run"), 0)
+        self.assertIn("WOULD-INSTALL", self.out[0])
+        self.assertEqual(self.head(), self.v1)
 
 
 if __name__ == "__main__":

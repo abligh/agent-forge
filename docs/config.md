@@ -591,6 +591,19 @@ never a tag. It refuses an installation with local changes or another
 * A marker over an hour old was left by an installer that died, and is
   ignored.
 
+With `--versions` it never waits ([designs/0015](designs/0015-install-beside-never-under.md)).
+The installation is a symlink to `<install>.d/<sha>`, one clean clone
+per release, and a new release is cloned beside the running one and the
+symlink renamed over to it. Jobs that start afterwards run the new
+release; running jobs keep theirs, and `forge-cron-run` puts the job's
+own release first in `PATH` so that what it runs by name comes from the
+same release. A release that is no longer current is deleted once it
+has been retired for ten minutes and no job holds its lock. The first
+`--versions` run on an installation that is still a directory moves it
+into this layout once, waiting for jobs as above. Since nothing waits,
+it can run every minute; a run with nothing to do reads only the pin
+and the symlink.
+
 ## Where state lives
 
 Each tool keeps its state in

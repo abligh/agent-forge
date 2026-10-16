@@ -1624,7 +1624,7 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
     # the worker, which outlives it: the release can't move under a run.
     held = locks.inherited_install_lock()
     subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "--worker", sha,
+        [sys.executable, os.path.realpath(__file__), "--worker", sha,
          "--pr", str(pr), "--state-dir", state_dir, "--slot", str(slot)]
         + (["--checkout", checkout] if checkout else [])
         + (["--post"] if posting else [])

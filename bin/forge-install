@@ -2,6 +2,7 @@
 """Keep this agent-forge installation at the commit a project pins.
 
     forge-install [--checkout DIR] [--install DIR] [--wait SECONDS]
+                  [--versions]
     forge-install --dry-run
 
 `forge-cron-run` runs a tool only when the installation it runs from is
@@ -27,6 +28,18 @@ whose checks never all stop at once. It waits up to `--wait` seconds
 and the next run waits again. The marker is removed once the
 installation is moved, and one older than an hour (an installer that
 died) is ignored.
+
+**With `--versions`, a release goes beside the running one, never under
+it** (docs/designs/0015). The installation is then a symlink to
+`<install>.d/<sha>`, one clean clone per release. A new release is
+cloned there from the current one, and the symlink is renamed over to
+it: nothing waits, a job that starts afterwards runs the new release,
+and one already running keeps its own (each holds `<release>.lock`
+shared, as above). A release that is no longer current is retired, and
+deleted once it has been retired for RETIRE_AFTER_S and no job holds
+its lock. The first `--versions` run on an installation that is a
+directory moves it into this layout once, the old way: the marker,
+then the wait for running jobs.
 
 **It refuses rather than guesses.** An installation whose `origin`
 isn't `--url`, or that has local changes, or a pin that isn't a full
@@ -57,6 +70,13 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_URL = "https://github.com/abligh/agent-forge.git"
 PIN_NAME = os.path.join(config.CONFIG_DIR, "pin")
 GIT_TIMEOUT_S = 120
+# Releases live in <install> + VERSIONS_SUFFIX with --versions.
+VERSIONS_SUFFIX = ".d"
+# How long a retired release is kept before it may be deleted, at least,
+# so that a job which resolved it just before the switch, and is waiting
+# for its other locks (FORGE_CRON_LOCK_WAIT_S, 300 by default), has
+# taken that release's lock by then.
+RETIRE_AFTER_S = 600
 
 
 class Refused(Exception):
@@ -186,6 +206,10 @@ def drained(install, wait, clock=time.monotonic, nap=time.sleep):
 def install_pin(install, url, pin, wait, run=git, dry_run=False,
                 clock=time.monotonic, nap=time.sleep):
     """Bring `install` to `pin`; the line that says what was done."""
+    if os.path.islink(install):
+        # Checking out in place would change a release under its jobs.
+        raise Refused("VERSIONED: %s is a symlink to a release; run with "
+                      "--versions" % install)
     fresh = not os.path.exists(install)
     if not fresh:
         check_clone(install, url, run)
@@ -214,6 +238,177 @@ def install_pin(install, url, pin, wait, run=git, dry_run=False,
     return "INSTALLED: %s from %s to %s" % (install, was[:12], pin[:12])
 
 
+def default_install():
+    """The installation this tool belongs to: the symlink, when it runs
+    from a release in `<install>.d`, else its own directory."""
+    here = os.path.dirname(HERE)
+    parent = os.path.dirname(here)
+    if parent.endswith(VERSIONS_SUFFIX):
+        link = parent[:-len(VERSIONS_SUFFIX)]
+        if os.path.islink(link):
+            return link
+    return here
+
+
+def versions_dir(install):
+    return install.rstrip("/") + VERSIONS_SUFFIX
+
+
+def point_at(install, release):
+    """Make `install` a symlink to `release`, in one rename: a job sees
+    the old release or the new one, never neither."""
+    link = install.rstrip("/") + ".new-link"
+    if os.path.lexists(link):
+        os.unlink(link)
+    os.symlink(os.path.relpath(release, os.path.dirname(install)), link)
+    os.replace(link, install)
+
+
+def retire(release, now=time.time):
+    with open(release + ".retired", "w") as handle:
+        handle.write("%d\n" % now())
+
+
+def make_release(install, url, pin, source, run=git):
+    """`<install>.d/<pin>`, a clean clone at the pin: kept if it already
+    is one, else cloned beside as `.new` (from `source`, the current
+    release, when there is one, so its objects are hard links) and
+    renamed into place once it is at the pin."""
+    target = os.path.join(versions_dir(install), pin)
+    if os.path.isdir(target):
+        try:
+            check_clone(target, url, run)
+            if head(target, run) == pin:
+                return target
+        except (Refused, Failed):
+            pass
+        # Never current (the current release is not at the pin), so no
+        # job runs it: a leftover, made again.
+        shutil.rmtree(target, ignore_errors=True)
+    os.makedirs(versions_dir(install), exist_ok=True)
+    temp = target + ".new"
+    shutil.rmtree(temp, ignore_errors=True)
+    got = run(["clone", "-q", "--no-checkout", source or url, temp])
+    if got.returncode != 0:
+        shutil.rmtree(temp, ignore_errors=True)
+        raise Failed("git clone %s: %s" % (source or url, got.stderr.strip()))
+    try:
+        if source:
+            got = run(["-C", temp, "remote", "set-url", "origin", url])
+            if got.returncode != 0:
+                raise Failed("git remote set-url: %s" % got.stderr.strip())
+        fetch_pin(temp, url, pin, run)
+        checkout(temp, pin, run)
+        os.rename(temp, target)
+    except (Failed, OSError):
+        shutil.rmtree(temp, ignore_errors=True)
+        raise
+    return target
+
+
+def prune(install, now=time.time):
+    """Delete each retired release of `install` that has been retired for
+    RETIRE_AFTER_S and whose lock no job holds; the names deleted. A
+    release that isn't current and has no retirement time (one made
+    by a run that died before switching) is retired now."""
+    root = versions_dir(install)
+    current = os.path.realpath(install)
+    gone = []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return gone
+    for name in names:
+        release = os.path.join(root, name)
+        if (not SHA_RE.match(name) or not os.path.isdir(release)
+                or os.path.realpath(release) == current):
+            continue
+        try:
+            with open(release + ".retired") as handle:
+                since = float(handle.read().split()[0])
+        except (OSError, ValueError, IndexError):
+            retire(release, now)
+            continue
+        if now() - since < RETIRE_AFTER_S:
+            continue
+        handle = open(locks.install_lock_path(release), "a")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            continue
+        with handle:
+            shutil.rmtree(release, ignore_errors=True)
+            for leftover in (release + ".retired",
+                             locks.install_lock_path(release)):
+                if os.path.exists(leftover):
+                    os.unlink(leftover)
+        gone.append(name[:12])
+    return gone
+
+
+def move_into_versions(install, url, wait, run=git, clock=time.monotonic,
+                       nap=time.sleep):
+    """Make the directory `install` the first release of the versioned
+    layout, once, under its lock as an in-place install would be; the
+    release it became."""
+    check_clone(install, url, run)
+    was = head(install, run)
+    if not SHA_RE.match(was):
+        raise Failed("%s has no commit to name its release by" % install)
+    held = drained(install, wait, clock, nap)
+    if held is None:
+        raise Failed("jobs still hold %s after %gs (new ones are held off; "
+                     "the next run waits again)"
+                     % (locks.install_lock_path(install), wait))
+    with held:
+        os.makedirs(versions_dir(install), exist_ok=True)
+        release = os.path.join(versions_dir(install), was)
+        if os.path.exists(release):
+            shutil.rmtree(release)
+        os.rename(install, release)
+        point_at(install, release)
+        os.unlink(locks.install_wanted_path(install))
+    return release
+
+
+def install_versions(install, url, pin, wait, run=git, dry_run=False,
+                     clock=time.monotonic, nap=time.sleep, now=time.time):
+    """--versions: bring `install` to `pin` beside the running release;
+    the line that says what was done."""
+    moved = ""
+    if os.path.isdir(install) and not os.path.islink(install):
+        if dry_run:
+            return ("WOULD-MOVE: %s into %s, then install %s beside it"
+                    % (install, versions_dir(install), pin[:12]))
+        move_into_versions(install, url, wait, run, clock, nap)
+        moved = " (moved into %s first)" % versions_dir(install)
+    current = os.path.realpath(install) if os.path.lexists(install) else None
+    if current and not os.path.isdir(current):
+        raise Refused("BROKEN: %s points at %s, which isn't there"
+                      % (install, current))
+    if os.path.exists(locks.install_wanted_path(install)):
+        os.unlink(locks.install_wanted_path(install))
+    if current:
+        check_clone(current, url, run)
+        was = head(current, run)
+        if was == pin:
+            line = "AT-PIN: %s is at %s%s" % (install, pin[:12], moved)
+            gone = [] if dry_run else prune(install, now)
+            return line + ("; deleted %s" % ", ".join(gone) if gone else "")
+    if dry_run:
+        return "WOULD-INSTALL: %s from %s to %s beside it" % (
+            install, was[:12] if current else "nothing", pin[:12])
+    release = make_release(install, url, pin, current, run)
+    point_at(install, release)
+    if current:
+        retire(current, now)
+    gone = prune(install, now)
+    return ("INSTALLED: %s from %s to %s, beside it%s%s"
+            % (install, was[:12] if current else "nothing", pin[:12], moved,
+               "; deleted %s" % ", ".join(gone) if gone else ""))
+
+
 def main(argv=None, run=git, out=print, err=None, environ=None,
          clock=time.monotonic, nap=time.sleep):
     environ = os.environ if environ is None else environ
@@ -223,7 +418,7 @@ def main(argv=None, run=git, out=print, err=None, environ=None,
     parser.add_argument("--checkout", default=environ.get(
         "FORGE_CRON_CHECKOUT"), help="the project's cron checkout, whose "
         "pin is followed (default $FORGE_CRON_CHECKOUT)")
-    parser.add_argument("--install", default=os.path.dirname(HERE),
+    parser.add_argument("--install", default=default_install(),
                         help="the installation to move (default this one)")
     parser.add_argument("--url", default=DEFAULT_URL,
                         help="where agent-forge is cloned from "
@@ -231,6 +426,10 @@ def main(argv=None, run=git, out=print, err=None, environ=None,
     parser.add_argument("--wait", type=float, default=240,
                         help="seconds to wait for running jobs to finish "
                         "(default %(default)s)")
+    parser.add_argument("--versions", action="store_true",
+                        help="install each release beside the running one "
+                        "and switch a symlink, never waiting for jobs "
+                        "(docs/designs/0015)")
     parser.add_argument("--dry-run", action="store_true",
                         help="say what would be done, change nothing")
     args = parser.parse_args(argv)
@@ -238,15 +437,16 @@ def main(argv=None, run=git, out=print, err=None, environ=None,
         err("forge-install: no --checkout, and FORGE_CRON_CHECKOUT is not "
             "set")
         return 2
-    install = os.path.abspath(os.path.expanduser(args.install))
+    install = os.path.abspath(os.path.expanduser(args.install)).rstrip("/")
     try:
         pin = read_pin(os.path.expanduser(args.checkout))
         if pin is None:
             out("NO-PIN: %s has no %s; nothing to install"
                 % (args.checkout, PIN_NAME))
             return 0
-        out(install_pin(install, args.url, pin, args.wait, run, args.dry_run,
-                        clock, nap))
+        do = install_versions if args.versions else install_pin
+        out(do(install, args.url, pin, args.wait, run, args.dry_run,
+               clock, nap))
         return 0
     except Refused as why:
         err("forge-install: %s" % why)

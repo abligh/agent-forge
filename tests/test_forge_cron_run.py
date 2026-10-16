@@ -86,11 +86,14 @@ class CronRun(unittest.TestCase):
         self.assertIn("token=none\n", log)
         self.assertTrue(log.rstrip().endswith("exit=0"))
 
-    def test_path_is_the_hosts_toolchains_then_the_system(self):
+    def test_path_is_this_release_the_hosts_toolchains_then_the_system(self):
         self.run_tool("report")
         path = [l for l in self.log().splitlines()
                 if l.startswith("path=")][0][5:].split(":")
-        self.assertEqual(path[0], "/opt/tool/bin")
+        # A tool a job runs by name comes from the release the job
+        # started on (designs/0015), not through a symlink that moves.
+        self.assertEqual(path[0], tool.HERE)
+        self.assertEqual(path[1], "/opt/tool/bin")
         self.assertEqual(path[-3:], ["/usr/local/bin", "/usr/bin", "/bin"])
 
     def test_local_edits_are_reset(self):

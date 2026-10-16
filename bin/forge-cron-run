@@ -10,7 +10,8 @@ Why a wrapper rather than calling the tool from the crontab:
   person's working copy, which sits on whatever branch they last chose)
   to `origin/<default branch>` before the run.
 * **cron's environment is not a login shell.** PATH is set here, in the
-  one wrapper every job goes through: `$FORGE_CRON_PATH` (a host's
+  one wrapper every job goes through: this release's own `bin`, then
+  `$FORGE_CRON_PATH` (a host's
   toolchains, first so they win), then ~/.local/bin and the system
   directories. The caller's PATH is discarded, so a job resolves the
   same binaries whatever fired it.
@@ -120,7 +121,12 @@ def cron_env(environ):
     """The environment every job runs with."""
     env = dict(environ)
     home = env.get("HOME") or os.path.expanduser("~")
-    parts = [p for p in env.get("FORGE_CRON_PATH", "").split(":") if p]
+    # This release's own tools first: a tool a job runs by name (a
+    # gate's forge-commit-identity) must come from the release the job
+    # started on, not through ~/.local/bin and the installation's
+    # symlink, which forge-install --versions may move meanwhile.
+    parts = [HERE]
+    parts += [p for p in env.get("FORGE_CRON_PATH", "").split(":") if p]
     parts += [os.path.join(home, ".local", "bin"), "/usr/local/bin",
               "/usr/bin", "/bin"]
     env["HOME"] = home

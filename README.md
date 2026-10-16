@@ -85,12 +85,15 @@ the full commit SHA it approved, optionally followed by the tag.
 `forge-cron-run` then runs nothing while the installation's `HEAD` is
 any other commit ([docs/config.md](docs/config.md#the-pin)). A tag can
 be moved; a commit can't. `forge-install`, run from cron every few
-minutes, moves the installation to the pin once it changes, between
-jobs:
+minutes, moves the installation to the pin once it changes. With
+`--versions` it installs the new release beside the running one and
+switches a symlink, so no job is waited for and none is held off:
 
 ```sh
-*/5 * * * * FORGE_CRON_CHECKOUT=$HOME/my-project-cron $HOME/.local/share/agent-forge/bin/forge-install
+* * * * * FORGE_CRON_CHECKOUT=$HOME/my-project-cron $HOME/.local/share/agent-forge/bin/forge-install --versions
 ```
+
+Without it, the installation is moved in place, between jobs.
 
 ## Tests
 
