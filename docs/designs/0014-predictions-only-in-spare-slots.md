@@ -1,6 +1,6 @@
 # 0014: The Merger's predictions only in spare slots
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-12, https://github.com/abligh/agent-forge/issues/22#issuecomment-6132254794)
 * Implemented: v0.4.43, off until configured.
 * Author: XMPPEngineer
 * Date: 2026-10-12
