@@ -1,6 +1,7 @@
 # 0015: Install a new release beside the running one, never under it
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-16, https://github.com/abligh/agent-forge/issues/24#issuecomment-6210941989)
+* Implemented: v0.4.66, off until a host runs `forge-install --versions`.
 * Author: XMPPEngineer
 * Date: 2026-10-16
 
