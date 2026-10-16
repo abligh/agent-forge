@@ -1,8 +1,9 @@
 # 0017: Idle with a background task still running
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-16, in XMPPEngineer's session, recorded at
+  https://github.com/abligh/agent-forge/issues/26#issuecomment-6226988236)
 * Author: XMPPEngineer
-* Date: 2026-10-17
+* Date: 2026-10-16
 
 ## Summary
 
