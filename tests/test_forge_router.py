@@ -343,8 +343,15 @@ class PullRequestRules(unittest.TestCase):
 
     def test_6_not_when_something_was_said_since(self):
         d = decide_pr(pr_node(reviews=[review(REVIEWER, "APPROVED", T1)],
-                              comments=[comment(LEADDEV, T2, "thanks")]))
+                              comments=[comment("shelldevwidgetagent[bot]", T2,
+                                                "why this?")]))
         self.assertTurn(d, "Reviewer", 8, T2)
+
+    def test_6_the_authors_thanks_since_is_not_a_hold(self):
+        # As the Merger reads it: an author who wants it held drafts it.
+        self.assertNobody(decide_pr(pr_node(
+            reviews=[review(REVIEWER, "APPROVED", T1)],
+            comments=[comment(LEADDEV, T2, "thanks")])), 6)
 
     def test_6_an_approval_covers_the_head_through_merges(self):
         # The Merger's update-branch merges of main after the approval.
@@ -401,12 +408,15 @@ class PullRequestRules(unittest.TestCase):
                               statuses=[status("FAILURE")]))
         self.assertTurn(d, OWNER, 4)
 
-    def test_no_rule(self):
-        # Green, Reviewer approved, then someone else spoke after it: not
-        # quiet (6), but Reviewer has reviewed since the push (8).
+    def test_8_a_remark_after_the_approval_is_the_approvers(self):
+        # Green, Reviewer approved, then someone else spoke after it. The
+        # Merger holds it until a newer approval, and this used to match
+        # no rule, so nobody was told: an approved, green pull request
+        # sat for hours.
         d = decide_pr(pr_node(reviews=[review(REVIEWER, "APPROVED", T1)],
                               comments=[comment("someone", T2)]))
-        self.assertNobody(d, None)
+        self.assertTurn(d, "Reviewer", 8, T2)
+        self.assertIn("approve again", d["line"])
 
 
 def blockers_page(**found):

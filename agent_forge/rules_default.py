@@ -69,9 +69,13 @@ Then:
    configuration, not anyone's turn);
 8. green, and a request for changes stands that the author has
    answered: the reviewer's who asked, to review again (nobody's when
-   the owner asked). Otherwise green, and no reviewer has reviewed it:
-   no reviewer's review at the head (or approval covering it), or an
-   author comment after the newest one: the pull request's reviewer's.
+   the owner asked). Or green, a reviewer's newest review is an
+   approval covering the head, and someone other than the author said
+   something after it that holds it (`forge-merger`'s test again): the
+   approver's, to approve again or answer it. Otherwise green, and no
+   reviewer has reviewed it: no reviewer's review at the head (or
+   approval covering it), or an author comment after the newest one:
+   the pull request's reviewer's.
 
 **A reviewer** is an agent the configuration marks `"kind":
 "reviewer"`. **A pull request's reviewer** is the one, other than its
@@ -613,6 +617,18 @@ def route_pr(pr, roster, when=None):
                     "needs your review again: you asked for changes "
                     "(review %s), green at %s" % (request.get("databaseId"),
                                                   head[:7]))
+    # Someone other than the author spoke after the approval: the Merger
+    # holds it until a newer approval, so it is the approver's to read.
+    if (newest is not None and newest.get("state") == "APPROVED"
+            and covers_head(newest, pr)):
+        said = merger.said_since(dict(pr, reviews=reviews,
+                                      comments=comments), newest)
+        if said:
+            who, at, kind = said[-1]
+            return turn(n, roster.who(author_of(newest)), 8, at,
+                        "%s's %s came after your approval, so the Merger "
+                        "holds it: approve again if nothing needs to change"
+                        % (roster.who(who), kind))
     seen = [r for r in theirs if at_head(r, pr) or (
         r.get("state") == "APPROVED" and covers_head(r, pr))]
     last = max((r["submittedAt"] for r in seen), default=None)

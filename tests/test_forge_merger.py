@@ -167,14 +167,20 @@ class SaidSince(unittest.TestCase):
     def test_nothing_after_the_approval(self):
         self.assertEqual(self.said([comment(AUTHOR, at=T0)]), [])
 
-    def test_the_authors_thanks_counts(self):
-        # A hold carries no marker, so nothing said after an approval
-        # can be read as harmless.
-        self.assertEqual(self.said([comment(AUTHOR, at=T2)]),
-                         [(AUTHOR, T2, "comment")])
+    def test_the_author_is_quiet(self):
+        # An author who wants it held makes it a draft. Their notes
+        # after the approval held approved pull requests for hours.
+        self.assertEqual(self.said([comment(AUTHOR, at=T2)]), [])
+        self.assertEqual(self.said([comment(AUTHOR + "[bot]", at=T2)]), [])
+        self.assertEqual(self.said(reviews=[review(AUTHOR, "COMMENTED",
+                                                   at=T2)]), [])
+
+    def test_someone_elses_comment_counts(self):
+        self.assertEqual(self.said([comment(PEER, at=T2)]),
+                         [(PEER, T2, "comment")])
 
     def test_a_comment_at_the_same_second_does_not_count(self):
-        self.assertEqual(self.said([comment(AUTHOR, at=T1)]), [])
+        self.assertEqual(self.said([comment(PEER, at=T1)]), [])
 
     def test_a_bare_later_approval_is_not_said(self):
         # A code owner's approval after Reviewer's is assent, not a hold.
@@ -182,15 +188,18 @@ class SaidSince(unittest.TestCase):
         self.assertEqual(self.said(reviews=[review(PEER, at=T2, body=" \n")]),
                          [])
 
-    def test_a_later_approval_with_text_counts(self):
+    def test_a_later_approval_with_text_is_not_said(self):
+        # An owner's sign-off for their part, with notes, is assent: it
+        # held a pull request for five hours. Second thoughts request
+        # changes instead.
         self.assertEqual(self.said(reviews=[review(PEER, at=T2,
                                                    body="nit: rename x")]),
-                         [(PEER, T2, "review")])
+                         [])
 
-    def test_a_later_approval_with_line_comments_counts(self):
+    def test_a_later_approval_with_line_comments_is_not_said(self):
         r = review(PEER, at=T2)
         r["comments"] = {"totalCount": 2}
-        self.assertEqual(self.said(reviews=[r]), [(PEER, T2, "review")])
+        self.assertEqual(self.said(reviews=[r]), [])
 
     def test_a_bare_later_comment_review_counts(self):
         self.assertEqual(self.said(reviews=[review(PEER, "COMMENTED", at=T2)]),
@@ -216,8 +225,8 @@ class SaidSince(unittest.TestCase):
         self.assertEqual(self.said([ghost]), [("ghost", T2, "comment")])
 
     def test_sorted_oldest_first(self):
-        got = self.said([comment(AUTHOR, at=T3), comment(PEER, at=T2)])
-        self.assertEqual([s[0] for s in got], [PEER, AUTHOR])
+        got = self.said([comment(REVIEWER, at=T3), comment(PEER, at=T2)])
+        self.assertEqual([s[0] for s in got], [PEER, REVIEWER])
 
 
 class Eligible(unittest.TestCase):
@@ -237,8 +246,8 @@ class Eligible(unittest.TestCase):
         self.assertHeld(pr(base="x"), set(), "based on x")
         self.assertHeld(pr(reviews=[review(PEER)]), set(),
                         "no Reviewer approval")
-        self.assertHeld(pr(comments=[comment(AUTHOR)]), set(),
-                        "comment by %s at %s" % (AUTHOR, T2))
+        self.assertHeld(pr(comments=[comment(PEER)]), set(),
+                        "comment by %s at %s" % (PEER, T2))
         self.assertHeld(pr(body="Blocked-by: #7"), {7}, "Blocked-by: #7")
 
     def test_a_standing_request_for_changes_holds_it(self):
@@ -1200,17 +1209,63 @@ class Tick(Decide):
         self.assertIn("7", record["held"])
 
     def test_records_the_queue_the_action_and_the_held(self):
-        held = pr(7, T0, comments=[comment(AUTHOR)])
+        held = pr(7, T0, comments=[comment(PEER)])
         record, lines = self.tick([self.item(), held, pr(8, T0, reviews=[])])
         self.assertEqual(record["queue"], [5])
         self.assertEqual(record["held"], {"7": "comment by %s at %s, after "
-                                          "the approval" % (AUTHOR, T2)})
+                                          "the approval" % (PEER, T2)})
+        self.assertEqual(record["spoken"], [
+            {"pr": 7, "approved": T1, "said": T2}])
         self.assertEqual(record["decisions"], [
             {"action": "MERGE", "pr": 5, "head": self.head}])
         self.assertEqual(record["at"], "2026-10-07T12:00:00Z")
         self.assertEqual(record["main"], self.repo.main_tip())
         self.assertEqual(lines, ["DRY-RUN 1 eligible, 1 approved but held; "
                                  "#5 MERGE"])
+
+    # A hold for a remark after the approval is said, once.
+
+    def spoken_writes(self):
+        return [f for _, path, f in self.github.writes
+                if path == SLUG + "/issues/7/comments"]
+
+    def test_a_hold_for_a_remark_is_said_once_to_the_approver(self):
+        # Approved, green pull requests sat for hours, held
+        # by a remark nobody knew was holding them.
+        held = pr(7, T0, comments=[comment(PEER)])
+        record, _ = self.tick([held], live=True)
+        self.assertEqual(record["spoken"][0]["result"], "done")
+        [said] = self.spoken_writes()
+        body = said["body"]
+        self.assertTrue(body.startswith("Not-a-review\n"))
+        self.assertIn("%s's comment at %s came after" % (PEER, T2), body)
+        self.assertIn("please approve again", body)
+        self.assertTrue(body.endswith("— Merger"))
+        record, _ = self.tick([held], live=True)
+        self.assertEqual(record["spoken"][0]["result"], "already said")
+        self.assertEqual(self.spoken_writes(), [])
+
+    def test_a_new_remark_or_approval_is_said_again(self):
+        self.tick([pr(7, T0, comments=[comment(PEER)])], live=True)
+        record, _ = self.tick([pr(7, T0, comments=[comment(PEER),
+                                                    comment(PEER, at=T3)])],
+                              live=True)
+        self.assertEqual(record["spoken"][0]["result"], "already said")
+        record, _ = self.tick([pr(7, T0, reviews=[review(REVIEWER, at=T2)],
+                                  comments=[comment(PEER, at=T3)])],
+                              live=True)
+        self.assertEqual(record["spoken"][0],
+                         {"pr": 7, "approved": T2, "said": T3,
+                          "result": "done"})
+
+    def test_a_draft_or_a_released_hold_says_nothing(self):
+        record, _ = self.tick([pr(7, T0, draft=True,
+                                  comments=[comment(PEER)])], live=True)
+        self.assertEqual(self.spoken_writes(), [])
+        record, _ = self.tick([pr(7, T0, comments=[comment(AUTHOR)])],
+                              live=True)
+        self.assertFalse(record.get("spoken"))
+        self.assertEqual(self.spoken_writes(), [])
 
     def test_an_open_issue_named_as_a_blocker_holds(self):
         record, _ = self.tick([pr(5, body="Blocked-by: #40")], issues=[40])

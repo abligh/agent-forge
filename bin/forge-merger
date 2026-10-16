@@ -117,11 +117,14 @@ only points; it never lets a head through.
 
 **What "nobody has spoken" means.** No comment or review after the
 approval, except one carrying `Not-a-review` in the same text, one by
-the Merger's own App (`QUIET_LOGINS`), or a bare approval: an `APPROVED`
-review with no text and no line comments, such as the owner's
-code-owner approval. A plain hold carries no marker, so anything else
-said after the approval makes the pull request its reviewer's again,
-until a newer approval.
+the Merger's own App (`QUIET_LOGINS`), one by the pull request's
+author, or an approval: an `APPROVED` review, whatever it says, such as
+an owner's sign-off for their part. An author who wants it held makes
+it a draft, and a reviewer who has second thoughts requests changes.
+Anything else said after the approval makes the pull request its
+reviewer's again, until a newer approval. The Merger says so on the
+pull request, once per approval and remark (`HELD_FILE`), so the
+approver knows the hold is theirs to lift.
 
 **A standing request for changes holds it.** A reviewer's (or the
 owner's) newest verdict, `APPROVED`, `CHANGES_REQUESTED` or
@@ -405,6 +408,8 @@ IN_FLIGHT = ("UPDATE", "WAIT")
 HOLD_CONFLICTING = False
 HOLD_REASON = "conflicts with #%d, ahead of it in the queue"
 HOLD_FILE = "held-conflicting.json"
+# Which holds for a remark after the approval were said, per pull request.
+HELD_FILE = "held-said.json"
 # merge.yield_after_hand_back: places a lately handed-back pull request
 # yields per hand-back (0: off), counting at most YIELD_CAP of them
 # within YIELD_WINDOW.
@@ -591,9 +596,11 @@ def changes_requested(pr, changers=None):
 
 def said_since(pr, approval):
     """Comments and reviews after `approval`, as (login, time, kind),
-    less those marked `Not-a-review`, those by QUIET_LOGINS and bare
-    approvals. Empty means nothing has been said since."""
+    less those marked `Not-a-review`, those by QUIET_LOGINS, those by
+    the pull request's author and approvals. Empty means nothing has
+    been said since."""
     at = approval["submittedAt"]
+    author = login(pr)
     said = []
     for kind, items, stamp in (("review", pr["reviews"], "submittedAt"),
                                ("comment", pr["comments"], "createdAt")):
@@ -601,24 +608,17 @@ def said_since(pr, approval):
             when = item.get(stamp) or ""
             if item is approval or when <= at:
                 continue
-            if login(item) in QUIET_LOGINS:
+            who = login(item)
+            if who in QUIET_LOGINS or (author and who == author):
                 continue
             if NOT_A_REVIEW_RE.search(markers_of(item.get("body"))):
                 continue
-            if kind == "review" and is_bare_approval(item):
+            if kind == "review" and item.get("state") == "APPROVED":
+                # Assent, whatever its text: a reviewer with second
+                # thoughts requests changes instead.
                 continue
-            said.append((login(item) or "ghost", when, kind))
+            said.append((who or "ghost", when, kind))
     return sorted(said, key=lambda s: s[1])
-
-
-def is_bare_approval(review):
-    """An `APPROVED` review with no text and no line comments: assent,
-    such as a code owner's approval after Reviewer's, which says nothing
-    to act on. One with any text, or any line comment, still holds."""
-    line_comments = (review.get("comments") or {}).get("totalCount") or 0
-    return (review.get("state") == "APPROVED"
-            and not (review.get("body") or "").strip()
-            and line_comments == 0)
 
 
 def blockers_of(pr):
@@ -1779,6 +1779,50 @@ def tell_holds(state_dir, github, prs, held_by, live, row=()):
     return told
 
 
+def spoken_text(approval, remark):
+    """What the Merger says on a pull request it holds because `remark`
+    (login, time, kind) came after `approval`."""
+    who, when, kind = remark
+    approver = APPROVERS.get(login(approval), login(approval))
+    return ("Not-a-review\n\nHolding this: %s's %s at %s came after %s's "
+            "approval, and anything said after an approval might be an "
+            "objection. A newer approval releases it, so %s, if nothing "
+            "needs to change, please approve again.\n\n"
+            "Comments by the author, approvals and comments marked "
+            "`Not-a-review` don't hold a pull request.\n\n%s"
+            % (who, kind, when, approver, approver, SIGNATURE))
+
+
+def tell_spoken(state_dir, github, prs, spoken, live):
+    """[{pr, approved, said, result}] for each pull request held for a
+    remark after its approval. When `live`, each approval and remark is
+    said once, HELD_FILE remembering it; pull requests no longer open
+    are forgotten."""
+    path = os.path.join(state_dir, HELD_FILE)
+    open_now = {str(pr["number"]) for pr in prs}
+    said = {k: v for k, v in load_json(path, {}).items() if k in open_now}
+    told = []
+    for pr, approval, remark in spoken:
+        number = pr["number"]
+        key = {"approved": approval.get("submittedAt"), "said": remark[1]}
+        entry = dict(key, pr=number)
+        if live:
+            if said.get(str(number)) == key:
+                entry["result"] = "already said"
+            else:
+                ok, why = github.write(
+                    "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG,
+                                                           number),
+                    body=spoken_text(approval, remark))
+                entry["result"] = "done" if ok else "refused: " + why
+                if ok:
+                    said[str(number)] = key
+        told.append(entry)
+    if live:
+        save_json(path, said)
+    return told
+
+
 def predict_ahead(repo, main_tip, queue, run=sh, depth=None):
     """The commits the first `depth` + 1 pull requests in `queue`
     (default AHEAD_DEPTH) will have once those ahead of each have
@@ -1852,7 +1896,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                    run=run).stdout.strip()
     prs = fetch_prs(github)
     open_numbers = {pr["number"] for pr in prs} | fetch_open_issues(github)
-    candidates, approvals, held = [], {}, {}
+    candidates, approvals, held, spoken = [], {}, {}, []
     when = now()
     for pr in prs:
         approval, why = eligible(pr, open_numbers, when)
@@ -1861,6 +1905,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             approvals[pr["number"]] = approval
         elif approval_of(pr) is not None:
             held[str(pr["number"])] = why
+            said_after = said_since(pr, approval_of(pr))
+            if said_after and not pr.get("isDraft"):
+                spoken.append((pr, approval_of(pr), said_after[0]))
     if CODE_OWNERS:
         rules = codeowners_rules(repo, "refs/remotes/origin/" + MAIN, run)
         for pr in list(candidates):
@@ -1918,6 +1965,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         record["right_of_way"] = row
     said_path = os.path.join(state_dir, "handed-back.json")
     said = load_json(said_path, {})
+    if spoken or os.path.exists(os.path.join(state_dir, HELD_FILE)):
+        record["spoken"] = tell_spoken(state_dir, github, prs, spoken, live)
     if HOLD_CONFLICTING or RIGHT_OF_WAY:
         record["holds"] = tell_holds(state_dir, github, prs,
                                      {**held_by, **row_held}, live,
