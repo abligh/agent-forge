@@ -1,6 +1,6 @@
 # 0016: Clear the build output of idle worktrees
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-16, https://github.com/abligh/agent-forge/issues/25#issuecomment-6218657303)
 * Implemented: v0.4.68, off until a host runs it.
 * Author: XMPPEngineer
 * Date: 2026-10-16
