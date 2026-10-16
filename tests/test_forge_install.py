@@ -251,6 +251,39 @@ class Versions(Install):
             self.assertEqual(tool.default_install(),
                              os.path.join(self.r.dir, "x"))
 
+    def test_one_installer_at_a_time(self):
+        self.pin("%s v1\n" % self.v1)
+        self.main()
+        self.pin("%s v2\n" % self.v2)
+        with open(self.install + ".installer.lock", "a") as other:
+            fcntl.flock(other, fcntl.LOCK_EX)
+            self.assertEqual(self.main(), 0)
+            self.assertIn("BUSY", self.out[0])
+            self.assertEqual(self.head(), self.v1)
+        self.assertEqual(self.main(), 0)
+        self.assertEqual(self.head(), self.v2)
+
+    def test_a_move_done_meanwhile_is_not_done_again(self):
+        # Another run moved the installation while this one waited for
+        # the jobs: the release it made must survive.
+        self.pin("%s v1\n" % self.v1)
+        super().main()
+        real = tool.drained
+        moved = []
+
+        def drained(install, *args):
+            if not moved:
+                moved.append(True)
+                tool.move_into_versions(install, self.url, 0, self.git)
+            return real(install, *args)
+        with mock.patch.object(tool, "drained", drained):
+            release = tool.move_into_versions(self.install, self.url, 0,
+                                              self.git)
+        self.assertTrue(os.path.islink(self.install))
+        self.assertEqual(os.path.realpath(self.install), release)
+        self.assertEqual(self.head(), self.v1)
+        self.assertFalse(locks.install_wanted(self.install))
+
     # Inherited tests that describe the in-place layout.
     test_a_running_job_is_waited_for_and_new_ones_are_held_off = None
 

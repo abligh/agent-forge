@@ -48,7 +48,11 @@ the installation where it was: exit 1. A missing installation is cloned
 beside its path and renamed into place, so a half-made clone is never
 the installation.
 
-Exit status: 0 at the pin, now installed, or no pin; 1 a step failed or
+Only one runs at a time for an installation (`<install>.installer.lock`):
+another that finds it held says `BUSY` and exits 0, so cron can run it
+every minute.
+
+Exit status: 0 at the pin, now installed, no pin, or busy; 1 a step failed or
 the jobs didn't drain in time (nothing changed); 2 refused.
 """
 
@@ -362,6 +366,10 @@ def move_into_versions(install, url, wait, run=git, clock=time.monotonic,
                      "the next run waits again)"
                      % (locks.install_lock_path(install), wait))
     with held:
+        if os.path.islink(install) or not os.path.isdir(install):
+            # Moved meanwhile, by another run: nothing left to move.
+            os.unlink(locks.install_wanted_path(install))
+            return os.path.realpath(install)
         os.makedirs(versions_dir(install), exist_ok=True)
         release = os.path.join(versions_dir(install), was)
         if os.path.exists(release):
@@ -379,8 +387,10 @@ def install_versions(install, url, pin, wait, run=git, dry_run=False,
     moved = ""
     if os.path.isdir(install) and not os.path.islink(install):
         if dry_run:
-            return ("WOULD-MOVE: %s into %s, then install %s beside it"
-                    % (install, versions_dir(install), pin[:12]))
+            was = head(install, run)
+            return ("WOULD-MOVE: %s into %s%s"
+                    % (install, versions_dir(install), "" if was == pin
+                       else ", then install %s beside it" % pin[:12]))
         move_into_versions(install, url, wait, run, clock, nap)
         moved = " (moved into %s first)" % versions_dir(install)
     current = os.path.realpath(install) if os.path.lexists(install) else None
@@ -445,8 +455,18 @@ def main(argv=None, run=git, out=print, err=None, environ=None,
                 % (args.checkout, PIN_NAME))
             return 0
         do = install_versions if args.versions else install_pin
-        out(do(install, args.url, pin, args.wait, run, args.dry_run,
-               clock, nap))
+        # One installer at a time: cron may start the next run while this
+        # one still waits for jobs, and two moving the installation at
+        # once could each undo the other's work.
+        with open(install + ".installer.lock", "a") as mine:
+            try:
+                fcntl.flock(mine, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                out("BUSY: another forge-install is running for %s"
+                    % install)
+                return 0
+            out(do(install, args.url, pin, args.wait, run, args.dry_run,
+                   clock, nap))
         return 0
     except Refused as why:
         err("forge-install: %s" % why)
