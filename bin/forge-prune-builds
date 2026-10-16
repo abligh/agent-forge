@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Clear the build output of worktrees nobody is using (designs/0016).
+
+Agents work in a git worktree per task, and each builds its own cache
+(a Rust `target/` is 10 to 30 GB) that nothing removes when the task
+ends. This deletes such caches, and only them: a directory is a
+candidate only if it carries a valid CACHEDIR.TAG, which Cargo writes
+into every `target/`. Source, git data and anything written by hand are
+never touched, so a wrong decision costs one rebuild.
+
+A cache directory is cleared only when ALL of these hold:
+
+  1. no process has its working directory, or a file open, inside the
+     worktree;
+  2. every Cargo build lock in it can be taken without waiting;
+  3. no FILE in it was read or written for N hours (newest atime and
+     mtime of files; directories' times, and the tag file's, are
+     updated by scans like this one, so they are not evidence). N is --merged-hours when the
+     worktree's branch heads a merged or closed pull request, else
+     --idle-hours, including when that can't be read.
+
+The two thresholds guard each other: a merged pull request is not
+proof that a worktree is finished (agents reuse them), and with
+`relatime` a file's atime may be up to a day stale, which the longer
+threshold allows for.
+
+Each worktree is a directory directly under a --root (for example the
+supervisor's agents directory) that has a `.git`. The pull-request
+state is read from the configuration's repository, with the read token
+forge-config's other tools use; without a configuration, every
+worktree is judged by --idle-hours.
+
+Exit status:
+
+    0   the scan finished (whatever it cleared or kept)
+    2   bad arguments, or a --root could not be read
+"""
+
+import argparse
+import errno
+import fcntl
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, github  # noqa: E402
+
+PROG = "forge-prune-builds"
+
+# The Cache Directory Tagging Specification's signature line.
+TAG = "CACHEDIR.TAG"
+SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
+# How deep below a worktree a cache directory may sit (target/,
+# desktop/target/, crates/x/target/).
+CACHE_DEPTH = 3
+# The lock files Cargo holds while it builds, in each profile directory
+# (debug/, release/) and each target's (wasm32-unknown-unknown/debug/).
+CARGO_LOCKS = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
+LOCK_DEPTH = 2
+PRUNING = ".forge-pruning"
+
+
+def is_cache_dir(path):
+    """True if `path` holds a CACHEDIR.TAG that starts with the signature."""
+    try:
+        with open(os.path.join(path, TAG), "rb") as handle:
+            return handle.read(len(SIGNATURE)) == SIGNATURE
+    except OSError:
+        return False
+
+
+def walk_limited(top, depth):
+    """(dirpath, dirnames) for `top` and its subdirectories down to
+    `depth` levels below it, skipping .git and not following links.
+    The caller may prune `dirnames` in place, as with os.walk."""
+    stack = [(top, 0)]
+    while stack:
+        path, level = stack.pop()
+        try:
+            entries = [e for e in os.scandir(path)
+                       if e.is_dir(follow_symlinks=False) and e.name != ".git"]
+        except OSError:
+            continue
+        names = sorted(e.name for e in entries)
+        yield path, level, names
+        if level < depth:
+            stack.extend((os.path.join(path, n), level + 1)
+                         for n in reversed(names))
+
+
+def find_caches(worktree):
+    """(caches, leftovers): the tagged cache directories in `worktree`,
+    and directories an interrupted run left renamed for deletion."""
+    caches, leftovers = [], []
+    for path, level, names in walk_limited(worktree, CACHE_DEPTH):
+        if path != worktree and path.endswith(PRUNING):
+            leftovers.append(path)
+            names[:] = []
+        elif path != worktree and is_cache_dir(path):
+            caches.append(path)
+            names[:] = []
+    return caches, leftovers
+
+
+def newest_file_time(top):
+    """The newest atime or mtime of any regular file under `top`, as
+    seconds; 0 when it holds no files. Links are not followed.
+
+    Not the top's own CACHEDIR.TAG: reading it, to recognise the cache,
+    is what this tool does, and that sets its atime to now."""
+    newest = 0.0
+    for dirpath, _dirs, files in os.walk(top):
+        for name in files:
+            if dirpath == top and name == TAG:
+                continue
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            newest = max(newest, st.st_atime, st.st_mtime)
+    return newest
+
+
+def busy_paths(proc="/proc"):
+    """Every path some process has as its working directory or an open
+    file, resolved."""
+    paths = set()
+    try:
+        pids = [p for p in os.listdir(proc) if p.isdigit()]
+    except OSError:
+        return paths
+    for pid in pids:
+        base = os.path.join(proc, pid)
+        links = [os.path.join(base, "cwd")]
+        try:
+            fds = os.listdir(os.path.join(base, "fd"))
+        except OSError:
+            fds = []
+        links.extend(os.path.join(base, "fd", fd) for fd in fds)
+        for link in links:
+            try:
+                target = os.readlink(link)
+            except OSError:
+                continue
+            if target.startswith("/"):
+                paths.add(target)
+    return paths
+
+
+def is_busy(worktree, paths):
+    real = os.path.realpath(worktree)
+    prefix = real.rstrip("/") + "/"
+    return any(p == real or p.startswith(prefix) for p in paths)
+
+
+class Locks:
+    """Every Cargo build lock in a cache directory, held exclusively, or
+    none: `acquired` is False if any is held elsewhere."""
+
+    def __init__(self, cache):
+        self.handles = []
+        self.acquired = True
+        for path, _level, _names in walk_limited(cache, LOCK_DEPTH):
+            for name in CARGO_LOCKS:
+                lock = os.path.join(path, name)
+                if not os.path.isfile(lock):
+                    continue
+                try:
+                    handle = open(lock, "rb")
+                except OSError:
+                    continue
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as err:
+                    handle.close()
+                    if err.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                        self.acquired = False
+                        self.release()
+                        return
+                    continue
+                self.handles.append(handle)
+
+    def release(self):
+        for handle in self.handles:
+            handle.close()
+        self.handles = []
+
+
+def current_branch(worktree, run=subprocess.run):
+    """The worktree's branch, or None when detached or unreadable."""
+    try:
+        done = run(["git", "-C", worktree, "branch", "--show-current"],
+                   capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    branch = done.stdout.strip() if done.returncode == 0 else ""
+    return branch or None
+
+
+def pr_finished(repo, token, branch, call=github.api_call):
+    """True if `branch` heads a merged or closed pull request and none
+    open; None when it can't be told (no repository, an API failure)."""
+    if not repo or not branch:
+        return None
+    owner = repo.split("/")[0]
+    head = urllib.parse.quote("%s:%s" % (owner, branch), safe="")
+    status, items = github.paged(
+        token, "/repos/%s/pulls?state=all&head=%s" % (repo, head), call=call)
+    if status != 200:
+        return None
+    if not items:
+        return False
+    return all(p.get("state") == "closed" for p in items)
+
+
+def hours(seconds):
+    return seconds / 3600.0
+
+
+def judge(cache, worktree, *, now, busy, merged_hours, idle_hours, finished):
+    """(clear, reason) for one cache directory. `finished()` is asked
+    only when the answer depends on it."""
+    if busy:
+        return False, "busy (a process is using the worktree)"
+    idle = hours(now - newest_file_time(cache))
+    if idle < merged_hours:
+        return False, "used %.0fh ago" % idle
+    if idle >= idle_hours:
+        return True, "idle %.0fh" % idle
+    done = finished()
+    if done:
+        return True, "pull request finished, idle %.0fh" % idle
+    why = "pull request open" if done is False else "pull request state unknown"
+    return False, "%s, idle %.0fh (< %gh)" % (why, idle, idle_hours)
+
+
+def delete(path):
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def size_kib(path):
+    total = 0
+    for dirpath, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_blocks // 2
+            except OSError:
+                pass
+    return total
+
+
+def worktrees(root):
+    for entry in sorted(os.scandir(root), key=lambda e: e.name):
+        if entry.is_dir(follow_symlinks=False) and \
+                os.path.exists(os.path.join(entry.path, ".git")):
+            yield entry.path
+
+
+def prune(roots, *, dry_run, merged_hours, idle_hours, repo, token,
+          now=None, busy=None, branch_of=current_branch, finished_of=pr_finished,
+          out=print):
+    """Scan `roots`, clear what the rules allow; (cleared, kept, KiB)."""
+    now = time.time() if now is None else now
+    busy = busy_paths() if busy is None else busy
+    cleared = kept = freed = 0
+    for root in roots:
+        for wt in worktrees(root):
+            caches, leftovers = find_caches(wt)
+            for left in leftovers:
+                out("%s %s: leftover of an interrupted run" % (
+                    "would delete" if dry_run else "deleted", left))
+                if not dry_run:
+                    delete(left)
+            in_use = is_busy(wt, busy)
+            branch = []
+
+            def finished():
+                if not branch:
+                    branch.append(branch_of(wt))
+                return finished_of(repo, token, branch[0])
+
+            for cache in caches:
+                clear, reason = judge(
+                    cache, wt, now=now, busy=in_use, merged_hours=merged_hours,
+                    idle_hours=idle_hours, finished=finished)
+                if not clear:
+                    out("kept %s: %s" % (cache, reason))
+                    kept += 1
+                    continue
+                locks = Locks(cache)
+                if not locks.acquired:
+                    out("kept %s: locked (a build is running)" % cache)
+                    kept += 1
+                    continue
+                try:
+                    kib = size_kib(cache)
+                    if dry_run:
+                        out("would clear %s (%.1f GB): %s" % (cache, kib / 1048576, reason))
+                    else:
+                        doomed = cache + PRUNING
+                        os.rename(cache, doomed)
+                        locks.release()
+                        delete(doomed)
+                        out("cleared %s (%.1f GB): %s" % (cache, kib / 1048576, reason))
+                finally:
+                    locks.release()
+                cleared += 1
+                freed += kib
+    return cleared, kept, freed
+
+
+def main(argv=None, out=print, err=None, environ=None, **hooks):
+    err = err or (lambda m: print(m, file=sys.stderr))
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(prog=PROG, description=__doc__.splitlines()[0])
+    parser.add_argument("--root", action="append", required=True,
+                        help="a directory whose subdirectories are worktrees (repeatable)")
+    parser.add_argument("--merged-hours", type=float, default=6,
+                        help="idle hours before clearing, when the pull request is finished (default 6)")
+    parser.add_argument("--idle-hours", type=float, default=48,
+                        help="idle hours before clearing otherwise (default 48)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="report what would be cleared, delete nothing")
+    args = parser.parse_args(argv)
+    if args.merged_hours < 0 or args.idle_hours < args.merged_hours:
+        err("%s: need 0 <= --merged-hours <= --idle-hours" % PROG)
+        return 2
+    roots = [os.path.expanduser(r) for r in args.root]
+    for root in roots:
+        if not os.path.isdir(root):
+            err("%s: %s is not a directory" % (PROG, root))
+            return 2
+    repo = token = None
+    if "finished_of" not in hooks:
+        try:
+            project = config.load(environ=environ)
+            repo = project.repo
+            token = github.read_token(project, environ)
+        except config.ConfigError as e:
+            err("%s: no configuration (%s); judging every worktree by --idle-hours"
+                % (PROG, e))
+    cleared, kept, kib = prune(
+        roots, dry_run=args.dry_run, merged_hours=args.merged_hours,
+        idle_hours=args.idle_hours, repo=repo, token=token, out=out, **hooks)
+    out("%s: %s %d, kept %d, %.1f GB" % (
+        PROG, "would clear" if args.dry_run else "cleared", cleared, kept, kib / 1048576))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
