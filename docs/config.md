@@ -458,8 +458,12 @@ could start. With `idle_offer`, each router run reads the relay's
 from the other rules, is offered the oldest issue it owns
 (`Owner:<Name>`) that it can act on: not waiting on the owner or on
 someone outside, nothing its `Blocked-by:` lines name still open, and
-not referenced by an open pull request of its own. One offer per idle
-period, never reminded. An idle developer with nothing to act on is
+not referenced by an open pull request of its own. With
+`shell_minutes`, an agent shown `shell` that long counts as idle too:
+its turn has ended and only a background task it started still runs,
+such as a wait loop that will never finish (designs/0017). Its offer
+says since when the task has been running. One offer per idle period,
+never reminded. An idle developer with nothing to act on is
 reported to `report_to`, once per idle period. A directory that can't
 be read, or isn't complete, makes nobody idle. Off without the key;
 `{}` turns it on with the defaults. `agent_forge/rules_default.py`
@@ -468,6 +472,7 @@ be read, or isn't complete, makes nobody idle. Off without the key;
 | Key | Default | What it is |
 | --- | --- | --- |
 | `idle_minutes` | `10` | How long an agent's directory entry must have been `idle` before it is offered anything: long enough to skip the pause between two turns of one task. |
+| `shell_minutes` | none (off) | How long an agent's entry must have been `shell` (its turn ended, a background task still running) before it counts as idle. Longer than `idle_minutes`, because the agent often acts on a background build when it finishes; 20 is a reasonable start. Needs agents and relay on an xmpp-mcp that reports `shell`. |
 | `report_to` | none | The agent told about a developer (not a reviewer) that is idle with nothing it can act on, such as whoever plans the work. Not told about itself. Without it, nobody is told. |
 
 ### `router.merge_notice`

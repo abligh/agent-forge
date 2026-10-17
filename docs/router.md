@@ -247,7 +247,8 @@ Reviewer2 stands in.").
 can read other items: a blocker's state, a reviewer's load),
 `only`, the numbers an `--only` run routes, else None, and
 `directory`, the relay's `GET /directory` answer (who is in the
-agents' room, busy or idle since when). The engine reads the directory
+agents' room, busy, idle or `shell` (its turn over, a background task
+still running) since when). The engine reads the directory
 once a run, sending or not, only for a module whose `wants_directory`
 is true after `configure`; one that can't be read, or isn't complete,
 is printed (`NO-DIRECTORY: …`) and handed over as None, which a module

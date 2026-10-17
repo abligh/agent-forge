@@ -108,7 +108,7 @@ RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
           "stuck": dict, "owners": dict}
-IDLE_OFFER = {"idle_minutes": int, "report_to": str}
+IDLE_OFFER = {"idle_minutes": int, "shell_minutes": int, "report_to": str}
 MERGE_NOTICE = {"window_minutes": int}
 STUCK = {"retarget": bool, "self_blocked": bool, "draft_hours": int}
 OWNERS = {"triage": str}
@@ -586,8 +586,9 @@ def _check_idle_offer(offer, agents, problems):
     its next item, and who is told of a developer with none."""
     where = "router.idle_offer"
     _fields(where, offer, IDLE_OFFER, problems)
-    if _is(offer.get("idle_minutes"), int) and offer["idle_minutes"] < 1:
-        problems.append("%s.idle_minutes must be at least 1" % where)
+    for key in ("idle_minutes", "shell_minutes"):
+        if _is(offer.get(key), int) and offer[key] < 1:
+            problems.append("%s.%s must be at least 1" % (where, key))
     if isinstance(offer.get("report_to"), str) and \
             offer["report_to"] not in agents:
         problems.append("%s.report_to: %r is not an agent"

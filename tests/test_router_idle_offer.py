@@ -44,7 +44,7 @@ def configure(test, offer):
 
 def entry(name, status="idle", since=IDLE):
     return {"name": name, "nick": name, "status": status,
-            "idle_since": since if status == "idle" else None}
+            "idle_since": since if status in ("idle", "shell") else None}
 
 
 def directory(*entries, complete=True):
@@ -100,6 +100,15 @@ class Config(unittest.TestCase):
         self.assertEqual(self.problems({"idle_minutes": 0}),
                          ["router.idle_offer.idle_minutes must be at least 1"])
 
+    def test_shell_minutes_an_integer_of_at_least_one(self):
+        self.assertEqual(self.problems({"shell_minutes": 20}), [])
+        self.assertEqual(self.problems({"shell_minutes": 0}),
+                         ["router.idle_offer.shell_minutes must be at least "
+                          "1"])
+        self.assertEqual(self.problems({"shell_minutes": "20"}),
+                         ["router.idle_offer.shell_minutes must be an "
+                          "integer"])
+
     def test_report_to_is_an_agent(self):
         self.assertEqual(self.problems({"report_to": "Merger"}),
                          ["router.idle_offer.report_to: 'Merger' is not an "
@@ -119,7 +128,8 @@ class Configure(unittest.TestCase):
     def test_defaults(self):
         configure(self, {})
         self.assertEqual(rules.IDLE_OFFER,
-                         {"idle_minutes": 10, "report_to": None})
+                         {"idle_minutes": 10, "shell_minutes": None,
+                          "report_to": None})
         self.assertTrue(rules.wants_directory)
 
     def test_the_rules_load_with_it(self):
@@ -199,6 +209,69 @@ class Idle(unittest.TestCase):
         self.assertEqual(self.idle(entry("WidgetLeadDev", since=T1),
                                    entry("WidgetLeadDev")),
                          {"LeadDev": IDLE})
+
+
+class Shell(unittest.TestCase):
+    """`shell`: the turn has ended, a background task still runs (design
+    0017). Idle only with `shell_minutes`, and only after that long."""
+
+    def idle(self, *entries):
+        return rules.idle_sweep(context(listing=directory(*entries)))
+
+    def test_not_idle_without_shell_minutes(self):
+        configure(self, {"idle_minutes": 10})
+        self.assertEqual(self.idle(entry("WidgetLeadDev", "shell")), {})
+
+    def test_idle_after_shell_minutes(self):
+        configure(self, {"idle_minutes": 10, "shell_minutes": 20})
+        # 30 minutes in shell: past 20.
+        self.assertEqual(self.idle(entry("WidgetLeadDev", "shell")),
+                         {"LeadDev": (IDLE, True)})
+        # 15 minutes: past idle_minutes, not yet shell_minutes.
+        self.assertEqual(self.idle(entry("WidgetLeadDev", "shell",
+                                         since="2026-10-09T13:45:00Z")), {})
+        self.assertEqual(self.idle(entry("WidgetLeadDev", "shell",
+                                         since="2026-10-09T13:40:00Z")),
+                         {"LeadDev": ("2026-10-09T13:40:00Z", True)})
+
+    def test_shell_with_no_time_is_not_idle(self):
+        configure(self, {"shell_minutes": 20})
+        self.assertEqual(self.idle(entry("WidgetLeadDev", "shell",
+                                         since=None)), {})
+
+    def test_idle_is_not_shell(self):
+        configure(self, {"shell_minutes": 20})
+        self.assertEqual(self.idle(entry("WidgetLeadDev")),
+                         {"LeadDev": (IDLE, False)})
+
+    def test_listed_twice_each_long_enough_in_its_own_status(self):
+        configure(self, {"idle_minutes": 10, "shell_minutes": 20})
+        self.assertEqual(self.idle(
+            entry("WidgetLeadDev", since="2026-10-09T13:45:00Z"),
+            entry("WidgetLeadDev", "shell")),
+            {"LeadDev": ("2026-10-09T13:45:00Z", True)})
+        self.assertEqual(self.idle(
+            entry("WidgetLeadDev"),
+            entry("WidgetLeadDev", "shell", since="2026-10-09T13:45:00Z")),
+            {})
+
+    def test_the_offer_says_a_task_still_runs(self):
+        configure(self, {"shell_minutes": 20})
+        ctx = context(issues=[owned(30, title="Draw the cat")],
+                      listing=directory(entry("WidgetLeadDev", "shell")))
+        [decision] = rules.sweep(ctx)
+        self.assertEqual((decision.agent, decision.rule, decision.event),
+                         ("LeadDev", 15, IDLE))
+        self.assertTrue(decision.line.endswith(
+            "You have been idle since 13:30Z. A background task of yours "
+            "has been running since 13:30Z. Stop it if it is stale."),
+            decision.line)
+
+    def test_a_developer_with_nothing_is_reported_from_shell_too(self):
+        configure(self, {"shell_minutes": 20, "report_to": "LeadDev"})
+        ctx = context(listing=directory(entry("WidgetUIDev", "shell")))
+        self.assertEqual([(d.agent, d.rule) for d in rules.sweep(ctx)],
+                         [("LeadDev", 16)])
 
 
 class Actionable(unittest.TestCase):
@@ -419,6 +492,17 @@ class Engine(unittest.TestCase):
                         None)
         self.run_router([owned(30)], when=NOW + datetime.timedelta(hours=7))
         self.assertEqual([s for s, _ in self.posts], ["WidgetLeadDev"])
+
+    def test_shell_then_idle_is_one_idle_period(self):
+        # The turn ended once: xmpp-mcp keeps its time from shell to idle.
+        configure(self, {"report_to": "LeadDev", "shell_minutes": 20})
+        self.listing = (directory(entry("WidgetLeadDev", "shell")), None)
+        self.run_router([owned(30)])
+        self.assertEqual([s for s, _ in self.posts], ["WidgetLeadDev"])
+        self.assertIn("A background task of yours", self.posts[0][1])
+        self.listing = (directory(entry("WidgetLeadDev")), None)
+        self.run_router([owned(30)], when=NOW + datetime.timedelta(hours=1))
+        self.assertEqual(self.posts, [])
 
     def test_another_item_in_the_same_idle_period_is_not_offered(self):
         self.run_router([owned(30), owned(31, created=T1)])

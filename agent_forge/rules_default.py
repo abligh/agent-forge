@@ -114,8 +114,10 @@ With `router.idle_offer` in the configuration, a run also sweeps for
 agents with nothing to do (off without it):
 
 15. an agent the relay's directory shows idle (status `idle`, every
-    entry of its session name, for at least `idle_minutes`, default 10),
-    with no turn from rules 0a-14, which owns an actionable issue: the
+    entry of its session name, for at least `idle_minutes`, default 10;
+    with `shell_minutes` set, an entry `shell` for at least that long
+    counts too: its turn has ended and only a background task it started
+    still runs), with no turn from rules 0a-14, which owns an actionable issue: the
     agent's, offered the oldest such issue by creation. An issue is
     actionable when it is labelled `Owner:<Name>`, is waiting neither
     on the owner nor on someone outside, every item its `Blocked-by:`
@@ -124,7 +126,8 @@ agents with nothing to do (off without it):
     references it (a closing reference, `#N` or its URL in the body).
     The event is when the idle period began, and it is about no item,
     so it is offered once per idle period, never reminded, and the
-    next idle period offers again;
+    next idle period offers again. An agent idle through `shell` is
+    also told since when its background task has been running;
 16. an idle developer (not a reviewer) with no such turn and nothing
     actionable: `idle_offer.report_to`'s, so whoever plans the work
     knows, once per idle period. Not for `report_to` itself, and not
@@ -279,6 +282,7 @@ def configure(project, merger_tool):
     offer = project.section("router").get("idle_offer")
     IDLE_OFFER = None if offer is None else {
         "idle_minutes": offer.get("idle_minutes", DEFAULT_IDLE_MINUTES),
+        "shell_minutes": offer.get("shell_minutes"),
         "report_to": offer.get("report_to")}
     wants_directory = IDLE_OFFER is not None
     notice = project.section("router").get("merge_notice")
@@ -888,12 +892,21 @@ def parse_stamp(stamp):
 
 def idle_agents(ctx):
     """{agent: when its idle period began (the directory's string)} for
-    each agent the directory shows idle for at least `idle_minutes`. A
-    session is matched by its name; one listed more than once is idle
-    only when every entry is, since the latest of them. An agent with
-    twins is idle when any of her sessions is, since the longest idle
-    of them: an offer then reaches the one with nothing to do. Nobody is
-    idle when the directory is unknown."""
+    each agent the directory shows idle: see `idle_sweep`."""
+    return {agent: stamp for agent, (stamp, _) in idle_sweep(ctx).items()}
+
+
+def idle_sweep(ctx):
+    """{agent: (when its idle period began, the directory's string;
+    whether a background task still runs)} for each agent the directory
+    shows idle: `idle` for at least `idle_minutes`, or, with
+    `shell_minutes` set, `shell` (its turn over, a background task it
+    started still running) for at least that. A session is matched by
+    its name; one listed more than once is idle only when every entry
+    is, since the latest of them. An agent with twins is idle when any
+    of her sessions is, since the longest idle of them: an offer then
+    reaches the one with nothing to do. Nobody is idle when the
+    directory is unknown."""
     listing = ctx.directory
     if not isinstance(listing, dict) or listing.get("complete") is not True \
             or not isinstance(listing.get("agents"), list):
@@ -902,6 +915,11 @@ def idle_agents(ctx):
     sessions = {s: a for a in ctx.roster.agents
                 if ctx.roster.stand_in(a) == a
                 for s in ctx.roster.sessions(a)}
+    cutoffs = {"idle": IDLE_OFFER["idle_minutes"]}
+    if IDLE_OFFER.get("shell_minutes"):
+        cutoffs["shell"] = IDLE_OFFER["shell_minutes"]
+    cutoffs = {status: ctx.when - datetime.timedelta(minutes=minutes)
+               for status, minutes in cutoffs.items()}
     seen = {}
     for entry in listing["agents"]:
         if not isinstance(entry, dict):
@@ -909,19 +927,25 @@ def idle_agents(ctx):
         name = entry.get("name")
         if name not in sessions:
             continue
+        status = entry.get("status")
         since = parse_stamp(entry.get("idle_since")) \
-            if entry.get("status") == "idle" else None
-        seen.setdefault(name, []).append((since, entry.get("idle_since")))
-    cutoff = ctx.when - datetime.timedelta(minutes=IDLE_OFFER["idle_minutes"])
+            if status in cutoffs else None
+        # Long enough in its status, or None: not idle.
+        if since is not None and since > cutoffs[status]:
+            since = None
+        seen.setdefault(name, []).append(
+            (since, entry.get("idle_since"), status == "shell"))
     idle = {}
     for name, entries in seen.items():
-        if any(since is None for since, _ in entries):
+        if any(since is None for since, _, _ in entries):
             continue
-        since, stamp = max(entries)
+        since, stamp, _ = max(entries)
+        shell = any(in_shell for _, _, in_shell in entries)
         agent = sessions[name]
-        if since <= cutoff and (agent not in idle or since < idle[agent][0]):
-            idle[agent] = (since, stamp)
-    return {agent: stamp for agent, (_, stamp) in idle.items()}
+        if agent not in idle or since < idle[agent][0]:
+            idle[agent] = (since, stamp, shell)
+    return {agent: (stamp, shell)
+            for agent, (_, stamp, shell) in idle.items()}
 
 
 # A pull request body's reference to an issue: `#N`, or its URL.
@@ -1014,7 +1038,7 @@ def idle_offers(ctx):
     developer with none."""
     report_to = IDLE_OFFER["report_to"]
     decisions = []
-    for agent, stamp in sorted(idle_agents(ctx).items()):
+    for agent, (stamp, shell) in sorted(idle_sweep(ctx).items()):
         if not ctx.roster.is_agent(agent) or has_turn(agent, ctx):
             continue
         actionable, held, waiting = owned_issues(agent, ctx)
@@ -1025,10 +1049,13 @@ def idle_offers(ctx):
                 None, agent, 15, stamp,
                 "#%d%s is yours and nothing blocks it: start it, or say on "
                 "the issue why not (a %s or %s label, or a Blocked-by: "
-                "line). You have been idle since %s." % (
+                "line). You have been idle since %s.%s" % (
                     issue["number"], ' "%s"' % title if title else "",
                     WAITING_OWNER, WAITING_EXTERNAL,
-                    since_text(stamp, ctx.when)),
+                    since_text(stamp, ctx.when),
+                    " A background task of yours has been running since "
+                    "%s. Stop it if it is stale." % since_text(
+                        stamp, ctx.when) if shell else ""),
                 reminder=ONCE))
             continue
         if not report_to or agent == ctx.roster.stand_in(report_to) or \
