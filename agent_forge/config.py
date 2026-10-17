@@ -94,11 +94,12 @@ SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 # checks.fast_lane: a slot for heads whose chosen steps are cheap.
 FAST_LANE = {"max_seconds": int}
 # checks.reuse: a step's green verdict reused for unchanged inputs.
-REUSE = {"max_age_days": int}
+REUSE = {"max_age_days": int, "trace_matched_main": bool,
+         "chain_writes_only": bool, "dirs_by_names": bool}
 # checks.fresh: records from every run, and heads that wait for one.
 FRESH = {"wait_minutes": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool,
-        "version": list, "reads_base": bool}
+        "version": list, "reads_base": bool, "outputs": list}
 # checks.tracer's values (docs/designs/0005).
 TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.
@@ -379,6 +380,13 @@ def check(data):
                     and all(isinstance(a, str) for a in version)):
                 problems.append("%s.version must be a non-empty list of "
                                 "strings" % where)
+            for path in step.get("outputs", []) \
+                    if isinstance(step.get("outputs"), list) else ():
+                if not (isinstance(path, str) and path.strip("/")
+                        and ".." not in path.split("/")
+                        and not any(c in path for c in "*?[!\\")):
+                    problems.append("%s.outputs: %r is not a path inside "
+                                    "the worktree" % (where, path))
     if isinstance(checks.get("caches"), dict) and not all(
             isinstance(v, str) and v and "/" not in v
             for v in checks["caches"].values()):
@@ -570,7 +578,9 @@ def _check_fresh(checks, problems):
 def _check_reuse(checks, problems):
     """checks.reuse (designs/0009): how old a step's green verdict may
     be to stand for unchanged inputs. The inputs are read from the
-    dependency record, so it needs `depends`."""
+    dependency record, so it needs `depends`. Its switches
+    (designs/0018) are booleans; `trace_matched_main` needs `main`
+    "every", the only mode that matches a default-branch head."""
     where = "checks.reuse"
     reuse = checks["reuse"]
     _fields(where, reuse, REUSE, problems)
@@ -579,6 +589,11 @@ def _check_reuse(checks, problems):
     if checks.get("depends") is not True:
         problems.append("%s needs checks.depends: a step's inputs are "
                         "what its dependency record says it read" % where)
+    if reuse.get("trace_matched_main") is True \
+            and checks.get("main", "needed") != "every":
+        problems.append("%s.trace_matched_main needs checks.main \"every\": "
+                        "only then is a default-branch head matched"
+                        % where)
 
 
 def _check_idle_offer(offer, agents, problems):

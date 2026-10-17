@@ -128,6 +128,29 @@ class Library(unittest.TestCase):
         self.assertIn("MISSING", paths)
         self.assertIn("NOPE", paths)
 
+    def test_what_a_step_writes_or_creates_is_its_write_set(self):
+        # designs/0018: a file opened to write is read too, as before;
+        # a directory, link or rename only creates. `mkdir -p` of a
+        # directory that is there creates nothing.
+        entries, paths = self.traced(
+            "echo x > out; mkdir -p docs gen/sub; echo y > gen/tmp; "
+            "mv gen/tmp gen/moved; ln -s A link; cat A >/dev/null; "
+            "%s -c 'open(\"py\", \"a\").close()'" % sys.executable)
+        writes = trace.written(entries, self.wt, [".record"])
+        self.assertEqual(writes, ["gen", "gen/moved", "gen/sub", "gen/tmp",
+                                  "link", "out", "py"])
+        self.assertNotIn("docs", writes)
+        self.assertNotIn("A", writes)
+        self.assertIn("out", paths)
+        self.assertIn("A", paths)
+        self.assertNotIn("gen/sub", paths)
+        self.assertNotIn("gen/moved", paths)
+
+    def test_a_failed_create_is_no_write(self):
+        entries, _ = self.traced("mkdir A 2>/dev/null || true; "
+                                 "ln -s B C 2>/dev/null || true")
+        self.assertEqual(trace.written(entries, self.wt, [".record"]), [])
+
     def test_a_listed_directory_is_recorded(self):
         _, paths = self.traced("ls docs >/dev/null")
         self.assertIn("docs", paths)
@@ -238,6 +261,26 @@ class Strace(unittest.TestCase):
             ("o", "/wt/src/lib.rs"), ("o", "/wt/missing"),
             ("o", '/wt/a"b')])
 
+    def test_writes_and_what_succeeded_in_creating(self):
+        text = textwrap.dedent("""\
+            1 openat(AT_FDCWD</wt>, "out", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 3</wt/out>
+            1 openat(AT_FDCWD</wt>, "in", O_RDONLY|O_CLOEXEC) = 3</wt/in>
+            1 creat("made", 0644) = 4
+            1 mkdir("gen", 0777) = 0
+            1 mkdir("docs", 0777) = -1 EEXIST (File exists)
+            1 renameat2(AT_FDCWD</wt>, "gen/tmp", AT_FDCWD</wt/gen>, "moved", RENAME_NOREPLACE) = 0
+            1 symlinkat("A", AT_FDCWD</wt>, "link") = 0
+            1 rename("x", "y") = -1 ENOENT (No such file or directory)
+            """)
+        with tempfile.NamedTemporaryFile("w", delete=False) as handle:
+            handle.write(text)
+        self.addCleanup(os.unlink, handle.name)
+        self.assertEqual(trace.read_strace(handle.name, "/wt"), [
+            ("w", "/wt/out"), ("o", "/wt/in"), ("w", "/wt/made"),
+            ("o", "/wt/gen"), ("c", "/wt/gen"), ("o", "/wt/docs"),
+            ("o", "/wt/gen/tmp"), ("c", "/wt/gen/moved"),
+            ("o", "/wt/A"), ("c", "/wt/link"), ("o", "/wt/x")])
+
     def test_the_prefix(self):
         prefix = trace.strace_prefix("/rec")
         self.assertEqual(prefix[0], "strace")
@@ -285,6 +328,22 @@ class Paths(unittest.TestCase):
                                             "sh"))
 
 
+class Outputs(unittest.TestCase):
+    """Whether a path missing from the tree is a step's output
+    (designs/0018)."""
+
+    def test_one_written_beneath_one_and_above_one(self):
+        index = trace.outputs_index(["gen/out", "/web/node_modules/"])
+        for path in ("gen/out", "gen", "web/node_modules/x/index.js",
+                     "web/node_modules", "web"):
+            self.assertTrue(trace.output_of(path, index), path)
+        for path in ("gen/other", "genx", "web/other", "maybe"):
+            self.assertFalse(trace.output_of(path, index), path)
+
+    def test_nothing_written(self):
+        self.assertFalse(trace.output_of("x", trace.outputs_index([])))
+
+
 class Records(unittest.TestCase):
 
     def setUp(self):
@@ -305,6 +364,15 @@ class Records(unittest.TestCase):
         self.assertEqual(loaded[0][0], path)
         with open(path) as handle:
             self.assertEqual(json.load(handle)["commit"], "ct2")
+
+    def test_a_write_set_is_kept_only_when_given(self):
+        with open(self.write("t1", T0)) as handle:
+            self.assertNotIn("writes", json.load(handle))
+        path = trace.write_record(self.state, "t2", "ct2", "digest",
+                                  iso(T0), "preload", {"test": ["a"]},
+                                  {"test": ["."]}, writes={"test": ["out"]})
+        with open(path) as handle:
+            self.assertEqual(json.load(handle)["writes"], {"test": ["out"]})
 
     def test_unreadable_and_temporary_files_are_left_out(self):
         self.write("t1", T0)

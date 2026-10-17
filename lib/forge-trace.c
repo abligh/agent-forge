@@ -6,9 +6,13 @@
  * Each call it wraps appends one line, "<kind> <absolute path>\n", in a
  * single write to a descriptor opened with O_APPEND, so lines from
  * many processes and threads never interleave. The kind is "x" for a
- * program executed (or about to be), "o" for anything else. A path is
- * recorded whether or not the call succeeds: a file looked for and not
- * found can change what a step does once it appears.
+ * program executed (or about to be), "w" for a file opened to be
+ * written or created, "c" for a path a directory, link or rename
+ * created, and "o" for anything else. A path is recorded whether or
+ * not the call succeeds: a file looked for and not found can change
+ * what a step does once it appears. A "c" path is recorded only when
+ * the call succeeds, since `mkdir -p` asks for every directory that is
+ * already there (docs/designs/0018).
  *
  * Every process must keep the tracer. LD_PRELOAD and FORGE_TRACE_FILE
  * are inherited across fork and exec like any variable, and each exec*
@@ -101,6 +105,15 @@ DECLARE(int, faccessat, int, const char *, int, int);
 DECLARE(int, euidaccess, const char *, int);
 DECLARE(int, eaccess, const char *, int);
 DECLARE(DIR *, opendir, const char *);
+DECLARE(int, mkdir, const char *, mode_t);
+DECLARE(int, mkdirat, int, const char *, mode_t);
+DECLARE(int, rename, const char *, const char *);
+DECLARE(int, renameat, int, const char *, int, const char *);
+DECLARE(int, renameat2, int, const char *, int, const char *, unsigned int);
+DECLARE(int, link, const char *, const char *);
+DECLARE(int, linkat, int, const char *, int, const char *, int);
+DECLARE(int, symlink, const char *, const char *);
+DECLARE(int, symlinkat, const char *, int, const char *);
 DECLARE(ssize_t, readlink, const char *, char *, size_t);
 DECLARE(int, execve, const char *, char *const[], char *const[]);
 DECLARE(int, execvpe, const char *, char *const[], char *const[]);
@@ -132,6 +145,9 @@ static void resolve_all(void)
     RESOLVE(__fxstatat); RESOLVE(__fxstatat64); RESOLVE(statx);
     RESOLVE(access); RESOLVE(faccessat); RESOLVE(euidaccess);
     RESOLVE(eaccess); RESOLVE(opendir); RESOLVE(readlink);
+    RESOLVE(mkdir); RESOLVE(mkdirat); RESOLVE(rename); RESOLVE(renameat);
+    RESOLVE(renameat2); RESOLVE(link); RESOLVE(linkat); RESOLVE(symlink);
+    RESOLVE(symlinkat);
     RESOLVE(execve); RESOLVE(execvpe); RESOLVE(fexecve);
     RESOLVE(posix_spawn); RESOLVE(posix_spawnp); RESOLVE(system);
     RESOLVE(popen);
@@ -356,6 +372,20 @@ __attribute__((constructor)) static void start(void)
     }
 }
 
+/* What an open with `flags` records: "w" when it may write or create. */
+static char open_kind(int flags)
+{
+    return (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND))
+        ? 'w' : 'o';
+}
+
+/* What an fopen with mode `how` records: "w" for "w", "a" or "+". */
+static char fopen_kind(const char *how)
+{
+    how = OPAQUE(how);
+    return how && strpbrk(how, "wa+") ? 'w' : 'o';
+}
+
 /* open and its relatives: the mode is there only with O_CREAT or
  * O_TMPFILE, as the C library reads it. */
 #define MODE(flags) \
@@ -371,7 +401,7 @@ int open(const char *path, int flags, ...)
 {
     MODE(flags);
     RESOLVE(open);
-    record('o', AT_FDCWD, path);
+    record(open_kind(flags), AT_FDCWD, path);
     return real_open(path, flags, mode);
 }
 
@@ -379,7 +409,7 @@ int open64(const char *path, int flags, ...)
 {
     MODE(flags);
     RESOLVE(open64);
-    record('o', AT_FDCWD, path);
+    record(open_kind(flags), AT_FDCWD, path);
     return real_open64(path, flags, mode);
 }
 
@@ -387,7 +417,7 @@ int openat(int dirfd, const char *path, int flags, ...)
 {
     MODE(flags);
     RESOLVE(openat);
-    record('o', dirfd, path);
+    record(open_kind(flags), dirfd, path);
     return real_openat(dirfd, path, flags, mode);
 }
 
@@ -395,77 +425,77 @@ int openat64(int dirfd, const char *path, int flags, ...)
 {
     MODE(flags);
     RESOLVE(openat64);
-    record('o', dirfd, path);
+    record(open_kind(flags), dirfd, path);
     return real_openat64(dirfd, path, flags, mode);
 }
 
 int __open_2(const char *path, int flags)
 {
     RESOLVE(__open_2);
-    record('o', AT_FDCWD, path);
+    record(open_kind(flags), AT_FDCWD, path);
     return real___open_2(path, flags);
 }
 
 int __open64_2(const char *path, int flags)
 {
     RESOLVE(__open64_2);
-    record('o', AT_FDCWD, path);
+    record(open_kind(flags), AT_FDCWD, path);
     return real___open64_2(path, flags);
 }
 
 int __openat_2(int dirfd, const char *path, int flags)
 {
     RESOLVE(__openat_2);
-    record('o', dirfd, path);
+    record(open_kind(flags), dirfd, path);
     return real___openat_2(dirfd, path, flags);
 }
 
 int __openat64_2(int dirfd, const char *path, int flags)
 {
     RESOLVE(__openat64_2);
-    record('o', dirfd, path);
+    record(open_kind(flags), dirfd, path);
     return real___openat64_2(dirfd, path, flags);
 }
 
 int creat(const char *path, mode_t mode)
 {
     RESOLVE(creat);
-    record('o', AT_FDCWD, path);
+    record('w', AT_FDCWD, path);
     return real_creat(path, mode);
 }
 
 int creat64(const char *path, mode_t mode)
 {
     RESOLVE(creat64);
-    record('o', AT_FDCWD, path);
+    record('w', AT_FDCWD, path);
     return real_creat64(path, mode);
 }
 
 FILE *fopen(const char *path, const char *how)
 {
     RESOLVE(fopen);
-    record('o', AT_FDCWD, path);
+    record(fopen_kind(how), AT_FDCWD, path);
     return real_fopen(path, how);
 }
 
 FILE *fopen64(const char *path, const char *how)
 {
     RESOLVE(fopen64);
-    record('o', AT_FDCWD, path);
+    record(fopen_kind(how), AT_FDCWD, path);
     return real_fopen64(path, how);
 }
 
 FILE *freopen(const char *path, const char *how, FILE *stream)
 {
     RESOLVE(freopen);
-    record('o', AT_FDCWD, path);
+    record(fopen_kind(how), AT_FDCWD, path);
     return real_freopen(path, how, stream);
 }
 
 FILE *freopen64(const char *path, const char *how, FILE *stream)
 {
     RESOLVE(freopen64);
-    record('o', AT_FDCWD, path);
+    record(fopen_kind(how), AT_FDCWD, path);
     return real_freopen64(path, how, stream);
 }
 
@@ -603,6 +633,75 @@ DIR *opendir(const char *path)
     RESOLVE(opendir);
     record('o', AT_FDCWD, path);
     return real_opendir(path);
+}
+
+/* Calls that create a path: recorded "c", after the call and only when
+ * it succeeds. The errno the caller sees is the call's own. */
+#define CREATED(call, dirfd, path) \
+    do { \
+        int _got = (call); \
+        if (_got == 0) { \
+            int _saved = errno; \
+            record('c', (dirfd), (path)); \
+            errno = _saved; \
+        } \
+        return _got; \
+    } while (0)
+
+int mkdir(const char *path, mode_t mode)
+{
+    RESOLVE(mkdir);
+    CREATED(real_mkdir(path, mode), AT_FDCWD, path);
+}
+
+int mkdirat(int dirfd, const char *path, mode_t mode)
+{
+    RESOLVE(mkdirat);
+    CREATED(real_mkdirat(dirfd, path, mode), dirfd, path);
+}
+
+int rename(const char *from, const char *to)
+{
+    RESOLVE(rename);
+    CREATED(real_rename(from, to), AT_FDCWD, to);
+}
+
+int renameat(int fromfd, const char *from, int tofd, const char *to)
+{
+    RESOLVE(renameat);
+    CREATED(real_renameat(fromfd, from, tofd, to), tofd, to);
+}
+
+int renameat2(int fromfd, const char *from, int tofd, const char *to,
+              unsigned int flags)
+{
+    RESOLVE(renameat2);
+    CREATED(real_renameat2(fromfd, from, tofd, to, flags), tofd, to);
+}
+
+int link(const char *from, const char *to)
+{
+    RESOLVE(link);
+    CREATED(real_link(from, to), AT_FDCWD, to);
+}
+
+int linkat(int fromfd, const char *from, int tofd, const char *to,
+           int flags)
+{
+    RESOLVE(linkat);
+    CREATED(real_linkat(fromfd, from, tofd, to, flags), tofd, to);
+}
+
+int symlink(const char *target, const char *path)
+{
+    RESOLVE(symlink);
+    CREATED(real_symlink(target, path), AT_FDCWD, path);
+}
+
+int symlinkat(const char *target, int dirfd, const char *path)
+{
+    RESOLVE(symlinkat);
+    CREATED(real_symlinkat(target, dirfd, path), dirfd, path);
 }
 
 int execve(const char *path, char *const argv[], char *const envp[])

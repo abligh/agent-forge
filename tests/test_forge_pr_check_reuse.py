@@ -50,6 +50,42 @@ class Configure(unittest.TestCase):
                       "are what its dependency record says it read",
                       config.check(self.data(reuse={})))
 
+    def test_the_switches_are_off_unless_set(self):
+        # designs/0018: each changes which steps run, so each is opt-in.
+        pc.configure(config.Project(self.data(depends=True, reuse={}), None))
+        self.assertEqual((pc.TRACE_MATCHED_MAIN, pc.CHAIN_WRITES_ONLY,
+                          pc.DIRS_BY_NAMES, pc.OUTPUTS),
+                         (False, False, False, {}))
+        data = self.data(depends=True, main="every", reuse={
+            "trace_matched_main": True, "chain_writes_only": True,
+            "dirs_by_names": True})
+        data["checks"]["steps"][0]["outputs"] = ["web/node_modules/"]
+        self.assertEqual(config.check(data), [])
+        pc.configure(config.Project(data, None))
+        self.assertEqual((pc.TRACE_MATCHED_MAIN, pc.CHAIN_WRITES_ONLY,
+                          pc.DIRS_BY_NAMES), (True, True, True))
+        name = data["checks"]["steps"][0]["name"]
+        self.assertEqual(pc.OUTPUTS, {name: ["web/node_modules"]})
+
+    def test_the_switches_shapes(self):
+        problems = config.check(self.data(depends=True, reuse={
+            "chain_writes_only": "yes", "dirs_by_names": 1}))
+        self.assertTrue(any("chain_writes_only" in p for p in problems))
+        self.assertTrue(any("dirs_by_names" in p for p in problems))
+        self.assertIn('checks.reuse.trace_matched_main needs checks.main '
+                      '"every": only then is a default-branch head matched',
+                      config.check(self.data(depends=True, reuse={
+                          "trace_matched_main": True})))
+        data = self.data(depends=True)
+        data["checks"]["steps"][0]["outputs"] = ["../up", "", "a/*", 3]
+        problems = config.check(data)
+        for bad in ("'../up'", "''", "'a/*'", "3"):
+            self.assertIn("checks.steps[0].outputs: %s is not a path inside "
+                          "the worktree" % bad, problems)
+        data["checks"]["steps"][0]["outputs"] = "web/node_modules"
+        self.assertTrue(any("checks.steps[0]" in p and "outputs" in p
+                            for p in config.check(data)))
+
     def test_shapes(self):
         problems = config.check(self.data(depends=True,
                                           reuse={"max_age_days": 0}))
@@ -284,6 +320,205 @@ class Digests(DigestCase):
         self.assertEqual(sorted(got), ["a", "b", "c"])
         with open(counter) as handle:
             self.assertEqual(handle.read(), "x\n")
+
+
+class ChainWritesOnly(DigestCase):
+    """designs/0018 C: a missing path chains only the earlier step that
+    wrote it. "c" reads gen/out, which "b" writes, and looks for
+    "maybe", which nothing writes."""
+
+    def setUp(self):
+        super().setUp()
+        self.reads["c"] = ["gen/out", "lib", "maybe"]
+        self.writes = {"a": [], "b": ["gen", "gen/out"], "c": []}
+        self.write_record()
+        for name, value in (("CHAIN_WRITES_ONLY", True), ("OUTPUTS", {})):
+            patch = mock.patch.object(pc, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def write_record(self, commit=None):
+        commit = commit or self.first
+        tree = git("rev-parse", commit + "^{tree}", cwd=self.seed)
+        trace.write_record(self.state_dir, tree, commit, pc.steps_digest(),
+                           pc.iso(T0), "preload", self.reads, self.dirs,
+                           writes=getattr(self, "writes", None))
+
+    def test_a_step_that_wrote_nothing_it_reads_doesnt_chain(self):
+        # 0009 meant "c" to be reusable across a change to what "a" reads.
+        base = self.digests(self.first)
+        got = self.digests(self.commit({"A": "a2\n"}))
+        self.assertNotEqual(got["a"], base["a"])
+        self.assertEqual(got["c"], base["c"])
+        with mock.patch.object(pc, "CHAIN_WRITES_ONLY", False):
+            self.assertNotEqual(self.digests(self.first)["c"],
+                                self.digests(self.commit({"A": "a3\n"}))["c"])
+
+    def test_a_real_output_changing_still_runs_it(self):
+        base = self.digests(self.first)
+        self.assertNotEqual(self.digests(self.commit({"B": "b2\n"}))["c"],
+                            base["c"])
+
+    def test_a_path_looked_for_appearing_still_counts(self):
+        base = self.digests(self.first)
+        self.assertNotEqual(self.digests(self.commit({"maybe": "m\n"}))["c"],
+                            base["c"])
+
+    def test_without_write_sets_it_chains_as_before(self):
+        del self.writes["a"]
+        self.write_record()
+        base = self.digests(self.first)
+        self.assertNotEqual(self.digests(self.commit({"A": "a2\n"}))["c"],
+                            base["c"])
+
+    def test_declared_outputs_chain(self):
+        # "b" writes outside the tracer's view: nothing in its write set.
+        self.writes["b"] = []
+        self.write_record()
+        base = self.digests(self.first)
+        self.assertEqual(self.digests(self.commit({"B": "b2\n"}))["c"],
+                         base["c"])
+        with mock.patch.object(pc, "OUTPUTS", {"b": ["gen"]}):
+            base = self.digests(self.first)
+            self.assertNotEqual(
+                self.digests(self.commit({"B": "b3\n"}))["c"], base["c"])
+
+    def test_a_writer_without_a_digest_leaves_none(self):
+        with mock.patch.object(pc, "VERSIONS", {"b": ["false"]}):
+            got = self.digests(self.first)
+        self.assertEqual(sorted(got), ["a"])
+        # One that wrote nothing it reads leaves it be.
+        with mock.patch.object(pc, "VERSIONS", {"a": ["false"]}):
+            self.assertEqual(sorted(self.digests(self.first)), ["b", "c"])
+
+
+class DirsByNames(DigestCase):
+    """designs/0018 D: a directory with a file read beneath it counts
+    its entry names, not its tree."""
+
+    def setUp(self):
+        super().setUp()
+        self.top = self.commit({"lib/x": "x\n", "lib/sub/y": "y\n",
+                                "docs/d": "d\n"})
+        self.reads["c"] = ["gen/out", "lib", "lib/x"]
+        self.reads["a"] = ["A", "docs"]
+        self.write_record(self.top)
+        patch = mock.patch.object(pc, "DIRS_BY_NAMES", True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_a_change_beneath_that_wasnt_read(self):
+        # 0009 item 2 meant a listed directory to count by its names.
+        base = self.digests(self.top)
+        got = self.digests(self.commit({"lib/sub/y": "y2\n"}))
+        self.assertEqual(got["c"], base["c"])
+        with mock.patch.object(pc, "DIRS_BY_NAMES", False):
+            self.assertNotEqual(self.digests(self.top)["c"], self.digests(
+                self.commit({"lib/sub/y": "y3\n"}))["c"])
+
+    def test_a_file_read_beneath_it_changing_still_runs_it(self):
+        base = self.digests(self.top)
+        self.assertNotEqual(self.digests(self.commit({"lib/x": "x2\n"}))["c"],
+                            base["c"])
+
+    def test_an_entry_added_still_runs_it(self):
+        base = self.digests(self.top)
+        self.assertNotEqual(self.digests(self.commit({"lib/z": "z\n"}))["c"],
+                            base["c"])
+
+    def test_a_directory_with_no_file_read_beneath_keeps_its_tree(self):
+        base = self.digests(self.top)
+        self.assertNotEqual(self.digests(self.commit({"docs/d": "d2\n"}))["a"],
+                            base["a"])
+
+
+class TraceMatchedMain(DigestCase):
+    """designs/0018 A: a default-branch head whose tree tested green
+    runs traced, not matched, when a step's record is stale."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_record()
+        for name, value in (("MAIN_EVERY", True),
+                            ("TRACE_MATCHED_MAIN", True),
+                            ("CHAIN_WRITES_ONLY", False)):
+            patch = mock.patch.object(pc, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        for name in ("trace_wrapper", "tracer_for"):
+            patch = mock.patch.object(pc, name, lambda *a: None)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def green_elsewhere(self, files, at=T0 + DAY):
+        """A new default-branch head, its tree tested green as another
+        commit, and a record of that tree from a pull request's run
+        with step "a" only."""
+        tip = self.move_main(files)
+        tree = git("rev-parse", tip + "^{tree}", cwd=self.seed)
+        other = git("commit-tree", tree, "-p", tip, "-m", "twin",
+                    cwd=self.seed)
+        self.write_state({"results": {other: {
+            "pr": 7, "ok": True, "tree": tree, "finished": pc.iso(at),
+            "host": socket.gethostname(), "steps": pc.steps_digest()}},
+            "waiting": {}})
+        trace.write_record(self.state_dir, tree, tip, pc.steps_digest(),
+                           pc.iso(at), "preload", {"a": self.reads["a"]},
+                           {"a": []}, source="run")
+        return tip, other
+
+    def work_main(self, sha, at=T0 + DAY, slot=1):
+        self.write_state(dict(self.state(), waiting={sha: {
+            "pr": 0, "main": True, "since": pc.iso(at)}}))
+        clock = iter([at + datetime.timedelta(minutes=1),
+                      at + datetime.timedelta(minutes=2)])
+        return pc.worker(self.repo, self.state_dir, sha, 0, pc.sh,
+                         self.lines.append, lambda: next(clock), None,
+                         slot=slot, main=True)
+
+    def test_a_stale_record_runs_it_traced(self):
+        tip, _ = self.green_elsewhere({"B": "b2\n"})
+        self.assertEqual(self.work_main(tip), 0)
+        self.assertEqual(self.ran(), ["a", "b", "c"])
+        self.assertNotIn("matched", self.state()["results"][tip])
+        self.assertIn("MAIN-TRACE main %s: its tree tested green, but the "
+                      "records of b are stale or missing; run traced, not "
+                      "matched" % tip[:10], self.logged())
+
+    def test_records_that_hold_match_it(self):
+        tip, other = self.green_elsewhere({"Z": "z\n"})
+        self.assertEqual(self.work_main(tip), 0)
+        self.assertEqual(self.ran(), [])
+        self.assertEqual(self.state()["results"][tip]["matched"], other)
+
+    def test_off_a_stale_record_is_matched_as_before(self):
+        tip, other = self.green_elsewhere({"B": "b2\n"})
+        with mock.patch.object(pc, "TRACE_MATCHED_MAIN", False):
+            self.assertEqual(self.work_main(tip), 0)
+        self.assertEqual(self.ran(), [])
+        self.assertEqual(self.state()["results"][tip]["matched"], other)
+
+    def test_once_every_depends_minutes_per_slot(self):
+        tip, _ = self.green_elsewhere({"B": "b2\n"})
+        tree = git("rev-parse", tip + "^{tree}", cwd=self.seed)
+        git("checkout", "-q", "--detach", "--force", tip, cwd=self.repo)
+        when = T0 + DAY
+
+        def traced(slot, at):
+            return pc.trace_matched(self.state_dir, self.repo, tip, tree,
+                                    slot, at, pc.sh, self.lines.append)
+        self.assertTrue(traced(1, when))
+        self.assertFalse(traced(1, when + pc.DEPENDS_WAIT / 2))
+        self.assertTrue(traced(2, when + pc.DEPENDS_WAIT / 2))
+        self.assertTrue(traced(1, when + pc.DEPENDS_WAIT))
+
+    def test_missing_write_sets_count_with_chain_writes_only(self):
+        tip, _ = self.green_elsewhere({"Z": "z\n"})
+        with mock.patch.object(pc, "CHAIN_WRITES_ONLY", True):
+            self.assertEqual(self.work_main(tip), 0)
+        self.assertEqual(self.ran(), ["a", "b", "c"])
+        self.assertIn("the records of a, b, c are stale or missing",
+                      self.logged())
 
 
 class Worker(DigestCase):

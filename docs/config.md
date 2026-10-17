@@ -106,11 +106,14 @@ A value the host already sets wins.
 A green traced run of the default branch's head writes
 `depends/<tree>.json` in the build check's state directory:
 `{"tree", "commit", "steps", "at", "tracer", "reads": {step: [path]},
-"dirs": {step: [directory]}}`, paths relative to the worktree, `.` for
-its top. `reads` is every path the step opened, executed or looked for
-(found or not), less `.git` and build caches; `dirs` is each read
-path's directory and each read path that is a directory. Records are
-kept 14 days, and the newest always.
+"dirs": {step: [directory]}, "writes": {step: [path]}}`, paths relative
+to the worktree, `.` for its top. `reads` is every path the step
+opened, executed or looked for (found or not), less `.git` and build
+caches; `dirs` is each read path's directory and each read path that
+is a directory. `writes`, the step's write set (designs/0018), is every
+path it opened to write or create, and every directory, link or rename
+target it created; a record from before write sets has none. Records
+are kept 14 days, and the newest always.
 
 A pull request's steps that run with a record get two variables, so a
 project's own test runner can narrow further:
@@ -224,6 +227,33 @@ chosen by:
 * when it read a path the tree doesn't have, the digests of every
   earlier step, since such a path is another step's output (the
   worktree is cleaned first) and which step wrote it isn't recorded.
+  With `chain_writes_only`, see below.
+
+Three switches, each off by default since each changes which steps
+run, make reuse work for a project whose records went stale or whose
+digests all chain to the base (designs/0018). Turn on all three
+together, after one traced default-branch run with a release that
+records write sets:
+
+* **`trace_matched_main`** (with `main: "every"`): a default-branch
+  head that would be matched (`MAIN-GREEN … matched`) first asks which
+  steps lack a record, or have a stale one, at its tree, as `fresh`
+  does; with `chain_writes_only`, a step whose record has no write set
+  counts too. If any do, it runs traced instead (`MAIN-TRACE` in
+  `verdicts.log`), at most once every `depends_minutes` in each slot.
+* **`chain_writes_only`**: a path the tree doesn't have chains only the
+  digests of the earlier steps that wrote it: it is in a step's write
+  set or its `outputs`, beneath one of them, or a directory with one
+  beneath it. Any other such path is just absent. Until the record has
+  a write set for every earlier step, the step chains every earlier
+  step's digest, as without the switch. A step's `outputs`
+  (`["web/node_modules"]`) declare what it leaves behind out of the
+  tracer's sight, such as through a statically linked program.
+* **`dirs_by_names`**: a directory read with a file read beneath it
+  counts its entry names, not its tree, so a change beneath it that
+  the step never read doesn't stop the reuse. A directory with no file
+  read beneath it keeps its tree: that is the only evidence of what
+  the step read there.
 
 A step is reused, not run, when the newest verdict here (this host,
 these steps) with the same digest ran it green, or reused it, at most
@@ -545,7 +575,7 @@ reasons.
 | --- | --- | --- |
 | `context` | `vm/build-and-test` | The commit status the build check posts and the Merger requires. |
 | `poster` | `merge.merger` | The App that posts it; the Merger counts only its statuses. |
-| `steps` | one step, `make test` | What runs on each head, in order: `{"name": ..., "run": [argv], "only_if": path, "always": bool, "version": [argv], "reads_base": bool}`, `only_if` a file the head must have; with `depends`, `always` runs the step whatever changed, for a cheap step or one that depends on more than files (a statically linked tool the tracer can't see). |
+| `steps` | one step, `make test` | What runs on each head, in order: `{"name": ..., "run": [argv], "only_if": path, "always": bool, "version": [argv], "reads_base": bool, "outputs": [path]}`, `only_if` a file the head must have; `outputs`, paths inside the worktree the step leaves behind that the tracer may not see it write (`reuse.chain_writes_only`); with `depends`, `always` runs the step whatever changed, for a cheap step or one that depends on more than files (a statically linked tool the tracer can't see). |
 | `caches` | none | `{variable: directory name}`: each slot's own build cache, kept in the state directory, such as `{"CARGO_TARGET_DIR": "cargo-target"}`. |
 | `cache_limit` | none | The most a slot's `caches` may hold after a run, as a size such as `40G` (`K`, `M`, `G` or `T`); with it each run prunes its slot's caches (see below). Without it nothing is pruned. |
 | `slots` | `2` | Checks run at once (`$FORGE_PR_CHECK_SLOTS` overrides). |
@@ -568,6 +598,9 @@ reasons.
 | `merge_default` | `false` | Check a pull request's head merged with the default branch's tip, the tree GitHub's update makes, instead of the head alone (designs/0007; see below). |
 | `reuse` | none | `{"max_age_days": 7}`: don't run a step on inputs a green run here already passed (designs/0009; see below). Refused without `depends`. |
 | `reuse.max_age_days` | `7` | How long a step's green verdict stands for the same inputs, counted from the run that ran it. At least 1. |
+| `reuse.trace_matched_main` | `false` | Run a default-branch head that would be matched traced instead, when a step's record at its tree is missing or stale, at most once every `depends_minutes` in each slot (designs/0018; see above). Refused unless `main` is `every`. |
+| `reuse.chain_writes_only` | `false` | A path a step read that the tree lacks chains only the earlier steps that wrote it (their write sets and `outputs`), not every earlier step (designs/0018). |
+| `reuse.dirs_by_names` | `false` | A directory read with a file read beneath it is digested by its entry names, not its tree (designs/0018). |
 | `fresh` | none | `{"wait_minutes": 15}`: every green run writes a dependency record, each step is chosen from its own freshest record, and a head that runs a step only because its record is stale waits for a fresh one (designs/0010; see below). Refused without `depends`. |
 | `fresh.wait_minutes` | `15` | The longest a head waits for a fresh record before it runs as it would without `fresh`. At least 1. |
 

@@ -439,6 +439,9 @@ class RealRuns(StateCase):
         self.assertNotIn("B", record["reads"]["show"])
         self.assertIn("docs", record["reads"]["list"])
         self.assertIn("docs", record["dirs"]["list"])
+        # And what each wrote in the worktree (designs/0018): nothing.
+        self.assertEqual(record["writes"], {"show": [], "list": [],
+                                            "base": []})
         self.assertIn("MAIN-GREEN main %s" % self.main[:10], self.logged())
         self.assertEqual([p[:2] for p in self.posts],
                          [(self.main, "pending"), (self.main, "success")])

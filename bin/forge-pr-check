@@ -456,6 +456,18 @@ VERSIONS = {}
 # Steps whose digest leaves CHECK_BASE out (`"reads_base": false`).
 NO_BASE = frozenset()
 STEP_ENTRIES = {}
+# checks.reuse's switches (designs/0018), each off by default:
+# `trace_matched_main`, a default-branch head that would be matched runs
+# traced when a step's record is missing or stale; `chain_writes_only`,
+# only a missing path an earlier step wrote (its write set, or its
+# `outputs`) chains that step's digest; `dirs_by_names`, a directory
+# with a file read beneath it is digested by its entry names.
+TRACE_MATCHED_MAIN = False
+CHAIN_WRITES_ONLY = False
+DIRS_BY_NAMES = False
+# Each step's declared `outputs`, by name: paths it leaves behind that
+# the tracer may not see it write.
+OUTPUTS = {}
 # How long a step's `version` command may take.
 VERSION_TIMEOUT_S = 60
 # checks.cache_limit: the most a slot's caches may hold, in bytes, after
@@ -611,7 +623,7 @@ def configure(project):
     `step_timeout_minutes`, `merger_first`, `depends`,
     `depends_minutes`, `tracer`, `fast_lane`, `merge_default`,
     `cache_limit`, `reuse`, `fresh`, `first_authors`, `max_wait_minutes`,
-    `keep_ignored`, each step's `always` and `version`),
+    `keep_ignored`, each step's `always`, `version` and `outputs`),
     each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
     implies `merger_first`."""
@@ -621,6 +633,7 @@ def configure(project):
     global TEST_AHEAD, SPARE_ONLY, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
+    global TRACE_MATCHED_MAIN, CHAIN_WRITES_ONLY, DIRS_BY_NAMES, OUTPUTS
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
     global RED_COMMENT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED
@@ -646,6 +659,12 @@ def configure(project):
     # The configuration refuses reuse without depends.
     REUSE_AGE = datetime.timedelta(days=checks["reuse"].get(
         "max_age_days", DEFAULT_REUSE_DAYS)) if "reuse" in checks else None
+    reuse = checks.get("reuse", {})
+    TRACE_MATCHED_MAIN = reuse.get("trace_matched_main", False)
+    CHAIN_WRITES_ONLY = reuse.get("chain_writes_only", False)
+    DIRS_BY_NAMES = reuse.get("dirs_by_names", False)
+    OUTPUTS = {s["name"]: [o.strip("/") for o in s["outputs"]]
+               for s in checks.get("steps", []) if s.get("outputs")}
     DEPENDS = checks.get("depends", False)
     DEPENDS_WAIT = datetime.timedelta(minutes=checks.get(
         "depends_minutes", DEFAULT_DEPENDS_MINUTES))
@@ -2634,11 +2653,11 @@ def choose_fresh(wt, sha, state_dir, run=sh, names=None, onto=None):
 
 def compose(state_dir, selection, slot, when):
     """The record a fresh selection chose each step from, as one record
-    ({"reads", "dirs", "from": {step: path}}), written as
+    ({"reads", "dirs", "writes", "from": {step: path}}), written as
     depends/.selection-<slot>.json for CHECK_DEPENDS and the steps'
     digests: (path, record). A step whose record has been pruned since
     is left out, as a step no record has."""
-    loaded, reads, dirs = {}, {}, {}
+    loaded, reads, dirs, writes = {}, {}, {}, {}
     for name, path in sorted(selection["records"].items()):
         if path not in loaded:
             try:
@@ -2652,12 +2671,16 @@ def compose(state_dir, selection, slot, when):
             continue
         reads[name] = record["reads"][name]
         dirs[name] = (record.get("dirs") or {}).get(name, [])
+        if name in (record.get("writes") or {}):
+            writes[name] = record["writes"][name]
     sources = {name: selection["records"][name] for name in reads}
-    record = {"reads": reads, "dirs": dirs, "from": sources}
+    record = {"reads": reads, "dirs": dirs, "writes": writes,
+              "from": sources}
     path = trace.write_record(state_dir, "", selection["record"],
                               steps_digest(), iso(when), "", reads, dirs,
                               source="selection", sources=sources,
-                              name=".selection-%d.json" % slot)
+                              name=".selection-%d.json" % slot,
+                              writes=writes)
     return path, record
 
 
@@ -2676,18 +2699,66 @@ def records_key(state_dir, tip):
     return "%s %d %d" % (tip or "", len(names), max(stamps or [0]))
 
 
-def main_needs(checkout, head, state_dir, run=sh):
+def main_needs(checkout, head, state_dir, run=sh, writes=False):
     """The steps the default branch's head (sha, tree) needs traced
     (checks.fresh): those whose record is stale at its tree, or that
     no record has. None means every step (no record answers at all).
-    A head that needs none isn't traced: every record still holds."""
+    A head that needs none isn't traced: every record still holds.
+    With `writes`, also those whose record has no write set
+    (designs/0018), which CHAIN_WRITES_ONLY needs."""
     sha, _ = head
     names = [name for name, _, _ in applicable_at(checkout, sha, run)]
-    selection = choose_fresh(checkout, sha, state_dir, run, names)
+    selection = choose_fresh(checkout, sha, state_dir, run, names, onto=sha)
     if "every" in selection:
         return None
-    return sorted(n for n, why in selection["ran"].items()
-                  if n in selection["stale"] or why == "not in any record")
+    needs = {n for n, why in selection["ran"].items()
+             if n in selection["stale"] or why == "not in any record"}
+    if writes:
+        loaded = {}
+        for name, path in selection["records"].items():
+            if path not in loaded:
+                try:
+                    with open(path) as handle:
+                        loaded[path] = json.load(handle)
+                except (OSError, ValueError):
+                    loaded[path] = None
+            record = loaded[path]
+            if not isinstance(record, dict) \
+                    or name not in (record.get("writes") or {}):
+                needs.add(name)
+    return sorted(needs)
+
+
+def trace_matched(state_dir, wt, sha, tree, slot, when, run=sh, out=print):
+    """With TRACE_MATCHED_MAIN (designs/0018), whether a default-branch
+    head the worker would match runs traced instead: when a step's
+    record is missing or stale at its tree (`main_needs`; with
+    CHAIN_WRITES_ONLY, also one with no write set), and this slot
+    hasn't traced one instead of matching it in the last
+    DEPENDS_WAIT. Logged MAIN-TRACE when it does."""
+    if not (TRACE_MATCHED_MAIN and DEPENDS and MAIN_EVERY):
+        return False
+    with state_lock(state_dir):
+        last = load(state_dir).get("main_traced", {}).get(str(slot))
+    try:
+        if last is not None and when - parse(last) < DEPENDS_WAIT:
+            return False
+    except (TypeError, ValueError):
+        pass
+    needs = main_needs(wt, (sha, tree), state_dir, run,
+                       writes=CHAIN_WRITES_ONLY)
+    if needs == []:
+        return False
+    with state_lock(state_dir):
+        state = load(state_dir)
+        state.setdefault("main_traced", {})[str(slot)] = iso(when)
+        save(state_dir, state)
+    log(state_dir, "MAIN-TRACE %s %s: its tree tested green, but %s; "
+        "run traced, not matched"
+        % (MAIN, sha[:10], "no record answers" if needs is None else
+           "the records of %s are stale or missing" % ", ".join(needs)),
+        when, out)
+    return True
 
 
 def busy_trees(shas, checkout, run=sh):
@@ -2966,7 +3037,15 @@ def step_digests(wt, commit, record, env, run=sh, names=None):
     command's output. The worktree is cleaned before any step runs, so
     a path the step read that commit doesn't have was either not there
     or written by a step; when there is one, the digests of every
-    earlier step count too, since which step wrote it isn't recorded."""
+    earlier step count too, since which step wrote it isn't recorded.
+
+    designs/0018: with CHAIN_WRITES_ONLY, once the record has a write
+    set for every earlier step, such a path counts only the digests of
+    the earlier steps that wrote it or declare it in `outputs`
+    (`trace.output_of`); one no earlier step wrote is just absent. With
+    DIRS_BY_NAMES, a directory read with a file read beneath it counts
+    its entry names, not its tree, whose other changes the step never
+    looked at; one with no file read beneath keeps its tree."""
     if names is None:
         names = [name for name, _, _ in applicable(wt)]
     listed = tree_entries(wt, commit, run)
@@ -2979,11 +3058,18 @@ def step_digests(wt, commit, record, env, run=sh, names=None):
         return {}
     steps = {name: (name, args, only_if) for name, args, only_if in STEPS}
     digests, earlier = {}, []
+    # (name, what it wrote or None) of each earlier step, for
+    # CHAIN_WRITES_ONLY: None when the record has no write set for it.
+    wrote = []
     # Each distinct version command runs once: steps usually share one,
     # and on a loaded host a run is a quarter of a second.
     versions = {}
     for name in names:
         reads = record.get("reads", {}).get(name)
+        writes = (record.get("writes") or {}).get(name) \
+            if CHAIN_WRITES_ONLY else None
+        wrote.append((name, None if writes is None else trace.outputs_index(
+            list(writes) + OUTPUTS.get(name, []))))
         if reads is None:
             earlier.append(None)
             continue
@@ -2992,17 +3078,40 @@ def step_digests(wt, commit, record, env, run=sh, names=None):
         def add(*parts):
             h.update(json.dumps(parts).encode() + b"\n")
         add("entry", STEP_ENTRIES.get(name) or list(steps.get(name, ())))
-        written = False
+        missing = []
+        # The directories with a file read beneath them (DIRS_BY_NAMES).
+        above = set()
+        if DIRS_BY_NAMES:
+            for path in reads:
+                meta = entries.get(path)
+                if meta and meta.split()[1:2] != ["tree"]:
+                    while "/" in path:
+                        path = path.rpartition("/")[0]
+                        above.add(path)
         for path in sorted(reads):
             meta = entries.get(path)
             if meta is None and path != ".":
-                written = True
-            add("read", path, meta or "absent")
+                missing.append(path)
+            if path in above and meta.split()[1:2] == ["tree"]:
+                add("names", path, children.get(path))
+            else:
+                add("read", path, meta or "absent")
         for folder in sorted(record.get("dirs", {}).get(name, ())):
             add("dir", folder, children.get(folder))
         if name not in NO_BASE:
             add("base", base_tree)
-        if written:
+        if missing and CHAIN_WRITES_ONLY and all(
+                w is not None for _, w in wrote[:-1]):
+            # designs/0018: only the earlier steps that wrote one.
+            chained = [(other, digest) for (other, w), digest
+                       in zip(wrote[:-1], earlier)
+                       if any(trace.output_of(p, w) for p in missing)]
+            if any(digest is None for _, digest in chained):
+                earlier.append(None)
+                continue
+            if chained:
+                add("outputs", chained)
+        elif missing:
             if None in earlier:
                 earlier.append(None)
                 continue
@@ -3119,7 +3228,7 @@ def record_depends(state_dir, wt, sha, tree, files, env, tracer, when,
     inside = [os.path.relpath(env[v], wt) for v in CACHES if v in env
               and os.path.abspath(env[v]).startswith(
                   os.path.abspath(wt) + os.sep)]
-    reads, dirs, implausible = {}, {}, []
+    reads, dirs, writes, implausible = {}, {}, {}, []
     for name, path in files.items():
         entries = trace.read_strace(path, wt) if kind == "strace" \
             else trace.read_preload(path)
@@ -3133,6 +3242,7 @@ def record_depends(state_dir, wt, sha, tree, files, env, tracer, when,
             continue
         reads[name] = trace.relative(entries, wt, inside)
         dirs[name] = trace.directories(reads[name], wt)
+        writes[name] = trace.written(entries, wt, inside)
     if implausible:
         log(state_dir, "DEPENDS-UNUSABLE %s %s: %s recorded nothing, not "
             "even its own program; nothing recorded"
@@ -3141,7 +3251,7 @@ def record_depends(state_dir, wt, sha, tree, files, env, tracer, when,
     if not tree:
         return None
     path = trace.write_record(state_dir, tree, sha, steps_digest(),
-                              iso(when), kind, reads, dirs)
+                              iso(when), kind, reads, dirs, writes=writes)
     trace.prune_records(state_dir, when, parse,
                         FRESH_KEEP if FRESH_WAIT is not None else None)
     out("  recorded what %d steps read: %s"
@@ -3171,7 +3281,7 @@ def record_run(state_dir, wt, sha, checked, tree, files, env, tracer, when,
     inside = [os.path.relpath(env[v], wt) for v in CACHES if v in env
               and os.path.abspath(env[v]).startswith(
                   os.path.abspath(wt) + os.sep)]
-    reads, dirs, sources, implausible = {}, {}, {}, []
+    reads, dirs, writes, sources, implausible = {}, {}, {}, {}, []
     for step, path in files.items():
         entries = None
         if step in NO_BASE:
@@ -3189,6 +3299,7 @@ def record_run(state_dir, wt, sha, checked, tree, files, env, tracer, when,
             continue
         reads[step] = trace.relative(entries, wt, inside)
         dirs[step] = trace.directories(reads[step], wt)
+        writes[step] = trace.written(entries, wt, inside)
         sources[step] = "run"
     if implausible:
         log(state_dir, "DEPENDS-UNUSABLE %s %s: %s recorded nothing, not "
@@ -3200,6 +3311,8 @@ def record_run(state_dir, wt, sha, checked, tree, files, env, tracer, when,
         if step in NO_BASE and composed and step in composed["reads"]:
             reads[step] = composed["reads"][step]
             dirs[step] = composed["dirs"].get(step, [])
+            if step in (composed.get("writes") or {}):
+                writes[step] = composed["writes"][step]
             sources[step] = composed["from"][step]
     if not reads or not tree:
         return None
@@ -3218,10 +3331,12 @@ def record_run(state_dir, wt, sha, checked, tree, files, env, tracer, when,
             if step not in reads:
                 reads[step] = read
                 dirs[step] = (earlier.get("dirs") or {}).get(step, [])
+                if step in (earlier.get("writes") or {}):
+                    writes[step] = earlier["writes"][step]
                 sources[step] = (earlier.get("from") or {}).get(step, "run")
     path = trace.write_record(state_dir, tree, checked, steps_digest(),
                               iso(when), kind, reads, dirs, source="run",
-                              sources=sources)
+                              sources=sources, writes=writes)
     trace.prune_records(state_dir, when, parse, FRESH_KEEP)
     out("  recorded what %d steps read: %s"
         % (len(reads), os.path.basename(path)))
@@ -3401,7 +3516,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             # since writing that is what the traced run is for.
             with state_lock(state_dir):
                 same = tested(load(state_dir), tree, started, ok=True)
-            if same is not None and same != sha:
+            if same is not None and same != sha and not trace_matched(
+                    state_dir, wt, sha, tree, slot, started, run, out):
                 settled = True
                 matched(state_dir, sha, 0, same, tree, started, None, out,
                         main=True)

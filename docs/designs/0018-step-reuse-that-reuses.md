@@ -2,6 +2,7 @@
 
 * Status: approved (Alex, 2026-10-17, in XMPPEngineer's session, recorded at
   https://github.com/abligh/agent-forge/issues/27#issuecomment-6230450578)
+* Implemented: v0.4.71, off until configured.
 * Author: XMPPEngineer
 * Date: 2026-10-17
 

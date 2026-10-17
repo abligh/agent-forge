@@ -242,8 +242,19 @@ class Choose(StateCase):
         self.assertEqual(pc.main_needs(self.wt, main(), self.state_dir),
                          ["list"])
 
+    def test_main_needs_write_sets_when_asked(self):
+        # designs/0018: chain_writes_only needs each step's write set.
+        main = (git("rev-parse", MAIN_REF, cwd=self.wt), "")
+        self.record(self.first)
+        self.assertEqual(pc.main_needs(self.wt, main, self.state_dir), [])
+        self.assertEqual(pc.main_needs(self.wt, main, self.state_dir,
+                                       writes=True), ["list", "show"])
+        self.record(self.first, writes={"show": [], "list": ["out"]})
+        self.assertEqual(pc.main_needs(self.wt, main, self.state_dir,
+                                       writes=True), [])
+
     def test_compose(self):
-        old = self.record(self.first)
+        old = self.record(self.first, writes={"show": [], "list": ["out"]})
         tip = self.move_main({"A": "a2"})
         new = self.record(tip, steps=("show",), at=T0 + MINUTE, source="run")
         head = self.commit({"B": "b2"}, at=tip)
@@ -254,6 +265,9 @@ class Choose(StateCase):
         with open(path) as handle:
             written = json.load(handle)
         self.assertEqual(written["reads"], {"show": ["A"], "list": ["docs"]})
+        # A write set only where the chosen record has one.
+        self.assertEqual(written["writes"], {"list": ["out"]})
+        self.assertEqual(record["writes"], {"list": ["out"]})
         self.assertEqual(written["source"], "selection")
         # Not a record to choose from.
         self.assertEqual(len(trace.load_records(self.state_dir)), 2)
@@ -543,6 +557,8 @@ class Records(RepoCase):
         self.assertEqual(record["reads"]["show"], self.record_of(
             self.first)["reads"]["show"])
         self.assertEqual(record["from"], {"list": "run", "show": main_path})
+        # Write sets too (designs/0018): traced, or carried with the reads.
+        self.assertEqual(record["writes"], {"list": [], "show": []})
         # `base` is given CHECK_BASE, so a narrowed run says too little.
         self.assertNotIn("base", record["reads"])
         selection = self.state()["results"][head]["selection"]
