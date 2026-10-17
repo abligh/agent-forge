@@ -2,6 +2,8 @@
 
 * Status: approved (Alex, 2026-10-16, in XMPPEngineer's session, recorded at
   https://github.com/abligh/agent-forge/issues/26#issuecomment-6226988236)
+* Implemented: v0.4.69, off until configured. Needs the agents and
+  their relay on an xmpp-mcp that reports `shell` (its steps 1 and 2).
 * Author: XMPPEngineer
 * Date: 2026-10-16
 
