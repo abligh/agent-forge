@@ -494,7 +494,8 @@ could start. With `idle_offer`, each router run reads the relay's
 from the other rules, is offered the oldest issue it owns
 (`Owner:<Name>`) that it can act on: not waiting on the owner or on
 someone outside, nothing its `Blocked-by:` lines name still open, and
-not referenced by an open pull request of its own. With
+not referenced by an open pull request of its own (a closing
+reference, or `#N`, its URL or "issue N" in the body). With
 `shell_minutes`, an agent shown `shell` that long counts as idle too:
 its turn has ended and only a background task it started still runs,
 such as a wait loop that will never finish (designs/0017). Its offer

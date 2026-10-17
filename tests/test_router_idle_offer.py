@@ -354,9 +354,21 @@ class Actionable(unittest.TestCase):
             self.assertEqual(self.offer([owned(30), owned(31, created=T1)],
                                         prs=[pr(41, **kind)]), ["#31"], kind)
 
+    def test_not_when_its_own_pull_request_names_it_in_words(self):
+        # As commit messages do: "(issue 30)".
+        for body in ("Write the cat (issue 30).", "For Issue 30.",
+                     "issues 29 and 30", "issues 28, 30 and 32",
+                     "issues 28, 29, and 30"):
+            self.assertEqual(self.offer([owned(30), owned(31, created=T1)],
+                                        prs=[pr(41, body=body)]), ["#31"],
+                             body)
+
     def test_a_reference_that_isnt_one(self):
         self.assertEqual(self.offer([owned(30)], prs=[pr(41, body=(
             "x#30, &#30; and pull/30 are not references"))]), ["#30"])
+        self.assertEqual(self.offer([owned(30)], prs=[pr(41, body=(
+            "tissue 30, issue30 and issues of 30 are not either"))]),
+            ["#30"])
 
     def test_someone_elses_pull_request_does_not_count(self):
         self.assertEqual(self.offer([owned(30)], prs=[

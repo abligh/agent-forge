@@ -951,16 +951,24 @@ def idle_sweep(ctx):
 # A pull request body's reference to an issue: `#N`, or its URL.
 REFERENCE_RE = re.compile(
     r"(?<![\w/&])#(\d+)\b|/issues/(\d+)\b")
+# "issue 12", "issues 12 and 13", "issues 12, 13 and 14": how commit
+# messages, and so many pull request bodies, name an issue.
+WORDED_RE = re.compile(
+    r"\bissues?[ \t]+(\d+(?:(?:[ \t]*,[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+)"
+    r"\d+)*)\b", re.IGNORECASE)
 
 
 def referenced_by(pr):
     """The issue numbers a pull request references: GitHub's closing
-    references, and every `#N` or issue URL in its body."""
+    references, and every `#N`, issue URL or "issue N" in its body."""
     refs = pr.get("closingIssuesReferences") or {}
     nodes = refs.get("nodes") if isinstance(refs, dict) else refs
     numbers = {n.get("number") for n in nodes or [] if isinstance(n, dict)}
-    for m in REFERENCE_RE.finditer(pr.get("body") or ""):
+    body = pr.get("body") or ""
+    for m in REFERENCE_RE.finditer(body):
         numbers.add(int(m.group(1) or m.group(2)))
+    for m in WORDED_RE.finditer(body):
+        numbers |= {int(n) for n in re.findall(r"\d+", m.group(1))}
     return numbers
 
 
