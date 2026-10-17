@@ -151,15 +151,21 @@ every test executable it has ever linked, one per change of its
 inputs, and never removes them. With `cache_limit`, each run prunes its
 slot's caches as it finishes, while it still holds the slot:
 
-1. executables directly in a `deps` directory, older than a day, that
-   the default branch's last green run in the slot didn't write;
+1. executables (no extension) directly in a `deps` directory, older
+   than a day, that the default branch's last green run in the slot
+   didn't write (written between its start and end; 3 hours from its
+   start when no end was recorded), each with its split debug info
+   (`<name>.*.dwo`); and any `.dwo` older than a day whose unit has
+   nothing left in the directory but its `.d`;
 2. directories directly in an `incremental` directory with nothing in
    them touched for 7 days;
 3. then, until the slot's caches hold at most `cache_limit`, whole
-   directories, each aged by its newest file, oldest first: those
-   directly in an `incremental` directory, then those directly in a
-   cache (a build profile such as `debug`, or a target with its
-   profiles).
+   directories directly in an `incremental` directory, each aged by its
+   newest file, oldest first. Only while they hold more than one and a
+   half times `cache_limit` does it go on to whole directories directly
+   in a cache (a build profile such as `debug`, or a target with its
+   profiles), since each of those is a cold build. Between the limit
+   and that, the run logs `CACHE-OVER-LIMIT` with how much is over.
 
 Pass 3 never removes a single file. A build tool trusts what it
 recorded about the files it wrote, so a file missing from a directory

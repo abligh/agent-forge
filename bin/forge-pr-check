@@ -412,6 +412,7 @@ import resource
 import shutil
 import signal
 import socket
+import stat
 import statistics
 import subprocess
 import sys
@@ -461,11 +462,17 @@ VERSION_TIMEOUT_S = 60
 # a run prunes them (`prune_caches`); None: never pruned.
 CACHE_LIMIT = None
 # What pruning takes first: executables under a `deps` directory older
-# than this that neither this run nor the default branch's last green
-# run in the slot wrote, and `incremental` directories untouched for
-# longer than this.
+# than this that the default branch's last green run in the slot didn't
+# write (and their split debug info), and `incremental` directories
+# untouched for longer than this.
 STALE_EXECUTABLE = datetime.timedelta(days=1)
 STALE_INCREMENTAL = datetime.timedelta(days=7)
+# How long the default branch's last green run is taken to have written
+# for, when its end wasn't recorded (state from before `cache_main_end`).
+MAIN_RUN_WINDOW = datetime.timedelta(hours=3)
+# Only past this many times the limit does pruning take whole profiles
+# (`debug`, a target): a cold build, but not a full disk.
+CACHE_CEILING = 1.5
 SIZE_UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 DEFAULT_STEP_TIMEOUT_S = 30 * 60
 STEP_TIMEOUT_S = DEFAULT_STEP_TIMEOUT_S
@@ -2262,32 +2269,47 @@ def newest_mtime(path):
     return newest
 
 
-def prune_caches(roots, limit, now, main_since=None):
+def prune_caches(roots, limit, now, main_since=None, main_until=None):
     """Prune a slot's build caches, `roots`, in three passes, and return
-    what went: {"executables", "incremental", "units", "freed", "left"}.
+    what went: {"executables", "dwo", "incremental", "units", "freed",
+    "left", "over"}.
 
-    1. Executables directly in any `deps` directory older than
-       STALE_EXECUTABLE that the default branch's last green run in
-       the slot didn't write (mtime before `main_since`, its start):
-       each head's rebuilt test binaries, which nothing runs again.
+    1. Executables (no extension) directly in any `deps` directory older
+       than STALE_EXECUTABLE that the default branch's last green run in
+       the slot didn't write (mtime from `main_since`, its start, to
+       `main_until`, its end, or MAIN_RUN_WINDOW after its start): each
+       head's rebuilt test binaries, which nothing runs again. With
+       each, its split debug info (`<name>.*.dwo` beside it); and any
+       `.dwo` that old whose unit (`<stem>-<hash>`, before the first
+       dot) has no other file left in the directory but its `.d`. A
+       start alone never keeps everything newer than it: the default
+       branch may not run green in the slot for days.
     2. Directories directly in any `incremental` directory with nothing
        in them touched for STALE_INCREMENTAL.
-    3. Then, until the caches hold at most `limit`, whole directories,
-       each aged by its newest file, oldest first: those directly in an
-       `incremental` directory, then those directly in a root. Never a
-       single file: a build tool trusts what it recorded about the
-       files it wrote, so one missing from a directory it still uses
-       can break a build (a hollow incremental session crashed rustc),
-       where a missing directory only makes it start that part afresh.
+    3. Then, until the caches hold at most `limit`, whole directories
+       directly in an `incremental` directory, each aged by its newest
+       file, oldest first. Never a single file: a build tool trusts what
+       it recorded about the files it wrote, so one missing from a
+       directory it still uses can break a build (a hollow incremental
+       session crashed rustc), where a missing directory only makes it
+       start that part afresh. Whole directories directly in a root (a
+       profile such as `debug`, a target) go only while the caches hold
+       more than CACHE_CEILING times `limit`: that is a cold build, so
+       it is kept for a disk that would otherwise fill. Between the
+       limit and the ceiling, what is over is returned as `over`.
 
-    `now` and `main_since` are epoch seconds. A root that is a link, or
-    isn't there, is left alone."""
-    gone = {"executables": 0, "incremental": 0, "units": 0, "freed": 0}
+    `now`, `main_since` and `main_until` are epoch seconds. A root that
+    is a link, or isn't there, is left alone."""
+    gone = {"executables": 0, "dwo": 0, "incremental": 0, "units": 0,
+            "freed": 0, "over": 0}
     roots = [r for r in roots if os.path.isdir(r) and not os.path.islink(r)]
     stale = now - STALE_EXECUTABLE.total_seconds()
-    if main_since is not None:
-        stale = min(stale, main_since)
+    if main_since is not None and main_until is None:
+        main_until = main_since + MAIN_RUN_WINDOW.total_seconds()
     old = now - STALE_INCREMENTAL.total_seconds()
+
+    def mains(mtime):
+        return main_since is not None and main_since <= mtime <= main_until
 
     def remove(path, size, kind):
         try:
@@ -2301,15 +2323,7 @@ def prune_caches(roots, limit, now, main_since=None):
         for top, dirs, files in os.walk(root):
             name = os.path.basename(top)
             if name == "deps":
-                for entry in files:
-                    path = os.path.join(top, entry)
-                    try:
-                        st = os.lstat(path)
-                    except OSError:
-                        continue
-                    if (not os.path.islink(path) and st.st_mode & 0o111
-                            and st.st_mtime < stale):
-                        remove(path, st.st_size, "executables")
+                prune_deps(top, files, stale, mains, remove)
             elif name == "incremental":
                 for entry in list(dirs):
                     path = os.path.join(top, entry)
@@ -2325,12 +2339,13 @@ def prune_caches(roots, limit, now, main_since=None):
                     gone["freed"] += size
     total = sum(st.st_size for root in roots for _, st in files_under(root))
     if limit is not None:
-        for units in (lambda: incremental_sessions(roots),
-                      lambda: top_directories(roots)):
-            if total <= limit:
+        for units, keep in ((lambda: incremental_sessions(roots), limit),
+                            (lambda: top_directories(roots),
+                             limit * CACHE_CEILING)):
+            if total <= keep:
                 break
             for path in sorted(units(), key=newest_mtime):
-                if total <= limit:
+                if total <= keep:
                     break
                 size = sum(st.st_size for _, st in files_under(path))
                 try:
@@ -2340,8 +2355,49 @@ def prune_caches(roots, limit, now, main_since=None):
                 gone["units"] += 1
                 gone["freed"] += size
                 total -= size
+        gone["over"] = max(0, total - limit)
     gone["left"] = total
     return gone
+
+
+def prune_deps(top, files, stale, mains, remove):
+    """Pass 1 of prune_caches in one `deps` directory, `top`, holding
+    `files`: stale executables, their `.dwo`, and orphaned `.dwo`."""
+    def unit(entry):
+        return entry.split(".", 1)[0]
+
+    dwo = {}
+    live = set()
+    for entry in files:
+        if entry.endswith(".dwo"):
+            dwo.setdefault(unit(entry), []).append(entry)
+        elif not entry.endswith(".d"):
+            live.add(unit(entry[3:] if entry.startswith("lib") else entry))
+    for entry in files:
+        if "." in entry or entry.endswith(".dwo"):
+            continue
+        path = os.path.join(top, entry)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if (not os.path.islink(path) and stat.S_ISREG(st.st_mode)
+                and st.st_mode & 0o111 and st.st_mtime < stale
+                and not mains(st.st_mtime)):
+            remove(path, st.st_size, "executables")
+            if not os.path.exists(path):
+                live.discard(entry)
+    for name, entries in dwo.items():
+        if name in live:
+            continue
+        for entry in entries:
+            path = os.path.join(top, entry)
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if not os.path.islink(path) and st.st_mtime < stale:
+                remove(path, st.st_size, "dwo")
 
 
 def incremental_sessions(roots):
@@ -2376,11 +2432,15 @@ def prune_slot_caches(state_dir, slot, out=print):
     if CACHE_LIMIT is None or not CACHES:
         return None
     try:
-        since = load(state_dir).get("cache_main", {}).get(str(slot))
+        state = load(state_dir)
+        since = state.get("cache_main", {}).get(str(slot))
+        until = state.get("cache_main_end", {}).get(str(slot))
+        if since is not None and until is not None and until < since:
+            until = None  # an end from an earlier run than the start
         gone = prune_caches(
             [os.path.join(state_dir, slot_name(folder, slot))
              for folder in CACHES.values()],
-            CACHE_LIMIT, time.time(), since)
+            CACHE_LIMIT, time.time(), since, until)
     except Exception as err:
         log(state_dir, "CACHE-PRUNE-FAILED %s: %s: %s"
             % (slot_label(slot), type(err).__name__, err), now_utc(), out)
@@ -2388,9 +2448,15 @@ def prune_slot_caches(state_dir, slot, out=print):
     if gone["freed"]:
         log(state_dir, "CACHE-PRUNED %s: freed %d bytes (%d executables, %d "
             "incremental directories, %d directories over the limit); %d "
-            "bytes left" % (slot_label(slot), gone["freed"],
-                            gone["executables"], gone["incremental"],
-                            gone["units"], gone["left"]),
+            "bytes left; %d split debug info files"
+            % (slot_label(slot), gone["freed"], gone["executables"],
+               gone["incremental"], gone["units"], gone["left"],
+               gone["dwo"]),
+            now_utc(), out)
+    if gone.get("over"):
+        log(state_dir, "CACHE-OVER-LIMIT %s: %d bytes over the limit of %d "
+            "after pruning; whole profiles go only past %g times it"
+            % (slot_label(slot), gone["over"], CACHE_LIMIT, CACHE_CEILING),
             now_utc(), out)
     return gone
 
@@ -3495,6 +3561,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 if ok:
                     # What this slot's cache pruning keeps (prune_caches).
                     state.setdefault("cache_main", {})[str(slot)] = begun
+                    state.setdefault("cache_main_end", {})[str(slot)] = \
+                        time.time()
             if selection is not None:
                 record["selection"] = selection
             if merge:

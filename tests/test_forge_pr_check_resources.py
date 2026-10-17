@@ -245,9 +245,57 @@ class PruneCaches(unittest.TestCase):
     def test_what_mains_last_green_run_wrote_stays(self):
         mains = make(self.path("debug", "deps", "t-main"), 1, 3, True)
         older = make(self.path("debug", "deps", "t-old"), 1, 5, True)
-        pc.prune_caches([self.root], None, NOW, main_since=NOW - 4 * DAY)
+        newer = make(self.path("debug", "deps", "t-new"), 1, 2, True)
+        pc.prune_caches([self.root], None, NOW, main_since=NOW - 4 * DAY,
+                        main_until=NOW - 3 * DAY)
         self.assertTrue(os.path.exists(mains))
         self.assertFalse(os.path.exists(older))
+        self.assertFalse(os.path.exists(newer))
+
+    def test_an_old_start_keeps_only_its_window(self):
+        # A start alone used to keep everything newer than it: when the
+        # default branch hadn't run green in a slot for days, no test
+        # binary was ever pruned there.
+        mains = make(self.path("debug", "deps", "t-main"), 1, 4 - 1 / 24,
+                     True)
+        later = make(self.path("debug", "deps", "t-later"), 1, 2, True)
+        pc.prune_caches([self.root], None, NOW, main_since=NOW - 4 * DAY)
+        self.assertTrue(os.path.exists(mains))
+        self.assertFalse(os.path.exists(later))
+
+    def test_only_extensionless_executables_are_test_binaries(self):
+        macro = make(self.path("debug", "deps", "libm-aaa.so"), 1, 3, True)
+        script = make(self.path("debug", "deps", "run.sh"), 1, 3, True)
+        pc.prune_caches([self.root], None, NOW)
+        self.assertTrue(os.path.exists(macro))
+        self.assertTrue(os.path.exists(script))
+
+    def test_a_pruned_executables_split_debug_info_goes_with_it(self):
+        exe = make(self.path("debug", "deps", "t-aaa"), 10, 3, True)
+        dwos = [make(self.path("debug", "deps", "t-aaa.%s.rcgu.dwo" % n), 2, 3)
+                for n in ("cgu0.0a", "cgu1.0b")]
+        dep_info = make(self.path("debug", "deps", "t-aaa.d"), 1, 3)
+        gone = pc.prune_caches([self.root], None, NOW)
+        self.assertFalse(any(os.path.exists(p) for p in [exe] + dwos))
+        self.assertTrue(os.path.exists(dep_info))
+        self.assertEqual((gone["executables"], gone["dwo"], gone["freed"]),
+                         (1, 2, 14))
+
+    def test_orphaned_split_debug_info_goes_a_live_units_stays(self):
+        orphan = make(self.path("debug", "deps", "o-bbb.x.rcgu.dwo"), 2, 3)
+        make(self.path("debug", "deps", "o-bbb.d"), 1, 3)
+        recent = make(self.path("debug", "deps", "r-ccc.x.rcgu.dwo"), 2, 0.1)
+        lib = make(self.path("debug", "deps", "libl-ddd.rlib"), 5, 3)
+        libs = make(self.path("debug", "deps", "l-ddd.x.rcgu.dwo"), 2, 3)
+        meta = make(self.path("debug", "deps", "libm-eee.rmeta"), 5, 3)
+        metas = make(self.path("debug", "deps", "m-eee.x.rcgu.dwo"), 2, 3)
+        live = make(self.path("debug", "deps", "t-fff"), 5, 0.1, True)
+        lives = make(self.path("debug", "deps", "t-fff.x.rcgu.dwo"), 2, 3)
+        gone = pc.prune_caches([self.root], None, NOW)
+        self.assertFalse(os.path.exists(orphan))
+        for kept in (recent, lib, libs, meta, metas, live, lives):
+            self.assertTrue(os.path.exists(kept), kept)
+        self.assertEqual(gone["dwo"], 1)
 
     def test_untouched_incremental_directories_go(self):
         make(self.path("debug", "incremental", "a-1", "s", "f"), 5, 10)
@@ -280,6 +328,17 @@ class PruneCaches(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.inc)), [])
         self.assertEqual(sorted(os.listdir(self.deps)),
                          ["libx.rlib", "liby.rlib"])
+
+    def test_whole_top_directories_only_past_the_ceiling(self):
+        # A profile is a cold build: over the limit but under
+        # CACHE_CEILING times it, nothing more goes, and what is over is
+        # said.
+        debug = make(self.path("debug", "deps", "libx.rlib"), 40, 0.5)
+        wasm = make(self.path("wasm32", "debug", "deps", "liby.rlib"), 30, 0.3)
+        gone = pc.prune_caches([self.root], 50, NOW)
+        self.assertTrue(os.path.exists(debug) and os.path.exists(wasm))
+        self.assertEqual((gone["units"], gone["left"], gone["over"]),
+                         (0, 70, 20))
 
     def test_then_whole_top_directories_oldest_first(self):
         debug = make(self.path("debug", "deps", "libx.rlib"), 40, 0.5)
@@ -339,28 +398,47 @@ class PruneSlotCaches(StateCase):
     def test_the_slots_own_caches_and_a_log_line(self):
         now = pc.time.time()
         mine = make(os.path.join(self.state_dir, "cargo-target-2", "d", "a"),
-                    60, 0.5, now=now)
+                    80, 0.5, now=now)
         theirs = make(os.path.join(self.state_dir, "cargo-target", "d", "a"),
-                      60, 0.5, now=now)
+                      80, 0.5, now=now)
         gone = pc.prune_slot_caches(self.state_dir, 2, self.lines.append)
         self.assertFalse(os.path.exists(mine))
         self.assertTrue(os.path.exists(theirs))
-        self.assertEqual(gone["freed"], 60)
-        self.assertIn("CACHE-PRUNED slot 2: freed 60 bytes (0 executables, "
+        self.assertEqual(gone["freed"], 80)
+        self.assertIn("CACHE-PRUNED slot 2: freed 80 bytes (0 executables, "
                       "0 incremental directories, 1 directories over the limit); "
-                      "0 bytes left", self.lines[-1])
+                      "0 bytes left; 0 split debug info files", self.lines[-1])
+
+    def test_over_the_limit_under_the_ceiling_is_logged(self):
+        now = pc.time.time()
+        make(os.path.join(self.state_dir, "cargo-target", "d", "a"), 60, 0.5,
+             now=now)
+        gone = pc.prune_slot_caches(self.state_dir, 1, self.lines.append)
+        self.assertEqual((gone["freed"], gone["over"]), (0, 10))
+        self.assertIn("CACHE-OVER-LIMIT slot 1: 10 bytes over the limit of 50",
+                      self.lines[-1])
 
     def test_off_without_a_limit(self):
         with mock.patch.object(pc, "CACHE_LIMIT", None):
             self.assertIsNone(pc.prune_slot_caches(self.state_dir, 1))
 
     def test_main_since_comes_from_the_state(self):
-        self.write_state({"cache_main": {"1": 123.0}})
+        self.write_state({"cache_main": {"1": 123.0},
+                          "cache_main_end": {"1": 456.0}})
         seen = []
         with mock.patch.object(pc, "prune_caches",
                                lambda *a: seen.append(a) or {"freed": 0}):
             pc.prune_slot_caches(self.state_dir, 1)
-        self.assertEqual(seen[0][3], 123.0)
+        self.assertEqual(seen[0][3:], (123.0, 456.0))
+
+    def test_an_end_before_the_start_is_ignored(self):
+        self.write_state({"cache_main": {"1": 123.0},
+                          "cache_main_end": {"1": 100.0}})
+        seen = []
+        with mock.patch.object(pc, "prune_caches",
+                               lambda *a: seen.append(a) or {"freed": 0}):
+            pc.prune_slot_caches(self.state_dir, 1)
+        self.assertEqual(seen[0][3:], (123.0, None))
 
     def test_a_failure_is_logged_not_raised(self):
         def broken(*args):
@@ -400,6 +478,8 @@ class CachesInTheWorker(RepoCase):
         pc.worker(self.repo, self.state_dir, tip, 0, pc.sh, self.lines.append,
                   lambda: next(clock), None, main=True)
         self.assertGreaterEqual(self.state()["cache_main"]["1"], before)
+        self.assertGreaterEqual(self.state()["cache_main_end"]["1"],
+                                self.state()["cache_main"]["1"])
 
 
 if __name__ == "__main__":
