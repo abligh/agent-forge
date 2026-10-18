@@ -2050,6 +2050,41 @@ class TickAhead(Tick):
         self.assertEqual(self.lines[-1], "STARTED #8 %s; 0 waiting, first: "
                          "it has waited 30 minutes" % SHA_B[:10])
 
+    def test_a_head_put_first_goes_before_predictions(self):
+        # checks.first_authors: put first on purpose, so not behind the
+        # Merger's predictions either.
+        lead = "leaddevwidgetagent[bot]"
+        with mock.patch.object(pc, "FIRST_AUTHORS", frozenset({lead})):
+            self.tick([(8, SHA_B, REPO, "false\t" + lead)],
+                      merger_dir=self.merger())
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_B, 8, False, 1)])
+
+    def test_the_mergers_head_waiting_stops_predictions(self):
+        # A pick put before the Merger's head takes one slot; the next
+        # goes to the Merger's head, never to a prediction, since every
+        # prediction assumes it merges first.
+        lead = "leaddevwidgetagent[bot]"
+        self.hold(1, "#9 %s %s" % (SHA_C, pc.iso(T0)))
+        heads = [(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false\t" + lead),
+                 (9, SHA_C, REPO, "false")]
+        with mock.patch.object(pc, "FIRST_AUTHORS", frozenset({lead})):
+            self.tick(heads, merger_dir=self.merger())
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_B, 8, False, 2)])
+        self.assertNotIn(SHA_P, self.state().get("ahead_started", {}))
+
+    def test_put_first(self):
+        self.assertTrue(pc.put_first({"urgent": True}))
+        self.assertFalse(pc.put_first({"urgent": True, "errors": 1}))
+        self.assertFalse(pc.put_first({"main": True, "urgent": True}))
+        self.assertFalse(pc.put_first({"pr": 3}))
+
+    def test_merger_head_waits(self):
+        state = {"waiting": {SHA_A: {"pr": 7, "since": pc.iso(T0)}}}
+        self.assertTrue(pc.merger_head_waits(state, 7, (), T0))
+        self.assertFalse(pc.merger_head_waits(state, 7, {SHA_A}, T0))
+        self.assertFalse(pc.merger_head_waits(state, 8, (), T0))
+        self.assertFalse(pc.merger_head_waits(state, None, (), T0))
+
     def test_one_that_has_not_yet_still_goes_after_them(self):
         self.write_state({"waiting": {SHA_B: {
             "pr": 8, "since": pc.iso(T0 - datetime.timedelta(minutes=29))}}})

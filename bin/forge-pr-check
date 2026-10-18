@@ -132,6 +132,12 @@ requests in its queue will have once the ones in front of it merge
    `STARTED-AHEAD`;
 3. every other waiting head, oldest first.
 
+A prediction never goes first while a head of the Merger's own pull
+request waits unstarted (every prediction assumes it merges first, so
+none can merge anything before it has its verdict), nor before a head
+put first on purpose (`labels.urgent`, `checks.first_authors`) or one
+that has waited `max_wait_minutes`.
+
 Nothing after an entry whose tree is red here is started: every later
 prediction contains that pull request, so it would only be red too.
 
@@ -1048,6 +1054,27 @@ def first(entry):
     return entry.get("author", "").lower() in FIRST_AUTHORS
 
 
+def put_first(entry):
+    """Whether a waiting head was put first on purpose: its pull request
+    is labelled `labels.urgent` or is by one of `checks.first_authors`.
+    A failed head isn't: it goes behind for a reason of its own."""
+    if entry.get("main") or entry.get("errors"):
+        return False
+    return bool(entry.get("urgent")) or first(entry)
+
+
+def merger_head_waits(state, first_pr, busy=(), when=None):
+    """Whether a head of the pull request the Merger waits on is waiting
+    and could be started now: not running (`busy`), not just started,
+    not given up on."""
+    if first_pr is None:
+        return False
+    waiting = state["waiting"]
+    return any(waiting[s].get("pr") == first_pr
+               and not waiting[s].get("main")
+               for s in live_heads(state, busy, when))
+
+
 def overdue(entry, when):
     """Whether a waiting pull request's head has waited MAX_WAIT
     (checks.max_wait_minutes) or longer by `when`. One that failed to
@@ -1791,13 +1818,21 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 # but not before a head that has waited max_wait, nor
                 # before the default branch's run once it has waited
                 # depends_minutes or while heads wait on its record
-                # (urgent, or held). With spare_slots_only
+                # (urgent, or held). Nor before a head put first on
+                # purpose (labels.urgent, checks.first_authors), nor at
+                # all while a head of the Merger's own pull request waits
+                # unstarted: every prediction assumes it merges first,
+                # so none of them can merge anything before it has its
+                # own verdict, and a pick put before it would otherwise
+                # let predictions starve both. With spare_slots_only
                 # (designs/0014), never before an ordinary pick.
-                if pick is None or not SPARE_ONLY and not (
+                if not merger_head_waits(state, first_pr, taken, when) and (
+                        pick is None or not SPARE_ONLY and not (
                         pick[1] == first_pr
                         or overdue(state["waiting"][pick[0]], when)
+                        or put_first(state["waiting"][pick[0]])
                         or (pick[1] == 0 and (urgent or held or main_due(
-                            state["waiting"][pick[0]], when)))):
+                            state["waiting"][pick[0]], when))))):
                     predicted = next_ahead(state, ahead, taken, when,
                                            busy_trees(taken, checkout, run))
             if predicted is not None:
