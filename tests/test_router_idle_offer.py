@@ -456,6 +456,28 @@ class Report(unittest.TestCase):
         self.assertEqual(self.sweep([], [], entry("WidgetReviewer"),
                                     entry("WidgetLeadDev")), [])
 
+    def collaborating(self, issues, *entries):
+        """A sweep with Helper a collaborator."""
+        data = example()
+        data["router"] = {"idle_offer": {"report_to": "LeadDev"}}
+        data["agents"]["Helper"]["kind"] = "collaborator"
+        project = config.Project(data, None)
+        r.configure(project)
+        got_prs, got_issues = r.fetch(FakeGitHub(response([], list(issues))))
+        return rules.sweep(router.Context(
+            rules.Roster(project), NOW, got_prs, got_issues,
+            directory=directory(*entries)))
+
+    def test_not_a_collaborator_with_nothing_of_hers(self):
+        # She works on the project only when given something.
+        self.assertEqual(self.collaborating(
+            [owned(30, owner="UIDev")], entry("Helper")), [])
+
+    def test_a_collaborator_is_offered_her_own_issues(self):
+        got = self.collaborating([owned(30, owner="Helper")],
+                                 entry("Helper"))
+        self.assertEqual([(d.agent, d.rule) for d in got], [("Helper", 15)])
+
     def test_not_while_the_developer_has_a_turn(self):
         self.assertEqual(self.sweep([owned(30, owner="UIDev", comments=[
             comment(REVIEWER, T2)], body="Blocked-by: #31\n"),

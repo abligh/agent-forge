@@ -128,9 +128,11 @@ agents with nothing to do (off without it):
     so it is offered once per idle period, never reminded, and the
     next idle period offers again. An agent idle through `shell` is
     also told since when its background task has been running;
-16. an idle developer (not a reviewer) with no such turn and nothing
-    actionable: `idle_offer.report_to`'s, so whoever plans the work
-    knows, once per idle period. Not for `report_to` itself, and not
+16. an idle developer (not a reviewer or a collaborator) with no such
+    turn and nothing actionable: `idle_offer.report_to`'s, so whoever
+    plans the work knows, once per idle period. A collaborator works
+    on the project only when given something: idle with nothing of
+    hers to do is where she is meant to be. Not for `report_to` itself, and not
     without `report_to`.
 
 A directory that couldn't be read, or isn't complete, makes nobody
@@ -1040,6 +1042,11 @@ def counted(n, one, many):
     return "%d %s" % (n, one if n == 1 else many)
 
 
+# Kinds never reported idle with nothing to do (rule 16): a reviewer's
+# work comes to her, and a collaborator works here only when given some.
+NOT_REPORTED = ("reviewer", "collaborator")
+
+
 def idle_offers(ctx):
     """Rules 15 and 16: an offer to each idle agent with an actionable
     issue and no turn, and a report to `report_to` of each idle
@@ -1067,7 +1074,7 @@ def idle_offers(ctx):
                 reminder=ONCE))
             continue
         if not report_to or agent == ctx.roster.stand_in(report_to) or \
-                ctx.roster.project.kind(agent) == "reviewer":
+                ctx.roster.project.kind(agent) in NOT_REPORTED:
             continue
         mine = ctx.roster.login_of(agent)
         prs = sum(1 for pr in ctx.prs if author_of(pr) == mine)

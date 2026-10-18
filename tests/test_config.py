@@ -142,8 +142,13 @@ class Check(unittest.TestCase):
         self.assertEqual(config.check(data), [
             "agents.LeadDev.app_id must be an integer or null",
             "agents.LeadDev: unknown key 'colour'",
-            "agents.UIDev.kind must be one of developer, reviewer",
+            "agents.UIDev.kind must be one of developer, reviewer, collaborator",
             "agents.UIDev.reviews: only a reviewer reviews paths"])
+
+    def test_a_collaborator_is_a_kind(self):
+        data = example()
+        data["agents"]["UIDev"]["kind"] = "collaborator"
+        self.assertEqual(config.check(data), [])
 
     def test_a_bool_is_not_an_id(self):
         data = example()
