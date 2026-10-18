@@ -2143,9 +2143,9 @@ class SettledHeads(StateCase):
             (lambda a: "--is-ancestor" in a,
              done([], 0 if contains else 1)))
 
-    def settle(self, result, contains=True, busy=True):
-        self.write_state({"waiting": {SHA_A: {"pr": 7, "since": pc.iso(
-            T0 - datetime.timedelta(minutes=5))}},
+    def settle(self, result, contains=True, busy=True, **estimate):
+        self.write_state({"waiting": {SHA_A: dict({"pr": 7, "since": pc.iso(
+            T0 - datetime.timedelta(minutes=5))}, **estimate)},
             "results": {SHA_P: result}})
         if busy:
             self.hold(1, "#8 %s %s" % (SHA_B, pc.iso(T0)))
@@ -2181,6 +2181,39 @@ class SettledHeads(StateCase):
         self.settle(verdict(pr=7, ahead=True,
                             selection={"ran": [], "base": TIP}))
         self.assertIn(SHA_A, self.state()["waiting"])
+
+    def narrow(self):
+        # A prediction runs only the steps its changes chose.
+        return verdict(pr=7, ahead=True, selection={"ran": [], "base": TIP})
+
+    def test_one_that_ran_every_step_the_head_would_is_matched(self):
+        # Seen on 2026-10-18: the prediction ran 13 s, then the Merger's
+        # head on its tree waited 50 minutes behind two full runs.
+        posted = self.settle(self.narrow(), lane_steps=[], lane_base=TIP)
+        self.assertEqual(self.state()["results"][SHA_A]["matched"], SHA_P)
+        self.assertEqual([p[:2] for p in posted], [(SHA_A, "success")])
+
+    def test_a_head_that_would_run_more_steps_is_not_matched(self):
+        self.settle(self.narrow(), lane_steps=["test"], lane_base=TIP)
+        self.assertIn(SHA_A, self.state()["waiting"])
+
+    def test_an_estimate_against_another_tip_is_not_used(self):
+        self.settle(self.narrow(), lane_steps=[], lane_base=SHA_B)
+        self.assertIn(SHA_A, self.state()["waiting"])
+
+    def test_with_fresh_an_estimate_from_older_records_is_not_used(self):
+        with mock.patch.object(pc, "FRESH_WAIT",
+                               datetime.timedelta(minutes=15)):
+            self.settle(self.narrow(), lane_steps=[], lane_base=TIP,
+                        lane_key="stale")
+        self.assertIn(SHA_A, self.state()["waiting"])
+
+    def test_with_fresh_a_current_estimate_is_used(self):
+        with mock.patch.object(pc, "FRESH_WAIT",
+                               datetime.timedelta(minutes=15)):
+            self.settle(self.narrow(), lane_steps=[], lane_base=TIP,
+                        lane_key=pc.records_key(self.state_dir, TIP))
+        self.assertEqual(self.state()["results"][SHA_A]["matched"], SHA_P)
 
     def test_with_a_free_slot_it_is_matched_and_the_slot_goes_on(self):
         self.settle(verdict(pr=7, ahead=True), busy=False)

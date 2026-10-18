@@ -163,8 +163,12 @@ produces the predicted tree, the head is posted green at once and the
 Merger merges it on its next tick. The tick itself makes that match,
 whether or not a slot is free, for a head that already contains the
 default branch's tip and whose tree has a green verdict that ran every
-step (`settled_heads`); a worker would only have matched it, and in a
-queue it waits behind every run started first.
+step the head would (`settled_heads`): its estimate's steps, when one
+was worked out against that tip (and, with checks.fresh, the records
+as they are now), else every step. A prediction runs only the steps
+its own changes choose, so without the estimate it is never matched
+here. A worker would only have matched it, and in a queue it waits
+behind every run started first.
 
 What that guarantees, and what it doesn't:
 
@@ -1730,7 +1734,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                    len(queued - busy)))
     # A head that would only be matched is matched now, slot or none.
     for sha, pr, same, tree in settled_heads(state, checkout, busy, when,
-                                             run):
+                                             run, state_dir):
         matched(state_dir, sha, pr, same, tree, when, post, out)
         queued.discard(sha)
     free = [slot for slot, holder in holders.items()
@@ -2801,15 +2805,21 @@ def twin_heads(state, running, checkout, run=sh):
     return twins
 
 
-def settled_heads(state, checkout, busy=(), when=None, run=sh):
+def settled_heads(state, checkout, busy=(), when=None, run=sh,
+                  state_dir=None):
     """[(sha, pr, same, tree)] of the waiting heads a worker would only
     match, never run: each already contains the default branch's tip,
     so it is checked as itself, and its tree has a green verdict here
-    (`same`) that ran every step under that tip or an older one. A
-    match costs no run, so the tick makes it at once instead of queueing
-    it for a slot: the Merger's head, updated to its prediction's tree,
-    otherwise waits behind every run started before it. Not one a slot
-    is running or a tick has just started."""
+    (`same`) that ran every step this head would, under that tip or an
+    older one. The steps it would run are its estimate (`lane_steps`)
+    when that was worked out against the tip and, with checks.fresh,
+    the records as they are now; without one, every step. A
+    prediction ran only the steps its own changes chose, so it never
+    covers every step: the head's estimate is what lets the tick match
+    it. A match costs no run, so the tick makes it at once instead of
+    queueing it for a slot: the Merger's head, updated to its
+    prediction's tree, otherwise waits behind every run started before
+    it. Not one a slot is running or a tick has just started."""
     if not TEST_AHEAD or not checkout:
         return []
     tip = main_head(checkout, run)
@@ -2820,19 +2830,38 @@ def settled_heads(state, checkout, busy=(), when=None, run=sh):
     def older(a, b):
         return run(["git", "-C", checkout, "merge-base", "--is-ancestor",
                     a, b]).returncode == 0
-    accept = covers({"ran": [name for name, _, _ in STEPS], "base": tip},
-                    older)
+    every = covers({"ran": [name for name, _, _ in STEPS], "base": tip},
+                   older)
+    key = records_key(state_dir, tip) \
+        if FRESH_WAIT is not None and state_dir else None
     found = []
     for sha, entry in sorted(state["waiting"].items()):
         if entry.get("main") or sha in busy or just_started(entry, when) \
                 or not older(tip, sha):
             continue
         tree = tree_of(checkout, sha, run)
-        same = tested(state, tree, when, ok=True, accept=accept) \
+        same = tested(state, tree, when, ok=True, accept=every) \
             if tree else None
+        steps = estimated(entry, tip, key)
+        if same is None and tree and steps is not None:
+            same = tested(state, tree, when, ok=True, accept=covers(
+                {"ran": steps, "base": tip}, older))
         if same is not None and same != sha:
             found.append((sha, entry["pr"], same, tree))
     return found
+
+
+def estimated(entry, tip, key=None):
+    """The steps a waiting head's estimate says it would run against
+    `tip`, or None when it has none worked out against that tip (and,
+    with checks.fresh, `key`, the records as they are now)."""
+    steps = entry.get("lane_steps")
+    if not isinstance(steps, list) or entry.get("lane_base") != tip:
+        return None
+    if FRESH_WAIT is not None and (key is None
+                                   or entry.get("lane_key") != key):
+        return None
+    return steps
 
 
 def held_heads(state, tip, busy, when, first_pr=None, cheap=()):
