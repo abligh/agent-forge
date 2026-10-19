@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Ask a shared host to stay quiet for a while, or ask whether it must.
+
+    forge-quiet hold 45 "SSSS baseline on the GPU VM"
+    forge-quiet release
+    forge-quiet status
+
+An agent timing something on a host other agents share takes a
+**hold**: until it ends or is released, heavy work on that host (builds,
+check runs, deploys) waits. A hold is one file in the project's quiet
+directory, `quiet.dir` in its configuration, named for the holder; see
+agent_forge/quiet.py for the format. A hold past its time is void, so a
+holder that dies blocks nothing for longer than it asked.
+
+**hold <minutes> <reason>** takes the holder's hold, or replaces it: at
+most `quiet.max_minutes` (default 120). **release** drops it.
+**status** lists the live holds, soonest to end first, and is what a job
+calls before heavy work:
+
+    forge-quiet status --wait 180 || echo "still held; going ahead"
+
+The holder is `--as`, else $FORGE_AGENT. The directory is `--dir`, else
+$FORGE_QUIET_DIR, else the configuration's `quiet.dir`; with none of
+them nothing is ever held, and `status` says so and exits 0.
+
+Exit status:
+
+    0   hold and release: done; status: no hold is live (after
+        --wait, the holds ended in time)
+    1   status: a hold is live (after --wait, still, when it ran out)
+    2   bad arguments, or no holder for hold or release
+"""
+
+import argparse
+import datetime
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, quiet  # noqa: E402
+
+PROG = "forge-quiet"
+# How often --wait looks again.
+POLL_S = 30
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+
+
+def settings(args, environ):
+    """(directory or None, max minutes) from the arguments, the
+    environment and the configuration, in that order."""
+    folder = args.dir or environ.get("FORGE_QUIET_DIR")
+    limit = None
+    if folder is None or args.command == "hold":
+        try:
+            section = config.load_reviewed(environ=environ).section("quiet")
+        except config.ConfigError:
+            section = {}
+        folder = folder or section.get("dir")
+        limit = section.get("max_minutes")
+    if folder:
+        folder = os.path.expanduser(folder)
+    return folder, limit
+
+
+def main(argv=None, environ=None, clock=now_utc, sleep=time.sleep,
+         out=print):
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(prog=PROG, description=(
+        "Hold a shared host quiet, or ask whether it is held."))
+    parser.add_argument("--dir", help="the quiet directory (default "
+                        "$FORGE_QUIET_DIR, else the configuration's "
+                        "quiet.dir)")
+    sub = parser.add_subparsers(dest="command", required=True)
+    held = sub.add_parser("hold", help="take or replace your hold")
+    held.add_argument("minutes", type=int)
+    held.add_argument("reason", nargs="+")
+    held.add_argument("--as", dest="holder")
+    gone = sub.add_parser("release", help="drop your hold")
+    gone.add_argument("--as", dest="holder")
+    status = sub.add_parser("status", help="list the live holds")
+    status.add_argument("--wait", type=int, metavar="MINUTES", help=(
+        "wait up to this long for every hold to end"))
+    args = parser.parse_args(argv)
+    folder, limit = settings(args, environ)
+
+    if args.command == "status":
+        if not folder:
+            out("no quiet directory is configured: nothing is held")
+            return 0
+        deadline = None if args.wait is None else \
+            clock() + datetime.timedelta(minutes=args.wait)
+        while True:
+            holds = quiet.live(folder, clock())
+            if not holds:
+                out("quiet: no hold is live")
+                return 0
+            if deadline is None or clock() >= deadline:
+                for line in quiet.describe(holds):
+                    out("held: " + line)
+                return 1
+            sleep(min(POLL_S, max(1, (deadline - clock()).total_seconds())))
+
+    holder = args.holder or environ.get("FORGE_AGENT")
+    if not holder:
+        out("%s: no holder: pass --as or set FORGE_AGENT" % PROG)
+        return 2
+    if not folder:
+        out("%s: no quiet directory: pass --dir, set FORGE_QUIET_DIR or "
+            "the configuration's quiet.dir" % PROG)
+        return 2
+    try:
+        if args.command == "hold":
+            until = quiet.hold(folder, holder, args.minutes,
+                               " ".join(args.reason), clock(), limit)
+            out("held by %s until %s" % (holder, quiet.stamp(until)))
+        elif quiet.release(folder, holder):
+            out("released %s's hold" % holder)
+        else:
+            out("%s had no hold" % holder)
+    except ValueError as err:
+        out("%s: %s" % (PROG, err))
+        return 2
+    except OSError as err:
+        out("%s: %s: %s" % (PROG, folder, err))
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

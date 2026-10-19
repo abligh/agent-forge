@@ -66,6 +66,7 @@ Documentation and hosts:
 | `forge-host-settings` | Compares a host's agent settings with the project's tracked copy, or installs it. |
 | `forge-session-start` | A SessionStart hook: tells a restarted session what died and what it owns. |
 | `forge-memory-sync`, `forge-memory-check`, `forge-memory-trim` | Share the agents' memory between hosts through a git repository; check the index still loads in full; shorten its lines safely ([docs/memory-sync.md](docs/memory-sync.md)). |
+| `forge-quiet` | Holds a shared host quiet while someone times something on it, and tells a job whether it must wait: `hold <minutes> <reason>`, `release`, `status [--wait M]`. A hold is a file in `quiet.dir` that ends by itself; `forge-pr-check` starts nothing while one is live. |
 | `forge-prune-builds` | Clears the build output (tagged cache directories) of worktrees nobody is using, sooner once their pull request has merged ([designs/0016](docs/designs/0016-clear-build-output-of-idle-worktrees.md)). |
 | `forge-config` | Checks and reads the project's configuration. |
 

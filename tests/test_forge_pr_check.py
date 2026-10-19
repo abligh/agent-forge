@@ -615,6 +615,31 @@ class Tick(StateCase):
         self.assertEqual(self.lines, ["STARTED #8 bbbbbbbbbb; 1 waiting"])
         self.assertEqual(sorted(self.state()["waiting"]), [SHA_A, SHA_B])
 
+    def test_a_live_quiet_hold_starts_nothing_and_says_whose(self):
+        from agent_forge import quiet
+        folder = os.path.join(self._tmp.name, "quiet")
+        os.makedirs(folder)
+        quiet.hold(folder, "Alice", 30, "timing run",
+                   T0 - datetime.timedelta(minutes=5))
+        with mock.patch.object(pc, "QUIET_DIR", folder):
+            self.tick([(7, SHA_A, REPO, "false")])
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.lines, [
+            "QUIET: Alice until 2026-%s: timing run; starting "
+            "nothing; 1 waiting" % pc.iso(T0 + datetime.timedelta(
+                minutes=25))[5:]])
+        self.assertEqual(sorted(self.state()["waiting"]), [SHA_A])
+
+    def test_a_hold_past_its_time_holds_nothing(self):
+        from agent_forge import quiet
+        folder = os.path.join(self._tmp.name, "quiet")
+        os.makedirs(folder)
+        quiet.hold(folder, "Alice", 30, "old",
+                   T0 - datetime.timedelta(hours=1))
+        with mock.patch.object(pc, "QUIET_DIR", folder):
+            self.tick([(7, SHA_A, REPO, "false")])
+        self.assertEqual([s[1] for s in self.spawned], [SHA_A])
+
     def test_a_posting_tick_starts_a_posting_worker_and_reposts(self):
         self.write_state({"results": {SHA_B: {
             "pr": 8, "ok": True, "seconds": 3, "failed": [],

@@ -52,6 +52,7 @@ TOP = {
     "receiver": (dict, False),
     "closing_keywords": (dict, False),
     "memory": (dict, False),
+    "quiet": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
@@ -64,6 +65,8 @@ HOST_SETTINGS = {"files": list, "host_keys": list}
 MEMORY = {"dir": str, "remote": str, "git_dir": str, "seed_dir": str,
           "ssh_key": str, "branch": str, "labels": list, "limit": int,
           "long_line": int}
+# forge-quiet and what honours a hold (agent_forge/quiet.py).
+QUIET = {"dir": str, "max_minutes": int}
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_minutes": int, "stall_alert": dict, "test_ahead": dict,
          "hold_conflicting": bool, "yield_after_hand_back": int,
@@ -235,6 +238,16 @@ def _check_memory(memory, present, problems):
     for key in ("limit", "long_line"):
         if _is(memory.get(key), int) and memory[key] < 1:
             problems.append("memory.%s must be at least 1" % key)
+
+
+def _check_quiet(quiet, present, problems):
+    """The `quiet` section: where a shared host's holds are."""
+    if not _fields("quiet", quiet, QUIET, problems) or not present:
+        return
+    if not isinstance(quiet.get("dir"), str) or not quiet["dir"].strip():
+        problems.append("quiet: missing 'dir'")
+    if _is(quiet.get("max_minutes"), int) and quiet["max_minutes"] < 1:
+        problems.append("quiet.max_minutes must be at least 1")
 
 
 def check(data):
@@ -421,6 +434,7 @@ def check(data):
             problems.append("host_settings.host_keys must be a list of "
                             "strings")
     _check_memory(data.get("memory", {}), "memory" in data, problems)
+    _check_quiet(data.get("quiet", {}), "quiet" in data, problems)
     docs = data.get("docs", {})
     for key, kinds in DOCS.items():
         if key in docs and not _is(docs[key], kinds):

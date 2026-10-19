@@ -366,6 +366,12 @@ verdict (KEEP), and the verdict's `results` names it. A step that
 leaves more than RESULTS_MAX bytes keeps none, logged as
 `RESULTS-DROPPED`; one that leaves nothing has no directory.
 
+**While a quiet hold is live on the host, a tick starts nothing**
+(`quiet.dir`, agent_forge/quiet.py, `forge-quiet`): someone is timing
+something here, and a run started now would spoil it. A tick says
+`QUIET:` with each hold, and runs already going carry on. A hold ends by
+itself, at most `quiet.max_minutes` after it was taken.
+
 **Each step's whole output is kept, a time on every line**, in
 `logs/<head>/<step>.log.gz` in the state directory, written as the
 step runs: each line is `<seconds since the step started> <1 or 2,
@@ -447,7 +453,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-from agent_forge import config, github, locks, trace  # noqa: E402
+from agent_forge import config, github, locks, quiet, trace  # noqa: E402
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 
@@ -621,6 +627,9 @@ ALWAYS = frozenset()
 # steps have together taken at most FAST_LANE_S here; None is off.
 DEFAULT_FAST_LANE_S = 60
 FAST_LANE_S = None
+# The project's quiet directory (`quiet.dir`): while a hold in it is
+# live on this host, a tick starts no run (agent_forge/quiet.py).
+QUIET_DIR = None
 # A step's cost is the median of its last COST_RUNS runs here; with
 # fewer than COST_MIN_RUNS it has none, and counts as expensive.
 COST_RUNS = 20
@@ -681,8 +690,10 @@ def configure(project):
     global TRACE_MATCHED_MAIN, CHAIN_WRITES_ONLY, DIRS_BY_NAMES, OUTPUTS
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
     global RED_COMMENT
-    global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED
+    global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR
     checks = project.section("checks")
+    QUIET_DIR = os.path.expanduser(project.section("quiet")["dir"]) \
+        if project.section("quiet").get("dir") else None
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
     STATUS_CONTEXT = checks.get("context", DEFAULT_CONTEXT)
@@ -1872,6 +1883,14 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             if holder is None and slot != LANE]
     lane_free = lane and holders[LANE] is None
     if not free and not lane_free:
+        return 0
+    holds = quiet.live(QUIET_DIR, when) if QUIET_DIR else []
+    if holds:
+        # Someone is timing something on this host: a run started now
+        # would spoil it. The hold ends by itself, so nothing is lost
+        # but time, and runs already going carry on.
+        out("QUIET: %s; starting nothing; %d waiting"
+            % ("; ".join(quiet.describe(holds)), len(queued - busy)))
         return 0
     if lane or fresh:
         estimate(state_dir, checkout, busy, run,
