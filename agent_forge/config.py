@@ -66,7 +66,8 @@ MEMORY = {"dir": str, "remote": str, "git_dir": str, "seed_dir": str,
           "ssh_key": str, "branch": str, "labels": list, "limit": int,
           "long_line": int}
 # forge-quiet and what honours a hold (agent_forge/quiet.py).
-QUIET = {"dir": str, "max_minutes": int}
+QUIET = {"dir": str, "max_minutes": int, "settle": list,
+         "settle_minutes": int}
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_minutes": int, "stall_alert": dict, "test_ahead": dict,
          "hold_conflicting": bool, "yield_after_hand_back": int,
@@ -248,6 +249,12 @@ def _check_quiet(quiet, present, problems):
         problems.append("quiet: missing 'dir'")
     if _is(quiet.get("max_minutes"), int) and quiet["max_minutes"] < 1:
         problems.append("quiet.max_minutes must be at least 1")
+    settle = quiet.get("settle")
+    if settle is not None and not (
+            settle and all(isinstance(a, str) and a for a in settle)):
+        problems.append("quiet.settle must be a non-empty list of strings")
+    if _is(quiet.get("settle_minutes"), int) and quiet["settle_minutes"] < 1:
+        problems.append("quiet.settle_minutes must be at least 1")
 
 
 def check(data):

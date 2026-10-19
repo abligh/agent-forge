@@ -13,7 +13,16 @@ agent_forge/quiet.py for the format. A hold past its time is void, so a
 holder that dies blocks nothing for longer than it asked.
 
 **hold <minutes> <reason>** takes the holder's hold, or replaces it: at
-most `quiet.max_minutes` (default 120). **release** drops it.
+most `quiet.max_minutes` (default 120). A hold stops heavy work from
+starting, not work already under way, so when the configuration has a
+`quiet.settle` command, hold then runs it, and again every 30 seconds
+until it exits 0, for at most `quiet.settle_minutes` (default 30): a
+project's way of waiting out, say, a deploy that was building before the
+hold. The command has FORGE_QUIET_HOLDER, FORGE_QUIET_MINUTES,
+FORGE_QUIET_UNTIL and FORGE_QUIET_DIR set; a `forge-` name runs from
+this installation and anything else from the configuration's checkout.
+It is run only after the hold is written, so nothing new starts while
+it waits. `--no-settle` skips it. **release** drops a hold.
 **status** lists the live holds, soonest to end first, and is what a job
 calls before heavy work:
 
@@ -29,11 +38,15 @@ Exit status:
         --wait, the holds ended in time)
     1   status: a hold is live (after --wait, still, when it ran out)
     2   bad arguments, or no holder for hold or release
+    3   hold: the hold is taken, but the settle command still fails at
+        the end of settle_minutes (its last output is printed); what
+        to do then, wait, go ahead or release, is the holder's call
 """
 
 import argparse
 import datetime
 import os
+import subprocess
 import sys
 import time
 
@@ -41,8 +54,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from agent_forge import config, quiet  # noqa: E402
 
 PROG = "forge-quiet"
-# How often --wait looks again.
+# How often --wait looks again, and the settle command is run again.
 POLL_S = 30
+DEFAULT_SETTLE_MINUTES = 30
+# The longest one run of the settle command may take.
+SETTLE_RUN_S = 120
+BIN = os.path.dirname(os.path.realpath(__file__))
 
 
 def now_utc():
@@ -50,24 +67,80 @@ def now_utc():
 
 
 def settings(args, environ):
-    """(directory or None, max minutes) from the arguments, the
-    environment and the configuration, in that order."""
+    """(directory or None, the quiet section, the checkout or None) from
+    the arguments, the environment and the configuration, in that
+    order."""
     folder = args.dir or environ.get("FORGE_QUIET_DIR")
-    limit = None
+    section, root = {}, None
     if folder is None or args.command == "hold":
         try:
-            section = config.load_reviewed(environ=environ).section("quiet")
+            project = config.load_reviewed(environ=environ)
+            section, root = project.section("quiet"), project.root
         except config.ConfigError:
-            section = {}
+            pass
         folder = folder or section.get("dir")
-        limit = section.get("max_minutes")
     if folder:
         folder = os.path.expanduser(folder)
-    return folder, limit
+    return folder, section, root
+
+
+def settle_argv(argv, root):
+    """The settle command with its program resolved, as the Merger does
+    a gate's: a forge- name from this installation, anything else from
+    the checkout."""
+    argv = list(argv)
+    tool = argv[0]
+    if os.sep not in tool and tool.startswith("forge-"):
+        argv[0] = os.path.join(BIN, tool)
+    elif root and not os.path.isabs(tool):
+        argv[0] = os.path.join(root, tool)
+    return argv
+
+
+def run_settle(argv, cwd, env):
+    """(exit status, output) of one run; a run that can't start or runs
+    too long fails with a line saying so."""
+    try:
+        got = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, errors="replace",
+                             timeout=SETTLE_RUN_S)
+    except subprocess.TimeoutExpired:
+        return 124, "%s: timed out after %ss" % (argv[0], SETTLE_RUN_S)
+    except OSError as err:
+        return 127, "%s: %s" % (argv[0], err)
+    return got.returncode, got.stdout
+
+
+def settle(section, root, folder, holder, minutes, until, environ, clock,
+           sleep, out, run):
+    """Run the settle command until it exits 0 or its time runs out.
+    True once it has."""
+    argv = settle_argv(section["settle"], root)
+    env = dict(environ)
+    env.update(FORGE_QUIET_HOLDER=holder, FORGE_QUIET_MINUTES=str(minutes),
+               FORGE_QUIET_UNTIL=quiet.stamp(until), FORGE_QUIET_DIR=folder)
+    limit = section.get("settle_minutes", DEFAULT_SETTLE_MINUTES)
+    deadline = clock() + datetime.timedelta(minutes=limit)
+    said = None
+    while True:
+        status, text = run(argv, root, env)
+        if status == 0:
+            out("settled")
+            return True
+        text = (text or "").strip() or "exit %d" % status
+        if clock() >= deadline:
+            out("%s: not settled after %d minutes; the hold is kept:\n%s"
+                % (PROG, limit, text))
+            return False
+        if text != said:
+            out("settling: " + text)
+            said = text
+        sleep(min(POLL_S, max(1, (deadline - clock()).total_seconds())))
 
 
 def main(argv=None, environ=None, clock=now_utc, sleep=time.sleep,
-         out=print):
+         out=print, run=run_settle):
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(prog=PROG, description=(
         "Hold a shared host quiet, or ask whether it is held."))
@@ -79,13 +152,15 @@ def main(argv=None, environ=None, clock=now_utc, sleep=time.sleep,
     held.add_argument("minutes", type=int)
     held.add_argument("reason", nargs="+")
     held.add_argument("--as", dest="holder")
+    held.add_argument("--no-settle", action="store_true", help=(
+        "don't run the configuration's quiet.settle command"))
     gone = sub.add_parser("release", help="drop your hold")
     gone.add_argument("--as", dest="holder")
     status = sub.add_parser("status", help="list the live holds")
     status.add_argument("--wait", type=int, metavar="MINUTES", help=(
         "wait up to this long for every hold to end"))
     args = parser.parse_args(argv)
-    folder, limit = settings(args, environ)
+    folder, section, root = settings(args, environ)
 
     if args.command == "status":
         if not folder:
@@ -115,8 +190,13 @@ def main(argv=None, environ=None, clock=now_utc, sleep=time.sleep,
     try:
         if args.command == "hold":
             until = quiet.hold(folder, holder, args.minutes,
-                               " ".join(args.reason), clock(), limit)
+                               " ".join(args.reason), clock(),
+                               section.get("max_minutes"))
             out("held by %s until %s" % (holder, quiet.stamp(until)))
+            if section.get("settle") and not args.no_settle:
+                if not settle(section, root, folder, holder, args.minutes,
+                              until, environ, clock, sleep, out, run):
+                    return 3
         elif quiet.release(folder, holder):
             out("released %s's hold" % holder)
         else:
