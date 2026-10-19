@@ -48,6 +48,15 @@ the installation where it was: exit 1. A missing installation is cloned
 beside its path and renamed into place, so a half-made clone is never
 the installation.
 
+**New tools get a link where the host keeps its links.** A host that
+puts the tools on its PATH links each one into a directory (`--bin`,
+default ~/.local/bin; README.md's `ln -s`). When that directory already
+links at least one tool into the installation, every `forge-*` tool the
+installation has and it lacks gets a link of the same kind, said as
+`LINKED`, so a new tool can be run by name on every such host from its
+first release. Nothing already there is replaced, and a directory that
+links nothing into the installation is left alone.
+
 Only one runs at a time for an installation (`<install>.installer.lock`):
 another that finds it held says `BUSY` and exits 0, so cron can run it
 every minute.
@@ -419,6 +428,40 @@ def install_versions(install, url, pin, wait, run=git, dry_run=False,
                "; deleted %s" % ", ".join(gone) if gone else ""))
 
 
+def link_new_tools(install, bin_dir, dry_run=False):
+    """Link into `bin_dir` each `forge-*` tool in `install`'s bin that
+    it lacks, when it already links one there. Returns the names
+    linked (or that would be, with dry_run)."""
+    tools = os.path.join(install, "bin")
+    try:
+        have = os.listdir(bin_dir)
+        offered = sorted(n for n in os.listdir(tools)
+                         if n.startswith("forge-")
+                         and os.access(os.path.join(tools, n), os.X_OK))
+    except OSError:
+        return []
+
+    def into_install(name):
+        path = os.path.join(bin_dir, name)
+        return os.path.islink(path) and os.readlink(path) == os.path.join(
+            tools, name)
+
+    if not any(into_install(n) for n in have):
+        return []
+    linked = []
+    for name in offered:
+        if os.path.lexists(os.path.join(bin_dir, name)):
+            continue
+        if not dry_run:
+            try:
+                os.symlink(os.path.join(tools, name),
+                           os.path.join(bin_dir, name))
+            except OSError:
+                continue
+        linked.append(name)
+    return linked
+
+
 def main(argv=None, run=git, out=print, err=None, environ=None,
          clock=time.monotonic, nap=time.sleep):
     environ = os.environ if environ is None else environ
@@ -440,6 +483,9 @@ def main(argv=None, run=git, out=print, err=None, environ=None,
                         help="install each release beside the running one "
                         "and switch a symlink, never waiting for jobs "
                         "(docs/designs/0015)")
+    parser.add_argument("--bin", default=os.path.join(
+        environ.get("HOME") or os.path.expanduser("~"), ".local", "bin"),
+        help="where the host links the tools (default ~/.local/bin)")
     parser.add_argument("--dry-run", action="store_true",
                         help="say what would be done, change nothing")
     args = parser.parse_args(argv)
@@ -467,6 +513,12 @@ def main(argv=None, run=git, out=print, err=None, environ=None,
                 return 0
             out(do(install, args.url, pin, args.wait, run, args.dry_run,
                    clock, nap))
+            linked = link_new_tools(install, os.path.expanduser(args.bin),
+                                    args.dry_run)
+            if linked:
+                out("LINKED%s: %s in %s" % (
+                    " (dry run)" if args.dry_run else "",
+                    ", ".join(linked), args.bin))
         return 0
     except Refused as why:
         err("forge-install: %s" % why)

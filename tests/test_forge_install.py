@@ -300,3 +300,72 @@ class Versions(Install):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LinkNewTools(unittest.TestCase):
+    """A tool added in a release gets a link where the host keeps its
+    links, so it runs by name (forge-quiet, v0.4.78, had none)."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.install = os.path.join(self._tmp.name, "agent-forge")
+        self.tools = os.path.join(self.install, "bin")
+        self.bin = os.path.join(self._tmp.name, "local-bin")
+        os.makedirs(self.tools)
+        os.makedirs(self.bin)
+        for name in ("forge-old", "forge-new", "forge-also-new"):
+            self.tool(name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def tool(self, name, mode=0o755):
+        path = os.path.join(self.tools, name)
+        with open(path, "w") as handle:
+            handle.write("#!/bin/sh\n")
+        os.chmod(path, mode)
+
+    def link(self, name, target=None):
+        os.symlink(target or os.path.join(self.tools, name),
+                   os.path.join(self.bin, name))
+
+    def test_new_tools_get_a_link_beside_the_old_ones(self):
+        self.link("forge-old")
+        self.assertEqual(tool.link_new_tools(self.install, self.bin),
+                         ["forge-also-new", "forge-new"])
+        self.assertEqual(os.readlink(os.path.join(self.bin, "forge-new")),
+                         os.path.join(self.tools, "forge-new"))
+        self.assertEqual(tool.link_new_tools(self.install, self.bin), [])
+
+    def test_a_directory_linking_nothing_here_is_left_alone(self):
+        self.link("forge-old", "/somewhere/else/forge-old")
+        self.assertEqual(tool.link_new_tools(self.install, self.bin), [])
+        self.assertEqual(os.listdir(self.bin), ["forge-old"])
+
+    def test_nothing_already_there_is_replaced(self):
+        self.link("forge-old")
+        with open(os.path.join(self.bin, "forge-new"), "w") as handle:
+            handle.write("mine\n")
+        self.assertEqual(tool.link_new_tools(self.install, self.bin),
+                         ["forge-also-new"])
+        self.assertFalse(os.path.islink(os.path.join(self.bin, "forge-new")))
+
+    def test_only_executable_forge_tools(self):
+        self.link("forge-old")
+        self.tool("forge-notes.md", 0o644)
+        self.tool("helper")
+        self.assertNotIn("forge-notes.md",
+                         tool.link_new_tools(self.install, self.bin))
+        self.assertFalse(os.path.lexists(os.path.join(self.bin, "helper")))
+
+    def test_dry_run_links_nothing(self):
+        self.link("forge-old")
+        self.assertEqual(
+            tool.link_new_tools(self.install, self.bin, dry_run=True),
+            ["forge-also-new", "forge-new"])
+        self.assertEqual(os.listdir(self.bin), ["forge-old"])
+
+    def test_no_directory_is_fine(self):
+        self.assertEqual(tool.link_new_tools(
+            self.install, os.path.join(self._tmp.name, "none")), [])
