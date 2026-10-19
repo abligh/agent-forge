@@ -401,9 +401,11 @@ verdict, refusal and give-up), and `worker.log`, each worker's output:
 every step's exit status and time, and under a failed step its last
 TAIL_LINES lines, each prefixed `    | `. Lines before those that name a
 failure (FAILURE_LINE: `go test`'s `--- FAIL` and `_test.go:N:` lines,
-and `panic:`) come first, up to FAILURE_LINES of them, so a test that
-failed early in a package's output is still named. The status names
-the failed step and nothing more; why it failed is in `worker.log`.
+and `panic:`; Rust's `---- name stdout ----`, `test name ... FAILED`,
+and `thread 'name' panicked at`, with the panic's message) come first,
+up to FAILURE_LINES of them, so a test that failed early in a
+package's output is still named, and why. The status names the failed
+step and nothing more; why it failed is in `worker.log`.
 
 The checkout is the cron checkout (`--checkout`, default
 `$FORGE_CRON_CHECKOUT`), kept at the default branch.
@@ -509,9 +511,19 @@ CPU_WEIGHT = DEFAULT_CPU_WEIGHT
 TAIL_LINES = 40
 # Lines before the tail that name a failure, kept above it: go test
 # prints a failed test's name and messages before the rest of its
-# package's output.
-FAILURE_LINE = re.compile(r"^\s*--- FAIL\b|_test\.go:\d+:|^panic: ")
+# package's output, and Rust's test harness prints each failed test's
+# captured output under `---- name stdout ----`, where a panic is
+# `thread 'name' panicked at file:line:column:`.
+FAILURE_LINE = re.compile(
+    r"^\s*--- FAIL\b|_test\.go:\d+:|^panic: "
+    r"|^---- \S.* std(out|err) ----$|^thread '.*' panicked at "
+    r"|^test \S+ \.\.\. FAILED$")
 FAILURE_LINES = 40
+# A Rust panic's message is on the lines after its location: up to this
+# many of them are kept with it, stopping at a blank line or at the
+# harness's `note:`.
+PANIC_LINE = re.compile(r"^thread '.*' panicked at ")
+PANIC_MESSAGE_LINES = 6
 # Verdicts older than this are dropped from state.json.
 KEEP = datetime.timedelta(days=21)
 # Each run's CHECK_RESULTS directories, by head, in the state directory:
@@ -2188,11 +2200,21 @@ def memory_cap(memory_max, env, run=sh, out=print):
 
 def tail(text, lines=TAIL_LINES, failures=FAILURE_LINES):
     """The last `lines` lines of text, after the first `failures` of the
-    earlier lines that match FAILURE_LINE, with a line saying how many
-    lines were left out between them."""
+    earlier lines that match FAILURE_LINE (a Rust panic with its
+    message), with a line saying how many lines were left out between
+    them."""
     every = text.rstrip("\n").splitlines()
     before, last = every[:-lines], every[-lines:]
-    named = [line for line in before if FAILURE_LINE.search(line)]
+    named, message = [], 0
+    for line in before:
+        if FAILURE_LINE.search(line):
+            named.append(line)
+            message = PANIC_MESSAGE_LINES if PANIC_LINE.search(line) else 0
+        elif message and line.strip() and not line.startswith("note: "):
+            named.append(line)
+            message -= 1
+        else:
+            message = 0
     if not named:
         return "\n".join(last)
     kept = named[:failures]

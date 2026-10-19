@@ -1014,6 +1014,55 @@ class Tail(unittest.TestCase):
             "panic: runtime error: index out of range",
             "[4 earlier lines left out]", "filler", "filler"])
 
+    def test_a_rust_tests_panic_and_its_message_are_kept(self):
+        # A failed shard's output is printed long before the step ends:
+        # the rest of the step pushes it out of the last TAIL_LINES.
+        text = ("running 2 tests\n"
+                "test a_bad_input_is_refused ... FAILED\n"
+                "test renders ... ok\n"
+                "\n"
+                "failures:\n"
+                "\n"
+                "---- a_bad_input_is_refused stdout ----\n"
+                "\n"
+                "thread 'a_bad_input_is_refused' panicked at "
+                "tests/cli.rs:412:5:\n"
+                "assertion `left == right` failed\n"
+                "  left: 0\n"
+                " right: 2\n"
+                "note: run with `RUST_BACKTRACE=1` environment variable "
+                "to display a backtrace\n"
+                "\n"
+                + "".join("   Compiling crate%d v0.1.0\n" % i
+                          for i in range(50)))
+        got = pc.tail(text).splitlines()
+        self.assertEqual(got[:7], [
+            "test a_bad_input_is_refused ... FAILED",
+            "---- a_bad_input_is_refused stdout ----",
+            "thread 'a_bad_input_is_refused' panicked at "
+            "tests/cli.rs:412:5:",
+            "assertion `left == right` failed",
+            "  left: 0",
+            " right: 2",
+            "[18 earlier lines left out]"])
+        self.assertEqual(got[7:], text.splitlines()[-pc.TAIL_LINES:])
+
+    def test_a_panics_message_stops_at_a_blank_line_and_its_cap(self):
+        text = ("thread 'a' panicked at x.rs:1:1:\n"
+                + "".join("message %d\n" % i
+                          for i in range(pc.PANIC_MESSAGE_LINES + 2))
+                + "thread 'b' panicked at y.rs:2:2:\n"
+                "short\n"
+                "\n"
+                "not part of it\n"
+                "end\n")
+        got = pc.tail(text, lines=1).splitlines()
+        self.assertEqual(got, (
+            ["thread 'a' panicked at x.rs:1:1:"]
+            + ["message %d" % i for i in range(pc.PANIC_MESSAGE_LINES)]
+            + ["thread 'b' panicked at y.rs:2:2:", "short",
+               "[4 earlier lines left out]", "end"]))
+
     def test_one_line_left_out_is_singular(self):
         text = "--- FAIL: TestX (0.00s)\nnoise\na\nb\n"
         self.assertEqual(pc.tail(text, lines=2).splitlines()[1],
@@ -1035,7 +1084,10 @@ class Tail(unittest.TestCase):
     def test_lines_that_only_mention_a_failure_are_not_kept(self):
         for line in ("ok  \tgithub.com/x/y\t0.1s", "FAIL",
                      "msg=\"--- FAIL is a word here\"",
-                     "x.go:12: not a test file", "a panic: later"):
+                     "x.go:12: not a test file", "a panic: later",
+                     "test renders ... ok", "test result: FAILED. 1 passed",
+                     "log: thread 'x' panicked at y.rs:1:1:",
+                     "---- not a header"):
             self.assertIsNone(pc.FAILURE_LINE.search(line), line)
 
 
