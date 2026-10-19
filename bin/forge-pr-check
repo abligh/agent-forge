@@ -366,6 +366,14 @@ verdict (KEEP), and the verdict's `results` names it. A step that
 leaves more than RESULTS_MAX bytes keeps none, logged as
 `RESULTS-DROPPED`; one that leaves nothing has no directory.
 
+**Each step's whole output is kept, a time on every line**, in
+`logs/<head>/<step>.log.gz` in the state directory, written as the
+step runs: each line is `<seconds since the step started> <1 or 2,
+its stream> <the line>`, so a step's parts can be timed afterwards
+without the step printing times of its own. The verdict's `logs`
+names the directory. Logs go once they are LOGS_AGE old, and a step's
+log stops at LOGS_MAX bytes before compression, saying so.
+
 **Each step gets `CHECK_CPUS`, its slot's share of the CPUs**: those
 this process may run on, divided by the slots (the fast lane counting
 as one more), and at least 1. A test runner that starts a process or a
@@ -421,6 +429,7 @@ and 2 when the question could not be asked.
 
 import argparse
 import datetime
+import gzip
 import hashlib
 import json
 import os
@@ -540,6 +549,13 @@ RESULTS_DIR = "results"
 TMP_DIR = "tmp"
 RESULTS_MAX = 10 * 1024 * 1024
 RESULTS_ORPHAN_AGE = datetime.timedelta(days=1)
+# Each run's step logs, by head, in the state directory (sh_logged):
+# kept for LOGS_AGE, each step's at most LOGS_MAX bytes before
+# compression. A step still printing after that is noted once and the
+# rest is not written, though its tail still comes from all of it.
+LOGS_DIR = "logs"
+LOGS_AGE = datetime.timedelta(days=14)
+LOGS_MAX = 64 * 1024 * 1024
 # Failures to prepare a head's worktree before it is given up on.
 MAX_ERRORS = 3
 # How long a head just started is left to its worker before another
@@ -754,6 +770,74 @@ def sh(args, cwd=None, env=None, timeout=None):
         out = err.stdout if isinstance(err.stdout, str) else ""
         return subprocess.CompletedProcess(
             args, 124, out, "timed out after %ss" % timeout)
+
+
+def sh_logged(args, cwd=None, env=None, timeout=None, log=None):
+    """sh, also writing the output to `log` (gzipped) as it comes, each
+    line as "<seconds> <stream> <line>": seconds since the start, to
+    the millisecond, and 1 for stdout or 2 for stderr. A timeout kills
+    the program and comes back as exit 124; a pipe its children still
+    hold open is given up on a few seconds later."""
+    proc = subprocess.Popen(args, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            errors="replace")
+    started = time.monotonic()
+    texts = {1: [], 2: []}
+    lock = threading.Lock()
+    sink = gzip.open(log, "wt", encoding="utf-8")
+    room = [LOGS_MAX]
+
+    def drain(pipe, stream):
+        try:
+            for line in pipe:
+                keep(line, stream)
+        except (OSError, ValueError):
+            # Closed under it, after a timeout gave up on the pipe.
+            pass
+
+    def keep(line, stream):
+        texts[stream].append(line)
+        with lock:
+            if room[0] <= 0 or sink.closed:
+                return
+            entry = "%.3f %d %s" % (time.monotonic() - started, stream,
+                                    line if line.endswith("\n")
+                                    else line + "\n")
+            room[0] -= len(entry.encode("utf-8", "replace"))
+            sink.write(entry)
+            if room[0] <= 0:
+                sink.write("%.3f 0 [log stopped at %d bytes]\n"
+                           % (time.monotonic() - started, LOGS_MAX))
+
+    readers = [threading.Thread(target=drain, args=(pipe, stream),
+                                daemon=True)
+               for pipe, stream in ((proc.stdout, 1), (proc.stderr, 2))]
+    for reader in readers:
+        reader.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        proc.wait()
+    for reader in readers:
+        reader.join(timeout=5 if timed_out else None)
+    for pipe in (proc.stdout, proc.stderr):
+        try:
+            pipe.close()
+        except OSError:
+            pass
+    with lock:
+        if timed_out:
+            sink.write("%.3f 0 [timed out after %ss]\n"
+                       % (time.monotonic() - started, timeout))
+        sink.close()
+    out, err = "".join(texts[1]), "".join(texts[2])
+    if timed_out:
+        return subprocess.CompletedProcess(
+            args, 124, out, "timed out after %ss" % timeout)
+    return subprocess.CompletedProcess(args, proc.returncode, out, err)
 
 
 def now_utc():
@@ -1755,6 +1839,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         prune(state, when)
         save(state_dir, state)
         prune_results(state_dir, state, when)
+        prune_logs(state_dir, when)
         queued = set(state["waiting"])
     current = {head[1] for head in heads}
     for slot, holder in holders.items():
@@ -2279,7 +2364,7 @@ def children_cpu():
 
 
 def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
-          cpu=children_cpu):
+          cpu=children_cpu, logs=None, stream=None):
     """Every step that applies to the head, each run even if an earlier
     one failed, and none retried, each after `prefix` (memory_cap).
     `wrap(name, prefix, argv, env)` gives a traced step's (argv, env).
@@ -2287,7 +2372,10 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
     one of its own there as CHECK_RESULTS (`keep_results`). Each
     result has its wall time and its CPU time (`cpu()` before and
     after: user and system seconds of the step's process tree), so a
-    step's work can be told from its waiting. Returns (ok, results)."""
+    step's work can be told from its waiting. With `logs`, a directory,
+    and `stream` (sh_logged), each step runs through `stream` instead,
+    which keeps its output there as `<step>.log.gz`. Returns (ok,
+    results)."""
     results = []
     for name, args, only_if in applicable(wt, steps):
         step_env_, folder = env, None
@@ -2300,8 +2388,14 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
         if wrap is not None:
             step_args, step_env_ = wrap(name, list(prefix), args, step_env_)
         started, used = time.monotonic(), cpu()
-        got = run(step_args, cwd=wt, env=step_env_,
-                  timeout=STEP_TIMEOUT_S)
+        if logs is not None and stream is not None:
+            os.makedirs(logs, exist_ok=True)
+            got = stream(step_args, cwd=wt, env=step_env_,
+                         timeout=STEP_TIMEOUT_S, log=os.path.join(
+                             logs, results_name(name) + ".log.gz"))
+        else:
+            got = run(step_args, cwd=wt, env=step_env_,
+                      timeout=STEP_TIMEOUT_S)
         wall = time.monotonic() - started
         result = {"name": name, "rc": got.returncode,
                   "seconds": int(wall), "wall": round(wall, 2),
@@ -2582,6 +2676,24 @@ def prune_results(state_dir, state, when):
         except OSError:
             continue
         if name not in state["results"] and old:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def prune_logs(state_dir, when):
+    """Each head's step logs once they are LOGS_AGE old."""
+    top = os.path.join(state_dir, LOGS_DIR)
+    try:
+        names = os.listdir(top)
+    except OSError:
+        return
+    cutoff = (when - LOGS_AGE).timestamp()
+    for name in names:
+        path = os.path.join(top, name)
+        try:
+            old = os.lstat(path).st_mtime < cutoff
+        except OSError:
+            continue
+        if old:
             shutil.rmtree(path, ignore_errors=True)
 
 
@@ -3706,10 +3818,14 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 wrap = trace_wrapper(state_dir, slot, tracer, files)
         kept = os.path.join(state_dir, RESULTS_DIR, sha)
         shutil.rmtree(kept, ignore_errors=True)
+        logs = os.path.join(state_dir, LOGS_DIR, sha)
+        shutil.rmtree(logs, ignore_errors=True)
         phases.mark("setup")
+        # A test's own `run` stands in for every program, steps too.
         ok, results = check(wt, env, run, steps=steps,
                             prefix=memory_cap(memory_max, env, run, out),
-                            wrap=wrap, kept=kept)
+                            wrap=wrap, kept=kept, logs=logs,
+                            stream=sh_logged if run is sh else None)
         phases.mark("steps")
         for r in results:
             out("  %-20s rc=%-3d %4ds" % (r["name"], r["rc"], r["seconds"]))
@@ -3772,6 +3888,9 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                     "dir": os.path.join(RESULTS_DIR, sha),
                     "steps": {r["name"]: results_name(r["name"])
                               for r in results if r.get("results_bytes")}}
+            if os.path.isdir(logs):
+                # Each step's whole output, a time on every line.
+                record["logs"] = os.path.join(LOGS_DIR, sha)
             if TEST_AHEAD:
                 # What a later head with the same tree is matched by.
                 record.update(tree=tree, host=socket.gethostname(),
