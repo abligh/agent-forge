@@ -786,14 +786,17 @@ def sh(args, cwd=None, env=None, timeout=None):
 def sh_logged(args, cwd=None, env=None, timeout=None, log=None):
     """sh, also writing the output to `log` (gzipped) as it comes, each
     line as "<seconds> <stream> <line>": seconds since the start, to
-    the millisecond, and 1 for stdout or 2 for stderr. A timeout kills
-    the program and comes back as exit 124; a pipe its children still
-    hold open is given up on a few seconds later."""
+    the millisecond, and 1 for stdout or 2 for stderr. What comes back
+    as stdout is both streams in the order their lines arrived (stderr
+    empty), so a failed step's tail ends where the step did, not with
+    whatever it wrote to stderr earlier. A timeout kills the program and
+    comes back as exit 124; a pipe its children still hold open is given
+    up on a few seconds later."""
     proc = subprocess.Popen(args, cwd=cwd, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True,
                             errors="replace")
     started = time.monotonic()
-    texts = {1: [], 2: []}
+    lines = []
     lock = threading.Lock()
     sink = gzip.open(log, "wt", encoding="utf-8")
     room = [LOGS_MAX]
@@ -807,8 +810,8 @@ def sh_logged(args, cwd=None, env=None, timeout=None, log=None):
             pass
 
     def keep(line, stream):
-        texts[stream].append(line)
         with lock:
+            lines.append(line if line.endswith("\n") else line + "\n")
             if room[0] <= 0 or sink.closed:
                 return
             entry = "%.3f %d %s" % (time.monotonic() - started, stream,
@@ -844,11 +847,11 @@ def sh_logged(args, cwd=None, env=None, timeout=None, log=None):
             sink.write("%.3f 0 [timed out after %ss]\n"
                        % (time.monotonic() - started, timeout))
         sink.close()
-    out, err = "".join(texts[1]), "".join(texts[2])
+    out = "".join(lines)
     if timed_out:
         return subprocess.CompletedProcess(
             args, 124, out, "timed out after %ss" % timeout)
-    return subprocess.CompletedProcess(args, proc.returncode, out, err)
+    return subprocess.CompletedProcess(args, proc.returncode, out, "")
 
 
 def now_utc():

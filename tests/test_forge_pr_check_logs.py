@@ -50,7 +50,7 @@ class ShLogged(unittest.TestCase):
             "print('two', file=sys.stderr, flush=True)\n"
             "sys.exit(3)\n"), log=self.log)
         self.assertEqual((got.returncode, got.stdout, got.stderr),
-                         (3, "one\n", "two\n"))
+                         (3, "one\ntwo\n", ""))
         rows = [parsed(line) for line in lines_of(self.log)]
         self.assertEqual([(s, t) for _, s, t in rows],
                          [(1, "one"), (2, "two")])
@@ -59,9 +59,23 @@ class ShLogged(unittest.TestCase):
     def test_a_last_line_without_a_newline_is_kept(self):
         got = pc.sh_logged(python(
             "import sys; sys.stdout.write('end')"), log=self.log)
-        self.assertEqual(got.stdout, "end")
+        self.assertEqual(got.stdout, "end\n")
         self.assertEqual([parsed(line)[1:] for line in lines_of(self.log)],
                          [(1, "end")])
+
+    def test_the_output_comes_back_in_the_order_it_was_written(self):
+        # Stdout then stderr put a failed step's earlier
+        # compiler lines after its failure, at the end of the tail.
+        got = pc.sh_logged(python(
+            "import sys, time\n"
+            "print('compiling', file=sys.stderr, flush=True)\n"
+            "time.sleep(0.2)\n"
+            "print('FAILED: / is 302, got 502', flush=True)\n"
+            "sys.exit(1)\n"), log=self.log)
+        self.assertEqual(got.stdout,
+                         "compiling\nFAILED: / is 302, got 502\n")
+        self.assertEqual(pc.tail(got.stdout + got.stderr).splitlines()[-1],
+                         "FAILED: / is 302, got 502")
 
     def test_a_timeout_is_exit_124_and_says_so_in_the_log(self):
         got = pc.sh_logged(python(
