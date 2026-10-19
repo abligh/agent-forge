@@ -289,6 +289,11 @@ maps an environment variable to a directory name, such as
 directory in the state directory, outside the worktree, so a head isn't
 built from nothing each time. A variable the host already sets wins.
 A step is stopped after `checks.step_timeout_minutes` (default 30).
+Each slot also has its own `TMPDIR` there (`tmp`, `tmp-2`, ...), which
+the host's never overrides: it is emptied as a run starts, under the
+slot's lock, and removed when the run ends, stopped or not. A step
+stopped by SIGTERM (a superseded head) or killed outright leaves its
+`go-build*` and test directories there, not in /tmp.
 
 **Each step runs under a memory limit**, in its own `systemd-run
 --user --scope` with `MemoryMax` (`checks.memory_max`, default `16G`;
@@ -531,6 +536,8 @@ KEEP = datetime.timedelta(days=21)
 # bytes. One with no verdict (a run stopped, or the host's fault) goes
 # once it is RESULTS_ORPHAN_AGE old, which no run takes.
 RESULTS_DIR = "results"
+# Each slot's TMPDIR, in the state directory (slot_tmp).
+TMP_DIR = "tmp"
 RESULTS_MAX = 10 * 1024 * 1024
 RESULTS_ORPHAN_AGE = datetime.timedelta(days=1)
 # Failures to prepare a head's worktree before it is given up on.
@@ -2146,17 +2153,34 @@ def check_cpus(online=None, slots=None):
     return max(1, online // max(1, slots))
 
 
+def slot_tmp(state_dir, slot):
+    """The slot's TMPDIR: its steps' temporary files, in the state
+    directory."""
+    return os.path.join(state_dir, slot_name(TMP_DIR, slot))
+
+
+def fresh_tmp(path):
+    """Empty path, a slot's TMPDIR, and make it again, private: what a
+    stopped or killed run left there goes."""
+    shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+
+
 def step_env(state_dir, base=None, slot=1):
     """The steps' environment: `base` (os.environ) less STEP_DROP_ENV,
     every FORGE_ setting and what checks.drop_env names, with the slot's build caches (CACHES)
     outside the worktree and the slot's share of the CPUs
-    (CHECK_CPUS), unless the host set them."""
+    (CHECK_CPUS), unless the host set them, and always the slot's own
+    TMPDIR (slot_tmp)."""
     env = {k: v for k, v in (os.environ if base is None else base).items()
            if k not in STEP_DROP_ENV and k not in DROP_NAMES
            and not k.startswith((STEP_DROP_PREFIX,) + DROP_PREFIXES)}
     for name, folder in CACHES.items():
         env.setdefault(name, os.path.join(state_dir, slot_name(folder, slot)))
     env.setdefault("CHECK_CPUS", str(check_cpus()))
+    # Always the slot's: a step stopped mid-build leaves its temporary
+    # files where the next run in the slot clears them.
+    env["TMPDIR"] = slot_tmp(state_dir, slot)
     # systemd-run --user finds the user's manager through it, and cron
     # doesn't set it.
     env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
@@ -3513,6 +3537,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     settled = False
     phases.mark("lock")
     wt = os.path.join(state_dir, slot_name("wt", slot))
+    # Under the slot's lock: what a run killed outright left goes.
+    fresh_tmp(slot_tmp(state_dir, slot))
     if ahead:
         # A prediction is no pull request's head: it gets no status.
         post = None
@@ -3873,6 +3899,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         signal.signal(signal.SIGTERM, lambda signum, frame: None)
         # Under the slot's lock, so no run in it is building meanwhile.
         prune_slot_caches(state_dir, slot, out)
+        shutil.rmtree(slot_tmp(state_dir, slot), ignore_errors=True)
         held.close()
         # After the lock is free, so the started tick can take it.
         if chain is not None and settled:

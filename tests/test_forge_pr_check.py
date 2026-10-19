@@ -1101,7 +1101,8 @@ class StepEnv(unittest.TestCase):
                                "CARGO_TARGET_DIR": "/s/cargo-target",
                                "XDG_RUNTIME_DIR": "/run/user/%d"
                                % os.getuid(),
-                               "CHECK_CPUS": str(pc.check_cpus())})
+                               "CHECK_CPUS": str(pc.check_cpus()),
+                               "TMPDIR": "/s/tmp"})
 
     def test_drops_what_the_project_names(self):
         # agent-forge #18: checks.drop_env, names and prefixes.
@@ -1124,6 +1125,15 @@ class StepEnv(unittest.TestCase):
     def test_keeps_the_hosts_runtime_dir(self):
         env = pc.step_env("/s", {"XDG_RUNTIME_DIR": "/r"})
         self.assertEqual(env["XDG_RUNTIME_DIR"], "/r")
+
+    def test_each_slot_has_its_own_tmpdir_whatever_the_host_sets(self):
+        # A step stopped by SIGTERM leaves go-build* and test directories
+        # behind; they must land where the slot's next run clears them.
+        self.assertEqual(pc.step_env("/s", {"TMPDIR": "/tmp"})["TMPDIR"],
+                         "/s/tmp")
+        self.assertEqual(pc.step_env("/s", {}, slot=2)["TMPDIR"], "/s/tmp-2")
+        self.assertEqual(pc.step_env("/s", {}, slot=pc.LANE)["TMPDIR"],
+                         "/s/tmp-lane")
 
 
 class MemoryCap(unittest.TestCase):
@@ -1498,6 +1508,38 @@ class Worker(StateCase):
                           self.state_dir, "verdicts.log").read_text())
         self.assertEqual(held, [None])
         self.assertEqual(self.lines[-1], "CHAINED forge-pr-check --post")
+
+    def test_the_steps_get_a_fresh_tmpdir_which_goes_afterwards(self):
+        self.queue()
+        tmp = os.path.join(self.state_dir, "tmp")
+        os.makedirs(os.path.join(tmp, "go-build123"))
+        seen = []
+
+        def look(args):
+            seen.append(os.listdir(tmp))
+            return done(args)
+        run = self.run_for()
+        run.rules.insert(0, (lambda a: a == ["make", "test"], look))
+        self.work(run)
+        self.assertEqual(seen, [[]])
+        steps = [c for c in run.calls if c["args"] == ["make", "test"]]
+        self.assertEqual(steps[0]["env"]["TMPDIR"], tmp)
+        self.assertFalse(os.path.exists(tmp))
+
+    def test_a_stopped_run_leaves_no_tmpdir(self):
+        self.queue()
+        self.addCleanup(signal.signal, signal.SIGTERM,
+                        signal.getsignal(signal.SIGTERM))
+        tmp = os.path.join(self.state_dir, "tmp")
+
+        def superseded(args):
+            os.makedirs(os.path.join(tmp, "go-build456"))
+            os.kill(os.getpid(), signal.SIGTERM)
+            return done(args)
+        run = self.run_for()
+        run.rules.insert(0, (lambda a: a == ["make", "test"], superseded))
+        self.assertEqual(self.work(run), 3)
+        self.assertFalse(os.path.exists(tmp))
 
     def test_the_sigterm_handler_is_restored_afterwards(self):
         self.queue()
