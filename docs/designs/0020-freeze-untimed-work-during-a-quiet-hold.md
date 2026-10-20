@@ -1,6 +1,6 @@
 # 0020: Freeze untimed work during a quiet hold
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-20, https://github.com/abligh/agent-forge/issues/33#issuecomment-6286890539)
 * Author: XMPPEngineer
 * Date: 2026-10-20
 
