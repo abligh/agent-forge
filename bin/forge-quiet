@@ -22,7 +22,11 @@ hold. The command has FORGE_QUIET_HOLDER, FORGE_QUIET_MINUTES,
 FORGE_QUIET_UNTIL and FORGE_QUIET_DIR set; a `forge-` name runs from
 this installation and anything else from the configuration's checkout.
 It is run only after the hold is written, so nothing new starts while
-it waits. `--no-settle` skips it. **release** drops a hold.
+it waits. Exit 1 means busy; any other failure is an error, said as
+one, and three in a row end the wait. Settling doesn't spend the
+hold's minutes: the hold is renewed while it waits, and taken again
+for its full minutes once settled. `--no-settle` skips it.
+**release** drops a hold.
 **status** lists the live holds, soonest to end first, and is what a job
 calls before heavy work:
 
@@ -39,8 +43,9 @@ Exit status:
     1   status: a hold is live (after --wait, still, when it ran out)
     2   bad arguments, or no holder for hold or release
     3   hold: the hold is taken, but the settle command still fails at
-        the end of settle_minutes (its last output is printed); what
-        to do then, wait, go ahead or release, is the holder's call
+        the end of settle_minutes, or failed with an error three times
+        in a row (its last output is printed); what to do then, wait,
+        go ahead or release, is the holder's call
 """
 
 import argparse
@@ -59,6 +64,10 @@ POLL_S = 30
 DEFAULT_SETTLE_MINUTES = 30
 # The longest one run of the settle command may take.
 SETTLE_RUN_S = 120
+# A settle command's exit status for "busy"; anything else but 0 is an
+# error, and this many in a row end the wait.
+SETTLE_BUSY = 1
+SETTLE_ERRORS = 3
 BIN = os.path.dirname(os.path.realpath(__file__))
 
 
@@ -112,23 +121,43 @@ def run_settle(argv, cwd, env):
     return got.returncode, got.stdout
 
 
-def settle(section, root, folder, holder, minutes, until, environ, clock,
+def say(line):
+    """print, flushed: a hold's output often goes to a file, and a
+    holder that is stopped must not lose what it had said."""
+    print(line, flush=True)
+
+
+def settle(section, root, folder, holder, minutes, renew, environ, clock,
            sleep, out, run):
     """Run the settle command until it exits 0 or its time runs out.
-    True once it has."""
+    `renew()` takes the hold again for its full minutes from now and
+    returns its end: called before each run, so waiting doesn't use up
+    the hold, and once settled. True once settled."""
     argv = settle_argv(section["settle"], root)
-    env = dict(environ)
-    env.update(FORGE_QUIET_HOLDER=holder, FORGE_QUIET_MINUTES=str(minutes),
-               FORGE_QUIET_UNTIL=quiet.stamp(until), FORGE_QUIET_DIR=folder)
     limit = section.get("settle_minutes", DEFAULT_SETTLE_MINUTES)
     deadline = clock() + datetime.timedelta(minutes=limit)
-    said = None
+    said, errors = None, 0
     while True:
+        until = renew()
+        env = dict(environ)
+        env.update(FORGE_QUIET_HOLDER=holder, FORGE_QUIET_MINUTES=str(minutes),
+                   FORGE_QUIET_UNTIL=quiet.stamp(until),
+                   FORGE_QUIET_DIR=folder)
         status, text = run(argv, root, env)
         if status == 0:
-            out("settled")
+            until = renew()
+            out("settled; held by %s until %s" % (holder, quiet.stamp(until)))
             return True
         text = (text or "").strip() or "exit %d" % status
+        if status == SETTLE_BUSY:
+            errors = 0
+        else:
+            errors += 1
+            text = "settle error (exit %d): %s" % (status, text)
+            if errors >= SETTLE_ERRORS:
+                out("%s: the settle command failed %d times in a row; the "
+                    "hold is kept:\n%s" % (PROG, errors, text))
+                return False
         if clock() >= deadline:
             out("%s: not settled after %d minutes; the hold is kept:\n%s"
                 % (PROG, limit, text))
@@ -140,7 +169,7 @@ def settle(section, root, folder, holder, minutes, until, environ, clock,
 
 
 def main(argv=None, environ=None, clock=now_utc, sleep=time.sleep,
-         out=print, run=run_settle):
+         out=say, run=run_settle):
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(prog=PROG, description=(
         "Hold a shared host quiet, or ask whether it is held."))
@@ -189,13 +218,15 @@ def main(argv=None, environ=None, clock=now_utc, sleep=time.sleep,
         return 2
     try:
         if args.command == "hold":
-            until = quiet.hold(folder, holder, args.minutes,
-                               " ".join(args.reason), clock(),
-                               section.get("max_minutes"))
+            def renew():
+                return quiet.hold(folder, holder, args.minutes,
+                                  " ".join(args.reason), clock(),
+                                  section.get("max_minutes"))
+            until = renew()
             out("held by %s until %s" % (holder, quiet.stamp(until)))
             if section.get("settle") and not args.no_settle:
                 if not settle(section, root, folder, holder, args.minutes,
-                              until, environ, clock, sleep, out, run):
+                              renew, environ, clock, sleep, out, run):
                     return 3
         elif quiet.release(folder, holder):
             out("released %s's hold" % holder)

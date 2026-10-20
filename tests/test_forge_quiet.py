@@ -138,7 +138,8 @@ class Settle(unittest.TestCase):
         self.assertEqual((env["FORGE_QUIET_HOLDER"], env["FORGE_QUIET_MINUTES"],
                           env["FORGE_QUIET_UNTIL"], env["FORGE_QUIET_DIR"]),
                          ("Carol", "20", "2026-10-19T15:20:00Z", self.dir))
-        self.assertEqual(self.lines[-1], "settled")
+        self.assertEqual(self.lines[-1],
+                         "settled; held by Carol until 2026-10-19T15:20:00Z")
 
     def test_it_waits_until_the_command_passes(self):
         self.results = [(1, "deploy 41 building"), (1, "deploy 41 building"),
@@ -148,6 +149,35 @@ class Settle(unittest.TestCase):
         self.assertEqual(self.now, T0 + datetime.timedelta(seconds=60))
         # A repeated message is said once.
         self.assertEqual(self.lines.count("settling: deploy 41 building"), 1)
+
+    def test_settling_does_not_spend_the_hold(self):
+        # 4 minutes of a busy host, then settled: the 20-minute hold
+        # runs 20 minutes from then, and was live all along.
+        self.results = [(1, "deploy 41 building")] * 8
+        self.assertEqual(self.run_cli("hold", "20", "timing"), 0)
+        settled = T0 + datetime.timedelta(seconds=30 * 8)
+        self.assertEqual(self.now, settled)
+        self.assertTrue(all(holds for *_, holds in self.calls))
+        (_, until, _), = quiet.live(self.dir, self.now)
+        self.assertEqual(until, settled + minutes(20))
+        self.assertEqual(self.calls[-1][2]["FORGE_QUIET_UNTIL"],
+                         quiet.stamp(settled + minutes(20)))
+
+    def test_a_failing_command_is_an_error_and_ends_the_wait(self):
+        self.results = [(2, "gh auth login")] * 100
+        self.assertEqual(self.run_cli("hold", "20", "timing"), 3)
+        self.assertEqual(len(self.calls), fq.SETTLE_ERRORS)
+        self.assertIn("settling: settle error (exit 2): gh auth login",
+                      self.lines)
+        self.assertIn("failed 3 times in a row", self.lines[-1])
+        self.assertEqual([h[0] for h in quiet.live(self.dir, self.now)],
+                         ["Carol"])
+
+    def test_an_error_between_busy_runs_is_waited_out(self):
+        self.results = [(2, "timeout"), (1, "busy"), (2, "timeout"),
+                        (2, "timeout"), (1, "busy"), (0, "")]
+        self.assertEqual(self.run_cli("hold", "20", "timing"), 0)
+        self.assertEqual(len(self.calls), 6)
 
     def test_running_out_keeps_the_hold_and_exits_3(self):
         self.results = [(1, "deploy 41 building")] * 100
