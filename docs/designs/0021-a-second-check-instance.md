@@ -1,6 +1,6 @@
 # 0021: A second check instance, on another platform
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-20, https://github.com/abligh/agent-forge/issues/34#issuecomment-6295002798)
 * Author: XMPPEngineer
 * Date: 2026-10-20
 
