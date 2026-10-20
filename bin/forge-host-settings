@@ -1,22 +1,40 @@
 #!/usr/bin/env python3
-"""Compare a host's agent settings with the project's tracked copy, or install it.
+"""Compare a host's agent settings and crontab with the project's tracked copies, or install them.
 
 Every agent session on a host loads the same files: Claude Code's
-~/.claude/settings.json, and the hooks it names. Edited by hand on one
-host, they drift silently from the others. The project tracks its
-copies and lists them in its configuration's `host_settings.files`; they change
+~/.claude/settings.json, and the hooks it names. Each host also runs a
+crontab. Edited by hand on one host, they drift silently from the
+others, and a crontab installed on the wrong host runs its jobs twice.
+The project tracks its copies, lists the files in its configuration's
+`host_settings.files` and each host's crontab in
+`host_settings.crontabs` (keyed by the host's short name); they change
 by pull request like anything else.
 
     forge-host-settings --check      0 when the host matches; 1 when it
                                      differs (a unified diff on stdout);
                                      2 when a tracked copy can't be read
     forge-host-settings --install    write the tracked copies over the host's
+    forge-host-settings --apply      the same, from cron: says nothing
+                                     when there is nothing to do
 
-**Installing is a person's step.** The settings decide what agents may
-do without asking, so a change reaches a host only when the owner
-installs it, or an agent at their explicit request. Nothing should run
-`--install` on a schedule. Running sessions pick settings up only when
-they next start.
+**Installing follows approval on the default branch.** The settings
+decide what agents may do without asking, and the crontab what runs
+unattended, so their tracked copies should be code-owned: a change
+reaches the default branch only with the owner's approving review.
+Once it has, `--apply`, run from each host's crontab every few minutes,
+installs it there, so nobody types install commands on each host. A
+project that wants a person to install by hand leaves `--apply` out of
+its crontabs and runs `--install`. Running sessions pick settings up
+only when they next start.
+
+**Which crontab.** A host installs the entry in `host_settings.crontabs`
+for its own short name (`--host`, else $FORGE_HOST_NAME, else the
+hostname up to its first dot), and never another host's. A host with no
+entry keeps whatever crontab it has: `--check` and `--install` say so,
+and `--apply` says nothing. A crontab compares as text. `--apply` won't
+install a crontab that drops the `forge-host-settings --apply` line the
+host's own crontab has, since that would turn the installing off
+silently; `--install`, run by a person, will.
 
 **What counts as a difference.** A file marked `json` is compared as
 JSON, so key order and layout don't count, and the keys in
@@ -30,7 +48,8 @@ keeps each replaced file under
 ~/.local/state/agent-forge/<project>/host-settings/backups/ as
 `<name>.<UTC timestamp>` (never beside the file: every file in a hooks
 directory is taken for a hook), and writes through a temporary file and
-a rename, so a failure leaves the old file whole. A second run finds
+a rename, so a failure leaves the old file whole. A replaced crontab is
+kept there too, as `crontab.<UTC timestamp>`. A second run finds
 nothing to do.
 
 The copies are read from the project's cron checkout
@@ -44,6 +63,8 @@ import datetime
 import difflib
 import json
 import os
+import socket
+import subprocess
 import sys
 import tempfile
 
@@ -177,6 +198,70 @@ def install_one(dest, text, mode, backups, now=None):
     return backup
 
 
+# The line in a crontab that keeps installing it; --apply won't drop it.
+APPLY_LINE = "forge-host-settings --apply"
+
+
+def run_crontab(args, text=None):
+    """(exit status, stdout, stderr) of `crontab <args>`."""
+    try:
+        got = subprocess.run(["crontab"] + list(args), input=text,
+                             capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        return 127, "", str(err)
+    return got.returncode, got.stdout, got.stderr
+
+
+def installed_crontab(run=run_crontab):
+    """The host's crontab, or None if it has none. Unreadable when
+    `crontab -l` fails for any other reason."""
+    code, out, err = run(["-l"])
+    if code == 0:
+        return out
+    if "no crontab" in err.lower():
+        return None
+    raise Unreadable("crontab -l: %s" % (err.strip() or "exit %d" % code))
+
+
+def crontab_of(project, tree, host):
+    """The tracked crontab for `host`, or None when it has no entry."""
+    rel = project.section("host_settings").get("crontabs", {}).get(host)
+    if rel is None:
+        return None
+    src = os.path.join(tree, rel)
+    try:
+        text = read(src)
+    except OSError as err:
+        raise Unreadable("%s: %s" % (src, err)) from err
+    if text is None:
+        raise Unreadable("%s: no such file" % src)
+    return text
+
+
+def install_crontab(text, have, backups, run=run_crontab, now=None):
+    """Install `text` as the crontab, keeping `have`. The backup's path,
+    or None when there was no crontab. Unreadable when crontab refuses
+    it, which leaves the old one in place."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    backup = None
+    if have is not None:
+        os.makedirs(backups, exist_ok=True)
+        backup = os.path.join(backups, "crontab.%s"
+                              % now.strftime("%Y%m%dT%H%M%SZ"))
+        with open(backup, "w", encoding="utf-8") as fh:
+            fh.write(have)
+    code, _out, err = run(["-"], text)
+    if code != 0:
+        raise Unreadable("crontab refused the tracked copy: %s"
+                         % (err.strip() or "exit %d" % code))
+    return backup
+
+
+def host_name(args, environ, hostname=socket.gethostname):
+    return args.host or environ.get("FORGE_HOST_NAME") \
+        or hostname().split(".")[0]
+
+
 def files_of(project):
     """(tracked path, installed path, mode, is JSON) for each host file."""
     return [(f["from"], f["to"], int(f.get("mode", "0644"), 8),
@@ -184,7 +269,8 @@ def files_of(project):
             .get("files", [])]
 
 
-def main(argv=None, out=sys.stdout, err=sys.stderr, environ=None):
+def main(argv=None, out=sys.stdout, err=sys.stderr, environ=None,
+         run=run_crontab, hostname=socket.gethostname):
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(prog="forge-host-settings",
                                      description=__doc__.splitlines()[0])
@@ -193,9 +279,15 @@ def main(argv=None, out=sys.stdout, err=sys.stderr, environ=None):
                        help="report differences; change nothing")
     group.add_argument("--install", action="store_true",
                        help="write the tracked copies over the host's")
+    group.add_argument("--apply", action="store_true",
+                       help="--install, from cron: quiet when nothing "
+                       "differs")
     parser.add_argument("--tree", default=environ.get("FORGE_CRON_CHECKOUT"),
                         help="the checkout to read the copies from "
                         "(default $FORGE_CRON_CHECKOUT)")
+    parser.add_argument("--host", help="this host's short name, for its "
+                        "crontab (default $FORGE_HOST_NAME, else the "
+                        "hostname)")
     args = parser.parse_args(argv)
     if not args.tree:
         print("forge-host-settings: no --tree, and FORGE_CRON_CHECKOUT is "
@@ -208,30 +300,46 @@ def main(argv=None, out=sys.stdout, err=sys.stderr, environ=None):
     except config.ConfigError as exc:
         print("forge-host-settings: %s" % exc, file=err)
         return 2
-    host_keys = tuple(project.section("host_settings").get("host_keys", []))
-    if not files_of(project):
-        print("forge-host-settings: %s lists no host_settings.files" % project.path,
-              file=err)
+    section = project.section("host_settings")
+    host_keys = tuple(section.get("host_keys", []))
+    if not files_of(project) and not section.get("crontabs"):
+        print("forge-host-settings: %s lists no host_settings.files or "
+              "crontabs" % project.path, file=err)
         return 2
+    host = host_name(args, environ, hostname)
     try:
         files = tracked(tree, files_of(project), home)
+        cron = crontab_of(project, tree, host)
+        have_cron = installed_crontab(run) if cron is not None else None
     except Unreadable as exc:
         print("forge-host-settings: %s; nothing written" % exc, file=err)
         return 2
     wrong = differences(files, host_keys)
+    cron_wrong = cron is not None and cron != have_cron
+    if section.get("crontabs") and cron is None and not args.apply:
+        print("forge-host-settings: no crontab is tracked for host %r; its "
+              "crontab is left alone" % host, file=out)
     if args.check:
         for _dest, diff in wrong:
             out.write(diff)
-        if wrong:
+        if cron_wrong:
+            out.write("".join(difflib.unified_diff(
+                (have_cron or "").splitlines(keepends=True),
+                cron.splitlines(keepends=True),
+                fromfile="crontab -l" + (" (none)" if have_cron is None
+                                         else ""),
+                tofile="tracked crontab for %s" % host)))
+        if wrong or cron_wrong:
+            names = [d for d, _ in wrong] + (["crontab"] if cron_wrong else [])
             print("forge-host-settings: %d file(s) differ from %s: %s"
-                  % (len(wrong), tree, ", ".join(d for d, _ in wrong)),
-                  file=err)
+                  % (len(names), tree, ", ".join(names)), file=err)
             return 1
         print("forge-host-settings: host matches %s" % tree, file=out)
         return 0
-    if not wrong:
-        print("forge-host-settings: nothing to install; host matches %s"
-              % tree, file=out)
+    if not wrong and not cron_wrong:
+        if not args.apply:
+            print("forge-host-settings: nothing to install; host matches %s"
+                  % tree, file=out)
         return 0
     backups = os.path.join(locks.state_dir(project.name, "host-settings",
                                            environ), "backups")
@@ -243,8 +351,25 @@ def main(argv=None, out=sys.stdout, err=sys.stderr, environ=None):
         print("forge-host-settings: installed %s%s" % (
             dest, "; kept the old file as %s" % backup if backup else ""),
             file=out)
-    print("forge-host-settings: sessions pick the settings up when they "
-          "next start", file=out)
+    if wrong:
+        print("forge-host-settings: sessions pick the settings up when they "
+              "next start", file=out)
+    if cron_wrong:
+        if args.apply and have_cron is not None and APPLY_LINE in have_cron \
+                and APPLY_LINE not in cron:
+            print("forge-host-settings: the tracked crontab for %s has no "
+                  "%r line, so installing it would stop these installs; "
+                  "left alone: install it by hand with --install" % (
+                      host, APPLY_LINE), file=err)
+            return 1
+        try:
+            backup = install_crontab(cron, have_cron, backups, run)
+        except Unreadable as exc:
+            print("forge-host-settings: %s" % exc, file=err)
+            return 1
+        print("forge-host-settings: installed the crontab for %s%s" % (
+            host, "; kept the old one as %s" % backup if backup else ""),
+            file=out)
     return 0
 
 

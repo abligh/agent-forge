@@ -60,7 +60,7 @@ APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
 AGENT = dict(APP, session_name=str, twins=list, kind=str, reviews=list,
              away=str)
 IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
-HOST_SETTINGS = {"files": list, "host_keys": list}
+HOST_SETTINGS = {"files": list, "host_keys": list, "crontabs": dict}
 # forge-memory-sync, -check and -trim (agent_forge/memory.py).
 MEMORY = {"dir": str, "remote": str, "git_dir": str, "seed_dir": str,
           "ssh_key": str, "branch": str, "labels": list, "limit": int,
@@ -436,6 +436,15 @@ def check(data):
                                     "its tree" % (where, key))
             if "mode" in entry and not MODE_RE.match(entry["mode"]):
                 problems.append("%s.mode must be octal, like \"0644\""
+                                % where)
+        for host, rel in settings.get("crontabs", {}).items():
+            where = "host_settings.crontabs[%r]" % host
+            if not host or "." in host:
+                problems.append("%s: a host is its short name, with no dot"
+                                % where)
+            if not isinstance(rel, str) or not rel or rel.startswith("/") \
+                    or ".." in rel.split("/"):
+                problems.append("%s must be a relative path inside its tree"
                                 % where)
         if not all(isinstance(k, str) for k in settings.get("host_keys", [])):
             problems.append("host_settings.host_keys must be a list of "

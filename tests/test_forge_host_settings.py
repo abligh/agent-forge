@@ -289,5 +289,139 @@ class Configuration(Host):
         self.assertEqual(self.run_tool("--check")[0], 1)
 
 
+FLEET = "*/5 * * * * $HOME/agent-forge/bin/forge-host-settings --apply\n" \
+        "0 * * * * fleet-job\n"
+OWN = "*/5 * * * * $HOME/agent-forge/bin/forge-host-settings --apply\n" \
+      "0 3 * * * own-job\n"
+
+
+class FakeCron:
+    """`crontab`, as forge-host-settings runs it: -l and -."""
+
+    def __init__(self, text=None, refuse=False):
+        self.text, self.refuse, self.calls = text, refuse, []
+
+    def __call__(self, args, text=None):
+        self.calls.append(list(args))
+        if args == ["-l"]:
+            if self.text is None:
+                return 1, "", "no crontab for claude\n"
+            return 0, self.text, ""
+        if self.refuse:
+            return 1, "", "bad minute\n"
+        self.text = text
+        return 0, "", ""
+
+
+class Crontabs(Host):
+    """Each host installs its own tracked crontab, and no other's."""
+
+    def setUp(self):
+        super().setUp()
+        data = example()
+        data["host_settings"]["crontabs"] = {"fleet": "tools/host/crontab.fleet",
+                                             "spare": "tools/host/crontab.spare"}
+        self.write_config(data)
+        (self.tree / "tools/host/crontab.fleet").write_text(FLEET)
+        (self.tree / "tools/host/crontab.spare").write_text(OWN)
+        self.run_tool("--install", host="none")  # the files, not a crontab
+
+    def run_tool(self, *args, host="fleet", cron=None):
+        self.cron = cron if cron is not None else getattr(self, "cron",
+                                                          FakeCron())
+        out, err = io.StringIO(), io.StringIO()
+        code = tool.main([*args, "--tree", str(self.tree)], out=out, err=err,
+                         environ={"HOME": str(self.home)}, run=self.cron,
+                         hostname=lambda: host + ".example.net")
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_host_installs_its_own_crontab(self):
+        code, out, _ = self.run_tool("--apply", cron=FakeCron())
+        self.assertEqual(code, 0)
+        self.assertEqual(self.cron.text, FLEET)
+        self.assertIn("installed the crontab for fleet", out)
+
+    def test_another_host_installs_its_own_not_the_fleets(self):
+        self.run_tool("--apply", host="spare", cron=FakeCron("old\n"))
+        self.assertEqual(self.cron.text, OWN)
+
+    def test_a_host_with_no_entry_keeps_its_crontab(self):
+        code, out, _ = self.run_tool("--install", host="laptop",
+                                     cron=FakeCron("mine\n"))
+        self.assertEqual((code, self.cron.text), (0, "mine\n"))
+        self.assertIn("no crontab is tracked for host 'laptop'", out)
+        self.assertEqual(self.cron.calls, [])
+        code, out, _ = self.run_tool("--apply", host="laptop")
+        self.assertEqual((code, out), (0, ""))
+
+    def test_apply_is_quiet_when_nothing_differs(self):
+        self.run_tool("--apply", cron=FakeCron())
+        code, out, err = self.run_tool("--apply")
+        self.assertEqual((code, out, err), (0, "", ""))
+        self.assertEqual(self.cron.calls[-1], ["-l"])
+
+    def test_check_shows_the_crontab_diff(self):
+        code, out, err = self.run_tool("--check", cron=FakeCron("0 * * * * x\n"))
+        self.assertEqual(code, 1)
+        self.assertIn("-0 * * * * x", out)
+        self.assertIn("+0 * * * * fleet-job", out)
+        self.assertIn("crontab", err)
+        self.assertEqual(self.cron.text, "0 * * * * x\n")
+
+    def test_the_replaced_crontab_is_kept(self):
+        self.run_tool("--apply", cron=FakeCron("old line\n"))
+        backups = list((self.home / ".local/state").rglob("crontab.*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), "old line\n")
+
+    def test_apply_wont_drop_its_own_line(self):
+        (self.tree / "tools/host/crontab.fleet").write_text("0 * * * * job\n")
+        code, _, err = self.run_tool("--apply", cron=FakeCron(FLEET))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.cron.text, FLEET)
+        self.assertIn("would stop these installs", err)
+        code, _, _ = self.run_tool("--install")
+        self.assertEqual((code, self.cron.text), (0, "0 * * * * job\n"))
+
+    def test_a_refused_crontab_leaves_the_old_one(self):
+        code, _, err = self.run_tool("--apply", cron=FakeCron("old\n",
+                                                               refuse=True))
+        self.assertEqual((code, self.cron.text), (1, "old\n"))
+        self.assertIn("bad minute", err)
+
+    def test_an_unreadable_crontab_writes_nothing(self):
+        self.settings().unlink()
+
+        def broken(args, text=None):
+            return 1, "", "permission denied\n"
+        code, _, err = self.run_tool("--apply", cron=broken)
+        self.assertEqual(code, 2)
+        self.assertFalse(self.settings().exists())
+        self.assertIn("permission denied", err)
+
+    def test_the_host_flag_overrides_the_hostname(self):
+        self.run_tool("--apply", "--host", "spare", cron=FakeCron())
+        self.assertEqual(self.cron.text, OWN)
+
+    def test_a_crontab_only_configuration_is_enough(self):
+        data = example()
+        data["host_settings"] = {"crontabs": {"fleet": "tools/host/crontab.fleet"}}
+        self.write_config(data)
+        code, _, _ = self.run_tool("--apply", cron=FakeCron())
+        self.assertEqual((code, self.cron.text), (0, FLEET))
+
+    def test_the_configuration_checks_the_entries(self):
+        from agent_forge import config
+        data = example()
+        data["host_settings"]["crontabs"] = {"a.b": "x", "c": "../y", "d": "/z"}
+        problems = config.check(data)
+        self.assertIn("host_settings.crontabs['a.b']: a host is its short "
+                      "name, with no dot", problems)
+        self.assertIn("host_settings.crontabs['c'] must be a relative path "
+                      "inside its tree", problems)
+        self.assertIn("host_settings.crontabs['d'] must be a relative path "
+                      "inside its tree", problems)
+
+
 if __name__ == "__main__":
     unittest.main()
