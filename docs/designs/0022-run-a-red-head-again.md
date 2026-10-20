@@ -1,6 +1,6 @@
 # 0022: Run a red head again
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-20, https://github.com/abligh/agent-forge/issues/35#issuecomment-6295595950)
 * Author: XMPPEngineer
 * Date: 2026-10-20
 
