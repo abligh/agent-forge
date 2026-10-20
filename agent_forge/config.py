@@ -81,13 +81,29 @@ STALL_ALERT = {"tell": list, "retell_minutes": int,
 # checks is shared with tools not here yet, so only these keys are
 # checked.
 CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
-          "slots": int, "memory_max": str, "step_timeout_minutes": int,
+          "slots": int, "memory_max": (str, type(None)), "step_timeout_minutes": int,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
           "tracer": str, "cpu_weight": int, "fast_lane": dict,
           "merge_default": bool, "cache_limit": str, "reuse": dict,
           "fresh": dict, "first_authors": list, "max_wait_minutes": int,
           "main": str, "main_red_issue": dict, "drop_env": list,
-          "keep_ignored": list, "red_comment": bool}
+          "keep_ignored": list, "red_comment": bool, "instances": dict}
+# checks.instances (designs/0021): more instances of the check, each on
+# its own host with its own context and steps. A block's keys come from
+# the block alone (OWN), from the block or else `checks` (INHERITED),
+# from the block alone and never inherited, because they describe the
+# first host's tracer (BLOCK_ONLY), or from `checks` alone, because they
+# belong to the context the Merger requires (CHECKS_ONLY).
+INSTANCE_OWN = ("host", "context", "steps", "poster")
+INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight",
+                      "step_timeout_minutes", "caches", "cache_limit",
+                      "keep_ignored", "drop_env", "merge_default",
+                      "red_comment", "max_wait_minutes")
+INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
+                       "reuse", "fresh", "main")
+INSTANCE_CHECKS_ONLY = ("main_red_issue", "first_authors", "merger_first")
+# An instance's name names its state directory and its log lines.
+INSTANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # checks.drop_env: a variable's name, or a prefix ending in `*`.
 DROP_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\*?$")
 # checks.main: which default-branch heads are run (designs/0011).
@@ -328,94 +344,9 @@ def check(data):
             data["relay"]["remind_seconds"] < 1:
         problems.append("relay.remind_seconds must be at least 1")
     checks = data.get("checks", {})
-    for key, kinds in CHECKS.items():
-        if key in checks and not _is(checks[key], kinds):
-            problems.append("checks.%s must be %s" % (key, _type_name(kinds)))
-    for key in ("slots", "step_timeout_minutes", "depends_minutes",
-                "max_wait_minutes"):
-        if _is(checks.get(key), int) and checks[key] < 1:
-            problems.append("checks.%s must be at least 1" % key)
-    if _is(checks.get("cpu_weight"), int) \
-            and not 0 <= checks["cpu_weight"] <= 10000:
-        problems.append("checks.cpu_weight must be 0 (none) or 1 to 10000")
-    if isinstance(checks.get("fast_lane"), dict):
-        _check_fast_lane(checks, problems)
-    if isinstance(checks.get("reuse"), dict):
-        _check_reuse(checks, problems)
-    if isinstance(checks.get("fresh"), dict):
-        _check_fresh(checks, problems)
-    if isinstance(checks.get("main"), str) \
-            and checks["main"] not in MAIN_MODES:
-        problems.append("checks.main must be one of %s"
-                        % ", ".join(MAIN_MODES))
-    if isinstance(checks.get("main_red_issue"), dict):
-        _fields("checks.main_red_issue", checks["main_red_issue"],
-                MAIN_RED_ISSUE, problems)
-        if checks.get("main", "needed") != "every" \
-                and not checks.get("depends"):
-            problems.append("checks.main_red_issue needs checks.main "
-                            "\"every\" (or checks.depends): otherwise the "
-                            "default branch is never checked")
-    if isinstance(checks.get("keep_ignored"), list):
-        for path in checks["keep_ignored"]:
-            if not (isinstance(path, str) and path.strip("/")
-                    and ".." not in path.split("/")
-                    and not any(c in path for c in "*?[!\\")):
-                problems.append("checks.keep_ignored: %r is not a path "
-                                "inside the worktree" % (path,))
-    if isinstance(checks.get("drop_env"), list):
-        for entry in checks["drop_env"]:
-            if not isinstance(entry, str) or not DROP_ENV_RE.match(entry):
-                problems.append("checks.drop_env: %r is not a variable's "
-                                "name or a prefix ending in *" % (entry,))
-    if isinstance(checks.get("first_authors"), list):
-        agents = data.get("agents", {})
-        for name in checks["first_authors"]:
-            if not isinstance(name, str) or name not in agents:
-                problems.append("checks.first_authors: %r is not an agent"
-                                % (name,))
-    if isinstance(checks.get("cache_limit"), str) \
-            and not SIZE_RE.match(checks["cache_limit"]):
-        problems.append("checks.cache_limit must be a size such as 40G "
-                        "(K, M, G or T)")
-    if isinstance(checks.get("tracer"), str) \
-            and checks["tracer"] not in TRACERS:
-        problems.append("checks.tracer must be one of %s"
-                        % ", ".join(TRACERS))
-    if isinstance(checks.get("steps"), list):
-        for i, step in enumerate(checks["steps"]):
-            where = "checks.steps[%d]" % i
-            if not _fields(where, step, STEP, problems):
-                continue
-            if "name" not in step:
-                problems.append("%s: missing 'name'" % where)
-            run = step.get("run")
-            if not (isinstance(run, list) and run
-                    and all(isinstance(a, str) for a in run)):
-                problems.append("%s.run must be a non-empty list of strings"
-                                % where)
-            version = step.get("version")
-            if "version" in step and not (
-                    isinstance(version, list) and version
-                    and all(isinstance(a, str) for a in version)):
-                problems.append("%s.version must be a non-empty list of "
-                                "strings" % where)
-            for path in step.get("outputs", []) \
-                    if isinstance(step.get("outputs"), list) else ():
-                if not (isinstance(path, str) and path.strip("/")
-                        and ".." not in path.split("/")
-                        and not any(c in path for c in "*?[!\\")):
-                    problems.append("%s.outputs: %r is not a path inside "
-                                    "the worktree" % (where, path))
-    if isinstance(checks.get("caches"), dict) and not all(
-            isinstance(v, str) and v and "/" not in v
-            for v in checks["caches"].values()):
-        problems.append("checks.caches must map variables to directory names")
-    poster = checks.get("poster")
-    if isinstance(poster, str) and poster not in data.get("machinery", {}) \
-            and poster not in data.get("agents", {}):
-        problems.append("checks.poster %r is no App in the configuration"
-                        % poster)
+    _check_checks(checks, data, problems)
+    if isinstance(checks.get("instances"), dict):
+        _check_instances(checks["instances"], data, problems)
     _check_receiver(data.get("receiver", {}), problems)
     closing = data.get("closing_keywords", {})
     if _fields("closing_keywords", closing, CLOSING_KEYWORDS, problems):
@@ -561,6 +492,153 @@ def _check_stall_alert(alert, agents, problems):
         problems.append("%s.labels must be a list of label names" % where)
 
 
+def _check_checks(checks, data, problems, where="checks"):
+    """The `checks` section, or a block of `checks.instances`, whose
+    problems then name it as `where`."""
+    for key, kinds in CHECKS.items():
+        if key in checks and not _is(checks[key], kinds):
+            problems.append("%s.%s must be %s" % (where, key, _type_name(kinds)))
+    for key in ("slots", "step_timeout_minutes", "depends_minutes",
+                "max_wait_minutes"):
+        if _is(checks.get(key), int) and checks[key] < 1:
+            problems.append("%s.%s must be at least 1" % (where, key))
+    if _is(checks.get("cpu_weight"), int) \
+            and not 0 <= checks["cpu_weight"] <= 10000:
+        problems.append("%s.cpu_weight must be 0 (none) or 1 to 10000" % where)
+    if isinstance(checks.get("fast_lane"), dict):
+        _check_fast_lane(checks, problems, where)
+    if isinstance(checks.get("reuse"), dict):
+        _check_reuse(checks, problems, where)
+    if isinstance(checks.get("fresh"), dict):
+        _check_fresh(checks, problems, where)
+    if isinstance(checks.get("main"), str) \
+            and checks["main"] not in MAIN_MODES:
+        problems.append("%s.main must be one of %s"
+                        % (where, ", ".join(MAIN_MODES)))
+    if isinstance(checks.get("main_red_issue"), dict):
+        _fields(where + ".main_red_issue", checks["main_red_issue"],
+                MAIN_RED_ISSUE, problems)
+        if checks.get("main", "needed") != "every" \
+                and not checks.get("depends"):
+            problems.append("checks.main_red_issue needs checks.main "
+                            "\"every\" (or checks.depends): otherwise the "
+                            "default branch is never checked")
+    if isinstance(checks.get("keep_ignored"), list):
+        for path in checks["keep_ignored"]:
+            if not (isinstance(path, str) and path.strip("/")
+                    and ".." not in path.split("/")
+                    and not any(c in path for c in "*?[!\\")):
+                problems.append("%s.keep_ignored: %r is not a path "
+                                "inside the worktree" % (where, path))
+    if isinstance(checks.get("drop_env"), list):
+        for entry in checks["drop_env"]:
+            if not isinstance(entry, str) or not DROP_ENV_RE.match(entry):
+                problems.append("%s.drop_env: %r is not a variable's "
+                                "name or a prefix ending in *" % (where, entry))
+    if isinstance(checks.get("first_authors"), list):
+        agents = data.get("agents", {})
+        for name in checks["first_authors"]:
+            if not isinstance(name, str) or name not in agents:
+                problems.append("%s.first_authors: %r is not an agent"
+                                % (where, name))
+    if isinstance(checks.get("cache_limit"), str) \
+            and not SIZE_RE.match(checks["cache_limit"]):
+        problems.append("%s.cache_limit must be a size such as 40G "
+                        "(K, M, G or T)" % where)
+    if isinstance(checks.get("tracer"), str) \
+            and checks["tracer"] not in TRACERS:
+        problems.append("%s.tracer must be one of %s"
+                        % (where, ", ".join(TRACERS)))
+    if isinstance(checks.get("steps"), list):
+        for i, step in enumerate(checks["steps"]):
+            at = "%s.steps[%d]" % (where, i)
+            if not _fields(at, step, STEP, problems):
+                continue
+            if "name" not in step:
+                problems.append("%s: missing 'name'" % at)
+            run = step.get("run")
+            if not (isinstance(run, list) and run
+                    and all(isinstance(a, str) for a in run)):
+                problems.append("%s.run must be a non-empty list of strings"
+                                % at)
+            version = step.get("version")
+            if "version" in step and not (
+                    isinstance(version, list) and version
+                    and all(isinstance(a, str) for a in version)):
+                problems.append("%s.version must be a non-empty list of "
+                                "strings" % at)
+            for path in step.get("outputs", []) \
+                    if isinstance(step.get("outputs"), list) else ():
+                if not (isinstance(path, str) and path.strip("/")
+                        and ".." not in path.split("/")
+                        and not any(c in path for c in "*?[!\\")):
+                    problems.append("%s.outputs: %r is not a path inside "
+                                    "the worktree" % (at, path))
+    if isinstance(checks.get("caches"), dict) and not all(
+            isinstance(v, str) and v and "/" not in v
+            for v in checks["caches"].values()):
+        problems.append("%s.caches must map variables to directory names" % where)
+    poster = checks.get("poster")
+    if isinstance(poster, str) and poster not in data.get("machinery", {}) \
+            and poster not in data.get("agents", {}):
+        problems.append("%s.poster %r is no App in the configuration"
+                        % (where, poster))
+
+
+def _check_instances(instances, data, problems):
+    """checks.instances (designs/0021): each block is a `checks` section
+    of its own, with `context` and `steps` required, `host` a string,
+    the Merger's keys refused and any key that isn't a check's refused
+    too, so that a typo can't pass silently."""
+    for name, block in instances.items():
+        where = "checks.instances.%s" % name
+        if not INSTANCE_NAME_RE.match(name):
+            problems.append("%s: an instance's name is lower-case letters, "
+                            "digits and hyphens" % where)
+        if not isinstance(block, dict):
+            problems.append("%s must be an object" % where)
+            continue
+        for key in block:
+            if key.startswith("_"):
+                continue
+            if key in INSTANCE_CHECKS_ONLY:
+                problems.append("%s.%s: only checks may set it, since it "
+                                "belongs to the context the Merger requires"
+                                % (where, key))
+            elif key not in INSTANCE_OWN + INSTANCE_INHERITED \
+                    + INSTANCE_BLOCK_ONLY:
+                problems.append("%s: unknown key %r" % (where, key))
+        for key in ("context", "steps"):
+            if key not in block:
+                problems.append("%s: missing %r" % (where, key))
+        if "host" in block and not isinstance(block["host"], str):
+            problems.append("%s.host must be a string" % where)
+        own = {k: v for k, v in block.items()
+               if k in INSTANCE_OWN + INSTANCE_INHERITED + INSTANCE_BLOCK_ONLY
+               and k != "host"}
+        _check_checks(own, data, problems, where)
+
+
+def instance_checks(data, name):
+    """The `checks` section that instance `name` runs with, and its
+    host: the block's own keys, then what it inherits from `checks`,
+    with poster and host falling back to checks.poster and the
+    top-level host. The tracer's keys and the Merger's keys aren't
+    inherited. KeyError, listing the names, for an unknown instance."""
+    checks = data.get("checks", {})
+    instances = checks.get("instances", {})
+    if name not in instances:
+        raise KeyError("no checks.instances.%s (instances: %s)"
+                       % (name, ", ".join(sorted(instances)) or "none"))
+    block = instances[name]
+    section = {k: checks[k] for k in INSTANCE_INHERITED if k in checks}
+    if "poster" in checks:
+        section["poster"] = checks["poster"]
+    section.update({k: v for k, v in block.items()
+                    if k != "host" and not k.startswith("_")})
+    return section, block.get("host", data.get("host", ""))
+
+
 def _check_test_ahead(ahead, checks, problems):
     """merge.test_ahead: how far ahead the Merger predicts, and how long
     the build check reuses a green verdict for another commit with its
@@ -577,53 +655,53 @@ def _check_test_ahead(ahead, checks, problems):
                         "checks.merger_first must not be false" % where)
 
 
-def _check_fast_lane(checks, problems):
+def _check_fast_lane(checks, problems, section="checks"):
     """checks.fast_lane: a slot of its own for heads whose chosen steps
     have taken at most max_seconds here. Only `depends` chooses steps,
     so without it nothing could be cheap."""
-    where = "checks.fast_lane"
+    where = section + ".fast_lane"
     lane = checks["fast_lane"]
     _fields(where, lane, FAST_LANE, problems)
     if _is(lane.get("max_seconds"), int) and lane["max_seconds"] < 1:
         problems.append("%s.max_seconds must be at least 1" % where)
     if checks.get("depends") is not True:
-        problems.append("%s needs checks.depends: without it every head "
-                        "runs every step, and none is cheap" % where)
+        problems.append("%s needs %s.depends: without it every head "
+                        "runs every step, and none is cheap" % (where, section))
 
 
-def _check_fresh(checks, problems):
+def _check_fresh(checks, problems, section="checks"):
     """checks.fresh (designs/0010): dependency records from every green
     run, and how long a head waits for a fresh one. Records are what
     `depends` writes, so it needs it."""
-    where = "checks.fresh"
+    where = section + ".fresh"
     fresh = checks["fresh"]
     _fields(where, fresh, FRESH, problems)
     if _is(fresh.get("wait_minutes"), int) and fresh["wait_minutes"] < 1:
         problems.append("%s.wait_minutes must be at least 1" % where)
     if checks.get("depends") is not True:
-        problems.append("%s needs checks.depends: it keeps the dependency "
-                        "records depends writes fresh" % where)
+        problems.append("%s needs %s.depends: it keeps the dependency "
+                        "records depends writes fresh" % (where, section))
 
 
-def _check_reuse(checks, problems):
+def _check_reuse(checks, problems, section="checks"):
     """checks.reuse (designs/0009): how old a step's green verdict may
     be to stand for unchanged inputs. The inputs are read from the
     dependency record, so it needs `depends`. Its switches
     (designs/0018) are booleans; `trace_matched_main` needs `main`
     "every", the only mode that matches a default-branch head."""
-    where = "checks.reuse"
+    where = section + ".reuse"
     reuse = checks["reuse"]
     _fields(where, reuse, REUSE, problems)
     if _is(reuse.get("max_age_days"), int) and reuse["max_age_days"] < 1:
         problems.append("%s.max_age_days must be at least 1" % where)
     if checks.get("depends") is not True:
-        problems.append("%s needs checks.depends: a step's inputs are "
-                        "what its dependency record says it read" % where)
+        problems.append("%s needs %s.depends: a step's inputs are "
+                        "what its dependency record says it read" % (where, section))
     if reuse.get("trace_matched_main") is True \
             and checks.get("main", "needed") != "every":
-        problems.append("%s.trace_matched_main needs checks.main \"every\": "
+        problems.append("%s.trace_matched_main needs %s.main \"every\": "
                         "only then is a default-branch head matched"
-                        % where)
+                        % (where, section))
 
 
 def _check_idle_offer(offer, agents, problems):

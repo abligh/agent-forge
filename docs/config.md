@@ -581,7 +581,7 @@ reasons.
 | `caches` | none | `{variable: directory name}`: each slot's own build cache, kept in the state directory, such as `{"CARGO_TARGET_DIR": "cargo-target"}`. |
 | `cache_limit` | none | The most a slot's `caches` may hold after a run, as a size such as `40G` (`K`, `M`, `G` or `T`); with it each run prunes its slot's caches (see below). Without it nothing is pruned. |
 | `slots` | `2` | Checks run at once (`$FORGE_PR_CHECK_SLOTS` overrides). |
-| `memory_max` | `16G` | Each step's memory limit, in systemd's syntax, or `off` (`$FORGE_PR_CHECK_MEMORY_MAX` overrides). |
+| `memory_max` | `16G` | Each step's memory limit, in systemd's syntax, or `off`; `null` starts no scope and says nothing (`$FORGE_PR_CHECK_MEMORY_MAX` overrides). |
 | `cpu_weight` | `1000` | Each step's scope's `CPUWeight` (systemd's default is 100), so the check gets most of the CPU when agents on the same host build too; `0` sets none. |
 | `step_timeout_minutes` | `30` | When a step is stopped. |
 | `merger_first` | `false` | Start first a waiting head of the pull request the Merger waits on (its `next.json`, read while under 10 minutes old), since the next merge waits on its verdict; every other head is then started oldest first, as without it. It only orders: a free slot is never kept empty for the Merger, whose wait may be on something no check here ends. `merge.test_ahead` turns it on, and refuses `false`. |
@@ -605,9 +605,38 @@ reasons.
 | `reuse.dirs_by_names` | `false` | A directory read with a file read beneath it is digested by its entry names, not its tree (designs/0018). |
 | `fresh` | none | `{"wait_minutes": 15}`: every green run writes a dependency record, each step is chosen from its own freshest record, and a head that runs a step only because its record is stale waits for a fresh one (designs/0010; see below). Refused without `depends`. |
 | `fresh.wait_minutes` | `15` | The longest a head waits for a fresh record before it runs as it would without `fresh`. At least 1. |
+| `instances` | none | `{name: block}`: more instances of the check, each on its own host with its own context (designs/0021; see below). |
 
 Only these keys are checked; the section may hold others, for tools
 not here yet.
+
+### `checks.instances`
+
+A block describes one more instance of the check, for example on a
+macOS host. The instance runs with `forge-pr-check --instance <name>`,
+or with `$FORGE_PR_CHECK_INSTANCE` set. An unknown name is refused at
+start (`NO-INSTANCE`), with the names that exist; it never falls back
+to `checks`, which would post the first context from the wrong
+platform. Without an instance, `forge-pr-check` runs as before.
+[designs/0021](designs/0021-a-second-check-instance.md).
+
+| Keys | Where they come from |
+| --- | --- |
+| `host`, `context`, `steps`, `poster` | The block. `context` and `steps` are required. `host` falls back to the top-level `host`, and `poster` to `checks.poster`. |
+| `slots`, `memory_max`, `cpu_weight`, `step_timeout_minutes`, `caches`, `cache_limit`, `keep_ignored`, `drop_env`, `merge_default`, `red_comment`, `max_wait_minutes` | The block, else `checks`, else the default. |
+| `depends`, `tracer`, `depends_minutes`, `fast_lane`, `reuse`, `fresh`, `main` | The block only, else the default: they describe the first host's tracer. |
+| `main_red_issue`, `first_authors`, `merger_first` | `checks` only, and refused in a block: they belong to the context the Merger requires. `merge.test_ahead` doesn't apply to an instance either. |
+
+Any other key in a block is refused. An instance's name is lower-case
+letters, digits and hyphens. It keeps its own state directory
+(`<state>/pr-check-<name>`), its `verdicts.log` lines carry its name
+after the first word (`GREEN mac #7 …`), and its workers and chained
+ticks are started with the same `--instance`. The Merger still requires
+`checks.context` alone, so an instance's red can't stall merges.
+
+Two instances on one host share `forge-cron-run`'s per-tool lock, so
+their ticks run one after the other. Ticks return at once, so neither
+waits long. Their state, slots and workers stay separate.
 
 ## The pin
 

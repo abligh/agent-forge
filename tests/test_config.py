@@ -322,7 +322,7 @@ class Check(unittest.TestCase):
             "steps": [{"name": "a", "run": ["make"]}, {"run": []},
                       {"name": "b", "run": ["x"], "when": "y"}],
             "caches": {"CARGO_TARGET_DIR": "../up"}, "merger_first": 1}), [
-            "checks.memory_max must be a string",
+            "checks.memory_max must be a string or null",
             "checks.merger_first must be true or false",
             "checks.slots must be at least 1",
             "checks.steps[1]: missing 'name'",

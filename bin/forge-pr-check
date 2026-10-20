@@ -16,6 +16,12 @@ merges on that status (`forge-merger`).
                                          the check of a Merger prediction
                                          (merge.test_ahead), never posted
 
+**`--instance <name>` runs `checks.instances.<name>`**
+(`$FORGE_PR_CHECK_INSTANCE`; designs/0021): another instance of the
+check, on another host, with that block's context, steps, host and
+poster, its own state directory (`pr-check-<name>`) and log lines that
+name it. Without one, the check is the one `checks` describes.
+
 **The cron tick returns at once and the check runs detached.**
 `forge-cron-run` holds locks while a job runs, so a long test run under
 it would starve the rest of the schedule. The worker is started with
@@ -468,6 +474,9 @@ DEFAULT_CONTEXT = "vm/build-and-test"
 STATUS_CONTEXT = DEFAULT_CONTEXT
 POSTER = "Merger"
 HOST = ""
+# The instance this process runs (checks.instances, designs/0021), or
+# None for the check `checks` itself describes.
+INSTANCE = None
 # What the worker runs, in order: (name, argv, run only if this path
 # exists in the head, or None).
 DEFAULT_STEPS = [("test", ["make", "test"], None)]
@@ -670,7 +679,7 @@ MERGE_DATE = "2000-01-01T00:00:00Z"
 MERGE_IDENTITY = ("forge-pr-check", "pr-check@agent-forge.invalid")
 
 
-def configure(project):
+def configure(project, instance=None):
     """Set the module's settings from `project`, a loaded configuration:
     its repository and default branch, and the `checks` section
     (`context`, `poster`, `steps`, `caches`, `slots`, `memory_max`,
@@ -680,7 +689,11 @@ def configure(project):
     `keep_ignored`, each step's `always`, `version` and `outputs`),
     each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
-    implies `merger_first`."""
+    implies `merger_first`. With `instance`, the `checks` section and the
+    host are those of checks.instances.<instance> (designs/0021), and
+    the Merger's keys (`merger_first`, `first_authors`,
+    `main_red_issue`, `merge.test_ahead`) don't apply: they belong to
+    the context the Merger requires."""
     global REPO_SLUG, MAIN, CONFIG_PATH, STATUS_CONTEXT, POSTER, HOST
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
     global CPU_WEIGHT
@@ -690,8 +703,12 @@ def configure(project):
     global TRACE_MATCHED_MAIN, CHAIN_WRITES_ONLY, DIRS_BY_NAMES, OUTPUTS
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
     global RED_COMMENT
-    global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR
-    checks = project.section("checks")
+    global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
+    INSTANCE = instance
+    if instance is None:
+        checks, HOST = project.section("checks"), project.host
+    else:
+        checks, HOST = config.instance_checks(project.data, instance)
     QUIET_DIR = os.path.expanduser(project.section("quiet")["dir"]) \
         if project.section("quiet").get("dir") else None
     REPO_SLUG, MAIN = project.repo, project.default_branch
@@ -699,7 +716,6 @@ def configure(project):
     STATUS_CONTEXT = checks.get("context", DEFAULT_CONTEXT)
     POSTER = checks.get("poster",
                         project.section("merge").get("merger", "Merger"))
-    HOST = project.host
     STEPS = [(s["name"], list(s["run"]), s.get("only_if"))
              for s in checks["steps"]] if "steps" in checks else DEFAULT_STEPS
     ALWAYS = frozenset(s["name"] for s in checks.get("steps", [])
@@ -755,7 +771,8 @@ def configure(project):
     CPU_WEIGHT = checks.get("cpu_weight", DEFAULT_CPU_WEIGHT)
     STEP_TIMEOUT_S = 60 * checks.get("step_timeout_minutes",
                                      DEFAULT_STEP_TIMEOUT_S // 60)
-    ahead = project.section("merge").get("test_ahead")
+    ahead = project.section("merge").get("test_ahead") \
+        if instance is None else None
     TEST_AHEAD = ahead is not None
     SPARE_ONLY = bool((ahead or {}).get("spare_slots_only"))
     MATCH_MAX_AGE = datetime.timedelta(hours=(ahead or {}).get(
@@ -894,6 +911,10 @@ def save(state_dir, state):
 
 def log(state_dir, line, when, out=print):
     """One line to verdicts.log, and to out."""
+    if INSTANCE is not None:
+        word, _, rest = line.partition(" ")
+        line = "%s %s %s" % (word, INSTANCE, rest) if rest \
+            else "%s %s" % (word, INSTANCE)
     text = "%s %s" % (iso(when), line)
     with open(os.path.join(state_dir, "verdicts.log"), "a") as handle:
         handle.write(text + "\n")
@@ -1804,7 +1825,8 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
         + (["--post"] if posting else [])
         + (["--ahead"] if ahead else [])
         + (["--main"] if main else [])
-        + (["--merger-dir", MERGER_DIR_ARG] if MERGER_DIR_ARG else []),
+        + (["--merger-dir", MERGER_DIR_ARG] if MERGER_DIR_ARG else [])
+        + (["--instance", INSTANCE] if INSTANCE is not None else []),
         cwd=state_dir, stdin=subprocess.DEVNULL, stdout=wlog,
         stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
         pass_fds=() if held is None else (held,))
@@ -2297,7 +2319,7 @@ def step_env(state_dir, base=None, slot=1):
 def memory_max_from_env(environ=None):
     """The steps' memory limit, or None for none."""
     value = (os.environ if environ is None else environ).get(
-        "FORGE_PR_CHECK_MEMORY_MAX", MEMORY_MAX).strip()
+        "FORGE_PR_CHECK_MEMORY_MAX", MEMORY_MAX or "off").strip()
     return None if value.lower() in ("", "off") else value
 
 
@@ -3598,7 +3620,8 @@ def start_next_tick(popen=None, checkout=None, state_dir=None,
     popen = popen or subprocess.Popen
     argv = [CRON_RUN] + list(NEXT_TICK) \
         + (["--state-dir", state_dir] if state_dir else []) \
-        + (["--merger-dir", merger_dir] if merger_dir else [])
+        + (["--merger-dir", merger_dir] if merger_dir else []) \
+        + (["--instance", INSTANCE] if INSTANCE is not None else [])
     env = dict(os.environ)
     if checkout:
         env["FORGE_CRON_CHECKOUT"] = checkout
@@ -4084,6 +4107,11 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
                         "the pull request to check first and whose "
                         "ahead.json lists its predictions (default "
                         "~/.local/state/agent-forge/<project>/merger)")
+    parser.add_argument("--instance", default=environ.get(
+        "FORGE_PR_CHECK_INSTANCE") or None,
+        help="run checks.instances.INSTANCE, with its own context, steps, "
+        "host and state directory (default $FORGE_PR_CHECK_INSTANCE; "
+        "none: the check checks itself describes)")
     parser.add_argument("--checkout", default=environ.get(
         "FORGE_CRON_CHECKOUT"), help="the checkout kept at the default "
         "branch (default $FORGE_CRON_CHECKOUT)")
@@ -4106,11 +4134,18 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
     except config.ConfigError as err:
         out("NO-CONFIG: %s" % err)
         return 2
-    configure(project)
+    if args.instance is not None and args.instance not in \
+            project.section("checks").get("instances", {}):
+        names = sorted(project.section("checks").get("instances", {}))
+        out("NO-INSTANCE: no checks.instances.%s (instances: %s)"
+            % (args.instance, ", ".join(names) or "none"))
+        return 2
+    configure(project, args.instance)
     global MERGER_DIR_ARG
     MERGER_DIR_ARG = args.merger_dir
-    state_dir = args.state_dir or locks.state_dir(project.name, "pr-check",
-                                                  environ)
+    state_dir = args.state_dir or locks.state_dir(
+        project.name, "pr-check" if args.instance is None
+        else "pr-check-" + args.instance, environ)
     os.makedirs(state_dir, exist_ok=True)
     post = make_poster(run, out, project) if args.post else None
     if args.worker:
