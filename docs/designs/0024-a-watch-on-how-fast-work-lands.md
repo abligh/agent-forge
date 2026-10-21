@@ -1,6 +1,6 @@
 # 0024: A watch on how fast work lands
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-21, in the terminal; https://github.com/abligh/agent-forge/issues/40)
 * Author: XMPPEngineer
 * Date: 2026-10-21
 
