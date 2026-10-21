@@ -2194,6 +2194,25 @@ class Main(unittest.TestCase):
         self.assertEqual(self.run_main([]),
                          (0, [(self.checkout, self.state, "token", True)]))
 
+    def test_after_a_merge_it_ticks_again(self):
+        merged = {"decisions": [{"action": "MERGE", "result": "done"}]}
+        waits = {"decisions": [{"action": "WAIT"}]}
+        records = [merged, merged, waits, merged]
+        rc, calls = self.run_main([], tick=lambda: records.pop(0))
+        self.assertEqual((rc, len(calls), records), (0, 3, [merged]))
+
+    def test_a_refused_merge_or_a_dry_run_ticks_once(self):
+        refused = {"decisions": [{"action": "MERGE", "result": "refused: x"}]}
+        self.assertEqual(len(self.run_main([], tick=lambda: refused)[1]), 1)
+        merged = {"decisions": [{"action": "MERGE", "result": "done"}]}
+        self.assertEqual(len(self.run_main(["--dry-run"],
+                                           tick=lambda: merged)[1]), 1)
+
+    def test_ticks_in_a_run_are_bounded(self):
+        merged = {"decisions": [{"action": "MERGE", "result": "done"}]}
+        self.assertEqual(len(self.run_main([], tick=lambda: merged)[1]),
+                         m.TICKS_PER_RUN)
+
     def test_a_dry_run_does_not_act(self):
         self.assertEqual(self.run_main(["--dry-run"]),
                          (0, [(self.checkout, self.state, "token", False)]))
@@ -2528,12 +2547,24 @@ class PredictAhead(unittest.TestCase):
         run_git(self.repo.path, "config", "gpg.program", "/nonexistent")
         self.assertEqual(m.predict_ahead(self.repo.path, self.base, q), first)
 
-    def test_a_conflict_ends_the_list(self):
+    def test_one_that_conflicts_with_one_ahead_is_skipped(self):
+        # #2 conflicts with #1, so #3 is predicted on #1 alone, and the
+        # list still fills to the depth.
         q = [self.pr_on(1, self.base, {"shared.txt": "ONE\n"}),
              self.pr_on(2, self.base, {"shared.txt": "uno\n"}),
              self.pr_on(3, self.base, {"c.txt": "c\n"})]
-        self.assertEqual([e["pr"] for e in m.predict_ahead(
-            self.repo.path, self.base, q)], [1])
+        got = m.predict_ahead(self.repo.path, self.base, q, depth=1)
+        self.assertEqual([e["pr"] for e in got], [1, 3])
+        self.assertEqual(run_git(self.repo.path, "rev-parse",
+                                 got[1]["sha"] + "^"), got[0]["sha"])
+
+    def test_the_first_conflicting_with_main_ends_the_list(self):
+        self.repo.branch("main2", self.base)
+        self.repo.commit("shared.txt", "main's\n", "main moves")
+        main = run_git(self.repo.path, "rev-parse", "HEAD")
+        q = [self.pr_on(1, self.base, {"shared.txt": "ONE\n"}),
+             self.pr_on(2, self.base, {"c.txt": "c\n"})]
+        self.assertEqual(m.predict_ahead(self.repo.path, main, q), [])
 
     def test_a_head_not_fetched_yet_is_fetched(self):
         q = [self.pr_on(1, self.base, {"a.txt": "a\n"})]
@@ -2673,6 +2704,49 @@ class TickAhead(RepoCase):
         for action in m.IN_FLIGHT:
             with self.subTest(action=action):
                 self.assertEqual(self.keeps_place(action), 6)
+
+    def locked(self, *entries):
+        os.makedirs(os.path.join(self.tmp.name, "state"), exist_ok=True)
+        m.save_json(os.path.join(self.tmp.name, "state", m.AHEAD_FILE),
+                    {"at": "2026-10-07T11:59:00Z", "entries": [
+                        {"pr": n, "head": h} for n, h in entries]})
+
+    def test_those_predicted_keep_their_order_ahead_of_older_ones(self):
+        # #5 is older, but #7 and #6 were predicted, in that order: an
+        # older one approved again goes behind them, not between.
+        six, seven = self.other_pr(), self.other_pr(7)
+        self.locked((7, seven["headRefOid"]), (6, six["headRefOid"]))
+        record, _ = self.tick([self.item(), six, seven],
+                              conclusions=(None,), live=True)
+        self.assertEqual(record["queue"], [7, 6, 5])
+
+    def test_a_new_head_loses_its_place(self):
+        six = self.other_pr()
+        self.locked((6, "0" * 40))
+        record, _ = self.tick([self.item(), six], conclusions=(None,),
+                              live=True)
+        self.assertEqual(record["queue"], [5, 6])
+
+    def test_one_newly_urgent_goes_behind_those_predicted(self):
+        m.configure(urgent_project(test_ahead={}))
+        six, seven = self.other_pr(), self.other_pr(7)
+        self.locked((6, six["headRefOid"]))
+        labelled(seven, "Priority:urgent")
+        record, _ = self.tick([self.item(), six, seven],
+                              conclusions=(None,), live=True)
+        self.assertEqual(record["queue"], [6, 7, 5])
+
+    def test_locked_order_reads_what_it_can(self):
+        q = [pr(5, head="5" * 40), pr(6, head="6" * 40)]
+        for junk in (None, [], {"entries": "x"}, {"entries": [1, None]}):
+            with self.subTest(junk=junk):
+                os.makedirs(os.path.join(self.tmp.name, "s"), exist_ok=True)
+                m.save_json(os.path.join(self.tmp.name, "s", m.AHEAD_FILE),
+                            junk)
+                self.assertEqual(m.locked_order(
+                    os.path.join(self.tmp.name, "s"), q), {})
+        self.assertEqual(m.locked_order(os.path.join(self.tmp.name, "no"),
+                                        q), {})
 
     def test_the_control_one_merged_or_handed_back_keeps_nothing(self):
         for action in ("MERGE", "HAND-BACK", None):

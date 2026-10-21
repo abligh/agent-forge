@@ -7,8 +7,10 @@ it at a head the approval
 still covers, nobody has spoken since, and nothing it names in a
 `Blocked-by:` line is still open. The Merger takes those in order:
 
+* with `merge.test_ahead`, those already predicted, in the order
+  predicted (below);
 * with `labels.urgent`, the pull requests carrying that label come
-  first, oldest-opened first (a person's call: it goes before
+  next, oldest-opened first (a person's call: it goes before
   blockers);
 * then the pull requests another open one is blocked by, held or not;
 * then the rest, oldest-opened first;
@@ -27,7 +29,9 @@ For the first candidate, it decides one action:
   the head moved while reading). The next tick asks again.
 
 **Without `--dry-run` it acts**, as the Merger's own App. A tick makes
-at most one update or merge. Before it, it hands back each pull
+at most one update or merge, and a run whose tick merged ticks again
+at once (at most TICKS_PER_RUN ticks), so the next pull request is
+updated without waiting for the next event or cron tick. Before it, it hands back each pull
 request ahead in the queue that it can't take, unless that hand-back
 was already said:
 
@@ -254,7 +258,9 @@ once those in front of it have merged:
   head, with S(k-1) as its parent: the tree GitHub's `update-branch`
   makes for Qk once the ones ahead have merged.
 
-A conflict ends the list, since nothing behind it can be predicted.
+A pull request that conflicts with those predicted ahead of it is
+left out, and the list goes on past it, so one conflict doesn't stop
+the rest being tested ahead; a Q0 that conflicts with `main` ends it.
 Pull requests already handed back under their current approval and
 head are left out. The commits never leave this host: they are local
 commits under `refs/agent-forge-merger/ahead/<k>` in this checkout,
@@ -334,6 +340,15 @@ another one's `Blocked-by:` names) is promoted past it. A blocker that
 jumped it would merge, move `main` and put it behind again, spending
 the run it was already having. One merged or handed back keeps
 nothing. `next.json` then also says that tick's `action`.
+
+**With `test_ahead`, those already predicted keep their order.** The
+candidates the last live tick predicted (`ahead.json`), at the heads
+it predicted, go first, in its order, after only the one in flight.
+Their runs have started: anything else goes behind them, whether
+approved later, an older one approved again, one newly labelled
+urgent, a blocker or one with right of way, rather than into the
+middle, where it would spend every prediction behind it. One with a
+new head loses its place, and one left out as a conflict goes behind.
 
 Exit 0 when the tick ran, whatever GitHub answered its write, or
 another tick held the lock; 2 when it could not ask (no checkout, no
@@ -471,6 +486,8 @@ AHEAD_FILE = "ahead.json"
 AHEAD_REF = "refs/agent-forge-merger/ahead/"
 AHEAD_DATE = "2000-01-01T00:00:00Z"
 AHEAD_IDENTITY = ("forge-merger", "merger@agent-forge.invalid")
+# The most ticks one run makes: it ticks again straight after a merge.
+TICKS_PER_RUN = 10
 # The actions that leave a run in progress or about to start on the
 # pull request: with test_ahead, it keeps its place in the queue.
 IN_FLIGHT = ("UPDATE", "WAIT")
@@ -2146,8 +2163,10 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None):
     gives (its own tree when it is up to date), with `main_tip` as its
     parent. Each Sk is the next one's head merged onto S(k-1), with
     S(k-1) as its parent, which is what GitHub's update makes once the
-    one before has merged. A conflict, or anything git can't do, ends
-    the list: nothing behind it can be predicted. An entry whose tree is
+    one before has merged. One that conflicts with what is ahead of it
+    is left out and the list goes on past it (the next tick puts it
+    behind the predicted ones: see `locked_order`); anything else git
+    can't do ends the list. An entry whose tree is
     its head's own says `same_as_head`, since the head's own check
     tests it. The commits carry a fixed identity and date and no
     signature, so the same prediction is the same commit on every
@@ -2158,11 +2177,17 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None):
                GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email,
                GIT_AUTHOR_DATE=AHEAD_DATE, GIT_COMMITTER_DATE=AHEAD_DATE)
     entries, parent = [], main_tip
-    for pr in queue[:depth + 1]:
+    for pr in queue:
+        if len(entries) > depth:
+            break
         head = pr["headRefOid"]
         have_head(repo, pr, run)
         merged = git(repo, "merge-tree", "--write-tree", "--no-messages",
                      parent, head, run=run)
+        if merged.returncode == 1 and entries:
+            # It conflicts with one predicted ahead of it: skip it, so
+            # that those behind it are still tested ahead.
+            continue
         if merged.returncode != 0 or not merged.stdout.split():
             break
         tree = merged.stdout.split()[0]
@@ -2187,6 +2212,31 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None):
     for ref in sorted(stale):
         git(repo, "update-ref", "-d", ref, run=run)
     return entries
+
+
+def locked_order(state_dir, queue):
+    """{number: place} for the candidates in `queue` that the last live
+    tick predicted (AHEAD_FILE) at the head they still have, in its
+    order. Their runs have started, so they keep their places ahead of
+    every other candidate: one approved later, an older one approved
+    again, or one newly labelled urgent goes behind them, rather than
+    into the middle where it would spend every prediction behind it."""
+    last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+    entries = last.get("entries") if isinstance(last, dict) else None
+    heads = {pr["number"]: pr["headRefOid"] for pr in queue}
+    places = {}
+    for entry in entries if isinstance(entries, list) else ():
+        number = entry.get("pr") if isinstance(entry, dict) else None
+        if (number is not None and number not in places
+                and heads.get(number) == entry.get("head")):
+            places[number] = len(places)
+    return places
+
+
+def merged_one(record):
+    """Whether the tick that wrote `record` merged a pull request."""
+    return any(d.get("action") == "MERGE" and d.get("result") == "done"
+               for d in (record or {}).get("decisions") or ())
 
 
 def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
@@ -2265,6 +2315,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         queue.sort(key=lambda pr: (pr["number"] != in_flight,
                                    pr["number"] != row["pr"]))
         yielded.pop(row["pr"], None)
+    if TEST_AHEAD:
+        # Those already predicted go first, in the order predicted.
+        places = locked_order(state_dir, queue)
+        queue.sort(key=lambda pr: (pr["number"] != in_flight, places.get(
+            pr["number"], len(places))))
     held_by = (conflicts_ahead(repo, queue, run, main_tip)
                if HOLD_CONFLICTING else {})
     for number, ahead in held_by.items():
@@ -2493,8 +2548,13 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
         send = ((sender or relay_sender)(project, environ)
                 if STALL_ALERT and not args.dry_run else None)
         try:
-            record = tick(repo, state_dir, GitHub(token, run), run,
-                          out, live=not args.dry_run, send=send)
+            # After a merge, the next pull request is taken at once
+            # rather than on the next event or cron tick.
+            for _ in range(TICKS_PER_RUN):
+                record = tick(repo, state_dir, GitHub(token, run), run,
+                              out, live=not args.dry_run, send=send)
+                if args.dry_run or not merged_one(record):
+                    break
         except (RuntimeError, KeyError, TypeError, ValueError) as err:
             out("FAILED: %s" % err)
             return 2
