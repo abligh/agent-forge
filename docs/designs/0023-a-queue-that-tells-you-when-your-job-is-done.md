@@ -92,7 +92,15 @@ its `twins`), through the relay, with the confirmed-delivery path
 ```
 Queue gate: <name> ended, exit 0 (green), after 12 min waiting and 31 min running.
 Ticket gate-20261021T081500Z-3fa2, commit 1a2b3c4d. Log: <path>
+<summary line, if the job left one>
 ```
+
+The job is given `FORGE_QUEUE_TICKET` and `FORGE_QUEUE_SUMMARY`, a
+file path. One line the command writes there (say "series-x a46b5dfe
+exit 0, results in ~/results/t123") is quoted in the message as is, so
+the message says what the job produced without `forge-queue` knowing
+what that is. The ticket is in the message so that `forge-queue status
+TICKET` is one copy away.
 
 A failed delivery is retried on the router's reminder interval, and a
 ticket whose message never landed is listed by `forge-queue list
