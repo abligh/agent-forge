@@ -387,12 +387,21 @@ def items_of(keys, github_for, out):
     return sorted(items)
 
 
-def cron_command(argv, here=BIN):
-    """`argv` as forge-cron-run runs it."""
-    return [os.path.join(here, "forge-cron-run")] + list(argv)
+def current_bin():
+    """This installation's bin/ as it is now. BIN is where the receiver
+    started, a versioned directory that forge-install removes when it
+    installs a newer agent-forge: a long-running receiver that kept it
+    ran nothing at all after the next install (exit 127). Resolving the
+    path again on each event follows the installed version's link."""
+    return os.path.dirname(os.path.realpath(__file__))
 
 
-def router_command(items, here=BIN):
+def cron_command(argv, here=None):
+    """`argv` as forge-cron-run runs it, from the current installation."""
+    return [os.path.join(here or current_bin(), "forge-cron-run")] + list(argv)
+
+
+def router_command(items, here=None):
     numbers = ",".join(str(n) for n in items)
     return cron_command([a.replace("{items}", numbers) for a in ROUTE], here)
 

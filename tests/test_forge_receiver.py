@@ -12,6 +12,7 @@ import hmac
 import http.client
 import json
 import os
+import unittest.mock
 import socket
 import tempfile
 import threading
@@ -582,3 +583,29 @@ class UnitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstalledBinTest(unittest.TestCase):
+    """A receiver runs for days, across installs. forge-install points
+    a stable link at a new versioned directory and removes the old one,
+    so the tools must be found through the link on each event, not
+    where the receiver started (every tick exited 127 after an
+    install)."""
+
+    def test_the_tools_follow_a_new_install(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            for version in ("v1", "v2"):
+                os.makedirs(os.path.join(tmp, "d", version, "bin"))
+            link = os.path.join(tmp, "agent-forge")
+            os.symlink(os.path.join("d", "v1"), link)
+            here = os.path.join(link, "bin", "forge-receiver")
+            with unittest.mock.patch.object(rc, "__file__", here):
+                first = rc.cron_command(["forge-merger"])[0]
+                os.remove(link)
+                os.symlink(os.path.join("d", "v2"), link)
+                second = rc.cron_command(["forge-merger"])[0]
+        self.assertEqual(os.path.basename(os.path.dirname(os.path.dirname(
+            first))), "v1")
+        self.assertEqual(os.path.basename(os.path.dirname(os.path.dirname(
+            second))), "v2")
