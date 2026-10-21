@@ -1,6 +1,6 @@
 # 0023: A queue that tells you when your job is done
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-21, https://github.com/abligh/agent-forge/issues/38#issuecomment-6311260360)
 * Author: XMPPEngineer
 * Date: 2026-10-21
 
