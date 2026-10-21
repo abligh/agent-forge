@@ -203,6 +203,33 @@ class Check(unittest.TestCase):
             "host_settings.files[1]: unknown key 'colour'",
             "host_settings.files[1]: missing 'from'"])
 
+    def test_queue(self):
+        self.assertEqual(self.problems(queue={}), [])
+        self.assertEqual(self.problems(queue={
+            "queues": {"gate": {"slots": 2, "nice": 10,
+                                "timeout_minutes": 90,
+                                "keep_worktree": True},
+                       "timing": {}},
+            "state_dir": "~/q", "retain_days": 3}), [])
+        self.assertEqual(self.problems(queue={
+            "queues": {"Gate": {}, "gate": {"slots": 0, "nice": 20,
+                                            "timeout_minutes": "9",
+                                            "colour": "red"},
+                       "x": []},
+            "state_dir": " ", "retain_days": 0, "size": 1}), [
+            "queue: unknown key 'size'",
+            "queue.state_dir must not be empty",
+            "queue.retain_days must be at least 1",
+            "queue.queues.Gate: a queue's name is lower case letters, "
+            "digits and hyphens",
+            "queue.queues.gate.timeout_minutes must be an integer",
+            "queue.queues.gate: unknown key 'colour'",
+            "queue.queues.gate.slots must be at least 1",
+            "queue.queues.gate.nice must be from 0 to 19",
+            "queue.queues.x must be an object"])
+        self.assertEqual(self.problems(queue=[]),
+                         ["'queue' must be an object"])
+
     def test_memory(self):
         self.assertEqual(self.problems(memory={
             "dir": "", "git_dir": 3, "labels": ["bug", ""], "limit": 0,

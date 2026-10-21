@@ -1,0 +1,909 @@
+#!/usr/bin/env python3
+"""Queue slow work, and tell its agent when it is done.
+
+    forge-queue submit gate -- make gate          # prints the ticket
+    forge-queue submit timing --dir ~/bundle --name "series x" -- ./time
+    forge-queue list [QUEUE] [--done] [--undelivered]
+    forge-queue status TICKET
+    forge-queue cancel TICKET [--operator]
+    forge-queue recover
+
+Agents sharing a host take turns at slow work: a full gate run, a
+timing, a turn on a shared machine. Instead of keeping a place in a
+chat room and watching it, an agent **submits** the work here and goes
+on with something else; the job waits its turn in its own systemd user
+unit, which outlives the agent's session, and when it ends the agent is
+sent a message through the relay (designs/0023).
+
+**submit QUEUE [--at REF | --dir DIR] [--name TEXT] -- COMMAND...**
+freezes what the job works on and returns its ticket at once:
+
+* `--at REF` (the default, at `HEAD`) refuses a dirty worktree, naming
+  the files, then makes a detached `git worktree` at REF's commit in the
+  ticket's directory and runs COMMAND there (in the same subdirectory
+  it was submitted from). The agent's own worktree is free to change at
+  once. The frozen worktree is removed when the job ends, unless the
+  queue sets `keep_worktree`.
+* `--dir DIR` runs COMMAND in DIR as it stands, for input that is
+  already frozen.
+
+The ticket is `<queue>-<UTC time>-<4 hex>`, and the job is written to
+`<state_dir>/<queue>/<ticket>.json`: agent, session names, command,
+directory, commit, submit time, the queue's settings and the
+submitter's environment (the file is the agent's own, mode 0600). It
+is started as `systemd-run --user --unit forge-queue-<ticket>
+--collect` running `forge-queue run <ticket>`. The agent is `--agent`,
+else $FORGE_AGENT, else the worktree's stamped identity (`git config
+--worktree user.name`, forge-worktree-identity), and must be one of the
+configuration's `agents`.
+
+**run TICKET** is what the unit runs. It waits for one of the queue's
+`slots`, in submit order: it holds an flock on its own ticket file for
+its whole life, and takes a slot (an flock on `.slot-<n>` in the
+queue's directory) only when no older ticket of the queue is still
+waiting. A ticket counts as waiting while its runner holds its lock, or,
+before a runner has started, for GRACE_S after it was queued. COMMAND
+runs at the queue's `nice`, through `forge-untimed` (designs/0020) when
+this installation has it, with `FORGE_QUEUE_TICKET`, `FORGE_AGENT` and
+`FORGE_QUEUE_SUMMARY` set, its own process group, and the queue's
+`timeout_minutes`; past it, the group is sent SIGTERM, then SIGKILL.
+Output goes to `<ticket>/log`, and `<ticket>/status.json` records the
+state (queued, waiting, running, then done, timed-out, cancelled, lost
+or failed), when it waited, started and ended, and the exit status.
+
+**The message.** When the job ends, one message goes to the agent's
+sessions (hers and her `twins'`, or her stand-in's), through the relay
+with the confirmed delivery `forge-router` and `forge-merger` use:
+
+    Queue gate: make gate ended, exit 0 (green), after 12 min waiting and 31 min running.
+    Ticket gate-20261021T081500Z-3fa2, commit 1a2b3c4d. Log: <path>
+    <the last line the job wrote to $FORGE_QUEUE_SUMMARY, if any>
+
+A delivery the relay didn't take is tried again every
+`relay.remind_seconds` (default 7200): by the runner, which stays until
+it is taken, and, once the runner is gone, by `recover`. `list
+--undelivered` lists the tickets whose message hasn't landed.
+
+**list [QUEUE]** shows running and waiting jobs, in order; `--done`
+adds those that ended in the last day, and `--undelivered` lists only
+ended ones whose message never landed. **status TICKET** prints one
+job's status and its log's last lines. **cancel TICKET** stops a
+waiting or running job, which its agent is still told of; only the
+submitting agent may, or the operator with `--operator`.
+
+**recover** sweeps every queue, and every other command does the same
+first: a ticket left running with no runner holding its lock (the host
+restarted, or the unit was stopped) is marked `lost` and its agent is
+told; a waiting one is started again, in submit order; nothing that
+ran is run again. Messages due again are sent, and ended tickets older
+than `queue.retain_days` (default 7) are removed with their logs. Run
+it from a boot-time unit or cron.
+
+The configuration's `queue` section names the queues
+(docs/config.md); without one, nothing can be submitted. The state
+directory is `--state-dir`, else `queue.state_dir`, else
+`~/.local/state/agent-forge/queue` (`$FORGE_STATE_DIR` or
+`$XDG_STATE_HOME` moving its root, as for every tool).
+
+Exit status:
+
+    0   done; for cancel, the job is stopped or will be within seconds
+    1   cancel: the job had already ended
+    2   bad arguments, an unknown queue or ticket, no configuration or
+        queue section, an agent that isn't one, a dirty worktree, or a
+        cancel by someone other than the job's agent
+    3   submit: git or systemd-run failed; nothing is queued
+"""
+
+import argparse
+import datetime
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(BIN))
+from agent_forge import config, locks, proc, state  # noqa: E402
+
+PROG = "forge-queue"
+DEFAULTS = {"slots": 1, "nice": 10, "timeout_minutes": 120,
+            "keep_worktree": False}
+DEFAULT_RETAIN_DAYS = 7
+DEFAULT_REMIND_S = 7200
+# How often a waiter looks for its turn, and a job's runner for its end
+# or a cancel.
+WAIT_POLL_S = 2
+JOB_POLL_S = 1
+# How long a submitted ticket whose runner hasn't taken its lock yet
+# still holds its place, and isn't started again by `recover`.
+GRACE_S = 120
+# After SIGTERM, how long a job's group has before SIGKILL.
+KILL_WAIT_S = 10
+# Seconds in a minute of `timeout_minutes` (tests shorten it).
+MINUTE_S = 60
+LOG_TAIL = 20
+SUMMARY_MAX = 300
+NAME_MAX = 60
+# forge-untimed (designs/0020): when this installation has it, every job
+# runs through it, so a quiet hold freezes or stops it like any other
+# untimed work.
+UNTIMED = os.path.join(BIN, "forge-untimed")
+TICKET_RE = re.compile(r"^([a-z0-9][a-z0-9-]*)-(\d{8}T\d{6}Z)-([0-9a-f]{4})$")
+WAITING = ("queued", "waiting")
+ENDED = ("done", "timed-out", "cancelled", "lost", "failed")
+# Not handed on to a job: they describe the submitting process.
+DROP_ENV = ("FORGE_INSTALL_LOCK_FD", "OLDPWD", "PWD", "FORGE_UNTIMED_SCOPE")
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+
+
+def stamp(when):
+    return when.astimezone(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_time(text):
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def default_state_dir(environ):
+    home = environ.get("HOME") or os.path.expanduser("~")
+    root = environ.get("FORGE_STATE_DIR") or os.path.join(
+        environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"),
+        "agent-forge")
+    return os.path.join(root, "queue")
+
+
+# Where a ticket's files are.
+
+def queue_of(ticket):
+    m = TICKET_RE.match(ticket or "")
+    return m.group(1) if m else None
+
+
+def queue_dir(sd, queue):
+    return os.path.join(sd, queue)
+
+
+def ticket_path(sd, ticket):
+    return os.path.join(sd, queue_of(ticket), ticket + ".json")
+
+
+def job_dir(sd, ticket):
+    return os.path.join(sd, queue_of(ticket), ticket)
+
+
+def job_file(sd, ticket, name):
+    return os.path.join(job_dir(sd, ticket), name)
+
+
+def queue_lock(sd, queue):
+    return os.path.join(queue_dir(sd, queue), ".lock")
+
+
+def slot_path(sd, queue, n):
+    return os.path.join(queue_dir(sd, queue), ".slot-%d" % n)
+
+
+def new_ticket(queue, when):
+    return "%s-%s-%s" % (queue, when.astimezone(datetime.timezone.utc)
+                         .strftime("%Y%m%dT%H%M%SZ"), secrets.token_hex(2))
+
+
+def queues_in(sd):
+    try:
+        names = sorted(os.listdir(sd))
+    except OSError:
+        return []
+    return [n for n in names if config.QUEUE_NAME_RE.match(n)
+            and os.path.isdir(os.path.join(sd, n))]
+
+
+def jobs(sd, queue):
+    """The queue's tickets, each as its job record, in submit order."""
+    found = []
+    try:
+        names = os.listdir(queue_dir(sd, queue))
+    except OSError:
+        return []
+    for name in names:
+        if name.endswith(".json") and TICKET_RE.match(name[:-5]):
+            job = state.load(os.path.join(queue_dir(sd, queue), name))
+            if job.get("ticket") == name[:-5]:
+                found.append(job)
+    return sorted(found, key=lambda j: (j.get("seq", 0), j["ticket"]))
+
+
+def load_status(sd, ticket):
+    return state.load(job_file(sd, ticket, "status.json"))
+
+
+def save_status(sd, ticket, status):
+    state.save(job_file(sd, ticket, "status.json"), status)
+
+
+def alive(sd, ticket):
+    """Whether a runner holds the ticket's lock."""
+    probe = locks.try_lock_shared(ticket_path(sd, ticket))
+    if probe is None:
+        return True
+    probe.close()
+    return False
+
+
+def hold_ticket(sd, ticket):
+    """The ticket file's exclusive lock, held while the returned file is
+    open, or None when another runner has it. The file is opened for
+    reading, so it is never truncated (unlike locks.try_lock)."""
+    try:
+        handle = open(ticket_path(sd, ticket))
+    except OSError:
+        return None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+# The job.
+
+def job_argv(job, untimed=None):
+    """What the runner starts: COMMAND at the queue's nice, through
+    forge-untimed when there is one (the seam for designs/0020)."""
+    untimed = UNTIMED if untimed is None else untimed
+    argv = list(job["command"])
+    if untimed and os.access(untimed, os.X_OK):
+        argv = [untimed, "--name", job["ticket"], "--"] + argv
+    return ["nice", "-n", str(job["settings"]["nice"])] + argv
+
+
+def job_env(sd, job):
+    env = dict(job.get("env") or {})
+    env.update(FORGE_QUEUE_TICKET=job["ticket"], FORGE_AGENT=job["agent"],
+               FORGE_QUEUE_SUMMARY=job_file(sd, job["ticket"], "summary"),
+               PWD=job["dir"])
+    return env
+
+
+def spawn(argv, cwd, env, log):
+    return subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+
+
+def stop(child):
+    """SIGTERM the job's group, then SIGKILL it after KILL_WAIT_S."""
+    for sig, wait in ((signal.SIGTERM, KILL_WAIT_S), (signal.SIGKILL, None)):
+        try:
+            os.killpg(child.pid, sig)
+        except OSError:
+            pass
+        try:
+            return child.wait(timeout=wait)
+        except subprocess.TimeoutExpired:
+            continue
+    return child.wait()
+
+
+def supervise(child, timeout_s, cancelled, sleep, mono=time.monotonic):
+    """(exit status, how it ended: "done", "timed-out" or "cancelled")."""
+    start = mono()
+    while True:
+        rc = child.poll()
+        if rc is not None:
+            return rc, "done"
+        if cancelled():
+            return stop(child), "cancelled"
+        if mono() - start >= timeout_s:
+            return stop(child), "timed-out"
+        sleep(JOB_POLL_S)
+
+
+def remove_worktree(job, run):
+    """Remove the frozen worktree (`--at`), if there is one left."""
+    path = job.get("worktree")
+    if not path or not os.path.exists(path):
+        return
+    run(["git", "-C", job.get("repo") or path, "worktree", "remove",
+         "--force", path])
+    if os.path.exists(path):
+        shutil.rmtree(path, ignore_errors=True)
+        run(["git", "-C", job.get("repo") or ".", "worktree", "prune"])
+
+
+def summary_line(sd, ticket):
+    """The last line the job wrote to $FORGE_QUEUE_SUMMARY, or None."""
+    try:
+        with open(job_file(sd, ticket, "summary"), errors="replace") as f:
+            lines = [ln.strip() for ln in f.read(65536).splitlines()]
+    except OSError:
+        return None
+    lines = [ln for ln in lines if ln]
+    return lines[-1][:SUMMARY_MAX] if lines else None
+
+
+def minutes(seconds):
+    return "%d min" % round(max(0, seconds or 0) / 60)
+
+
+def message(sd, job, status):
+    """The message that tells the agent her job ended."""
+    rc = status.get("exit")
+    how = status.get("state")
+    if how == "done" and isinstance(rc, int) and rc < 0:
+        what = "was killed by signal %d (red)" % -rc
+    elif how == "done":
+        what = "ended, exit %s (%s)" % (rc, "green" if rc == 0 else "red")
+    elif how == "timed-out":
+        what = "timed out at its %d-minute limit (red)" % \
+            job["settings"]["timeout_minutes"]
+    elif how == "cancelled":
+        what = "was cancelled"
+    elif how == "lost":
+        what = "was lost: its runner stopped (the host restarted?) " \
+            "while it ran, and it was not run again"
+    else:
+        what = "could not start: %s" % status.get("error", "unknown")
+    waited = status.get("waited_s")
+    if waited is None:
+        ended, submitted = parse_time(status.get("ended")), \
+            parse_time(job.get("submitted"))
+        waited = (ended - submitted).total_seconds() \
+            if ended and submitted else 0
+    times = "after %s waiting" % minutes(waited)
+    if status.get("started"):
+        times += " and %s running" % minutes(status.get("ran_s"))
+    where = "commit %s" % job["commit"][:8] if job.get("commit") \
+        else "in %s" % job["dir"]
+    lines = ["Queue %s: %s %s, %s." % (job["queue"], job["name"], what, times),
+             "Ticket %s, %s. Log: %s" % (job["ticket"], where,
+                                          job_file(sd, job["ticket"], "log"))]
+    summary = summary_line(sd, job["ticket"])
+    if summary:
+        lines.append(summary)
+    return "\n".join(lines)
+
+
+def _load_tool(name):
+    loader = importlib.machinery.SourceFileLoader(
+        name.replace("-", "_"), os.path.join(BIN, name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def relay_send(job, text):
+    """Send `text` to the job's agent: forge-merger's relay sender, which
+    is forge-router's poster, configured from the same `relay` section
+    and addressed to each of her sessions. None when one took it, else
+    why not."""
+    try:
+        project = config.load(job["config"])
+    except (config.ConfigError, KeyError, TypeError) as err:
+        return "no configuration: %s" % err
+    if job["agent"] not in project.agents:
+        return "%s is no longer one of the configuration's agents" \
+            % job["agent"]
+    # The submitter's environment, for $FORGE_ROUTER_RELAY.
+    environ = dict(job.get("env") or {})
+    return _load_tool("forge-merger").relay_sender(project, environ)(
+        job["agent"], text)
+
+
+def deliver(sd, job, send, clock, out):
+    """One delivery attempt for an ended ticket, if one is due and no one
+    else is making it. True when the message has landed."""
+    ticket = job["ticket"]
+    guard = locks.try_lock(job_file(sd, ticket, ".deliver"), str(os.getpid()))
+    if guard is None:
+        return False
+    try:
+        status = load_status(sd, ticket)
+        if status.get("delivered") or status.get("state") not in ENDED:
+            return bool(status.get("delivered"))
+        try:
+            why = send(job, message(sd, job, status))
+        except Exception as err:  # a fault in delivery must not lose state
+            why = "delivery failed: %s" % err
+        when = clock()
+        status["deliveries"] = status.get("deliveries", 0) + 1
+        if why is None:
+            status.update(delivered=True, delivered_at=stamp(when))
+            status.pop("delivery_error", None)
+            status.pop("next_delivery", None)
+            out("told %s: %s" % (job["agent"], ticket))
+        else:
+            status.update(delivered=False, delivery_error=why,
+                          next_delivery=stamp(when + datetime.timedelta(
+                              seconds=job.get("remind_s", DEFAULT_REMIND_S))))
+            out("NOT TOLD %s: %s: %s" % (job["agent"], ticket, why))
+        save_status(sd, ticket, status)
+        return why is None
+    finally:
+        guard.close()
+
+
+def due(status, when):
+    if status.get("delivered") or status.get("state") not in ENDED:
+        return False
+    at = parse_time(status.get("next_delivery"))
+    return at is None or when >= at
+
+
+def finish(sd, job, status, how, rc, run, clock, extra=None):
+    """Record the end of a job and remove its frozen worktree."""
+    status.update(state=how, ended=stamp(clock()), delivered=False)
+    if rc is not None:
+        status["exit"] = rc
+    if extra:
+        status.update(extra)
+    save_status(sd, job["ticket"], status)
+    if not job["settings"].get("keep_worktree"):
+        remove_worktree(job, run)
+
+
+def older_waiting(sd, job, when):
+    """Whether a ticket submitted before `job` is still waiting."""
+    for other in jobs(sd, job["queue"]):
+        if other.get("seq", 0) >= job.get("seq", 0) \
+                or other["ticket"] == job["ticket"]:
+            continue
+        st = load_status(sd, other["ticket"])
+        if st.get("state") not in WAITING:
+            continue
+        if alive(sd, other["ticket"]):
+            return True
+        queued = parse_time(st.get("queued_at"))
+        if st.get("state") == "queued" and queued and \
+                (when - queued).total_seconds() < GRACE_S:
+            return True
+    return False
+
+
+def run_ticket(sd, ticket, run, out, clock, sleep, send, spawn_job):
+    """The unit's work: wait for a slot in order, run, tell the agent."""
+    job = state.load(ticket_path(sd, ticket)) if queue_of(ticket) else {}
+    if job.get("ticket") != ticket:
+        out("%s: no ticket %s" % (PROG, ticket))
+        return 2
+    handle = hold_ticket(sd, ticket)
+    if handle is None:
+        out("%s: %s already has a runner" % (PROG, ticket))
+        return 0
+    cancel_mark = job_file(sd, ticket, "cancel")
+
+    def cancelled():
+        return os.path.exists(cancel_mark)
+
+    try:
+        with locks.locked(queue_lock(sd, job["queue"])):
+            status = load_status(sd, ticket)
+            if status.get("state") in ENDED:
+                return 0
+            status.update(state="waiting", waiting_since=stamp(clock()))
+            save_status(sd, ticket, status)
+        slot = None
+        while slot is None:
+            if cancelled():
+                finish(sd, job, status, "cancelled", None, run, clock)
+                break
+            if not older_waiting(sd, job, clock()):
+                for n in range(job["settings"]["slots"]):
+                    slot = locks.try_lock(slot_path(sd, job["queue"], n),
+                                          ticket)
+                    if slot is not None:
+                        break
+            if slot is None:
+                sleep(WAIT_POLL_S)
+        if slot is not None:
+            try:
+                run_job(sd, job, status, cancelled, run, clock, sleep,
+                        spawn_job)
+            finally:
+                slot.close()
+        while not deliver(sd, job, send, clock, out):
+            st = load_status(sd, ticket)
+            if st.get("delivered") or st.get("state") not in ENDED:
+                break
+            at = parse_time(st.get("next_delivery")) or clock()
+            sleep(max(1, (at - clock()).total_seconds()))
+        return 0
+    finally:
+        handle.close()
+
+
+def run_job(sd, job, status, cancelled, run, clock, sleep, spawn_job):
+    started = clock()
+    submitted = parse_time(job.get("submitted")) or started
+    status.update(state="running", started=stamp(started),
+                  waited_s=int((started - submitted).total_seconds()))
+    save_status(sd, job["ticket"], status)
+    argv = job_argv(job)
+    with open(job_file(sd, job["ticket"], "log"), "ab") as log:
+        try:
+            child = spawn_job(argv, job["dir"], job_env(sd, job), log)
+        except OSError as err:
+            log.write(("%s: could not start %s: %s\n"
+                       % (PROG, argv, err)).encode())
+            rc, how = 127, "done"
+        else:
+            rc, how = supervise(
+                child, job["settings"]["timeout_minutes"] * MINUTE_S,
+                cancelled, sleep)
+    ended = clock()
+    finish(sd, job, status, how, rc, run, clock,
+           {"ran_s": int((ended - started).total_seconds())})
+
+
+# Recovery: what a restart left behind, deliveries due, pruning.
+
+def start_unit(sd, job, run):
+    """systemd-run the ticket's runner; None, or why it didn't start."""
+    argv = ["systemd-run", "--user", "--unit", "forge-queue-" + job["ticket"],
+            "--collect", "--quiet", "--description",
+            "forge-queue %s: %s" % (job["ticket"], job["name"]),
+            sys.executable, os.path.join(BIN, "forge-queue"),
+            "--state-dir", sd, "run", job["ticket"]]
+    got = run(argv)
+    if got.returncode == 0:
+        return None
+    return (got.stderr or got.stdout or "exit %d" % got.returncode).strip()
+
+
+def prune(sd, job, run):
+    remove_worktree(job, run)
+    shutil.rmtree(job_dir(sd, job["ticket"]), ignore_errors=True)
+    try:
+        os.unlink(ticket_path(sd, job["ticket"]))
+    except OSError:
+        pass
+
+
+def recover(sd, run, clock, out, send, retain_days):
+    """Mark lost what a dead runner left running, start again what a dead
+    runner left waiting, send messages due, prune old tickets."""
+    when = clock()
+    to_tell = []
+    for queue in queues_in(sd):
+        with locks.locked(queue_lock(sd, queue)):
+            for job in jobs(sd, queue):
+                ticket = job["ticket"]
+                if alive(sd, ticket):
+                    continue
+                status = load_status(sd, ticket)
+                how = status.get("state")
+                if how == "running":
+                    finish(sd, job, status, "lost", None, run, clock)
+                    out("lost: %s (%s's runner is gone)" % (ticket,
+                                                            job["agent"]))
+                elif how in WAITING:
+                    queued = parse_time(status.get("queued_at"))
+                    if how == "queued" and queued and \
+                            (when - queued).total_seconds() < GRACE_S:
+                        continue
+                    status.update(state="queued", queued_at=stamp(when),
+                                  restarts=status.get("restarts", 0) + 1)
+                    save_status(sd, ticket, status)
+                    why = start_unit(sd, job, run)
+                    out("started again: %s%s" % (
+                        ticket, " FAILED: " + why if why else ""))
+                elif how in ENDED:
+                    ended = parse_time(status.get("ended"))
+                    if ended and when - ended > datetime.timedelta(
+                            days=retain_days):
+                        prune(sd, job, run)
+                        continue
+                if due(load_status(sd, ticket), when):
+                    to_tell.append(job)
+    for job in to_tell:
+        deliver(sd, job, send, clock, out)
+
+
+# Who is asking.
+
+def identity(args, environ, run, cwd):
+    if getattr(args, "agent", None):
+        return args.agent
+    if environ.get("FORGE_AGENT"):
+        return environ["FORGE_AGENT"]
+    got = run(["git", "config", "--worktree", "user.name"], cwd=cwd)
+    return (got.stdout or "").strip() if got.returncode == 0 else ""
+
+
+def git(run, cwd, *args, strip=True):
+    got = run(["git", *args], cwd=cwd)
+    out = got.stdout or ""
+    return got.returncode, out.strip() if strip else out, \
+        (got.stderr or "").strip()
+
+
+def submit(args, project, sd, environ, run, out, clock, cwd):
+    section = project.section("queue") if project else {}
+    if not project or "queue" not in project.data:
+        out("%s: no queue section in the configuration: nothing can be "
+            "submitted" % PROG)
+        return 2
+    queues = section.get("queues", {})
+    if args.queue not in queues:
+        out("%s: no queue %r; the configuration has %s" % (
+            PROG, args.queue, ", ".join(sorted(queues)) or "none"))
+        return 2
+    command = args.command
+    if not command:
+        out("%s: no command: submit QUEUE ... -- COMMAND..." % PROG)
+        return 2
+    if args.at and args.dir:
+        out("%s: --at and --dir: give one" % PROG)
+        return 2
+    agent = identity(args, environ, run, cwd)
+    if not agent:
+        out("%s: no agent: pass --agent, set FORGE_AGENT or stamp the "
+            "worktree (forge-worktree-identity)" % PROG)
+        return 2
+    if agent not in project.agents:
+        out("%s: %s is not one of the configuration's agents" % (PROG, agent))
+        return 2
+    settings = dict(DEFAULTS, **queues[args.queue])
+    top = prefix = commit = None
+    if args.dir:
+        workdir = os.path.abspath(os.path.expanduser(args.dir))
+        if not os.path.isdir(workdir):
+            out("%s: --dir %s is not a directory" % (PROG, workdir))
+            return 2
+    else:
+        rc, top, err = git(run, cwd, "rev-parse", "--show-toplevel")
+        if rc != 0:
+            out("%s: not in a git worktree (%s); use --dir" % (PROG, err))
+            return 2
+        _, prefix, _ = git(run, cwd, "rev-parse", "--show-prefix")
+        rc, porcelain, err = git(run, top, "status", "--porcelain",
+                                 "--untracked-files=all", strip=False)
+        if rc != 0:
+            out("%s: git status failed: %s" % (PROG, err))
+            return 3
+        if porcelain.strip():
+            files = [ln[3:] for ln in porcelain.splitlines() if ln.strip()]
+            out("%s: the worktree has changes that aren't committed, so "
+                "they wouldn't be in the job; commit them or use --dir:\n  %s"
+                % (PROG, "\n  ".join(files)))
+            return 2
+        ref = args.at or "HEAD"
+        rc, commit, err = git(run, top, "rev-parse", "--verify", "--quiet",
+                              ref + "^{commit}")
+        if rc != 0 or not commit:
+            out("%s: %s is not a commit" % (PROG, ref))
+            return 2
+    qdir = queue_dir(sd, args.queue)
+    os.makedirs(qdir, mode=0o700, exist_ok=True)
+    when = clock()
+    with locks.locked(queue_lock(sd, args.queue)):
+        seq_file = os.path.join(qdir, ".seq")
+        seq = state.load(seq_file, {"next": 1})["next"]
+        state.save(seq_file, {"next": seq + 1})
+        ticket = new_ticket(args.queue, when)
+        while os.path.exists(job_dir(sd, ticket)):
+            ticket = new_ticket(args.queue, when)
+        os.makedirs(job_dir(sd, ticket), mode=0o700)
+        worktree = None
+        if commit:
+            worktree = job_file(sd, ticket, "worktree")
+            rc, _, err = git(run, top, "worktree", "add", "--detach",
+                             worktree, commit)
+            if rc != 0:
+                shutil.rmtree(job_dir(sd, ticket), ignore_errors=True)
+                out("%s: git worktree add failed: %s" % (PROG, err))
+                return 3
+            workdir = os.path.join(worktree, prefix) if prefix else worktree
+        relay = project.section("relay")
+        job = {"ticket": ticket, "queue": args.queue, "seq": seq,
+               "agent": agent, "sessions": project.sessions(
+                   project.stand_in(agent)),
+               "name": args.name or " ".join(command)[:NAME_MAX],
+               "command": command, "dir": workdir, "commit": commit,
+               "ref": None if args.dir else (args.at or "HEAD"),
+               "repo": top, "worktree": worktree,
+               "submitted": stamp(when), "config": project.path,
+               "settings": settings,
+               "remind_s": relay.get("remind_seconds", DEFAULT_REMIND_S),
+               "env": {k: v for k, v in environ.items()
+                       if k not in DROP_ENV}}
+        path = ticket_path(sd, ticket)
+        state.save(path, job)
+        os.chmod(path, 0o600)
+        save_status(sd, ticket, {"state": "queued",
+                                 "queued_at": stamp(when)})
+        why = start_unit(sd, job, run)
+        if why:
+            finish(sd, job, load_status(sd, ticket), "failed", None, run,
+                   clock, {"error": "systemd-run: " + why, "delivered": True})
+            out("%s: systemd-run failed, so %s is not queued: %s"
+                % (PROG, ticket, why))
+            return 3
+    out(ticket)
+    return 0
+
+
+# Looking.
+
+def describe(sd, job, status, when):
+    how = status.get("state", "?")
+    where = job["commit"][:8] if job.get("commit") else job["dir"]
+    times = "submitted %s" % job.get("submitted")
+    if how == "running":
+        started = parse_time(status.get("started"))
+        times += ", running %s" % (minutes((when - started).total_seconds())
+                                   if started else "?")
+    elif how in ENDED:
+        times += ", ended %s, exit %s" % (status.get("ended"),
+                                          status.get("exit", "-"))
+        if not status.get("delivered"):
+            times += ", NOT TOLD: %s" % status.get("delivery_error",
+                                                  "not tried yet")
+    return "%-10s %s  %s  %s  %s  %s" % (how, job["ticket"], job["agent"],
+                                         job["name"], where, times)
+
+
+def list_jobs(sd, queue, done, undelivered, clock, out):
+    when = clock()
+    shown = 0
+    for name in [queue] if queue else queues_in(sd):
+        rows = [(j, load_status(sd, j["ticket"])) for j in jobs(sd, name)]
+        if undelivered:
+            pick = [r for r in rows if r[1].get("state") in ENDED
+                    and not r[1].get("delivered")]
+        else:
+            pick = [r for r in rows if r[1].get("state") == "running"] + \
+                [r for r in rows if r[1].get("state") in WAITING]
+            if done:
+                pick += [r for r in rows if r[1].get("state") in ENDED and
+                         (parse_time(r[1].get("ended")) or when)
+                         > when - datetime.timedelta(days=1)]
+        for job, status in pick:
+            out(describe(sd, job, status, when))
+            shown += 1
+    if not shown:
+        out("nothing %s" % ("undelivered" if undelivered else "queued"))
+    return 0
+
+
+def show_status(sd, ticket, out):
+    job = state.load(ticket_path(sd, ticket)) if queue_of(ticket) else {}
+    if job.get("ticket") != ticket:
+        out("%s: no ticket %s" % (PROG, ticket))
+        return 2
+    shown = {k: job.get(k) for k in ("ticket", "queue", "agent", "name",
+                                     "command", "dir", "commit", "submitted")}
+    shown.update(load_status(sd, ticket))
+    out(json.dumps(shown, indent=1, sort_keys=True))
+    log = job_file(sd, ticket, "log")
+    try:
+        with open(log, errors="replace") as f:
+            tail = f.read().splitlines()[-LOG_TAIL:]
+    except OSError:
+        tail = None
+    out("log %s:" % log + ("" if tail else " (empty)"))
+    for line in tail or []:
+        out("  " + line)
+    return 0
+
+
+def cancel(args, sd, environ, run, clock, out, send, cwd):
+    ticket = args.ticket
+    job = state.load(ticket_path(sd, ticket)) if queue_of(ticket) else {}
+    if job.get("ticket") != ticket:
+        out("%s: no ticket %s" % (PROG, ticket))
+        return 2
+    who = identity(args, environ, run, cwd)
+    if who != job["agent"] and not args.operator:
+        out("%s: %s is %s's; only she, or the operator with --operator, may "
+            "cancel it" % (PROG, ticket, job["agent"]))
+        return 2
+    with locks.locked(queue_lock(sd, job["queue"])):
+        status = load_status(sd, ticket)
+        if status.get("state") in ENDED:
+            out("%s already ended: %s" % (ticket, status.get("state")))
+            return 1
+        with open(job_file(sd, ticket, "cancel"), "w") as mark:
+            mark.write("%s %s\n" % (stamp(clock()), who or "operator"))
+        if alive(sd, ticket):
+            out("cancelling %s: its runner stops it within seconds, and "
+                "tells %s" % (ticket, job["agent"]))
+            return 0
+        # A runner that starts later finds it ended, and stops.
+        finish(sd, job, status, "cancelled", None, run, clock)
+    deliver(sd, job, send, clock, out)
+    out("cancelled %s" % ticket)
+    return 0
+
+
+def main(argv=None, environ=None, run=proc.sh, out=print, clock=now_utc,
+         sleep=time.sleep, send=relay_send, spawn_job=spawn, cwd=None):
+    environ = dict(os.environ if environ is None else environ)
+    cwd = cwd or os.getcwd()
+    parser = argparse.ArgumentParser(prog=PROG, description=(
+        __doc__.splitlines()[0]))
+    parser.add_argument("--state-dir", help="where tickets, logs and frozen "
+                        "worktrees live (default queue.state_dir, else "
+                        "~/.local/state/agent-forge/queue)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("submit", help="queue a job; prints its ticket")
+    p.add_argument("queue")
+    p.add_argument("--at", metavar="REF", help="run at this commit, in a "
+                   "frozen worktree (default HEAD)")
+    p.add_argument("--dir", help="run in this directory as it stands")
+    p.add_argument("--name", help="what the job is called in messages")
+    p.add_argument("--agent", help="whose job it is (default $FORGE_AGENT, "
+                   "else the worktree's stamped identity)")
+    p = sub.add_parser("run", help="what a job's unit runs")
+    p.add_argument("ticket")
+    p = sub.add_parser("list", help="running and waiting jobs, in order")
+    p.add_argument("queue", nargs="?")
+    p.add_argument("--done", action="store_true",
+                   help="add the jobs that ended in the last day")
+    p.add_argument("--undelivered", action="store_true",
+                   help="only ended jobs whose message hasn't landed")
+    p = sub.add_parser("status", help="one job's status and log")
+    p.add_argument("ticket")
+    p = sub.add_parser("cancel", help="stop a waiting or running job")
+    p.add_argument("ticket")
+    p.add_argument("--agent", help="who is asking (default $FORGE_AGENT, "
+                   "else the worktree's stamped identity)")
+    p.add_argument("--operator", action="store_true",
+                   help="cancel another agent's job")
+    sub.add_parser("recover", help="mark lost, start again, tell, prune")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Everything after the first `--` is the command, never options.
+    command = argv[argv.index("--") + 1:] if "--" in argv else []
+    args = parser.parse_args(argv[:argv.index("--")] if "--" in argv
+                             else argv)
+    args.command = command
+
+    project = None
+    try:
+        project = config.load_reviewed(environ=environ, cwd=cwd, run=run)
+    except config.ConfigError as err:
+        if args.cmd == "submit":
+            out("%s: %s" % (PROG, err))
+            return 2
+    section = project.section("queue") if project else {}
+    sd = os.path.abspath(os.path.expanduser(
+        args.state_dir or section.get("state_dir")
+        or default_state_dir(environ)))
+    if args.cmd == "run":
+        return run_ticket(sd, args.ticket, run, out, clock, sleep, send,
+                          spawn_job)
+    os.makedirs(sd, mode=0o700, exist_ok=True)
+    recover(sd, run, clock, out, send,
+            section.get("retain_days", DEFAULT_RETAIN_DAYS))
+    if args.cmd == "submit":
+        return submit(args, project, sd, environ, run, out, clock, cwd)
+    if args.cmd == "list":
+        return list_jobs(sd, args.queue, args.done, args.undelivered, clock,
+                         out)
+    if args.cmd == "status":
+        return show_status(sd, args.ticket, out)
+    if args.cmd == "cancel":
+        return cancel(args, sd, environ, run, clock, out, send, cwd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

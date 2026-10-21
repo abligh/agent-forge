@@ -53,6 +53,7 @@ TOP = {
     "closing_keywords": (dict, False),
     "memory": (dict, False),
     "quiet": (dict, False),
+    "queue": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
@@ -68,6 +69,12 @@ MEMORY = {"dir": str, "remote": str, "git_dir": str, "seed_dir": str,
 # forge-quiet and what honours a hold (agent_forge/quiet.py).
 QUIET = {"dir": str, "max_minutes": int, "settle": list,
          "settle_minutes": int}
+# forge-queue (designs/0023): named queues of slow jobs.
+QUEUE = {"queues": dict, "state_dir": str, "retain_days": int}
+QUEUE_ENTRY = {"slots": int, "nice": int, "timeout_minutes": int,
+               "keep_worktree": bool}
+# A queue's name starts its tickets and names its directory.
+QUEUE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_minutes": int, "stall_alert": dict, "test_ahead": dict,
          "hold_conflicting": bool, "yield_after_hand_back": int,
@@ -273,6 +280,29 @@ def _check_quiet(quiet, present, problems):
         problems.append("quiet.settle_minutes must be at least 1")
 
 
+def _check_queue(queue, problems):
+    """The `queue` section: forge-queue's queues."""
+    if not _fields("queue", queue, QUEUE, problems):
+        return
+    if isinstance(queue.get("state_dir"), str) and \
+            not queue["state_dir"].strip():
+        problems.append("queue.state_dir must not be empty")
+    if _is(queue.get("retain_days"), int) and queue["retain_days"] < 1:
+        problems.append("queue.retain_days must be at least 1")
+    for name, entry in (queue.get("queues") or {}).items():
+        where = "queue.queues.%s" % name
+        if not QUEUE_NAME_RE.match(name):
+            problems.append("%s: a queue's name is lower case letters, "
+                            "digits and hyphens" % where)
+        if not _fields(where, entry, QUEUE_ENTRY, problems):
+            continue
+        for key in ("slots", "timeout_minutes"):
+            if _is(entry.get(key), int) and entry[key] < 1:
+                problems.append("%s.%s must be at least 1" % (where, key))
+        if _is(entry.get("nice"), int) and not 0 <= entry["nice"] <= 19:
+            problems.append("%s.nice must be from 0 to 19" % where)
+
+
 def check(data):
     """Every problem with `data`, a parsed configuration; [] if none."""
     problems = []
@@ -382,6 +412,7 @@ def check(data):
                             "strings")
     _check_memory(data.get("memory", {}), "memory" in data, problems)
     _check_quiet(data.get("quiet", {}), "quiet" in data, problems)
+    _check_queue(data.get("queue", {}), problems)
     docs = data.get("docs", {})
     for key, kinds in DOCS.items():
         if key in docs and not _is(docs[key], kinds):
