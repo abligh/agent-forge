@@ -67,6 +67,26 @@ request: the record says `RESYNC`, the tick moves on, and the next tick
 judges the new head as it would any other (its approval, its check),
 never the head GitHub lost.
 
+**A CI run GitHub misreports is judged by its jobs.** GitHub sometimes
+goes on reporting a run of `merge.ci_workflow` as `queued` or
+`in_progress` long after every job in it has completed, while it
+considers the run finished itself (it refuses to cancel it). For each
+run on the head that says it is unfinished, the Merger reads its jobs
+(every page): when all have completed, the run is finished, green when
+each job concluded `success`, `skipped` or `neutral` and red (handed
+back like any red run) otherwise, and the tick prints `CI-STALE #N:
+GitHub says run <id> is in_progress, but all its jobs finished at
+<time>; judged by its jobs (green)`. A run whose jobs say unfinished
+too is waited on, as before. Once it has been unfinished for
+`STALL_AFTER` since it started, the Merger re-runs it, once per pull
+request and head (`ci-reruns.json` in the state directory), printing
+`CI-RERUN #N: ...`; a dry run only says it would. If the head's CI is
+still unfinished `STALL_AFTER` after the re-run, the tick prints
+`CI-STUCK #N: ...`, hands the pull request back to its author (once per
+approval and head; a push starts CI afresh) and the queue moves past
+it, until the run does finish. Like a lost head, that hand-back is not
+the pull request's own failure.
+
 Each tick appends one JSON record to `merger.jsonl` in the state
 directory (~/.local/state/agent-forge/<project>/merger, or
 `--state-dir`) (`dry-run.jsonl` under `--dry-run`). `held` names each pull
@@ -400,6 +420,15 @@ ACCESS_RE = re.compile(r"\b40[13]\b")
 # said once per approval and head.
 LOST_HEAD_REASON = ("GitHub refuses to update or merge it at this head, "
                     "saying the head it expected didn't match")
+# The job conclusions that make a run of the CI workflow green when
+# GitHub reports the run unfinished but every one of its jobs completed:
+# the run is then judged by its jobs.
+GREEN_JOBS = ("success", "skipped", "neutral")
+# Which pull request heads the Merger re-ran a CI run on, because GitHub
+# had the run and its jobs unfinished for STALL_AFTER: {pr: {"head",
+# "run", "since" (the run's start), "at" (the re-run's), "result"}}.
+# Once per head, so a re-run that doesn't help is not repeated.
+RERUN_FILE = "ci-reruns.json"
 # Which pull request heads the Merger has nudged GitHub to read again,
 # {pr: {"head": the head GitHub had, "result": the nudge's}}: once per
 # head, so a nudge that doesn't work is not repeated every tick.
@@ -824,11 +853,12 @@ def author_hand_backs(records):
 def hand_backs(records, conflicts=True):
     """{pr: how many times it was handed back to its author} in
     `records` (see `author_hand_backs`); without `conflicts`, a conflict
-    with main doesn't count. A head GitHub lost (LOST_HEAD_REASON) is
-    never the pull request's own failure, so it doesn't count either."""
+    with main doesn't count. A head GitHub lost (LOST_HEAD_REASON), or
+    a CI run GitHub never finished (`ci_stuck_reason`), is never the
+    pull request's own failure, so it doesn't count either."""
     counts = {}
     for pr, _, reason in author_hand_backs(records):
-        if reason != LOST_HEAD_REASON and (
+        if not not_own_failure(reason) and (
                 conflicts or reason != CONFLICT_REASON):
             counts[pr] = counts.get(pr, 0) + 1
     return counts
@@ -860,7 +890,7 @@ def yields_spent(records, conflicts=True):
                     or d.get("to") != "author" \
                     or str(d.get("result") or "").startswith("refused"):
                 continue
-            if d.get("reason") != LOST_HEAD_REASON and (
+            if not not_own_failure(d.get("reason")) and (
                     conflicts or d.get("reason") != CONFLICT_REASON):
                 last[d.get("pr")] = record
                 spent[d.get("pr")] = 0
@@ -1056,6 +1086,72 @@ def ci_problem(runs):
     return None
 
 
+def ci_stuck_reason():
+    """The reason a pull request goes back to its author once a CI run
+    on its head is still unfinished STALL_AFTER after the Merger re-ran
+    it. It names no run or SHA, so it is said once per approval and
+    head."""
+    return ("the %s workflow has not finished on this head, even after "
+            "the Merger re-ran it" % CI_WORKFLOW)
+
+
+def not_own_failure(reason):
+    """Whether a hand-back for `reason` is no failure of the pull
+    request's own (GitHub lost its head, or never finished its CI), so
+    it never counts toward `merge.yield_after_hand_back`."""
+    return reason in (LOST_HEAD_REASON, ci_stuck_reason())
+
+
+def run_jobs(github, run_id):
+    """Every job of the CI run `run_id`'s latest attempt, all pages, or
+    None when GitHub couldn't be asked."""
+    try:
+        jobs = github.api("--paginate", "repos/%s/actions/runs/%s/jobs"
+                          "?per_page=100" % (REPO_SLUG, run_id),
+                          "--jq", ".jobs")
+    except (RuntimeError, ValueError):
+        return None
+    return jobs if isinstance(jobs, list) else None
+
+
+def judge_runs(runs, github):
+    """(runs, stale, unfinished) for the CI workflow's runs on the head.
+
+    GitHub sometimes goes on reporting a run `queued` or `in_progress`
+    long after every job in it has completed, and considers it finished
+    itself (it refuses to cancel it). So each run of CI_WORKFLOW that
+    says it is unfinished is judged by its jobs when they have all
+    completed: finished, concluding `success` when every job concluded
+    one of GREEN_JOBS, and otherwise the first other job's conclusion.
+    `runs` comes back with those runs replaced by what their jobs say;
+    `stale` lists them, as {"run", "status", "finished" (the latest job
+    completion), "judged" ("green" or "red")}; `unfinished` lists the
+    runs whose jobs haven't all completed either (or couldn't be read),
+    as {"run", "status", "since" (the run's start)}."""
+    judged, stale, unfinished = [], [], []
+    for run in runs:
+        if run.get("name") != CI_WORKFLOW or run.get("status") == "completed":
+            judged.append(run)
+            continue
+        jobs = run_jobs(github, run.get("id"))
+        if not jobs or any(j.get("status") != "completed" for j in jobs):
+            unfinished.append({"run": run.get("id"),
+                               "status": run.get("status"),
+                               "since": run.get("run_started_at")
+                               or run.get("created_at")})
+            judged.append(run)
+            continue
+        red = [j.get("conclusion") or "unknown" for j in jobs
+               if j.get("conclusion") not in GREEN_JOBS]
+        stale.append({"run": run.get("id"), "status": run.get("status"),
+                      "finished": max(j.get("completed_at") or ""
+                                      for j in jobs) or "?",
+                      "judged": "red" if red else "green"})
+        judged.append(dict(run, status="completed",
+                           conclusion=red[0] if red else "success"))
+    return judged, stale, unfinished
+
+
 def tail(text, lines=TAIL_LINES):
     return "\n".join((text or "").strip().splitlines()[-lines:])
 
@@ -1205,21 +1301,27 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh):
     if state != "success":
         return back("author", "%s is %s%s" % (
             STATUS_CONTEXT, state, ": " + said if said else ""))
-    problem = None
+    problem, notes = None, {}
     if CI_WORKFLOW:
         runs = github.api("repos/%s/actions/runs?head_sha=%s&per_page=100"
                           % (REPO_SLUG, head))
-        problem = ci_problem((runs or {}).get("workflow_runs") or [])
+        runs, stale, unfinished = judge_runs(
+            (runs or {}).get("workflow_runs") or [], github)
+        if stale:
+            notes["ci_stale"] = stale
+        problem = ci_problem(runs)
     if problem and ("not finished" in problem or "not started" in problem):
-        return {"action": "WAIT", "reason": problem}
+        if unfinished:
+            notes["ci_unfinished"] = unfinished
+        return dict({"action": "WAIT", "reason": problem}, **notes)
     for argv in GATE:
         if problem:
             break
         problem = tool_problem(gate_args(argv, repo, number, main_tip, head),
                                env, repo, run)
     if problem:
-        return back("author", problem)
-    return {"action": "MERGE"}
+        return dict(back("author", problem), **notes)
+    return dict({"action": "MERGE"}, **notes)
 
 
 def gate_args(argv, repo, number, base, head):
@@ -1636,6 +1738,67 @@ def lost_head(decision, github, state_dir, out):
             "base update was refused: %s"
             % (number, short(held), short(branch), why))
     return lost
+
+
+def ci_rerun(decision, github, state_dir, when, live, out):
+    """For a WAIT on CI runs GitHub has unfinished, jobs and all
+    (`decision["ci_unfinished"]`, see `judge_runs`): None to go on
+    waiting, or the detail of a hand-back when waiting is no use.
+
+    A run unfinished for STALL_AFTER since it started is re-run, once
+    per pull request and head (RERUN_FILE), with one `CI-RERUN` line,
+    and `rerun` ("done" or "refused: ...") added to the decision. A
+    dry run only says it would, and writes nothing. If the head's CI is
+    still unfinished STALL_AFTER after that re-run, nothing more the
+    Merger does will finish it: the answer is the hand-back's detail,
+    and the queue moves past the pull request."""
+    number, head = decision["pr"], decision["head"]
+    path = os.path.join(state_dir, RERUN_FILE)
+    done = load_json(path, {})
+    if not isinstance(done, dict):
+        done = {}
+    before = done.get(str(number))
+    if isinstance(before, dict) and before.get("head") == head:
+        decision["rerun"] = before.get("result") or "done"
+        try:
+            at = parse_time(before["at"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if when - at < STALL_AFTER:
+            return None
+        return ("GitHub has reported %s run %s unfinished, its jobs too, "
+                "since %s; the Merger re-ran it at %s (%s), and it still "
+                "hasn't finished. A push to the branch starts CI afresh, and "
+                "if the run does finish green, the Merger takes it again"
+                % (CI_WORKFLOW, before.get("run"), before.get("since") or "?",
+                   before["at"], decision["rerun"]))
+    for stuck in decision.get("ci_unfinished") or ():
+        try:
+            since = parse_time(stuck["since"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if when - since < STALL_AFTER:
+            continue
+        minutes = int((when - since).total_seconds() // 60)
+        if not live:
+            out("CI-RERUN #%d: GitHub says run %s is %s, and so are its "
+                "jobs, after %d minutes; a live tick would re-run it"
+                % (number, stuck["run"], stuck["status"], minutes))
+            return None
+        ok, why = github.write("POST", "repos/%s/actions/runs/%s/rerun"
+                               % (REPO_SLUG, stuck["run"]))
+        decision["rerun"] = "done" if ok else "refused: " + why
+        done[str(number)] = {"head": head, "run": stuck["run"],
+                             "since": stuck["since"], "at": iso(when),
+                             "result": decision["rerun"]}
+        save_json(path, done)
+        out("CI-RERUN #%d: GitHub says run %s is %s, and so are its jobs, "
+            "after %d minutes; %s" % (
+                number, stuck["run"], stuck["status"], minutes,
+                "re-ran it, once for this head" if ok
+                else "re-running it was refused: " + why))
+        return None
+    return None
 
 
 def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
@@ -2144,6 +2307,27 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             record["decisions"].append(conflict_hand_back(
                 pr, approval, github, said, live, LOST_HEAD_REASON))
             continue
+        for stale in decision.get("ci_stale") or ():
+            out("CI-STALE #%d: GitHub says run %s is %s, but all its jobs "
+                "finished at %s; judged by its jobs (%s)" % (
+                    pr["number"], stale["run"], stale["status"],
+                    stale["finished"], stale["judged"]))
+        if decision["action"] == "WAIT" and decision.get("ci_unfinished"):
+            stuck = ci_stuck_reason()
+            if said.get(str(pr["number"])) == hand_back_key(
+                    approval, pr["headRefOid"], stuck):
+                # Its CI never finished, even re-run, and it went back
+                # to its author; the queue moves past it until it does.
+                record["decisions"].append(conflict_hand_back(
+                    pr, approval, github, said, live, stuck))
+                continue
+            detail = ci_rerun(decision, github, state_dir, when, live, out)
+            if detail:
+                out("CI-STUCK #%d: %s; handed back to its author, and the "
+                    "queue moves past it" % (pr["number"], detail))
+                record["decisions"].append(conflict_hand_back(
+                    pr, approval, github, said, live, stuck, detail + "."))
+                continue
         if live:
             result = carry_out(decision, approval, github, said)
             if result is not None:

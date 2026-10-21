@@ -728,12 +728,17 @@ class FakeGitHub:
         return (self.created, "") if ok else (None, why)
 
     def api(self, *args):
+        """The answer whose prefix matches the first or second argument,
+        the longest such prefix winning: a run's jobs are asked for
+        under the runs' own path, and with `--paginate` first."""
         self.calls.append(args)
-        for prefix, value in self.answers.items():
-            if args[0].startswith(prefix) or (
-                    len(args) > 1 and args[1].startswith(prefix)):
-                return value() if callable(value) else value
-        raise AssertionError("unexpected gh api %r" % (args,))
+        found = [prefix for prefix in self.answers
+                 if args[0].startswith(prefix) or (
+                     len(args) > 1 and args[1].startswith(prefix))]
+        if not found:
+            raise AssertionError("unexpected gh api %r" % (args,))
+        value = self.answers[max(found, key=len)]
+        return value() if callable(value) else value
 
 
 def tools_run(results=None):
@@ -1651,6 +1656,205 @@ class LostHead(RepoCase):
         self.assertNotIn("access", text)
         self.assertTrue(text.endswith(
             "It has gone back to its author, and the queue moves past it."))
+
+
+def job(status="completed", conclusion="success",
+        completed="2026-10-07T11:50:00Z"):
+    return {"status": status, "conclusion": conclusion,
+            "completed_at": completed if status == "completed" else None}
+
+
+def stuck_run(status="in_progress", since="2026-10-07T11:40:00Z", ident=7):
+    return dict(ci_run(None, status, ident=ident), run_started_at=since)
+
+
+class CiStale(RepoCase):
+    """GitHub goes on reporting a ci run unfinished after its jobs have
+    all completed: the Merger judges the run by its jobs. A run whose
+    jobs are unfinished too is re-run once STALL_AFTER after it started,
+    and STALL_AFTER after that the queue moves past it."""
+
+    item = Decide.item
+    tick = Tick.tick
+    other_pr = Tick.other_pr
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+
+    def extra(self, jobs, run=None):
+        # #5's head only: any other's ci is the default green run.
+        return {SLUG + "/actions/runs?head_sha=" + self.head: {
+                    "workflow_runs": [run or stuck_run()]},
+                SLUG + "/actions/runs/7/jobs": jobs}
+
+    def test_finished_green_jobs_merge_it(self):
+        jobs = [job(), job(conclusion="skipped",
+                           completed="2026-10-07T11:51:00Z")]
+        record, lines = self.tick([self.item()], live=True,
+                                  extra=self.extra(jobs))
+        self.assertEqual(lines[0], (
+            "CI-STALE #5: GitHub says run 7 is in_progress, but all its jobs "
+            "finished at 2026-10-07T11:51:00Z; judged by its jobs (green)"))
+        decision, = record["decisions"]
+        self.assertEqual((decision["action"], decision["result"]),
+                         ("MERGE", "done"))
+        self.assertEqual(decision["ci_stale"], [{
+            "run": 7, "status": "in_progress",
+            "finished": "2026-10-07T11:51:00Z", "judged": "green"}])
+        self.assertEqual([w[1] for w in self.github.writes],
+                         [SLUG + "/pulls/5/merge"])
+        # Every page of the jobs, as one list.
+        self.assertIn(("--paginate", SLUG + "/actions/runs/7/jobs"
+                       "?per_page=100", "--jq", ".jobs"), self.github.calls)
+
+    def test_a_neutral_job_is_green_too(self):
+        record, _ = self.tick([self.item()], extra=self.extra(
+            [job(conclusion="neutral")], stuck_run("queued")))
+        self.assertEqual(record["decisions"][0]["action"], "MERGE")
+
+    def test_a_failed_job_makes_it_red(self):
+        jobs = [job(), job(conclusion="failure")]
+        record, lines = self.tick([self.item()], live=True,
+                                  extra=self.extra(jobs))
+        self.assertTrue(lines[0].endswith("judged by its jobs (red)"))
+        decision, = record["decisions"]
+        self.assertEqual((decision["action"], decision["to"],
+                          decision["reason"]),
+                         ("HAND-BACK", "author", "ci run 7 concluded failure"))
+        self.assertEqual([w[1] for w in self.github.writes],
+                         [SLUG + "/issues/5/comments"])
+
+    def test_a_run_really_in_progress_is_still_a_wait(self):
+        jobs = [job(), job("in_progress", None)]
+        record, lines = self.tick([self.item()], live=True,
+                                  extra=self.extra(jobs))
+        decision, = record["decisions"]
+        self.assertEqual((decision["action"], decision["reason"]),
+                         ("WAIT", "ci has not finished on the head"))
+        self.assertEqual(decision["ci_unfinished"], [{
+            "run": 7, "status": "in_progress",
+            "since": "2026-10-07T11:40:00Z"}])
+        self.assertEqual(self.github.writes, [])
+        self.assertEqual(len(lines), 1)
+
+    def test_jobs_github_cannot_read_are_unfinished(self):
+        def broken():
+            raise RuntimeError("gh api: HTTP 502")
+        record, _ = self.tick([self.item()], extra=self.extra(broken))
+        self.assertEqual(record["decisions"][0]["action"], "WAIT")
+
+    def test_long_unfinished_is_rerun_once_then_moved_past(self):
+        other = self.other_pr()
+        prs = [self.item(), other]
+        extra = self.extra([job(), job("queued", None)])
+        # 20 minutes after it started: waited on, no re-run.
+        record, lines = self.tick(prs, live=True, extra=extra)
+        self.assertEqual(record["decisions"][0]["action"], "WAIT")
+        self.assertEqual(self.github.writes, [])
+        # 30 minutes: re-run, once.
+        record, lines = self.tick(prs, live=True, extra=extra, minutes=10)
+        self.assertEqual(self.github.writes,
+                         [("POST", SLUG + "/actions/runs/7/rerun", {})])
+        self.assertEqual(lines[0], (
+            "CI-RERUN #5: GitHub says run 7 is in_progress, and so are its "
+            "jobs, after 30 minutes; re-ran it, once for this head"))
+        self.assertEqual(record["decisions"][0]["rerun"], "done")
+        with open(os.path.join(self.state, m.RERUN_FILE)) as handle:
+            self.assertEqual(json.load(handle), {"5": {
+                "head": self.head, "run": 7,
+                "since": "2026-10-07T11:40:00Z",
+                "at": "2026-10-07T12:10:00Z", "result": "done"}})
+        # Never again for this head, and #5 stays first meanwhile.
+        for minutes in (11, 30, 39):
+            record, lines = self.tick(prs, live=True, extra=extra,
+                                      minutes=minutes)
+            self.assertEqual(self.github.writes, [])
+            self.assertEqual([(d["pr"], d["action"])
+                              for d in record["decisions"]], [(5, "WAIT")])
+            self.assertFalse([l for l in lines if l.startswith("CI-")])
+        # STALL_AFTER after the re-run: back to its author, once, and
+        # the queue moves on to #6 in the same tick.
+        record, lines = self.tick(prs, live=True, extra=extra, minutes=40)
+        self.assertEqual(
+            [(d["pr"], d["action"], d.get("result"))
+             for d in record["decisions"]],
+            [(5, "HAND-BACK", "done"), (6, "MERGE", "done")])
+        self.assertEqual(record["decisions"][0]["reason"],
+                         m.ci_stuck_reason())
+        detail = ("GitHub has reported ci run 7 unfinished, its jobs too, "
+                  "since 2026-10-07T11:40:00Z; the Merger re-ran it at "
+                  "2026-10-07T12:10:00Z (done), and it still hasn't "
+                  "finished. A push to the branch starts CI afresh, and if "
+                  "the run does finish green, the Merger takes it again")
+        self.assertEqual(lines[0], "CI-STUCK #5: %s; handed back to its "
+                         "author, and the queue moves past it" % detail)
+        self.assertNotIn("stalled", record)
+        (_, path, fields), = [w for w in self.github.writes
+                              if w[0] == "POST"]
+        self.assertEqual(path, SLUG + "/issues/5/comments")
+        self.assertEqual(fields["body"], (
+            "Not merging %s: the ci workflow has not finished on this head, "
+            "even after the Merger re-ran it.\n\n%s.\n\nThis is back with "
+            "its author. Once a reviewer approves a head that fixes it, the "
+            "Merger takes it again.\n\n— Merger" % (self.head[:10], detail)))
+        # Later ticks say nothing more and never re-run it again.
+        record, _ = self.tick(prs, live=True, extra=extra, minutes=41)
+        self.assertEqual(
+            [(d["pr"], d["action"], d["result"])
+             for d in record["decisions"]],
+            [(5, "HAND-BACK", "already said"), (6, "MERGE", "done")])
+        self.assertEqual([w[1] for w in self.github.writes],
+                         [SLUG + "/pulls/6/merge"])
+        # Not the pull request's own failure: it never yields for it.
+        with open(os.path.join(self.state, "merger.jsonl")) as handle:
+            records = [json.loads(l) for l in handle]
+        self.assertEqual(m.hand_backs(records), {})
+        # Once the run does finish green, it merges.
+        record, _ = self.tick([self.item()], live=True, minutes=50)
+        self.assertEqual([(d["action"], d["result"])
+                          for d in record["decisions"]], [("MERGE", "done")])
+
+    def test_a_refused_rerun_is_said_and_not_tried_again(self):
+        extra = self.extra([job("queued", None)])
+        refuse = lambda method, path: (
+            "HTTP 403: no" if path.endswith("/rerun") else None)
+        _, lines = self.tick([self.item()], live=True, extra=extra,
+                             refuse=refuse, minutes=10)
+        self.assertTrue(lines[0].endswith(
+            "after 30 minutes; re-running it was refused: HTTP 403: no"))
+        record, _ = self.tick([self.item()], live=True, extra=extra,
+                              refuse=refuse, minutes=20)
+        self.assertEqual(record["decisions"][0]["rerun"],
+                         "refused: HTTP 403: no")
+        self.assertEqual(self.github.writes, [])
+        record, _ = self.tick([self.item()], live=True, extra=extra,
+                              refuse=refuse, minutes=40)
+        self.assertEqual(record["decisions"][0]["action"], "HAND-BACK")
+
+    def test_a_rerun_for_another_head_does_not_count(self):
+        state = os.path.join(self.tmp.name, "state")
+        os.makedirs(state)
+        m.save_json(os.path.join(state, m.RERUN_FILE), {"5": {
+            "head": "f" * 40, "run": 7, "since": "2026-10-07T10:00:00Z",
+            "at": "2026-10-07T10:30:00Z", "result": "done"}})
+        record, _ = self.tick([self.item()], live=True, minutes=10,
+                              extra=self.extra([job("queued", None)]))
+        self.assertEqual(record["decisions"][0]["action"], "WAIT")
+        self.assertEqual(self.github.writes,
+                         [("POST", SLUG + "/actions/runs/7/rerun", {})])
+
+    def test_a_dry_run_writes_nothing(self):
+        extra = self.extra([job("in_progress", None)])
+        record, lines = self.tick([self.item()], extra=extra, minutes=10)
+        self.assertEqual(record["decisions"][0]["action"], "WAIT")
+        self.assertEqual(lines[0], (
+            "CI-RERUN #5: GitHub says run 7 is in_progress, and so are its "
+            "jobs, after 30 minutes; a live tick would re-run it"))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state, m.RERUN_FILE)))
 
 
 class StallAlert(Decide):
