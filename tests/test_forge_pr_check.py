@@ -630,6 +630,21 @@ class Tick(StateCase):
                 minutes=25))[5:]])
         self.assertEqual(sorted(self.state()["waiting"]), [SHA_A])
 
+    def test_the_quiet_directory_comes_from_the_environment_first(self):
+        data = example()
+        data["quiet"] = {"dir": "~/quiet"}
+        project = config.Project(data, None)
+        self.assertEqual(pc.quiet_dir(project, {}),
+                         os.path.expanduser("~/quiet"))
+        self.assertEqual(
+            pc.quiet_dir(project, {"FORGE_QUIET_DIR": "/Users/q"}),
+            "/Users/q")
+        data.pop("quiet")
+        self.assertIsNone(pc.quiet_dir(config.Project(data, None), {}))
+        self.assertEqual(pc.quiet_dir(config.Project(data, None),
+                                      {"FORGE_QUIET_DIR": "~/q"}),
+                         os.path.expanduser("~/q"))
+
     def test_a_hold_past_its_time_holds_nothing(self):
         from agent_forge import quiet
         folder = os.path.join(self._tmp.name, "quiet")

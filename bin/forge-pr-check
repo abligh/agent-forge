@@ -387,7 +387,9 @@ leaves more than RESULTS_MAX bytes keeps none, logged as
 (`quiet.dir`, agent_forge/quiet.py, `forge-quiet`): someone is timing
 something here, and a run started now would spoil it. A tick says
 `QUIET:` with each hold, and runs already going carry on. A hold ends by
-itself, at most `quiet.max_minutes` after it was taken.
+itself, at most `quiet.max_minutes` after it was taken. $FORGE_QUIET_DIR,
+which `forge-quiet` reads too, names another directory on a host where
+`quiet.dir` can't exist, such as a Mac's.
 
 **Each step's whole output is kept, a time on every line**, in
 `logs/<head>/<step>.log.gz` in the state directory, written as the
@@ -696,6 +698,16 @@ MERGE_DATE = "2000-01-01T00:00:00Z"
 MERGE_IDENTITY = ("forge-pr-check", "pr-check@agent-forge.invalid")
 
 
+def quiet_dir(project, environ):
+    """The quiet directory a tick reads: $FORGE_QUIET_DIR, else the
+    configuration's `quiet.dir`, else None (never held). The variable
+    is for a host where that path can't exist, such as a Mac, where
+    /home is the system's; `forge-quiet` takes it too."""
+    folder = environ.get("FORGE_QUIET_DIR") \
+        or project.section("quiet").get("dir")
+    return os.path.expanduser(folder) if folder else None
+
+
 def configure(project, instance=None):
     """Set the module's settings from `project`, a loaded configuration:
     its repository and default branch, and the `checks` section
@@ -726,8 +738,7 @@ def configure(project, instance=None):
         checks, HOST = project.section("checks"), project.host
     else:
         checks, HOST = config.instance_checks(project.data, instance)
-    QUIET_DIR = os.path.expanduser(project.section("quiet")["dir"]) \
-        if project.section("quiet").get("dir") else None
+    QUIET_DIR = quiet_dir(project, os.environ)
     REPO_SLUG, MAIN = project.repo, project.default_branch
     CONFIG_PATH = project.path
     STATUS_CONTEXT = checks.get("context", DEFAULT_CONTEXT)
