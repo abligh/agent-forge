@@ -6,7 +6,10 @@ import datetime
 import gzip
 import os
 import sys
+import signal
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 
@@ -27,6 +30,23 @@ def lines_of(path):
 def parsed(line):
     seconds, stream, text = line.split(" ", 2)
     return float(seconds), int(stream), text
+
+
+class Stopped(BaseException):
+    pass
+
+
+def stop(signum, frame):
+    raise Stopped()
+
+
+def alive(pid):
+    """Whether `pid` is a live process (a zombie counts as dead)."""
+    try:
+        with open("/proc/%d/stat" % pid) as handle:
+            return handle.read().split(") ", 1)[1][0] != "Z"
+    except (FileNotFoundError, IndexError):
+        return False
 
 
 def python(code):
@@ -86,6 +106,50 @@ class ShLogged(unittest.TestCase):
         lines = lines_of(self.log)
         self.assertEqual(parsed(lines[0])[1:], (1, "started"))
         self.assertEqual(parsed(lines[-1])[1:], (0, "[timed out after 1s]"))
+
+    def test_a_timeout_ends_the_children_that_hold_the_pipes(self):
+        # 2026-10-21: a hung `npx ng test` was killed alone at its
+        # timeout; npm, ng and Chrome kept the pipes open, closing them
+        # waited on the readers' locks, and the step never ended.
+        pidfile = os.path.join(self._tmp.name, "child.pid")
+        started = time.monotonic()
+        got = pc.sh_logged(["sh", "-c",
+                            "echo started; (echo $$ >/dev/null; "
+                            "sh -c 'echo $$ > %s; while :; do echo tick; "
+                            "sleep 0.1; done') & sleep 60" % pidfile],
+                           timeout=1, log=self.log)
+        self.assertEqual(got.returncode, 124)
+        self.assertLess(time.monotonic() - started, 10)
+        with open(pidfile) as handle:
+            child = int(handle.read())
+        self.assertFalse(alive(child))
+
+    def test_a_step_that_ignores_term_is_killed(self):
+        started = time.monotonic()
+        with unittest.mock.patch.object(pc, "KILL_GRACE_S", 1):
+            got = pc.sh_logged(python(
+                "import signal, time; signal.signal(signal.SIGTERM, "
+                "signal.SIG_IGN); print('started', flush=True); "
+                "time.sleep(60)"), timeout=1, log=self.log)
+        self.assertEqual(got.returncode, 124)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_stopped_worker_ends_its_step(self):
+        # A superseded run's worker gets SIGTERM (Stopped); its step,
+        # in a session of its own, must not outlive it.
+        pidfile = os.path.join(self._tmp.name, "step.pid")
+        timer = threading.Timer(1, os.kill, (os.getpid(), signal.SIGUSR1))
+        old = signal.signal(signal.SIGUSR1, stop)
+        timer.start()
+        try:
+            with self.assertRaises(Stopped):
+                pc.sh_logged(["sh", "-c", "echo $$ > %s; sleep 60"
+                              % pidfile], log=self.log)
+        finally:
+            timer.cancel()
+            signal.signal(signal.SIGUSR1, old)
+        with open(pidfile) as handle:
+            self.assertFalse(alive(int(handle.read())))
 
     def test_the_log_stops_at_its_limit_but_the_output_does_not(self):
         with unittest.mock.patch.object(pc, "LOGS_MAX", 200):

@@ -583,6 +583,8 @@ RESULTS_ORPHAN_AGE = datetime.timedelta(days=1)
 LOGS_DIR = "logs"
 LOGS_AGE = datetime.timedelta(days=14)
 LOGS_MAX = 64 * 1024 * 1024
+# How long a timed-out step's process group has between SIGTERM and SIGKILL.
+KILL_GRACE_S = 10
 # Failures to prepare a head's worktree before it is given up on.
 MAX_ERRORS = 3
 # How long a head just started is left to its worker before another
@@ -826,12 +828,15 @@ def sh_logged(args, cwd=None, env=None, timeout=None, log=None):
     the millisecond, and 1 for stdout or 2 for stderr. What comes back
     as stdout is both streams in the order their lines arrived (stderr
     empty), so a failed step's tail ends where the step did, not with
-    whatever it wrote to stderr earlier. A timeout kills the program and
-    comes back as exit 124; a pipe its children still hold open is given
-    up on a few seconds later."""
+    whatever it wrote to stderr earlier. A timeout comes back as exit
+    124: the step runs in a session of its own, and the timeout kills
+    its whole process group (TERM, then KILL), children included, since
+    killing the program alone left children that held its pipes open
+    and the step never ended. A pipe something outside the group still
+    holds is given up on a few seconds later, and left open."""
     proc = subprocess.Popen(args, cwd=cwd, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True,
-                            errors="replace")
+                            errors="replace", start_new_session=True)
     started = time.monotonic()
     lines = []
     lock = threading.Lock()
@@ -870,11 +875,22 @@ def sh_logged(args, cwd=None, env=None, timeout=None, log=None):
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        proc.kill()
-        proc.wait()
+        kill_group(proc)
+    except BaseException:
+        # Stopped (a superseded run's SIGTERM) or anything else: the
+        # step is in a group of its own, so it ends here, not with the
+        # worker's group.
+        kill_group(proc, grace=2)
+        with lock:
+            sink.close()
+        raise
     for reader in readers:
         reader.join(timeout=5 if timed_out else None)
-    for pipe in (proc.stdout, proc.stderr):
+    for reader, pipe in zip(readers, (proc.stdout, proc.stderr)):
+        # Closing a pipe whose reader is still blocked in it waits for
+        # the reader's lock, for ever: such a pipe is left open.
+        if reader.is_alive():
+            continue
         try:
             pipe.close()
         except OSError:
@@ -889,6 +905,27 @@ def sh_logged(args, cwd=None, env=None, timeout=None, log=None):
         return subprocess.CompletedProcess(
             args, 124, out, "timed out after %ss" % timeout)
     return subprocess.CompletedProcess(args, proc.returncode, out, "")
+
+
+def kill_group(proc, grace=None):
+    """SIGTERM the process group `proc` leads, wait up to `grace`
+    seconds (KILL_GRACE_S) for `proc`, then SIGKILL the group, so
+    nothing it started outlives it."""
+    if grace is None:
+        grace = KILL_GRACE_S
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.wait()
 
 
 def now_utc():
@@ -995,8 +1032,8 @@ def holder_fields(line):
 
 def stop_worker(pid):
     """SIGTERM to worker pid's process group, which it leads when it was
-    started by a tick (its steps are in it too), else to pid alone.
-    Whether a signal was sent."""
+    started by a tick, else to pid alone; the worker then ends its
+    running step's own group (sh_logged). Whether a signal was sent."""
     try:
         if os.getpgid(pid) == pid:
             os.killpg(pid, signal.SIGTERM)
