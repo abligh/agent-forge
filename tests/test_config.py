@@ -243,6 +243,53 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(queue=[]),
                          ["'queue' must be an object"])
 
+    def test_stats_watch(self):
+        self.assertEqual(self.problems(stats_watch={"owner": "LeadDev"}), [])
+        self.assertEqual(self.problems(stats_watch={
+            "owner": "LeadDev", "window_hours": 6, "baseline_days": 7,
+            "label": "stats-watch", "remind_hours": 6, "min_samples": 5,
+            "as": "Reviewer", "figures": {
+                "check_run": {"limit": 12, "ratio": 1.5},
+                "check_wait": {"limit": 20, "ratio": 2},
+                "pr_turnaround": {"limit": 20, "ratio": 1.5},
+                "merge_time": {"limit": 45, "ratio": 2},
+                "merge_rate": {"ratio": 2}, "slots_busy": {"limit": 90},
+                "main_red": {}}}), [])
+        self.assertEqual(self.problems(stats_watch={
+            "owner": "Merger", "window_hours": 0, "label": " ",
+            "as": "Nobody", "colour": 1, "figures": {
+                "check_run": {"limit": 0, "ratio": 1},
+                "merge_rate": {"limit": 3, "ratio": True},
+                "main_red": [], "speed": {}}}), [
+            "stats_watch: unknown key 'colour'",
+            "stats_watch.owner 'Merger' is not an agent",
+            "stats_watch.as 'Nobody' is not an agent or machinery (it "
+            "defaults to the Merger)",
+            "stats_watch.window_hours must be at least 1",
+            "stats_watch.label must not be empty",
+            "stats_watch.figures.check_run.limit must be a number above 0",
+            "stats_watch.figures.check_run.ratio must be more than 1",
+            "stats_watch.figures.merge_rate: unknown key 'limit'",
+            "stats_watch.figures.merge_rate.ratio must be a number above 0",
+            "stats_watch.figures.main_red must be an object",
+            "stats_watch.figures.speed: unknown figure (one of check_run, "
+            "check_wait, pr_turnaround, merge_time, merge_rate, "
+            "slots_busy, main_red)"])
+        self.assertEqual(self.problems(stats_watch={}),
+                         ["stats_watch: missing 'owner'"])
+        self.assertEqual(self.problems(stats_watch=[]),
+                         ["'stats_watch' must be an object"])
+
+    def test_stats_watch_files_as_the_merger_by_default(self):
+        data = example()
+        data["stats_watch"] = {"owner": "LeadDev"}
+        data["merge"]["merger"] = "Other"
+        data["machinery"]["Other"] = {"app_id": 1, "installation_id": 2}
+        self.assertEqual(config.check(data), [])
+        del data["machinery"]["Other"]
+        self.assertIn("stats_watch.as 'Other' is not an agent or machinery "
+                      "(it defaults to the Merger)", config.check(data))
+
     def test_memory(self):
         self.assertEqual(self.problems(memory={
             "dir": "", "git_dir": 3, "labels": ["bug", ""], "limit": 0,

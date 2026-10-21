@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""Watch how fast work lands, and file an issue when a figure is out of line.
+
+    forge-stats-watch [--dry-run]
+
+Run every hour from cron, through forge-cron-run, on the host that runs
+the build check (designs/0024). It takes `forge-stats`' figures over
+the last `window_hours` (default 6) and over the `baseline_days`
+(default 7) before that window, and judges each figure named in the
+configuration's `stats_watch.figures`:
+
+    check_run      the build check's run time, median, in minutes:
+                   over `limit`, or over `ratio` x the baseline's
+    check_wait     the wait for a slot, p90, in minutes: the same
+    pr_turnaround  a pull-request head's wait and run, median: the same
+    merge_time     joined the queue to merged, median: the same
+    merge_rate     merges an hour: under the baseline's over `ratio`,
+                   judged only when approved pull requests waited
+    slots_busy     the slots busy, in percent: over `limit`
+    main_red       red build checks of the default branch: any
+
+A figure from fewer than `min_samples` (default 5) samples is not
+judged, nor a `ratio` against a baseline that thin. merge_rate's
+samples are the approved pull requests that waited in the queue during
+the window, so a quiet night, with nothing to merge, is never a fault.
+main_red is a count, not a statistic, so one red is enough.
+
+**One open issue per figure.** A figure out of line opens an issue
+labelled `label` (default `stats-watch`) and `<labels.owner_prefix><owner>`
+(whose it is), with the window's and the baseline's figures, the rule
+that tripped and the `forge-stats` command to see more. The issue is
+found again by that label and its `Figure: <name>` line, so an issue an
+earlier run filed is found even without this tool's state. While the
+figure stays out, the issue gets one comment every `remind_hours`
+(default 6) with the new figures. Once it has been judged in line at
+every run for a whole window, the issue is closed with a comment
+saying so. Everything is written as the App named by `as` (default
+the Merger, `merge.merger`), with a token minted as forge-app-token
+does.
+
+The watch only reports: it changes no slot, setting or queue.
+
+State (each figure's issue, when it was last commented on and since
+when it has been in line) is kept in
+~/.local/state/agent-forge/<project>/stats-watch/state.json. A failure
+to reach GitHub skips the hour and says so on stderr; nothing is
+saved, so the next hour tries again. `--dry-run` prints what it would
+do and changes nothing, on GitHub or in the state. Without a
+`stats_watch` section it does nothing.
+
+From the build-check host's crontab, a few minutes past each hour:
+
+    7 * * * * FORGE_CRON_CHECKOUT=$HOME/widget-cron \
+        $HOME/.local/bin/forge-cron-run forge-stats-watch
+
+It mints its own token, so the job needs no `$FORGE_CRON_APP`.
+
+Exit status: 0 done, including when figures are out of line (the
+issues say so); 2 no configuration, or GitHub could not be read or
+refused a write.
+"""
+
+import argparse
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+import urllib.parse
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(BIN))
+from agent_forge import config, github, locks, state  # noqa: E402
+
+PROG = "forge-stats-watch"
+DEFAULTS = {"window_hours": 6, "baseline_days": 7, "label": "stats-watch",
+            "remind_hours": 6, "min_samples": 5}
+# What each figure is, for titles and bodies, and its unit.
+WHAT = {
+    "check_run": ("the build check's run time, median", "min"),
+    "check_wait": ("the wait for a build-check slot, p90", "min"),
+    "pr_turnaround": ("a pull-request head's wait and run, median", "min"),
+    "merge_time": ("joined the queue to merged, median", "min"),
+    "merge_rate": ("merges an hour", "an hour"),
+    "slots_busy": ("the build check's slots busy", "%"),
+    "main_red": ("red build checks of the default branch", "red"),
+}
+FIGURE_RE = re.compile(r"^Figure: ([a-z_]+)\s*$", re.MULTILINE)
+OUT, IN, UNJUDGED = "out", "in", "unjudged"
+
+
+def iso(when):
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def stamp(when):
+    return when.strftime("%Y-%m-%dT%H:%MZ")
+
+
+def parse_time(text):
+    return datetime.datetime.fromisoformat(
+        text.replace("Z", "+00:00")).astimezone(datetime.timezone.utc)
+
+
+def _load_tool(name):
+    loader = importlib.machinery.SourceFileLoader(
+        name.replace("-", "_"), os.path.join(BIN, name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def forge_stats(environ):
+    """A function (since, until) -> forge-stats' JSON for that window, or
+    None when there are no records. forge-stats runs in this process,
+    with `--no-github`: no watched figure comes from GitHub."""
+    tool = _load_tool("forge-stats")
+
+    def stats(since, until):
+        lines = []
+        rc = tool.main(["--json", "--no-github", "--since", iso(since),
+                        "--until", iso(until)], lines.append, environ)
+        if rc == 2 and lines and lines[0].startswith("NO-RECORDS"):
+            return None
+        if rc != 0:
+            raise RuntimeError("forge-stats: %s" % " ".join(lines))
+        return json.loads(lines[0])
+    return stats
+
+
+def figures(stats, hours):
+    """{figure: (value, samples)} from forge-stats' JSON over `hours`,
+    in the units `limit` is given in; values None where there were no
+    samples. None stats (no records) give every figure no samples."""
+    if not stats:
+        return {name: (None, 0) for name in WHAT}
+    check, queue = stats.get("check") or {}, stats.get("queue") or {}
+
+    def minutes(part, key):
+        value, n = part.get(key), part.get("n", 0)
+        return (None if value is None else value / 60), n
+    busy = check.get("busy_share")
+    ran = (check.get("ran") or {}).get("n", 0)
+    waiting = queue.get("waiting", 0)
+    return {
+        "check_run": minutes(check.get("ran") or {}, "median"),
+        "check_wait": minutes(check.get("waited") or {}, "p90"),
+        "pr_turnaround": minutes(
+            check.get("pull_request_seen_to_verdict") or {}, "median"),
+        "merge_time": minutes(queue.get("queue_to_merge") or {}, "median"),
+        "merge_rate": ((queue.get("merges", 0) / hours if hours else None),
+                       waiting),
+        "slots_busy": (None if busy is None else 100 * busy, ran),
+        "main_red": ((check.get("red") or {}).get("main", 0),
+                     (check.get("runs") or {}).get("main", 0)),
+    }
+
+
+def show(figure, value):
+    if value is None:
+        return "-"
+    unit = WHAT[figure][1]
+    if figure == "main_red":
+        return "%d red" % value
+    if figure == "merge_rate":
+        return "%.1f an hour" % value
+    if unit == "%":
+        return "%.0f%%" % value
+    return "%.1f min" % value
+
+
+def judge(figure, rules, window, baseline, min_samples):
+    """(OUT, IN or UNJUDGED, why) for one figure, from its window's and
+    baseline's (value, samples)."""
+    value, n = window
+    base, base_n = baseline
+    if figure == "main_red":
+        if value:
+            return OUT, "%s in the window" % show(figure, value)
+        return IN, "no red build checks of the default branch"
+    if figure == "merge_rate" and not n:
+        return UNJUDGED, "no approved pull request waited"
+    if value is None or n < min_samples:
+        return UNJUDGED, "%d samples, fewer than %d" % (n, min_samples)
+    ratio = rules.get("ratio")
+    have_base = (ratio is not None and base is not None
+                 and base_n >= min_samples and base > 0)
+    if figure == "merge_rate":
+        if not have_base:
+            return UNJUDGED, "no baseline to compare with"
+        if value < base / ratio:
+            return OUT, "%s, under the baseline's %s over %g" % (
+                show(figure, value), show(figure, base), ratio)
+        return IN, show(figure, value)
+    limit = rules.get("limit")
+    if limit is not None and value > limit:
+        return OUT, "%s, over the limit of %s" % (
+            show(figure, value), show(figure, limit))
+    if have_base and value > ratio * base:
+        return OUT, "%s, over %g x the baseline's %s" % (
+            show(figure, value), ratio, show(figure, base))
+    if limit is None and not have_base:
+        return UNJUDGED, "no limit, and no baseline to compare with"
+    return IN, show(figure, value)
+
+
+class Watch:
+    """One run: the settings, the windows and what to write."""
+
+    def __init__(self, project, now, dry_run, out, err):
+        self.project = project
+        self.cfg = dict(DEFAULTS, **project.section("stats_watch"))
+        self.name = self.cfg.get("as") or project.section("merge").get(
+            "merger", "Merger")
+        self.now = now
+        self.dry_run = dry_run
+        self.out, self.err = out, err
+        self.window = datetime.timedelta(hours=self.cfg["window_hours"])
+        self.baseline = datetime.timedelta(days=self.cfg["baseline_days"])
+        self.remind = datetime.timedelta(hours=self.cfg["remind_hours"])
+
+    def owner_label(self):
+        prefix = self.project.section("labels").get("owner_prefix", "Owner:")
+        return prefix + self.cfg["owner"]
+
+    def signature(self):
+        return ("Written by forge-stats-watch, agent-forge's watch on how "
+                "fast work lands.\n\n— %s" % self.name)
+
+    def table(self, figure, window, baseline):
+        hours = self.cfg["window_hours"]
+        return "\n".join([
+            "| | Last %d h, to %s | The %d days before |" % (
+                hours, stamp(self.now), self.cfg["baseline_days"]),
+            "| --- | --- | --- |",
+            "| `%s` | %s (%d samples) | %s (%d samples) |" % (
+                figure, show(figure, window[0]), window[1],
+                show(figure, baseline[0]), baseline[1])])
+
+    def rules_text(self, figure, rules):
+        parts = []
+        if "limit" in rules:
+            parts.append("limit %s" % show(figure, rules["limit"]))
+        if "ratio" in rules:
+            parts.append("ratio %g x the baseline" % rules["ratio"])
+        return ", ".join(parts) or "any is out of line"
+
+    def command(self):
+        return "forge-stats --since %s --until %s" % (
+            stamp(self.now - self.window), stamp(self.now))
+
+    def open_body(self, figure, rules, why, window, baseline):
+        return "\n\n".join([
+            "`%s`, %s, is out of line: %s." % (figure, WHAT[figure][0], why),
+            self.table(figure, window, baseline),
+            "Its rules: %s (the configuration's `stats_watch`)."
+            % self.rules_text(figure, rules),
+            "To see more, on the build-check host:\n\n    %s"
+            % self.command(),
+            "forge-stats-watch comments here every %d h while it stays out "
+            "of line, and closes this once it has been back in line for a "
+            "whole window (%d h). It only reports: what the slowdown means "
+            "is %s's to decide." % (self.cfg["remind_hours"],
+                                    self.cfg["window_hours"],
+                                    self.cfg["owner"]),
+            "Figure: %s" % figure, self.signature()])
+
+
+def find_issues(token, project, label, call):
+    """{figure: issue} for the open issues labelled `label` that name a
+    figure, the oldest for each; RuntimeError if GitHub can't be read."""
+    status, items = github.paged(
+        token, "/repos/%s/issues?state=open&labels=%s"
+        % (project.repo, urllib.parse.quote(label, safe="")), call=call)
+    if status != 200:
+        raise RuntimeError("GitHub answered %s for the open %s issues"
+                           % (status, label))
+    found = {}
+    for item in sorted(items, key=lambda i: i.get("number", 0)):
+        if "pull_request" in item:
+            continue
+        hit = FIGURE_RE.search(item.get("body") or "")
+        if hit and hit.group(1) in WHAT:
+            found.setdefault(hit.group(1), item)
+    return found
+
+
+def main(argv=None, out=print, err=None, environ=None, now=None,
+         call=github.api_call, sign=github.openssl_sign, stats=None,
+         mint=None):
+    err = err or (lambda line: print(line, file=sys.stderr))
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(prog=PROG,
+                                     description=__doc__.splitlines()[0])
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print what it would do and change nothing")
+    args = parser.parse_args(argv)
+    try:
+        checkout = environ.get("FORGE_CRON_CHECKOUT")
+        project = config.load(None, environ, cwd=os.path.expanduser(
+            checkout) if checkout else None)
+    except config.ConfigError as error:
+        err("NO-CONFIG: %s" % error)
+        return 2
+    if "stats_watch" not in project.data:
+        out("%s: no stats_watch section; nothing is watched" % PROG)
+        return 0
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    watch = Watch(project, now, args.dry_run, out, err)
+    cfg = watch.cfg
+    watched = cfg.get("figures") or {}
+    stats = stats or forge_stats(environ)
+    start = now - watch.window
+    try:
+        window = figures(stats(start, now), cfg["window_hours"])
+        baseline = figures(stats(start - watch.baseline, start),
+                           cfg["baseline_days"] * 24)
+    except (RuntimeError, OSError, ValueError) as error:
+        err("%s: skipping this hour: %s" % (PROG, error))
+        return 2
+    verdicts = {}
+    for figure, rules in watched.items():
+        verdicts[figure] = judge(figure, rules, window[figure],
+                                 baseline[figure], cfg["min_samples"])
+        out("%s %s: %s" % (verdicts[figure][0].upper(), figure,
+                           verdicts[figure][1]))
+    path = os.path.join(locks.state_dir(project.name, "stats-watch",
+                                        environ), "state.json")
+    saved = state.load(path, {"figures": {}})
+    try:
+        token = (mint or (lambda p, n: github.token(p, n, call, sign)))(
+            project, watch.name)
+        open_issues = find_issues(token, project, cfg["label"], call)
+    except (github.MintError, RuntimeError) as error:
+        err("%s: skipping this hour: %s" % (PROG, error))
+        return 2
+    failed = False
+    for figure, (verdict, why) in verdicts.items():
+        entry = saved["figures"].get(figure) or {}
+        issue = open_issues.get(figure)
+        if issue is None:
+            entry.pop("issue", None)
+        elif entry.get("issue") != issue["number"]:
+            # Filed by an earlier run whose state is gone, or by hand.
+            entry = {"issue": issue["number"],
+                     "told": issue.get("updated_at") or iso(now)}
+        new, ok = act(watch, token, call, figure, verdict, why, entry,
+                      watched[figure], window[figure], baseline[figure])
+        failed = failed or not ok
+        if new:
+            saved["figures"][figure] = new
+        else:
+            saved["figures"].pop(figure, None)
+    for figure in list(saved["figures"]):
+        if figure not in watched:
+            saved["figures"].pop(figure)
+    if not args.dry_run:
+        state.save(path, saved)
+    return 2 if failed else 0
+
+
+def act(watch, token, call, figure, verdict, why, entry, rules, window,
+        baseline):
+    """What one figure's verdict does to its issue: (the figure's new
+    state entry, or {} for none; whether GitHub took every write)."""
+    repo, now = watch.project.repo, watch.now
+    say = watch.out
+    would = "WOULD " if watch.dry_run else ""
+    number = entry.get("issue")
+
+    def write(method, path, body, want):
+        if watch.dry_run:
+            return True, {}
+        status, got = github.rest(token, method, path, body, call=call)
+        if status != want:
+            watch.err("%s: %s %s refused: HTTP %s %s" % (
+                PROG, method, path, status,
+                (got or {}).get("message", "") if isinstance(got, dict)
+                else ""))
+            return False, got
+        return True, got
+
+    if verdict == OUT:
+        entry.pop("clear_since", None)
+        if number is None:
+            title = "%s: %s %s" % (PROG, figure, why)
+            ok, got = write("POST", "/repos/%s/issues" % repo, {
+                "title": title,
+                "body": watch.open_body(figure, rules, why, window, baseline),
+                "labels": [watch.cfg["label"], watch.owner_label()]}, 201)
+            if not ok:
+                return entry, False
+            number = got.get("number")
+            say("%sOPEN %s: %s, for %s" % (would, figure, title,
+                                            watch.cfg["owner"]))
+            return {"issue": number, "opened": iso(now), "told": iso(now)}, \
+                True
+        try:
+            due = now - parse_time(entry["told"]) >= watch.remind
+        except (KeyError, TypeError, ValueError):
+            due = True
+        if due:
+            ok, _ = write("POST", "/repos/%s/issues/%d/comments"
+                          % (repo, number), {"body": "\n\n".join([
+                              "Still out of line: %s." % why,
+                              watch.table(figure, window, baseline),
+                              watch.signature()])}, 201)
+            if not ok:
+                return entry, False
+            say("%sREMIND #%d %s: %s" % (would, number, figure, why))
+            entry["told"] = iso(now)
+        return entry, True
+    if number is None:
+        return {}, True
+    if verdict == UNJUDGED:
+        # Not judged is not in line: a quiet spell doesn't count
+        # towards a clean window.
+        entry.pop("clear_since", None)
+        return entry, True
+    since = entry.get("clear_since") or iso(now)
+    entry["clear_since"] = since
+    if now - parse_time(since) < watch.window:
+        say("IN LINE #%d %s since %s; closes after %d h" % (
+            number, figure, since, watch.cfg["window_hours"]))
+        return entry, True
+    ok, _ = write("POST", "/repos/%s/issues/%d/comments" % (repo, number),
+                  {"body": "\n\n".join([
+                      "Back in line for a whole window (%d h, since %s): "
+                      "%s. Closing." % (watch.cfg["window_hours"], since, why),
+                      watch.table(figure, window, baseline),
+                      watch.signature()])}, 201)
+    if ok:
+        ok, _ = write("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                      {"state": "closed", "state_reason": "completed"}, 200)
+    if not ok:
+        return entry, False
+    say("%sCLOSE #%d %s: back in line since %s" % (would, number, figure,
+                                                    since))
+    return {}, True
+
+
+if __name__ == "__main__":
+    sys.exit(main())

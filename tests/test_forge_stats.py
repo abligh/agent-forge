@@ -102,6 +102,12 @@ class Queue(unittest.TestCase):
     def test_a_hand_back_is_counted_once_per_head_and_cause(self):
         self.assertEqual(self.got["hand_backs"], {"conflict": 1})
 
+    def test_the_approved_pull_requests_that_waited_in_the_window(self):
+        # #7 and #8 were queued in the window; #9 only after it.
+        self.assertEqual(self.got["waiting"], 2)
+        self.assertEqual(tool.queue_stats(RECORDS[:1], SINCE, UNTIL)
+                         ["waiting"], 0)
+
     def test_causes(self):
         self.assertEqual(tool.cause_of("vm/x is failure: red"), "red")
         self.assertEqual(tool.cause_of("abc, after the approval, is not "
@@ -482,6 +488,7 @@ class Main(unittest.TestCase):
         self.assertEqual(self.main("--no-github", "--json"), 0)
         got = json.loads(self.out[0])
         self.assertEqual(got["queue"]["merged"], [7, 8])
+        self.assertEqual(got["queue"]["waiting"], 2)
         self.assertEqual(got["since"], "2026-10-12T00:00Z")
 
 

@@ -54,6 +54,7 @@ TOP = {
     "memory": (dict, False),
     "quiet": (dict, False),
     "queue": (dict, False),
+    "stats_watch": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
@@ -75,6 +76,15 @@ QUEUE_ENTRY = {"slots": int, "nice": int, "timeout_minutes": int,
                "keep_worktree": bool}
 # A queue's name starts its tickets and names its directory.
 QUEUE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# forge-stats-watch (designs/0024): a watch on forge-stats' figures.
+STATS_WATCH = {"owner": str, "window_hours": int, "baseline_days": int,
+               "figures": dict, "label": str, "remind_hours": int,
+               "min_samples": int, "as": str}
+# Each watched figure, and the rules it takes: `limit` and `ratio`.
+STATS_WATCH_FIGURES = {
+    "check_run": ("limit", "ratio"), "check_wait": ("limit", "ratio"),
+    "pr_turnaround": ("limit", "ratio"), "merge_time": ("limit", "ratio"),
+    "merge_rate": ("ratio",), "slots_busy": ("limit",), "main_red": ()}
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_minutes": int, "stall_alert": dict, "test_ahead": dict,
          "hold_conflicting": bool, "yield_after_hand_back": int,
@@ -305,6 +315,51 @@ def _check_queue(queue, problems):
             problems.append("%s.nice must be from 0 to 19" % where)
 
 
+def _check_stats_watch(watch, data, problems):
+    """The `stats_watch` section: forge-stats-watch's figures, and the
+    agent its issues are for."""
+    where = "stats_watch"
+    if not _fields(where, watch, STATS_WATCH, problems):
+        return
+    owner = watch.get("owner")
+    if owner is None:
+        problems.append("%s: missing 'owner'" % where)
+    elif isinstance(owner, str) and owner not in data["agents"]:
+        problems.append("%s.owner %r is not an agent" % (where, owner))
+    name = watch.get("as")
+    if name is None:
+        name = data.get("merge", {}).get("merger", "Merger")
+    if isinstance(name, str) and name not in data["agents"] \
+            and name not in data.get("machinery", {}):
+        problems.append("%s.as %r is not an agent or machinery (it "
+                        "defaults to the Merger)" % (where, name))
+    for key in ("window_hours", "baseline_days", "remind_hours",
+                "min_samples"):
+        if _is(watch.get(key), int) and watch[key] < 1:
+            problems.append("%s.%s must be at least 1" % (where, key))
+    if isinstance(watch.get("label"), str) and not watch["label"].strip():
+        problems.append("%s.label must not be empty" % where)
+    for figure, rules in (watch.get("figures") or {}).items():
+        at = "%s.figures.%s" % (where, figure)
+        if figure not in STATS_WATCH_FIGURES:
+            problems.append("%s: unknown figure (one of %s)"
+                            % (at, ", ".join(STATS_WATCH_FIGURES)))
+            continue
+        if not isinstance(rules, dict):
+            problems.append("%s must be an object" % at)
+            continue
+        for key, value in rules.items():
+            if key.startswith("_"):
+                continue
+            if key not in STATS_WATCH_FIGURES[figure]:
+                problems.append("%s: unknown key %r" % (at, key))
+            elif not _is(value, (int, float)) or value <= 0:
+                problems.append("%s.%s must be a number above 0"
+                                % (at, key))
+            elif key == "ratio" and value <= 1:
+                problems.append("%s.ratio must be more than 1" % at)
+
+
 def check(data):
     """Every problem with `data`, a parsed configuration; [] if none."""
     problems = []
@@ -415,6 +470,8 @@ def check(data):
     _check_memory(data.get("memory", {}), "memory" in data, problems)
     _check_quiet(data.get("quiet", {}), "quiet" in data, problems)
     _check_queue(data.get("queue", {}), problems)
+    if "stats_watch" in data:
+        _check_stats_watch(data["stats_watch"], data, problems)
     docs = data.get("docs", {})
     for key, kinds in DOCS.items():
         if key in docs and not _is(docs[key], kinds):

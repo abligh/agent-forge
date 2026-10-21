@@ -63,6 +63,7 @@ Documentation and hosts:
 | `forge-doc-format`, `forge-doc-width`, `forge-doc-links` | Check Markdown: whitespace and headings, line width, links and anchors. |
 | `forge-install` | Moves this installation to the commit the project pins, between jobs. |
 | `forge-stats` | Reports how fast work lands: check waits and slot use, the merge queue, approval to merge per author; with `--actions`, the GitHub Actions minutes of the window's runs, without the billing API. |
+| `forge-stats-watch` | Runs hourly from cron and compares `forge-stats`' last hours with the week before and with limits; opens an issue for `stats_watch.owner` when a figure is out of line, comments while it stays out, and closes it once back in line ([designs/0024](docs/designs/0024-a-watch-on-how-fast-work-lands.md)). |
 | `forge-host-settings` | Compares a host's agent settings and crontab with the project's tracked copies, or installs them; `--apply`, from cron, keeps them installed. |
 | `forge-session-start` | A SessionStart hook: tells a restarted session what died and what it owns. |
 | `forge-memory-sync`, `forge-memory-check`, `forge-memory-trim` | Share the agents' memory between hosts through a git repository; check the index still loads in full; shorten its lines safely ([docs/memory-sync.md](docs/memory-sync.md)). |

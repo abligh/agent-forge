@@ -22,6 +22,9 @@ defaults to the last `--hours` (24) up to now.
 
 **The merge queue** (`merger.jsonl`):
 - merges in the window, and per hour;
+- how many approved pull requests waited in the queue during the
+  window (`waiting`, in the JSON), so a low rate with nothing to merge
+  can be told from a slow queue;
 - for each merge, the time since its head last joined the queue;
 - hand-backs by cause, each (pull request, head, cause) counted once.
 
@@ -190,13 +193,15 @@ def check_stats(lines, since, until, slots):
 def queue_stats(records, since, until):
     """Merges, queue times and hand-backs from merger.jsonl's records."""
     entered, previous = {}, set()
-    merges, in_queue, handed = [], [], set()
+    merges, in_queue, handed, waiting = [], [], set(), set()
     for record in records:
         at = parse_time(record["at"])
         queue = set(record.get("queue") or [])
         for pr in queue - previous:
             entered[pr] = at
         previous = queue
+        if since <= at < until:
+            waiting |= queue
         for decision in record.get("decisions") or []:
             pr = decision.get("pr")
             action = decision.get("action")
@@ -215,7 +220,7 @@ def queue_stats(records, since, until):
             "merged_at": {pr: at for pr, at in merges},
             "per_hour": dict(sorted(hours.items())),
             "queue_to_merge": summary(in_queue),
-            "hand_backs": dict(causes)}
+            "hand_backs": dict(causes), "waiting": len(waiting)}
 
 
 QUERY = """query($owner: String!, $name: String!) {
