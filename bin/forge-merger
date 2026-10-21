@@ -391,7 +391,7 @@ CONFLICT_REASON = "it conflicts with main, so it can't be updated"
 # merge's sha) that GitHub refused because the head it holds is not the
 # one named. GitHub sometimes moves a branch without moving the pull
 # request's head, and then refuses every such write for good.
-LOST_HEAD_RE = re.compile(r"expected head sha didn't match|"
+LOST_HEAD_RE = re.compile(r"expected head sha didn.t match|"
                           r"head branch was modified", re.IGNORECASE)
 # A refusal that is about the Merger App's access.
 ACCESS_RE = re.compile(r"\b40[13]\b")

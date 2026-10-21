@@ -1427,9 +1427,20 @@ class Tick(Decide):
                    lambda line: None, sleep=lambda s: None)
 
 
-STALE = ("gh: expected head sha didn't match current head ref. (HTTP 422)\n"
-         '{"message":"expected head sha didn\'t match current head ref.",'
-         '"status":"422"}')
+# GitHub's own text, with its curly apostrophe, as a live Merger logged it.
+STALE = ("gh: expected head sha didn\u2019t match current head ref. (HTTP 422)\n"
+         '{"message":"expected head sha didn\u2019t match current head ref.",'
+         '"documentation_url":"https://docs.github.com/rest/pulls/pulls'
+         '#update-a-pull-request-branch","status":"422"}')
+
+
+class LostHeadText(unittest.TestCase):
+    def test_either_apostrophe_is_a_lost_head(self):
+        self.assertTrue(m.LOST_HEAD_RE.search(STALE))
+        self.assertTrue(m.LOST_HEAD_RE.search(
+            "expected head sha didn't match current head ref."))
+        self.assertTrue(m.LOST_HEAD_RE.search("Head branch was modified."))
+        self.assertFalse(m.LOST_HEAD_RE.search("Resource not accessible"))
 
 
 class LostHead(RepoCase):
