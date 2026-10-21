@@ -51,6 +51,22 @@ everything queued behind it. Any other write GitHub refuses is
 recorded, not retried in the same tick: the next tick judges the pull
 request afresh.
 
+**A head GitHub has lost is nudged once.** GitHub sometimes moves a
+pull request's branch (its own update's merge commit lands on it)
+without moving the pull request's head, and then refuses every update
+or merge pinned to either, saying the expected head sha didn't match.
+On that refusal the Merger reads the pull request's head and its
+branch's ref. When they differ, and it hasn't done so for this pull
+request and head before (`resynced.json` in the state directory), it
+sets the pull request's base to the base it has, a write that changes
+nothing but makes GitHub read the head again, reads the pull request
+once more and prints `RESYNC #N: GitHub had head <sha>, branch is at
+<sha>; nudged with a no-op base update, and GitHub now has <sha>`. A
+pull request GitHub now holds another head for is a changed pull
+request: the record says `RESYNC`, the tick moves on, and the next tick
+judges the new head as it would any other (its approval, its check),
+never the head GitHub lost.
+
 Each tick appends one JSON record to `merger.jsonl` in the state
 directory (~/.local/state/agent-forge/<project>/merger, or
 `--state-dir`) (`dry-run.jsonl` under `--dry-run`). `held` names each pull
@@ -161,10 +177,18 @@ status, or an unfinished `ci` run, for `STALL_AFTER`, the tick prints a
 `STALLED` line and exits 2. It doesn't hand the pull request back,
 since the author can't fix a stuck check, and the pull request stays
 first in the queue. A write GitHub goes on refusing on the same head
-for `STALL_AFTER` is `STALLED` too, with the latest refusal quoted,
-since the author can't fix the Merger's access either. `waiting.json`
-in the state directory says since when the tick has waited on which
-head.
+for `STALL_AFTER` is `STALLED` too, with the latest refusal quoted; it
+stays first, since the author can't fix the Merger's access either, and
+the line says to look at that access only when GitHub refused it so
+(401, 403). One refused because the head GitHub expected didn't match
+(above), with the nudge not helping or GitHub's head and branch
+agreeing, is the exception: nothing the Merger does changes GitHub's
+mind, so in the tick it reaches `STALL_AFTER` its `STALLED` line gives
+both SHAs, it goes back to its author (once per approval and head; a
+push makes GitHub read the head again) and the queue moves past it.
+That hand-back is not the pull request's own failure, so it never
+counts toward `merge.yield_after_hand_back`. `waiting.json` in the
+state directory says since when the tick has waited on which head.
 
 **`next.json` names the pull request the tick stopped at**: `{"at":
 ..., "pr": N}`, the first in the queue it neither handed back nor
@@ -363,6 +387,23 @@ CI_WORKFLOW = "ci"
 # The reason a conflicting head is handed back for. It names no files,
 # so it stays the same while main moves and is said once per head.
 CONFLICT_REASON = "it conflicts with main, so it can't be updated"
+# A write pinned to a head (`update-branch`'s expected_head_sha, a
+# merge's sha) that GitHub refused because the head it holds is not the
+# one named. GitHub sometimes moves a branch without moving the pull
+# request's head, and then refuses every such write for good.
+LOST_HEAD_RE = re.compile(r"expected head sha didn't match|"
+                          r"head branch was modified", re.IGNORECASE)
+# A refusal that is about the Merger App's access.
+ACCESS_RE = re.compile(r"\b40[13]\b")
+# The reason a pull request goes back to its author once GitHub has
+# refused its pinned writes for STALL_AFTER. It names no SHA, so it is
+# said once per approval and head.
+LOST_HEAD_REASON = ("GitHub refuses to update or merge it at this head, "
+                    "saying the head it expected didn't match")
+# Which pull request heads the Merger has nudged GitHub to read again,
+# {pr: {"head": the head GitHub had, "result": the nudge's}}: once per
+# head, so a nudge that doesn't work is not repeated every tick.
+RESYNC_FILE = "resynced.json"
 # The ref a pull request's head is fetched into, in this checkout.
 PR_REF = "refs/agent-forge-merger/pr/%d"
 # The pause before fetching main again after losing a race for its ref.
@@ -783,10 +824,12 @@ def author_hand_backs(records):
 def hand_backs(records, conflicts=True):
     """{pr: how many times it was handed back to its author} in
     `records` (see `author_hand_backs`); without `conflicts`, a conflict
-    with main doesn't count."""
+    with main doesn't count. A head GitHub lost (LOST_HEAD_REASON) is
+    never the pull request's own failure, so it doesn't count either."""
     counts = {}
     for pr, _, reason in author_hand_backs(records):
-        if conflicts or reason != CONFLICT_REASON:
+        if reason != LOST_HEAD_REASON and (
+                conflicts or reason != CONFLICT_REASON):
             counts[pr] = counts.get(pr, 0) + 1
     return counts
 
@@ -817,7 +860,8 @@ def yields_spent(records, conflicts=True):
                     or d.get("to") != "author" \
                     or str(d.get("result") or "").startswith("refused"):
                 continue
-            if conflicts or d.get("reason") != CONFLICT_REASON:
+            if d.get("reason") != LOST_HEAD_REASON and (
+                    conflicts or d.get("reason") != CONFLICT_REASON):
                 last[d.get("pr")] = record
                 spent[d.get("pr")] = 0
         queue = record.get("queue") or ()
@@ -1193,13 +1237,17 @@ def gate_args(argv, repo, number, base, head):
 
 
 def hand_back_text(decision, approver):
-    """The comment a hand-back posts. To the author it is plain; to the
-    approver it starts `Not-a-review`, since it asks for a review."""
+    """The comment a hand-back posts. To the author it is plain, with the
+    decision's `detail` when it has one; to the approver it starts
+    `Not-a-review`, since it asks for a review."""
     if decision["to"] == "author":
-        return ("Not merging %s: %s.\n\nThis is back with its author. "
+        detail = decision.get("detail")
+        return ("Not merging %s: %s.\n\n%sThis is back with its author. "
                 "Once a reviewer approves a head that fixes it, the Merger "
                 "takes it again.\n\n%s" % (decision["head"][:10],
-                                             decision["reason"], SIGNATURE))
+                                             decision["reason"],
+                                             detail + "\n\n" if detail
+                                             else "", SIGNATURE))
     return ("Not-a-review\n\nNot merging %s: %s. The approval doesn't "
             "cover the head, so this needs %s's approval of it.\n\n%s%s"
             % (decision["head"][:10], decision["reason"], approver,
@@ -1296,21 +1344,61 @@ def where_to_look():
         if CI_WORKFLOW else "")
 
 
+def short(sha):
+    return (sha or "?")[:12]
+
+
+def lost_text(lost):
+    """What GitHub said the pull request's head and its branch are, for a
+    write it refused because the head it expected didn't match, from
+    `lost_head`'s record (None when they couldn't be read)."""
+    if not lost:
+        return ("GitHub's pull request head and its branch could not be "
+                "read")
+    if lost["github"] == lost["branch"]:
+        return ("GitHub's pull request head and its branch agree, at %s"
+                % short(lost["github"]))
+    nudge = lost.get("nudge") or ""
+    if nudge.startswith("refused"):
+        after = "a no-op base update to make GitHub read it again was " + nudge
+    else:
+        after = "a no-op base update didn't make GitHub read it again"
+    return ("GitHub's pull request head is %s but its branch is at %s, and %s"
+            % (short(lost["github"]), short(lost["branch"]), after))
+
+
+def refusal_hint(stalled):
+    """What a stall on a refused write says to do about it: the Merger
+    App's access only when GitHub refused it as such (401, 403)."""
+    if "lost" in stalled:
+        return lost_text(stalled["lost"])
+    if ACCESS_RE.search(stalled["refused"]):
+        return "look at the Merger App's access"
+    return "GitHub's answer says why"
+
+
 def stall_text(stalled, reason=None):
     """What a stall is, for the issue and the message: the pull request,
     the head, how long, and GitHub's own words when it refused. `reason`
     is the WAIT decision's, when it is a wait."""
     if "refused" in stalled:
+        hint = refusal_hint(stalled)
         what = ("GitHub has refused the Merger's write for %d minutes, "
-                "most recently:\n\n```\n%s\n```\n\nLook at the Merger App's "
-                "access." % (stalled["minutes"], stalled["refused"]))
+                "most recently:\n\n```\n%s\n```\n\n%s." % (
+                    stalled["minutes"], stalled["refused"],
+                    hint[0].upper() + hint[1:]))
     else:
         what = ("it has waited %d minutes%s; look at %s."
                 % (stalled["minutes"], ": " + reason if reason else "",
                    where_to_look()))
-    return ("The merge queue is stalled on #%d at `%s`: %s\n\nIt stays "
-            "first in the queue, so nothing behind it merges until this "
-            "clears." % (stalled["pr"], stalled["head"][:10], what))
+    if stalled.get("handed_back"):
+        then = ("It has gone back to its author, and the queue moves past "
+                "it.")
+    else:
+        then = ("It stays first in the queue, so nothing behind it merges "
+                "until this clears.")
+    return ("The merge queue is stalled on #%d at `%s`: %s\n\n%s"
+            % (stalled["pr"], stalled["head"][:10], what, then))
 
 
 def ended_by(pr, decisions):
@@ -1477,15 +1565,77 @@ def relay_sender(project, environ, opener=None):
     return send
 
 
-def conflict_hand_back(pr, approval, github, said, live):
+def conflict_hand_back(pr, approval, github, said, live,
+                       reason=CONFLICT_REASON, detail=None):
     """The hand-back for a head GitHub refused to update as a conflict:
-    to the author, like a conflict git found."""
+    to the author, like a conflict git found. With another `reason`, the
+    hand-back for a head GitHub goes on refusing, with `detail` in its
+    comment."""
     decision = {"action": "HAND-BACK", "to": "author",
-                "reason": CONFLICT_REASON, "pr": pr["number"],
+                "reason": reason, "pr": pr["number"],
                 "head": pr["headRefOid"]}
+    if detail:
+        decision["detail"] = detail
     if live:
         decision["result"] = carry_out(decision, approval, github, said)
     return decision
+
+
+def lost_head(decision, github, state_dir, out):
+    """For a write GitHub refused because the head it expected didn't
+    match: {"github", "branch", "now"}, the head GitHub holds for the
+    pull request, the commit its branch is at, and the head GitHub holds
+    after any nudge; None when GitHub couldn't be asked.
+
+    GitHub sometimes moves a branch (its own update's merge commit lands
+    on it) and never moves the pull request's head, and then refuses
+    every write pinned to either. Setting the pull request's base to the
+    base it has changes nothing but makes GitHub read the head again.
+    The Merger does that once per pull request and head GitHub holds
+    (RESYNC_FILE), reads the pull request again, prints one `RESYNC`
+    line and adds `nudge`, "done" or "refused: ...", to the record.
+    A head GitHub holds that isn't `decision`'s is a changed pull
+    request, nudged or not."""
+    number = decision["pr"]
+    path = "repos/%s/pulls/%d" % (REPO_SLUG, number)
+    try:
+        pull = github.api(path)
+        held = pull["head"]["sha"]
+        ref = github.api("repos/%s/git/ref/heads/%s" % (
+            pull["head"]["repo"]["full_name"],
+            urllib.parse.quote(pull["head"]["ref"], safe="/")))
+        branch = ref["object"]["sha"]
+        base = pull["base"]["ref"]
+    except (RuntimeError, KeyError, TypeError, ValueError, AttributeError):
+        return None
+    lost = {"github": held, "branch": branch, "now": held}
+    if held == branch:
+        return lost
+    resync_path = os.path.join(state_dir, RESYNC_FILE)
+    done = load_json(resync_path, {})
+    if not isinstance(done, dict):
+        done = {}
+    before = done.get(str(number))
+    if isinstance(before, dict) and before.get("head") == held:
+        lost["nudge"] = before.get("result") or "done"
+        return lost
+    ok, why = github.write("PATCH", path, base=base)
+    lost["nudge"] = "done" if ok else "refused: " + why
+    done[str(number)] = {"head": held, "result": lost["nudge"]}
+    save_json(resync_path, done)
+    if ok:
+        try:
+            lost["now"] = github.api(path)["head"]["sha"]
+        except (RuntimeError, KeyError, TypeError, ValueError):
+            pass
+        out("RESYNC #%d: GitHub had head %s, branch is at %s; nudged with a "
+            "no-op base update, and GitHub now has %s"
+            % (number, short(held), short(branch), short(lost["now"])))
+    else:
+        out("RESYNC #%d: GitHub had head %s, branch is at %s; the no-op "
+            "base update was refused: %s"
+            % (number, short(held), short(branch), why))
+    return lost
 
 
 def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
@@ -1986,6 +2136,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             record["decisions"].append(
                 conflict_hand_back(pr, approval, github, said, live))
             continue
+        if (decision["action"] in ("UPDATE", "MERGE")
+                and said.get(str(pr["number"])) == hand_back_key(
+                    approval, pr["headRefOid"], LOST_HEAD_REASON)):
+            # GitHub refused this head for STALL_AFTER and it went back
+            # to its author; the queue moves past it.
+            record["decisions"].append(conflict_hand_back(
+                pr, approval, github, said, live, LOST_HEAD_REASON))
+            continue
         if live:
             result = carry_out(decision, approval, github, said)
             if result is not None:
@@ -1999,6 +2157,35 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             record["decisions"].append(
                 conflict_hand_back(pr, approval, github, said, live))
             continue
+        if (live and decision["action"] in ("UPDATE", "MERGE")
+                and LOST_HEAD_RE.search(decision.get("result") or "")):
+            lost = lost_head(decision, github, state_dir, out)
+            decision["lost"] = lost
+            if lost and lost["now"] != pr["headRefOid"]:
+                # GitHub holds another head now: a changed pull request,
+                # judged afresh at that head next tick (its approval,
+                # its check), never retried at the head it lost.
+                record["decisions"].append({
+                    "action": "RESYNC", "pr": pr["number"],
+                    "head": pr["headRefOid"],
+                    "result": "GitHub now has " + short(lost["now"])})
+                continue
+            minutes = stalled_for(state_dir, decision, when)
+            if minutes is not None:
+                # Refused for STALL_AFTER, and nothing the Merger can do
+                # changes GitHub's mind: back to its author, whose push
+                # makes GitHub read the head again, and the queue moves
+                # past it rather than waiting behind it for ever.
+                record["stalled"] = {
+                    "pr": pr["number"], "head": pr["headRefOid"],
+                    "minutes": minutes, "lost": lost, "handed_back": True,
+                    "refused": "%s %s" % (decision["action"],
+                                          decision["result"])}
+                record["decisions"].append(conflict_hand_back(
+                    pr, approval, github, said, live, LOST_HEAD_REASON,
+                    lost_text(lost) + ". A push to the branch makes "
+                    "GitHub read its head again."))
+                continue
         if decision["action"] not in ("HAND-BACK", "SKIP"):
             waiting_on = pr["number"]
             # A refused write ends the tick on this pull request, and the
@@ -2015,12 +2202,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             run)
     if live:
         minutes = stalled_for(state_dir, waiting, when)
-        if minutes is not None:
+        if minutes is not None and "stalled" not in record:
             record["stalled"] = {"pr": waiting["pr"], "head": waiting["head"],
                                  "minutes": minutes}
             if waiting["action"] != "WAIT":
                 record["stalled"]["refused"] = "%s %s" % (
                     waiting["action"], waiting["result"])
+                if "lost" in waiting:
+                    record["stalled"]["lost"] = waiting["lost"]
         save_json(said_path, said)
         said_next = {"at": record["at"], "pr": waiting_on}
         if TEST_AHEAD:
@@ -2049,10 +2238,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     stalled = record.get("stalled")
     if stalled and "refused" in stalled:
         out("STALLED: GitHub has refused the Merger's write to #%d at %s "
-            "for %d minutes, most recently %s. It stays first in the queue "
-            "and is not handed back; look at the Merger App's access" % (
+            "for %d minutes, most recently %s. %s; %s" % (
                 stalled["pr"], stalled["head"][:10], stalled["minutes"],
-                stalled["refused"]))
+                stalled["refused"],
+                "It is handed back to its author, and the queue moves past "
+                "it" if stalled.get("handed_back") else
+                "It stays first in the queue and is not handed back",
+                refusal_hint(stalled)))
     elif stalled:
         out("STALLED: #%d has waited %d minutes on %s: %s. It stays "
             "first in the queue and is not handed back; look at %s" % (

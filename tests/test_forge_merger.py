@@ -979,9 +979,9 @@ class GitHubApi(unittest.TestCase):
 class Tick(Decide):
 
     def tick(self, prs, issues=(), conclusions=("success",), live=False,
-             refuse=None, minutes=0, send=None):
-        github = FakeGitHub(answers(conclusions, prs=prs, issues=issues),
-                            refuse)
+             refuse=None, minutes=0, send=None, extra=None):
+        github = FakeGitHub(dict(answers(conclusions, prs=prs, issues=issues),
+                                 **(extra or {})), refuse)
         self.github = github
         lines = []
         state = self.state = os.path.join(self.tmp.name, "state")
@@ -1335,7 +1335,25 @@ class Tick(Decide):
         self.assertEqual(record["stalled"], {
             "pr": 5, "head": self.head, "minutes": 30,
             "refused": "UPDATE refused: HTTP 403: forbidden"})
-        self.assertIn("look at the Merger App's access", lines[1])
+        self.assertEqual(lines[1], (
+            "STALLED: GitHub has refused the Merger's write to #5 at %s for "
+            "30 minutes, most recently UPDATE refused: HTTP 403: forbidden. "
+            "It stays first in the queue and is not handed back; look at the "
+            "Merger App's access" % self.head[:10]))
+        # A 403 is never taken for a lost head: GitHub is not asked.
+        self.assertEqual([w[0] for w in self.github.writes], ["PUT"])
+
+    def test_another_refusal_is_not_blamed_on_access(self):
+        self.advance_main("n.txt")
+        self.tick([self.item()], live=True, refuse="HTTP 502: bad gateway")
+        record, lines = self.tick([self.item()], live=True,
+                                  refuse="HTTP 502: bad gateway", minutes=30)
+        self.assertEqual(lines[1], (
+            "STALLED: GitHub has refused the Merger's write to #5 at %s for "
+            "30 minutes, most recently UPDATE refused: HTTP 502: bad gateway. "
+            "It stays first in the queue and is not handed back; GitHub's "
+            "answer says why" % self.head[:10]))
+        self.assertNotIn("access", m.stall_text(record["stalled"]))
 
     def test_an_update_is_not_a_wait(self):
         self.advance_main("n.txt")
@@ -1407,6 +1425,221 @@ class Tick(Decide):
         with self.assertRaisesRegex(RuntimeError, "fetch main"):
             m.tick(self.repo.path, self.tmp.name, FakeGitHub({}), tools_run(),
                    lambda line: None, sleep=lambda s: None)
+
+
+STALE = ("gh: expected head sha didn't match current head ref. (HTTP 422)\n"
+         '{"message":"expected head sha didn\'t match current head ref.",'
+         '"status":"422"}')
+
+
+class LostHead(RepoCase):
+    """GitHub moved #5's branch but not its head, and refuses every
+    update pinned to either: the Merger nudges it once with a no-op base
+    update, and if that doesn't help, hands it back once it has waited
+    STALL_AFTER, so the queue moves past it."""
+
+    item = Decide.item
+    tick = Tick.tick
+    other_pr = Tick.other_pr
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        # main moves on, so #5 (self.head) is behind it: an UPDATE.
+        self.advance_main("n.txt")
+        # The commit GitHub's own update put on the branch: the clean
+        # merge of main into the head.
+        self.moved = self.repo.merge("origin/main")
+        self.nudged = False
+
+    def refuse(self, method, path):
+        if path.endswith("/update-branch"):
+            return STALE
+        return None
+
+    def github_answers(self, fixed=False, branch=None):
+        """GitHub's pull request #5 (head self.head until a nudge, and
+        self.moved after one when `fixed`) and its branch (self.moved,
+        or `branch`)."""
+        def pull():
+            head = self.moved if fixed and self.patched() else self.head
+            return {"head": {"sha": head, "ref": "b5",
+                             "repo": {"full_name": "example/widget"}},
+                    "base": {"ref": "main"}}
+        return {SLUG + "/pulls/5": pull,
+                SLUG + "/git/ref/heads/b5": {"object": {
+                    "sha": branch or self.moved}}}
+
+    def patched(self):
+        return any(w[0] == "PATCH" for w in self.github.writes)
+
+    def resync_line(self, now):
+        return ("RESYNC #5: GitHub had head %s, branch is at %s; nudged with "
+                "a no-op base update, and GitHub now has %s"
+                % (self.head[:12], self.moved[:12], now[:12]))
+
+    def test_a_nudge_that_works_makes_it_a_changed_pull_request(self):
+        other = self.other_pr()
+        record, lines = self.tick([self.item(), other], live=True,
+                                  refuse=self.refuse,
+                                  extra=self.github_answers(fixed=True))
+        self.assertEqual(self.github.writes[:2], [
+            ("PUT", SLUG + "/pulls/5/update-branch",
+             {"expected_head_sha": self.head}),
+            ("PATCH", SLUG + "/pulls/5", {"base": "main"})])
+        self.assertEqual(lines[0], self.resync_line(self.moved))
+        self.assertEqual(
+            [(d["pr"], d["action"]) for d in record["decisions"]],
+            [(5, "UPDATE"), (5, "RESYNC"), (6, "MERGE")])
+        self.assertEqual(record["decisions"][0]["lost"], {
+            "github": self.head, "branch": self.moved, "now": self.moved,
+            "nudge": "done"})
+        self.assertEqual(record["decisions"][1]["result"],
+                         "GitHub now has " + self.moved[:12])
+        self.assertNotIn("stalled", record)
+        with open(os.path.join(self.state, "resynced.json")) as handle:
+            self.assertEqual(json.load(handle),
+                             {"5": {"head": self.head, "result": "done"}})
+
+        # The next tick sees the new head and judges it as usual: the
+        # approval covers a clean merge of main, its check is green, it
+        # merges at that head and nothing is nudged again.
+        self.repo.publish_pr(5, self.moved)
+        record, lines = self.tick([self.item(head=self.moved)], live=True,
+                                  minutes=1)
+        self.assertEqual(self.github.writes, [
+            ("PUT", SLUG + "/pulls/5/merge",
+             {"sha": self.moved, "merge_method": "squash"})])
+        self.assertEqual(len(lines), 1)
+
+    def test_a_nudge_that_does_not_help_is_not_repeated(self):
+        other = self.other_pr()
+        prs = [self.item(), other]
+        record, lines = self.tick(prs, live=True, refuse=self.refuse,
+                                  extra=self.github_answers())
+        self.assertEqual(lines[0], self.resync_line(self.head))
+        self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
+                         [(5, "UPDATE")])
+        self.assertEqual(self.github.writes[1][0], "PATCH")
+        for minutes in (1, 10, 29):
+            record, lines = self.tick(prs, live=True, refuse=self.refuse,
+                                      extra=self.github_answers(),
+                                      minutes=minutes)
+            # No nudge again, no RESYNC line, still first and not stalled.
+            self.assertEqual([w[0] for w in self.github.writes], ["PUT"])
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(record["decisions"][0]["lost"]["nudge"], "done")
+            self.assertNotIn("stalled", record)
+
+        # At STALL_AFTER it goes back to its author, once, and the queue
+        # moves on to #6 in the same tick.
+        record, lines = self.tick(prs, live=True, refuse=self.refuse,
+                                  extra=self.github_answers(), minutes=30)
+        self.assertEqual(
+            [(d["pr"], d["action"]) for d in record["decisions"]],
+            [(5, "UPDATE"), (5, "HAND-BACK"), (6, "MERGE")])
+        self.assertEqual(record["decisions"][1]["reason"],
+                         m.LOST_HEAD_REASON)
+        self.assertEqual(record["stalled"]["handed_back"], True)
+        self.assertEqual(lines[1], (
+            "STALLED: GitHub has refused the Merger's write to #5 at %s for "
+            "30 minutes, most recently UPDATE refused: %s. It is handed back "
+            "to its author, and the queue moves past it; GitHub's pull "
+            "request head is %s but its branch is at %s, and a no-op base "
+            "update didn't make GitHub read it again"
+            % (self.head[:10], STALE, self.head[:12], self.moved[:12])))
+        (_, path, fields), = [w for w in self.github.writes
+                              if w[0] == "POST"]
+        self.assertEqual(path, SLUG + "/issues/5/comments")
+        self.assertEqual(fields["body"], (
+            "Not merging %s: GitHub refuses to update or merge it at this "
+            "head, saying the head it expected didn't match.\n\n"
+            "GitHub's pull request head is %s but its branch is at %s, and "
+            "a no-op base update didn't make GitHub read it again. A push to "
+            "the branch makes GitHub read its head again.\n\n"
+            "This is back with its author. Once a reviewer approves a head "
+            "that fixes it, the Merger takes it again.\n\n— Merger"
+            % (self.head[:10], self.head[:12], self.moved[:12])))
+
+        # Later ticks neither update #5 again nor say more: no loop.
+        record, lines = self.tick(prs, live=True, refuse=self.refuse,
+                                  extra=self.github_answers(), minutes=31)
+        self.assertEqual(
+            [(d["pr"], d["action"], d["result"])
+             for d in record["decisions"]],
+            [(5, "HAND-BACK", "already said"), (6, "MERGE", "done")])
+        self.assertEqual([w[1] for w in self.github.writes],
+                         [SLUG + "/pulls/6/merge"])
+        self.assertNotIn("stalled", record)
+
+    def test_a_refusal_where_head_and_branch_agree_is_never_nudged(self):
+        prs = [self.item()]
+        extra = self.github_answers(branch=self.head)
+        self.tick(prs, live=True, refuse=self.refuse, extra=extra)
+        record, lines = self.tick(prs, live=True, refuse=self.refuse,
+                                  extra=extra, minutes=30)
+        self.assertNotIn("PATCH", [w[0] for w in self.github.writes])
+        self.assertEqual(record["decisions"][0]["lost"], {
+            "github": self.head, "branch": self.head, "now": self.head})
+        self.assertEqual(record["decisions"][1]["action"], "HAND-BACK")
+        self.assertTrue(lines[1].endswith(
+            "It is handed back to its author, and the queue moves past it; "
+            "GitHub's pull request head and its branch agree, at %s"
+            % self.head[:12]))
+
+    def test_a_refused_nudge_is_said_and_not_tried_again(self):
+        def refuse(method, path):
+            return "HTTP 403: no" if method == "PATCH" else self.refuse(
+                method, path)
+        prs = [self.item()]
+        _, lines = self.tick(prs, live=True, refuse=refuse,
+                             extra=self.github_answers())
+        self.assertEqual(lines[0], (
+            "RESYNC #5: GitHub had head %s, branch is at %s; the no-op base "
+            "update was refused: HTTP 403: no"
+            % (self.head[:12], self.moved[:12])))
+        _, lines = self.tick(prs, live=True, refuse=refuse,
+                             extra=self.github_answers(), minutes=30)
+        self.assertEqual([w[0] for w in self.github.writes],
+                         ["PUT", "POST"])
+        self.assertTrue(lines[1].endswith(
+            "and a no-op base update to make GitHub read it again was "
+            "refused: HTTP 403: no"))
+
+    def test_a_pull_request_github_cannot_read_is_handed_back_too(self):
+        def broken():
+            raise RuntimeError("gh api: HTTP 502")
+        prs = [self.item()]
+        extra = {SLUG + "/pulls/5": broken}
+        self.tick(prs, live=True, refuse=self.refuse, extra=extra)
+        record, lines = self.tick(prs, live=True, refuse=self.refuse,
+                                  extra=extra, minutes=30)
+        self.assertIsNone(record["decisions"][0]["lost"])
+        self.assertEqual(record["decisions"][1]["action"], "HAND-BACK")
+        self.assertTrue(lines[1].endswith(
+            "GitHub's pull request head and its branch could not be read"))
+
+    def test_a_dry_run_never_nudges(self):
+        record, _ = self.tick([self.item()], refuse=self.refuse,
+                              extra=self.github_answers())
+        self.assertEqual(record["decisions"][0]["action"], "UPDATE")
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state, "resynced.json")))
+
+    def test_the_stall_issue_says_what_github_lost(self):
+        text = m.stall_text({
+            "pr": 5, "head": self.head, "minutes": 30, "handed_back": True,
+            "refused": "UPDATE refused: " + STALE,
+            "lost": {"github": self.head, "branch": self.moved,
+                     "now": self.head, "nudge": "done"}})
+        self.assertIn("GitHub's pull request head is %s but its branch is at "
+                      "%s, and a no-op base update didn't make GitHub read it "
+                      "again." % (self.head[:12], self.moved[:12]), text)
+        self.assertNotIn("access", text)
+        self.assertTrue(text.endswith(
+            "It has gone back to its author, and the queue moves past it."))
 
 
 class StallAlert(Decide):
@@ -2326,6 +2559,12 @@ class HandBacks(unittest.TestCase):
 
     def test_a_dry_runs_hand_back_counts(self):
         self.assertEqual(m.hand_backs([hand_back(5, T0, result=None)]), {5: 1})
+
+    def test_a_head_github_lost_does_not_count(self):
+        records = [hand_back(5, T0, reason=m.LOST_HEAD_REASON),
+                   hand_back(6, T0, reason=m.LOST_HEAD_REASON)]
+        self.assertEqual(m.hand_backs(records), {})
+        self.assertEqual(m.yields_spent(records), {})
 
     def test_other_decisions_do_not_count(self):
         records = [{"at": T0, "decisions": [
