@@ -117,3 +117,17 @@ fails the first time and passes the second.
    Authors are told: once per head, and only for a red that isn't the
    change's fault, naming the flake issue in the pull request if there
    is one.
+
+## Amendment (2026-10-21)
+
+An addition, separate from the label: `checks.host_fault_text`, an
+optional list of strings in the project's configuration. A red whose
+failed step's tail contains one of them counts as the host's fault, as
+a full disk already does: no verdict is recorded, the head is tried
+again later, and after three such faults it is posted `error`. The
+strings are added to the built-in `No space left on device` and
+`ENOSPC`, and the `HOST-FAULT` line quotes the one that matched. A
+project can then name an outside service's outage, such as a package
+registry's error, without agent-forge knowing that service. It needs
+no label, and it settles some reds before anyone would want to run
+them again.

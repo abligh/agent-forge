@@ -109,6 +109,19 @@ class Check(unittest.TestCase):
         data["checks"]["keep_ignored"] = ["", "/", "../x", "a/*", 3]
         self.assertEqual(len(config.check(data)), 5)
 
+    def test_host_fault_text_takes_non_empty_strings(self):
+        data = example()
+        data["checks"]["host_fault_text"] = ["registry returned an error"]
+        self.assertEqual(config.check(data), [])
+        data["checks"]["host_fault_text"] = ["", "  ", 3, None]
+        problems = config.check(data)
+        self.assertEqual(len(problems), 4)
+        self.assertIn("checks.host_fault_text: '' is not a non-empty "
+                      "string", problems)
+        data["checks"]["host_fault_text"] = "registry down"
+        self.assertEqual(config.check(data),
+                         ["checks.host_fault_text must be a list"])
+
     def test_the_example_is_good(self):
         self.assertEqual(config.check(example()), [])
 

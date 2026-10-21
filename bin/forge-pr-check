@@ -95,6 +95,17 @@ pulls API's labels are kept with the head; taking the label off puts it
 back in its ordinary place. A head that failed to prepare still goes
 behind, and the default branch's traced run still goes first when due.
 
+**With `labels.rerun`, a red head can be run once more** (designs/0022).
+A tick that finds the label on an open pull request whose head is red
+moves the head's verdict out of `results` into `reruns` (with who put
+the label on, read from the pull request's events, and when), queues
+the head as if new, takes the label off, logs `RERUN` and posts the
+status back to pending. The second verdict's description says `(run
+again after red(<steps>))` and stands. A head already run again keeps
+its verdict, and the label comes off with a comment; on a green, pending
+or unrun head the label just comes off. Only a posting tick, and not an
+instance's (designs/0021), acts on it.
+
 **With `checks.max_wait_minutes`, no head waits on priority for ever**:
 a pull request's head that has waited that long goes before every
 other pull request's, the oldest first, the first_authors' and the
@@ -457,6 +468,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from agent_forge import config, github, locks, quiet, trace  # noqa: E402
@@ -604,6 +616,9 @@ DEFAULT_MERGER_FIRST = False
 FIRST_AUTHORS = frozenset()
 # labels.urgent: the label that puts a pull request first, or None.
 URGENT_LABEL = None
+# labels.rerun: the label that runs a red head once more (designs/0022),
+# or None.
+RERUN_LABEL = None
 # checks.max_wait_minutes: how long a pull request's head waits behind
 # others' priority before it goes first itself, or None.
 MAX_WAIT = None
@@ -702,7 +717,7 @@ def configure(project, instance=None):
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     global TRACE_MATCHED_MAIN, CHAIN_WRITES_ONLY, DIRS_BY_NAMES, OUTPUTS
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
-    global RED_COMMENT
+    global RED_COMMENT, RERUN_LABEL, HOST_FAULT_EXTRA
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
     INSTANCE = instance
     if instance is None:
@@ -752,6 +767,11 @@ def configure(project, instance=None):
     MAX_WAIT = datetime.timedelta(minutes=checks["max_wait_minutes"]) \
         if "max_wait_minutes" in checks else None
     URGENT_LABEL = project.section("labels").get("urgent")
+    # One instance taking the label off would hide it from the others,
+    # so only the check checks itself describes acts on it.
+    RERUN_LABEL = project.section("labels").get("rerun") \
+        if instance is None else None
+    HOST_FAULT_EXTRA = tuple(checks.get("host_fault_text", ()))
     MAIN_EVERY = checks.get("main", "needed") == "every"
     MAIN_RED_ISSUE = dict(checks["main_red_issue"]) \
         if "main_red_issue" in checks else None
@@ -1102,6 +1122,134 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
             entry["since"] = replaced[entry["pr"]]
 
 
+def rerun_kind(state, sha, draft=False, repo=None):
+    """What labels.rerun does to head sha (designs/0022): "again" for a
+    head already run again once, "red" for one to run again, else
+    "nothing", for a green, pending or unrun head, or a draft's or
+    another repository's, which aren't run."""
+    if draft or (repo is not None and repo != REPO_SLUG):
+        return "nothing"
+    if sha in state.get("reruns", {}):
+        return "again"
+    r = state["results"].get(sha)
+    return "red" if r is not None and not r.get("ok") else "nothing"
+
+
+def rerun_labelled(heads):
+    """[(pr, sha, draft, repo)] of the open heads carrying labels.rerun."""
+    if not RERUN_LABEL:
+        return []
+    return [(pr, sha, draft, repo)
+            for pr, sha, repo, draft, *extra in heads
+            if len(extra) > 1 and RERUN_LABEL in extra[1]]
+
+
+def labelled_by(pr, token, run=sh):
+    """(login, when) of the last time labels.rerun was put on pull
+    request pr, from its events, or None if GitHub can't say."""
+    got = gh(["--paginate", "repos/%s/issues/%d/events?per_page=100"
+              % (REPO_SLUG, pr), "--jq",
+              '.[] | select(.event == "labeled" and .label.name == %s) | '
+              '[(.actor.login // ""), .created_at] | @tsv'
+              % json.dumps(RERUN_LABEL)], token, run)
+    if got.returncode != 0:
+        return None
+    rows = [line.split("\t") for line in got.stdout.splitlines()
+            if line.strip()]
+    if not rows or len(rows[-1]) != 2 or not rows[-1][1]:
+        return None
+    return rows[-1][0] or "someone", rows[-1][1]
+
+
+def take_reruns(state, labelled, labellers, when, state_dir, out=print):
+    """labels.rerun, under the state lock, before the heads are queued:
+    move each labelled red head's verdict into `reruns`, so note_heads
+    queues it as if new, and say what is still to do on GitHub, as
+    [(pr, sha, what, detail)]: "rerun" (detail: who and the red's
+    steps) to post pending and take the label off, "again" (who) to
+    comment and take it off, "drop" to take it off. A head whose
+    labeller GitHub couldn't name, or that wasn't read (`labellers`), is
+    left labelled, for the next tick.
+    A head already answered for that labelling only loses the label:
+    taking it off failed last time."""
+    todo = []
+    reruns = state.setdefault("reruns", {})
+    for pr, sha, draft, repo in labelled:
+        kind = rerun_kind(state, sha, draft, repo)
+        if kind == "nothing":
+            todo.append((pr, sha, "drop", None))
+            continue
+        if sha not in labellers:
+            # It turned red after the labellers were read: next tick.
+            continue
+        got = labellers[sha]
+        if got is None:
+            out("RERUN-FAILED #%d %s: could not read who put %s on it; "
+                "tried again next tick" % (pr, sha[:10], RERUN_LABEL))
+            continue
+        login, at = got
+        if kind == "again":
+            entry = reruns[sha]
+            if entry.get("answered") == at:
+                todo.append((pr, sha, "drop", None))
+                continue
+            entry["answered"] = at
+            log(state_dir, "RERUN-REFUSED #%d %s: already run again once; "
+                "labelled by %s" % (pr, sha[:10], login), when, out)
+            todo.append((pr, sha, "again", login))
+            continue
+        verdict = state["results"].pop(sha)
+        reruns[sha] = {"pr": pr, "verdict": verdict, "by": login,
+                       "labelled": at, "queued": iso(when), "answered": at}
+        # A fresh place at the back: queued as if new.
+        state["waiting"].pop(sha, None)
+        log(state_dir, "RERUN #%d %s: was %s; queued by %s"
+            % (pr, sha[:10], verdict_word(verdict), login), when, out)
+        todo.append((pr, sha, "rerun", login))
+    if not reruns:
+        del state["reruns"]
+    return todo
+
+
+def rerun_text(sha):
+    """The comment a second labels.rerun on one head gets."""
+    return ("%s has already been run again once; push a new head to run "
+            "it a third time.\n\n%s" % (sha[:10], signature()))
+
+
+def finish_reruns(todo, token, run=sh, post=None, out=print):
+    """GitHub's half of take_reruns: the pending status, the comment and
+    taking the label off. A write GitHub refuses is printed
+    RERUN-FAILED; a label left on is taken off by a later tick."""
+    for pr, sha, what, login in todo:
+        if what == "rerun" and post is not None:
+            post(sha, "pending", "queued again after a red, by %s" % login)
+        if what == "again":
+            got = gh(["-X", "POST", "repos/%s/issues/%d/comments"
+                      % (REPO_SLUG, pr), "-f", "body=" + rerun_text(sha)],
+                     token, run)
+            if got.returncode != 0:
+                out("RERUN-FAILED #%d %s: commenting: %s"
+                    % (pr, sha[:10], (got.stderr or "").strip()[:200]))
+        got = gh(["-X", "DELETE", "repos/%s/issues/%d/labels/%s"
+                  % (REPO_SLUG, pr, urllib.parse.quote(RERUN_LABEL,
+                                                       safe=""))],
+                 token, run)
+        # Already off is as good as taken off.
+        if got.returncode != 0 and "404" not in (got.stderr or ""):
+            out("RERUN-FAILED #%d %s: taking %s off: %s"
+                % (pr, sha[:10], RERUN_LABEL,
+                   (got.stderr or "").strip()[:200]))
+
+
+def mark_rerun(state, sha, record):
+    """A verdict on a head run again (labels.rerun) names the red it
+    replaces, for its description."""
+    moved = state.get("reruns", {}).get(sha)
+    if moved is not None:
+        record["rerun_of"] = list(moved["verdict"].get("failed", []))
+
+
 def who(pr, main=False):
     """How a run is named in the logs: its pull request, or `main`."""
     return MAIN if main else "#%d" % pr
@@ -1447,6 +1595,15 @@ def prune(state, when):
         for sha in list(state[key]):
             if when - parse(state[key][sha][stamp]) > KEEP:
                 del state[key][sha]
+    # A head run again is remembered while it waits or has a verdict,
+    # so the label can't run it a third time.
+    reruns = state.get("reruns", {})
+    for sha in list(reruns):
+        if sha not in state["results"] and sha not in state["waiting"] \
+                and when - parse(reruns[sha]["queued"]) > KEEP:
+            del reruns[sha]
+    if "reruns" in state and not reruns:
+        del state["reruns"]
 
 
 # How long a minted token is used for. GitHub's last an hour; a check
@@ -1699,10 +1856,14 @@ def final_status(r):
     the paths that conflict with it."""
     selection = r.get("selection") or {}
     ran, skipped = selection.get("ran", {}), selection.get("skipped", [])
+    # labels.rerun (designs/0022): a second verdict says the head was
+    # red once, early, since GitHub cuts the end.
+    again = " (run again after red(%s))" % ",".join(r["rerun_of"]) \
+        if r.get("rerun_of") is not None else ""
     if r.get("conflicts") is not None:
         paths = r["conflicts"]
-        return "failure", "red%s: conflicts with %s at %s%s" % (
-            on_host(), MAIN, r["base"][:10],
+        return "failure", "red%s%s: conflicts with %s at %s%s" % (
+            on_host(), again, MAIN, r["base"][:10],
             ": " + ", ".join(paths[:CONFLICTS_SHOWN])
             + (" and %d more" % (len(paths) - CONFLICTS_SHOWN)
                if len(paths) > CONFLICTS_SHOWN else "") if paths else "")
@@ -1713,7 +1874,7 @@ def final_status(r):
         where += " with %s at %s" % (MAIN, r["base"][:10])
         if not r["ok"] and r.get("base_red"):
             where += " (itself red here)"
-    return _final_status(r, selection, ran, skipped, where)
+    return _final_status(r, selection, ran, skipped, where + again)
 
 
 # How many conflicting paths a description names.
@@ -1752,12 +1913,15 @@ def _final_status(r, selection, ran, skipped, where):
 
 # What a failed step's output says when the host, not the head, broke.
 HOST_FAULT_TEXT = ("No space left on device", "ENOSPC")
+# checks.host_fault_text: the project's own, added to those.
+HOST_FAULT_EXTRA = ()
 
 
 def host_fault(results):
     """(step, why) for the first failed step the host broke, or None:
     one that exited 126 or 127, so its command could not be run, or
-    whose output says the disk is full."""
+    whose output says the disk is full or holds one of
+    checks.host_fault_text, which `why` quotes."""
     for r in results:
         if r["rc"] == 0:
             continue
@@ -1765,6 +1929,10 @@ def host_fault(results):
             return r["name"], "exit %d: its command could not be run" % r["rc"]
         if any(text in r["tail"] for text in HOST_FAULT_TEXT):
             return r["name"], "no space left on device"
+        for text in HOST_FAULT_EXTRA:
+            if text in r["tail"]:
+                return r["name"], "its output says %s" % json.dumps(
+                    text, ensure_ascii=False)
     return None
 
 
@@ -1862,8 +2030,21 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     # worked out outside the lock: it reads git.
     needs = main_needs(checkout, head_of_main, state_dir, run) \
         if fresh else False
+    # labels.rerun: who put the label on each head it would act on, read
+    # outside the lock. Only a posting tick writes to GitHub.
+    labelled = rerun_labelled(heads) if post is not None else []
+    labellers = {}
+    if labelled:
+        seen = load(state_dir)
+        for pr, sha, draft, repo in labelled:
+            if rerun_kind(seen, sha, draft, repo) != "nothing":
+                labellers[sha] = labelled_by(pr, token, run)
+    todo = []
     with state_lock(state_dir):
         state = load(state_dir)
+        if labelled:
+            todo = take_reruns(state, labelled, labellers, when, state_dir,
+                               out)
         note_heads(state, heads, when, state_dir, out, post)
         if head_of_main and queue_main(state, head_of_main, when, state_dir,
                                        busy, needs):
@@ -1877,6 +2058,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         prune_results(state_dir, state, when)
         prune_logs(state_dir, when)
         queued = set(state["waiting"])
+    if todo:
+        finish_reruns(todo, token, run, post, out)
     current = {head[1] for head in heads}
     for slot, holder in holders.items():
         if holder is None:
@@ -2183,6 +2366,7 @@ def conflicted(state_dir, sha, pr, merge, started, finished, post,
             "seconds": 0, "step_seconds": {}, "base": merge["base"],
             "conflicts": merge["conflicts"],
         }
+        mark_rerun(state, sha, record)
         state["results"][sha] = record
         save(state_dir, state)
     log(state_dir, "VERDICT #%d %s: %s conflicts with %s at %s: %s"
@@ -2244,6 +2428,7 @@ def matched(state_dir, sha, pr, same, tree, started, post, out=print,
             record["selection"] = source["selection"]
         if main:
             record["main"] = True
+        mark_rerun(state, sha, record)
         state["results"][sha] = record
         save(state_dir, state)
     if main:
@@ -3408,7 +3593,11 @@ def reusable(state, name, digest, when):
     it reuses, and ages from it."""
     host, steps = socket.gethostname(), steps_digest()
     found = []
-    for sha, r in state["results"].items():
+    # A red verdict moved aside by labels.rerun still counts: the steps
+    # it passed may be reused, and those it failed are run again.
+    moved = [(sha, e["verdict"]) for sha, e in state.get("reruns", {}).items()
+             if isinstance(e.get("verdict"), dict)]
+    for sha, r in list(state["results"].items()) + moved:
         if (r.get("digests") or {}).get(name) != digest \
                 or r.get("host") != host or r.get("steps") != steps:
             continue
@@ -3964,6 +4153,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 tip = state["results"].get(merge["base"]) or {}
                 if tip.get("main") and not tip.get("ok"):
                     record["base_red"] = True
+            if not ahead and not main:
+                mark_rerun(state, sha, record)
             flaked = flakes_of(state, sha, record)
             state["results"][sha] = record
             save(state_dir, state)

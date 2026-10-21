@@ -94,7 +94,8 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "merge_default": bool, "cache_limit": str, "reuse": dict,
           "fresh": dict, "first_authors": list, "max_wait_minutes": int,
           "main": str, "main_red_issue": dict, "drop_env": list,
-          "keep_ignored": list, "red_comment": bool, "instances": dict}
+          "keep_ignored": list, "red_comment": bool, "instances": dict,
+          "host_fault_text": list}
 # checks.instances (designs/0021): more instances of the check, each on
 # its own host with its own context and steps. A block's keys come from
 # the block alone (OWN), from the block or else `checks` (INHERITED),
@@ -105,7 +106,7 @@ INSTANCE_OWN = ("host", "context", "steps", "poster")
 INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight",
                       "step_timeout_minutes", "caches", "cache_limit",
                       "keep_ignored", "drop_env", "merge_default",
-                      "red_comment", "max_wait_minutes")
+                      "red_comment", "max_wait_minutes", "host_fault_text")
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main")
 INSTANCE_CHECKS_ONLY = ("main_red_issue", "first_authors", "merger_first")
@@ -131,7 +132,8 @@ STEP = {"name": str, "run": list, "only_if": str, "always": bool,
 TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.
 LABELS = {"owner_prefix": str, "status_prefix": str,
-          "waiting_on_owner": str, "waiting_external": str, "urgent": str}
+          "waiting_on_owner": str, "waiting_external": str, "urgent": str,
+          "rerun": str}
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
@@ -566,6 +568,11 @@ def _check_checks(checks, data, problems, where="checks"):
             if not isinstance(entry, str) or not DROP_ENV_RE.match(entry):
                 problems.append("%s.drop_env: %r is not a variable's "
                                 "name or a prefix ending in *" % (where, entry))
+    if isinstance(checks.get("host_fault_text"), list):
+        for text in checks["host_fault_text"]:
+            if not isinstance(text, str) or not text.strip():
+                problems.append("%s.host_fault_text: %r is not a non-empty "
+                                "string" % (where, text))
     if isinstance(checks.get("first_authors"), list):
         agents = data.get("agents", {})
         for name in checks["first_authors"]:
