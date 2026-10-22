@@ -58,7 +58,8 @@ faults counted (`faults`, apart from a checkout's `errors`), and
 `verdicts.log` says `HOST-FAULT` with the step and why. It keeps its
 place in the queue, since the fault was not its own, and is tried
 again from cron's next tick, not at once; after MAX_ERRORS it is
-given up on with `error`. A red verdict says the head is broken, and
+given up on with `error`, until `labels.rerun` (below) tries it again.
+A red verdict says the head is broken, and
 its author would otherwise be sent to fix what isn't hers.
 
 **A run of a head that is no longer its pull request's is stopped.**
@@ -103,8 +104,12 @@ the head as if new, takes the label off, logs `RERUN` and posts the
 status back to pending. The second verdict's description says `(run
 again after red(<steps>))` and stands. A head already run again keeps
 its verdict, and the label comes off with a comment; on a green, pending
-or unrun head the label just comes off. Only a posting tick, and not an
-instance's (designs/0021), acts on it.
+or unrun head the label just comes off. On a head given up on (failures
+to prepare it, or host faults: neither its own) the label clears those
+counts, so the head is tried again in its old place; the tick logs
+`RERUN ... given up after ...`, posts pending and takes the label off.
+That is not its one run again, and it can be done as often as needed.
+Only a posting tick, and not an instance's (designs/0021), acts on it.
 
 **With `checks.max_wait_minutes`, no head waits on priority for ever**:
 a pull request's head that has waited that long goes before every
@@ -1170,13 +1175,24 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
             entry["since"] = replaced[entry["pr"]]
 
 
+def given_up(entry):
+    """Whether a waiting head was given up on: MAX_ERRORS failures to
+    prepare it, or MAX_ERRORS host faults."""
+    return (entry.get("errors", 0) >= MAX_ERRORS
+            or entry.get("faults", 0) >= MAX_ERRORS)
+
+
 def rerun_kind(state, sha, draft=False, repo=None):
-    """What labels.rerun does to head sha (designs/0022): "again" for a
-    head already run again once, "red" for one to run again, else
+    """What labels.rerun does to head sha (designs/0022): "stuck" for a
+    waiting head given up on, which is tried again (its failures were
+    not its own, so this is not its one run again), "again" for a head
+    already run again once, "red" for one to run again, else
     "nothing", for a green, pending or unrun head, or a draft's or
     another repository's, which aren't run."""
     if draft or (repo is not None and repo != REPO_SLUG):
         return "nothing"
+    if given_up(state["waiting"].get(sha, {})):
+        return "stuck"
     if sha in state.get("reruns", {}):
         return "again"
     r = state["results"].get(sha)
@@ -1214,8 +1230,10 @@ def take_reruns(state, labelled, labellers, when, state_dir, out=print):
     move each labelled red head's verdict into `reruns`, so note_heads
     queues it as if new, and say what is still to do on GitHub, as
     [(pr, sha, what, detail)]: "rerun" (detail: who and the red's
-    steps) to post pending and take the label off, "again" (who) to
-    comment and take it off, "drop" to take it off. A head whose
+    steps) to post pending and take the label off, "stuck" (who) the
+    same for a head given up on, whose counts are cleared and which
+    keeps its place, "again" (who) to comment and take it off, "drop"
+    to take it off. A head whose
     labeller GitHub couldn't name, or that wasn't read (`labellers`), is
     left labelled, for the next tick.
     A head already answered for that labelling only loses the label:
@@ -1236,6 +1254,17 @@ def take_reruns(state, labelled, labellers, when, state_dir, out=print):
                 "tried again next tick" % (pr, sha[:10], RERUN_LABEL))
             continue
         login, at = got
+        if kind == "stuck":
+            entry = state["waiting"][sha]
+            why = ("%d host faults" % entry["faults"]
+                   if entry.get("faults", 0) >= MAX_ERRORS
+                   else "%d failures to prepare it" % entry["errors"])
+            entry.pop("errors", None)
+            entry.pop("faults", None)
+            log(state_dir, "RERUN #%d %s: given up after %s; queued again "
+                "by %s" % (pr, sha[:10], why, login), when, out)
+            todo.append((pr, sha, "stuck", login))
+            continue
         if kind == "again":
             entry = reruns[sha]
             if entry.get("answered") == at:
@@ -1272,6 +1301,9 @@ def finish_reruns(todo, token, run=sh, post=None, out=print):
     for pr, sha, what, login in todo:
         if what == "rerun" and post is not None:
             post(sha, "pending", "queued again after a red, by %s" % login)
+        if what == "stuck" and post is not None:
+            post(sha, "pending", "queued again after it was given up on, "
+                 "by %s" % login)
         if what == "again":
             got = gh(["-X", "POST", "repos/%s/issues/%d/comments"
                       % (REPO_SLUG, pr), "-f", "body=" + rerun_text(sha)],
@@ -1377,8 +1409,7 @@ def live_heads(state, busy=(), when=None):
     running (`busy`), and not started less than START_GRACE before
     `when`."""
     return [s for s, w in state["waiting"].items()
-            if w.get("errors", 0) < MAX_ERRORS
-            and w.get("faults", 0) < MAX_ERRORS and s not in busy
+            if not given_up(w) and s not in busy
             and not just_started(w, when)]
 
 
@@ -3428,8 +3459,7 @@ def estimate(state_dir, checkout, busy=(), run=sh, tip=None):
                           else w.get("lane_key") != key)
                       and not w.get("main")
                       and sha not in busy
-                      and w.get("errors", 0) < MAX_ERRORS
-                      and w.get("faults", 0) < MAX_ERRORS)
+                      and not given_up(w))
     found = {}
     for _, sha, pr in todo:
         selection = lane_steps(checkout, sha, pr, state_dir, run, tip) \

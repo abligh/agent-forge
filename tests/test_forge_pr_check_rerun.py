@@ -249,6 +249,56 @@ class RerunTick(base.StateCase):
         self.assertEqual(self.calls(is_unlabel), [])
 
 
+    def test_a_head_given_up_on_after_host_faults_is_tried_again(self):
+        since = pc.iso(T0 - datetime.timedelta(hours=2))
+        self.write_state({"waiting": {SHA_A: {
+            "pr": 7, "since": since, "faults": pc.MAX_ERRORS}}})
+        self.tick()
+        state = self.state()
+        entry = state["waiting"][SHA_A]
+        self.assertEqual(entry["since"], since)  # its old place
+        self.assertNotIn("faults", entry)
+        self.assertNotIn("reruns", state)
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_A, 7, True, 1)])
+        self.assertEqual(len(self.calls(is_unlabel)), 1)
+        self.assertEqual(self.calls(is_comment), [])
+        self.assertIn((SHA_A, "pending", "queued again after it was given "
+                       "up on, by %s" % LABELLER), self.posts)
+        logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertIn("RERUN #7 aaaaaaaaaa: given up after 3 host faults; "
+                      "queued again by %s" % LABELLER, logged)
+
+    def test_a_head_given_up_on_after_failing_to_prepare_is_tried_again(self):
+        self.write_state({"waiting": {SHA_A: {
+            "pr": 7, "since": pc.iso(T0), "errors": pc.MAX_ERRORS}}})
+        self.tick()
+        self.assertNotIn("errors", self.state()["waiting"][SHA_A])
+        logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertIn("given up after 3 failures to prepare it", logged)
+
+    def test_a_head_not_given_up_on_only_loses_the_label(self):
+        self.write_state({"waiting": {SHA_A: {
+            "pr": 7, "since": pc.iso(T0), "faults": pc.MAX_ERRORS - 1}}})
+        self.tick()
+        self.assertEqual(self.state()["waiting"][SHA_A]["faults"],
+                         pc.MAX_ERRORS - 1)
+        self.assertEqual(self.calls(is_events), [])
+        self.assertEqual(len(self.calls(is_unlabel)), 1)
+        self.assertEqual(self.posts, [])
+
+    def test_trying_a_given_up_head_again_does_not_use_its_one_rerun(self):
+        # A head run again once, then given up on by the host: the label
+        # still frees it, with no refusal comment.
+        self.write_state({"waiting": {SHA_A: {
+            "pr": 7, "since": pc.iso(T0), "faults": pc.MAX_ERRORS}},
+            "reruns": {SHA_A: {
+                "pr": 7, "verdict": red(), "by": AUTHOR, "labelled": AT,
+                "queued": pc.iso(T0), "answered": AT}}})
+        self.tick()
+        self.assertNotIn("faults", self.state()["waiting"][SHA_A])
+        self.assertEqual(self.calls(is_comment), [])
+
+
 class RerunVerdict(base.StateCase):
     """The second run of a head and what it posts."""
 
