@@ -38,11 +38,43 @@ class CheckCpus(unittest.TestCase):
                 mock.patch.object(pc, "online_cpus", lambda: 20):
             self.assertEqual(pc.check_cpus(), 5)
 
+    def test_shared_between_the_busy_slots_only(self):
+        # Six slots and the lane on 32 CPUs: 4 each when all are busy.
+        with mock.patch.object(pc, "FAST_LANE_S", 60):
+            self.assertEqual(pc.check_cpus(online=32, slots=6, busy=7), 4)
+            self.assertEqual(pc.check_cpus(online=32, slots=6, busy=1), 32)
+            self.assertEqual(pc.check_cpus(online=32, slots=6, busy=2), 16)
+            self.assertEqual(pc.check_cpus(online=32, slots=6, busy=3), 10)
+            # Never below the all-slots share, whatever is counted.
+            self.assertEqual(pc.check_cpus(online=32, slots=6, busy=9), 4)
+            self.assertEqual(pc.check_cpus(online=32, slots=6, busy=0), 32)
+
     def test_every_step_gets_it_unless_the_host_set_it(self):
-        with mock.patch.object(pc, "online_cpus", lambda: 8):
-            self.assertEqual(pc.step_env("/s", {})["CHECK_CPUS"], "4")
-            self.assertEqual(
-                pc.step_env("/s", {"CHECK_CPUS": "3"})["CHECK_CPUS"], "3")
+        with tempfile.TemporaryDirectory() as state, \
+                mock.patch.object(pc, "online_cpus", lambda: 8), \
+                mock.patch.dict("os.environ", {"FORGE_PR_CHECK_SLOTS": "4"}):
+            mine = pc.locks.try_lock(pc.lock_path(state, 2), "7 abc")
+            self.addCleanup(mine.close)
+            # Alone, the run gets the host.
+            self.assertEqual(pc.step_env(state, {}, slot=2)["CHECK_CPUS"],
+                             "8")
+            other = pc.locks.try_lock(pc.lock_path(state, 4), "8 def")
+            self.addCleanup(other.close)
+            self.assertEqual(pc.busy_slots(state), 2)
+            self.assertEqual(pc.step_env(state, {}, slot=2)["CHECK_CPUS"],
+                             "4")
+            self.assertEqual(pc.step_env(
+                state, {"CHECK_CPUS": "3"}, slot=2)["CHECK_CPUS"], "3")
+
+    def test_the_lane_counts_when_it_runs(self):
+        with tempfile.TemporaryDirectory() as state, \
+                mock.patch.object(pc, "FAST_LANE_S", 60):
+            held = [pc.locks.try_lock(pc.lock_path(state, slot), "x")
+                    for slot in (1, pc.LANE)]
+            for handle in held:
+                self.addCleanup(handle.close)
+            self.assertEqual(pc.busy_slots(state, slots=2), 2)
+            self.assertEqual(pc.busy_slots(state, slots=1), 2)
 
     def test_online_cpus_is_at_least_one(self):
         self.assertGreaterEqual(pc.online_cpus(), 1)

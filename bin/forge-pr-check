@@ -406,9 +406,12 @@ without the step printing times of its own. The verdict's `logs`
 names the directory. Logs go once they are LOGS_AGE old, and a step's
 log stops at LOGS_MAX bytes before compression, saying so.
 
-**Each step gets `CHECK_CPUS`, its slot's share of the CPUs**: those
-this process may run on, divided by the slots (the fast lane counting
-as one more), and at least 1. A test runner that starts a process or a
+**Each step gets `CHECK_CPUS`, its run's share of the CPUs**: those
+this process may run on, divided by the slots holding a run when this
+one starts (itself included), never less than the share of every
+slot (the fast lane counting as one more), and at least 1. A run
+keeps its share to the end, so one that started alone competes with
+those that start after it. A test runner that starts a process or a
 thread per CPU would otherwise start that many in every slot at once,
 and with the agents' own builds, oversubscribe the host. A value the
 host already sets wins.
@@ -2832,14 +2835,29 @@ def online_cpus():
         return os.cpu_count() or 1
 
 
-def check_cpus(online=None, slots=None):
+def check_cpus(online=None, slots=None, busy=None):
     """CHECK_CPUS: the online CPUs shared between the slots, the fast
-    lane counting as one more, and at least 1."""
+    lane counting as one more, and at least 1. With `busy`, the slots
+    holding a run as this one starts (counting itself), it is shared
+    between those instead, never less than the all-slots share: a run
+    alone gets the whole host."""
     online = online_cpus() if online is None else online
     slots = slots_from_env() if slots is None else slots
     if FAST_LANE_S is not None:
         slots += 1
-    return max(1, online // max(1, slots))
+    share = max(1, online // max(1, slots))
+    if busy is None:
+        return share
+    return max(share, online // max(1, min(busy, slots)))
+
+
+def busy_slots(state_dir, slots=None):
+    """How many slots, the fast lane too, hold a run now."""
+    slots = slots_from_env() if slots is None else slots
+    names = list(range(1, slots + 1))
+    if FAST_LANE_S is not None:
+        names.append(LANE)
+    return sum(running(state_dir, slot) is not None for slot in names)
 
 
 def slot_tmp(state_dir, slot):
@@ -2866,7 +2884,10 @@ def step_env(state_dir, base=None, slot=1):
            and not k.startswith((STEP_DROP_PREFIX,) + DROP_PREFIXES)}
     for name, folder in CACHES.items():
         env.setdefault(name, os.path.join(state_dir, slot_name(folder, slot)))
-    env.setdefault("CHECK_CPUS", str(check_cpus()))
+    # Taken when the run starts, from the slots busy then (itself
+    # included), and kept for the run.
+    env.setdefault("CHECK_CPUS", str(check_cpus(
+        busy=max(1, busy_slots(state_dir)))))
     # Always the slot's: a step stopped mid-build leaves its temporary
     # files where the next run in the slot clears them.
     env["TMPDIR"] = slot_tmp(state_dir, slot)

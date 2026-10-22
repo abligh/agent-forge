@@ -1141,7 +1141,7 @@ class StepEnv(unittest.TestCase):
                                "CARGO_TARGET_DIR": "/s/cargo-target",
                                "XDG_RUNTIME_DIR": "/run/user/%d"
                                % os.getuid(),
-                               "CHECK_CPUS": str(pc.check_cpus()),
+                               "CHECK_CPUS": str(pc.check_cpus(busy=1)),
                                "TMPDIR": "/s/tmp"})
 
     def test_drops_what_the_project_names(self):
