@@ -90,8 +90,9 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "hold_conflicting": bool, "yield_after_hand_back": int,
          "yield_cap": int, "yield_ignores_conflicts": bool,
          "right_of_way": dict, "code_owners": bool,
-         "early_conflicts": bool}
+         "early_conflicts": bool, "stacks": dict}
 RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int}
+STACKS = {"max_run": int}
 TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool}
 STALL_ALERT = {"tell": list, "retell_minutes": int,
                "owner_after_minutes": int, "title": str, "labels": list}
@@ -425,6 +426,11 @@ def check(data):
                 if _is(row.get(key), int) and row[key] < 1:
                     problems.append("merge.right_of_way.%s must be at least 1"
                                     % key)
+        if isinstance(merge.get("stacks"), dict):
+            stacks = merge["stacks"]
+            _fields("merge.stacks", stacks, STACKS, problems)
+            if _is(stacks.get("max_run"), int) and stacks["max_run"] < 0:
+                problems.append("merge.stacks.max_run must be at least 0")
     for name, allowed in (("labels", LABELS), ("relay", RELAY)):
         section = data.get(name, {})
         for key, kinds in allowed.items():

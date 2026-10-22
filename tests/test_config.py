@@ -337,6 +337,18 @@ class Check(unittest.TestCase):
             "merge.stall_alert.labels must be a list"])
         self.assertEqual(self.problems(merge={"stall_alert": {}}), [])
 
+    def test_merge_stacks(self):
+        self.assertEqual(self.problems(merge={"stacks": {}}), [])
+        self.assertEqual(self.problems(merge={"stacks": {"max_run": 3}}), [])
+        self.assertEqual(self.problems(merge={"stacks": {
+            "max_run": -1, "depth": 2}}), [
+            "merge.stacks: unknown key 'depth'",
+            "merge.stacks.max_run must be at least 0"])
+        self.assertEqual(self.problems(merge={"stacks": {"max_run": True}}),
+                         ["merge.stacks.max_run must be an integer"])
+        self.assertEqual(self.problems(merge={"stacks": True}),
+                         ["merge.stacks must be an object"])
+
     def test_merge_test_ahead(self):
         self.assertEqual(self.problems(merge={"test_ahead": {
             "depth": -1, "max_age_hours": 0, "width": 2,

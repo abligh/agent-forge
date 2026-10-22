@@ -3628,3 +3628,201 @@ class CodeOwners(RepoCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StackCoversHead(RepoCase):
+    """designs/0025: a clean merge of a merged lower layer's head covers
+    the head of the layer above it; a hand-resolved one doesn't."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.branch("upper", "feature")
+        self.approved = self.repo.commit("u.txt", "upper\n", "upper")
+
+    def lower_change(self, name, text):
+        self.repo.branch("feature", "feature")
+        lower = self.repo.commit(name, text, "lower " + name)
+        self.repo.branch("upper", "upper")
+        return lower
+
+    def test_a_clean_merge_of_the_merged_layer_below(self):
+        lower = self.lower_change("l.txt", "lower\n")
+        head = self.repo.merge("feature")
+        self.assertEqual(m.covers_head(
+            self.repo.path, self.approved, head, "refs/remotes/origin/main",
+            below=(lower,)), (True, None))
+        covered, why = self.covers(head)
+        self.assertFalse(covered)
+        self.assertIn("merges nothing from main", why)
+
+    def test_a_hand_resolved_merge_of_the_layer_below(self):
+        lower = self.lower_change("u.txt", "lower's own\n")
+        got = subprocess.run(["git", "-C", self.repo.path, "merge", "-q",
+                              "--no-edit", "feature"], capture_output=True,
+                             text=True, env=dict(
+                                 os.environ, GIT_AUTHOR_NAME="t",
+                                 GIT_AUTHOR_EMAIL="t@t",
+                                 GIT_COMMITTER_NAME="t",
+                                 GIT_COMMITTER_EMAIL="t@t"))
+        self.assertNotEqual(got.returncode, 0)
+        with open(os.path.join(self.repo.path, "u.txt"), "w") as handle:
+            handle.write("both\n")
+        run_git(self.repo.path, "add", "u.txt")
+        run_git(self.repo.path, "commit", "-q", "--no-edit")
+        head = run_git(self.repo.path, "rev-parse", "HEAD")
+        covered, why = m.covers_head(
+            self.repo.path, self.approved, head, "refs/remotes/origin/main",
+            below=(lower,))
+        self.assertFalse(covered)
+        self.assertIn("not the clean merge", why)
+
+
+class Stacks(RepoCase):
+    """designs/0025: with merge.stacks, a stack merges as a unit."""
+
+    def setUp(self):
+        super().setUp()
+        m.configure(project(stacks={}))
+        self.addCleanup(m.configure, project())
+        self.state = os.path.join(self.tmp.name, "state")
+        # #5 is the bottom layer, on main; #6 is stacked on #5's branch.
+        self.lower = self.approved
+        self.repo.publish_pr(5, self.lower)
+        self.repo.branch("upper", "feature")
+        self.upper = self.repo.commit("u.txt", "upper\n", "upper")
+        self.repo.publish_pr(6, self.upper)
+        self.repo.branch("feature", "feature")
+
+    def bottom(self):
+        return pr(5, head=self.lower,
+                  reviews=[review(REVIEWER, oid=self.lower)])
+
+    def layer(self, base="b5", reviews=None):
+        return pr(6, T1, base=base, head=self.upper, reviews=[
+            review(REVIEWER, oid=self.upper)] if reviews is None else reviews)
+
+    def tick(self, prs, live=True, minutes=0):
+        github = FakeGitHub(answers(prs=prs))
+        self.github = github
+        lines = []
+        start = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                                  tzinfo=datetime.timezone.utc)
+        record = m.tick(self.repo.path, self.state, github, tools_run(),
+                        lines.append,
+                        now=lambda: start + datetime.timedelta(minutes=minutes),
+                        live=live)
+        if not live:
+            self.assertEqual(github.writes, [])
+        return record, lines
+
+    def squash_bottom_onto_main(self):
+        """What GitHub's squash merge of #5 leaves on main."""
+        self.repo.branch("main", "main")
+        self.repo.commit("f.txt", "feature\n", "#5, squashed")
+        self.repo.push("main")
+        self.repo.branch("feature", "feature")
+
+    def stack_file(self):
+        return m.load_json(os.path.join(self.state, m.STACK_FILE), None)
+
+    def merge_bottom(self):
+        record, _ = self.tick([self.bottom(), self.layer()])
+        self.assertEqual([(d["pr"], d["action"], d.get("result"))
+                          for d in record["decisions"]],
+                         [(5, "MERGE", "done")])
+        self.squash_bottom_onto_main()
+        return record
+
+    def test_held_as_stacked_only_with_the_setting(self):
+        record, _ = self.tick([self.bottom(), self.layer()], live=False)
+        self.assertEqual(record["held"], {"6": "stacked on #5"})
+        m.configure(project())
+        record, _ = self.tick([self.bottom(), self.layer()], live=False)
+        self.assertEqual(record["held"], {"6": "based on b5, not main"})
+
+    def test_a_merge_records_the_layers_above(self):
+        record = self.merge_bottom()
+        self.assertEqual(record["stack"], [{"pr": 6, "after": 5}])
+        self.assertEqual(self.stack_file(), {
+            "at": "2026-10-07T12:00:00Z", "heads": [self.lower], "run": 1,
+            "pending": [{"pr": 6, "after": 5, "branch": "b5"}]})
+        self.assertTrue(m.moved_a_stack(record))
+
+    def test_the_next_tick_retargets_the_layer(self):
+        self.merge_bottom()
+        record, lines = self.tick([self.layer()], live=False, minutes=1)
+        self.assertEqual(record["decisions"], [{
+            "action": "RETARGET", "pr": 6, "head": self.upper, "after": 5}])
+        self.assertIn("STACK #6: would be retargeted to main after #5 "
+                      "merged; 0 above", lines)
+        record, lines = self.tick([self.layer()], minutes=1)
+        self.assertEqual(self.github.writes, [
+            ("PATCH", SLUG + "/pulls/6", {"base": "main"})])
+        self.assertEqual(record["decisions"][0]["result"], "done")
+        self.assertIn("STACK #6: retargeted to main after #5 merged; "
+                      "0 above", lines)
+        self.assertTrue(m.moved_a_stack(record))
+
+    def other(self, number=4):
+        """An approved pull request on main, opened before the stack."""
+        self.repo.branch("other", "origin/main")
+        sha = self.repo.commit("o.txt", "other\n", "other")
+        self.repo.publish_pr(number, sha)
+        self.repo.branch("feature", "feature")
+        return pr(number, "2026-10-07T09:00:00Z", head=sha,
+                  reviews=[review(REVIEWER, oid=sha)])
+
+    def test_the_retargeted_layer_goes_first(self):
+        self.merge_bottom()
+        older = self.other()
+        record, _ = self.tick([older, self.layer("main")], minutes=2)
+        self.assertEqual(record["queue"], [6, 4])
+        # Behind main by #5's squash, which merges cleanly into it.
+        self.assertEqual((record["decisions"][0]["pr"],
+                          record["decisions"][0]["action"]), (6, "UPDATE"))
+        self.assertEqual(record["stack"], [{"pr": 6, "after": 5}])
+
+    def test_max_run_lets_the_queue_have_a_turn(self):
+        m.configure(project(stacks={"max_run": 1}))
+        self.merge_bottom()
+        older = self.other()
+        record, _ = self.tick([older, self.layer("main")], live=False,
+                              minutes=2)
+        self.assertEqual(record["queue"], [4, 6])
+
+    def test_a_layer_that_is_not_eligible_ends_the_stack(self):
+        self.merge_bottom()
+        record, lines = self.tick([self.layer(reviews=[])], minutes=1)
+        self.assertEqual(self.github.writes, [])
+        self.assertEqual(record["held"], {
+            "6": "stacked on #5, which merged, but no Reviewer approval"})
+        self.assertNotIn("stack", record)
+        self.assertIsNone(self.stack_file())
+
+    def test_a_held_layer_says_the_one_below_merged(self):
+        self.merge_bottom()
+        spoken = self.layer()
+        spoken["comments"] = [comment(PEER, T3)]
+        record, _ = self.tick([spoken], minutes=1)
+        self.assertNotIn("PATCH", [w[0] for w in self.github.writes])
+        self.assertEqual(record["held"]["6"],
+                         "stacked on #5, which merged, but comment by %s "
+                         "at %s, after the approval" % (PEER, T3))
+        self.assertIsNone(self.stack_file())
+
+    def test_a_stale_or_closed_stack_is_forgotten(self):
+        self.merge_bottom()
+        record, _ = self.tick([], minutes=1)
+        self.assertNotIn("stack", record)
+        self.assertIsNone(self.stack_file())
+        m.save_json(os.path.join(self.state, m.STACK_FILE), {
+            "at": "2026-10-07T12:00:00Z", "heads": [self.lower], "run": 1,
+            "pending": [{"pr": 6, "after": 5, "branch": "b5"}]})
+        record, _ = self.tick([self.layer()], minutes=60 * 25)
+        self.assertEqual(record["decisions"], [])
+        self.assertEqual(record["held"], {"6": "based on b5, not main"})
+        self.assertIsNone(self.stack_file())
+
+    def test_a_dry_run_merge_records_nothing(self):
+        self.tick([self.bottom(), self.layer()], live=False)
+        self.assertIsNone(self.stack_file())

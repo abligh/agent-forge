@@ -117,6 +117,22 @@ and none past the group's end. A hand-back to the approving reviewer
 keeps its place and never yields. The record's `yielded` says who
 moved back how many places.
 
+**With `merge.stacks`, a stack of pull requests merges as a unit**
+(designs/0025; default off). A pull request based on another open one's
+head branch is held as `stacked on #Q`, so it can be approved while it
+waits. When a live tick merges Q, the open pull requests stacked on it
+are recorded in `stacks.json` in the state directory, with Q's head,
+and the run goes on. The next tick retargets the first such layer that
+is eligible but for its base to `main` (`RETARGET`, printing `STACK #N:
+retargeted to main after #Q merged; K above`), as its only write. Once
+on `main`, a layer goes first in the queue, after only the one a
+`test_ahead` run is in flight for, and is updated, checked and merged
+like any other; a merge of a merged layer's head into it, made after its
+approval, covers its head like a merge of `main` when it is clean. A
+layer that isn't eligible ends the stack and is held as usual. With
+`max_run`, once that many layers merged in a row the next keeps its
+usual place. The record's `stack` lists the layers still to come.
+
 **`--dry-run` writes nothing to GitHub.** It reads with the Merger's
 App too, since a dry run is how to watch the Merger before it acts.
 
@@ -516,6 +532,12 @@ CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
 # merge.right_of_way: after ROW_AFTER conflict hand-backs, those that
 # conflict with the pull request's clean head are held for ROW_FOR.
 RIGHT_OF_WAY = False
+# designs/0025: a stack of pull requests merges as a unit.
+STACKS = False
+STACK_MAX_RUN = 0
+STACK_FILE = "stacks.json"
+STACK_FOR = datetime.timedelta(hours=24)
+STACK_REASON = "stacked on #%d"
 ROW_AFTER = 2
 ROW_FOR = datetime.timedelta(minutes=60)
 ROW_REASON = "conflicts with #%d, which has right of way"
@@ -533,7 +555,9 @@ def configure(project):
     (default none: nobody yields), `yield_cap` (default 3),
     `yield_ignores_conflicts` (default false) and `right_of_way`
     (default none: nobody has it; `after_conflicts`, default 2, and
-    `minutes`, default 60) and `code_owners` (default false). The
+    `minutes`, default 60) and `code_owners` (default false) and
+    `stacks` (default none: a stacked pull request is held; `max_run`,
+    default 0, no limit). The
     `checks` section: `context` and `poster` (default the merger).
     `labels.waiting_on_owner` is the label a long stall gets, and
     `labels.urgent` the label that puts a pull request first."""
@@ -544,6 +568,7 @@ def configure(project):
     global TEST_AHEAD, AHEAD_DEPTH, HOLD_CONFLICTING, YIELD_PLACES
     global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
     global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS, URGENT_LABEL
+    global STACKS, STACK_MAX_RUN
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -585,6 +610,9 @@ def configure(project):
     RIGHT_OF_WAY = row is not None
     ROW_AFTER = (row or {}).get("after_conflicts", 2)
     ROW_FOR = datetime.timedelta(minutes=(row or {}).get("minutes", 60))
+    stacks = merge.get("stacks")
+    STACKS = stacks is not None
+    STACK_MAX_RUN = (stacks or {}).get("max_run", 0)
 
 NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
 BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
@@ -753,15 +781,21 @@ def deferral_of(pr, now):
     return None
 
 
-def eligible(pr, open_numbers, now=None):
+def eligible(pr, open_numbers, now=None, stacked=None, any_base=False):
     """(approval, None) when `pr` is the Merger's, so far as GitHub's
     records say, or (None, reason). Whether the approval covers the head
     needs git, so `covers_head` asks that separately. `open_numbers` is
     every open pull request and issue a `Blocked-by:` line could name;
-    `now` decides whether a `Defer-until:` has passed."""
+    `now` decides whether a `Defer-until:` has passed. With STACKS,
+    `stacked` maps each open pull request's head branch to its number,
+    so one based on it is held as stacked on it; `any_base` judges the
+    rest as if the base were `main`."""
     if pr.get("isDraft"):
         return None, "draft"
-    if pr.get("baseRefName") != MAIN:
+    if pr.get("baseRefName") != MAIN and not any_base:
+        below = (stacked or {}).get(pr.get("baseRefName"))
+        if STACKS and below is not None:
+            return None, STACK_REASON % below
         return None, "based on %s, not %s" % (pr.get("baseRefName"), MAIN)
     approval = approval_of(pr)
     if approval is None:
@@ -964,21 +998,25 @@ def is_ancestor(repo, older, newer, run=sh):
                run=run).returncode == 0
 
 
-def covers_head(repo, approved, head, main_ref, run=sh):
+def covers_head(repo, approved, head, main_ref, run=sh, below=()):
     """(True, None) if the approval at `approved` covers `head`, else
-    (False, reason). Both commits and `main_ref` must be in `repo`."""
+    (False, reason). Both commits and `main_ref` must be in `repo`.
+    `below` are the heads of a stack's layers already merged (STACKS):
+    a clean merge of one of them, as of `main`, covers the head too."""
     if not is_ancestor(repo, approved, head, run):
         return False, "the approved commit %s is not in the head's history" % (
             approved[:10])
     got = git(repo, "rev-list", "--parents", head, "^" + approved,
-              "^" + main_ref, run=run)
+              "^" + main_ref, *("^" + b for b in below), run=run)
     if got.returncode != 0:
         return False, "git rev-list failed: %s" % got.stderr.strip()
     for line in got.stdout.splitlines():
         sha, *parents = line.split()
         if len(parents) != 2:
             return False, "%s, after the approval, is not a merge" % sha[:10]
-        if not any(is_ancestor(repo, p, main_ref, run) for p in parents):
+        if not any(is_ancestor(repo, p, main_ref, run)
+                   or any(is_ancestor(repo, p, b, run) for b in below)
+                   for p in parents):
             return False, "%s merges nothing from %s" % (sha[:10], MAIN)
         merged = git(repo, "merge-tree", "--write-tree", *parents, run=run)
         tree = git(repo, "rev-parse", sha + "^{tree}", run=run)
@@ -1272,10 +1310,10 @@ def fetch_open_issues(github):
     return set(got or [])
 
 
-def decide(pr, approval, repo, main_tip, github, env, run=sh):
+def decide(pr, approval, repo, main_tip, github, env, run=sh, below=()):
     """The action for one eligible pull request, as a dictionary with
     `action`, and `to` and `reason` for a hand-back. Reads, never
-    writes."""
+    writes. `below` is passed to `covers_head`."""
     number, head = pr["number"], pr["headRefOid"]
     approver = APPROVERS.get(login(approval), "a reviewer")
 
@@ -1294,7 +1332,7 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh):
     if not approved:
         return back(approver, "the approval names no commit")
     main_ref = "refs/remotes/origin/" + MAIN
-    covered, why = covers_head(repo, approved, head, main_ref, run)
+    covered, why = covers_head(repo, approved, head, main_ref, run, below)
     if not covered:
         return dict(back(approver, why),
                     paths=review_paths(repo, approved, head, main_ref, run))
@@ -1397,6 +1435,8 @@ def carry_out(decision, approval, github, said):
     elif decision["action"] == "MERGE":
         ok, why = github.write("PUT", path + "/merge", sha=head,
                                merge_method="squash")
+    elif decision["action"] == "RETARGET":
+        ok, why = github.write("PATCH", path, base=MAIN)
     elif decision["action"] == "HAND-BACK":
         key = hand_back_key(approval, head, decision["reason"])
         if said.get(str(number)) == key:
@@ -2239,6 +2279,105 @@ def merged_one(record):
                for d in (record or {}).get("decisions") or ())
 
 
+def moved_a_stack(record):
+    """Whether the tick that wrote `record` merged a pull request or
+    retargeted a stack's next layer: either way the run goes on."""
+    return merged_one(record) or any(
+        d.get("action") == "RETARGET" and d.get("result") == "done"
+        for d in (record or {}).get("decisions") or ())
+
+
+def load_stack(state_dir, prs, when):
+    """The stack in progress (designs/0025), from STACK_FILE: `heads`
+    merged so far, `run` (layers merged in a row) and `pending`, each
+    `{"pr", "after", "branch"}`, with the pull requests no longer open
+    left out. Empty when there is none, or it is older than STACK_FOR."""
+    state = load_json(os.path.join(state_dir, STACK_FILE), {})
+    if not isinstance(state, dict) or not state.get("pending"):
+        return {}
+    try:
+        at = parse_time(state.get("at") or "")
+    except ValueError:
+        return {}
+    if when - at > STACK_FOR:
+        return {}
+    open_now = {pr["number"] for pr in prs}
+    state["pending"] = [e for e in state["pending"] if e.get("pr") in open_now]
+    return state if state["pending"] else {}
+
+
+def next_layer(stack, prs, candidates, open_numbers, when, held):
+    """(stack, retarget): `stack` without the layers that end it, and
+    the first layer still based on the merged branch below it that is
+    eligible but for its base, as (pull request, number below), or None.
+    A layer already on `main` stays while it is a candidate. A layer
+    that isn't eligible ends the stack there and is held as usual, its
+    reason saying the layer below merged."""
+    by_number = {pr["number"]: pr for pr in prs}
+    chosen = {pr["number"] for pr in candidates}
+    pending, retarget = [], None
+    for entry in stack["pending"]:
+        pr = by_number.get(entry["pr"])
+        if pr is None:
+            continue
+        if pr.get("baseRefName") == MAIN:
+            if pr["number"] in chosen:
+                pending.append(entry)
+            continue
+        if pr.get("baseRefName") != entry["branch"]:
+            continue
+        approval, why = eligible(pr, open_numbers, when, any_base=True)
+        if approval is None:
+            held[str(pr["number"])] = "%s, which merged, but %s" % (
+                STACK_REASON % entry["after"], why)
+            continue
+        pending.append(entry)
+        if retarget is None:
+            retarget = (pr, entry["after"])
+    return dict(stack, pending=pending) if pending else {}, retarget
+
+
+def save_stack(state_dir, stack):
+    """Write `stack` to STACK_FILE, or remove the file when it's empty."""
+    path = os.path.join(state_dir, STACK_FILE)
+    if stack:
+        save_json(path, stack)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+def stacked_above(number, prs):
+    """How many open pull requests are stacked, at any depth, on `number`."""
+    by_number = {pr["number"]: pr for pr in prs}
+    branches, count = {by_number[number]["headRefName"]}, 0
+    while branches:
+        above = [pr for pr in prs if pr.get("baseRefName") in branches]
+        count += len(above)
+        branches = {pr["headRefName"] for pr in above}
+    return count
+
+
+def note_merge(state_dir, stack, pr, prs, when):
+    """After `pr` merged: the open, non-draft pull requests stacked on
+    it become the stack's next layers, and STACK_FILE is rewritten (or
+    removed when nothing is pending). Returns the new stack."""
+    pending = [e for e in stack.get("pending", ()) if e["pr"] != pr["number"]]
+    was_layer = len(pending) < len(stack.get("pending", ()))
+    above = sorted((p for p in prs if p.get("baseRefName") == pr["headRefName"]
+                    and not p.get("isDraft")),
+                   key=lambda p: (p["createdAt"], p["number"]))
+    pending += [{"pr": p["number"], "after": pr["number"],
+                 "branch": pr["headRefName"]} for p in above]
+    heads = list(stack.get("heads", ()))
+    if was_layer or above:
+        heads.append(pr["headRefOid"])
+    run = (stack.get("run", 0) + 1 if was_layer else 1 if above else 0)
+    new = ({"at": iso(when), "heads": heads, "run": run, "pending": pending}
+           if pending else {})
+    save_stack(state_dir, new)
+    return new
+
+
 def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
          sleep=time.sleep, live=False, send=None):
     """One tick: the queue, and the action for its first pull request
@@ -2261,8 +2400,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     open_numbers = {pr["number"] for pr in prs} | fetch_open_issues(github)
     candidates, approvals, held, spoken = [], {}, {}, []
     when = now()
+    heads = {pr["headRefName"]: pr["number"] for pr in prs
+             if pr.get("headRefName")}
     for pr in prs:
-        approval, why = eligible(pr, open_numbers, when)
+        approval, why = eligible(pr, open_numbers, when, heads)
         if approval is not None:
             candidates.append(pr)
             approvals[pr["number"]] = approval
@@ -2320,6 +2461,18 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         places = locked_order(state_dir, queue)
         queue.sort(key=lambda pr: (pr["number"] != in_flight, places.get(
             pr["number"], len(places))))
+    stack, retarget = (load_stack(state_dir, prs, when) if STACKS else {}), None
+    if stack:
+        stack, retarget = next_layer(stack, prs, candidates, open_numbers,
+                                     when, held)
+    if STACKS and live:
+        save_stack(state_dir, stack)
+    if stack:
+        first = [e["pr"] for e in stack.get("pending", ())]
+        if STACK_MAX_RUN and stack.get("run", 0) >= STACK_MAX_RUN:
+            first = []
+        queue.sort(key=lambda pr: (pr["number"] != in_flight,
+                                   pr["number"] not in first))
     held_by = (conflicts_ahead(repo, queue, run, main_tip)
                if HOLD_CONFLICTING else {})
     for number, ahead in held_by.items():
@@ -2331,6 +2484,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         record["yielded"] = {str(n): p for n, p in sorted(yielded.items())}
     if RIGHT_OF_WAY:
         record["right_of_way"] = row
+    if stack:
+        record["stack"] = [{"pr": e["pr"], "after": e["after"]}
+                           for e in stack["pending"]]
     said_path = os.path.join(state_dir, "handed-back.json")
     said = load_json(said_path, {})
     if spoken or os.path.exists(os.path.join(state_dir, HELD_FILE)):
@@ -2341,10 +2497,25 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                                      row_held)
     waiting_on = waiting = None
     stopped = len(queue)
-    for at, pr in enumerate(queue):
+    if retarget is not None:
+        # One write a tick: the stack's next layer goes onto main, and
+        # the run goes on to judge it there.
+        layer, after = retarget
+        decision = {"action": "RETARGET", "pr": layer["number"],
+                    "head": layer["headRefOid"], "after": after}
+        if live:
+            decision["result"] = carry_out(decision, None, github, said)
+        record["decisions"].append(decision)
+        out("STACK #%d: %sretargeted to %s after #%d merged; %d above" % (
+            layer["number"], "" if live else "would be ", MAIN, after,
+            stacked_above(layer["number"], prs)))
+        stopped = 0
+    below = tuple(stack.get("heads", ())) if stack else ()
+    layers = {e["pr"] for e in stack.get("pending", ())} if stack else set()
+    for at, pr in enumerate([] if retarget is not None else queue):
         approval = approvals[pr["number"]]
         decision = decide(pr, approval, repo, main_tip, github, github.env,
-                          run)
+                          run, below if pr["number"] in layers else ())
         decision.update(pr=pr["number"], head=pr["headRefOid"])
         if (decision["action"] == "UPDATE"
                 and said.get(str(pr["number"])) == hand_back_key(
@@ -2388,6 +2559,12 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if result is not None:
                 decision["result"] = result
         record["decisions"].append(decision)
+        if (STACKS and live and decision["action"] == "MERGE"
+                and decision.get("result") == "done"):
+            stack = note_merge(state_dir, stack or {}, pr, prs, when)
+            if stack:
+                record["stack"] = [{"pr": e["pr"], "after": e["after"]}
+                                   for e in stack["pending"]]
         if (decision["action"] == "UPDATE"
                 and "merge conflict" in (decision.get("result") or "")):
             # The backstop for a conflict git didn't see: GitHub's word
@@ -2553,7 +2730,7 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
             for _ in range(TICKS_PER_RUN):
                 record = tick(repo, state_dir, GitHub(token, run), run,
                               out, live=not args.dry_run, send=send)
-                if args.dry_run or not merged_one(record):
+                if args.dry_run or not moved_a_stack(record):
                     break
         except (RuntimeError, KeyError, TypeError, ValueError) as err:
             out("FAILED: %s" % err)
