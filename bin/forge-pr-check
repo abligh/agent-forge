@@ -51,8 +51,10 @@ moved is stopped by the next tick (below).
 
 **A run the host broke is no verdict.** A failed step that exited 126
 or 127 (its command can't be run: a tool missing from the host's
-`PATH`, say) or whose output says `No space left on device` (or
-`ENOSPC`) failed for the host, not the head. Such a run records no
+`PATH`, say), whose output says so for a command behind a wrapper
+(make's `*** [...] Error 127`, or a shell's `...: not found` line), or
+whose output says `No space left on device` (or `ENOSPC`) failed for
+the host, not the head. Such a run records no
 verdict and posts nothing more: the head stays waiting, `pending`, its
 faults counted (`faults`, apart from a checkout's `errors`), and
 `verdicts.log` says `HOST-FAULT` with the step and why. It keeps its
@@ -1994,18 +1996,30 @@ def _final_status(r, selection, ran, skipped, where):
 HOST_FAULT_TEXT = ("No space left on device", "ENOSPC")
 # checks.host_fault_text: the project's own, added to those.
 HOST_FAULT_EXTRA = ()
+# A command that could not be run, behind a wrapper that exits with a
+# status of its own: make's report of a recipe's 126 or 127, and the
+# shells' "not found" (agent-forge #31).
+UNRUNNABLE = re.compile(
+    r"^(?:g?make(?:\[\d+\])?: \*\*\* .*Error 12[67]"
+    r"|(?:/usr)?(?:/bin/)?(?:ba|da)?sh(?:: line \d+|: \d+)?: "
+    r"\S.*: (?:command )?not found)$", re.M)
 
 
 def host_fault(results):
     """(step, why) for the first failed step the host broke, or None:
     one that exited 126 or 127, so its command could not be run, or
-    whose output says the disk is full or holds one of
-    checks.host_fault_text, which `why` quotes."""
+    whose output says so for a command behind it (make's "Error 127",
+    the shell's "not found"), or says the disk is full, or holds one
+    of checks.host_fault_text, which `why` quotes."""
     for r in results:
         if r["rc"] == 0:
             continue
         if r["rc"] in (126, 127):
             return r["name"], "exit %d: its command could not be run" % r["rc"]
+        unrunnable = UNRUNNABLE.search(r["tail"])
+        if unrunnable:
+            return r["name"], "a command behind it could not be run: %s" % (
+                json.dumps(unrunnable.group(0).strip(), ensure_ascii=False))
         if any(text in r["tail"] for text in HOST_FAULT_TEXT):
             return r["name"], "no space left on device"
         for text in HOST_FAULT_EXTRA:

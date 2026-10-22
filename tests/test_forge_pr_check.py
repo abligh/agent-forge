@@ -1419,6 +1419,39 @@ class Worker(StateCase):
         self.assertIn("test: no space left on device", pathlib.Path(
             self.state_dir, "verdicts.log").read_text())
 
+    def test_a_missing_command_behind_make_is_a_host_fault(self):
+        # agent-forge #31: make exits 2 for a recipe's 127, so only its
+        # output says the command could not be run.
+        self.queue()
+        self.assertEqual(self.work(self.faulty(rc=2, text=(
+            "cd ui/console && npm ci --no-fund --no-audit\n"
+            "/bin/sh: 1: npm: not found\n"
+            "make: *** [Makefile:22: ui/console/node_modules/"
+            ".package-lock.json] Error 127\n"))), 2)
+        self.assertNotIn(SHA_A, self.state().get("results", {}))
+        self.assertIn("HOST-FAULT #7 aaaaaaaaaa: test: a command behind it "
+                      "could not be run: \"/bin/sh: 1: npm: not found\"",
+                      pathlib.Path(self.state_dir, "verdicts.log").read_text())
+
+    def test_what_says_a_command_could_not_be_run(self):
+        def fault(text, rc=2):
+            return pc.host_fault([{"name": "s", "rc": rc, "tail": text}])
+        for text in ("make: *** [Makefile:3: x] Error 127\n",
+                     "make[2]: *** [sub/Makefile:9: all] Error 126\n",
+                     "gmake: *** [x] Error 127\n",
+                     "bash: line 1: cargo-nextest: command not found\n",
+                     "/bin/bash: wasm-pack: command not found\n",
+                     "sh: 1: npx: not found\n",
+                     "/usr/bin/sh: 1: npx: not found\n"):
+            self.assertIsNotNone(fault(text), text)
+        for text in ("make: *** [Makefile:3: test] Error 2\n",
+                     "make: *** [Makefile:3: test] Error 1270\n",
+                     "--- FAIL: TestOpen: file not found\n",
+                     "    assert 'x: command not found' in out\n",
+                     "warning: sh: 1: npx: not found, retrying\n"):
+            self.assertIsNone(fault(text), text)
+        self.assertIsNone(fault("make: *** [x] Error 127\n", rc=0))
+
     def test_repeated_host_faults_give_up_with_error(self):
         self.queue(faults=pc.MAX_ERRORS - 1)
         posts, chained = [], []
