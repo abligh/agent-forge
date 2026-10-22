@@ -467,13 +467,13 @@ class TraceMatchedMain(DigestCase):
                            {"a": []}, source="run")
         return tip, other
 
-    def work_main(self, sha, at=T0 + DAY, slot=1):
+    def work_main(self, sha, at=T0 + DAY, slot=1, post=None):
         self.write_state(dict(self.state(), waiting={sha: {
             "pr": 0, "main": True, "since": pc.iso(at)}}))
         clock = iter([at + datetime.timedelta(minutes=1),
                       at + datetime.timedelta(minutes=2)])
         return pc.worker(self.repo, self.state_dir, sha, 0, pc.sh,
-                         self.lines.append, lambda: next(clock), None,
+                         self.lines.append, lambda: next(clock), post,
                          slot=slot, main=True)
 
     def test_a_stale_record_runs_it_traced(self):
@@ -490,6 +490,17 @@ class TraceMatchedMain(DigestCase):
         self.assertEqual(self.work_main(tip), 0)
         self.assertEqual(self.ran(), [])
         self.assertEqual(self.state()["results"][tip]["matched"], other)
+
+    def test_a_matched_head_posts_green_naming_what_it_matched(self):
+        tip, other = self.green_elsewhere({"Z": "z\n"})
+        posts = []
+        self.assertEqual(self.work_main(
+            tip, post=lambda *a: posts.append(a) or True), 0)
+        (sha, state, description), = posts
+        self.assertEqual((sha, state), (tip, "success"))
+        self.assertIn("tree tested as %s (#7's head)" % other[:10],
+                      description)
+        self.assertIs(self.state()["results"][tip]["posted"], True)
 
     def test_off_a_stale_record_is_matched_as_before(self):
         tip, other = self.green_elsewhere({"B": "b2\n"})

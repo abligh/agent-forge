@@ -4055,7 +4055,10 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             if same is not None and same != sha and not trace_matched(
                     state_dir, wt, sha, tree, slot, started, run, out):
                 settled = True
-                matched(state_dir, sha, 0, same, tree, started, None, out,
+                # Posted like any verdict, so every green default-branch
+                # commit carries a status, and a release is only tagged
+                # on one a run here vouched for.
+                matched(state_dir, sha, 0, same, tree, started, post, out,
                         main=True)
                 if report is not None:
                     report(sha, True, [], same)
