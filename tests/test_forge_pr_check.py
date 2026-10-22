@@ -1433,6 +1433,26 @@ class Worker(StateCase):
                       "could not be run: \"/bin/sh: 1: npm: not found\"",
                       pathlib.Path(self.state_dir, "verdicts.log").read_text())
 
+    def test_a_container_that_could_not_start_is_a_host_fault(self):
+        # Docker's runc failing to mount the container's root (an overlay
+        # race): the step's own work never ran.
+        line = ("docker: Error response from daemon: failed to create task "
+                "for container: failed to create shim task: OCI runtime "
+                "create failed: runc create failed: unable to start "
+                "container process: error during container init: error "
+                "mounting \"/usr/libexec/docker/docker-init\" to rootfs at "
+                "\"/sbin/docker-init\": no such file or directory: unknown.")
+        name, why = pc.host_fault([{"name": "svg", "rc": 2, "tail": (
+            "1.597 2 " + line + "\n"
+            "1.601 1 test result: FAILED. 0 passed; 1 failed\n"
+            "1.612 2 make: *** [Makefile:498: test-svg] Error 101\n")}])
+        self.assertEqual(name, "svg")
+        self.assertTrue(why.startswith(
+            "a container could not be started: \"1.597 2 docker: Error"), why)
+        self.assertLessEqual(len(why), 340)
+        self.assertIsNone(pc.host_fault([{"name": "s", "rc": 1, "tail":
+            "docker: Error response from daemon: No such image: x\n"}]))
+
     def test_what_says_a_command_could_not_be_run(self):
         def fault(text, rc=2):
             return pc.host_fault([{"name": "s", "rc": rc, "tail": text}])

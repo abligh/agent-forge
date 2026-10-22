@@ -52,8 +52,10 @@ moved is stopped by the next tick (below).
 **A run the host broke is no verdict.** A failed step that exited 126
 or 127 (its command can't be run: a tool missing from the host's
 `PATH`, say), whose output says so for a command behind a wrapper
-(make's `*** [...] Error 127`, or a shell's `...: not found` line), or
-whose output says `No space left on device` (or `ENOSPC`) failed for
+(make's `*** [...] Error 127`, or a shell's `...: not found` line),
+whose output says the container runtime could not start a container
+(docker's `OCI runtime create failed` or `failed to create shim task`),
+or whose output says `No space left on device` (or `ENOSPC`) failed for
 the host, not the head. Such a run records no
 verdict and posts nothing more: the head stays waiting, `pending`, its
 faults counted (`faults`, apart from a checkout's `errors`), and
@@ -2288,14 +2290,20 @@ UNRUNNABLE = re.compile(
     r"^(?:g?make(?:\[\d+\])?: \*\*\* .*Error 12[67]"
     r"|(?:/usr)?(?:/bin/)?(?:ba|da)?sh(?:: line \d+|: \d+)?: "
     r"\S.*: (?:command )?not found)$", re.M)
+# A container the host's container runtime could not start: docker's
+# report when runc fails to set up the container's root filesystem,
+# as an overlay mount race does now and then. The step never ran.
+UNSTARTABLE = re.compile(
+    r"^.*(?:OCI runtime create failed|failed to create shim task).*$", re.M)
 
 
 def host_fault(results):
     """(step, why) for the first failed step the host broke, or None:
     one that exited 126 or 127, so its command could not be run, or
     whose output says so for a command behind it (make's "Error 127",
-    the shell's "not found"), or says the disk is full, or holds one
-    of checks.host_fault_text, which `why` quotes."""
+    the shell's "not found"), or says a container could not be started
+    (docker's "OCI runtime create failed"), or says the disk is full,
+    or holds one of checks.host_fault_text, which `why` quotes."""
     for r in results:
         if r["rc"] == 0:
             continue
@@ -2305,6 +2313,11 @@ def host_fault(results):
         if unrunnable:
             return r["name"], "a command behind it could not be run: %s" % (
                 json.dumps(unrunnable.group(0).strip(), ensure_ascii=False))
+        unstartable = UNSTARTABLE.search(r["tail"])
+        if unstartable:
+            return r["name"], "a container could not be started: %s" % (
+                json.dumps(unstartable.group(0).strip()[:300],
+                           ensure_ascii=False))
         if any(text in r["tail"] for text in HOST_FAULT_TEXT):
             return r["name"], "no space left on device"
         for text in HOST_FAULT_EXTRA:
