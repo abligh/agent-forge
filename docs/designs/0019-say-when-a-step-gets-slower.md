@@ -1,6 +1,6 @@
 # 0019: Say when a check step gets slower
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-18, https://github.com/abligh/agent-forge/issues/29); built in v0.4.98
 * Author: XMPPEngineer
 * Date: 2026-10-18
 
@@ -92,3 +92,14 @@ fires.
   needs no upkeep.
 * **A weekly report.** That's too late: the evidence above cost two days
   of merges.
+
+## As built
+
+* The check runs from the posting tick, once for each new verdict,
+  rather than at the end of the worker's run: the tick already holds
+  the poster, and a write GitHub refuses is tried again on the next
+  tick.
+* The host case needs at least three steps with enough runs, so that
+  one slow step of two isn't reported as the host.
+* An issue closed by hand while the step is still slow stays closed,
+  and nothing is refiled until the step has been back under.

@@ -105,7 +105,10 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "fresh": dict, "first_authors": list, "max_wait_minutes": int,
           "main": str, "main_red_issue": dict, "drop_env": list,
           "keep_ignored": list, "red_comment": bool, "instances": dict,
-          "host_fault_text": list}
+          "host_fault_text": list, "step_alert": dict}
+# checks.step_alert (designs/0019): an issue when a step gets slower.
+STEP_ALERT = {"growth": (int, float), "min_seconds": int, "window_days": int,
+              "min_runs": int, "labels": list, "owner": str}
 # checks.instances (designs/0021): more instances of the check, each on
 # its own host with its own context and steps. A block's keys come from
 # the block alone (OWN), from the block or else `checks` (INHERITED),
@@ -116,7 +119,8 @@ INSTANCE_OWN = ("host", "context", "steps", "poster")
 INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight",
                       "step_timeout_minutes", "caches", "cache_limit",
                       "keep_ignored", "drop_env", "merge_default",
-                      "red_comment", "max_wait_minutes", "host_fault_text")
+                      "red_comment", "max_wait_minutes", "host_fault_text",
+                      "step_alert")
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main")
 INSTANCE_CHECKS_ONLY = ("main_red_issue", "first_authors", "merger_first")
@@ -582,6 +586,29 @@ def _check_stall_alert(alert, agents, problems):
         problems.append("%s.labels must be a list of label names" % where)
 
 
+def _check_step_alert(alert, data, problems, where):
+    """checks.step_alert (designs/0019)."""
+    if not _fields(where, alert, STEP_ALERT, problems):
+        return
+    growth = alert.get("growth")
+    if _is(growth, (int, float)) and not isinstance(growth, bool) \
+            and growth <= 1:
+        problems.append("%s.growth must be above 1" % where)
+    for key, low in (("min_seconds", 0), ("min_runs", 1)):
+        if isinstance(alert.get(key), int) and alert[key] < low:
+            problems.append("%s.%s must be at least %d" % (where, key, low))
+    # The verdicts it reads are kept 21 days, and one is the recent day.
+    days = alert.get("window_days")
+    if isinstance(days, int) and not 1 <= days <= 20:
+        problems.append("%s.window_days must be 1 to 20" % where)
+    if isinstance(alert.get("labels"), list) and not all(
+            isinstance(label, str) and label for label in alert["labels"]):
+        problems.append("%s.labels must be label names" % where)
+    owner = alert.get("owner")
+    if isinstance(owner, str) and owner not in data.get("agents", {}):
+        problems.append("%s.owner %r is not an agent" % (where, owner))
+
+
 def _check_checks(checks, data, problems, where="checks"):
     """The `checks` section, or a block of `checks.instances`, whose
     problems then name it as `where`."""
@@ -613,6 +640,9 @@ def _check_checks(checks, data, problems, where="checks"):
             problems.append("checks.main_red_issue needs checks.main "
                             "\"every\" (or checks.depends): otherwise the "
                             "default branch is never checked")
+    if isinstance(checks.get("step_alert"), dict):
+        _check_step_alert(checks["step_alert"], data, problems,
+                          where + ".step_alert")
     if isinstance(checks.get("keep_ignored"), list):
         for path in checks["keep_ignored"]:
             if not (isinstance(path, str) and path.strip("/")

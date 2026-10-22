@@ -432,6 +432,17 @@ status: each tick posts again any verdict on a still-open head that
 never reached GitHub. A worker killed mid-run leaves `pending`, and its
 head still waiting, so the next check replaces it.
 
+**With `checks.step_alert`, a step that gets slower opens an issue**
+(designs/0019). After each new verdict a posting tick compares each
+step's median over the last day with its median over the `window_days`
+before, counting only its own runs (not matched, reused or failed
+ones). Over `growth` times as long and `min_seconds` more, it opens one
+issue for the step, naming the default-branch runs either side of the
+jump and the commits between them (`FILED`); it gets fresh figures at
+most once a day, and is closed once the step is back under (`CLOSED`).
+When most of at least three steps slow at once, one issue names the
+host instead. Nothing is held: the gate and the Merger don't see it.
+
 **A posting worker starts the next tick when it lets the lock go**,
 through `forge-cron-run`, so a head that arrived while it ran waits for
 that rather than for the next cron minute. A tick with nothing to do
@@ -689,6 +700,15 @@ FRESH_WAIT = None
 MAIN_EVERY = False
 # checks.main_red_issue (designs/0011): {"label", "title"}, or None.
 MAIN_RED_ISSUE = None
+# checks.step_alert (designs/0019), with its defaults filled in and
+# `owner_label`; None when off.
+STEP_ALERT = None
+STEP_ALERT_DEFAULTS = {"growth": 1.5, "min_seconds": 30, "window_days": 7,
+                       "min_runs": 10, "labels": []}
+# Fewer steps judged than this, and a slow majority is still read as
+# slow steps, not a slow host.
+STEP_ALERT_HOST_MIN = 3
+STEP_ALERT_HOST = "*host*"
 # checks.red_comment: say on a pull request why its head is red, with
 # the end of each failed step's output, for those who can't read
 # worker.log on the host.
@@ -738,7 +758,7 @@ def configure(project, instance=None):
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     global TRACE_MATCHED_MAIN, CHAIN_WRITES_ONLY, DIRS_BY_NAMES, OUTPUTS
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
-    global RED_COMMENT, RERUN_LABEL, HOST_FAULT_EXTRA
+    global RED_COMMENT, RERUN_LABEL, HOST_FAULT_EXTRA, STEP_ALERT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
     INSTANCE = instance
     if instance is None:
@@ -796,6 +816,12 @@ def configure(project, instance=None):
     MAIN_RED_ISSUE = dict(checks["main_red_issue"]) \
         if "main_red_issue" in checks else None
     RED_COMMENT = bool(checks.get("red_comment", False))
+    STEP_ALERT = None
+    if "step_alert" in checks:
+        STEP_ALERT = dict(STEP_ALERT_DEFAULTS, **checks["step_alert"])
+        STEP_ALERT["owner_label"] = (
+            project.section("labels").get("owner_prefix", "Owner:")
+            + STEP_ALERT["owner"]) if STEP_ALERT.get("owner") else None
     # The configuration refuses fresh without depends.
     FRESH_WAIT = datetime.timedelta(minutes=checks["fresh"].get(
         "wait_minutes", DEFAULT_FRESH_MINUTES)) if "fresh" in checks else None
@@ -1921,6 +1947,262 @@ def report_main(state_dir, repo, sha, ok, failed, same, write, out=print,
         state = load(state_dir)
         state["main_red"] = red
         save(state_dir, state)
+
+
+def step_runs(state, since, until=None):
+    """{step: [(finished, seconds, sha, main)]}, oldest first: the runs
+    of each step in the verdicts kept that finished at `since` or later
+    (and before `until`). Only a step's own run counts: not a matched
+    verdict, a reused step, or a failed one, whose time says nothing of
+    its cost; a step skipped by selection has no time."""
+    runs = {}
+    for sha, r in state["results"].items():
+        seconds = r.get("step_seconds")
+        if not isinstance(seconds, dict) or r.get("matched"):
+            continue
+        try:
+            done = parse(r["finished"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if done < since or until is not None and done >= until:
+            continue
+        reused = r.get("reused") or {}
+        failed = set(r.get("failed") or [])
+        for name, took in seconds.items():
+            if name in reused or name in failed or isinstance(took, bool) \
+                    or not isinstance(took, (int, float)):
+                continue
+            runs.setdefault(name, []).append(
+                (done, took, sha, bool(r.get("main"))))
+    for found in runs.values():
+        found.sort(key=lambda run: run[0])
+    return runs
+
+
+def judge_steps(state, when):
+    """{step: figures} for each step with checks.step_alert's min_runs
+    runs both in the last day and in the window_days before it: its two
+    medians, run counts, the `limit` it is slow over, `slow`, and the
+    default-branch runs it was judged on (`mains`)."""
+    alert = STEP_ALERT
+    day = datetime.timedelta(days=1)
+    usual_since = when - day - datetime.timedelta(days=alert["window_days"])
+    recent = step_runs(state, when - day)
+    usual = step_runs(state, usual_since, when - day)
+    every = step_runs(state, usual_since)
+    judged = {}
+    for name in sorted(set(recent) & set(usual)):
+        if min(len(recent[name]), len(usual[name])) < alert["min_runs"]:
+            continue
+        now = statistics.median(took for _, took, _, _ in recent[name])
+        was = statistics.median(took for _, took, _, _ in usual[name])
+        judged[name] = {
+            "recent": now, "usual": was, "runs": len(recent[name]),
+            "usual_runs": len(usual[name]),
+            "limit": max(alert["growth"] * was, was + alert["min_seconds"]),
+            "slow": now > alert["growth"] * was
+            and now - was >= alert["min_seconds"],
+            "mains": [run for run in every[name] if run[3]]}
+    return judged
+
+
+def jump(figures):
+    """(last under, first over): the default-branch runs either side of
+    where the step's time crossed its limit and stayed over, each
+    (finished, seconds, sha, main); None for one there isn't. (None,
+    None) when the newest default-branch run isn't over."""
+    mains = figures["mains"]
+    if not mains or mains[-1][1] <= figures["limit"]:
+        return None, None
+    first = len(mains) - 1
+    while first > 0 and mains[first - 1][1] > figures["limit"]:
+        first -= 1
+    return (mains[first - 1] if first else None), mains[first]
+
+
+def seconds_text(took):
+    return "%ds" % round(took)
+
+
+def figures_text(name, figures):
+    return ("its median over the last day is **%s** (%d runs), against "
+            "**%s** over the %d days before (%d runs): %.1f times as long"
+            % (seconds_text(figures["recent"]), figures["runs"],
+               seconds_text(figures["usual"]), STEP_ALERT["window_days"],
+               figures["usual_runs"],
+               figures["recent"] / figures["usual"]
+               if figures["usual"] else float("inf")))
+
+
+def slow_step_text(name, figures, repo, run=sh):
+    """The body of the issue a slower step opens."""
+    lines = ["The **%s** step of the build check%s has got slower: %s. "
+             "checks.step_alert reports a step over %s times its usual "
+             "median and at least %ds more." % (
+                 name, on_host(), figures_text(name, figures),
+                 STEP_ALERT["growth"], STEP_ALERT["min_seconds"]), ""]
+    under, over = jump(figures)
+    if over is None:
+        lines.append("The default branch's newest run of it isn't over "
+                     "the limit (%s), so the slow runs are pull requests'."
+                     % seconds_text(figures["limit"]))
+    elif under is None:
+        lines.append("Every default-branch run of it in the window is over "
+                     "the limit (%s), from %s (%s)." % (
+                         seconds_text(figures["limit"]), over[2][:10],
+                         seconds_text(over[1])))
+    else:
+        lines += ["On %s it was under the limit (%s) at %s (%s) and over "
+                  "it from %s (%s). The commits between, where to look:" % (
+                      MAIN, seconds_text(figures["limit"]), under[2][:10],
+                      seconds_text(under[1]), over[2][:10],
+                      seconds_text(over[1])), ""]
+        got = run(["git", "-C", repo, "log", "--format=%h %s",
+                   "%s..%s" % (under[2], over[2])]) if repo else None
+        commits = got.stdout.splitlines()[:50] \
+            if got is not None and got.returncode == 0 else []
+        lines += ["* %s" % c for c in commits] or ["* (none listed)"]
+    lines += ["", "While it stays slow this gets fresh figures at most once "
+              "a day, and it closes when the step's median is back under "
+              "the limit; a step made slower on purpose becomes the usual "
+              "after %d days. Closed by hand, it stays closed until the "
+              "step is back under." % STEP_ALERT["window_days"], "",
+              signature()]
+    return "\n".join(lines)
+
+
+def slow_host_text(judged):
+    """The body of the issue opened when most steps slow at once."""
+    try:
+        load = "%.1f, %.1f, %.1f" % os.getloadavg()
+    except OSError:
+        load = "unknown"
+    lines = ["Most steps of the build check%s got slower at once, which "
+             "is the host, not the steps: %d of the %d with enough runs are "
+             "over checks.step_alert's limit. Load average now: %s." % (
+                 on_host(), sum(1 for f in judged.values() if f["slow"]),
+                 len(judged), load), "",
+             "| Step | Last day | Usual | Times |", "|---|---|---|---|"]
+    for name, figures in sorted(judged.items()):
+        lines.append("| %s%s | %s | %s | %.1f |" % (
+            name, " (slow)" if figures["slow"] else "",
+            seconds_text(figures["recent"]), seconds_text(figures["usual"]),
+            figures["recent"] / figures["usual"]
+            if figures["usual"] else float("inf")))
+    lines += ["", "No issue is opened for each step while this one is open; "
+              "it closes when most steps are back under their limits.", "",
+              signature()]
+    return "\n".join(lines)
+
+
+def alert_steps(state_dir, repo, write, out=print, run=sh, when=None):
+    """checks.step_alert (designs/0019): open, refresh and close the
+    issues for steps that got slower, once for each new verdict. Returns
+    the number of writes that failed."""
+    when = when or now_utc()
+    with state_lock(state_dir):
+        state = load(state_dir)
+        newest = max((str(r.get("finished", ""))
+                      for r in state["results"].values()), default="")
+        alert = state.get("step_alert") or {}
+        if not newest or newest <= alert.get("checked", ""):
+            return 0
+        judged = judge_steps(state, when)
+    issues = {key: dict(entry)
+              for key, entry in alert.get("issues", {}).items()}
+    slow = {name for name, figures in judged.items() if figures["slow"]}
+    host = len(judged) >= STEP_ALERT_HOST_MIN and 2 * len(slow) > len(judged)
+    wanted = {STEP_ALERT_HOST} if host else slow
+
+    def back_under(key):
+        if key == STEP_ALERT_HOST:
+            return not host
+        return key in judged and key not in slow
+
+    failed = 0
+    labels = list(STEP_ALERT["labels"]) + (
+        [STEP_ALERT["owner_label"]] if STEP_ALERT["owner_label"] else [])
+    for key in sorted(issues):
+        entry = issues[key]
+        if not back_under(key):
+            continue
+        if entry.get("dismissed"):
+            del issues[key]
+            continue
+        what = "most steps" if key == STEP_ALERT_HOST else key
+        got, _ = write("POST", "/repos/%s/issues/%d/comments" % (
+            REPO_SLUG, entry["issue"]), {"body": "Back under the limit: %s. "
+            "Closing.\n\n%s" % (
+                "fewer than half the steps are slow" if key == STEP_ALERT_HOST
+                else figures_text(key, judged[key]), signature())})
+        shut, _ = write("PATCH", "/repos/%s/issues/%d" % (
+            REPO_SLUG, entry["issue"]), {"state": "closed"})
+        if got != 201 or shut != 200:
+            failed += 1
+            log(state_dir, "REPORT-FAILED step alert: closing #%d: HTTP %s, "
+                "%s" % (entry["issue"], got, shut), when, out)
+            continue
+        log(state_dir, "CLOSED #%d: %s back under the limit"
+            % (entry["issue"], what), when, out)
+        del issues[key]
+    for key in sorted(wanted):
+        entry = issues.get(key)
+        if entry is not None and entry.get("dismissed"):
+            continue
+        if entry is not None:
+            if when - parse(entry["told"]) < datetime.timedelta(days=1):
+                continue
+            got, seen = write("GET", "/repos/%s/issues/%d"
+                              % (REPO_SLUG, entry["issue"]))
+            if got == 200 and seen.get("state") == "closed":
+                entry["dismissed"] = True
+                log(state_dir, "DISMISSED #%d: closed while %s is still "
+                    "slow; left closed" % (entry["issue"], key), when, out)
+                continue
+            got, _ = write("POST", "/repos/%s/issues/%d/comments" % (
+                REPO_SLUG, entry["issue"]), {"body": "Still slow: %s.\n\n%s"
+                % ("%d of %d steps over their limits" % (len(slow),
+                                                          len(judged))
+                   if key == STEP_ALERT_HOST
+                   else figures_text(key, judged[key]), signature())})
+            if got != 201:
+                failed += 1
+                log(state_dir, "REPORT-FAILED step alert: commenting on #%d: "
+                    "HTTP %s" % (entry["issue"], got), when, out)
+                continue
+            entry["told"] = iso(when)
+            continue
+        if key == STEP_ALERT_HOST:
+            title = "The build check%s got slower at every step" % on_host()
+            body = slow_host_text(judged)
+        else:
+            figures = judged[key]
+            title = "Build check step %s got slower%s: %s, was %s" % (
+                key, on_host(), seconds_text(figures["recent"]),
+                seconds_text(figures["usual"]))
+            body = slow_step_text(key, figures, repo, run)
+        made_body = {"title": title, "body": body}
+        if labels:
+            made_body["labels"] = labels
+        got, made = write("POST", "/repos/%s/issues" % REPO_SLUG, made_body)
+        if got != 201 or "number" not in made:
+            failed += 1
+            log(state_dir, "REPORT-FAILED step alert: opening an issue for "
+                "%s: HTTP %s %s" % (key, got, made.get("message", "")),
+                when, out)
+            continue
+        issues[key] = {"issue": made["number"], "told": iso(when)}
+        log(state_dir, "FILED #%d: %s" % (made["number"], title), when, out)
+    with state_lock(state_dir):
+        state = load(state_dir)
+        state["step_alert"] = {"issues": issues}
+        # A failed write is tried again with the next tick.
+        if not failed:
+            state["step_alert"]["checked"] = newest
+        elif alert.get("checked"):
+            state["step_alert"]["checked"] = alert["checked"]
+        save(state_dir, state)
+    return failed
 
 
 def on_host():
@@ -4460,9 +4742,12 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
     if MERGER_FIRST:
         merger_dir = args.merger_dir or locks.state_dir(project.name,
                                                         "merger", environ)
-    return tick(state_dir, token, run, spawn, out, post=post,
+    done = tick(state_dir, token, run, spawn, out, post=post,
                 slots=slots_from_env(environ), checkout=repo,
                 merger_dir=merger_dir)
+    if STEP_ALERT is not None and args.post:
+        alert_steps(state_dir, repo, make_writer(project, out), out, run)
+    return done
 
 
 if __name__ == "__main__":
