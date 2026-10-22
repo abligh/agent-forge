@@ -1,6 +1,7 @@
 # 0025: Merge a stack as a unit
 
 * Status: approved (Alex Bligh, 2026-10-22, https://github.com/abligh/agent-forge/issues/42#issuecomment-6351073967)
+* Implemented: v0.4.102
 * Author: XMPPEngineer
 * Date: 2026-10-22
 
