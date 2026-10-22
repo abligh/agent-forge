@@ -451,3 +451,62 @@ class HostFaultTextWorker(base.StateCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MainRerun(unittest.TestCase):
+    """labels.rerun on the open checks.main_red_issue issue runs the
+    default branch's red head again: it has no pull request to carry
+    the label."""
+
+    def setUp(self):
+        configured()
+        self.addCleanup(pc.configure, config.Project(example(), None))
+        self.state = {"results": {SHA_A: dict(red(0), main=True)},
+                      "waiting": {}, "main_red": {"issue": 92}}
+
+    def labels(self, *names):
+        return FakeRun((lambda a: a[:3] == ["gh", "api", "repos/%s/issues/92"
+                                            % pc.REPO_SLUG],
+                        done([], 0, "".join(n + "\n" for n in names))))
+
+    def test_the_label_on_the_main_red_issue_names_the_head(self):
+        got = pc.main_rerun_labelled(self.state, (SHA_A, "t"), "tok",
+                                     self.labels("bug", RERUN))
+        self.assertEqual(got, [(92, SHA_A, False, None)])
+
+    def test_nothing_without_the_label_an_issue_or_the_setting(self):
+        self.assertEqual(pc.main_rerun_labelled(
+            self.state, (SHA_A, "t"), "tok", self.labels("bug")), [])
+        self.assertEqual(pc.main_rerun_labelled(
+            {"results": {}, "waiting": {}}, (SHA_A, "t"), "tok",
+            self.labels(RERUN)), [])
+        configured(rerun=None)
+        self.assertEqual(pc.main_rerun_labelled(
+            self.state, (SHA_A, "t"), "tok", self.labels(RERUN)), [])
+
+    def test_the_red_head_is_queued_again_and_kept_queued(self):
+        lines = []
+        with mock.patch.object(pc, "log", lambda *a, **k: lines.append(a[1])):
+            todo = pc.take_reruns(self.state, [(92, SHA_A, False, None)],
+                                  {SHA_A: (LABELLER, AT)}, T0, "/s")
+        self.assertEqual(todo, [(92, SHA_A, "rerun", LABELLER)])
+        self.assertNotIn(SHA_A, self.state["results"])
+        self.assertEqual(self.state["waiting"][SHA_A],
+                         {"pr": 0, "since": pc.iso(T0), "main": True,
+                          "rerun": True})
+        self.assertTrue(lines[0].startswith("RERUN #92 "))
+        # A tick whose records say nothing needs tracing keeps it.
+        self.assertFalse(pc.queue_main(self.state, (SHA_A, "t"), T0, "/s",
+                                       needs=[]))
+        self.assertIn(SHA_A, self.state["waiting"])
+
+    def test_only_once(self):
+        with mock.patch.object(pc, "log", lambda *a, **k: None):
+            pc.take_reruns(self.state, [(92, SHA_A, False, None)],
+                           {SHA_A: (LABELLER, AT)}, T0, "/s")
+        self.state["waiting"].pop(SHA_A)
+        self.state["results"][SHA_A] = dict(red(0), main=True)
+        with mock.patch.object(pc, "log", lambda *a, **k: None):
+            todo = pc.take_reruns(self.state, [(92, SHA_A, False, None)],
+                                  {SHA_A: (LABELLER, AT_2)}, T0, "/s")
+        self.assertEqual(todo, [(92, SHA_A, "again", LABELLER)])

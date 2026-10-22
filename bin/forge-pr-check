@@ -113,6 +113,9 @@ to prepare it, or host faults: neither its own) the label clears those
 counts, so the head is tried again in its old place; the tick logs
 `RERUN ... given up after ...`, posts pending and takes the label off.
 That is not its one run again, and it can be done as often as needed.
+The default branch's red head has no pull request: the label on the
+open `checks.main_red_issue` issue runs it again instead, once, the
+same way, and the label comes off the issue.
 Only a posting tick, and not an instance's (designs/0021), acts on it.
 
 **With `checks.max_wait_minutes`, no head waits on priority for ever**:
@@ -1313,6 +1316,11 @@ def take_reruns(state, labelled, labellers, when, state_dir, out=print):
                        "labelled": at, "queued": iso(when), "answered": at}
         # A fresh place at the back: queued as if new.
         state["waiting"].pop(sha, None)
+        if verdict.get("main"):
+            # No pull request queues it: put back the default branch's
+            # head, marked so queue_main keeps it.
+            state["waiting"][sha] = {"pr": 0, "since": iso(when),
+                                     "main": True, "rerun": True}
         log(state_dir, "RERUN #%d %s: was %s; queued by %s"
             % (pr, sha[:10], verdict_word(verdict), login), when, out)
         todo.append((pr, sha, "rerun", login))
@@ -1401,7 +1409,8 @@ def queue_main(state, head, when, state_dir, busy=(), needs=False):
     elif needs is not False:
         if needs == []:
             for other, entry in list(state["waiting"].items()):
-                if entry.get("main") and other not in busy:
+                if entry.get("main") and other not in busy \
+                        and not entry.get("rerun"):
                     del state["waiting"][other]
             return False
         if sha in state["results"] or sha in state["waiting"]:
@@ -1417,6 +1426,22 @@ def queue_main(state, head, when, state_dir, busy=(), needs=False):
             del state["waiting"][other]
     state["waiting"][sha] = {"pr": 0, "since": since, "main": True}
     return True
+
+
+def main_rerun_labelled(state, head, token, run=sh):
+    """[(issue, sha, False, None)] when labels.rerun is on the open
+    checks.main_red_issue issue and `head` is the default branch's head
+    that issue is about, else []: the default branch's red head is run
+    again through its issue, since it has no pull request."""
+    red = state.get("main_red") or {}
+    issue = red.get("issue")
+    if not RERUN_LABEL or head is None or not issue:
+        return []
+    got = gh(["repos/%s/issues/%d" % (REPO_SLUG, issue), "--jq",
+              ".labels[].name"], token, run)
+    if got.returncode != 0 or RERUN_LABEL not in got.stdout.splitlines():
+        return []
+    return [(issue, head[0], False, None)]
 
 
 def main_due(entry, when):
@@ -2424,9 +2449,11 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     # labels.rerun: who put the label on each head it would act on, read
     # outside the lock. Only a posting tick writes to GitHub.
     labelled = rerun_labelled(heads) if post is not None else []
+    seen = load(state_dir)
+    if post is not None:
+        labelled += main_rerun_labelled(seen, head_of_main, token, run)
     labellers = {}
     if labelled:
-        seen = load(state_dir)
         for pr, sha, draft, repo in labelled:
             if rerun_kind(seen, sha, draft, repo) != "nothing":
                 labellers[sha] = labelled_by(pr, token, run)
