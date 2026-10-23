@@ -162,6 +162,31 @@ not waiting on the owner, is rule 18's:
     `Owner:` labels' last change, so it is said once and said again if
     its label is taken off.
 
+With `router.unreviewed` (designs/0027), which needs `owners.triage`,
+a run that isn't `--only`'s also sweeps for paths no reviewer covers
+(off without it):
+
+19. an open pull request, not a draft, changes paths that match no
+    reviewer's `reviews` glob (by the reviewer choice's
+    `fnmatchcase`, which still gives their lines to the first
+    reviewer) and no `unreviewed.ignore` glob. They are grouped by
+    area: a path's first segment, or its first two under a directory
+    `unreviewed.depth2` lists, and `/` for a file at the top. For an
+    area with no open issue (the one `unreviewed.json` records, else
+    one titled for it), `triage`'s turn, "give it a reviewer", whose
+    action opens one, titled `No reviewer covers <area> (first seen on
+    #N)`, listing the pull requests and their paths and labelled
+    `Owner:<triage>`. With one open, the pull requests not yet on it
+    are added to it in a comment, surfaced. Either way each pull
+    request is told once, in a `Not-a-review` comment naming the
+    issue. While open pull requests still change the area, the issue
+    is reminded of them in a comment once a day, surfaced, on a day
+    nothing else was written to it. `unreviewed.json`, in the router's
+    state directory, records each area's issue, the pull requests told
+    and the day it last wrote, as each write is done. The event has
+    the day in it, so a write GitHub refused is tried again the next
+    day.
+
 **Who wrote something is read from its login**, never its text (but
 for rule 10's exception): an App's bot login (`<slug>[bot]`) maps to
 its name through the configuration, the Merger's under `machinery`,
@@ -183,11 +208,13 @@ Each rule is written as `route_pr` or `route_issue` returning the dict
 `Decision`.
 """
 
+import dataclasses
 import datetime
 import fnmatch
+import os
 import re
 
-from agent_forge.router import ONCE, Decision, Lookup
+from agent_forge.router import ONCE, Action, Decision, Lookup
 
 # The Merger's hand-back names the head it judged, in both its forms.
 HAND_BACK_RE = re.compile(r"^Not merging ([0-9a-f]{7,40}):", re.MULTILINE)
@@ -224,6 +251,8 @@ WAITING_PREFIX = "Status:waiting-"
 # `router.owners` (designs/0008), or None: off. `triage` is the agent
 # an unowned issue goes to, or None: surfaced.
 OWNERS = None
+# `router.unreviewed` (designs/0027), {"ignore", "depth2"}, or None: off.
+UNREVIEWED = None
 
 # What the rules read of each open item, besides its number.
 graphql = {
@@ -272,6 +301,7 @@ def configure(project, merger_tool):
     global OWNER_PREFIX, STATUS_CONTEXT, IDLE_OFFER, wants_directory
     global MERGE_NOTICE, merged_window
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
+    global UNREVIEWED
     merger = merger_tool
     labels = project.section("labels")
     MERGER = merger.ACT_AS
@@ -299,6 +329,10 @@ def configure(project, merger_tool):
     WAITING_PREFIX = labels.get("status_prefix", "Status:") + "waiting-"
     owners = project.section("router").get("owners")
     OWNERS = None if owners is None else {"triage": owners.get("triage")}
+    gaps = project.section("router").get("unreviewed")
+    UNREVIEWED = None if gaps is None else {
+        "ignore": list(gaps.get("ignore") or []),
+        "depth2": list(gaps.get("depth2") or [])}
     graphql["Issue"] = ISSUE_FIELDS + (OWNER_LABEL_EVENTS if OWNERS else "")
 
 
@@ -854,8 +888,9 @@ recheck = decide
 
 
 def sweep(ctx):
-    """Rules 15 and 16, the idle offer, and rule 17, the merge notice,
-    each when it is configured; nothing on a run started by an event
+    """Rules 15 and 16, the idle offer, rule 17, the merge notice, and
+    rule 19, the paths no reviewer covers, each when it is configured;
+    nothing on a run started by an event
     (`ctx.only`), whose items are all it may decide about."""
     if ctx.only is not None:
         return []
@@ -864,6 +899,8 @@ def sweep(ctx):
         decisions += idle_offers(ctx)
     if MERGE_NOTICE is not None:
         decisions += merge_notices(ctx)
+    if UNREVIEWED is not None:
+        decisions += unreviewed(ctx)
     return decisions
 
 
@@ -1139,6 +1176,230 @@ def merge_notices(ctx):
         decisions.append(Decision(
             None, agent, 17, "#%d %s" % (pr["number"], pr["mergedAt"]),
             text, reminder=ONCE))
+    return decisions
+
+
+# --- paths no reviewer covers (rule 19) ---------------------------------------
+
+
+# Rule 19's record, in the engine's state directory: {area: {"issue",
+# "prs" (told so far), "said" (the day it last wrote to the issue)}}.
+UNREVIEWED_FILE = "unreviewed.json"
+# The most paths a comment names for one pull request.
+MAX_PATHS = 20
+
+
+def area_of(path):
+    """A path's area, with its trailing slash: its first segment, or its
+    first two under a `depth2` directory; "/" for a file at the top."""
+    parts = path.split("/")
+    if len(parts) == 1:
+        return "/"
+    if parts[0] in UNREVIEWED["depth2"] and len(parts) > 2:
+        return "%s/%s/" % (parts[0], parts[1])
+    return parts[0] + "/"
+
+
+def uncovered(ctx):
+    """{area: {number: [path]}}: each open pull request's changed paths,
+    drafts left out, that match no reviewer's `reviews` glob (by the
+    reviewer choice's `fnmatchcase`) and no `ignore` glob."""
+    globs = [g for n in ctx.roster.reviewers()
+             for g in ctx.roster.agents[n].get("reviews") or []]
+    globs += UNREVIEWED["ignore"]
+    found = {}
+    for pr in ctx.prs:
+        if pr.get("isDraft"):
+            continue
+        for f in pr.get("files") or []:
+            path = f.get("path") or ""
+            if path and not any(fnmatch.fnmatchcase(path, g) for g in globs):
+                found.setdefault(area_of(path), {}).setdefault(
+                    pr["number"], []).append(path)
+    return found
+
+
+def load_unreviewed(state_dir):
+    state = merger.load_json(os.path.join(state_dir, UNREVIEWED_FILE), {})
+    return state if isinstance(state, dict) else {}
+
+
+def area_issue(area, known, ctx):
+    """The open issue about `area`: the one `unreviewed.json` records,
+    else the oldest titled for it; or None."""
+    if known.get("issue") in {i["number"] for i in ctx.issues}:
+        return known["issue"]
+    prefix = "No reviewer covers %s (" % area
+    titled = sorted(i["number"] for i in ctx.issues
+                    if (i.get("title") or "").startswith(prefix))
+    return titled[0] if titled else None
+
+
+def path_list(paths):
+    shown = ", ".join("`%s`" % p for p in sorted(paths)[:MAX_PATHS])
+    more = len(paths) - MAX_PATHS
+    return shown + (" and %d more" % more if more > 0 else "")
+
+
+def pr_lines(prs):
+    """One line a pull request, for an issue: its number and paths."""
+    return "".join("- #%d: %s\n" % (n, path_list(paths))
+                   for n, paths in prs)
+
+
+def numbered(prs):
+    return ", ".join("#%d" % n for n, _ in prs)
+
+
+class Unreviewed(Action):
+    """Rule 19's writes about one area, recording each in
+    `unreviewed.json` as it is done, so no later run does it again."""
+
+    def path(self):
+        return os.path.join(self.state_dir, UNREVIEWED_FILE)
+
+    def save(self, entry):
+        state = load_unreviewed(self.state_dir)
+        state[self.area] = entry
+        os.makedirs(self.state_dir, exist_ok=True)
+        merger.save_json(self.path(), state)
+
+
+@dataclasses.dataclass(frozen=True)
+class ReportUnreviewed(Unreviewed):
+    """Open the area's issue naming `prs`, or, with `issue`, the open
+    one, add them to it; then say so once on each pull request, in a
+    `Not-a-review` comment. `prs` is ((number, (path, ...)), ...),
+    those not yet told."""
+    state_dir: str
+    area: str
+    issue: int | None
+    prs: tuple
+    label: str
+    day: str
+
+    def describe(self):
+        if self.issue is None:
+            return "open an issue for %s naming %s, and say so on each" % (
+                self.area, numbered(self.prs))
+        return "add %s to #%d, and say so on each" % (numbered(self.prs),
+                                                      self.issue)
+
+    def run(self, github, repo):
+        if self.issue is None:
+            issue, why = github.create(
+                "repos/%s/issues" % repo,
+                title="No reviewer covers %s (first seen on #%d)" % (
+                    self.area, self.prs[0][0]),
+                body="No reviewer's `reviews` globs cover `%s`, so its lines "
+                "go to the first reviewer listed. Give it a reviewer in the "
+                "configuration, then close this issue.\n\nPull requests "
+                "that change it:\n%s\n%s" % (
+                    self.area, pr_lines(self.prs), merger.SIGNATURE),
+                **{"labels[]": self.label})
+            if issue is None:
+                return False, why
+            entry = {"issue": issue, "prs": []}
+        else:
+            issue = self.issue
+            entry = load_unreviewed(self.state_dir).get(self.area)
+            if not isinstance(entry, dict) or entry.get("issue") != issue:
+                entry = {"issue": issue, "prs": []}
+            ok, why = github.write(
+                "POST", "repos/%s/issues/%d/comments" % (repo, issue),
+                body="Also:\n%s\n%s" % (pr_lines(self.prs), merger.SIGNATURE))
+            if not ok:
+                return False, why
+        entry["said"] = self.day
+        self.save(entry)
+        failed = []
+        for n, paths in self.prs:
+            ok, why = github.write(
+                "POST", "repos/%s/issues/%d/comments" % (repo, n),
+                body="Not-a-review: no reviewer's `reviews` globs cover `%s` "
+                "(%s), so #%d asks for one. Its lines still go to the first "
+                "reviewer listed meanwhile.\n\n%s" % (
+                    self.area, path_list(paths), issue, merger.SIGNATURE))
+            if not ok:
+                failed.append("#%d: %s" % (n, why))
+                continue
+            entry["prs"] = sorted(set(entry["prs"]) | {n})
+            self.save(entry)
+        return (False, "; ".join(failed)) if failed else (True, "")
+
+
+@dataclasses.dataclass(frozen=True)
+class RemindUnreviewed(Unreviewed):
+    """Comment on the area's open `issue` that `prs` still change it."""
+    state_dir: str
+    area: str
+    issue: int
+    prs: tuple
+    day: str
+
+    def describe(self):
+        return "remind #%d that %s still change %s" % (
+            self.issue, numbered(self.prs), self.area)
+
+    def run(self, github, repo):
+        ok, why = github.write(
+            "POST", "repos/%s/issues/%d/comments" % (repo, self.issue),
+            body="Open pull requests still change `%s`, which no "
+            "reviewer's `reviews` globs cover:\n%s\n%s" % (
+                self.area, pr_lines(self.prs), merger.SIGNATURE))
+        if not ok:
+            return False, why
+        entry = load_unreviewed(self.state_dir).get(self.area)
+        if not isinstance(entry, dict) or entry.get("issue") != self.issue:
+            entry = {"issue": self.issue, "prs": []}
+        entry["said"] = self.day
+        self.save(entry)
+        return True, ""
+
+
+def unreviewed(ctx):
+    """Rule 19: for each area open pull requests change that no reviewer
+    covers, its issue opened (the triage owner's turn) or the new pull
+    requests added to it, each told once; and, on a day nothing else
+    was written to it, a reminder on the open issue. Nothing without
+    the engine's state directory to record it in."""
+    state_dir = getattr(ctx, "state_dir", None)
+    if not state_dir:
+        return []
+    state = load_unreviewed(state_dir)
+    day = ctx.when.strftime("%Y-%m-%d")
+    triage = OWNERS["triage"]
+    label = OWNER_PREFIX + triage
+    decisions = []
+    for area, found in sorted(uncovered(ctx).items()):
+        known = state.get(area) if isinstance(state.get(area), dict) else {}
+        issue = area_issue(area, known, ctx)
+        told = set(known.get("prs") or []) \
+            if issue is not None and known.get("issue") == issue else set()
+        prs = tuple((n, tuple(sorted(found[n]))) for n in sorted(found))
+        new = tuple(p for p in prs if p[0] not in told)
+        if new and issue is None:
+            decisions.append(Decision(
+                None, triage, 19, "%s %s %s" % (area, numbered(new), day),
+                "No reviewer covers %s: %s change it. Give it a reviewer in "
+                "the configuration; its issue is labelled %s." % (
+                    area, numbered(new), label),
+                actions=(ReportUnreviewed(state_dir, area, None, new, label,
+                                          day),),
+                reminder=ONCE))
+        elif new:
+            decisions.append(Decision(
+                None, None, 19, "%s %s %s" % (area, numbered(new), day), None,
+                kind="surface", suppressed="%s change %s, which no reviewer "
+                "covers (#%d)" % (numbered(new), area, issue),
+                actions=(ReportUnreviewed(state_dir, area, issue, new, label,
+                                          day),)))
+        elif (known.get("said") or "") < day:
+            decisions.append(Decision(
+                None, None, 19, "%s %s" % (area, day), None, kind="surface",
+                suppressed="#%d: %s still change %s, which no reviewer "
+                "covers" % (issue, numbered(prs), area),
+                actions=(RemindUnreviewed(state_dir, area, issue, prs, day),)))
     return decisions
 
 

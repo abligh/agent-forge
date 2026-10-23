@@ -824,7 +824,8 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
             out("NO-MERGED: %s; no merge is announced" % err)
     ctx = router.Context(roster, when, prs, issues,
                          only=frozenset(only) if only else None,
-                         directory=listing, merged=merged)
+                         directory=listing, merged=merged,
+                         state_dir=state_dir)
     decisions = decide(ctx)
     tally = RULES.summary(ctx)
     if only:

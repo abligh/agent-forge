@@ -173,7 +173,10 @@ class Context:
     requests merged in the rules' `merged_window` (each with `number`,
     `title`, `mergedAt` and `author`), read only when that is above 0
     and the run isn't `only`'s, and None when it wasn't read or
-    couldn't be: unknown, never "nothing merged"."""
+    couldn't be: unknown, never "nothing merged". `state_dir` is the
+    engine's state directory, where a module may keep files of its own:
+    read them when deciding, and write them only from an `Action`, so
+    only a sending run changes them."""
     roster: Any
     when: datetime.datetime
     prs: list
@@ -181,6 +184,7 @@ class Context:
     only: frozenset | None = None
     directory: Any = None
     merged: Any = None
+    state_dir: str | None = None
 
     @property
     def items(self):

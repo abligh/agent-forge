@@ -260,11 +260,14 @@ on a run that isn't `--only`'s, only for a module whose
 `merged_window` is above 0; a search that fails is printed
 (`NO-MERGED: …`) and handed over as None, which a module must read as
 unknown, not as nothing merged. The default rules want it only for
-`router.merge_notice` (rule 17). A later step
-may add the previous run's decisions, a namespaced store the module may
-write to, written only when the run's delivery is confirmed, and the
-configuration; until then a module keeps what it needs from
-`configure`.
+`router.merge_notice` (rule 17). `state_dir` is the engine's state
+directory, where a module may keep files of its own: it reads them
+when deciding and writes them only from an `Action`, so only a sending
+run changes them. The default rules keep `unreviewed.json` there for
+`router.unreviewed` (rule 19): which issue each area no reviewer
+covers has, and which pull requests it has told. A later step may add
+the previous run's decisions and the configuration; until then a
+module keeps what it needs from `configure`.
 
 **Who wrote something** is the module's `author`. The default rules
 read the login. A module whose agents share a login reads the
