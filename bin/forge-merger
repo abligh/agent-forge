@@ -182,8 +182,8 @@ reviewer's again, until a newer approval. The Merger says so on the
 pull request, once per approval and remark (`HELD_FILE`), so the
 approver knows the hold is theirs to lift.
 
-**A standing request for changes holds it.** A reviewer's (or the
-owner's) newest verdict, `APPROVED`, `CHANGES_REQUESTED` or
+**A standing request for changes holds it.** A reviewer's (the
+owner's, or anyone's who can push to the repository) newest verdict, `APPROVED`, `CHANGES_REQUESTED` or
 `DISMISSED`, that is `CHANGES_REQUESTED` stands until that reviewer
 reviews again or it is dismissed, whatever another reviewer approved
 since: GitHub refuses the merge while it stands, so taking the pull
@@ -632,7 +632,8 @@ query($owner:String!, $name:String!, $cursor:String) {
         author { login }
         labels(first:50) { nodes { name } }
         reviews(last:100) {
-          nodes { author { login } state submittedAt body commit { oid }
+          nodes { author { login } authorCanPushToRepository
+                  state submittedAt body commit { oid }
                   comments { totalCount } }
         }
         comments(last:100) { nodes { author { login } createdAt body } }
@@ -687,8 +688,8 @@ def approval_of(pr, approvers=None):
 
 def changes_requested(pr, changers=None):
     """The reviews whose request for changes still stands, oldest first:
-    for each login in CHANGERS (or `changers`) other than the author,
-    its newest `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED` review,
+    for each login in CHANGERS (or `changers`), or that GitHub says can
+    push to the repository, other than the author, its newest `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED` review,
     when that is `CHANGES_REQUESTED`. GitHub refuses to merge while one
     stands, whatever another reviewer approved since, and a push or a
     comment doesn't lift it: only that reviewer's next verdict or a
@@ -698,7 +699,8 @@ def changes_requested(pr, changers=None):
     latest = {}
     for review in pr["reviews"]:
         who = login(review).lower()
-        if (who in changers and who != login(pr).lower()
+        if ((who in changers or review.get("authorCanPushToRepository"))
+                and who != login(pr).lower()
                 and review.get("state") in ("APPROVED", "CHANGES_REQUESTED",
                                             "DISMISSED")
                 and (who not in latest or (review.get("submittedAt") or "")

@@ -275,10 +275,20 @@ class Eligible(unittest.TestCase):
                                     review(REVIEWER, at=T1)]), set(),
                         "changes requested")
 
-    def test_only_reviewers_and_the_owner_hold_by_asking(self):
+    def test_only_reviewers_the_owner_and_writers_hold_by_asking(self):
         self.assertIsNotNone(m.eligible(pr(reviews=[
             review(PEER, "CHANGES_REQUESTED", T0), review(REVIEWER)]),
             set())[0])
+        # Anyone who can push counts with GitHub, so with the Merger.
+        asked = review(PEER, "CHANGES_REQUESTED", T0)
+        asked["authorCanPushToRepository"] = True
+        self.assertHeld(pr(reviews=[asked, review(REVIEWER)]), set(),
+                        "changes requested by %s at %s" % (PEER, T0))
+        # The author's own review never holds it.
+        mine = review(AUTHOR, "CHANGES_REQUESTED", T0)
+        mine["authorCanPushToRepository"] = True
+        self.assertIsNotNone(m.eligible(pr(reviews=[mine, review(REVIEWER)]),
+                                        set())[0])
 
     def test_a_closed_blocker_blocks_nothing(self):
         self.assertIsNotNone(m.eligible(pr(body="Blocked-by: #7"), {8})[0])
