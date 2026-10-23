@@ -1,6 +1,6 @@
 # 0026: Merger settings for a stricter project
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-23, https://github.com/abligh/agent-forge/issues/45#issuecomment-6358168686)
 * Author: XMPPEngineer
 * Date: 2026-10-23
 
