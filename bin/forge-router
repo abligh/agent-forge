@@ -105,6 +105,12 @@ A dry run reads them too. A search that fails is printed
 (`NO-MERGED: …`) and handed over as None, which the rules read as
 unknown, never as "nothing merged".
 
+**A pull request that fixes a red nightly is routed first**
+(designs/0028): while forge-nightly's issue saying the nightly is red
+is open, the open pull requests that close it, read from its state
+(agent_forge/nightly.py) as the Merger reads them, are decided and
+listed before every other item, and their lines say so.
+
 **Without `--send` it is a dry run**: it prints each decision and the
 messages it would send, sends nothing, takes no lock and leaves
 `state.json` alone. It appends each turn it would send or withhold to
@@ -146,7 +152,7 @@ import urllib.request
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(BIN))
-from agent_forge import config, locks, router  # noqa: E402
+from agent_forge import config, locks, nightly, router  # noqa: E402
 
 
 def _load(name, path):
@@ -667,8 +673,10 @@ def decide(ctx):
 
 
 def order(decision):
-    """Items by number, then those about no item, each in decided order."""
-    return (decision.item is None, decision.item or 0)
+    """Pull requests that fix a red nightly first, then items by number,
+    then those about no item, each in decided order."""
+    return (decision.item not in merger.NIGHTLY_FIXES, decision.item is None,
+            decision.item or 0)
 
 
 def nobody_line(d):
@@ -879,7 +887,9 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
             acting.append((d, rec))
             would.append((d, d.line, "withheld: not an agent"))
             continue
-        line = d.line + (" (reminder)" if why == "reminder" else "")
+        line = d.line + (" (reminder)" if why == "reminder" else "") + (
+            " (fixes the red nightly: first)"
+            if d.item in merger.NIGHTLY_FIXES else "")
         would.append((d, line, "would send to %s" % ", ".join(
             sessions_of(roster, d.agent))))
         wakes.append({"d": d, "line": line, "why": why, "entry": entry})
@@ -1081,6 +1091,7 @@ def main(argv=None, sh=merger.sh, out=print, post=None, roster=None,
     except router.RulesError as err:
         out("BAD-CONFIG: %s" % err)
         return 2
+    merger.NIGHTLY_FIXES = nightly.fixes(project, environ)
     state_dir = args.state_dir or locks.state_dir(project.name, "router",
                                                   environ)
     try:

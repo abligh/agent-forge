@@ -72,6 +72,13 @@ class StateDir(unittest.TestCase):
                                                 "merger"))
             self.assertTrue(os.path.isdir(path))
 
+    def test_a_reader_creates_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = locks.state_dir("widget", "nightly",
+                                   {"FORGE_STATE_DIR": tmp}, create=False)
+            self.assertEqual(path, os.path.join(tmp, "widget", "nightly"))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "widget")))
+
     def test_forge_state_dir_moves_the_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(

@@ -115,6 +115,15 @@ class Urgent(unittest.TestCase):
     def test_the_query_reads_labels(self):
         self.assertIn("labels(first:50) { nodes { name } }", m.PR_QUERY)
 
+    def test_a_fix_of_the_red_nightly_goes_first_without_the_label(self):
+        m.configure(project())
+        self.addCleanup(setattr, m, "NIGHTLY_FIXES", frozenset())
+        m.NIGHTLY_FIXES = frozenset({5})
+        got = m.order([pr(3, T0), pr(5, T3), pr(4, T1)])
+        self.assertEqual([p["number"] for p in got], [5, 3, 4])
+        self.assertTrue(m.urgent(pr(5, T3)))
+        self.assertFalse(m.urgent(pr(3, T0)))
+
 
 class LoginAndMarkers(unittest.TestCase):
 
@@ -2392,6 +2401,20 @@ class RelaySender(unittest.TestCase):
         send = m.relay_sender(config.Project(data, None), {}, opener)
         self.assertIsNone(send("UIDev", "From: Merger\nx"))
         self.assertEqual(seen, ["http://relay:8788/agent/WidgetLeadDev"])
+
+    def test_a_name_that_is_no_agent_is_sent_as_it_is(self):
+        """Such as the owner's address (forge-nightly's escalation)."""
+        data = example()
+        data["relay"] = {"url": "http://relay:8788",
+                         "token_file": self.token_file}
+        seen = []
+
+        def opener(req, timeout):
+            seen.append(req.full_url)
+            return self.Response()
+        send = m.relay_sender(config.Project(data, None), {}, opener)
+        self.assertIsNone(send("owner@example.org", "From: x\ny"))
+        self.assertEqual(seen, ["http://relay:8788/agent/owner%40example.org"])
 
 
 class Configure(unittest.TestCase):

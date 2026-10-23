@@ -1,6 +1,6 @@
 # 0028: A red nightly is a red main
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-23, https://github.com/abligh/agent-forge/issues/50#issuecomment-6369875312)
 * Author: XMPPEngineer
 * Date: 2026-10-23
 

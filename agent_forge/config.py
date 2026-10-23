@@ -55,6 +55,7 @@ TOP = {
     "quiet": (dict, False),
     "queue": (dict, False),
     "stats_watch": (dict, False),
+    "nightly": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
@@ -84,7 +85,14 @@ STATS_WATCH = {"owner": str, "window_hours": int, "baseline_days": int,
 STATS_WATCH_FIGURES = {
     "check_run": ("limit", "ratio"), "check_wait": ("limit", "ratio"),
     "pr_turnaround": ("limit", "ratio"), "merge_time": ("limit", "ratio"),
-    "merge_rate": ("ratio",), "slots_busy": ("limit",), "main_red": ()}
+    "merge_rate": ("ratio",), "slots_busy": ("limit",), "main_red": (),
+    "nightly_red_hours": ("limit",)}
+# forge-nightly (designs/0028): a red nightly is a red main.
+NIGHTLY = {"workflow": str, "job": str, "owners": dict, "labels": list,
+           "retry_hours": int, "escalate_hours": list, "as": str,
+           "tell_owner": str}
+# A workflow is named by its file, which is read for its inputs.
+WORKFLOW_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_minutes": int, "stall_alert": dict, "test_ahead": dict,
          "hold_conflicting": bool, "yield_after_hand_back": int,
@@ -372,6 +380,57 @@ def _check_stats_watch(watch, data, problems):
                 problems.append("%s.ratio must be more than 1" % at)
 
 
+def _check_nightly(nightly, data, problems):
+    """The `nightly` section: forge-nightly's workflow and job, who owns
+    which of its steps, and when it retries and escalates."""
+    where = "nightly"
+    if not _fields(where, nightly, NIGHTLY, problems):
+        return
+    for key in ("workflow", "job"):
+        if key not in nightly:
+            problems.append("%s: missing %r" % (where, key))
+        elif isinstance(nightly[key], str) and not nightly[key].strip():
+            problems.append("%s.%s must not be empty" % (where, key))
+    if isinstance(nightly.get("workflow"), str) and nightly["workflow"] \
+            and not WORKFLOW_FILE_RE.match(nightly["workflow"]):
+        problems.append("%s.workflow must be the workflow's file name, "
+                        "such as ci.yaml" % where)
+    if not isinstance(data.get("router", {}).get("owners", {}).get(
+            "triage"), str):
+        problems.append("%s needs router.owners.triage: a failed step "
+                        "that `owners` doesn't name is hers" % where)
+    for pattern, agent in (nightly.get("owners") or {}).items():
+        if pattern.startswith("_"):
+            continue
+        if not isinstance(agent, str) or agent not in data["agents"]:
+            problems.append("%s.owners.%s: %r is not an agent"
+                            % (where, pattern, agent))
+    labels = nightly.get("labels")
+    if isinstance(labels, list) and not all(
+            isinstance(l, str) and l.strip() for l in labels):
+        problems.append("%s.labels must be a list of label names" % where)
+    if _is(nightly.get("retry_hours"), int) and nightly["retry_hours"] < 1:
+        problems.append("%s.retry_hours must be at least 1" % where)
+    hours = nightly.get("escalate_hours")
+    if isinstance(hours, list) and not (
+            1 <= len(hours) <= 2
+            and all(_is(h, int) and h >= 1 for h in hours)
+            and hours == sorted(set(hours))):
+        problems.append("%s.escalate_hours must be one or two whole "
+                        "numbers of hours, at least 1, rising (the "
+                        "developers, then the owner)" % where)
+    if isinstance(nightly.get("tell_owner"), str) \
+            and not nightly["tell_owner"].strip():
+        problems.append("%s.tell_owner must not be empty" % where)
+    name = nightly.get("as")
+    if name is None:
+        name = data.get("merge", {}).get("merger", "Merger")
+    if isinstance(name, str) and name not in data["agents"] \
+            and name not in data.get("machinery", {}):
+        problems.append("%s.as %r is not an agent or machinery (it "
+                        "defaults to the Merger)" % (where, name))
+
+
 def check(data):
     """Every problem with `data`, a parsed configuration; [] if none."""
     problems = []
@@ -492,6 +551,8 @@ def check(data):
     _check_queue(data.get("queue", {}), problems)
     if "stats_watch" in data:
         _check_stats_watch(data["stats_watch"], data, problems)
+    if "nightly" in data:
+        _check_nightly(data["nightly"], data, problems)
     docs = data.get("docs", {})
     for key, kinds in DOCS.items():
         if key in docs and not _is(docs[key], kinds):
