@@ -1,0 +1,818 @@
+#!/usr/bin/env python3
+"""Treat a red nightly as a red main: one issue, fixes first, retries.
+
+    forge-nightly [--dry-run]
+
+Run every five minutes from cron, through forge-cron-run, on the host
+of the build check, the Merger and the router (designs/0028). Without
+a `nightly` section it does nothing. Each tick reads the newest runs of
+`nightly.workflow` on the default branch that were scheduled or
+dispatched (`schedule`, `workflow_dispatch`), and judges the newest
+completed one it has not judged yet by the jobs named `nightly.job`
+(or `<job> (...)`, a matrix's): green when each succeeded, red when
+one failed or timed out, and neither (cancelled, say) otherwise.
+
+**One issue while the nightly is red.** A red run with no issue open
+opens one, titled `The nightly is red at <sha>`, labelled
+`nightly.labels` and `<labels.owner_prefix><owner>` for each owner of a
+failed step. It says, for each failed step, its name, its owner and the
+end of its output (colour codes removed, at most 12,000 characters a
+step, as the build check's `red_comment` quotes one; less a step when
+many failed, so the issue fits), and the commits since the last green
+nightly. A step's owner is the agent `nightly.owners` maps its name,
+or a glob over names, to; a step it names in no way is
+`router.owners.triage`'s. A step's output is the lines of its job's log
+stamped between its start and end. Each later red run comments once
+with the same detail and adds the labels of new owners; one whose
+issue was closed meanwhile (a fix's merge closes it) reopens it. The
+first green run comments and closes it. The issue is found again by
+its `Nightly: <workflow>` line in the open issues the App opened,
+so one an earlier tick opened is found even without this tool's state.
+
+**Fixes go first.** While the issue is open, each tick writes the
+numbers of the open pull requests that close it (a closing keyword in
+the title, the body or a commit message, by forge-closing-keywords'
+rule, or the issue in `closingIssuesReferences`) to its state.
+forge-pr-check, forge-merger and forge-router read them there
+(agent_forge/nightly.py) and treat them as if they carried
+`labels.urgent`. Only the 100 oldest open pull requests are read.
+
+**Run again by itself until green.** While the nightly is red, a tick
+dispatches the workflow on the default branch when no run of it is
+queued or in progress and either a pull request that closes the issue
+merged after the newest run started, or `retry_hours` (default 3) have
+passed since it ended. One it dispatched counts as running until a run
+created after the dispatch is seen, or DISPATCH_WAIT has passed. Each
+dispatch is a comment on the issue, with the commit and why.
+
+**A retry fails fast.** When the workflow's file on the default
+branch declares a `workflow_dispatch` input named `first`, a dispatch
+passes the failed steps of the last red run there, by name, separated
+by commas. A workflow without it is dispatched without inputs.
+
+**Escalation.** While the nightly stays red, `escalate_hours` (default
+24 and 48) after the issue was opened, the first messages every
+developer agent and the second the project's owner, at `tell_owner`
+(default `owner`; a name the relay resolves, or a JID), through the
+relay with the Merger's sender (`relay.url`, `relay.token_file`;
+`$FORGE_ROUTER_RELAY` overrides the url). Each is a comment on the
+issue too, the owner's mentioning her. One nobody took is tried again
+on the next tick, and not commented on.
+
+Everything is written as the App named by `nightly.as` (default
+`merge.merger`, else `Merger`), with a token minted as forge-app-token
+does; it needs Actions (to dispatch), Issues and Pull requests. State
+(the issue, the last run judged, the last green and red runs, the
+fixes, the dispatch and the escalations done) is kept in
+~/.local/state/agent-forge/<project>/nightly/nightly.json, and
+`forge-stats` reads `nightly_red_hours` from it. `--dry-run` prints
+what it would do and changes nothing, on GitHub, in the state or on
+the relay.
+
+From the host's crontab:
+
+    */5 * * * * FORGE_CRON_CHECKOUT=$HOME/widget-cron \\
+        $HOME/.local/bin/forge-cron-run forge-nightly
+
+Exit status: 0 done, including while the nightly is red (the issue
+says so), and when another tick holds the lock; 2 no configuration,
+or GitHub could not be read or refused a write.
+"""
+
+import argparse
+import base64
+import datetime
+import fnmatch
+import importlib.machinery
+import importlib.util
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(BIN))
+from agent_forge import config, github, locks, nightly, state  # noqa: E402
+
+PROG = "forge-nightly"
+DEFAULTS = {"owners": {}, "labels": [], "retry_hours": 3,
+            "escalate_hours": [24, 48]}
+# The events a nightly run starts from.
+EVENTS = ("schedule", "workflow_dispatch")
+ACTIVE = ("queued", "in_progress", "waiting", "requested", "pending")
+GREEN = ("success",)
+RED = ("failure", "timed_out", "startup_failure")
+# How long a dispatch counts as running before its run is seen.
+DISPATCH_WAIT = datetime.timedelta(minutes=30)
+# How much of a step's output is quoted, as the build check's red
+# comment quotes it, and how much of every step's together, so the
+# issue stays under GitHub's 65,536 characters.
+STEP_CHARS = 12000
+ALL_STEPS_CHARS = 48000
+# How many commits since the last green nightly are listed.
+COMMITS_SHOWN = 50
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+LOG_STAMP_RE = re.compile(
+    r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z ?")
+MARKER = "Nightly: %s"
+TITLE = "The nightly is red at %s"
+REQUEST_TIMEOUT_S = 60
+
+OPEN_PRS_QUERY = """
+query($o: String!, $r: String!, $n: Int!) {
+  repository(owner: $o, name: $r) {
+    issue(number: $n) { state }
+    open: pullRequests(states: OPEN, first: 100,
+                       orderBy: {field: CREATED_AT, direction: ASC}) {
+      nodes { ...closes }
+    }
+    merged: pullRequests(states: MERGED, first: 30,
+                         orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes { ...closes mergedAt }
+    }
+  }
+}
+fragment closes on PullRequest {
+  number title body
+  closingIssuesReferences(first: 50) { nodes { number } }
+  commits(last: 100) { nodes { commit { message } } }
+}
+"""
+
+
+def iso(when):
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def stamp(when):
+    return when.strftime("%Y-%m-%dT%H:%MZ")
+
+
+parse_time = nightly.parse_time
+
+
+def _load_tool(name):
+    loader = importlib.machinery.SourceFileLoader(
+        name.replace("-", "_"), os.path.join(BIN, name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def owner_of(step, owners, triage):
+    """The agent who owns `step`: `owners`' entry for its name, else the
+    first glob that matches it, else `triage`."""
+    if step in owners:
+        return owners[step]
+    for pattern, agent in owners.items():
+        if not pattern.startswith("_") and fnmatch.fnmatchcase(step,
+                                                               pattern):
+            return agent
+    return triage
+
+
+def decisive_jobs(jobs, name):
+    """The jobs named `name`, or a matrix's `name (...)`."""
+    return [j for j in jobs if j.get("name") == name
+            or (j.get("name") or "").startswith(name + " (")]
+
+
+def verdict(jobs):
+    """"green", "red" or None (neither, or no job) for the deciding jobs."""
+    if not jobs:
+        return None
+    conclusions = [j.get("conclusion") for j in jobs]
+    if any(c in RED for c in conclusions):
+        return "red"
+    if all(c in GREEN for c in conclusions):
+        return "green"
+    return None
+
+
+def failed_steps(jobs):
+    """[(job, step)] for each step that failed or timed out, in order."""
+    return [(job, step) for job in jobs if job.get("conclusion") in RED
+            for step in job.get("steps") or ()
+            if step.get("conclusion") in RED]
+
+
+def step_output(log, step):
+    """The lines of a job's `log` stamped within `step`'s start and end
+    (to the second), their stamps removed; "" when it has none."""
+    try:
+        start = parse_time(step["started_at"])
+        end = parse_time(step["completed_at"])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return ""
+    lines, inside = [], False
+    for line in (log or "").splitlines():
+        hit = LOG_STAMP_RE.match(line)
+        if hit:
+            when = parse_time(hit.group(1) + "Z")
+            inside = start <= when <= end
+            line = line[hit.end():]
+        if inside:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def quote(text, limit):
+    """`text` with colour codes removed and only its last `limit`
+    characters kept."""
+    text = ANSI_RE.sub("", text or "").rstrip()
+    if len(text) > limit:
+        text = "[…]\n" + text[-limit:]
+    return text
+
+
+def fence(text):
+    """A code fence longer than any run of backticks in text."""
+    runs = [len(r) for r in re.findall(r"`+", text)]
+    return "`" * max([3] + [n + 1 for n in runs])
+
+
+def declares_first(text):
+    """Whether a workflow file declares a `workflow_dispatch` input named
+    `first`. Read by indentation, without a YAML parser: the key
+    `workflow_dispatch:`, its `inputs:`, and `first:` directly under
+    that."""
+    dispatch = inputs = child = None
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        key = line.strip()
+        if inputs is not None and indent <= inputs:
+            inputs = None
+        if dispatch is not None and indent <= dispatch:
+            dispatch = None
+        if inputs is not None:
+            child = indent if child is None else child
+            if indent == child and re.match(r"""^["']?first["']?\s*:""",
+                                            key):
+                return True
+            continue
+        if dispatch is not None and re.match(r"^inputs\s*:\s*(#.*)?$", key):
+            inputs, child = indent, None
+            continue
+        if re.match(r"""^["']?workflow_dispatch["']?\s*:""", key):
+            dispatch = indent
+    return False
+
+
+def fetch_log(token, repo, job_id):
+    """A job's whole log as text, or None. GitHub answers with a redirect
+    to storage elsewhere, which is followed without the token."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    request = urllib.request.Request(
+        "%s/repos/%s/actions/jobs/%d/logs" % (github.api_base(), repo,
+                                              job_id),
+        headers={"Authorization": "token %s" % token,
+                 "Accept": "application/vnd.github+json",
+                 "User-Agent": "agent-forge"})
+    try:
+        with urllib.request.build_opener(NoRedirect).open(
+                request, timeout=REQUEST_TIMEOUT_S) as resp:
+            return resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as err:
+        where = err.headers.get("Location") if err.headers else None
+        if err.code not in (301, 302, 303, 307, 308) or not where:
+            return None
+    except (urllib.error.URLError, OSError):
+        return None
+    try:
+        with urllib.request.urlopen(where, timeout=REQUEST_TIMEOUT_S) as resp:
+            return resp.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError):
+        return None
+
+
+class Tick:
+    """One tick: the settings, GitHub and what to write."""
+
+    def __init__(self, project, token, now, dry_run, out, err, call, logs,
+                 send):
+        self.project = project
+        self.cfg = dict(DEFAULTS, **project.section("nightly"))
+        self.name = self.cfg.get("as") or project.section("merge").get(
+            "merger", "Merger")
+        self.repo = project.repo
+        self.main = project.default_branch
+        self.workflow = self.cfg["workflow"]
+        self.triage = project.section("router").get("owners", {}).get(
+            "triage")
+        self.token = token
+        self.now = now
+        self.dry_run = dry_run
+        self.out, self.err = out, err
+        self.call = call
+        self.logs = logs
+        self.send = send
+        self.would = "WOULD " if dry_run else ""
+        self.failed = False
+        self.closing = _load_tool("forge-closing-keywords")
+        self.closing.configure(project)
+
+    def get(self, path, what):
+        status, body = github.rest(self.token, "GET", path, call=self.call)
+        if status != 200:
+            raise RuntimeError("GitHub answered %s for %s" % (status, what))
+        return body
+
+    def write(self, method, path, body, want):
+        """(whether GitHub took it, its answer); a dry run takes nothing."""
+        if self.dry_run:
+            return True, {}
+        status, got = github.rest(self.token, method, path, body,
+                                  call=self.call)
+        if status not in want:
+            self.failed = True
+            self.err("%s: %s %s refused: HTTP %s %s" % (
+                PROG, method, path, status,
+                (got or {}).get("message", "") if isinstance(got, dict)
+                else ""))
+            return False, got
+        return True, got
+
+    def comment(self, number, text):
+        ok, _ = self.write("POST", "/repos/%s/issues/%d/comments"
+                           % (self.repo, number),
+                           {"body": text + "\n\n" + self.signature()},
+                           (201,))
+        return ok
+
+    def signature(self):
+        return ("Written by forge-nightly, agent-forge's watch on the "
+                "nightly (designs/0028).\n\n— %s" % self.name)
+
+    def owner_label(self, agent):
+        prefix = self.project.section("labels").get("owner_prefix",
+                                                    "Owner:")
+        return prefix + agent
+
+    def url(self, number):
+        return "https://github.com/%s/issues/%d" % (self.repo, number)
+
+    def runs(self):
+        """The workflow's scheduled and dispatched runs on the default
+        branch, newest first."""
+        body = self.get("/repos/%s/actions/workflows/%s/runs?branch=%s"
+                        "&per_page=30" % (
+                            self.repo, urllib.parse.quote(self.workflow),
+                            urllib.parse.quote(self.main, safe="")),
+                        "the runs of %s" % self.workflow)
+        runs = [r for r in (body or {}).get("workflow_runs") or ()
+                if r.get("event") in EVENTS]
+        return sorted(runs, key=lambda r: (r.get("created_at") or "",
+                                           r.get("id") or 0), reverse=True)
+
+    def find_issue(self):
+        """The open issue the App opened for this workflow, or None."""
+        status, items = github.paged(
+            self.token, "/repos/%s/issues?state=open&creator=%s" % (
+                self.repo, urllib.parse.quote(
+                    self.project.bot_login(self.name), safe="")),
+            call=self.call)
+        if status != 200:
+            raise RuntimeError("GitHub answered %s for the open issues"
+                               % status)
+        marker = MARKER % self.workflow
+        for item in sorted(items, key=lambda i: i.get("number", 0)):
+            if "pull_request" not in item and marker in (
+                    item.get("body") or "").splitlines():
+                return item
+        return None
+
+    def red_detail(self, run, jobs):
+        """(the steps that failed, by name; their owners; the text that
+        says so, for the issue or a comment)."""
+        failed = failed_steps(jobs)
+        names = []
+        for _, step in failed:
+            if step["name"] not in names:
+                names.append(step["name"])
+        owners = []
+        for name in names:
+            agent = owner_of(name, self.cfg["owners"], self.triage)
+            if agent not in owners:
+                owners.append(agent)
+        lines = ["The nightly (`%s`, job `%s`) is red at %s: [run %s](%s), "
+                 "ended %s." % (self.workflow, self.cfg["job"],
+                                run["head_sha"][:10], run["id"],
+                                run.get("html_url", ""),
+                                stamp(parse_time(run["updated_at"])))]
+        if not failed:
+            lines += ["", "No step failed, so it is %s's: the job itself "
+                      "did (%s)." % (self.triage, ", ".join(
+                          "%s %s" % (j.get("name"), j.get("conclusion"))
+                          for j in jobs))]
+            owners = owners or [self.triage]
+        else:
+            lines += ["", "Failed: %s." % ", ".join(
+                "`%s` (%s)" % (n, owner_of(n, self.cfg["owners"],
+                                           self.triage)) for n in names)]
+        limit = min(STEP_CHARS, ALL_STEPS_CHARS // max(1, len(failed)))
+        texts = {}
+        for job, step in failed:
+            if job["id"] not in texts:
+                texts[job["id"]] = self.logs(job["id"])
+            log = texts[job["id"]]
+            text = quote(step_output(log, step), limit) if log else \
+                "(the job's log could not be read)"
+            mark = fence(text)
+            lines += ["", "**%s**%s, %s's, the end of its output:" % (
+                step["name"], " in `%s`" % job["name"]
+                if len(jobs) > 1 else "",
+                owner_of(step["name"], self.cfg["owners"], self.triage)),
+                "", mark, text or "(no output)", mark]
+        return names, owners, "\n".join(lines)
+
+    def commits_since(self, green, sha):
+        """Lines listing the commits from the last green nightly to `sha`."""
+        if not green or not green.get("sha"):
+            return "No green nightly is known to compare with."
+        if green["sha"] == sha:
+            return "No commits since the last green nightly: the same commit."
+        try:
+            body = self.get("/repos/%s/compare/%s...%s" % (
+                self.repo, green["sha"], sha), "the commits since green")
+        except RuntimeError as error:
+            return "The commits since the last green nightly (%s) could " \
+                "not be read: %s." % (green["sha"][:10], error)
+        commits = body.get("commits") or []
+        total = body.get("total_commits", len(commits))
+        lines = ["Commits since the last green nightly (%s, run %s), %d:"
+                 % (green["sha"][:10], green.get("run"), total), ""]
+        shown = commits[-COMMITS_SHOWN:]
+        if total > len(shown):
+            lines.append("- … %d before these" % (total - len(shown)))
+        for commit in shown:
+            message = ((commit.get("commit") or {}).get("message") or "")
+            lines.append("- `%s` %s" % ((commit.get("sha") or "")[:10],
+                                        message.split("\n", 1)[0]))
+        return "\n".join(lines)
+
+    def explain(self):
+        return ("While this is open, a pull request that closes it goes "
+                "first: the build check checks it, the Merger merges it "
+                "and the router routes it before other work. forge-nightly "
+                "runs the nightly again when one merges, or %d h after a "
+                "red run ended, and closes this at the first green one."
+                % self.cfg["retry_hours"])
+
+    def judge(self, saved, run):
+        """Judge one completed run: open, comment on or close the issue."""
+        jobs = self.get("/repos/%s/actions/runs/%d/jobs?per_page=100"
+                        % (self.repo, run["id"]),
+                        "the jobs of run %s" % run["id"]).get("jobs") or []
+        jobs = decisive_jobs(jobs, self.cfg["job"])
+        got = verdict(jobs)
+        sha = run["head_sha"]
+        number = saved.get("issue")
+        if got == "green":
+            self.out("GREEN run %s at %s" % (run["id"], sha[:10]))
+            if number is not None:
+                text = "The nightly is green at %s: [run %s](%s). Closing." \
+                    % (sha[:10], run["id"], run.get("html_url", ""))
+                if not self.comment(number, text):
+                    return False
+                if saved.get("issue_open", True):
+                    ok, _ = self.write("PATCH", "/repos/%s/issues/%d" % (
+                        self.repo, number), {"state": "closed",
+                                             "state_reason": "completed"},
+                        (200,))
+                    if not ok:
+                        return False
+                self.out("%sCLOSE #%d: green at %s" % (self.would, number,
+                                                       sha[:10]))
+            for key in ("issue", "issue_open", "red", "red_since", "opened",
+                        "escalated", "dispatched"):
+                saved.pop(key, None)
+            saved["fixes"] = []
+            saved["green"] = {"run": run["id"], "sha": sha,
+                              "ended": run["updated_at"]}
+            saved["newest"] = "green"
+            return True
+        if got != "red":
+            self.out("NEITHER run %s at %s: %s" % (
+                run["id"], sha[:10], ", ".join(
+                    "%s %s" % (j.get("name"), j.get("conclusion"))
+                    for j in jobs) or "no job %s" % self.cfg["job"]))
+            return True
+        names, owners, detail = self.red_detail(run, jobs)
+        commits = self.commits_since(saved.get("green"), sha)
+        labels = list(self.cfg["labels"]) + [self.owner_label(a)
+                                             for a in owners if a]
+        self.out("RED run %s at %s: %s" % (run["id"], sha[:10],
+                                           ", ".join(names) or "no step"))
+        if number is None:
+            title = TITLE % sha[:10]
+            ok, got_issue = self.write("POST", "/repos/%s/issues" % self.repo, {
+                "title": title,
+                "body": "\n\n".join([detail, commits, self.explain(),
+                                     MARKER % self.workflow,
+                                     self.signature()]),
+                "labels": labels}, (201,))
+            if not ok:
+                return False
+            saved["issue"] = (got_issue or {}).get("number")
+            saved["issue_open"] = True
+            saved["opened"] = iso(self.now)
+            saved["escalated"] = []
+            saved["red_since"] = (saved.get("green") or {}).get(
+                "ended") or run["updated_at"]
+            self.out("%sOPEN %s, for %s" % (self.would, title,
+                                             ", ".join(owners)))
+        else:
+            if not saved.get("issue_open", True):
+                ok, _ = self.write("PATCH", "/repos/%s/issues/%d" % (
+                    self.repo, number), {"state": "open"}, (200,))
+                if not ok:
+                    return False
+                saved["issue_open"] = True
+                self.out("%sREOPEN #%d" % (self.would, number))
+            if not self.comment(number, "Red again.\n\n" + detail + "\n\n"
+                                + commits):
+                return False
+            if labels:
+                ok, _ = self.write("POST", "/repos/%s/issues/%d/labels" % (
+                    self.repo, number), {"labels": labels}, (200,))
+                if not ok:
+                    return False
+            self.out("%sCOMMENT #%d: red again at %s" % (self.would, number,
+                                                         sha[:10]))
+            saved.setdefault("red_since", (saved.get("green") or {}).get(
+                "ended") or run["updated_at"])
+        saved["red"] = {"run": run["id"], "sha": sha,
+                        "started": run.get("run_started_at")
+                        or run.get("created_at"),
+                        "ended": run["updated_at"], "steps": names}
+        saved["newest"] = "red"
+        return True
+
+    def closes(self, pr, number):
+        """Whether pull request `pr` (GraphQL) closes issue `number`."""
+        declared = {(n or {}).get("number") for n in (
+            (pr.get("closingIssuesReferences") or {}).get("nodes") or ())}
+        if number in declared:
+            return True
+        refs = self.closing.refs
+        if number in refs(self.closing.blank_code(pr.get("body") or "")) \
+                or number in refs(pr.get("title") or ""):
+            return True
+        return any(number in refs(((c or {}).get("commit") or {}).get(
+            "message") or "") for c in (
+                (pr.get("commits") or {}).get("nodes") or ()))
+
+    def fixes(self, number):
+        """(whether the issue is open, the open pull requests that close
+        it, [(number, mergedAt)] of those merged that close it)."""
+        owner, _, name = self.repo.partition("/")
+        status, doc = github.graphql(self.token, OPEN_PRS_QUERY, {
+            "o": owner, "r": name, "n": number}, call=self.call)
+        try:
+            repo = doc["data"]["repository"]
+            is_open = (repo["issue"] or {}).get("state") == "OPEN"
+            open_prs = repo["open"]["nodes"]
+            merged = repo["merged"]["nodes"]
+        except (KeyError, TypeError):
+            raise RuntimeError("GitHub answered %s for the pull requests "
+                               "that close #%d" % (status, number)) from None
+        return (is_open,
+                [p["number"] for p in open_prs if self.closes(p, number)],
+                [(p["number"], p.get("mergedAt")) for p in merged
+                 if p.get("mergedAt") and self.closes(p, number)])
+
+    def dispatch(self, saved, runs, newest, merged):
+        """Dispatch the workflow again when nothing of it runs and a fix
+        merged or `retry_hours` have passed."""
+        number = saved["issue"]
+        active = [r for r in runs if r.get("status") in ACTIVE]
+        if active:
+            self.out("RUNNING run %s: %s" % (active[0]["id"],
+                                            active[0]["status"]))
+            return
+        sent = saved.get("dispatched") or {}
+        if sent.get("at"):
+            at = parse_time(sent["at"])
+            seen = any(parse_time(r["created_at"]) >= at for r in runs
+                       if r.get("created_at"))
+            if not seen and self.now - at < DISPATCH_WAIT:
+                self.out("DISPATCHED at %s; its run isn't seen yet"
+                         % sent["at"])
+                return
+        if newest is None:
+            return
+        why = None
+        started = parse_time(newest.get("run_started_at")
+                             or newest["created_at"])
+        for pr, when in sorted(merged, key=lambda m: m[1]):
+            if parse_time(when) > started:
+                why = "#%d, which closes #%d, merged at %s, after run %s " \
+                    "started" % (pr, number, stamp(parse_time(when)),
+                                 newest["id"])
+                break
+        retry = datetime.timedelta(hours=self.cfg["retry_hours"])
+        if why is None and self.now - parse_time(newest["updated_at"]) \
+                >= retry:
+            why = "%d h since run %s ended" % (self.cfg["retry_hours"],
+                                               newest["id"])
+        if why is None:
+            return
+        head = self.get("/repos/%s/commits/%s" % (
+            self.repo, urllib.parse.quote(self.main, safe="")),
+            "the head of %s" % self.main).get("sha") or ""
+        body = {"ref": self.main}
+        steps = (saved.get("red") or {}).get("steps") or []
+        first = ""
+        if steps and self.takes_first():
+            first = ",".join(steps)
+            body["inputs"] = {"first": first}
+        ok, _ = self.write("POST", "/repos/%s/actions/workflows/%s/"
+                           "dispatches" % (self.repo, urllib.parse.quote(
+                               self.workflow)), body, (200, 204))
+        if not ok:
+            return
+        self.out("%sDISPATCH %s on %s at %s: %s%s" % (
+            self.would, self.workflow, self.main, head[:10], why,
+            "; first: %s" % first if first else ""))
+        saved["dispatched"] = {"at": iso(self.now), "sha": head, "why": why}
+        self.comment(number, "Ran the nightly again on `%s` at %s: %s.%s"
+                     % (self.main, head[:10], why,
+                        " The steps that failed last go first: `%s`."
+                        % first if first else ""))
+
+    def takes_first(self):
+        """Whether the workflow's file declares the `first` input."""
+        path = ".github/workflows/%s" % self.workflow
+        try:
+            body = self.get("/repos/%s/contents/%s?ref=%s" % (
+                self.repo, path, urllib.parse.quote(self.main, safe="")),
+                path)
+            text = base64.b64decode(body.get("content") or "").decode(
+                "utf-8", "replace")
+        except (RuntimeError, ValueError, AttributeError) as error:
+            self.err("%s: %s not read, so no `first`: %s" % (PROG, path,
+                                                             error))
+            return False
+        return declares_first(text)
+
+    def escalate(self, saved):
+        """Message the developers, then the owner, as the issue ages
+        past each of `escalate_hours`."""
+        number = saved["issue"]
+        try:
+            opened = parse_time(saved["opened"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return
+        done = saved.setdefault("escalated", [])
+        hours = (self.now - opened).total_seconds() / 3600
+        steps = ", ".join((saved.get("red") or {}).get("steps") or ()) \
+            or "the job"
+        for level, after in enumerate(self.cfg["escalate_hours"][:2]):
+            if level in done or hours < after:
+                continue
+            if level == 0:
+                who = self.project.developers()
+                text = ("From: forge-nightly\nThe nightly has been red for "
+                        "%d h: %s (%s). A pull request that closes #%d goes "
+                        "first: checked, merged and routed before other "
+                        "work.\n" % (after, self.url(number), steps, number))
+            else:
+                who = [self.cfg.get("tell_owner") or self.project.owner]
+                text = ("From: forge-nightly\nThe nightly has been red for "
+                        "%d h, and the developers were told at %d h: %s "
+                        "(%s).\n" % (after, self.cfg["escalate_hours"][0],
+                                     self.url(number), steps))
+            if self.dry_run:
+                self.out("WOULD ESCALATE #%d after %d h to %s" % (
+                    number, after, ", ".join(who)))
+                continue
+            took, missed = [], []
+            for name in who:
+                why = self.send(name, text)
+                (missed if why else took).append(
+                    "%s (%s)" % (name, why) if why else name)
+            if not took:
+                self.out("NOT SENT escalation #%d after %d h: %s; tried "
+                         "again next tick" % (number, after,
+                                              "; ".join(missed)))
+                continue
+            note = "Red for %d h: messaged %s through the relay." % (
+                after, ", ".join(took))
+            if level == 1:
+                note = "@%s, the nightly has been red for %d h. %s" % (
+                    self.project.owner, after, note)
+            if missed:
+                note += " Not taken: %s." % "; ".join(missed)
+            if self.comment(number, note):
+                done.append(level)
+                self.out("ESCALATE #%d after %d h: %s" % (number, after,
+                                                         ", ".join(took)))
+
+
+def relay_sender(project, environ):
+    """The Merger's relay sender (forge-merger's `relay_sender`)."""
+    return _load_tool("forge-merger").relay_sender(project, environ)
+
+
+def main(argv=None, out=print, err=None, environ=None, now=None,
+         call=github.api_call, sign=github.openssl_sign, mint=None,
+         logs=None, sender=None):
+    err = err or (lambda line: print(line, file=sys.stderr))
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(prog=PROG,
+                                     description=__doc__.splitlines()[0])
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print what it would do and change nothing")
+    args = parser.parse_args(argv)
+    try:
+        checkout = environ.get("FORGE_CRON_CHECKOUT")
+        project = config.load(None, environ, cwd=os.path.expanduser(
+            checkout) if checkout else None)
+    except config.ConfigError as error:
+        err("NO-CONFIG: %s" % error)
+        return 2
+    if "nightly" not in project.data:
+        out("%s: no nightly section; nothing is watched" % PROG)
+        return 0
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    path = nightly.path(project.name, environ, create=True)
+    lock = locks.try_lock(os.path.join(os.path.dirname(path), "lock"),
+                          str(os.getpid()))
+    if lock is None:
+        out("BUSY: another tick holds the lock")
+        return 0
+    with lock:
+        saved = state.load(path, {"fixes": []})
+        cfg = dict(DEFAULTS, **project.section("nightly"))
+        name = cfg.get("as") or project.section("merge").get("merger",
+                                                             "Merger")
+        try:
+            token = (mint or (lambda p, n: github.token(p, n, call, sign)))(
+                project, name)
+        except github.MintError as error:
+            err("%s: skipping this tick: %s" % (PROG, error))
+            return 2
+        made = []
+
+        def send(who, text):
+            # The relay sender is made when an escalation is due, not
+            # on every tick.
+            if not made:
+                made.append((sender or relay_sender)(project, environ))
+            return made[0](who, text)
+        tick = Tick(project, token, now, args.dry_run, out, err, call,
+                    logs or (lambda job: fetch_log(token, project.repo, job)),
+                    send)
+        try:
+            runs = tick.runs()
+            done = [r for r in runs if r.get("status") == "completed"]
+            newest = done[0] if done else None
+            if not saved.get("green"):
+                green = next((r for r in done
+                              if r.get("conclusion") in GREEN), None)
+                if green:
+                    saved["green"] = {"run": green["id"],
+                                      "sha": green["head_sha"],
+                                      "ended": green["updated_at"]}
+            if saved.get("issue") is None:
+                found = tick.find_issue()
+                if found is not None:
+                    saved["issue"] = found["number"]
+                    saved["issue_open"] = True
+                    saved["opened"] = found.get("created_at") or iso(now)
+                    saved.setdefault("escalated", [])
+            if newest is not None and newest["id"] != saved.get("judged"):
+                if tick.judge(saved, newest):
+                    saved["judged"] = newest["id"]
+            merged = []
+            if saved.get("issue") is not None:
+                is_open, fixes, merged = tick.fixes(saved["issue"])
+                saved["issue_open"] = is_open
+                saved["fixes"] = fixes if is_open else []
+                if fixes and is_open:
+                    out("FIXES #%d: %s" % (saved["issue"], ", ".join(
+                        "#%d" % n for n in fixes)))
+                tick.dispatch(saved, runs, newest, merged)
+                tick.escalate(saved)
+            else:
+                saved["fixes"] = []
+        except (RuntimeError, KeyError, TypeError, ValueError) as error:
+            err("%s: skipping this tick: %s" % (PROG, error))
+            return 2
+        saved["at"] = iso(now)
+        if not args.dry_run:
+            state.save(path, saved)
+    return 2 if tick.failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

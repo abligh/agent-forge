@@ -18,12 +18,17 @@ configuration's `stats_watch.figures`:
                    judged only when approved pull requests waited
     slots_busy     the slots busy, in percent: over `limit`
     main_red       red build checks of the default branch: any
+    nightly_red_hours  the hours since the last green nightly ended
+                   (forge-nightly, designs/0028), 0 while the newest
+                   is green: over `limit`, else any above 0
 
 A figure from fewer than `min_samples` (default 5) samples is not
 judged, nor a `ratio` against a baseline that thin. merge_rate's
 samples are the approved pull requests that waited in the queue during
 the window, so a quiet night, with nothing to merge, is never a fault.
-main_red is a count, not a statistic, so one red is enough.
+main_red is a count, not a statistic, so one red is enough, and
+nightly_red_hours is a reading of forge-nightly's state at the end of
+the window, so `min_samples` doesn't apply to it either.
 
 **One open issue per figure.** A figure out of line opens an issue
 labelled `label` (default `stats-watch`) and `<labels.owner_prefix><owner>`
@@ -86,6 +91,7 @@ WHAT = {
     "merge_rate": ("merges an hour", "an hour"),
     "slots_busy": ("the build check's slots busy", "%"),
     "main_red": ("red build checks of the default branch", "red"),
+    "nightly_red_hours": ("the hours since the last green nightly", "h"),
 }
 FIGURE_RE = re.compile(r"^Figure: ([a-z_]+)\s*$", re.MULTILINE)
 OUT, IN, UNJUDGED = "out", "in", "unjudged"
@@ -145,6 +151,7 @@ def figures(stats, hours):
     busy = check.get("busy_share")
     ran = (check.get("ran") or {}).get("n", 0)
     waiting = queue.get("waiting", 0)
+    red_hours = (stats.get("nightly") or {}).get("red_hours")
     return {
         "check_run": minutes(check.get("ran") or {}, "median"),
         "check_wait": minutes(check.get("waited") or {}, "p90"),
@@ -156,6 +163,7 @@ def figures(stats, hours):
         "slots_busy": (None if busy is None else 100 * busy, ran),
         "main_red": ((check.get("red") or {}).get("main", 0),
                      (check.get("runs") or {}).get("main", 0)),
+        "nightly_red_hours": (red_hours, 0 if red_hours is None else 1),
     }
 
 
@@ -165,6 +173,8 @@ def show(figure, value):
     unit = WHAT[figure][1]
     if figure == "main_red":
         return "%d red" % value
+    if figure == "nightly_red_hours":
+        return "%.1f h" % value
     if figure == "merge_rate":
         return "%.1f an hour" % value
     if unit == "%":
@@ -181,6 +191,16 @@ def judge(figure, rules, window, baseline, min_samples):
         if value:
             return OUT, "%s in the window" % show(figure, value)
         return IN, "no red build checks of the default branch"
+    if figure == "nightly_red_hours":
+        if value is None:
+            return UNJUDGED, "no nightly judged by forge-nightly"
+        limit = rules.get("limit", 0)
+        if value > limit:
+            return OUT, "red for %s%s" % (show(figure, value), (
+                ", over the limit of %s" % show(figure, limit))
+                if limit else "")
+        return IN, ("green" if not value else
+                    "red for %s" % show(figure, value))
     if figure == "merge_rate" and not n:
         return UNJUDGED, "no approved pull request waited"
     if value is None or n < min_samples:

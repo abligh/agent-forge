@@ -11,7 +11,10 @@ still covers, nobody has spoken since, and nothing it names in a
   predicted (below);
 * with `labels.urgent`, the pull requests carrying that label come
   next, oldest-opened first (a person's call: it goes before
-  blockers);
+  blockers), and with them those that fix a red nightly
+  (designs/0028): while forge-nightly's issue saying so is open, each
+  open pull request that closes it, read from forge-nightly's state
+  (agent_forge/nightly.py);
 * then the pull requests another open one is blocked by, held or not;
 * then the rest, oldest-opened first;
 * with `merge.yield_after_hand_back`, each that was handed back lately
@@ -387,7 +390,8 @@ import time
 import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-from agent_forge import config, github as forge_github, locks  # noqa: E402
+from agent_forge import config, github as forge_github, locks, \
+    nightly  # noqa: E402
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 
@@ -493,6 +497,9 @@ STALL_LABELS = ()
 WAITING_OWNER = DEFAULT_WAITING_OWNER
 # labels.urgent: the label that puts a pull request first, or None.
 URGENT_LABEL = None
+# The pull requests that fix a red nightly (designs/0028), taken as if
+# urgent; read from forge-nightly's state by `main` (and the router's).
+NIGHTLY_FIXES = frozenset()
 STALL_ALERT_NAME = "stall-alert.json"
 # `merge.test_ahead`: whether the next pull requests' commits are
 # predicted for the build check to test ahead, and how many behind the
@@ -942,7 +949,9 @@ def eligible(pr, open_numbers, now=None, stacked=None, any_base=False):
 
 
 def urgent(pr):
-    """Whether `pr` carries `labels.urgent`."""
+    """Whether `pr` carries `labels.urgent`, or fixes a red nightly."""
+    if pr.get("number") in NIGHTLY_FIXES:
+        return True
     return bool(URGENT_LABEL) and URGENT_LABEL in [
         (n or {}).get("name") for n in
         ((pr.get("labels") or {}).get("nodes") or [])]
@@ -2123,8 +2132,8 @@ def relay_sender(project, environ, opener=None):
 
     def send(name, text):
         problems = []
-        for session in project.sessions(project.stand_in(name)
-                                        if name in project.agents else name):
+        for session in (project.sessions(project.stand_in(name))
+                        if name in project.agents else [name]):
             why = post(session, text)
             if why is None:
                 return None
@@ -3167,7 +3176,7 @@ def load_check_state(state_dir):
 
 def main(argv=None, run=sh, out=print, environ=None, mint=mint,
          sender=None, identity=commit_identity):
-    global RESOLVE_IDENTITY
+    global RESOLVE_IDENTITY, NIGHTLY_FIXES
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(
         prog="forge-merger", description=__doc__.splitlines()[0])
@@ -3199,6 +3208,7 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
         out("NO-CONFIG: %s" % err)
         return 2
     configure(project)
+    NIGHTLY_FIXES = nightly.fixes(project, environ)
     state_dir = args.state_dir or locks.state_dir(project.name, "merger",
                                                   environ)
     os.makedirs(state_dir, exist_ok=True)

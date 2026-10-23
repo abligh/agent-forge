@@ -116,6 +116,22 @@ class UrgentHeads(unittest.TestCase):
                       None, out=lambda *a: None)
         self.assertNotIn("urgent", state["waiting"][SHA_A])
 
+    def test_a_fix_of_the_red_nightly_is_urgent_without_the_label(self):
+        pc.configure(config.Project(example(), None))
+        self.addCleanup(setattr, pc, "NIGHTLY_FIXES", frozenset())
+        pc.NIGHTLY_FIXES = frozenset({7})
+        state = {"waiting": {}, "results": {}, "refused": {}}
+        pc.note_heads(state, [(7, SHA_A, REPO, False, LEAD, []),
+                              (8, SHA_B, REPO, False, LEAD, [])], T0,
+                      None, out=lambda *a: None)
+        self.assertTrue(state["waiting"][SHA_A]["urgent"])
+        self.assertNotIn("urgent", state["waiting"][SHA_B])
+        # Once the issue closes, so does its place at the front.
+        pc.NIGHTLY_FIXES = frozenset()
+        pc.note_heads(state, [(7, SHA_A, REPO, False, LEAD, [])], T0,
+                      None, out=lambda *a: None)
+        self.assertNotIn("urgent", state["waiting"][SHA_A])
+
 
 if __name__ == "__main__":
     unittest.main()

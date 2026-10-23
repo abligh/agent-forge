@@ -100,6 +100,12 @@ pulls API's labels are kept with the head; taking the label off puts it
 back in its ordinary place. A head that failed to prepare still goes
 behind, and the default branch's traced run still goes first when due.
 
+**A pull request that fixes a red nightly goes first too** (designs/0028):
+while forge-nightly's issue saying the nightly is red is open, each open
+pull request that closes it is treated as if it carried `labels.urgent`.
+The numbers are read from forge-nightly's state
+(agent_forge/nightly.py), once a tick.
+
 **With `labels.rerun`, a red head can be run once more** (designs/0022).
 A tick that finds the label on an open pull request whose head is red
 moves the head's verdict out of `results` into `reruns` (with who put
@@ -499,7 +505,8 @@ import time
 import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-from agent_forge import config, github, locks, quiet, trace  # noqa: E402
+from agent_forge import (config, github, locks, nightly, quiet,  # noqa: E402
+                         trace)
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 
@@ -646,6 +653,9 @@ DEFAULT_MERGER_FIRST = False
 FIRST_AUTHORS = frozenset()
 # labels.urgent: the label that puts a pull request first, or None.
 URGENT_LABEL = None
+# The pull requests that fix a red nightly (designs/0028), put first as
+# if urgent; read from forge-nightly's state by `main`.
+NIGHTLY_FIXES = frozenset()
 # labels.rerun: the label that runs a red head once more (designs/0022),
 # or None.
 RERUN_LABEL = None
@@ -1191,7 +1201,8 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
         state["waiting"][sha]["pr"] = pr
         if author:
             state["waiting"][sha]["author"] = author
-        if URGENT_LABEL and URGENT_LABEL in labels:
+        if URGENT_LABEL and URGENT_LABEL in labels \
+                or pr in NIGHTLY_FIXES:
             state["waiting"][sha]["urgent"] = True
         else:
             state["waiting"][sha].pop("urgent", None)
@@ -4770,8 +4781,9 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
             % (args.instance, ", ".join(names) or "none"))
         return 2
     configure(project, args.instance)
-    global MERGER_DIR_ARG
+    global MERGER_DIR_ARG, NIGHTLY_FIXES
     MERGER_DIR_ARG = args.merger_dir
+    NIGHTLY_FIXES = nightly.fixes(project, environ)
     state_dir = args.state_dir or locks.state_dir(
         project.name, "pr-check" if args.instance is None
         else "pr-check-" + args.instance, environ)

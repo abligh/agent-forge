@@ -435,6 +435,42 @@ class Main(unittest.TestCase):
         self.assertIn("hand-backs: conflict 1", text)
         self.assertNotIn("Approval to merge", text)
 
+    def test_nightly_red_hours_from_forge_nightlys_state(self):
+        self.write()
+        data = json.loads(EXAMPLE.read_text())
+        data["router"] = {"owners": {"triage": "LeadDev"}}
+        data["nightly"] = {"workflow": "ci.yaml", "job": "build"}
+        path = os.path.join(self.dir.name, "config.json")
+        with open(path, "w") as handle:
+            json.dump(data, handle)
+        self.env["FORGE_CONFIG"] = path
+        self.main("--no-github", "--json")
+        self.assertEqual(json.loads(self.out[-1])["nightly"],
+                         {"red_hours": None})
+        os.makedirs(os.path.join(self.dir.name, "widget", "nightly"))
+        state = os.path.join(self.dir.name, "widget", "nightly",
+                             "nightly.json")
+        with open(state, "w") as handle:
+            json.dump({"newest": "red",
+                       "red_since": "2026-10-11T14:30:00Z"}, handle)
+        self.main("--no-github", "--json")
+        self.assertEqual(json.loads(self.out[-1])["nightly"],
+                         {"red_hours": 11.5})
+        self.main("--no-github")
+        self.assertIn("Nightly\n  red for 11.5 h since the last green one "
+                      "ended", self.out[-1])
+        with open(state, "w") as handle:
+            json.dump({"newest": "green"}, handle)
+        self.main("--no-github")
+        self.assertIn("Nightly\n  green", self.out[-1])
+
+    def test_no_nightly_without_the_section(self):
+        self.write()
+        self.main("--no-github", "--json")
+        self.assertIsNone(json.loads(self.out[-1])["nightly"])
+        self.main("--no-github")
+        self.assertNotIn("Nightly", self.out[-1])
+
     def fake(self):
         runs = [dict(r, created="2026-10-12T00:30:00Z") for r in RUNS]
         return FakeActions(runs, JOBS)

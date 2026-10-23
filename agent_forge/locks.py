@@ -11,8 +11,9 @@ import fcntl
 import os
 
 
-def state_dir(project, tool, environ=None):
-    """~/.local/state/agent-forge/<project>/<tool>, created. FORGE_STATE_DIR
+def state_dir(project, tool, environ=None, create=True):
+    """~/.local/state/agent-forge/<project>/<tool>, created unless
+    `create` is false (a tool reading another's state). FORGE_STATE_DIR
     moves the root (tests, and hosts that keep state elsewhere). The home
     directory is `environ`'s HOME, so a caller's environment is honoured
     whole."""
@@ -22,7 +23,8 @@ def state_dir(project, tool, environ=None):
         environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"),
         "agent-forge")
     path = os.path.join(root, project, tool)
-    os.makedirs(path, exist_ok=True)
+    if create:
+        os.makedirs(path, exist_ok=True)
     return path
 
 

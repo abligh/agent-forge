@@ -274,11 +274,54 @@ class Check(unittest.TestCase):
             "stats_watch.figures.main_red must be an object",
             "stats_watch.figures.speed: unknown figure (one of check_run, "
             "check_wait, pr_turnaround, merge_time, merge_rate, "
-            "slots_busy, main_red)"])
+            "slots_busy, main_red, nightly_red_hours)"])
         self.assertEqual(self.problems(stats_watch={}),
                          ["stats_watch: missing 'owner'"])
         self.assertEqual(self.problems(stats_watch=[]),
                          ["'stats_watch' must be an object"])
+
+    def test_nightly(self):
+        data = example()
+        data["router"] = {"owners": {"triage": "LeadDev"}}
+        data["nightly"] = {"workflow": "ci.yaml", "job": "build-and-test"}
+        self.assertEqual(config.check(data), [])
+        data["nightly"] = {
+            "workflow": "nightly.yml", "job": "build-and-test",
+            "owners": {"test-slow": "UIDev", "vet-*": "Helper"},
+            "labels": ["bug"], "retry_hours": 3, "escalate_hours": [24, 48],
+            "tell_owner": "owner@example.org", "as": "Merger"}
+        self.assertEqual(config.check(data), [])
+        data["nightly"]["stats_figure"] = {}
+        data["nightly"].update(
+            workflow="ci", owners={"test-slow": "Nobody"}, labels=[""],
+            retry_hours=0, escalate_hours=[48, 24], tell_owner=" ",
+            **{"as": "Nobody"})
+        self.assertEqual(config.check(data), [
+            "nightly: unknown key 'stats_figure'",
+            "nightly.workflow must be the workflow's file name, such as "
+            "ci.yaml",
+            "nightly.owners.test-slow: 'Nobody' is not an agent",
+            "nightly.labels must be a list of label names",
+            "nightly.retry_hours must be at least 1",
+            "nightly.escalate_hours must be one or two whole numbers of "
+            "hours, at least 1, rising (the developers, then the owner)",
+            "nightly.tell_owner must not be empty",
+            "nightly.as 'Nobody' is not an agent or machinery (it "
+            "defaults to the Merger)"])
+        for hours in ([], [1, 2, 3], [0], [24, 24], [True]):
+            with self.subTest(hours=hours):
+                data["nightly"] = {"workflow": "ci.yaml", "job": "j",
+                                   "escalate_hours": hours}
+                self.assertEqual(len(config.check(data)), 1)
+
+    def test_nightly_needs_its_workflow_job_and_triage(self):
+        self.assertEqual(self.problems(nightly={"job": " "}), [
+            "nightly: missing 'workflow'",
+            "nightly.job must not be empty",
+            "nightly needs router.owners.triage: a failed step that "
+            "`owners` doesn't name is hers"])
+        self.assertEqual(self.problems(nightly=[]),
+                         ["'nightly' must be an object"])
 
     def test_stats_watch_files_as_the_merger_by_default(self):
         data = example()

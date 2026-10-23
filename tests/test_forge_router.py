@@ -872,6 +872,16 @@ class Wakes(StateCase):
         self.assertIn("ROUTED 4 open, 4 turn(s) to wake, 1 waiting on example-owner",
                       self.lines[-1])
 
+    def test_a_fix_of_the_red_nightly_is_routed_first(self):
+        self.addCleanup(setattr, r.merger, "NIGHTLY_FIXES", frozenset())
+        r.merger.NIGHTLY_FIXES = frozenset({43})
+        self.assertEqual(self.run_router([pr_node(41), pr_node(43)]), 0)
+        self.assertEqual(self.posts, [
+            ("WidgetReviewer", "From: Router\nYour turn:\n"
+             "#43 needs your review (green at 5b257c8) (fixes the red "
+             "nightly: first)\n"
+             "#41 needs your review (green at 5b257c8)\n")])
+
     def test_once_per_turn(self):
         self.run_router([pr_node(41)])
         self.run_router([pr_node(41)], when=NOW + datetime.timedelta(

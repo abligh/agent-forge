@@ -38,6 +38,13 @@ and idle (`presence.jsonl`, from v0.4.41), also the part of those hours
 she was idle: waiting on her own work, not merely working on something
 else meanwhile.
 
+**The nightly** (forge-nightly's `nightly.json`, designs/0028): with a
+`nightly` section, `nightly_red_hours`, the hours from the end of the
+last green nightly to the end of the window while the newest nightly
+forge-nightly judged is red, and 0 while it is green. It is a reading
+of forge-nightly's state, not of the window's records, so it is the
+figure now even for a window that ended earlier.
+
 **GitHub Actions minutes** (`--actions`, GitHub): the workflow runs
 created in the window, and every job of every attempt of each, from the
 runs and jobs APIs. The billing API is never read. A job's minutes are
@@ -66,7 +73,7 @@ import sys
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-from agent_forge import config, github, locks  # noqa: E402
+from agent_forge import config, github, locks, nightly  # noqa: E402
 
 VERDICT_RE = re.compile(
     r"^(\S+) VERDICT (AHEAD )?(#\d+|main) ([0-9a-f]+): (green|red)(\S*)"
@@ -530,8 +537,37 @@ def actions_text(actions, top=10):
     return lines
 
 
+def nightly_stats(project, until, environ):
+    """{"red_hours": ...} from forge-nightly's state: 0 while the newest
+    nightly it judged is green, else the hours from `red_since` (the end
+    of the last green one) to `until`; None without a `nightly` section
+    or a judged nightly."""
+    if "nightly" not in project.data:
+        return None
+    saved = nightly_state(project, environ)
+    if saved.get("newest") == "green":
+        return {"red_hours": 0}
+    if saved.get("newest") != "red":
+        return {"red_hours": None}
+    try:
+        since = parse_time(saved["red_since"])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return {"red_hours": None}
+    return {"red_hours": round(max(0.0, (until - since).total_seconds()
+                                   / 3600), 1)}
+
+
+def nightly_state(project, environ):
+    try:
+        with open(nightly.path(project.name, environ)) as handle:
+            saved = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return saved if isinstance(saved, dict) else {}
+
+
 def report(name, since, until, check, queue, approval, authors,
-           actions=None):
+           actions=None, night=None):
     hours = (until - since).total_seconds() / 3600
     lines = ["forge-stats: %s, %s to %s (%.1f h)"
              % (name, stamp(since), stamp(until), hours), "",
@@ -584,6 +620,11 @@ def report(name, since, until, check, queue, approval, authors,
                 spread(s["approval_to_merge"]),
                 s["hours_with_approved_work_waiting"],
                 "" if idle is None else ", %.1f h idle" % idle))
+    if night is not None:
+        hours = night.get("red_hours")
+        lines += ["", "Nightly", "  " + (
+            "not judged yet" if hours is None else "green" if not hours
+            else "red for %.1f h since the last green one ended" % hours)]
     if actions is not None:
         lines += actions_text(actions)
     return "\n".join(lines)
@@ -672,17 +713,18 @@ def main(argv=None, out=print, environ=None, now=None,
         actions = actions_stats(runs, {
             run["id"]: fetch_jobs(token, project.repo, run["id"], call)
             for run in runs}, fetch_private(token, project.repo, call))
+    night = nightly_stats(project, until, environ)
     if args.json:
         out(json.dumps(jsonable({
             "project": project.name, "since": since, "until": until,
             "check": check,
             "queue": {k: v for k, v in queue.items() if k != "merged_at"},
             "approval_to_merge": approval, "authors": authors,
-            "actions": actions}),
+            "actions": actions, "nightly": night}),
             indent=1, sort_keys=True))
     else:
         out(report(project.name, since, until, check, queue, approval,
-                   authors, actions))
+                   authors, actions, night))
     return 0
 
 

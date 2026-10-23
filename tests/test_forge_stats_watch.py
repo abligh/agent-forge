@@ -122,6 +122,22 @@ class Judge(unittest.TestCase):
         self.assertEqual(self.judge("main_red", (1, 1))[0], tool.OUT)
         self.assertEqual(self.judge("main_red", (0, 0))[0], tool.IN)
 
+    def test_nightly_red_hours(self):
+        def judge(window, rules):
+            return tool.judge("nightly_red_hours", rules, window,
+                              (None, 0), 5)
+        self.assertEqual(judge((30, 1), {"limit": 24}), (
+            tool.OUT, "red for 30.0 h, over the limit of 24.0 h"))
+        self.assertEqual(judge((20, 1), {"limit": 24}), (
+            tool.IN, "red for 20.0 h"))
+        self.assertEqual(judge((0.5, 1), {}), (tool.OUT, "red for 0.5 h"))
+        self.assertEqual(judge((0, 1), {}), (tool.IN, "green"))
+        self.assertEqual(judge((None, 0), {})[0], tool.UNJUDGED)
+        got = tool.figures(dict(stats(), nightly={"red_hours": 30}), 6)
+        self.assertEqual(got["nightly_red_hours"], (30, 1))
+        self.assertEqual(tool.figures(stats(), 6)["nightly_red_hours"],
+                         (None, 0))
+
     def test_too_few_samples_is_not_judged(self):
         for figure in ("check_run", "slots_busy", "merge_rate"):
             with self.subTest(figure=figure):
