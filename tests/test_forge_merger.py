@@ -2710,7 +2710,7 @@ class TickAhead(RepoCase):
 
     def test_one_with_a_run_in_flight_keeps_its_place(self):
         # #5 is older, so it would go first; #6 is mid-run.
-        self.assertEqual(m.IN_FLIGHT, ("UPDATE", "WAIT"))
+        self.assertEqual(m.IN_FLIGHT, ("UPDATE", "RESOLVE", "WAIT"))
         for action in m.IN_FLIGHT:
             with self.subTest(action=action):
                 self.assertEqual(self.keeps_place(action), 6)
@@ -3836,3 +3836,601 @@ class Stacks(RepoCase):
     def test_a_dry_run_merge_records_nothing(self):
         self.tick([self.bottom(), self.layer()], live=False)
         self.assertIsNone(self.stack_file())
+
+
+# designs/0026: settings for a project with stricter holds.
+
+TA = "2026-10-07T10:10:00Z"
+TB = "2026-10-07T10:20:00Z"
+
+
+class Configure0026(unittest.TestCase):
+
+    def tearDown(self):
+        m.configure(project())
+
+    def test_all_off_by_default(self):
+        self.assertEqual((m.RESOLVE, m.HOLD_LABELS, m.BLOCKED_BY), ((), (),
+                                                                    "body"))
+        self.assertEqual((m.SAID_AUTHOR, m.SAID_APPROVALS, m.UPDATE_ONCE),
+                         (False, False, False))
+        self.assertEqual((m.CI_NEVER_STARTED, m.QUEUED_STALL_AFTER,
+                          m.READ_AS), (None, None, None))
+
+    def test_each_setting(self):
+        p = project(resolve=[{"paths": ["g.txt"], "command": ["tools/gen"],
+                              "check": ["tools/gen", "--check"]}],
+                    hold_labels=["Hold"], blocked_by="everywhere",
+                    said_since={"author": True, "approvals": True,
+                                "quiet": ["Helper"]},
+                    update_once=True, ci_never_started=20,
+                    queued_stall_minutes=90, read_as="Helper")
+        m.configure(p)
+        self.assertEqual(m.RESOLVE, ({"paths": frozenset(["g.txt"]),
+                                      "command": ("tools/gen",),
+                                      "check": ("tools/gen", "--check")},))
+        self.assertEqual((m.HOLD_LABELS, m.BLOCKED_BY), (("Hold",),
+                                                         "everywhere"))
+        self.assertTrue(m.SAID_AUTHOR and m.SAID_APPROVALS and m.UPDATE_ONCE)
+        self.assertEqual(m.QUIET_LOGINS, {"mergerwidgetagent",
+                                          p.slug("Helper")})
+        self.assertEqual((m.CI_NEVER_STARTED, m.QUEUED_STALL_AFTER),
+                         (datetime.timedelta(minutes=20),
+                          datetime.timedelta(minutes=90)))
+        self.assertEqual(m.READ_AS, "Helper")
+
+
+class HoldLabels(unittest.TestCase):
+
+    def tearDown(self):
+        m.configure(project())
+
+    def test_a_listed_label_holds(self):
+        m.configure(project(hold_labels=["Hold", "Status:waiting-owner"]))
+        approval, why = m.eligible(labelled(pr(), "bug", "Hold"), set())
+        self.assertIsNone(approval)
+        self.assertEqual(why, "labelled Hold")
+
+    def test_other_labels_and_flat_lists_are_read(self):
+        m.configure(project(hold_labels=["Hold"]))
+        self.assertIsNotNone(m.eligible(labelled(pr(), "bug"), set())[0])
+        flat = dict(pr(), labels=["Hold"])
+        self.assertEqual(m.eligible(flat, set())[1], "labelled Hold")
+
+    def test_without_the_setting_a_label_holds_nothing(self):
+        self.assertIsNotNone(m.eligible(labelled(pr(), "Hold"), set())[0])
+
+
+class BlockedByEverywhere(unittest.TestCase):
+    """Blockers named before the approval, so that nothing said since it
+    holds the pull request first."""
+
+    def setUp(self):
+        m.configure(project(blocked_by="everywhere"))
+        self.addCleanup(m.configure, project())
+
+    def held(self, item, open_numbers=(2, 3, 4)):
+        return m.eligible(item, set(open_numbers))[1]
+
+    def test_by_default_only_the_body_counts(self):
+        m.configure(project())
+        item = pr(comments=[comment(PEER, at=TA, body="Blocked-by: #2")])
+        self.assertIsNone(self.held(item))
+        self.assertEqual(self.held(pr(body="Blocked-by: #2")),
+                         "Blocked-by: #2")
+
+    def test_a_comment_blocks(self):
+        item = pr(comments=[comment(PEER, at=TA, body="Blocked-by: #2")])
+        self.assertEqual(self.held(item), "Blocked-by: #2")
+
+    def test_two_lines_in_one_comment_both_count(self):
+        item = pr(comments=[comment(PEER, at=TA, body="Waiting on two.\n"
+                                    "Blocked-by: #2\nBlocked-by: #3")])
+        self.assertEqual(self.held(item), "Blocked-by: #2, #3")
+        self.assertEqual(m.blockers_of(item), {2, 3})
+
+    def test_the_newest_text_decides(self):
+        item = pr(body="Blocked-by: #2",
+                  comments=[comment(PEER, at=TA, body="Blocked-by: #3")])
+        self.assertEqual(self.held(item), "Blocked-by: #3")
+
+    def test_none_clears_it(self):
+        item = pr(body="Blocked-by: #2",
+                  comments=[comment(PEER, at=TA, body="Blocked-by: none")])
+        self.assertIsNone(self.held(item))
+
+    def test_a_text_without_the_line_changes_nothing(self):
+        item = pr(comments=[comment(PEER, at=TA, body="Blocked-by: #2"),
+                            comment(PEER, at=TB, body="any news?")])
+        self.assertEqual(self.held(item), "Blocked-by: #2")
+
+    def test_a_review_and_a_not_a_review_comment_count(self):
+        item = pr(reviews=[review(REVIEWER),
+                           review(PEER, "COMMENTED", at=TA,
+                                  body="Blocked-by: #4")])
+        self.assertEqual(self.held(item), "Blocked-by: #4")
+        item = pr(comments=[comment(PEER, at=TA, body="Not-a-review.\n"
+                                    "Blocked-by: #2")])
+        self.assertEqual(self.held(item), "Blocked-by: #2")
+
+    def test_a_closed_blocker_holds_nothing(self):
+        item = pr(comments=[comment(PEER, at=TA, body="Blocked-by: #9")])
+        self.assertIsNone(self.held(item))
+
+    def test_an_unparsed_line_holds(self):
+        item = pr(comments=[comment(PEER, at=TA, body="Blocked-by: the release")])
+        self.assertEqual(self.held(item),
+                         "unparsed Blocked-by line: Blocked-by: the release")
+
+    def test_a_line_in_a_fence_is_not_read(self):
+        item = pr(comments=[comment(PEER, at=TA, body="```\nBlocked-by: #2\n```")])
+        self.assertIsNone(self.held(item))
+
+
+class SaidSince0026(unittest.TestCase):
+
+    def tearDown(self):
+        m.configure(project())
+
+    def said(self, comments=(), reviews=()):
+        approval = review(REVIEWER, at=T1)
+        item = pr(reviews=[approval] + list(reviews), comments=list(comments))
+        return m.said_since(item, approval)
+
+    def test_the_authors_remark_holds_with_author(self):
+        m.configure(project(said_since={"author": True}))
+        self.assertEqual(self.said([comment(AUTHOR, at=T2)]),
+                         [(AUTHOR, T2, "comment")])
+
+    def test_a_later_approval_holds_with_approvals(self):
+        m.configure(project(said_since={"approvals": True}))
+        self.assertEqual(self.said(reviews=[review(PEER, at=T2)]),
+                         [(PEER, T2, "review")])
+
+    def test_quiet_logins_never_hold(self):
+        p = project(said_since={"quiet": ["Helper"]})
+        m.configure(p)
+        self.assertEqual(self.said([comment(p.slug("Helper") + "[bot]")]), [])
+        self.assertEqual(len(self.said([comment(PEER)])), 1)
+
+
+class FetchPr(Decide):
+
+    def test_a_missing_pull_ref_is_fetched_by_sha(self):
+        self.repo.branch("hidden", "feature")
+        sha = self.repo.commit("h.txt", "hidden\n", "hidden")
+        run_git(self.repo.path, "push", "-q", "origin", "hidden")
+        got = m.fetch_pr(self.repo.path, 7, sha)
+        self.assertEqual(got.returncode, 0)
+        self.assertEqual(run_git(self.repo.path, "rev-parse", m.PR_REF % 7),
+                         sha)
+
+    def test_a_sha_that_cannot_be_fetched_returns_the_first_failure(self):
+        got = m.fetch_pr(self.repo.path, 7, "e" * 40)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn("refs/pull/7/head", got.stderr)
+
+    def test_the_pull_ref_is_used_when_it_exists(self):
+        self.assertEqual(m.fetch_pr(self.repo.path, 5, "f" * 40).returncode, 0)
+        self.assertEqual(run_git(self.repo.path, "rev-parse", m.PR_REF % 5),
+                         self.head)
+
+
+class CiNeverStarted(Decide):
+
+    def setUp(self):
+        super().setUp()
+        m.configure(project(ci_never_started=30))
+        self.addCleanup(m.configure, project())
+
+    def decide_at(self, minutes, checks=()):
+        item = self.item()
+        table = dict(answers(runs=[]), **{
+            "repos/example/widget/commits/%s/check-runs" % self.head: {
+                "check_runs": [{"app": {"slug": s}} for s in checks]}})
+        committed = int(run_git(self.repo.path, "log", "-1", "--format=%ct",
+                                self.head))
+        now = datetime.datetime.fromtimestamp(
+            committed, datetime.timezone.utc) + datetime.timedelta(
+                minutes=minutes)
+        return m.decide(item, m.approval_of(item), self.repo.path,
+                        self.repo.main_tip(), FakeGitHub(table), {},
+                        tools_run(), now=now)
+
+    def test_a_young_head_waits(self):
+        got = self.decide_at(10)
+        self.assertEqual(got["action"], "WAIT")
+        self.assertIn("has not started", got["reason"])
+
+    def test_an_old_head_with_no_jobs_goes_back(self):
+        got = self.decide_at(31, checks=["someone-else"])
+        self.assertEqual((got["action"], got["to"]), ("HAND-BACK", "author"))
+        self.assertIn("never started", got["reason"])
+        self.assertIn("push a new head", got["reason"])
+
+    def test_jobs_already_started_wait_however_old(self):
+        got = self.decide_at(300, checks=["github-actions"])
+        self.assertEqual(got["action"], "WAIT")
+        self.assertIn("jobs have started", got["reason"])
+
+    def test_a_listed_run_is_judged_as_before(self):
+        m.configure(project(ci_never_started=30))
+        item = self.item()
+        got = m.decide(item, m.approval_of(item), self.repo.path,
+                       self.repo.main_tip(),
+                       FakeGitHub(answers(runs=[ci_run(None, "queued")])), {},
+                       tools_run(), now=m.now_utc() + datetime.timedelta(
+                           days=1))
+        self.assertEqual(got["action"], "WAIT")
+        self.assertNotIn("never", got["reason"])
+
+
+class QueuedStall(unittest.TestCase):
+
+    START = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                              tzinfo=datetime.timezone.utc)
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = tmp.name
+        m.configure(project(queued_stall_minutes=90))
+        self.addCleanup(m.configure, project())
+
+    def stalled(self, minutes, entry, action="WAIT"):
+        waiting = {"pr": 5, "head": "h" * 40, "action": action}
+        check = {"waiting": {"h" * 40: entry}} if entry is not None else {}
+        m.stalled_for(self.state, waiting, self.START, check)
+        return m.stalled_for(
+            self.state, waiting,
+            self.START + datetime.timedelta(minutes=minutes), check)
+
+    def test_a_queued_head_has_the_longer_limit(self):
+        self.assertIsNone(self.stalled(60, {}))
+        self.assertEqual(self.stalled(90, {}), 90)
+
+    def test_a_running_head_counts_from_its_start(self):
+        started = {"started": "2026-10-07T12:20:00Z"}
+        self.assertIsNone(self.stalled(45, started))
+        self.assertEqual(self.stalled(50, started), 50)
+
+    def test_a_head_the_check_does_not_know_is_as_before(self):
+        self.assertEqual(self.stalled(30, None), 30)
+
+    def test_a_refused_write_is_as_before(self):
+        self.assertEqual(self.stalled(30, {}, action="UPDATE"), 30)
+
+    def test_without_the_setting_the_check_state_is_ignored(self):
+        m.configure(project())
+        self.assertEqual(self.stalled(30, {}), 30)
+
+
+GEN = """#!/bin/sh
+# Lists src/ in gen.txt; --check exits 1 when gen.txt is out of date.
+[ "$1" = --broken ] && { echo "broken here" >&2; exit 3; }
+ls src | sort > gen.new
+if [ "$1" = --check ]; then
+    cmp -s gen.new gen.txt; rc=$?; rm -f gen.new; exit $rc
+fi
+mv gen.new gen.txt
+"""
+RULE = {"paths": ["gen.txt"], "command": ["tools/gen"],
+        "check": ["tools/gen", "--check"]}
+IDENTITY = ("Merger", "1+mergerwidgetagent[bot]@users.noreply.github.com")
+
+
+class Resolve(unittest.TestCase):
+    """A generated file both sides changed: gen.txt lists src/, and the
+    feature and main each add a file to src/."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Repo(self.tmp.name)
+        self.state = os.path.join(self.tmp.name, "state")
+        os.mkdir(self.state)
+        self.write("tools/gen", GEN, mode=0o755)
+        self.write("src/base", "")
+        self.write("gen.txt", "base\n")
+        self.commit("generator")
+        self.repo.push("main")
+        self.repo.branch("feature")
+        self.write("src/f", "")
+        self.write("gen.txt", "base\nf\n")
+        self.head = self.commit("feature")
+        self.repo.publish_pr(5, self.head)
+        run_git(self.repo.path, "push", "-q", "origin", "feature:b5")
+        self.repo.branch("main", "main")
+        self.write("src/m", "")
+        self.write("gen.txt", "base\nm\n")
+        self.commit("main")
+        self.repo.push("main")
+        self.repo.branch("feature", "feature")
+        self.configure()
+        self.addCleanup(m.configure, project())
+        m.RESOLVE_IDENTITY = IDENTITY
+        self.addCleanup(setattr, m, "RESOLVE_IDENTITY", None)
+
+    def configure(self, **rule):
+        m.configure(project(resolve=[dict(RULE, **rule)]))
+
+    def write(self, name, text, mode=0o644):
+        path = os.path.join(self.repo.path, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+        os.chmod(path, mode)
+        run_git(self.repo.path, "add", name)
+
+    def commit(self, message):
+        run_git(self.repo.path, "commit", "-q", "-m", message)
+        return run_git(self.repo.path, "rev-parse", "HEAD")
+
+    def git_run(self):
+        """tools_run, with a push to GitHub sent to `origin` instead."""
+        base = tools_run()
+
+        def run(args, cwd=None, env=None):
+            if "push" in args:
+                args = [self.repo.origin if a.startswith("https://github.com/")
+                        else a for a in args]
+                self.pushed_env = env
+            return base(args, cwd, env)
+        return run
+
+    def item(self):
+        return pr(5, head=self.head,
+                  reviews=[review(REVIEWER, oid=self.head)])
+
+    def decide(self):
+        item = self.item()
+        return m.decide(item, m.approval_of(item), self.repo.path,
+                        self.repo.main_tip(), FakeGitHub(answers()), {},
+                        self.git_run())
+
+    def resolve(self):
+        return m.resolve(self.repo.path, {"action": "RESOLVE", "rule": 0,
+                                          "pr": 5, "head": self.head},
+                         "b5", self.repo.main_tip(), FakeGitHub({}),
+                         self.git_run())
+
+    def checker(self):
+        return m.remembered(self.state, lambda sha, rule: m.regenerated_in(
+            self.repo.path, sha, rule))
+
+    def test_a_conflict_only_in_generated_files_is_resolved(self):
+        self.assertEqual(self.decide(), {"action": "RESOLVE", "rule": 0})
+
+    def test_without_the_setting_it_is_handed_back(self):
+        m.configure(project())
+        self.assertEqual(self.decide()["action"], "HAND-BACK")
+
+    def test_another_conflict_is_handed_back(self):
+        self.configure(paths=["other.txt"])
+        got = self.decide()
+        self.assertEqual((got["action"], got["reason"]),
+                         ("HAND-BACK", m.CONFLICT_REASON))
+
+    def test_the_merge_is_regenerated_committed_and_pushed(self):
+        self.assertEqual(self.resolve(), "done")
+        new = run_git(self.repo.origin, "rev-parse", "b5")
+        self.assertEqual(run_git(self.repo.origin, "rev-list", "--parents",
+                                 "-n1", new).split()[1:],
+                         [self.head, self.repo.main_tip()])
+        self.assertEqual(run_git(self.repo.origin, "show", new + ":gen.txt"),
+                         "base\nf\nm")
+        self.assertEqual(run_git(self.repo.origin, "log", "-1",
+                                 "--format=%an <%ae>", new),
+                         "%s <%s>" % IDENTITY)
+        self.assertIn("gen.txt regenerated", run_git(
+            self.repo.origin, "log", "-1", "--format=%s", new))
+        self.assertEqual(self.pushed_env["GIT_CONFIG_KEY_0"],
+                         "http.https://github.com/.extraheader")
+        # No worktree is left behind.
+        self.assertEqual(len(run_git(self.repo.path, "worktree",
+                                     "list").splitlines()), 1)
+
+    def test_the_resolved_merge_covers_the_head_once_checked(self):
+        self.resolve()
+        self.repo.push("main")
+        new = run_git(self.repo.path, "rev-parse", "origin/b5")
+        main_ref = "refs/remotes/origin/main"
+        self.assertFalse(m.covers_head(self.repo.path, self.head, new,
+                                       main_ref)[0])
+        self.assertEqual(m.covers_head(self.repo.path, self.head, new,
+                                       main_ref, regenerated=self.checker()),
+                         (True, None))
+        self.assertEqual(m.load_json(os.path.join(
+            self.state, m.RESOLVE_CHECKED), {}), {"%s 0" % new: True})
+
+    def test_a_hand_made_merge_with_stale_files_does_not_cover(self):
+        subprocess.run(["git", "-C", self.repo.path, "merge", "-q",
+                        "origin/main"], capture_output=True)
+        self.write("gen.txt", "base\nf\n")
+        run_git(self.repo.path, "add", "src/m")
+        new = self.commit("hand merge")
+        got = m.covers_head(self.repo.path, self.head, new,
+                            "refs/remotes/origin/main",
+                            regenerated=self.checker())
+        self.assertFalse(got[0])
+        self.assertIn("not the clean merge", got[1])
+
+    def test_a_check_that_cannot_say_is_asked_again(self):
+        self.resolve()
+        self.repo.push("main")
+        new = run_git(self.repo.path, "rev-parse", "origin/b5")
+        self.configure(check=["tools/gen", "--broken"])
+        got = m.covers_head(self.repo.path, self.head, new,
+                            "refs/remotes/origin/main",
+                            regenerated=self.checker())
+        self.assertIsNone(got[0])
+        self.assertEqual(m.load_json(os.path.join(
+            self.state, m.RESOLVE_CHECKED), {}), {})
+
+    def test_a_moved_head_refuses_the_push(self):
+        run_git(self.repo.path, "commit", "-q", "--allow-empty", "-m", "x")
+        run_git(self.repo.path, "push", "-q", "-f", "origin", "HEAD:b5")
+        self.assertTrue(self.resolve().startswith("refused: "))
+
+    def test_a_failing_command_fails(self):
+        self.configure(command=["tools/gen", "--broken"])
+        self.assertEqual(self.resolve(),
+                         "failed: gen exited 3: broken here")
+
+    def test_a_missing_command_fails(self):
+        self.configure(command=["tools/nothing"])
+        self.assertTrue(self.resolve().startswith(
+            "failed: nothing could not run"))
+
+    def test_without_an_identity_it_fails(self):
+        m.RESOLVE_IDENTITY = None
+        self.assertTrue(self.resolve().startswith("failed: identity"))
+
+    def test_once_per_approval_and_head(self):
+        decision = {"action": "RESOLVE", "rule": 0, "pr": 5,
+                    "head": self.head}
+        approval = review(REVIEWER, oid=self.head)
+        args = (self.state, self.repo.path, decision, approval, "b5",
+                self.repo.main_tip(), FakeGitHub({}), self.git_run())
+        run_git(self.repo.path, "push", "-q", "-f", "origin",
+                "%s^:refs/heads/b5" % self.head)
+        self.assertTrue(m.resolve_once(*args).startswith("refused"))
+        self.assertEqual(m.resolve_once(*args),
+                         "failed: already tried at this head")
+
+    def tick(self, minutes=0):
+        item = self.item()
+        github = FakeGitHub(answers(prs=[item]))
+        start = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                                  tzinfo=datetime.timezone.utc)
+        record = m.tick(self.repo.path, self.state, github, self.git_run(),
+                        lambda line: None,
+                        now=lambda: start + datetime.timedelta(
+                            minutes=minutes), live=True)
+        return record, github
+
+    def test_a_tick_resolves_it(self):
+        record, github = self.tick()
+        self.assertEqual([(d["pr"], d["action"], d.get("result"))
+                          for d in record["decisions"]],
+                         [(5, "RESOLVE", "done")])
+        self.assertEqual(github.writes, [])
+        self.assertNotEqual(run_git(self.repo.origin, "rev-parse", "b5"),
+                            self.head)
+
+    def test_a_tick_that_cannot_resolve_hands_it_back_once(self):
+        self.configure(command=["tools/gen", "--broken"])
+        record, github = self.tick()
+        self.assertEqual([(d["action"], d.get("result"))
+                          for d in record["decisions"]],
+                         [("RESOLVE", "failed: gen exited 3: broken here"),
+                          ("HAND-BACK", "done")])
+        self.assertIn("could not resolve it (gen exited 3)",
+                      record["decisions"][1]["reason"])
+        self.assertEqual([w[1] for w in github.writes],
+                         [SLUG + "/issues/5/comments"])
+        record, github = self.tick(minutes=1)
+        self.assertEqual([(d["action"], d.get("result"))
+                          for d in record["decisions"]],
+                         [("RESOLVE", "failed: gen exited 3: broken here"),
+                          ("HAND-BACK", "already said")])
+        self.assertEqual(github.writes, [])
+
+
+class UpdateOnce(Tick):
+
+    def test_no_update_after_a_hand_back_under_the_same_approval(self):
+        m.configure(project(update_once=True))
+        self.addCleanup(m.configure, project())
+        record, _ = self.tick([self.item()], conclusions=("failure",),
+                              live=True)
+        self.assertEqual(record["decisions"][0]["action"], "HAND-BACK")
+        self.advance_main("m3.txt")
+        record, _ = self.tick([self.item()], live=True, minutes=1)
+        got = record["decisions"][0]
+        self.assertEqual(got["action"], "SKIP")
+        self.assertIn("not updated until it is approved again", got["reason"])
+        self.assertEqual(self.github.writes, [])
+        again = self.item()
+        again["reviews"].append(review(REVIEWER, at=T3, oid=self.approved))
+        record, _ = self.tick([again], live=True, minutes=2)
+        self.assertEqual(record["decisions"][0]["action"], "UPDATE")
+
+    def test_without_it_the_update_goes_ahead(self):
+        self.tick([self.item()], conclusions=("failure",), live=True)
+        self.advance_main("m3.txt")
+        record, _ = self.tick([self.item()], live=True, minutes=1)
+        self.assertEqual(record["decisions"][0]["action"], "UPDATE")
+
+
+class Main0026(unittest.TestCase):
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.state = os.path.join(tmp.name, "state")
+        os.mkdir(self.state)
+        self.checkout = os.path.join(tmp.name, "cron")
+        os.makedirs(os.path.join(self.checkout, ".agent-forge"))
+        self.environ = {"HOME": tmp.name,
+                        "FORGE_CRON_CHECKOUT": self.checkout}
+        self.addCleanup(m.configure, project())
+        self.addCleanup(setattr, m, "RESOLVE_IDENTITY", None)
+
+    def run_main(self, merge, argv):
+        data = example()
+        data["merge"].update(merge)
+        with open(os.path.join(self.checkout, config.CONFIG_NAME), "w") as f:
+            json.dump(data, f)
+        self.minted, self.ticks, self.identities = [], [], []
+
+        def run(args, cwd=None, env=None):
+            return subprocess.CompletedProcess(args, 0, self.checkout + "\n",
+                                               "")
+
+        def mint(project_, agent):
+            self.minted.append(agent)
+            return "token"
+
+        def identity(project_, name):
+            self.identities.append(name)
+            return IDENTITY
+
+        def fake_tick(repo, state_dir, github, run, out, live, send=None,
+                      **kwargs):
+            self.ticks.append(dict(kwargs, live=live,
+                                   identity=m.RESOLVE_IDENTITY))
+        with mock.patch.object(m, "tick", fake_tick):
+            return m.main(argv + ["--state-dir", self.state], run,
+                          lambda line: None, environ=self.environ,
+                          mint=mint, sender=lambda p, e: None,
+                          identity=identity)
+
+    def test_a_dry_run_reads_as_read_as(self):
+        self.assertEqual(self.run_main({"read_as": "Helper"}, ["--dry-run"]),
+                         0)
+        self.assertEqual(self.minted, ["Helper"])
+
+    def test_a_live_run_acts_as_the_merger(self):
+        self.run_main({"read_as": "Helper"}, [])
+        self.assertEqual(self.minted, ["Merger"])
+
+    def test_resolve_gives_a_live_run_the_mergers_identity(self):
+        self.run_main({"resolve": [RULE]}, [])
+        self.assertEqual(self.identities, ["Merger"])
+        self.assertEqual(self.ticks[0]["identity"], IDENTITY)
+        m.RESOLVE_IDENTITY = None
+        self.run_main({"resolve": [RULE]}, ["--dry-run"])
+        self.assertEqual(self.identities, [])
+
+    def test_the_check_state_is_read_for_queued_stalls(self):
+        check = os.path.join(self.tmp, "check")
+        os.mkdir(check)
+        with open(os.path.join(check, "state.json"), "w") as f:
+            json.dump({"waiting": {"h": {}}}, f)
+        self.run_main({"queued_stall_minutes": 90},
+                      ["--check-state", check])
+        self.assertEqual(self.ticks[0]["check_state"], {"waiting": {"h": {}}})
+        self.run_main({}, ["--check-state", check])
+        self.assertNotIn("check_state", self.ticks[0])

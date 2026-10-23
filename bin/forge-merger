@@ -372,14 +372,17 @@ token, GitHub or git failed) or the head it waits on is `STALLED`.
 """
 
 import argparse
+import base64
 import datetime
 import importlib.machinery
 import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 
@@ -506,7 +509,7 @@ AHEAD_IDENTITY = ("forge-merger", "merger@agent-forge.invalid")
 TICKS_PER_RUN = 10
 # The actions that leave a run in progress or about to start on the
 # pull request: with test_ahead, it keeps its place in the queue.
-IN_FLIGHT = ("UPDATE", "WAIT")
+IN_FLIGHT = ("UPDATE", "RESOLVE", "WAIT")
 # merge.hold_conflicting: hold one that conflicts with one ahead of it.
 HOLD_CONFLICTING = False
 HOLD_REASON = "conflicts with #%d, ahead of it in the queue"
@@ -542,6 +545,36 @@ ROW_AFTER = 2
 ROW_FOR = datetime.timedelta(minutes=60)
 ROW_REASON = "conflicts with #%d, which has right of way"
 ROW_FILE = "right-of-way.json"
+# Design 0026: settings for a project with stricter holds, each off
+# unless set.
+# merge.resolve: [{paths, command, check}], conflicts in generated
+# files the Merger regenerates itself.
+RESOLVE = ()
+RESOLVE_CHECKED = "resolve-checked.json"
+RESOLVED_FILE = "resolved.json"
+# The Merger's commit identity, (name, email), for RESOLVE commits; set
+# by `main` when RESOLVE is.
+RESOLVE_IDENTITY = None
+RESOLVE_MESSAGE = "Merge %s into %s; %s regenerated"
+# merge.hold_labels: labels that hold a pull request.
+HOLD_LABELS = ()
+# merge.blocked_by: "body", or "everywhere" as `blocker_state` reads it.
+BLOCKED_BY = "body"
+# merge.said_since: whether the author's remarks and later approvals by
+# others hold too.
+SAID_AUTHOR = False
+SAID_APPROVALS = False
+# merge.update_once: no second UPDATE or RESOLVE after any hand-back
+# under the same approval.
+UPDATE_ONCE = False
+# merge.ci_never_started: how long after the head's commit a CI run
+# that never started is handed back, or None to wait (and stall).
+CI_NEVER_STARTED = None
+# merge.queued_stall_minutes: the stall time while the build check has
+# the head queued and not yet started, or None.
+QUEUED_STALL_AFTER = None
+# merge.read_as: the App a dry run reads with, or None for the Merger.
+READ_AS = None
 
 
 def configure(project):
@@ -557,7 +590,9 @@ def configure(project):
     (default none: nobody has it; `after_conflicts`, default 2, and
     `minutes`, default 60) and `code_owners` (default false) and
     `stacks` (default none: a stacked pull request is held; `max_run`,
-    default 0, no limit). The
+    default 0, no limit), and design 0026's `resolve`, `hold_labels`,
+    `blocked_by`, `said_since`, `update_once`, `ci_never_started`,
+    `queued_stall_minutes` and `read_as` (each off unless set). The
     `checks` section: `context` and `poster` (default the merger).
     `labels.waiting_on_owner` is the label a long stall gets, and
     `labels.urgent` the label that puts a pull request first."""
@@ -568,7 +603,9 @@ def configure(project):
     global TEST_AHEAD, AHEAD_DEPTH, HOLD_CONFLICTING, YIELD_PLACES
     global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
     global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS, URGENT_LABEL
-    global STACKS, STACK_MAX_RUN
+    global STACKS, STACK_MAX_RUN, RESOLVE, HOLD_LABELS, BLOCKED_BY
+    global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
+    global QUEUED_STALL_AFTER, READ_AS
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -613,9 +650,31 @@ def configure(project):
     stacks = merge.get("stacks")
     STACKS = stacks is not None
     STACK_MAX_RUN = (stacks or {}).get("max_run", 0)
+    RESOLVE = tuple({"paths": frozenset(rule["paths"]),
+                     "command": tuple(rule["command"]),
+                     "check": tuple(rule["check"])}
+                    for rule in merge.get("resolve", ()))
+    HOLD_LABELS = tuple(merge.get("hold_labels", ()))
+    BLOCKED_BY = merge.get("blocked_by", "body")
+    said = merge.get("said_since") or {}
+    SAID_AUTHOR = said.get("author", False) is True
+    SAID_APPROVALS = said.get("approvals", False) is True
+    QUIET_LOGINS = QUIET_LOGINS | {project.slug(n)
+                                   for n in said.get("quiet", ())}
+    UPDATE_ONCE = merge.get("update_once", False) is True
+    never = merge.get("ci_never_started")
+    CI_NEVER_STARTED = (datetime.timedelta(minutes=never)
+                        if never is not None else None)
+    queued = merge.get("queued_stall_minutes")
+    QUEUED_STALL_AFTER = (datetime.timedelta(minutes=queued)
+                          if queued is not None else None)
+    READ_AS = merge.get("read_as")
 
 NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
 BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
+                        re.MULTILINE | re.IGNORECASE)
+BLOCKED_LINE_RE = re.compile(r"^\**Blocked-by:", re.IGNORECASE)
+UNBLOCK_RE = re.compile(r"^\**Blocked-by:\**\s*(none|nothing)\s*\.?\**$",
                         re.MULTILINE | re.IGNORECASE)
 FENCE_RE = re.compile(r"^\s*(```|~~~).*?(^\s*\1|\Z)", re.MULTILINE | re.DOTALL)
 DEFER_ANY_RE = re.compile(r"^Defer-until:[ \t]*(.+?)[ \t]*$",
@@ -689,8 +748,9 @@ def approval_of(pr, approvers=None):
 def changes_requested(pr, changers=None):
     """The reviews whose request for changes still stands, oldest first:
     for each login in CHANGERS (or `changers`), or that GitHub says can
-    push to the repository, other than the author, its newest `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED` review,
-    when that is `CHANGES_REQUESTED`. GitHub refuses to merge while one
+    push to the repository, other than the author, its newest
+    `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED` review, when that is
+    `CHANGES_REQUESTED`. GitHub refuses to merge while one
     stands, whatever another reviewer approved since, and a push or a
     comment doesn't lift it: only that reviewer's next verdict or a
     dismissal does."""
@@ -715,7 +775,10 @@ def said_since(pr, approval):
     """Comments and reviews after `approval`, as (login, time, kind),
     less those marked `Not-a-review`, those by QUIET_LOGINS, those by
     the pull request's author and approvals. Empty means nothing has
-    been said since."""
+    been said since. With `merge.said_since.author` the author's remarks
+    count too, and with `approvals` so does a later approval: another
+    reviewer's assent after the one that counts is still a remark the
+    approver hasn't seen."""
     at = approval["submittedAt"]
     author = login(pr)
     said = []
@@ -726,11 +789,13 @@ def said_since(pr, approval):
             if item is approval or when <= at:
                 continue
             who = login(item)
-            if who in QUIET_LOGINS or (author and who == author):
+            if who in QUIET_LOGINS or (author and who == author
+                                       and not SAID_AUTHOR):
                 continue
             if NOT_A_REVIEW_RE.search(markers_of(item.get("body"))):
                 continue
-            if kind == "review" and item.get("state") == "APPROVED":
+            if (kind == "review" and item.get("state") == "APPROVED"
+                    and not SAID_APPROVALS):
                 # Assent, whatever its text: a reviewer with second
                 # thoughts requests changes instead.
                 continue
@@ -738,11 +803,62 @@ def said_since(pr, approval):
     return sorted(said, key=lambda s: s[1])
 
 
+def label_names(pr):
+    """`pr`'s label names, from GraphQL's `labels.nodes` or a plain
+    list of names or `{"name": ...}` objects."""
+    labels = pr.get("labels") or ()
+    if isinstance(labels, dict):
+        labels = labels.get("nodes") or ()
+    return [l.get("name") if isinstance(l, dict) else l for l in labels]
+
+
+def texts_of(pr):
+    """The body, comments and submitted reviews of `pr`, oldest first, as
+    (time, text) pairs; the body sorts first. A pending review has no
+    time and is not read."""
+    texts = [("", pr.get("body"))]
+    texts += [(c.get("createdAt") or "", c.get("body"))
+              for c in pr.get("comments") or ()]
+    texts += [(r.get("submittedAt") or "", r.get("body"))
+              for r in pr.get("reviews") or () if r.get("submittedAt")]
+    return sorted(texts, key=lambda t: t[0])
+
+
+def blocker_state(pr):
+    """(numbers, unparsed) for `pr`'s `Blocked-by:` lines. With
+    `merge.blocked_by: "everywhere"`, the newest text with a
+    `Blocked-by:` line decides, across the body, comments and reviews,
+    `Not-a-review` included: every strict line in it counts and replaces
+    any earlier numbers, and `Blocked-by: none` clears them. `unparsed`
+    is the first line in that text that starts `Blocked-by:` but is
+    neither strict nor `none`, or None: it was meant as a hold, so it
+    holds. Otherwise only the body's strict lines count, and nothing is
+    unparsed."""
+    if BLOCKED_BY != "everywhere":
+        return ({int(m.group(1))
+                 for m in BLOCKED_RE.finditer(markers_of(pr.get("body")))},
+                None)
+    named, unparsed = set(), None
+    for _, text in texts_of(pr):
+        text = markers_of(text)
+        lines = [l for l in text.splitlines() if BLOCKED_LINE_RE.match(l)]
+        if not lines:
+            continue
+        bad = [l for l in lines
+               if not (BLOCKED_RE.match(l) or UNBLOCK_RE.match(l))]
+        unparsed = bad[0].strip() if bad else None
+        if UNBLOCK_RE.search(text):
+            named = set()
+        found = {int(m.group(1)) for m in BLOCKED_RE.finditer(text)}
+        if found:
+            named = found
+    return named, unparsed
+
+
 def blockers_of(pr):
-    """The pull request and issue numbers its body names in `Blocked-by:`
-    lines."""
-    return {int(m.group(1))
-            for m in BLOCKED_RE.finditer(markers_of(pr.get("body")))}
+    """The pull request and issue numbers `pr` is blocked by; see
+    `blocker_state`."""
+    return blocker_state(pr)[0]
 
 
 def parse_defer(value):
@@ -799,6 +915,9 @@ def eligible(pr, open_numbers, now=None, stacked=None, any_base=False):
         if STACKS and below is not None:
             return None, STACK_REASON % below
         return None, "based on %s, not %s" % (pr.get("baseRefName"), MAIN)
+    for label in HOLD_LABELS:
+        if label in label_names(pr):
+            return None, "labelled %s" % label
     approval = approval_of(pr)
     if approval is None:
         return None, "no Reviewer approval"
@@ -810,7 +929,10 @@ def eligible(pr, open_numbers, now=None, stacked=None, any_base=False):
     if standing:
         return None, "changes requested by %s at %s" % (
             login(standing[0]), standing[0].get("submittedAt"))
-    still = sorted(blockers_of(pr) & set(open_numbers))
+    named, unparsed = blocker_state(pr)
+    if unparsed:
+        return None, "unparsed Blocked-by line: %s" % unparsed[:60]
+    still = sorted(named & set(open_numbers))
     if still:
         return None, "Blocked-by: %s" % ", ".join("#%d" % n for n in still)
     deferred = deferral_of(pr, now or now_utc())
@@ -995,16 +1117,73 @@ def git(repo, *args, run=sh):
     return run(["git", "-C", repo] + list(args))
 
 
+def fetch_pr(repo, number, head, run=sh):
+    """Fetch pull request `number`'s head into PR_REF, and return the
+    first fetch's result when nothing could be fetched. GitHub can fail
+    to make `refs/pull/N/head`, and then a fetch of it fails on every
+    tick. The head the Merger means is `head`, the SHA it already read,
+    and GitHub serves a reachable commit by its SHA, so that is the
+    fallback; a SHA that can't be fetched either is still a failure."""
+    fetched = git(repo, "fetch", "-q", "origin",
+                  "+refs/pull/%d/head:%s" % (number, PR_REF % number),
+                  run=run)
+    if fetched.returncode == 0:
+        return fetched
+    if git(repo, "fetch", "-q", "origin", head, run=run).returncode != 0:
+        return fetched
+    return git(repo, "update-ref", PR_REF % number, head, run=run)
+
+
 def is_ancestor(repo, older, newer, run=sh):
     return git(repo, "merge-base", "--is-ancestor", older, newer,
                run=run).returncode == 0
 
 
-def covers_head(repo, approved, head, main_ref, run=sh, below=()):
-    """(True, None) if the approval at `approved` covers `head`, else
-    (False, reason). Both commits and `main_ref` must be in `repo`.
-    `below` are the heads of a stack's layers already merged (STACKS):
-    a clean merge of one of them, as of `main`, covers the head too."""
+def conflicted_paths(output):
+    """The paths `git merge-tree --write-tree --name-only --no-messages`
+    lists as conflicted: every line after the tree's id."""
+    return {line for line in output.splitlines()[1:] if line}
+
+
+def resolve_rule(paths):
+    """The index of the first `merge.resolve` rule whose paths hold all
+    of `paths` (a non-empty set), or None."""
+    for at, rule in enumerate(RESOLVE):
+        if paths and paths <= rule["paths"]:
+            return at
+    return None
+
+
+def regenerated_merge(repo, parents, sha, run=sh):
+    """The `merge.resolve` rule's index when merging `parents` conflicts
+    only in paths one rule lists and `sha`'s tree differs from that
+    merge only in those paths, else None. Whether the files themselves
+    are right is the rule's `check`'s question."""
+    merged = git(repo, "merge-tree", "--write-tree", "--name-only",
+                 "--no-messages", *parents, run=run)
+    if merged.returncode != 1:
+        return None
+    at = resolve_rule(conflicted_paths(merged.stdout))
+    if at is None:
+        return None
+    differs = git(repo, "diff-tree", "-r", "--name-only",
+                  merged.stdout.split()[0], sha + "^{tree}", run=run)
+    if differs.returncode != 0 or not set(
+            differs.stdout.split()) <= RESOLVE[at]["paths"]:
+        return None
+    return at
+
+
+def covers_head(repo, approved, head, main_ref, run=sh, below=(),
+                regenerated=None):
+    """(True, None) if the approval at `approved` covers `head`, (False,
+    reason) if not, or (None, reason) when `regenerated` could not say,
+    a question for the next tick. Both commits and `main_ref` must be in
+    `repo`. `below` are the heads of a stack's layers already merged
+    (STACKS): a clean merge of one of them, as of `main`, covers the
+    head too. With `merge.resolve`, a merge whose only conflict was in a
+    rule's paths covers it too, once `regenerated(sha, rule)` says its
+    files are what the rule's `check` makes of them."""
     if not is_ancestor(repo, approved, head, run):
         return False, "the approved commit %s is not in the head's history" % (
             approved[:10])
@@ -1022,11 +1201,172 @@ def covers_head(repo, approved, head, main_ref, run=sh, below=()):
             return False, "%s merges nothing from %s" % (sha[:10], MAIN)
         merged = git(repo, "merge-tree", "--write-tree", *parents, run=run)
         tree = git(repo, "rev-parse", sha + "^{tree}", run=run)
-        if not (merged.returncode == 0 and tree.returncode == 0
+        if (merged.returncode == 0 and tree.returncode == 0
                 and merged.stdout.split()[:1] == tree.stdout.split()[:1]):
-            return False, ("%s's tree is not the clean merge of its parents"
-                           % sha[:10])
+            continue
+        rule = (regenerated_merge(repo, parents, sha, run)
+                if RESOLVE and regenerated is not None else None)
+        if rule is not None:
+            verdict = regenerated(sha, rule)
+            if verdict is None:
+                return None, ("could not check %s's regenerated files; "
+                              "trying again next tick" % sha[:10])
+            if verdict:
+                continue
+        return False, ("%s's tree is not the clean merge of its parents"
+                       % sha[:10])
     return True, None
+
+
+def tokenless_env():
+    """The environment with every variable named like a token taken out,
+    for code a pull request brings (a rule's own `command` or `check`).
+    **This is not a sandbox**: the process runs as the host's user. What
+    stands between an approved pull request's tool and the Merger's
+    write access is the reviewer's approval of that code; taking the
+    tokens out only stops the tool using the Merger's by accident."""
+    return {k: v for k, v in os.environ.items() if "TOKEN" not in k.upper()}
+
+
+class Checkout:
+    """A temporary detached worktree of `repo` at `sha`, removed on exit.
+    `path` is None when it could not be made, and `error` says why."""
+
+    def __init__(self, repo, sha, run=sh):
+        self.repo, self.sha, self.run = repo, sha, run
+        self.tmp = self.path = None
+        self.error = ""
+
+    def __enter__(self):
+        self.tmp = tempfile.mkdtemp(prefix="forge-merger-")
+        where = os.path.join(self.tmp, "tree")
+        added = git(self.repo, "worktree", "add", "-q", "--detach", where,
+                    self.sha, run=self.run)
+        if added.returncode == 0:
+            self.path = where
+        else:
+            self.error = added.stderr.strip()
+        return self
+
+    def __exit__(self, *exc):
+        # Removing the directory and pruning is `worktree remove --force`
+        # without its refusals, and also clears a half-made worktree.
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        git(self.repo, "worktree", "prune", run=self.run)
+        return False
+
+
+def tree_tool(where, argv):
+    """`argv` with its tool taken from the worktree at `where`: a rule's
+    tool is the tree's own copy, which is what made the tree's files."""
+    tool = argv[0]
+    return [tool if os.path.isabs(tool) else os.path.join(where, tool)] + \
+        list(argv[1:])
+
+
+def regenerated_in(repo, sha, rule, run=sh):
+    """Whether `sha`'s files are what rule `rule`'s `check` makes of them,
+    run from `sha`'s own tree: True when it exits 0, False when it exits
+    1, and None when the check could not be made (a worktree that would
+    not open, or any other exit). None is not a verdict."""
+    with Checkout(repo, sha, run) as tree:
+        if tree.path is None:
+            return None
+        try:
+            got = run(tree_tool(tree.path, RESOLVE[rule]["check"]),
+                      cwd=tree.path, env=tokenless_env())
+        except OSError:
+            return None
+        return {0: True, 1: False}.get(got.returncode)
+
+
+def remembered(state_dir, check):
+    """`check(sha, rule)`, remembered in RESOLVE_CHECKED by commit and
+    rule: the head it judges is judged every tick until it merges. Only
+    a verdict is remembered; a None is asked again next time."""
+    path = os.path.join(state_dir, RESOLVE_CHECKED)
+
+    def regenerated(sha, rule):
+        seen = load_json(path, {})
+        key = "%s %d" % (sha, rule)
+        if key in seen:
+            return seen[key]
+        verdict = check(sha, rule)
+        if verdict is not None:
+            seen[key] = bool(verdict)
+            save_json(path, seen)
+        return verdict
+    return regenerated
+
+
+def push_env(github):
+    """`github`'s environment with git told to send its token to GitHub,
+    through the environment, never the checkout's config."""
+    token = github.env.get("GH_TOKEN", "")
+    basic = base64.b64encode(("x-access-token:" + token).encode()).decode()
+    return dict(github.env, GIT_CONFIG_COUNT="1",
+                GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+                GIT_CONFIG_VALUE_0="AUTHORIZATION: basic " + basic)
+
+
+def resolve(repo, decision, branch, main_tip, github, run=sh):
+    """Merge `main_tip` into the head in a temporary worktree, regenerate
+    the rule's files with the tree's own `command`, commit as the
+    Merger, and push to `branch` with a lease on the head. Returns
+    "done", "refused: why" when the push was refused (the head moved,
+    say: the next tick judges afresh), or "failed: why" when the
+    conflict could not be resolved this way."""
+    head, rule = decision["head"], RESOLVE[decision["rule"]]
+    if RESOLVE_IDENTITY is None:
+        return "failed: identity: the Merger's commit identity is unknown"
+    who = ["-c", "user.name=" + RESOLVE_IDENTITY[0],
+           "-c", "user.email=" + RESOLVE_IDENTITY[1]]
+    paths = sorted(rule["paths"])
+    message = RESOLVE_MESSAGE % (MAIN, branch, ", ".join(paths))
+    with Checkout(repo, head, run) as tree:
+        if tree.path is None:
+            return "failed: worktree: " + tree.error
+        here = tree.path
+        # --no-commit either way, so the one commit made below is the
+        # merge, whether or not git stopped for the conflict.
+        git(here, *who, "merge", "-q", "--no-commit", "--no-ff", main_tip,
+            run=run)
+        left = set(git(here, "diff", "--name-only", "--diff-filter=U",
+                       run=run).stdout.split())
+        if not left <= rule["paths"]:
+            return "failed: the merge conflicts in %s" % ", ".join(
+                sorted(left - rule["paths"]))
+        # Staged before regenerating as well as after: a tool may refuse
+        # an unmerged index, and it rewrites the files, so the conflict
+        # markers staged here don't survive it.
+        if left:
+            got = git(here, "add", "--", *sorted(left), run=run)
+            if got.returncode != 0:
+                return "failed: git add: " + got.stderr.strip()
+        try:
+            made = run(tree_tool(here, rule["command"]), cwd=here,
+                       env=tokenless_env())
+        except OSError as err:
+            return "failed: %s could not run: %s" % (
+                os.path.basename(rule["command"][0]), err.strerror or err)
+        if made.returncode != 0:
+            return "failed: %s exited %d: %s" % (
+                os.path.basename(rule["command"][0]), made.returncode,
+                tail(made.stderr + "\n" + made.stdout, 2))
+        for name, args in (("add", ["add", "-A", "--"] + paths),
+                           ("commit", who + ["commit", "-q", "-m",
+                                             message])):
+            got = git(here, *args, run=run)
+            if got.returncode != 0:
+                return "failed: git %s: %s" % (name, got.stderr.strip())
+        pushed = run(["git", "-C", here, "push", "-q",
+                      "--force-with-lease=refs/heads/%s:%s" % (branch, head),
+                      "https://github.com/%s.git" % REPO_SLUG,
+                      "HEAD:refs/heads/" + branch], env=push_env(github))
+        if pushed.returncode != 0:
+            return "refused: " + tail(pushed.stderr + "\n" + pushed.stdout,
+                                      2)
+    return "done"
 
 
 def tree_of(repo, commit, run=sh):
@@ -1141,6 +1481,41 @@ def ci_problem(runs):
         return "%s has %s on the head" % (
             CI_WORKFLOW, "not finished" if pending else "no successful run")
     return None
+
+
+def actions_started(github, head):
+    """Whether GitHub Actions has any check run on `head`. The runs
+    listing filtered by head SHA can lag well behind runs that exist,
+    while the commit's check runs show their jobs at once. Anything but
+    a check-runs answer reads as none."""
+    try:
+        got = github.api("repos/%s/commits/%s/check-runs?per_page=100"
+                         % (REPO_SLUG, head))
+    except RuntimeError:
+        return False
+    checks = got.get("check_runs") if isinstance(got, dict) else None
+    return any(((c.get("app") or {}).get("slug") == "github-actions")
+               for c in checks or [])
+
+
+def never_started(repo, head, github, now, run=sh):
+    """With `merge.ci_never_started`, the decision for a head on which
+    no CI run is listed: WAIT while Actions shows it starting or the
+    head is younger than the limit, else a hand-back to its author."""
+    if actions_started(github, head):
+        return {"action": "WAIT", "reason": "%s's run is not listed for "
+                "the head yet, though its jobs have started" % CI_WORKFLOW}
+    committed = git(repo, "log", "-1", "--format=%ct", head,
+                    run=run).stdout.strip()
+    age = now - datetime.datetime.fromtimestamp(
+        int(committed or 0), datetime.timezone.utc)
+    if age < CI_NEVER_STARTED:
+        return {"action": "WAIT", "reason": "%s has not started on the "
+                "head" % CI_WORKFLOW}
+    return {"action": "HAND-BACK", "to": "author", "reason": (
+        "%s never started on the head in %d minutes, which no approval "
+        "changes; push a new head" % (
+            CI_WORKFLOW, CI_NEVER_STARTED.total_seconds() // 60))}
 
 
 def ci_stuck_reason():
@@ -1312,19 +1687,19 @@ def fetch_open_issues(github):
     return set(got or [])
 
 
-def decide(pr, approval, repo, main_tip, github, env, run=sh, below=()):
+def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
+           regenerated=None, now=None):
     """The action for one eligible pull request, as a dictionary with
     `action`, and `to` and `reason` for a hand-back. Reads, never
-    writes. `below` is passed to `covers_head`."""
+    writes. `below` and `regenerated` are passed to `covers_head`;
+    `now` is the tick's clock."""
     number, head = pr["number"], pr["headRefOid"]
     approver = APPROVERS.get(login(approval), "a reviewer")
 
     def back(to, reason):
         return {"action": "HAND-BACK", "to": to, "reason": reason}
 
-    fetched = git(repo, "fetch", "-q", "origin",
-                  "+refs/pull/%d/head:%s" % (number, PR_REF % number),
-                  run=run)
+    fetched = fetch_pr(repo, number, head, run)
     if fetched.returncode != 0:
         return {"action": "SKIP", "reason": "fetch failed: %s"
                 % fetched.stderr.strip()}
@@ -1334,7 +1709,10 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=()):
     if not approved:
         return back(approver, "the approval names no commit")
     main_ref = "refs/remotes/origin/" + MAIN
-    covered, why = covers_head(repo, approved, head, main_ref, run, below)
+    covered, why = covers_head(repo, approved, head, main_ref, run, below,
+                               regenerated)
+    if covered is None:
+        return {"action": "SKIP", "reason": why}
     if not covered:
         return dict(back(approver, why),
                     paths=review_paths(repo, approved, head, main_ref, run))
@@ -1347,6 +1725,9 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=()):
         merged = git(repo, "merge-tree", "--write-tree", "--name-only",
                      "--no-messages", main_tip, head, run=run)
         if merged.returncode == 1:
+            rule = resolve_rule(conflicted_paths(merged.stdout))
+            if RESOLVE and rule is not None:
+                return {"action": "RESOLVE", "rule": rule}
             return back("author", CONFLICT_REASON)
         return {"action": "UPDATE"}
     state, said = status_state(github.api(
@@ -1367,6 +1748,10 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=()):
         if stale:
             notes["ci_stale"] = stale
         problem = ci_problem(runs)
+        if (CI_NEVER_STARTED is not None and problem
+                and not any(r.get("name") == CI_WORKFLOW for r in runs)):
+            return dict(never_started(repo, head, github, now or now_utc(),
+                                      run), **notes)
     if problem and ("not finished" in problem or "not started" in problem):
         if unfinished:
             notes["ci_unfinished"] = unfinished
@@ -1467,13 +1852,20 @@ def save_json(path, value):
     os.replace(path + ".tmp", path)
 
 
-def stalled_for(state_dir, waiting, when):
+def stalled_for(state_dir, waiting, when, check_state=None):
     """Whole minutes the Merger has waited on `waiting`'s head, once that
     is `STALL_AFTER` or more, else None. `waiting` is the tick's WAIT
     decision or a write GitHub refused, or None when the tick is held up
     by nothing, which forgets the wait. The wait is timed per pull
     request and head, so a new head or a different pull request starts
-    it again."""
+    it again.
+
+    With `merge.queued_stall_minutes` and `check_state`, the build
+    check's state, a WAIT is judged by where the check has the head:
+    queued (waiting, not started), a stall only after
+    QUEUED_STALL_AFTER; running, a stall once STALL_AFTER has passed
+    since the later of the wait's start and the run's; neither, as
+    without it."""
     path = os.path.join(state_dir, "waiting.json")
     if waiting is None:
         if os.path.exists(path):
@@ -1493,7 +1885,22 @@ def stalled_for(state_dir, waiting, when):
         save_json(path, {"pr": waiting["pr"], "head": waiting["head"],
                          "since": iso(when)})
     waited = when - began
-    return int(waited.total_seconds() // 60) if waited >= STALL_AFTER else None
+    limit, since = STALL_AFTER, began
+    queue = (check_state or {}).get("waiting")
+    entry = queue.get(waiting["head"]) if isinstance(queue, dict) else None
+    if (QUEUED_STALL_AFTER is not None and waiting.get("action") == "WAIT"
+            and isinstance(entry, dict)):
+        try:
+            started = parse_time(entry.get("started"))
+        except (TypeError, ValueError):
+            started = None
+        if started is None:
+            limit = QUEUED_STALL_AFTER
+        else:
+            since = max(began, started)
+    if when - since < limit:
+        return None
+    return int(waited.total_seconds() // 60)
 
 
 def where_to_look():
@@ -1904,8 +2311,7 @@ def have_head(repo, pr, run=sh):
     pull requests a tick decided on were fetched."""
     if git(repo, "cat-file", "-e", pr["headRefOid"] + "^{commit}",
            run=run).returncode != 0:
-        git(repo, "fetch", "-q", "origin", "+refs/pull/%d/head:%s"
-            % (pr["number"], PR_REF % pr["number"]), run=run)
+        fetch_pr(repo, pr["number"], pr["headRefOid"], run)
 
 
 def conflicts_ahead(repo, queue, run=sh, main_ref=None):
@@ -2034,7 +2440,7 @@ def owners_of(path, rules):
     return owners
 
 
-def code_owner_wait(repo, pr, rules, main_ref, run=sh):
+def code_owner_wait(repo, pr, rules, main_ref, run=sh, regenerated=None):
     """Why `pr` waits for a code owner, or None. Each path it changes
     since `main_ref` that `rules` gives owners needs one of them: its
     author, or an owner whose newest review is `APPROVED` at a commit
@@ -2064,8 +2470,9 @@ def code_owner_wait(repo, pr, rules, main_ref, run=sh):
             return False
         oid = (review.get("commit") or {}).get("oid")
         if oid not in covered:
-            covered[oid] = bool(oid) and covers_head(
-                repo, oid, head, main_ref, run)[0]
+            covered[oid] = bool(oid) and bool(covers_head(
+                repo, oid, head, main_ref, run,
+                regenerated=regenerated)[0])
         return covered[oid]
     waiting = {}
     for path in got.stdout.split():
@@ -2380,14 +2787,37 @@ def note_merge(state_dir, stack, pr, prs, when):
     return new
 
 
+def resolve_once(state_dir, repo, decision, approval, branch, main_tip,
+                 github, run=sh):
+    """`resolve`, at most once per approval and head (RESOLVED_FILE): a
+    push that worked moves the head, so a second try at the same head
+    means the first failed, and it would fail again. A repeat answers
+    with the first try's failure, so its hand-back is said once."""
+    path = os.path.join(state_dir, RESOLVED_FILE)
+    tried = load_json(path, {})
+    key = {"approved": approval.get("submittedAt"), "head": decision["head"]}
+    before = tried.get(str(decision["pr"])) or {}
+    if {k: before.get(k) for k in key} == key:
+        failed = before.get("result") or ""
+        return (failed if failed.startswith("failed: ")
+                else "failed: already tried at this head")
+    tried[str(decision["pr"])] = key
+    save_json(path, tried)
+    result = resolve(repo, decision, branch, main_tip, github, run)
+    tried[str(decision["pr"])] = dict(key, result=result)
+    save_json(path, tried)
+    return result
+
+
 def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
-         sleep=time.sleep, live=False, send=None):
+         sleep=time.sleep, live=False, send=None, check_state=None):
     """One tick: the queue, and the action for its first pull request
     that isn't handed back or skipped, carried out when `live`. Appends
     the record to merger.jsonl, or dry-run.jsonl when not live, and
     prints one summary line (two when stalled). With STALL_ALERT, a live
     tick then tells people of a stall, through `send` (see
-    `tell_stall`). Returns the record."""
+    `tell_stall`). `check_state` is the build check's state, for
+    `merge.queued_stall_minutes`. Returns the record."""
     fetched = git(repo, "fetch", "-q", "origin", MAIN, run=run)
     if fetched.returncode != 0 and "cannot lock ref" in fetched.stderr:
         # The checkout's refs are shared with every worktree on the host,
@@ -2414,10 +2844,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             said_after = said_since(pr, approval_of(pr))
             if said_after and not pr.get("isDraft"):
                 spoken.append((pr, approval_of(pr), said_after[0]))
+    regenerated = (remembered(state_dir, lambda sha, rule: regenerated_in(
+        repo, sha, rule, run)) if RESOLVE else None)
     if CODE_OWNERS:
         rules = codeowners_rules(repo, "refs/remotes/origin/" + MAIN, run)
         for pr in list(candidates):
-            why = rules and code_owner_wait(repo, pr, rules, main_tip, run)
+            why = rules and code_owner_wait(repo, pr, rules, main_tip, run,
+                                            regenerated)
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
@@ -2517,7 +2950,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     for at, pr in enumerate([] if retarget is not None else queue):
         approval = approvals[pr["number"]]
         decision = decide(pr, approval, repo, main_tip, github, github.env,
-                          run, below if pr["number"] in layers else ())
+                          run, below if pr["number"] in layers else (),
+                          regenerated, when)
         decision.update(pr=pr["number"], head=pr["headRefOid"])
         if (decision["action"] == "UPDATE"
                 and said.get(str(pr["number"])) == hand_back_key(
@@ -2535,6 +2969,20 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             record["decisions"].append(conflict_hand_back(
                 pr, approval, github, said, live, LOST_HEAD_REASON))
             continue
+        before = said.get(str(pr["number"])) or {}
+        if (UPDATE_ONCE and decision["action"] in ("UPDATE", "RESOLVE")
+                and before.get("approved")
+                and before["approved"] == approval.get("submittedAt")):
+            # Handed back under this approval: not updated again. An
+            # update spends a build on a head that comes back for the
+            # same reason. Only the update is withheld: a head already
+            # up to date is decided as before, and a new approval is a
+            # new question.
+            decision = {"action": "SKIP", "pr": pr["number"],
+                        "head": pr["headRefOid"],
+                        "reason": "handed back under this approval (%s); "
+                                  "not updated until it is approved "
+                                  "again" % before.get("reason")}
         for stale in decision.get("ci_stale") or ():
             out("CI-STALE #%d: GitHub says run %s is %s, but all its jobs "
                 "finished at %s; judged by its jobs (%s)" % (
@@ -2556,11 +3004,27 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 record["decisions"].append(conflict_hand_back(
                     pr, approval, github, said, live, stuck, detail + "."))
                 continue
-        if live:
+        if live and decision["action"] == "RESOLVE":
+            decision["result"] = resolve_once(
+                state_dir, repo, decision, approval, pr["headRefName"],
+                main_tip, github, run)
+        elif live:
             result = carry_out(decision, approval, github, said)
             if result is not None:
                 decision["result"] = result
         record["decisions"].append(decision)
+        if (decision["action"] == "RESOLVE"
+                and decision.get("result", "").startswith("failed")):
+            # Resolving it didn't work, so it is an ordinary conflict
+            # again, with the step that failed: the output after it can
+            # differ per tick, and the reason is half the key that says
+            # a hand-back once.
+            step = decision["result"][len("failed: "):].split(": ")[0]
+            record["decisions"].append(conflict_hand_back(
+                pr, approval, github, said, live,
+                "%s, and the Merger could not resolve it (%s)"
+                % (CONFLICT_REASON, step)))
+            continue
         if (STACKS and live and decision["action"] == "MERGE"
                 and decision.get("result") == "done"):
             stack = note_merge(state_dir, stack or {}, pr, prs, when)
@@ -2619,7 +3083,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             repo, main_tip, queue[stopped:], approvals, github, said, live,
             run)
     if live:
-        minutes = stalled_for(state_dir, waiting, when)
+        minutes = stalled_for(state_dir, waiting, when, check_state)
         if minutes is not None and "stalled" not in record:
             record["stalled"] = {"pr": waiting["pr"], "head": waiting["head"],
                                  "minutes": minutes}
@@ -2681,8 +3145,29 @@ def mint(project, agent):
         return None
 
 
+def commit_identity(project, name):
+    """(name, email) the App `name` commits as, or None when GitHub
+    can't say its user id."""
+    user_id = forge_github.bot_user_id(project, name)
+    if user_id is None:
+        return None
+    return name, forge_github.noreply_email(project, name, user_id)
+
+
+def load_check_state(state_dir):
+    """The build check's state.json in `state_dir`, or None when it can't
+    be read: every wait is then judged as without it."""
+    try:
+        with open(os.path.join(state_dir, "state.json")) as handle:
+            got = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return got if isinstance(got, dict) else None
+
+
 def main(argv=None, run=sh, out=print, environ=None, mint=mint,
-         sender=None):
+         sender=None, identity=commit_identity):
+    global RESOLVE_IDENTITY
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(
         prog="forge-merger", description=__doc__.splitlines()[0])
@@ -2694,6 +3179,10 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
     parser.add_argument("--checkout", default=environ.get(
         "FORGE_CRON_CHECKOUT"), help="the checkout kept at the default "
         "branch (default $FORGE_CRON_CHECKOUT)")
+    parser.add_argument("--check-state", default=None,
+                        help="the build check's state directory, read for "
+                        "merge.queued_stall_minutes (default "
+                        "~/.local/state/agent-forge/<project>/pr-check)")
     args = parser.parse_args(argv)
     if not args.checkout:
         out("NO-REPO: no --checkout, and FORGE_CRON_CHECKOUT is not set")
@@ -2718,10 +3207,19 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
         out("BUSY: another tick holds %s" % os.path.join(state_dir, "lock"))
         return 0
     with lock:
-        token = mint(project, ACT_AS)
+        # A dry run reads as `merge.read_as` when that is set.
+        reader = READ_AS if args.dry_run and READ_AS else ACT_AS
+        token = mint(project, reader)
         if token is None:
-            out("NO-TOKEN: could not mint %s's token" % ACT_AS)
+            out("NO-TOKEN: could not mint %s's token" % reader)
             return 2
+        if RESOLVE and not args.dry_run:
+            RESOLVE_IDENTITY = identity(project, ACT_AS)
+        check_state = None
+        if QUEUED_STALL_AFTER is not None:
+            check_state = load_check_state(
+                os.path.expanduser(args.check_state) if args.check_state
+                else locks.state_dir(project.name, "pr-check", environ))
         # Only a live tick, and only with a stall alert, is given the
         # relay: a dry run messages nobody.
         send = ((sender or relay_sender)(project, environ)
@@ -2731,7 +3229,9 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
             # rather than on the next event or cron tick.
             for _ in range(TICKS_PER_RUN):
                 record = tick(repo, state_dir, GitHub(token, run), run,
-                              out, live=not args.dry_run, send=send)
+                              out, live=not args.dry_run, send=send,
+                              **({"check_state": check_state}
+                                 if check_state is not None else {}))
                 if args.dry_run or not moved_a_stack(record):
                     break
         except (RuntimeError, KeyError, TypeError, ValueError) as err:

@@ -90,7 +90,13 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "hold_conflicting": bool, "yield_after_hand_back": int,
          "yield_cap": int, "yield_ignores_conflicts": bool,
          "right_of_way": dict, "code_owners": bool,
-         "early_conflicts": bool, "stacks": dict}
+         "early_conflicts": bool, "stacks": dict, "resolve": list,
+         "hold_labels": list, "blocked_by": str, "said_since": dict,
+         "update_once": bool, "ci_never_started": int,
+         "queued_stall_minutes": int, "read_as": str}
+RESOLVE_RULE = {"paths": list, "command": list, "check": list}
+SAID_SINCE = {"author": bool, "approvals": bool, "quiet": list}
+BLOCKED_BY = ("body", "everywhere")
 RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int}
 STACKS = {"max_run": int}
 TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool}
@@ -431,6 +437,7 @@ def check(data):
             _fields("merge.stacks", stacks, STACKS, problems)
             if _is(stacks.get("max_run"), int) and stacks["max_run"] < 0:
                 problems.append("merge.stacks.max_run must be at least 0")
+        _check_merge_0026(merge, data, problems)
     for name, allowed in (("labels", LABELS), ("relay", RELAY)):
         section = data.get(name, {})
         for key, kinds in allowed.items():
@@ -568,6 +575,51 @@ def _argv(value):
     return (isinstance(value, list) and value
             and all(isinstance(a, str) and a for a in value)
             and "/" not in value[0] and not value[0].startswith("."))
+
+
+def _strings(value):
+    """Whether `value` is a non-empty list of non-empty strings."""
+    return (isinstance(value, list) and bool(value)
+            and all(isinstance(x, str) and x.strip() for x in value))
+
+
+def _check_merge_0026(merge, data, problems):
+    """The `merge` settings of designs/0026."""
+    names = set(data.get("agents") or {}) | set(data.get("machinery") or {})
+    rules = merge.get("resolve")
+    if isinstance(rules, list):
+        for i, rule in enumerate(rules):
+            where = "merge.resolve[%d]" % i
+            if not _fields(where, rule, RESOLVE_RULE, problems):
+                continue
+            for key in RESOLVE_RULE:
+                if key not in rule:
+                    problems.append("%s: missing %r" % (where, key))
+                elif not _strings(rule[key]):
+                    problems.append("%s.%s must be a non-empty list of "
+                                    "strings" % (where, key))
+    labels = merge.get("hold_labels")
+    if isinstance(labels, list) and not all(
+            isinstance(l, str) and l.strip() for l in labels):
+        problems.append("merge.hold_labels must be a list of label names")
+    if isinstance(merge.get("blocked_by"), str) and \
+            merge["blocked_by"] not in BLOCKED_BY:
+        problems.append("merge.blocked_by must be one of %s"
+                        % ", ".join(BLOCKED_BY))
+    said = merge.get("said_since")
+    if isinstance(said, dict):
+        _fields("merge.said_since", said, SAID_SINCE, problems)
+        if isinstance(said.get("quiet"), list):
+            for name in said["quiet"]:
+                if not isinstance(name, str) or name not in names:
+                    problems.append("merge.said_since.quiet: %r is not an "
+                                    "agent or machinery" % (name,))
+    for key in ("ci_never_started", "queued_stall_minutes"):
+        if _is(merge.get(key), int) and merge[key] < 1:
+            problems.append("merge.%s must be at least 1" % key)
+    if isinstance(merge.get("read_as"), str) and merge["read_as"] not in names:
+        problems.append("merge.read_as %r is not an agent or machinery"
+                        % merge["read_as"])
 
 
 def _check_stall_alert(alert, agents, problems):

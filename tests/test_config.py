@@ -337,6 +337,40 @@ class Check(unittest.TestCase):
             "merge.stall_alert.labels must be a list"])
         self.assertEqual(self.problems(merge={"stall_alert": {}}), [])
 
+    def test_merge_settings_of_design_0026(self):
+        self.assertEqual(self.problems(merge={
+            "resolve": [{"paths": ["data/table.tsv"],
+                         "command": ["tools/gen-table"],
+                         "check": ["tools/gen-table", "--check"]}],
+            "hold_labels": ["Hold"], "blocked_by": "everywhere",
+            "said_since": {"author": True, "approvals": True,
+                           "quiet": ["Helper", "Merger"]},
+            "update_once": True, "ci_never_started": 20,
+            "queued_stall_minutes": 90, "read_as": "Helper"}), [])
+        self.assertEqual(self.problems(merge={
+            "resolve": [{"paths": [], "command": ["x"]},
+                        {"paths": ["a"], "command": ["x"], "check": ["y"],
+                         "extra": 1}, "x"],
+            "hold_labels": ["ok", ""], "blocked_by": "comments",
+            "said_since": {"author": "yes", "quiet": ["Nobody", 3],
+                           "other": 1},
+            "update_once": "yes", "ci_never_started": 0,
+            "queued_stall_minutes": 0, "read_as": "Nobody"}), [
+            "merge.update_once must be true or false",
+            "merge.resolve[0].paths must be a non-empty list of strings",
+            "merge.resolve[0]: missing 'check'",
+            "merge.resolve[1]: unknown key 'extra'",
+            "merge.resolve[2] must be an object",
+            "merge.hold_labels must be a list of label names",
+            "merge.blocked_by must be one of body, everywhere",
+            "merge.said_since.author must be true or false",
+            "merge.said_since: unknown key 'other'",
+            "merge.said_since.quiet: 'Nobody' is not an agent or machinery",
+            "merge.said_since.quiet: 3 is not an agent or machinery",
+            "merge.ci_never_started must be at least 1",
+            "merge.queued_stall_minutes must be at least 1",
+            "merge.read_as 'Nobody' is not an agent or machinery"])
+
     def test_merge_stacks(self):
         self.assertEqual(self.problems(merge={"stacks": {}}), [])
         self.assertEqual(self.problems(merge={"stacks": {"max_run": 3}}), [])
