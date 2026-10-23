@@ -1,6 +1,6 @@
 # 0027: A path no reviewer covers raises an issue
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-23, https://github.com/abligh/agent-forge/pull/47#pullrequestreview-5630809843)
 * Author: XMPPEngineer
 * Date: 2026-10-23
 

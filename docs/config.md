@@ -60,7 +60,7 @@ starts with `_` is a comment, at any level.
 | `checks` | no | The build check, `forge-pr-check`; see below. |
 | `labels` | no | The labels tools read: `owner_prefix` (default `Owner:`; `Owner:<Name>` says whose an item is), `status_prefix` (default `Status:`), `waiting_on_owner` (default `Status:waiting-owner`: the owner's turn), `waiting_external` (default `Status:waiting-external`: nobody's) and `urgent` (default none: off), a label that puts a pull request first: its waiting head is checked before every other pull request's (before `first_authors` and `max_wait_minutes`; a head that failed to prepare still goes behind, and the default branch's traced run still goes first when due), and the Merger takes it before every other candidate but the one a run is in flight for and, with `merge.test_ahead`, those already predicted. Several urgent ones go oldest first. A label anyone with triage access can set, so it is for a person to use sparingly, not agents. `rerun` (default none: off), a label that runs a red head once more ([designs/0022](designs/0022-run-a-red-head-again.md)): on a posting tick, `forge-pr-check` moves the head's red verdict into `reruns` in its state (with who put the label on, from the pull request's events, and when), queues the head as if new, takes the label off, logs `RERUN #<pr> <sha>: was red(<steps>); queued by <login>` and posts pending. The second verdict stands and its description says `(run again after red(<steps>))`. On a head already run again, the label comes off with a comment saying so; on a green, pending or unrun head it just comes off. On a head given up on after `MAX_ERRORS` failures to prepare it or host faults, it clears those counts so the head is tried again in its place, logs `RERUN #<pr> <sha>: given up after <why>; queued again by <login>` and posts pending; that doesn't use up the head's one run again. Anyone with triage access can set it; once per head bounds what it costs. The poster's App needs `issues: write`. The default branch's red head, which has no pull request, is run again the same way, once, by the label on the open `checks.main_red_issue` issue; the label comes off the issue. An instance (`checks.instances`) ignores it. |
 | `relay` | no | Where `forge-router` posts wakes, `forge-merger` its stall messages (`merge.stall_alert`) and `forge-queue` its end-of-job messages: `url`, the xmpp-webhook-relay's base (default `http://127.0.0.1:8788`), `token_file`, its environment file holding `WEBHOOK_TOKEN` (default `~/.config/xmpp-webhook-relay/token`), `remind_seconds`, how long before a turn is woken again (default 7200), and `room`, the room the agents share. |
-| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, `merge_notice` their merge notice, `stuck` their rules for stuck pull requests, and `owners` their reading of whose an issue is (all below). Every key is checked. |
+| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, `merge_notice` their merge notice, `stuck` their rules for stuck pull requests, `owners` their reading of whose an issue is, and `unreviewed` their issue for paths no reviewer covers (all below). Every key is checked. |
 | `closing_keywords` | no | How `forge-closing-keywords` words a refusal: `enforced_by`, what refuses a pull request it fails (default `the Merger`), and `rerun`, how to run it again once GitHub's `closingIssuesReferences` catches up with a body edit (default `run the check again (the Merger does, on its next tick)`). A project that runs it in CI names its workflow and `gh run rerun --failed <run>`. The issues it judges are `repo`'s, and its default range starts at `default_branch`. The Merger runs it as a gate: `["forge-closing-keywords", "--pr", "{pr}", "--include-subject"]`. |
 
 ### An agent
@@ -669,6 +669,34 @@ reasons.
 | Key | Default | What it is |
 | --- | --- | --- |
 | `triage` | none | The agent asked to label an issue nobody owns, usually whoever plans the work. Without it such issues are surfaced instead. |
+
+### `router.unreviewed`
+
+A pull request's lines that match no reviewer's `reviews` globs go to
+the first reviewer listed, who may decline them as outside her area.
+With `unreviewed`, each run that isn't `--only`'s also groups the
+changed paths of open pull requests (drafts left out) that no
+reviewer's globs cover by area: the first segment of a path, or its
+first two under a `depth2` directory, and `/` for a file at the top.
+An area with no open issue opens one, titled `No reviewer covers
+<area> (first seen on #N)`, listing the pull requests and their paths,
+labelled `<labels.owner_prefix><owners.triage>`, and makes it the
+triage owner's turn to give the area a reviewer. A later pull request
+is added to the open issue in a comment. Each pull request is told
+once, in a `Not-a-review` comment naming the issue. While open pull
+requests still change the area, the issue is reminded of them at most
+once a day. The issue is closed by hand once the configuration covers
+the area. Which reviewer a pull request goes to doesn't change.
+`unreviewed.json` in the router's state directory records each area's
+issue. Refused without `router.owners.triage`; `{}` turns it on with
+the defaults. `agent_forge/rules_default.py` (rule 19) has the detail,
+and [designs/0027](designs/0027-a-path-no-reviewer-covers-raises-an-issue.md)
+the reasons.
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `ignore` | none | Globs, matched as the reviewer choice matches `reviews`, of paths no reviewer needs to cover, such as a configuration directory a code owner reviews (`[".agent-forge/**"]`). Each a non-empty string. |
+| `depth2` | none | Top-level directories whose areas are two segments deep, such as one holding many packages (`["crates"]`: `crates/foo/` is an area of its own). Each a directory name with no `/`. |
 
 ### `checks`
 

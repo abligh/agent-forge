@@ -158,11 +158,12 @@ LABELS = {"owner_prefix": str, "status_prefix": str,
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
-          "stuck": dict, "owners": dict}
+          "stuck": dict, "owners": dict, "unreviewed": dict}
 IDLE_OFFER = {"idle_minutes": int, "shell_minutes": int, "report_to": str}
 MERGE_NOTICE = {"window_minutes": int}
 STUCK = {"retarget": bool, "self_blocked": bool, "draft_hours": int}
 OWNERS = {"triage": str}
+UNREVIEWED = {"ignore": list, "depth2": list}
 RECEIVER = {"address": str, "port": int, "path": str, "secret_file": str,
             "max_body": int, "ticks": dict, "route": list}
 # The webhook events forge-receiver reads; `receiver.ticks` keys are
@@ -405,6 +406,8 @@ def check(data):
             _check_stuck(router["stuck"], problems)
         if isinstance(router.get("owners"), dict):
             _check_owners(router["owners"], data["agents"], problems)
+        if isinstance(router.get("unreviewed"), dict):
+            _check_unreviewed(router["unreviewed"], router, problems)
     merge = data.get("merge", {})
     if _fields("merge", merge, MERGE, problems):
         for i, argv in enumerate(merge.get("gate", [])):
@@ -929,6 +932,28 @@ def _check_owners(owners, agents, problems):
             owners["triage"] not in agents:
         problems.append("%s.triage: %r is not an agent"
                         % (where, owners["triage"]))
+
+
+def _check_unreviewed(gaps, router, problems):
+    """router.unreviewed (designs/0027): which paths no reviewer need
+    cover, and which directories' areas go two segments deep. Its
+    issues are the triage owner's, so it needs one."""
+    where = "router.unreviewed"
+    _fields(where, gaps, UNREVIEWED, problems)
+    for key in ("ignore", "depth2"):
+        values = gaps.get(key)
+        for value in values if isinstance(values, list) else []:
+            if not isinstance(value, str) or not value:
+                problems.append("%s.%s: each must be a non-empty string"
+                                % (where, key))
+                break
+            if key == "depth2" and "/" in value:
+                problems.append("%s.depth2: %r must be a top-level "
+                                "directory, with no /" % (where, value))
+    owners = router.get("owners")
+    if not isinstance(owners, dict) or not owners.get("triage"):
+        problems.append("%s needs router.owners.triage: its issues are "
+                        "the triage owner's" % where)
 
 
 def _check_receiver(receiver, problems):
