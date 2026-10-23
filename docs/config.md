@@ -49,7 +49,7 @@ starts with `_` is a comment, at any level.
 | `naming` | no | `app_slug_suffix` and `session_prefix`; see below. |
 | `machinery` | no | Apps that act for scheduled tools rather than agents, such as the Merger's; each entry as an agent's App fields. |
 | `identity` | no | The host's unconfigured git identity, which no commit may carry: `unattributed_domain` (an email domain such as `@host.example.org`; default `$FORGE_UNATTRIBUTED_DOMAIN`, else the host's own fully qualified name, so a configuration need not name its hosts) and `unattributed_name`. |
-| `merge` | no | How `forge-merger` merges: `merger`, the machinery App that acts (default `Merger`); `ci_workflow`, the Actions workflow every head must pass (default `ci`; `""` for none); `gate`, tools that must exit 0 before a merge, each an argument list with `{pr}`, `{base}` and `{head}` filled in, a `forge-` name run from the installation and anything else from the cron checkout (default `[["forge-commit-identity", "{base}..{head}"]]`); `stall_minutes`, how long a head may wait on its checks, or have a write refused, before the tick reports it stalled (default 30; a head GitHub goes on refusing because the head it expected didn't match is then handed back to its author and the queue moves past it; a run of `ci_workflow` GitHub still has unfinished, its jobs too, this long after it started is re-run once per head, and if it still hasn't finished this long after that, the pull request is handed back and the queue moves past it: `bin/forge-merger`); `stall_alert`, whom a stall is told to (default none: a stall is only printed; see below); `test_ahead`, whether the next pull requests are tested ahead (default none: they aren't; see below); `hold_conflicting`, whether a pull request that conflicts with one ahead of it in the queue waits for it rather than being handed back after every merge (default `false`; see below); `yield_after_hand_back`, how many places a pull request handed back lately lets others go ahead of it, per hand-back (default none: nobody yields; see below), `yield_cap`, the most hand-backs counted (default 3), and `yield_ignores_conflicts`, whether a conflict with `main` is left out of that count (default `false`); `right_of_way`, whether a pull request overtaken again and again holds back what conflicts with it (default none: nobody has it; see below); `code_owners`, whether a pull request that changes a path CODEOWNERS assigns waits for an owner's approval (default `false`; see below); `early_conflicts`, whether a candidate behind the front that conflicts with the default branch is handed back at once (default `false`; see below); `stacks`, whether a stack of pull requests is merged as a unit (default none: a pull request not based on the default branch is held; see below). The required status is `checks.context`, counted only when `checks.poster`'s App (default the merger) posted it. |
+| `merge` | no | How `forge-merger` merges: `merger`, the machinery App that acts (default `Merger`); `ci_workflow`, the Actions workflow every head must pass (default `ci`; `""` for none); `gate`, tools that must exit 0 before a merge, each an argument list with `{pr}`, `{base}` and `{head}` filled in, a `forge-` name run from the installation and anything else from the cron checkout (default `[["forge-commit-identity", "{base}..{head}"]]`); `stall_minutes`, how long a head may wait on its checks, or have a write refused, before the tick reports it stalled (default 30; a head GitHub goes on refusing because the head it expected didn't match is then handed back to its author and the queue moves past it; a run of `ci_workflow` GitHub still has unfinished, its jobs too, this long after it started is re-run once per head, and if it still hasn't finished this long after that, the pull request is handed back and the queue moves past it: `bin/forge-merger`); `stall_alert`, whom a stall is told to (default none: a stall is only printed; see below); `test_ahead`, whether the next pull requests are tested ahead (default none: they aren't; see below); `hold_conflicting`, whether a pull request that conflicts with one ahead of it in the queue waits for it rather than being handed back after every merge (default `false`; see below); `yield_after_hand_back`, how many places a pull request handed back lately lets others go ahead of it, per hand-back (default none: nobody yields; see below), `yield_cap`, the most hand-backs counted (default 3), and `yield_ignores_conflicts`, whether a conflict with `main` is left out of that count (default `false`); `right_of_way`, whether a pull request overtaken again and again holds back what conflicts with it (default none: nobody has it; see below); `code_owners`, whether a pull request that changes a path CODEOWNERS assigns waits for an owner's approval (default `false`; see below); `early_conflicts`, whether a candidate behind the front that conflicts with the default branch is handed back at once (default `false`; see below); `stacks`, whether a stack of pull requests is merged as a unit (default none: a pull request not based on the default branch is held; see below). Designs/0026 adds `resolve`, `hold_labels`, `blocked_by`, `said_since`, `update_once`, `ci_never_started`, `queued_stall_minutes` and `read_as`, each off by default (see below). The required status is `checks.context`, counted only when `checks.poster`'s App (default the merger) posted it. |
 | `host_settings` | no | What every agent host carries, installed by `forge-host-settings`: `files`, each `{"from": path in the project, "to": path under the home directory, "mode": "0644", "json": true when compared as JSON}`; `host_keys`, keys a JSON file's host may set for itself; and `crontabs`, each host's crontab by its short name, `{"<host>": path in the project}`. A host installs only its own entry, and a host with none keeps its crontab. Run from a host's crontab, `forge-host-settings --apply` installs whatever has changed on the default branch, so keep these files code-owned. |
 | `memory` | no | Where the agents' memories are shared between hosts, for `forge-memory-sync`, `forge-memory-check` and `forge-memory-trim` ([memory-sync.md](memory-sync.md)): `dir`, the memory directory sessions load (`~/.claude/projects/<slug>/memory`), and `remote`, the repository that carries it, both required; `git_dir`, its git directory, outside it (default `~/.<project>-memory.git`); `seed_dir`, where `--seed` keeps a host's file it replaced (default `~/.<project>-memory-seed`); `ssh_key`, a key used for `remote` alone, such as a deploy key (default none: git's own setup); `branch` (default `main`); `labels`, the labels of the issue a stopped sync is reported on (default none); `limit`, the bytes of `MEMORY.md` the harness loads (default 24985), and `long_line`, the bytes past which one index line is reported (default 200). Paths may start `~`. On a host, `FORGE_MEMORY_DIR`, `FORGE_MEMORY_REMOTE`, `FORGE_MEMORY_GIT_DIR`, `FORGE_MEMORY_SEED_DIR` and `FORGE_MEMORY_SSH_KEY` override them, and `FORGE_MEMORY_HOST` names the host (default its short name). |
 | `quiet` | no | Quiet holds on a shared host, for `forge-quiet` and what honours them (agent_forge/quiet.py): `dir`, the directory holds are kept in, one file per holder, `~` allowed (required in the section; `$FORGE_QUIET_DIR` overrides it for `forge-quiet` and `forge-pr-check`, for a host where it can't exist, such as a Mac's), and `max_minutes`, the longest hold (default 120); `settle`, a command (an argument list) `forge-quiet hold` runs once the hold is written, again every 30 seconds until it exits 0, for heavy work that started before the hold and that the hold can't stop, such as a deploy already building (default none; a `forge-` name runs from the installation, a relative path from the configuration's checkout, with `FORGE_QUIET_HOLDER`, `FORGE_QUIET_MINUTES`, `FORGE_QUIET_UNTIL` and `FORGE_QUIET_DIR` set), and `settle_minutes`, how long it is given (default 30). Exit 1 means busy; any other failure is an error, and three in a row end the wait. The hold is renewed while it settles and taken again for its full minutes once settled, so settling doesn't spend it. It is read on whichever host a tool runs, so a host without the directory is never held. While a hold is live there, `forge-pr-check` starts no run. |
@@ -508,6 +508,82 @@ branch's head has merged in this stack. With `max_run`, after N layers
 merged in a row the next one keeps its usual place in the queue. The
 tick's record says which stack is in progress under `stack`. Off by
 default.
+
+### `merge.resolve`
+
+`[{"paths": [...], "command": [...], "check": [...]}]` (designs/0026).
+When every path of a candidate's conflict with the default branch is in
+one rule's `paths` (generated files), the Merger resolves it rather
+than handing it back (`RESOLVE`): in a scratch worktree of the head it
+merges the default branch, runs `command` there (a relative first
+argument is run from that worktree), commits the result as the
+Merger's App and pushes it to the head branch with a lease. It tries
+once per approval and head (`resolved.json` in the state directory);
+if a step fails, the pull request is handed back for the conflict, with
+the step named. A merge of the default branch whose only non-clean
+paths are one rule's `paths` then still covers the head, once `check`
+exits 0 in a worktree of that merge (the verdict is kept per commit and
+rule in `resolve-checked.json`). Any other conflict is handed back as
+before. Off by default.
+
+### `merge.hold_labels`
+
+A list of label names. A pull request carrying one is held, `labelled
+<name>`. Nothing is posted. Empty by default.
+
+### `merge.blocked_by`
+
+`"body"` (the default) reads `Blocked-by:` lines from the pull
+request's body only. With `"everywhere"`, the body, its comments and
+its reviews (`Not-a-review` comments included) are read, and the
+newest of them with a `Blocked-by:` line decides: every strict
+`Blocked-by: #N` line in it counts, `Blocked-by: none` clears, and a
+line that starts `Blocked-by:` but doesn't parse holds the pull
+request, `unparsed Blocked-by line: ...`, since it was meant as a hold.
+
+### `merge.said_since`
+
+`{"author": bool, "approvals": bool, "quiet": [names]}`. With
+`author: true`, the author's own remarks after the approval hold it as
+anyone else's do. With `approvals: true`, a later approval by anyone
+whose approval doesn't count (not a reviewer App) is a remark too, and
+holds it until a reviewer approves again. `quiet`
+names more agents or machinery Apps whose remarks never hold, beside
+the Merger's own. Off by default.
+
+### `merge.update_once`
+
+With `update_once: true`, after any hand-back under an approval (not
+only one for a conflict) the Merger neither updates nor resolves the
+pull request again until it is approved again: it is skipped,
+`handed back under this approval (...); not updated until it is
+approved again`. Off by default.
+
+### `merge.ci_never_started`
+
+Minutes. When no run of `ci_workflow` is listed for a head, the Merger
+looks at the head's check runs: while they show the workflow starting
+it waits; with none, it waits until this long after the head's commit
+and then hands the pull request back, `CI never started; push a new
+head`, rather than reporting a stall. Off by default.
+
+### `merge.queued_stall_minutes`
+
+Minutes. While the build check's state shows a head queued and not yet
+running, that head stalls after this long, not after `stall_minutes`;
+once running, its stall time counts from when it started. The state is
+read from `--check-state DIR` (default the `pr-check` state directory
+of the project). Off by default.
+
+### `merge.read_as`
+
+The name of an agent or machinery App whose token a `--dry-run` reads
+with, instead of the Merger's, so a dry run beside a live one doesn't
+share its App's rate limit. Live runs ignore it.
+
+When `refs/pull/N/head` can't be fetched, the Merger always fetches
+the head commit by its SHA before it gives up on it; there is no
+setting for that.
 
 ### `router.idle_offer`
 
