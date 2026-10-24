@@ -1,6 +1,6 @@
 # 0029: A head's steps run side by side
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-24, https://github.com/abligh/agent-forge/issues/59#issuecomment-6382972434)
 * Author: XMPPEngineer
 * Date: 2026-10-24
 
