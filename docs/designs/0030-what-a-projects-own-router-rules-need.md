@@ -13,9 +13,9 @@ way. That project's router has 111 rules. Checked one by one against
 the engine and the default rules, 25 are covered already, 65 belong in
 the project's module, and 11 are no longer needed. The other 10 can't
 be written in a module today. They need five engine hooks and three
-settings, and this design adds them, with a way to switch without
-waking everyone. Each is off, or changes nothing,
-until a module or a configuration uses it.
+settings, and switching to the module needs a sixth hook, a first run
+that wakes nobody. This design adds all nine. Each is off, or changes
+nothing, until a module or a configuration uses it.
 
 Engine hooks:
 
