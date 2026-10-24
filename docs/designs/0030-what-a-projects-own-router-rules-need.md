@@ -13,7 +13,8 @@ way. That project's router has 111 rules. Checked one by one against
 the engine and the default rules, 25 are covered already, 65 belong in
 the project's module, and 11 are no longer needed. The other 10 can't
 be written in a module today. They need five engine hooks and three
-settings, and this design adds them. Each is off, or changes nothing,
+settings, and this design adds them, with a way to switch without
+waking everyone. Each is off, or changes nothing,
 until a module or a configuration uses it.
 
 Engine hooks:
@@ -24,12 +25,13 @@ Engine hooks:
 4. **A turn already woken** by someone else, recorded without a wake
    (`Decision.woken`).
 5. **A grace period before a turn is forgotten** (`router.forget_minutes`).
+6. **`--seed`**: a first run that records turns without waking anyone.
 
 Settings:
 
-6. **Per-agent `areas` and `offer`.**
-7. **`router.quiet_labels`.**
-8. **`router.merge_notice.skip_label` and `merge_notice.to`.**
+7. **Per-agent `areas` and `offer`.**
+8. **`router.quiet_labels`.**
+9. **`router.merge_notice.skip_label` and `merge_notice.to`.**
 
 ## Evidence
 
@@ -88,7 +90,7 @@ there too. So `"Merged": "labels(first:20){nodes{name}}"` gives each
 fetches what it does today.
 
 The default rules add `labels` when `merge_notice.skip_label` or
-`merge_notice.to: "owner_label"` is set (8, below).
+`merge_notice.to: "owner_label"` is set (9, below).
 
 ### 2. The previous run's decisions
 
@@ -149,7 +151,24 @@ decided again with the same event, it is the same turn: it isn't woken
 again, and its reminders count on. An `--only` run forgets nothing, as
 before.
 
-### 6. Per-agent `areas` and `offer`
+### 6. `--seed`
+
+A project switching from its own router starts with empty engine
+state, so the first sending run would wake every open turn at once,
+though the old router has already woken most of them. `--seed` is a
+run that decides as a sending run does, then records every due turn
+as woken at this run's time, sends nothing, does no actions and no
+`each_run`, and journals each as `seeded`. It writes `previous.json`
+too. A run after it wakes only turns that began since. It refuses to
+run on a state directory that already records a turn, so it can't
+silence a live router by mistake.
+
+The project runs it once, just after the old router's last run. A
+turn the old router hadn't delivered by then (a failed send) is
+recorded too, and waits for its first reminder; the project checks
+the old router's last log for those and wakes them by hand.
+
+### 7. Per-agent `areas` and `offer`
 
 Two new fields on an agent's entry, both checked at load:
 
@@ -165,14 +184,14 @@ The default rules don't use `areas` yet. The offer order by area is
 the module's. `reviews` is still what chooses a reviewer. docs/design.md's
 mention of `areas` for reviewer routing is corrected to say `reviews`.
 
-### 7. `router.quiet_labels`
+### 8. `router.quiet_labels`
 
 A list of labels. An open item with any of them is nobody's turn under
 every default rule, suppressed `quiet: <label>`, with no reminder and
 no notice. A module reads the list through `configure`'s project, so it
 can use the same list.
 
-### 8. Who the merge notice goes to
+### 9. Who the merge notice goes to
 
 Two keys on `router.merge_notice`:
 
@@ -223,8 +242,8 @@ isn't an agent is withheld and journalled, as every wake is.
 
 1. 1 and 2, with tests against the small rules module in
    `tests/router_rules.py`.
-2. 3, 4 and 5.
-3. 6, 7 and 8 in the configuration and the default rules.
+2. 3, 4, 5 and 6.
+3. 7, 8 and 9 in the configuration and the default rules.
 
 Each lands with its docs (docs/router.md, docs/config.md) and changes
 no decision of the default rules while unset. The project then pins
