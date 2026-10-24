@@ -1593,7 +1593,8 @@ class LostHead(RepoCase):
             "head, saying the head it expected didn't match.\n\n"
             "GitHub's pull request head is %s but its branch is at %s, and "
             "a no-op base update didn't make GitHub read it again. A push to "
-            "the branch makes GitHub read its head again.\n\n"
+            "the branch, or closing and reopening the pull request, makes "
+            "GitHub read its head again.\n\n"
             "This is back with its author. Once a reviewer approves a head "
             "that fixes it, the Merger takes it again.\n\n— Merger"
             % (self.head[:10], self.head[:12], self.moved[:12])))
