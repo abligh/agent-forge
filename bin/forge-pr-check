@@ -427,6 +427,23 @@ thread per CPU would otherwise start that many in every slot at once,
 and with the agents' own builds, oversubscribe the host. A value the
 host already sets wins.
 
+**With `checks.cpu_share: "step"`, each step takes its share as it
+starts** (designs/0029), from the slots busy then, so a long step
+started after short ones gets the CPUs that runs which have since
+finished let go.
+
+**With `checks.side_by_side`, a run's steps run side by side**
+(designs/0029): at most `max_steps` at once, each started as soon as
+the steps its `after` names have finished (a name not run for this
+head is ignored), and the `alone` steps, timings, last, one at a time,
+with nothing else of the run beside them. The run's CPUs are divided
+between its steps running that aren't `light`, at least 1 each, and a
+`light` step gets 1. A step's own `caches` override `checks.caches`
+for it. Every step still runs, results come in the configured order,
+a step's CPU time is its own process tree's (`wait_usage`), a stopped
+run ends every running step, and the verdict says `side_by_side`,
+which `step_alert` compares runs by.
+
 **Each step's scope has a high CPU weight** (`checks.cpu_weight`,
 default 1000 against systemd's 100; 0 for none), so on a host where
 the agents build too, the check, which every merge waits on, gets most
@@ -490,6 +507,7 @@ import gzip
 import hashlib
 import json
 import os
+import queue
 import re
 import resource
 import shutil
@@ -530,6 +548,26 @@ DEFAULT_STEPS = [("test", ["make", "test"], None)]
 STEPS = DEFAULT_STEPS
 # {environment variable: directory name} for each slot's build caches.
 CACHES = {}
+# checks.cpu_share (designs/0029): "run", each step's CHECK_CPUS is the
+# share taken when the run starts; "step", when the step starts.
+CPU_SHARE = "run"
+# checks.side_by_side.max_steps (designs/0029): how many of a run's
+# steps run at once, or None: one after another.
+SIDE_BY_SIDE = None
+DEFAULT_MAX_STEPS = 4
+# Each step's `after` (the steps it waits for), and the steps that are
+# `alone` (timings, run last, one at a time) and `light` (about one
+# CPU), all only with SIDE_BY_SIDE.
+AFTER = {}
+ALONE = frozenset()
+LIGHT = frozenset()
+# Each step's own `caches`: {step: {variable: directory name}}, each
+# directory per slot like CACHES'.
+STEP_CACHES = {}
+# Step keys that say how a step is run beside others, not what it
+# tests: left out of its input digest, so setting them reuses nothing
+# less.
+SCHEDULING_KEYS = ("after", "alone", "light", "caches")
 # checks.keep_ignored: paths, relative to the worktree, that the clean
 # before each head leaves alone although they are ignored, so a build
 # can find its own last output there (`git clean -e`).
@@ -760,7 +798,8 @@ def configure(project, instance=None):
     `step_timeout_minutes`, `merger_first`, `depends`,
     `depends_minutes`, `tracer`, `fast_lane`, `merge_default`,
     `cache_limit`, `reuse`, `fresh`, `first_authors`, `max_wait_minutes`,
-    `keep_ignored`, each step's `always`, `version` and `outputs`),
+    `keep_ignored`, `cpu_share`, `side_by_side`, each step's `always`,
+    `version`, `outputs`, `after`, `alone`, `light` and `caches`),
     each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
     implies `merger_first`. With `instance`, the `checks` section and the
@@ -770,7 +809,8 @@ def configure(project, instance=None):
     the context the Merger requires."""
     global REPO_SLUG, MAIN, CONFIG_PATH, STATUS_CONTEXT, POSTER, HOST
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
-    global CPU_WEIGHT
+    global CPU_WEIGHT, CPU_SHARE, SIDE_BY_SIDE, AFTER, ALONE, LIGHT
+    global STEP_CACHES
     global TEST_AHEAD, SPARE_ONLY, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
@@ -799,8 +839,20 @@ def configure(project, instance=None):
     # base out, so they can be reused across the default branch moving.
     NO_BASE = frozenset(s["name"] for s in checks.get("steps", [])
                         if s.get("reads_base") is False)
-    STEP_ENTRIES = {s["name"]: json.dumps(s, sort_keys=True)
-                    for s in checks.get("steps", [])}
+    STEP_ENTRIES = {s["name"]: json.dumps(
+        {k: v for k, v in s.items() if k not in SCHEDULING_KEYS},
+        sort_keys=True) for s in checks.get("steps", [])}
+    CPU_SHARE = checks.get("cpu_share", "run")
+    SIDE_BY_SIDE = checks["side_by_side"].get(
+        "max_steps", DEFAULT_MAX_STEPS) if "side_by_side" in checks else None
+    AFTER = {s["name"]: list(s["after"]) for s in checks.get("steps", [])
+             if s.get("after")}
+    ALONE = frozenset(s["name"] for s in checks.get("steps", [])
+                      if s.get("alone"))
+    LIGHT = frozenset(s["name"] for s in checks.get("steps", [])
+                      if s.get("light"))
+    STEP_CACHES = {s["name"]: dict(s["caches"])
+                   for s in checks.get("steps", []) if s.get("caches")}
     # The configuration refuses reuse without depends.
     REUSE_AGE = datetime.timedelta(days=checks["reuse"].get(
         "max_age_days", DEFAULT_REUSE_DAYS)) if "reuse" in checks else None
@@ -884,7 +936,8 @@ def sh(args, cwd=None, env=None, timeout=None):
             args, 124, out, "timed out after %ss" % timeout)
 
 
-def sh_logged(args, cwd=None, env=None, timeout=None, log=None):
+def sh_logged(args, cwd=None, env=None, timeout=None, log=None, usage=None,
+              on_start=None):
     """sh, also writing the output to `log` (gzipped) as it comes, each
     line as "<seconds> <stream> <line>": seconds since the start, to
     the millisecond, and 1 for stdout or 2 for stderr. What comes back
@@ -895,10 +948,15 @@ def sh_logged(args, cwd=None, env=None, timeout=None, log=None):
     its whole process group (TERM, then KILL), children included, since
     killing the program alone left children that held its pipes open
     and the step never ended. A pipe something outside the group still
-    holds is given up on a few seconds later, and left open."""
+    holds is given up on a few seconds later, and left open. With
+    `usage`, a dict, the step's own CPU seconds go in its "cpu"
+    (wait_usage), and `on_start(proc)` is called once it has started
+    (designs/0029: steps side by side)."""
     proc = subprocess.Popen(args, cwd=cwd, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True,
                             errors="replace", start_new_session=True)
+    if on_start is not None:
+        on_start(proc)
     started = time.monotonic()
     lines = []
     lock = threading.Lock()
@@ -934,7 +992,12 @@ def sh_logged(args, cwd=None, env=None, timeout=None, log=None):
         reader.start()
     timed_out = False
     try:
-        proc.wait(timeout=timeout)
+        if usage is None:
+            proc.wait(timeout=timeout)
+        else:
+            cpu = wait_usage(proc, timeout)
+            if cpu is not None:
+                usage["cpu"] = cpu
     except subprocess.TimeoutExpired:
         timed_out = True
         kill_group(proc)
@@ -967,6 +1030,28 @@ def sh_logged(args, cwd=None, env=None, timeout=None, log=None):
         return subprocess.CompletedProcess(
             args, 124, out, "timed out after %ss" % timeout)
     return subprocess.CompletedProcess(args, proc.returncode, out, "")
+
+
+def wait_usage(proc, timeout=None):
+    """proc.wait(timeout), returning the CPU seconds, user and system,
+    of proc and every descendant it waited for: its own process tree,
+    where RUSAGE_CHILDREN would count every step that ended meanwhile.
+    None when something else reaped it first."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    pause = 0.01
+    while True:
+        try:
+            pid, status, used = os.wait4(proc.pid, os.WNOHANG)
+        except ChildProcessError:
+            proc.wait()
+            return None
+        if pid:
+            proc.returncode = os.waitstatus_to_exitcode(status)
+            return used.ru_utime + used.ru_stime
+        if deadline is not None and time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        time.sleep(pause)
+        pause = min(0.25, pause * 2)
 
 
 def kill_group(proc, grace=None):
@@ -1995,11 +2080,15 @@ def step_runs(state, since, until=None):
     of each step in the verdicts kept that finished at `since` or later
     (and before `until`). Only a step's own run counts: not a matched
     verdict, a reused step, or a failed one, whose time says nothing of
-    its cost; a step skipped by selection has no time."""
+    its cost; a step skipped by selection has no time. Nor does a run
+    in the other mode, side by side or not (designs/0029): a step's
+    wall side by side includes its neighbours' load."""
     runs = {}
+    mode = SIDE_BY_SIDE is not None
     for sha, r in state["results"].items():
         seconds = r.get("step_seconds")
-        if not isinstance(seconds, dict) or r.get("matched"):
+        if not isinstance(seconds, dict) or r.get("matched") \
+                or bool(r.get("side_by_side")) != mode:
             continue
         try:
             done = parse(r["finished"])
@@ -2902,6 +2991,28 @@ def check_cpus(online=None, slots=None, busy=None):
     return max(share, online // max(1, min(busy, slots)))
 
 
+def cpu_share(state_dir, env, environ=None):
+    """designs/0029: what a run's steps take their CHECK_CPUS from, as
+    `check`'s `share`: with checks.cpu_share "step", the share of the
+    slots busy as each step starts; side by side, else, the run's share
+    (env's CHECK_CPUS), to split between the steps running. None when
+    neither applies, or the host set CHECK_CPUS itself: env's stands."""
+    environ = os.environ if environ is None else environ
+    if "CHECK_CPUS" in environ:
+        return None
+    if CPU_SHARE == "step":
+        def share():
+            return check_cpus(busy=max(1, busy_slots(state_dir)))
+        return share
+    if SIDE_BY_SIDE is not None and "CHECK_CPUS" in env:
+        whole = int(env["CHECK_CPUS"])
+
+        def share():
+            return whole
+        return share
+    return None
+
+
 def busy_slots(state_dir, slots=None):
     """How many slots, the fast lane too, hold a run now."""
     slots = slots_from_env() if slots is None else slots
@@ -3040,7 +3151,8 @@ def children_cpu():
 
 
 def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
-          cpu=children_cpu, logs=None, stream=None):
+          cpu=children_cpu, logs=None, stream=None, share=None,
+          caches=None, side_by_side=None):
     """Every step that applies to the head, each run even if an earlier
     one failed, and none retried, each after `prefix` (memory_cap).
     `wrap(name, prefix, argv, env)` gives a traced step's (argv, env).
@@ -3050,39 +3162,156 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
     after: user and system seconds of the step's process tree), so a
     step's work can be told from its waiting. With `logs`, a directory,
     and `stream` (sh_logged), each step runs through `stream` instead,
-    which keeps its output there as `<step>.log.gz`. Returns (ok,
-    results)."""
-    results = []
-    for name, args, only_if in applicable(wt, steps):
-        step_env_, folder = env, None
+    which keeps its output there as `<step>.log.gz`. With `share`, a
+    function giving the run's share of the CPUs now, each step's
+    CHECK_CPUS is taken when it starts (checks.cpu_share "step"); with
+    `caches`, {step: {variable: path}}, a step's own build caches. With
+    `side_by_side`, at most that many steps run at once (`side_by_side`
+    below), each step's CPU time its own process's (`wait_usage`).
+    Returns (ok, results), the results in the steps' order."""
+    chosen = applicable(wt, steps)
+
+    def prepare(name, args, extra):
+        step_env_, folder = dict(env, **extra), None
+        step_env_.update((caches or {}).get(name, {}))
         if kept is not None:
             folder = os.path.join(kept, results_name(name))
             shutil.rmtree(folder, ignore_errors=True)
             os.makedirs(folder)
-            step_env_ = dict(env, CHECK_RESULTS=folder)
+            step_env_["CHECK_RESULTS"] = folder
         step_args = list(prefix) + args
         if wrap is not None:
             step_args, step_env_ = wrap(name, list(prefix), args, step_env_)
-        started, used = time.monotonic(), cpu()
+        return step_args, step_env_, folder
+
+    def execute(name, step_args, step_env_, folder, usage=None,
+                on_start=None):
+        started = time.monotonic()
+        used = cpu() if usage is None else None
         if logs is not None and stream is not None:
             os.makedirs(logs, exist_ok=True)
+            more = {} if usage is None else {"usage": usage,
+                                             "on_start": on_start}
             got = stream(step_args, cwd=wt, env=step_env_,
                          timeout=STEP_TIMEOUT_S, log=os.path.join(
-                             logs, results_name(name) + ".log.gz"))
+                             logs, results_name(name) + ".log.gz"), **more)
         else:
             got = run(step_args, cwd=wt, env=step_env_,
                       timeout=STEP_TIMEOUT_S)
         wall = time.monotonic() - started
         result = {"name": name, "rc": got.returncode,
                   "seconds": int(wall), "wall": round(wall, 2),
-                  "cpu": round(max(0.0, cpu() - used), 2),
                   "tail": tail((got.stdout or "") + (got.stderr or ""))}
+        if usage is None:
+            result["cpu"] = round(max(0.0, cpu() - used), 2)
+        elif usage.get("cpu") is not None:
+            result["cpu"] = round(usage["cpu"], 2)
         if folder is not None:
             result["results_bytes"], dropped = keep_results(folder)
             if dropped is not None:
                 result["results_dropped"] = dropped
-        results.append(result)
+        return result
+
+    if side_by_side is None:
+        results = []
+        for name, args, _ in chosen:
+            extra = {} if share is None else {"CHECK_CPUS": str(share())}
+            results.append(execute(name, *prepare(name, args, extra)))
+    else:
+        results = run_side_by_side(chosen, prepare, execute, side_by_side,
+                                   share)
     return all(r["rc"] == 0 for r in results), results
+
+
+def run_side_by_side(chosen, prepare, execute, max_steps, share=None):
+    """designs/0029: `chosen`'s steps, at most max_steps at once, each
+    started once every step it names in AFTER has finished (a name
+    not in `chosen` is ignored: skipped, reused or not applying). The
+    steps in ALONE run after all the others, one at a time in order,
+    with nothing else beside them. With `share`, a step's CHECK_CPUS is
+    the run's share now divided by the steps running that aren't
+    LIGHT, this one included, and at least 1; a LIGHT step's is 1.
+    `prepare(name, args, extra)` runs here, so a tracer's files are
+    named in order, and `execute` in a thread of its own. Stopped (or
+    any other exception), every running step's process group is ended
+    before it goes on up. Returns the results in `chosen`'s order."""
+    names = [name for name, _, _ in chosen]
+    present = set(names)
+    waits = {name: [a for a in AFTER.get(name, ())
+                    if a in present and a != name] for name in names}
+    pending = [(name, args) for name, args, _ in chosen if name not in ALONE]
+    last = [(name, args) for name, args, _ in chosen if name in ALONE]
+    done, results, running, procs = set(), {}, {}, {}
+    finished = queue.Queue()
+
+    def start(name, args):
+        extra = {}
+        if share is not None:
+            if name in LIGHT:
+                cpus = 1
+            else:
+                busy = 1 + sum(other not in LIGHT for other in running)
+                cpus = max(1, share() // busy)
+            extra["CHECK_CPUS"] = str(cpus)
+        prepared = prepare(name, args, extra)
+
+        def body():
+            try:
+                got = execute(name, *prepared, usage={},
+                              on_start=lambda proc: procs.__setitem__(
+                                  name, proc))
+            except BaseException as err:
+                got = err
+            finished.put((name, got))
+        thread = threading.Thread(target=body, daemon=True)
+        running[name] = thread
+        thread.start()
+
+    def collect():
+        name, got = finished.get()
+        running.pop(name).join()
+        procs.pop(name, None)
+        if isinstance(got, BaseException):
+            raise got
+        results[name] = got
+        done.add(name)
+
+    try:
+        while pending or running:
+            for name, args in list(pending):
+                if len(running) >= max_steps:
+                    break
+                if all(a in done for a in waits[name]):
+                    pending.remove((name, args))
+                    start(name, args)
+            if not running:
+                # Only a configuration that bypassed its checks waits
+                # for ever: every step still runs.
+                start(*pending.pop(0))
+            collect()
+        for name, args in last:
+            start(name, args)
+            collect()
+    except BaseException:
+        stop_steps(procs, running)
+        raise
+    return [results[name] for name in names]
+
+
+def stop_steps(procs, threads, grace=None):
+    """End each running step's process group: SIGTERM, up to `grace`
+    seconds (KILL_GRACE_S) for their threads to see them end, then
+    SIGKILL."""
+    grace = KILL_GRACE_S if grace is None else grace
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for proc in list(procs.values()):
+            try:
+                os.killpg(proc.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+        deadline = time.monotonic() + grace
+        for thread in list(threads.values()):
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def results_name(step):
@@ -3299,11 +3528,22 @@ def top_directories(roots):
     return found
 
 
+def cache_folders():
+    """The caches' directory names, checks.caches' and, side by side,
+    the steps' own (STEP_CACHES), each once."""
+    folders = list(CACHES.values())
+    if SIDE_BY_SIDE is not None:
+        for own in STEP_CACHES.values():
+            folders.extend(own.values())
+    return list(dict.fromkeys(folders))
+
+
 def prune_slot_caches(state_dir, slot, out=print):
     """With CACHE_LIMIT, prune the slot's caches after a run, and log
     what went as CACHE-PRUNED. Never raises: a failure is logged, and
     the run's verdict stands."""
-    if CACHE_LIMIT is None or not CACHES:
+    folders = cache_folders()
+    if CACHE_LIMIT is None or not folders:
         return None
     try:
         state = load(state_dir)
@@ -3313,7 +3553,7 @@ def prune_slot_caches(state_dir, slot, out=print):
             until = None  # an end from an earlier run than the start
         gone = prune_caches(
             [os.path.join(state_dir, slot_name(folder, slot))
-             for folder in CACHES.values()],
+             for folder in folders],
             CACHE_LIMIT, time.time(), since, until)
     except Exception as err:
         log(state_dir, "CACHE-PRUNE-FAILED %s: %s: %s"
@@ -4503,12 +4743,22 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         shutil.rmtree(kept, ignore_errors=True)
         logs = os.path.join(state_dir, LOGS_DIR, sha)
         shutil.rmtree(logs, ignore_errors=True)
+        share, step_caches = cpu_share(state_dir, env), None
+        if SIDE_BY_SIDE is not None:
+            step_caches = {
+                step: {name_: os.path.join(state_dir, slot_name(folder, slot))
+                       for name_, folder in own.items()}
+                for step, own in STEP_CACHES.items()}
         phases.mark("setup")
+        steps_began = time.monotonic()
         # A test's own `run` stands in for every program, steps too.
         ok, results = check(wt, env, run, steps=steps,
                             prefix=memory_cap(memory_max, env, run, out),
                             wrap=wrap, kept=kept, logs=logs,
-                            stream=sh_logged if run is sh else None)
+                            stream=sh_logged if run is sh else None,
+                            share=share, caches=step_caches,
+                            side_by_side=SIDE_BY_SIDE)
+        steps_took = time.monotonic() - steps_began
         phases.mark("steps")
         for r in results:
             out("  %-20s rc=%-3d %4ds" % (r["name"], r["rc"], r["seconds"]))
@@ -4553,7 +4803,10 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 "pr": pr, "seen": seen, "started": iso(started),
                 "finished": iso(finished), "ok": ok,
                 "failed": [r["name"] for r in results if r["rc"] != 0],
-                "seconds": sum(r["seconds"] for r in results),
+                # Side by side, the steps' own walls overlap: the run's
+                # is how long they took together.
+                "seconds": sum(r["seconds"] for r in results)
+                if SIDE_BY_SIDE is None else int(steps_took),
                 # What the fast lane's estimates come from (step_costs).
                 "step_seconds": {r["name"]: r["seconds"] for r in results},
                 # The same, unrounded: whole seconds lose about half a
@@ -4584,6 +4837,9 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                               steps=steps_digest())
             if reused:
                 record["reused"] = reused
+            if SIDE_BY_SIDE is not None:
+                # What step_alert compares a step's runs by (designs/0029).
+                record["side_by_side"] = True
             if ahead:
                 record["ahead"] = True
             if main:
