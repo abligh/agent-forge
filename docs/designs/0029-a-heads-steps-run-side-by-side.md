@@ -68,12 +68,19 @@ A step's own new keys:
 | --- | --- |
 | `after` | the names of steps this one waits for. A name that doesn't apply to the head is ignored. |
 | `alone` | `true`: a timing. It runs after every step that isn't `alone` has finished, with nothing else of its run beside it, the `alone` steps one at a time in the configured order. |
-| `light` | `true`: the step uses about one CPU, waiting on something else. It gets `CHECK_CPUS=1` and isn't counted when the others share the run's CPUs. |
-| `caches` | per-step overrides of `checks.caches`, e.g. `{"CARGO_TARGET_DIR": "cargo-target-wasm"}`, for a step that would otherwise wait on another step's build lock. Each such directory is per slot, like the shared ones, and `cache_limit` and pruning cover it. |
+| `light` | `true`: the step uses about one CPU, waiting on something else. It gets `CHECK_CPUS=1` and isn't counted when the others share the run's CPUs. A step that is CPU-bound on some heads, such as one that first builds what a change touched, isn't `light`. |
+| `caches` | per-step overrides of `checks.caches`, e.g. `{"CARGO_TARGET_DIR": "cargo-target-wasm"}`, for a step that would otherwise wait on another step's build lock. Each such directory is per slot, like the shared ones, and `cache_limit` and pruning cover it. Every step that builds the same thing needs the same override, or it builds it again, cold, in the default directory. |
 
 A step with no `after` starts at once, and without `side_by_side`
 these keys mean nothing. A step whose `after` makes a cycle is a
 configuration error, reported when the configuration is read.
+
+**Steps that write the same files.** A run's steps share the head's
+worktree. Two steps that write the same files there (the same `make`
+target, a generated directory) must not overlap, so the later one
+names the earlier in `after`. That holds for `alone` steps too: their
+order alone keeps them apart today, but `after` says why, and survives
+a reordering.
 
 **CPUs within a run.** The run's share (from 1, at the moment a step
 starts) is divided by the steps of the run that are running and not
@@ -127,7 +134,8 @@ steps, a browser suite and two timings:
    "caches": {"CARGO_TARGET_DIR": "cargo-target-wasm"}},
   {"name": "desktop", "run": ["make", "test-desktop"], "light": true},
   {"name": "browser", "run": ["make", "test-browser"],
-   "after": ["test-web"], "alone": true},
+   "after": ["test-web"], "alone": true,
+   "caches": {"CARGO_TARGET_DIR": "cargo-target-wasm"}},
   {"name": "timing", "run": ["make", "test-timing"], "alone": true}
 ]
 ```
@@ -136,14 +144,15 @@ steps, a browser suite and two timings:
 together, up to four at once, and the rest as places come free.
 `test-web` starts once `web dependencies` is done, building in its own
 target directory. `browser` and `timing` run last, one after the
-other, with nothing else of the run going.
+other, with nothing else of the run going. `browser` builds the same
+web build as `test-web`, so it names it in `after` and uses its
+directory.
 
 ## Not changed
 
 - The number of slots, and how a head is chosen for one.
-- Where a step runs: still in the head's worktree, shared by its steps.
-  A step that writes into the worktree what another reads needs an
-  `after`.
+- Where a step runs: still in the head's worktree, shared by its steps
+  (see "Steps that write the same files").
 - Anything a project hasn't switched on.
 
 ## Rollout
@@ -153,3 +162,12 @@ other, with nothing else of the run going.
    walls and the host's load with the day before.
 3. It then turns on `side_by_side`, with `after`, `alone`, `light` and
    `caches` set by whoever owns the steps, and compares again.
+
+Two things to expect at step 3:
+- Steps that share a build directory wait on its lock, and overlap
+  only their run time. Each step's log shows the wait, so a project
+  can decide from the logs whether a separate directory, which costs
+  disk and a cold first build in each slot, is worth it.
+- Tests that time out under load fail more often, since a slot's
+  steps load the host more than one step did. They are the project's
+  to fix.
