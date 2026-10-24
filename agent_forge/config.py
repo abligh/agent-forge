@@ -120,7 +120,12 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "fresh": dict, "first_authors": list, "max_wait_minutes": int,
           "main": str, "main_red_issue": dict, "drop_env": list,
           "keep_ignored": list, "red_comment": bool, "instances": dict,
-          "host_fault_text": list, "step_alert": dict}
+          "host_fault_text": list, "step_alert": dict, "cpu_share": str,
+          "side_by_side": dict}
+# checks.cpu_share (designs/0029): when a step's CHECK_CPUS is taken.
+CPU_SHARES = ("run", "step")
+# checks.side_by_side (designs/0029): a run's steps side by side.
+SIDE_BY_SIDE = {"max_steps": int}
 # checks.step_alert (designs/0019): an issue when a step gets slower.
 STEP_ALERT = {"growth": (int, float), "min_seconds": int, "window_days": int,
               "min_runs": int, "labels": list, "owner": str}
@@ -135,7 +140,7 @@ INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight",
                       "step_timeout_minutes", "caches", "cache_limit",
                       "keep_ignored", "drop_env", "merge_default",
                       "red_comment", "max_wait_minutes", "host_fault_text",
-                      "step_alert")
+                      "step_alert", "cpu_share", "side_by_side")
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main")
 INSTANCE_CHECKS_ONLY = ("main_red_issue", "first_authors", "merger_first")
@@ -156,7 +161,8 @@ REUSE = {"max_age_days": int, "trace_matched_main": bool,
 # checks.fresh: records from every run, and heads that wait for one.
 FRESH = {"wait_minutes": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool,
-        "version": list, "reads_base": bool, "outputs": list}
+        "version": list, "reads_base": bool, "outputs": list,
+        "after": list, "alone": bool, "light": bool, "caches": dict}
 # checks.tracer's values (docs/designs/0005).
 TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.
@@ -821,15 +827,83 @@ def _check_checks(checks, data, problems, where="checks"):
                         and not any(c in path for c in "*?[!\\")):
                     problems.append("%s.outputs: %r is not a path inside "
                                     "the worktree" % (at, path))
+            if isinstance(step.get("caches"), dict) and not all(
+                    isinstance(v, str) and v and "/" not in v
+                    for v in step["caches"].values()):
+                problems.append("%s.caches must map variables to directory "
+                                "names" % at)
+        _check_after(checks["steps"], problems, where)
     if isinstance(checks.get("caches"), dict) and not all(
             isinstance(v, str) and v and "/" not in v
             for v in checks["caches"].values()):
         problems.append("%s.caches must map variables to directory names" % where)
+    if isinstance(checks.get("cpu_share"), str) \
+            and checks["cpu_share"] not in CPU_SHARES:
+        problems.append("%s.cpu_share must be one of %s"
+                        % (where, ", ".join(CPU_SHARES)))
+    if isinstance(checks.get("side_by_side"), dict):
+        block = checks["side_by_side"]
+        if _fields(where + ".side_by_side", block, SIDE_BY_SIDE, problems) \
+                and _is(block.get("max_steps"), int) and block["max_steps"] < 1:
+            problems.append("%s.side_by_side.max_steps must be at least 1"
+                            % where)
     poster = checks.get("poster")
     if isinstance(poster, str) and poster not in data.get("machinery", {}) \
             and poster not in data.get("agents", {}):
         problems.append("%s.poster %r is no App in the configuration"
                         % (where, poster))
+
+
+def _check_after(steps, problems, where):
+    """Each step's `after` (designs/0029): names of other steps, a
+    step that isn't `alone` never waiting for one that is (it would
+    wait for ever, since `alone` steps run last), an `alone` step
+    waiting only for steps that aren't, or for `alone` steps before it
+    (they run in the configured order), and no cycle."""
+    entries = [s for s in steps if isinstance(s, dict)
+               and isinstance(s.get("name"), str)]
+    names = [s["name"] for s in entries]
+    alone = {s["name"] for s in entries if s.get("alone") is True}
+    waits = {}
+    for i, step in enumerate(entries):
+        after = step.get("after")
+        if not isinstance(after, list):
+            continue
+        at = "%s.steps[%d].after" % (where, steps.index(step))
+        good = []
+        for other in after:
+            if not isinstance(other, str) or other not in names:
+                problems.append("%s: %r is not a step's name" % (at, other))
+            elif other == step["name"]:
+                problems.append("%s: a step can't wait for itself" % at)
+            elif other in alone and step["name"] not in alone:
+                problems.append("%s: %r is alone, so it runs after every "
+                                "step that isn't; %r would wait for ever"
+                                % (at, other, step["name"]))
+            elif other in alone and names.index(other) > i:
+                problems.append("%s: %r is alone and comes later, and alone "
+                                "steps run in the configured order"
+                                % (at, other))
+            else:
+                good.append(other)
+        waits[step["name"]] = good
+    # A cycle in what's left: a step reached again from itself.
+    state = {}
+
+    def visit(name, path):
+        if state.get(name) == "done":
+            return
+        if state.get(name) == "on":
+            cycle = path[path.index(name):] + [name]
+            problems.append("%s.steps: `after` makes a cycle: %s"
+                            % (where, " -> ".join(cycle)))
+            return
+        state[name] = "on"
+        for other in waits.get(name, ()):
+            visit(other, path + [name])
+        state[name] = "done"
+    for name in names:
+        visit(name, [])
 
 
 def _check_instances(instances, data, problems):
