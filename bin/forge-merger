@@ -3074,8 +3074,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                                           decision["result"])}
                 record["decisions"].append(conflict_hand_back(
                     pr, approval, github, said, live, LOST_HEAD_REASON,
-                    lost_text(lost) + ". A push to the branch makes "
-                    "GitHub read its head again."))
+                    lost_text(lost) + ". A push to the branch, or closing "
+                    "and reopening the pull request, makes GitHub read its "
+                    "head again."))
                 continue
         if decision["action"] not in ("HAND-BACK", "SKIP"):
             waiting_on = pr["number"]
