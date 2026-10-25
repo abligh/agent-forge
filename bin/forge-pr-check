@@ -449,6 +449,16 @@ default 1000 against systemd's 100; 0 for none), so on a host where
 the agents build too, the check, which every merge waits on, gets most
 of the CPU when they compete, and theirs when it is idle.
 
+**With `checks.merger_cpu_weight`, the run the next merge waits on
+gets more** (designs/0031): a head of the pull request in the Merger's
+`next.json`, or with `merge.test_ahead` its first prediction. As each
+step starts, its scope gets that weight if the Merger's files say so
+then; the verdict and its VERDICT line say `merger_weight`, and
+`step_alert` leaves such runs out. With `checks.docker_slices`, each
+step's `CHECK_DOCKER_SLICE` is the `front` or `other` slice, for its
+containers' `docker run --cgroup-parent`. Neither applies to the fast
+lane, the default branch's runs or an instance.
+
 **Without `--post` it posts nothing.** It reads the open pull requests
 as the poster's App either way (`checks.poster`, default the Merger),
 minting its token with `forge-app-token`.
@@ -621,6 +631,12 @@ MEMORY_MAX = DEFAULT_MEMORY_MAX
 # Each step's scope's CPUWeight (systemd's default is 100); 0 sets none.
 DEFAULT_CPU_WEIGHT = 1000
 CPU_WEIGHT = DEFAULT_CPU_WEIGHT
+# checks.merger_cpu_weight (designs/0031): the CPUWeight of the steps
+# of the run the next merge waits on (`front`), or None: off.
+MERGER_CPU_WEIGHT = None
+# checks.docker_slices (designs/0031): {"front": slice, "other": slice},
+# each step's CHECK_DOCKER_SLICE, or None: off.
+DOCKER_SLICES = None
 # Lines of a failed step's output kept in worker.log.
 TAIL_LINES = 40
 # Lines before the tail that name a failure, kept above it: go test
@@ -810,6 +826,7 @@ def configure(project, instance=None):
     global REPO_SLUG, MAIN, CONFIG_PATH, STATUS_CONTEXT, POSTER, HOST
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
     global CPU_WEIGHT, CPU_SHARE, SIDE_BY_SIDE, AFTER, ALONE, LIGHT
+    global MERGER_CPU_WEIGHT, DOCKER_SLICES
     global STEP_CACHES
     global TEST_AHEAD, SPARE_ONLY, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
@@ -905,6 +922,11 @@ def configure(project, instance=None):
     SLOTS = checks.get("slots", DEFAULT_SLOTS)
     MEMORY_MAX = checks.get("memory_max", DEFAULT_MEMORY_MAX)
     CPU_WEIGHT = checks.get("cpu_weight", DEFAULT_CPU_WEIGHT)
+    # The Merger waits on the first context's runs only.
+    MERGER_CPU_WEIGHT = checks.get("merger_cpu_weight") \
+        if instance is None else None
+    DOCKER_SLICES = dict(checks["docker_slices"]) \
+        if instance is None and "docker_slices" in checks else None
     STEP_TIMEOUT_S = 60 * checks.get("step_timeout_minutes",
                                      DEFAULT_STEP_TIMEOUT_S // 60)
     ahead = project.section("merge").get("test_ahead") \
@@ -1739,6 +1761,36 @@ def merger_ahead(merger_dir, when, repo=None):
         return []
 
 
+def is_front(merger_dir, when, sha, pr, ahead=False, repo=None):
+    """designs/0031: whether sha's run is one the next merge waits on,
+    as the Merger's files say at `when`: with `ahead`, the first of its
+    predictions (ahead.json); otherwise a head of the pull request in
+    its next.json. Unreadable or stale files say no."""
+    if ahead:
+        entries = merger_ahead(merger_dir, when, repo)
+        return bool(entries) and entries[0]["sha"] == sha
+    return pr is not None and merger_first(merger_dir, when) == pr
+
+
+def weighted(prefix, weight):
+    """A step's scope prefix (scope_prefix) with CPUWeight `weight`
+    instead. No prefix, no scope: nothing to weight."""
+    if not prefix:
+        return list(prefix)
+    kept, skip = [], False
+    for i, arg in enumerate(prefix):
+        if skip:
+            skip = False
+            continue
+        if arg == "-p" and i + 1 < len(prefix) \
+                and prefix[i + 1].startswith("CPUWeight="):
+            skip = True
+            continue
+        kept.append(arg)
+    end = kept.index("--")
+    return kept[:end] + ["-p", "CPUWeight=%d" % weight] + kept[end:]
+
+
 def steps_digest(steps=None, always=None):
     """A short digest of the step list, so a verdict or a dependency
     record stands for another commit's only while the steps that made it
@@ -2075,20 +2127,24 @@ def report_main(state_dir, repo, sha, ok, failed, same, write, out=print,
         save(state_dir, state)
 
 
-def step_runs(state, since, until=None):
+def step_runs(state, since, until=None, weighted=None):
     """{step: [(finished, seconds, sha, main)]}, oldest first: the runs
     of each step in the verdicts kept that finished at `since` or later
     (and before `until`). Only a step's own run counts: not a matched
     verdict, a reused step, or a failed one, whose time says nothing of
     its cost; a step skipped by selection has no time. Nor does a run
     in the other mode, side by side or not (designs/0029): a step's
-    wall side by side includes its neighbours' load."""
+    wall side by side includes its neighbours' load. Nor, with
+    `weighted` (True or False), a run whose `merger_weight` differs
+    (designs/0031); None counts both."""
     runs = {}
     mode = SIDE_BY_SIDE is not None
     for sha, r in state["results"].items():
         seconds = r.get("step_seconds")
         if not isinstance(seconds, dict) or r.get("matched") \
-                or bool(r.get("side_by_side")) != mode:
+                or bool(r.get("side_by_side")) != mode \
+                or weighted is not None \
+                and bool(r.get("merger_weight")) != weighted:
             continue
         try:
             done = parse(r["finished"])
@@ -2113,13 +2169,16 @@ def judge_steps(state, when):
     """{step: figures} for each step with checks.step_alert's min_runs
     runs both in the last day and in the window_days before it: its two
     medians, run counts, the `limit` it is slow over, `slow`, and the
-    default-branch runs it was judged on (`mains`)."""
+    default-branch runs it was judged on (`mains`). Only runs without
+    `merger_weight` count (designs/0031): the front run's steps, on a
+    higher weight, aren't compared with the rest, and the default
+    branch's runs never have it."""
     alert = STEP_ALERT
     day = datetime.timedelta(days=1)
     usual_since = when - day - datetime.timedelta(days=alert["window_days"])
-    recent = step_runs(state, when - day)
-    usual = step_runs(state, usual_since, when - day)
-    every = step_runs(state, usual_since)
+    recent = step_runs(state, when - day, weighted=False)
+    usual = step_runs(state, usual_since, when - day, weighted=False)
+    every = step_runs(state, usual_since, weighted=False)
     judged = {}
     for name in sorted(set(recent) & set(usual)):
         if min(len(recent[name]), len(usual[name])) < alert["min_runs"]:
@@ -3152,7 +3211,7 @@ def children_cpu():
 
 def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
           cpu=children_cpu, logs=None, stream=None, share=None,
-          caches=None, side_by_side=None):
+          caches=None, side_by_side=None, front=None):
     """Every step that applies to the head, each run even if an earlier
     one failed, and none retried, each after `prefix` (memory_cap).
     `wrap(name, prefix, argv, env)` gives a traced step's (argv, env).
@@ -3168,20 +3227,34 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
     `caches`, {step: {variable: path}}, a step's own build caches. With
     `side_by_side`, at most that many steps run at once (`side_by_side`
     below), each step's CPU time its own process's (`wait_usage`).
-    Returns (ok, results), the results in the steps' order."""
+    With `front`, a function saying whether the next merge waits on this
+    run now (designs/0031), asked as each step starts: if so, the
+    step's scope has MERGER_CPU_WEIGHT and its result `merger_weight`;
+    with DOCKER_SLICES, its CHECK_DOCKER_SLICE is the front's or the
+    other's. Returns (ok, results), the results in the steps' order."""
     chosen = applicable(wt, steps)
+    weights = {}
 
     def prepare(name, args, extra):
         step_env_, folder = dict(env, **extra), None
         step_env_.update((caches or {}).get(name, {}))
+        step_prefix = list(prefix)
+        if front is not None:
+            now_front = front()
+            if now_front and MERGER_CPU_WEIGHT and step_prefix:
+                step_prefix = weighted(step_prefix, MERGER_CPU_WEIGHT)
+                weights[name] = True
+            if DOCKER_SLICES is not None:
+                step_env_["CHECK_DOCKER_SLICE"] = DOCKER_SLICES[
+                    "front" if now_front else "other"]
         if kept is not None:
             folder = os.path.join(kept, results_name(name))
             shutil.rmtree(folder, ignore_errors=True)
             os.makedirs(folder)
             step_env_["CHECK_RESULTS"] = folder
-        step_args = list(prefix) + args
+        step_args = step_prefix + args
         if wrap is not None:
-            step_args, step_env_ = wrap(name, list(prefix), args, step_env_)
+            step_args, step_env_ = wrap(name, step_prefix, args, step_env_)
         return step_args, step_env_, folder
 
     def execute(name, step_args, step_env_, folder, usage=None,
@@ -3206,6 +3279,8 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
             result["cpu"] = round(max(0.0, cpu() - used), 2)
         elif usage.get("cpu") is not None:
             result["cpu"] = round(usage["cpu"], 2)
+        if weights.get(name):
+            result["merger_weight"] = True
         if folder is not None:
             result["results_bytes"], dropped = keep_results(folder)
             if dropped is not None:
@@ -4526,7 +4601,7 @@ class Phases:
 
 def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
            post=None, chain=None, slot=1, memory_max=None, ahead=False,
-           main=False, report=None):
+           main=False, report=None, front=None):
     """Check sha, pull request pr's head, now, in this process, in
     `slot`, each step limited to memory_max (None: no limit). With
     `ahead`, sha is the Merger's prediction for pr: checked out without
@@ -4545,7 +4620,11 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     (`Phases`; agent-forge #13). Each step's own time is kept twice:
     `step_seconds`, whole seconds, and `step_wall`, to the hundredth;
     and its CPU time, user and system seconds of its process tree, as
-    `step_cpu`."""
+    `step_cpu`.
+
+    `front(when)` says whether the next merge waits on this run
+    (designs/0031: checks.merger_cpu_weight, checks.docker_slices),
+    asked as each step starts. The fast lane's run never is."""
     os.makedirs(state_dir, exist_ok=True)
     phases = Phases()
     started = clock()
@@ -4757,7 +4836,9 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                             wrap=wrap, kept=kept, logs=logs,
                             stream=sh_logged if run is sh else None,
                             share=share, caches=step_caches,
-                            side_by_side=SIDE_BY_SIDE)
+                            side_by_side=SIDE_BY_SIDE,
+                            front=None if front is None or slot == LANE
+                            or main else lambda: front(clock()))
         steps_took = time.monotonic() - steps_began
         phases.mark("steps")
         for r in results:
@@ -4840,6 +4921,10 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             if SIDE_BY_SIDE is not None:
                 # What step_alert compares a step's runs by (designs/0029).
                 record["side_by_side"] = True
+            if any(r.get("merger_weight") for r in results):
+                # Its steps, or some, had MERGER_CPU_WEIGHT; step_alert
+                # compares it only with runs that did too (designs/0031).
+                record["merger_weight"] = True
             if ahead:
                 record["ahead"] = True
             if main:
@@ -4885,11 +4970,12 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                     except OSError:
                         pass
         else:
-            log(state_dir, "VERDICT%s %s %s: %s waited=%ds ran=%ds"
+            log(state_dir, "VERDICT%s %s %s: %s waited=%ds ran=%ds%s"
                 % (" AHEAD" if ahead else "", name, sha[:10],
                    verdict_word(record),
                    (started - parse(seen)).total_seconds(),
-                   record["seconds"]), finished, out)
+                   record["seconds"], " merger_weight"
+                   if record.get("merger_weight") else ""), finished, out)
             if report is not None and not ok and not ahead:
                 report(sha, ok, [(r["name"], r.get("tail", ""))
                                  for r in results if r["rc"] != 0], None)
@@ -5059,10 +5145,17 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
             write = make_writer(project, out)
             report = lambda sha, ok, failed, same: report_pr(
                 state_dir, args.pr, sha, failed, write, out)
+        front = None
+        if (MERGER_CPU_WEIGHT or DOCKER_SLICES) and not args.main:
+            merger_dir = args.merger_dir or locks.state_dir(
+                project.name, "merger", environ)
+            front = lambda when: is_front(merger_dir, when, args.worker,
+                                          args.pr, args.ahead, repo)
         return worker(repo, state_dir, args.worker, args.pr, run, out,
                       post=post, chain=chain, slot=args.slot,
                       memory_max=memory_max_from_env(environ),
-                      ahead=args.ahead, main=args.main, report=report)
+                      ahead=args.ahead, main=args.main, report=report,
+                      front=front)
     token = mint(run)
     if token is None:
         out("NO-TOKEN: could not mint %s's token" % POSTER)

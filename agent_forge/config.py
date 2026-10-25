@@ -123,7 +123,11 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "main": str, "main_red_issue": dict, "drop_env": list,
           "keep_ignored": list, "red_comment": bool, "instances": dict,
           "host_fault_text": list, "step_alert": dict, "cpu_share": str,
-          "side_by_side": dict}
+          "side_by_side": dict, "merger_cpu_weight": int,
+          "docker_slices": dict}
+# checks.docker_slices (designs/0031): the slices each step's
+# containers go in, the next merge's run's and every other's.
+DOCKER_SLICES = {"front": str, "other": str}
 # checks.cpu_share (designs/0029): when a step's CHECK_CPUS is taken.
 CPU_SHARES = ("run", "step")
 # checks.side_by_side (designs/0029): a run's steps side by side.
@@ -145,7 +149,8 @@ INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight",
                       "step_alert", "cpu_share", "side_by_side")
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main")
-INSTANCE_CHECKS_ONLY = ("main_red_issue", "first_authors", "merger_first")
+INSTANCE_CHECKS_ONLY = ("main_red_issue", "first_authors", "merger_first",
+                        "merger_cpu_weight", "docker_slices")
 # An instance's name names its state directory and its log lines.
 INSTANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # checks.drop_env: a variable's name, or a prefix ending in `*`.
@@ -771,6 +776,21 @@ def _check_checks(checks, data, problems, where="checks"):
     if _is(checks.get("cpu_weight"), int) \
             and not 0 <= checks["cpu_weight"] <= 10000:
         problems.append("%s.cpu_weight must be 0 (none) or 1 to 10000" % where)
+    if _is(checks.get("merger_cpu_weight"), int):
+        floor = checks["cpu_weight"] if _is(checks.get("cpu_weight"), int) \
+            else 1000
+        if not max(1, floor) <= checks["merger_cpu_weight"] <= 10000:
+            problems.append("%s.merger_cpu_weight must be at least "
+                            "cpu_weight (%d) and at most 10000"
+                            % (where, max(1, floor)))
+    if isinstance(checks.get("docker_slices"), dict):
+        slices = checks["docker_slices"]
+        _fields(where + ".docker_slices", slices, DOCKER_SLICES, problems)
+        for key in DOCKER_SLICES:
+            if not isinstance(slices.get(key), str) \
+                    or not slices[key].endswith(".slice"):
+                problems.append("%s.docker_slices.%s must name a slice "
+                                "(\"<name>.slice\")" % (where, key))
     if isinstance(checks.get("fast_lane"), dict):
         _check_fast_lane(checks, problems, where)
     if isinstance(checks.get("reuse"), dict):
