@@ -39,11 +39,15 @@ request ahead in the queue that it can't take, unless that hand-back
 was already said:
 
 * `UPDATE` asks GitHub to merge `main` into the head (`update-branch`,
-  pinned to the head it judged);
+  pinned to the head it judged), then says on the pull request
+  (UPDATE_NOTE) that the approval still covers it, so nobody asks for
+  a review again;
 * `MERGE` squash-merges, pinned the same way, with GitHub's default
   message;
 * `HAND-BACK` comments once per approval, head and reason, signed
-  `— Merger`. To the author it is a plain comment; to the approving
+  `— Merger`. To the author it is a plain comment, and for a conflict
+  it says what to do (CONFLICT_ADVICE) and lists the author's other
+  open pull requests with where each stands; to the approving
   Reviewer it starts `Not-a-review`, since it asks for a review rather
   than giving one.
 
@@ -411,6 +415,10 @@ CHANGERS = frozenset()
 # The App a tick reads and writes with, dry run or not.
 ACT_AS = "Merger"
 SIGNATURE = "— Merger"
+# What the Merger says on a pull request once it has merged `main` in.
+UPDATE_NOTE = ("Merged `%s` into this, cleanly, on top of %s. The approval "
+               "of that head still covers the new one, so no review is "
+               "needed again: the Merger checks it and merges it.\n\n%s")
 # The required check: the commit status the build check posts, counted
 # only when the poster's App created it (REST's login, with its "[bot]"
 # suffix). Any other account with write access could post a status by
@@ -1790,12 +1798,70 @@ def gate_args(argv, repo, number, base, head):
     return filled
 
 
+# What a hand-back for a conflict tells the author to do. Agents read
+# "a reviewer approves a head that fixes it" as every reviewer, again,
+# for every merge, and asked for approvals a clean merge never needed.
+CONFLICT_ADVICE = (
+    "Merge `main` into the branch rather than rebasing it. Once one "
+    "reviewer approves the merge that resolves the conflict, the Merger "
+    "takes it again. A merge git makes cleanly, with nothing resolved, "
+    "needs no new approval: the approval of the head before it still "
+    "covers it, and the Merger merges `main` in itself that way.")
+
+# The queue as the tick that posts a hand-back sees it, for
+# `others_text`: set by `tick` before it acts.
+QUEUE_VIEW = {}
+
+
+def others_text(number, view=None):
+    """For a hand-back of pull request `number`: its author's other open
+    pull requests,
+    oldest first, each with its place in the queue or why it is held, so
+    they fix the one nearest the front first and can see which to stack
+    on which. "" when they have none."""
+    view = QUEUE_VIEW if view is None else view
+    queue = view.get("queue") or []
+    held = {str(k): v for k, v in (view.get("held") or {}).items()}
+    prs = view.get("prs") or ()
+    author = next((login(p) for p in prs if p["number"] == number), "")
+    lines = []
+    for pr in sorted(prs, key=lambda p: p["number"]):
+        if pr["number"] == number or login(pr) != author or not author:
+            continue
+        if pr["number"] in queue:
+            where = "number %d of %d in the queue" % (
+                queue.index(pr["number"]) + 1, len(queue))
+        elif str(pr["number"]) in held:
+            where = "held: %s" % held[str(pr["number"])]
+        elif pr.get("isDraft"):
+            where = "a draft"
+        else:
+            where = "not approved at its head yet"
+        lines.append("* #%d: %s" % (pr["number"], where))
+    if not lines:
+        return ""
+    return ("Your other open pull requests, oldest first:\n\n%s\n\n"
+            "Fix the one nearest the front first. Two that change the same "
+            "lines merge more easily as a stack, one based on the other's "
+            "branch, than side by side.\n\n" % "\n".join(lines))
+
+
 def hand_back_text(decision, approver):
     """The comment a hand-back posts. To the author it is plain, with the
-    decision's `detail` when it has one; to the approver it starts
-    `Not-a-review`, since it asks for a review."""
+    decision's `detail` when it has one; for a conflict, with what to
+    do (CONFLICT_ADVICE) and their other open pull requests
+    (`others_text`). To the approver it starts `Not-a-review`, since it
+    asks for a review."""
     if decision["to"] == "author":
         detail = decision.get("detail")
+        if decision["reason"].startswith(CONFLICT_REASON):
+            return ("Not merging %s: %s.\n\n%sThis is back with its "
+                    "author. %s\n\n%s%s" % (
+                        decision["head"][:10], decision["reason"],
+                        detail + "\n\n" if detail else "",
+                        CONFLICT_ADVICE,
+                        others_text(decision["pr"]),
+                        SIGNATURE))
         return ("Not merging %s: %s.\n\n%sThis is back with its author. "
                 "Once a reviewer approves a head that fixes it, the Merger "
                 "takes it again.\n\n%s" % (decision["head"][:10],
@@ -1829,6 +1895,13 @@ def carry_out(decision, approval, github, said):
     if decision["action"] == "UPDATE":
         ok, why = github.write("PUT", path + "/update-branch",
                                expected_head_sha=head)
+        if ok:
+            # Without it the approvals look stale on GitHub, and authors
+            # asked every reviewer to approve again. Its failure changes
+            # nothing: the update stands.
+            github.write("POST", "repos/%s/issues/%d/comments"
+                         % (REPO_SLUG, number), body=UPDATE_NOTE % (
+                             MAIN, head[:10], SIGNATURE))
     elif decision["action"] == "MERGE":
         ok, why = github.write("PUT", path + "/merge", sha=head,
                                merge_method="squash")
@@ -2925,6 +2998,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     queue = [pr for pr in queue if pr["number"] not in held_by]
     record = {"at": iso(when), "main": main_tip, "held": held,
               "queue": [pr["number"] for pr in queue], "decisions": []}
+    QUEUE_VIEW.clear()
+    QUEUE_VIEW.update(queue=record["queue"], held=held, prs=prs)
     if YIELD_PLACES:
         record["yielded"] = {str(n): p for n, p in sorted(yielded.items())}
     if RIGHT_OF_WAY:

@@ -1055,9 +1055,13 @@ class Tick(Decide):
         # No update-branch was ever asked for the conflicted head.
         self.assertEqual([w[1] for w in self.github.writes],
                          [SLUG + "/issues/5/comments", SLUG + "/pulls/6/merge"])
-        self.assertIn("conflicts with main", self.github.writes[0][2]["body"])
-        self.assertTrue(self.github.writes[0][2]["body"].endswith(
-            "\n\n— Merger"))
+        body = self.github.writes[0][2]["body"]
+        self.assertIn("conflicts with main", body)
+        self.assertIn(m.CONFLICT_ADVICE, body)
+        # The author's other pull request, and where it stands.
+        self.assertIn("Your other open pull requests, oldest first:\n\n"
+                      "* #6: number 2 of 2 in the queue\n\n", body)
+        self.assertTrue(body.endswith("\n\n— Merger"))
         # Later ticks say nothing more to #5 and go straight on.
         for minutes in (1, 2, 40):
             record, _ = self.tick([self.item(), other], live=True,
@@ -1146,7 +1150,12 @@ class Tick(Decide):
         record, _ = self.tick([self.item()], live=True)
         self.assertEqual(self.github.writes, [
             ("PUT", SLUG + "/pulls/5/update-branch",
-             {"expected_head_sha": self.head})])
+             {"expected_head_sha": self.head}),
+            ("POST", SLUG + "/issues/5/comments",
+             {"body": m.UPDATE_NOTE % ("main", self.head[:10], "— Merger")})])
+        # The note says the approval stands, so nobody asks for it again.
+        self.assertIn("no review is needed again",
+                      self.github.writes[1][2]["body"])
         self.assertEqual(record["decisions"][0]["result"], "done")
 
     def test_live_waits_without_writing(self):
@@ -3664,6 +3673,36 @@ class CodeOwners(RepoCase):
         self.assertIn("can't be listed", m.code_owner_wait(
             self.repo.path, self.item(), rules, self.repo.main_tip(), run))
 
+class OthersText(unittest.TestCase):
+    """The hand-back's list of the author's other open pull requests."""
+
+    def view(self):
+        return {"queue": [7, 5], "held": {"8": "stacked on #7"},
+                "prs": [pr(5), pr(7), pr(8), pr(9, draft=True),
+                        pr(10, reviews=[]), pr(11, author="someone-else")]}
+
+    def test_each_other_one_of_the_author_with_where_it_stands(self):
+        self.assertEqual(m.others_text(5, self.view()), (
+            "Your other open pull requests, oldest first:\n\n"
+            "* #7: number 1 of 2 in the queue\n"
+            "* #8: held: stacked on #7\n"
+            "* #9: a draft\n"
+            "* #10: not approved at its head yet\n\n"
+            "Fix the one nearest the front first. Two that change the same "
+            "lines merge more easily as a stack, one based on the other's "
+            "branch, than side by side.\n\n"))
+
+    def test_nothing_when_the_author_has_no_other(self):
+        self.assertEqual(m.others_text(11, self.view()), "")
+        self.assertEqual(m.others_text(5, {}), "")
+
+    def test_only_a_conflict_gets_the_advice(self):
+        decision = {"to": "author", "head": "a" * 40, "pr": 5,
+                    "reason": "the ci workflow failed"}
+        self.assertNotIn(m.CONFLICT_ADVICE, m.hand_back_text(decision, "R"))
+        decision["reason"] = m.CONFLICT_REASON
+        self.assertIn(m.CONFLICT_ADVICE, m.hand_back_text(decision, "R"))
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -4467,3 +4506,4 @@ class Main0026(unittest.TestCase):
         self.assertEqual(self.ticks[0]["check_state"], {"waiting": {"h": {}}})
         self.run_main({}, ["--check-state", check])
         self.assertNotIn("check_state", self.ticks[0])
+
