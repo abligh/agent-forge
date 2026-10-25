@@ -616,6 +616,15 @@ class Check(unittest.TestCase):
             "router.rules must be a string",
             "router: unknown key 'rule'"])
 
+    def test_router_forget_minutes(self):
+        for minutes in (0, 360):
+            self.assertEqual(self.problems(router={
+                "forget_minutes": minutes}), [])
+        self.assertEqual(self.problems(router={"forget_minutes": -1}), [
+            "router.forget_minutes must be at least 0"])
+        self.assertEqual(self.problems(router={"forget_minutes": "6h"}), [
+            "router.forget_minutes must be an integer"])
+
     def test_receiver(self):
         self.assertEqual(self.problems(receiver={
             "port": 0, "path": "hook", "max_body": 10 ** 8, "colour": 1,

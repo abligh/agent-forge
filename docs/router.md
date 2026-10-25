@@ -67,6 +67,8 @@ The engine runs one pass:
    withheld or surfaced, once); the journal for every wake sent,
    failed, withheld, withdrawn or surfaced; and every decision the run
    made, for the next run's rules (`previous.json`, below).
+7. **Once a run.** The module's `each_run` actions, on a sending run
+   that isn't `--only`'s (below).
 
 **Several decisions per item.** `decide` may return any number for
 one item: one agent's turn, a notice to another, a relook to its
@@ -93,6 +95,54 @@ none), or `withheld` or `surfaced` with `at`. A run forgets the turns
 of an item key that it decided but no longer gave, and every item key
 it didn't decide at all, unless it was `--only`; an item key whose
 wake failed is left as it was, as it always has been.
+
+**A grace period before a turn is forgotten.** With
+`router.forget_minutes` above 0 (the default, 0, is the above), each
+recorded turn also keeps `decided_at`, the last run that decided it,
+and a run that doesn't decide a turn forgets it only once `decided_at`
+is more than `forget_minutes` old. A turn recorded before has no
+`decided_at`, and its `woken_at` (or, withheld or surfaced, its `at`)
+is used. A turn kept this way isn't reminded while it is undecided,
+since only decisions are due; decided again with the same event, it
+is the same turn: it isn't woken again, and its reminders count on. So
+an item decided on one run, not on the next and then again with the
+same event is woken once. An `--only` run then forgets nothing.
+
+**A turn already woken.** A decision whose `woken` says why (`"Woke:
+comment 6390…"`) is one someone woke some other way. When its turn is
+new it isn't sent: it is recorded as woken at this run's time,
+journalled as `marked woken: <why>`, printed so, and its actions are
+done, as for a sent wake. From then on it is an ordinary recorded turn:
+its reminders run from that time, and a new event is a new turn. On a
+turn already recorded, `woken` has no effect. A dry run prints it and
+journals `would be marked woken: <why>`.
+
+**Actions once a run.** A module's `each_run(ctx)` gives `Action`s that
+belong to no turn, such as rewriting a status block in an issue body
+or posting a commit status on each open pull request. A sending run
+that read the queue, and isn't `--only`'s, does them once, in order,
+after delivery and recording, under the router's lock, through the
+engine's GitHub client. A dry run prints each (`WOULD …`). A failed one
+(GitHub refused it, it raised, or `each_run` itself raised or gave
+something not an `Action`) is printed (`ACTION FAILED: …`) and
+journalled in `wakes.jsonl` as `{"kind": "run", "outcome": "failed:
+<what>: <why>"}`; the others still run. Like a failed decision action,
+it doesn't change the exit status: they run on every run, so the next
+tries again. A module that wants one only every N minutes compares
+`ctx.when` with what an `Action` of its own wrote in `state_dir`.
+
+**`--seed`.** A project switching from a router of its own starts with
+empty state, so its first sending run would wake every open turn at
+once. `--seed` is a run, under the lock, that decides as a sending run
+does (with no recheck: it sends nothing), then records every due turn
+as woken at this run's time, sends nothing, does no actions and no
+`each_run`, and journals each as `seeded`. Withheld and surfaced
+decisions are recorded as on any run, without their actions. It writes
+`previous.json` too, and ends `SEEDED <n> open, <m> turn(s) recorded
+as woken`. A run after it wakes only turns that began since. It refuses
+(`SEED REFUSED: …`, exit 2) a state directory that already records a
+turn, so it can't silence a live router by mistake, and it can't be
+`--only`'s. Run it once, just after the old router's last run.
 
 **The previous run's decisions.** Each sending run that read the queue
 writes `previous.json` beside `state.json`: by item key, every decision
@@ -163,8 +213,9 @@ when some was delivered and the rest stays due; 2 when the queue
 couldn't be read, or something was due and none of it was delivered.
 The last was 1 before: a router that delivered nothing hasn't done its
 job, and 2 is what a scheduler reports as broken. A wake that stays due
-is one the relay didn't take or a recheck couldn't fetch; one withheld
-or withdrawn isn't due.
+is one the relay didn't take or a recheck couldn't fetch; one withheld,
+withdrawn or marked woken isn't due. A failed action, a decision's or
+`each_run`'s, never changes it. A refused `--seed` is 2.
 
 ## The interface
 
@@ -188,6 +239,7 @@ class Rules(Protocol):                # a module, not a class
     def sweep(ctx) -> Sequence[Decision]: ...         # optional
     def recheck(item, ctx) -> Sequence[Decision]: ... # optional
     def summary(ctx) -> str: ...                      # optional
+    def each_run(ctx) -> Sequence[Action]: ...        # optional
     wants_directory: bool         # optional: read the relay's directory
     merged_window: int            # optional: minutes of merges to read
     wants_previous: bool          # optional: read the last run's decisions
@@ -223,6 +275,7 @@ class Decision:
     suppressed: str | None = None # decided, not sent, and why
     actions: tuple = ()           # Actions, done before delivery
     reminder: Reminder | None = None   # None: relay.remind_seconds
+    woken: str | None = None      # already woken some other way: why
 
 ONCE: Reminder                    # woken once, never reminded
 ```
@@ -232,8 +285,9 @@ here: `configure` sets them up for the project, and is given
 `forge-merger`, so a rule can use the Merger's own tests (what an
 approval is, whether anything was said since, what `Blocked-by:` names)
 rather than a copy that could drift. `sweep` defaults to deciding
-nothing, `recheck` to `decide`, and `summary`, a phrase for the run's
-last line ("1 waiting on the owner"), to none.
+nothing, `recheck` to `decide`, `summary`, a phrase for the run's
+last line ("1 waiting on the owner"), to none, and `each_run` to no
+actions.
 
 **`item`** is the GraphQL node with the `flatten` connections as lists
 and `__typename` set, so `decide` can tell a pull request from an
@@ -332,5 +386,7 @@ relay already answers `unknown-name`, and that is reported.
    ([designs/0030](designs/0030-what-a-projects-own-router-rules-need.md)),
    each off, or changing nothing, until a module or the configuration
    uses it. Done so far: the merged pull requests' fields
-   (`graphql["Merged"]`) and the previous run's decisions
-   (`ctx.previous`).
+   (`graphql["Merged"]`), the previous run's decisions
+   (`ctx.previous`), actions once a run (`each_run`), a turn already
+   woken (`Decision.woken`), the grace period before a turn is
+   forgotten (`router.forget_minutes`) and `--seed`.

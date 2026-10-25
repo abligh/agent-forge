@@ -52,7 +52,23 @@ doubling to a ceiling, delayed by a jitter fixed by the key), or, with
 none, once `relay.remind_seconds` (default 7200;
 `$FORGE_ROUTER_REMIND` overrides it) have passed. `wakes.jsonl`
 appends every wake sent, failed, withheld or withdrawn, with the
-reason.
+reason. A turn no run decides is forgotten, or, with
+`router.forget_minutes`, kept until that long after the last run that
+decided it (`decided_at`), so an item that flaps is woken once. A
+decision whose `woken` says the agent was woken some other way is, as
+a new turn, recorded as woken and journalled as `marked woken: <why>`,
+not sent.
+
+**Once a run.** A sending run that isn't `--only`'s then does the
+rules' `each_run(ctx)` actions, after delivery and recording, under
+the lock: work that belongs to no turn, such as a heartbeat. A dry run
+prints them; a failed one is printed and journalled as a `run` record,
+and doesn't change the exit status.
+
+**`--seed`** is the first run of a router taking over from another: it
+decides as a sending run does, records every due turn as woken,
+journalled as `seeded`, and sends nothing, does no actions and no
+`each_run`. It refuses a state directory that already records a turn.
 
 **Check before send.** When the rules have a `recheck` of their own
 (not `decide` itself, as the default rules'), a sending run fetches
@@ -186,6 +202,8 @@ DEFAULT_TOKEN_FILE = "~/.config/xmpp-webhook-relay/token"
 TOKEN_FILE = os.path.expanduser(DEFAULT_TOKEN_FILE)
 DEFAULT_REMIND_S = 7200
 REMIND_S = DEFAULT_REMIND_S
+# `router.forget_minutes`: how long a turn no run decides is kept.
+FORGET_MINUTES = 0
 POST_TIMEOUT_S = 15
 # The longest Retry-After a 503 may ask for and still be tried again in
 # the same run; a longer one waits for the next run.
@@ -223,6 +241,7 @@ def configure(project, rules=True):
     names no rules module. The Merger borrows only the poster, so it
     loads no rules: a project's rules file is no business of its."""
     global REPO_SLUG, ACT_AS, RULES, RELAY, TOKEN_FILE, REMIND_S
+    global FORGET_MINUTES
     merger.configure(project)
     relay = project.section("relay")
     REPO_SLUG = project.repo
@@ -231,6 +250,7 @@ def configure(project, rules=True):
     TOKEN_FILE = os.path.expanduser(relay.get("token_file",
                                               DEFAULT_TOKEN_FILE))
     REMIND_S = relay.get("remind_seconds", DEFAULT_REMIND_S)
+    FORGET_MINUTES = project.section("router").get("forget_minutes", 0)
     if not rules:
         return
     module = router.load_rules(project.section("router").get(
@@ -450,21 +470,46 @@ def record(items, decision, entry):
                              if not same_turn(e, decision)] + [entry])
 
 
-def prune(items, live, only, held=()):
+def prune(items, live, only, held=(), when=None, forget_s=0):
     """Keep only the turns this run still decided: an item key's
     entries not matching one of `live[key]` are forgotten, and so is an
     item key not decided at all, unless the run was `only` some items.
     A key in `held` had a wake that stays due, and is left as it was, as
-    a failed wake always has been."""
+    a failed wake always has been. With `forget_s` (seconds), a turn
+    not decided is kept until that long after the last run that decided
+    it (`recent`), and a run `only` some items forgets nothing."""
+    if forget_s and only:
+        return
     for key in list(items):
-        if key in held:
+        if key in held or (key not in live and only):
             continue
-        if key in live:
-            put_entries(items, key, [e for e in entries(items, key)
-                                     if any(same_turn(e, d)
-                                            for d in live[key])])
-        elif not only:
-            del items[key]
+        put_entries(items, key, [e for e in entries(items, key)
+                                 if any(same_turn(e, d)
+                                        for d in live.get(key, ()))
+                                 or recent(e, when, forget_s)])
+
+
+def recent(entry, when, forget_s):
+    """Whether a turn was last decided within `forget_s` seconds of
+    `when`: by its `decided_at`, or, recorded before that was kept, when
+    it was woken or recorded."""
+    if not forget_s:
+        return False
+    try:
+        decided = parse_time(entry.get("decided_at") or entry.get("woken_at")
+                             or entry.get("at"))
+    except (TypeError, ValueError):
+        return False
+    return (when - decided).total_seconds() <= forget_s
+
+
+def mark_decided(items, live, when):
+    """Set `decided_at`, this run's time, on every recorded turn it
+    decided, for `recent`."""
+    for key, decided in live.items():
+        for entry in entries(items, key):
+            if any(same_turn(entry, d) for d in decided):
+                entry["decided_at"] = merger.iso(when)
 
 
 def reminders_sent(entry):
@@ -659,6 +704,8 @@ def check(decision):
     elif d.reminder is not None and not isinstance(d.reminder,
                                                    router.Reminder):
         problem = "its reminder is not a Reminder"
+    elif d.woken is not None and not isinstance(d.woken, str):
+        problem = "its woken is not a string or None"
     elif d.actions and d.agent is None and d.kind != "surface":
         problem = "nobody's turn has no key to do its actions once for"
     elif (d.agent is not None and d.suppressed is None
@@ -861,16 +908,32 @@ def record_presence(state_dir, listing, when):
 
 
 def run(github, roster, state_dir, send, post=None, only=None, out=print,
-        when=None, remind_s=None, directory=None):
+        when=None, remind_s=None, directory=None, forget_s=None, seed=False):
     """One run: decide every open item, or `only` those numbers, and
     when `send`, do the due decisions' actions, wake each agent with
-    its due items and record it. `directory`, for rules that want it,
-    reads the relay's directory (`make_directory_reader`). Returns the
-    exit status: 0 when nothing was due or all of it was delivered, 1
-    when some was and the rest stays due, 2 when something was due and
-    none of it was delivered."""
+    its due items and record it, then do the rules' `each_run`
+    actions. `directory`, for rules that want it, reads the relay's
+    directory (`make_directory_reader`). `forget_s` is how long a turn
+    no run decides is kept (default `router.forget_minutes`). With
+    `seed`, a sending run records every due turn as woken and sends
+    nothing, does no actions and no `each_run`; it refuses a state
+    directory that already records a turn. Returns the exit status: 0
+    when nothing was due or all of it was delivered, 1 when some was
+    and the rest stays due, 2 when something was due and none of it was
+    delivered (or a seed was refused)."""
     when = when or merger.now_utc()
     remind_s = REMIND_S if remind_s is None else remind_s
+    forget_s = FORGET_MINUTES * 60 if forget_s is None else forget_s
+    state_path = os.path.join(state_dir, "state.json")
+    if seed:
+        recorded = merger.load_json(state_path, {})
+        recorded = recorded.get("items") if isinstance(recorded, dict) \
+            else None
+        if isinstance(recorded, dict) and any(entries(recorded, key)
+                                              for key in recorded):
+            out("SEED REFUSED: %s already records turns; a seed is only "
+                "for a router's first run" % state_path)
+            return 2
     prs, issues = fetch(github)
     listing = None
     if RULES.wants_directory and directory is not None:
@@ -896,15 +959,15 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
     if only:
         decisions = [d for d in decisions if d.item in only]
     decisions.sort(key=order)
-    state_path = os.path.join(state_dir, "state.json")
     state = merger.load_json(state_path, {})
     items = state.get("items")
     if not isinstance(items, dict):
         items = state["items"] = {}
     # `live`: the decisions, by item key, whose recorded turns are kept.
-    # `acting`: decisions recorded once (withheld, surfaced) whose
-    # actions are done now, with their journal record.
+    # `acting`: decisions recorded once (withheld, surfaced, marked
+    # woken) whose actions are done now, with their journal record.
     log, would, wakes, acting, live = [], [], [], [], {}
+    marked = 0
     for d in decisions:
         keep = live.setdefault(item_key(d), [])
         if d.kind == "surface":
@@ -947,6 +1010,22 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
         line = d.line + (" (reminder)" if why == "reminder" else "") + (
             " (fixes the red nightly: first)"
             if d.item in merger.NIGHTLY_FIXES else "")
+        # Woken some other way, or by the router this replaces: recorded
+        # as woken now, and reminded from now.
+        if seed or (d.woken is not None and why == "new"):
+            outcome = "seeded" if seed else "marked woken: " + d.woken
+            out("%s %s's, rule %s: %s" % (label(d), d.agent, d.rule,
+                                          outcome))
+            if not send:
+                would.append((d, line, "would be " + outcome))
+                continue
+            marked += 1
+            record(items, d, dict(key_of(d), woken_at=merger.iso(when)))
+            rec = journal(d, line, outcome, session=", ".join(
+                sessions_of(roster, d.agent)))
+            log.append(rec)
+            acting.append((d, rec))
+            continue
         would.append((d, line, "would send to %s" % ", ".join(
             sessions_of(roster, d.agent))))
         wakes.append({"d": d, "line": line, "why": why, "entry": entry})
@@ -972,7 +1051,7 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
                                session=", ".join(sessions_of(roster,
                                                              d.agent))))
     for d, rec in acting:
-        if d.actions:
+        if d.actions and not seed:
             rec["actions"] = act(github, d, send, out)
     for w in wakes:
         w["actions"] = act(github, w["d"], send, out) if w["d"].actions \
@@ -1036,14 +1115,21 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
             if count:
                 entry["reminders"] = count
             record(items, d, entry)
-    prune(items, live, only, held)
-    out("%s %d open, %d turn(s) to wake%s%s%s%s" % (
-        "ROUTED" if send else "DRY-RUN", len(prs) + len(issues),
-        sum(len(b) for b in batches.values()),
-        ", " + tally if tally else "",
-        "; %d wake(s) not sent" % failed if failed else "",
-        "; %d withdrawn on recheck" % withdrawn_n if withdrawn_n else "",
-        "; %d not rechecked" % unchecked_n if unchecked_n else ""))
+    if forget_s:
+        mark_decided(items, live, when)
+    prune(items, live, only, held, when, forget_s)
+    if seed:
+        out("SEEDED %d open, %d turn(s) recorded as woken%s" % (
+            len(prs) + len(issues), marked, ", " + tally if tally else ""))
+    else:
+        out("%s %d open, %d turn(s) to wake%s%s%s%s%s" % (
+            "ROUTED" if send else "DRY-RUN", len(prs) + len(issues),
+            sum(len(b) for b in batches.values()),
+            ", " + tally if tally else "",
+            "; %d marked woken" % marked if marked else "",
+            "; %d wake(s) not sent" % failed if failed else "",
+            "; %d withdrawn on recheck" % withdrawn_n if withdrawn_n else "",
+            "; %d not rechecked" % unchecked_n if unchecked_n else ""))
     if send:
         os.makedirs(state_dir, exist_ok=True)
         merger.save_json(state_path, state)
@@ -1051,9 +1137,49 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
         write_previous(state_dir, decisions, only, when)
     else:
         record_dry_run(state_dir, decisions, would, only, when)
+    # Once a run, after delivery and recording, under the same lock.
+    if not only and not seed:
+        failures = run_each(github, ctx, send, out)
+        if send:
+            append_records(os.path.join(state_dir, "wakes.jsonl"),
+                           failures, when)
     if not stayed:
         return 0
     return 1 if delivered else 2
+
+
+def run_each(github, ctx, send, out):
+    """Do the rules' `each_run` actions, in order, as the Merger's App,
+    or, in a dry run, print them. Returns a `run` record for the journal
+    for each that failed (GitHub refused it, or it raised), and one for
+    `each_run` itself raising or giving something not an Action. A
+    failure is reported and the rest go on; the next run tries again."""
+    try:
+        actions = tuple(RULES.each_run(ctx))
+        for action in actions:
+            if not isinstance(action, router.Action):
+                raise ValueError("%r is not an Action" % (action,))
+    except Exception as err:  # noqa: BLE001 - the rules' own failures vary
+        out("ACTION FAILED: each_run: %s" % err)
+        return [{"kind": "run", "outcome": "failed: each_run: %s" % err}]
+    failed = []
+    for action in actions:
+        what = type(action).__name__
+        try:
+            what = action.describe()
+            if not send:
+                out("WOULD %s" % what)
+                continue
+            ok, why = action.run(github, REPO_SLUG)
+        except Exception as err:  # noqa: BLE001 - an action never stops a run
+            ok, why = False, str(err)
+        if ok:
+            out("DONE %s" % what)
+        else:
+            out("ACTION FAILED: %s: %s" % (what, why))
+            failed.append({"kind": "run",
+                           "outcome": "failed: %s: %s" % (what, why)})
+    return failed
 
 
 def append_records(path, records, when):
@@ -1128,6 +1254,11 @@ def main(argv=None, sh=merger.sh, out=print, post=None, roster=None,
                              "dry-run.jsonl")
     parser.add_argument("--only", type=parse_only, metavar="N[,N]",
                         help="route only these issues or pull requests")
+    parser.add_argument("--seed", action="store_true",
+                        help="the first run of a router taking over from "
+                             "another: record every due turn as woken, "
+                             "send nothing; refused once state records a "
+                             "turn")
     parser.add_argument("--state-dir", default=None,
                         help="where state and records live (default "
                         "~/.local/state/agent-forge/<project>/router)")
@@ -1135,6 +1266,11 @@ def main(argv=None, sh=merger.sh, out=print, post=None, roster=None,
         "FORGE_CRON_CHECKOUT"), help="the checkout whose configuration "
         "this reads (default $FORGE_CRON_CHECKOUT)")
     args = parser.parse_args(argv)
+    if args.seed and args.only:
+        out("BAD-ARGS: --seed records every item's turns, so it can't be "
+            "--only's")
+        return 2
+    sending = args.send or args.seed
     if not args.checkout:
         out("NO-CONFIG: no --checkout, and FORGE_CRON_CHECKOUT is not set")
         return 2
@@ -1174,13 +1310,13 @@ def main(argv=None, sh=merger.sh, out=print, post=None, roster=None,
             return 2
         try:
             return run(merger.GitHub(token, sh), roster, state_dir,
-                       args.send, post, args.only, out, remind_s=remind_s,
-                       directory=directory)
+                       sending, post, args.only, out, remind_s=remind_s,
+                       directory=directory, seed=args.seed)
         except (RuntimeError, KeyError, TypeError, ValueError) as err:
             out("FAILED: %s" % err)
             return 2
 
-    if not args.send:
+    if not sending:
         return go()
     os.makedirs(state_dir, exist_ok=True)
     with open(os.path.join(state_dir, "lock"), "a") as lock:

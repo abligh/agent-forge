@@ -35,6 +35,8 @@ A rules module is a Python module with:
     recheck(item, ctx)  decide again just before delivery (absent: decide)
     summary(ctx)        a phrase for the run's last line, or "" (may be
                         absent)
+    each_run(ctx)       [Action] done once a sending run that isn't
+                        `--only`'s, after delivery (may be absent)
     wants_directory     true when the rules read the relay's directory,
                         `ctx.directory` (absent: false). Read after
                         `configure`, so it may depend on the project
@@ -146,7 +148,10 @@ class Decision:
     them. A decision about no item (`item` None) is keyed on its rule in
     the item's place. `kind` is one of KINDS; `actions` are `Action`s
     done before the wake; `reminder` is a `Reminder`, or None for the
-    configuration's fixed `relay.remind_seconds`."""
+    configuration's fixed `relay.remind_seconds`. `woken` says why the
+    agent already knows (someone woke her some other way): a new turn
+    with it is recorded as woken, not sent; on a turn already recorded
+    it changes nothing."""
     item: int | None
     agent: str | None
     rule: Any
@@ -156,6 +161,7 @@ class Decision:
     suppressed: str | None = None
     actions: tuple = ()
     reminder: Any = None
+    woken: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -220,7 +226,7 @@ def load_rules(name, root=None):
             raise RulesError("rules %r has no %s" % (name, part))
     defaults = {"flatten": (), "lookups": (), "sweep": lambda ctx: [],
                 "wants_directory": False, "merged_window": 0,
-                "wants_previous": False,
+                "wants_previous": False, "each_run": lambda ctx: (),
                 "recheck": module.decide, "summary": lambda ctx: ""}
     for part, value in defaults.items():
         if not hasattr(module, part):

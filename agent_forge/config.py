@@ -172,7 +172,8 @@ LABELS = {"owner_prefix": str, "status_prefix": str,
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
-          "stuck": dict, "owners": dict, "unreviewed": dict}
+          "stuck": dict, "owners": dict, "unreviewed": dict,
+          "forget_minutes": int}
 IDLE_OFFER = {"idle_minutes": int, "shell_minutes": int, "report_to": str}
 MERGE_NOTICE = {"window_minutes": int}
 STUCK = {"retarget": bool, "self_blocked": bool, "draft_hours": int}
@@ -473,6 +474,9 @@ def check(data):
             _check_owners(router["owners"], data["agents"], problems)
         if isinstance(router.get("unreviewed"), dict):
             _check_unreviewed(router["unreviewed"], router, problems)
+        if _is(router.get("forget_minutes"), int) and \
+                router["forget_minutes"] < 0:
+            problems.append("router.forget_minutes must be at least 0")
     merge = data.get("merge", {})
     if _fields("merge", merge, MERGE, problems):
         for i, argv in enumerate(merge.get("gate", [])):
