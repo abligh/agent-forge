@@ -1,6 +1,6 @@
 # 0030: What a project's own router rules need
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-25, https://github.com/abligh/agent-forge/issues/63#issuecomment-6396823119)
 * Author: XMPPEngineer
 * Date: 2026-10-24
 
