@@ -323,7 +323,8 @@ is said once. A head whose green says it was covered is merged only
 while the last tick's batch still holds: that batch has its tree, its
 top's tree is green in the build check's state, and every pull request
 after it in the batch is still in the queue at the head predicted.
-Otherwise it waits for the new batch's top, so the default branch's
+Otherwise it waits for the new batch's top, or a run of its own tree
+(a batch split down to it), so the default branch's
 tip is never a tree no run tested unless a member is handed back
 after others merged. The build check's state is read from its state
 directory, as for `merge.queued_stall_minutes`.
@@ -3306,11 +3307,15 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                           run, below if pr["number"] in layers else (),
                           regenerated, when, restacks.get(pr["number"]))
         decision.update(pr=pr["number"], head=pr["headRefOid"])
-        if decision.get("covered") and not batch_holds(
+        tree = git(repo, "rev-parse", pr["headRefOid"] + "^{tree}",
+                   run=run).stdout.strip() if decision.get("covered") \
+            else None
+        # A covered head merges while its batch holds, or once a run of
+        # its tree itself (a batch split down to it) is green.
+        if tree and not batch_holds(
                 load_json(os.path.join(state_dir, AHEAD_FILE), {}),
-                pr["number"], git(repo, "rev-parse", pr["headRefOid"]
-                                  + "^{tree}", run=run).stdout.strip(),
-                queue, check_state):
+                pr["number"], tree, queue, check_state) \
+                and tree_verdict(check_state, tree) is not True:
             decision = {"action": "WAIT", "pr": pr["number"],
                         "head": pr["headRefOid"],
                         "reason": BATCH_WAIT_REASON}

@@ -176,6 +176,22 @@ that has waited `max_wait_minutes`.
 Nothing after an entry whose tree is red here is started: every later
 prediction contains that pull request, so it would only be red too.
 
+**With `merge.test_ahead.batch` above 1, only the batch's top is run**
+(designs/0032). `ahead.json`'s `batch` names the first entries the
+Merger counts as one batch, its top last; step 2 then starts only the
+top, even when it is a head's own tree. While the top has no verdict
+(and hasn't failed MAX_ERRORS times), a waiting head whose tree is in
+the batch is held (`HELD ...: its tree is in the Merger's batch
+#a..#b, whose top <sha> is checked for it`). Once the top is green, a
+head that contains the default branch's tip and whose tree is a
+member's is recorded green with `covered` naming the batch and
+`matched` the top's run, logged `COVERED`, and posted `success` as
+`green on <host>: covered by batch #a..#b (tested as <sha>)`, with no
+slot, as matches are. A cover is not a verdict on its tree: no other
+head is matched to it, and a head's own tree in the predictions is run
+after all when a batch covered that head. A red top leaves each head
+to its own run, and the Merger halves the batch.
+
 An entry is checked out from the object store its worktree shares with
 the Merger's checkout, so nothing is fetched and nothing is pushed; the
 Merger and this tool must therefore use the same checkout (`repo` in
@@ -1777,12 +1793,36 @@ def merger_ahead(merger_dir, when, repo=None):
         return []
 
 
+def merger_batch(merger_dir, when, repo=None):
+    """designs/0032: the Merger's batch, the predictions one run covers,
+    its top last, or [] when there is none of two or more, or ahead.json
+    can't be read as merger_ahead reads it, or its `batch` doesn't name
+    the trees of its first entries."""
+    entries = merger_ahead(merger_dir, when, repo)
+    if not entries:
+        return []
+    try:
+        with open(os.path.join(merger_dir, "ahead.json")) as handle:
+            batch = json.load(handle)["batch"]
+        size, trees = batch["size"], batch["trees"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    if not isinstance(size, int) or isinstance(size, bool) or size < 2 \
+            or [e["tree"] for e in entries[:size]] != trees:
+        return []
+    return entries[:size]
+
+
 def is_front(merger_dir, when, sha, pr, ahead=False, repo=None):
     """designs/0031: whether sha's run is one the next merge waits on,
     as the Merger's files say at `when`: with `ahead`, the first of its
-    predictions (ahead.json); otherwise a head of the pull request in
-    its next.json. Unreadable or stale files say no."""
+    predictions (ahead.json), or its batch's top when it has one;
+    otherwise a head of the pull request in its next.json. Unreadable
+    or stale files say no."""
     if ahead:
+        batch = merger_batch(merger_dir, when, repo)
+        if batch:
+            return batch[-1]["sha"] == sha
         entries = merger_ahead(merger_dir, when, repo)
         return bool(entries) and entries[0]["sha"] == sha
     return pr is not None and merger_first(merger_dir, when) == pr
@@ -1834,13 +1874,14 @@ def tested(state, tree, when, ok=None, accept=None):
     list, green only when `ok`, and only one `accept(record)` takes when
     given, or None. A verdict that finished more than MATCH_MAX_AGE
     before `when`, or after it, doesn't count: the step digest can't see
-    a toolchain upgrade."""
+    a toolchain upgrade. Nor does a batch's cover (designs/0032): no
+    run checked that tree."""
     host, steps = socket.gethostname(), steps_digest()
     best = None
     for sha, r in state["results"].items():
         age = verdict_age(r, when)
         if (tree and r.get("tree") == tree and r.get("host") == host
-                and r.get("steps") == steps
+                and r.get("steps") == steps and not r.get("covered")
                 and (ok is None or r.get("ok") is ok)
                 and (accept is None or accept(r))
                 and age is not None
@@ -1850,7 +1891,7 @@ def tested(state, tree, when, ok=None, accept=None):
     return best[0] if best else None
 
 
-def next_ahead(state, ahead, busy=(), when=None, busy_trees=()):
+def next_ahead(state, ahead, busy=(), when=None, busy_trees=(), batch=()):
     """(sha, pr) of the first of the Merger's predictions, `ahead`, that
     is worth a run, or None: not running in a slot (`busy`) or started
     less than START_GRACE before `when`, not given up on, not the head's
@@ -1860,15 +1901,20 @@ def next_ahead(state, ahead, busy=(), when=None, busy_trees=()):
     after an entry whose tree is red here (and not green too, as after a
     flake): each later prediction contains it, so it would be red too,
     and the Merger drops that pull request from the list on its next
-    tick anyway."""
+    tick anyway. With a `batch` (designs/0032), only its top, even when
+    the top is a head's own tree. Nor is a head's own tree left to its
+    check when a batch covered that head: its check is over, and no run
+    tested the tree."""
     started = state.get("ahead_started", {})
     when = when or now_utc()
-    for entry in ahead:
+    for entry in batch[-1:] or ahead:
         sha = entry["sha"]
         if tested(state, entry["tree"], when, ok=False) is not None \
                 and tested(state, entry["tree"], when, ok=True) is None:
             return None
-        if (entry.get("same_as_head") or sha in busy
+        own = (entry.get("same_as_head") and not batch and not state[
+            "results"].get(entry.get("head"), {}).get("covered"))
+        if (own or sha in busy
                 or entry["tree"] in busy_trees
                 or sha in state["results"]
                 or just_started({"started": started.get(sha)}, when)
@@ -2450,6 +2496,10 @@ CONFLICTS_SHOWN = 3
 
 
 def _final_status(r, selection, ran, skipped, where):
+    if r["ok"] and r.get("matched") and r.get("covered"):
+        # designs/0032; the Merger reads "covered by batch".
+        return "success", "green%s: covered by batch %s (tested as %s)" % (
+            where, r["covered"], r["matched"][:10])
     if r["ok"] and r.get("matched"):
         return "success", "green%s: tree tested as %s (%s)" % (
             where, r["matched"][:10], r.get("matched_as", "another head"))
@@ -2676,9 +2726,12 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                    else os.path.basename(lock_path(state_dir, slot)),
                    len(queued - busy)))
     # A head that would only be matched is matched now, slot or none.
-    for sha, pr, same, tree in settled_heads(state, checkout, busy, when,
-                                             run, state_dir):
-        matched(state_dir, sha, pr, same, tree, when, post, out)
+    batch = merger_batch(merger_dir, when, checkout) \
+        if TEST_AHEAD and merger_dir else []
+    for sha, pr, same, tree, covered in settled_heads(
+            state, checkout, busy, when, run, state_dir, batch):
+        matched(state_dir, sha, pr, same, tree, when, post, out,
+                covered=covered)
         queued.discard(sha)
     free = [slot for slot, holder in holders.items()
             if holder is None and slot != LANE]
@@ -2708,6 +2761,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         # for its verdict rather than checking the tree a second time.
         twins = twin_heads(state, fields.values(), checkout, run) \
             if TEST_AHEAD else {}
+        # And one in the Merger's batch waits for its top (designs/0032).
+        twins.update(batch_heads(state, batch, checkout, busy, when, run))
         if fresh:
             held = held_heads(state, head_of_main[0], busy, when, first_pr,
                               cheap)
@@ -2758,7 +2813,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                         or (pick[1] == 0 and (urgent or held or main_due(
                             state["waiting"][pick[0]], when))))):
                     predicted = next_ahead(state, ahead, taken, when,
-                                           busy_trees(taken, checkout, run))
+                                           busy_trees(taken, checkout, run),
+                                           batch)
             if predicted is not None:
                 state.setdefault("ahead_started", {})[predicted[0]] = \
                     iso(when)
@@ -2996,10 +3052,12 @@ def flakes_of(state, sha, record):
 
 
 def matched(state_dir, sha, pr, same, tree, started, post, out=print,
-            main=False):
+            main=False, covered=None):
     """Record and post green for head sha without running it: its tree
     has a green verdict here already, as `same`. Only a green verdict is
-    reused; a red one is always run again."""
+    reused; a red one is always run again. With `covered`, `same` is
+    instead the green top of the Merger's batch `covered` names, which
+    contains this tree (designs/0032)."""
     with state_lock(state_dir):
         state = load(state_dir)
         source = state["results"].get(same, {})
@@ -3021,6 +3079,8 @@ def matched(state_dir, sha, pr, same, tree, started, post, out=print,
             record["selection"] = source["selection"]
         if main:
             record["main"] = True
+        if covered:
+            record["covered"] = covered
         mark_rerun(state, sha, record)
         state["results"][sha] = record
         save(state_dir, state)
@@ -3028,6 +3088,10 @@ def matched(state_dir, sha, pr, same, tree, started, post, out=print,
         log(state_dir, "MAIN-GREEN %s %s: matched; its tree tested green as "
             "%s %s, not run again" % (MAIN, sha[:10], record["matched_as"],
                                       same[:10]), started, out)
+    elif covered:
+        log(state_dir, "COVERED #%d %s: the top of the Merger's batch %s "
+            "tested green as %s; not run" % (pr, sha[:10], covered,
+                                             same[:10]), started, out)
     else:
         log(state_dir, "MATCHED #%d %s: its tree tested green as %s %s; not "
             "run again" % (pr, sha[:10], record["matched_as"], same[:10]),
@@ -4005,8 +4069,34 @@ def twin_heads(state, running, checkout, run=sh):
     return twins
 
 
+def batch_heads(state, batch, checkout, busy=(), when=None, run=sh):
+    """{sha: why} of the waiting heads whose tree is in the Merger's
+    `batch` (designs/0032) while its top is still to be checked: the
+    top's run stands for them, and once it is green they are covered
+    without one. Not once the top has a verdict, or has been given up
+    on: then each is checked as usual."""
+    if not batch or not checkout:
+        return {}
+    top = batch[-1]
+    when = when or now_utc()
+    if tested(state, top["tree"], when) is not None or state.get(
+            "ahead_errors", {}).get(top["sha"], 0) >= MAX_ERRORS:
+        return {}
+    trees = {e["tree"] for e in batch}
+    return {sha: "its tree is in the Merger's batch %s, whose top %s is "
+            "checked for it; waits to be covered by it"
+            % (batch_span(batch), top["sha"][:10])
+            for sha, entry in state["waiting"].items()
+            if not entry.get("main") and sha not in busy
+            and tree_of(checkout, sha, run) in trees}
+
+
+def batch_span(batch):
+    return "#%d..#%d" % (batch[0]["pr"], batch[-1]["pr"])
+
+
 def settled_heads(state, checkout, busy=(), when=None, run=sh,
-                  state_dir=None):
+                  state_dir=None, batch=()):
     """[(sha, pr, same, tree)] of the waiting heads a worker would only
     match, never run: each already contains the default branch's tip,
     so it is checked as itself, and its tree has a green verdict here
@@ -4019,7 +4109,11 @@ def settled_heads(state, checkout, busy=(), when=None, run=sh,
     it. A match costs no run, so the tick makes it at once instead of
     queueing it for a slot: the Merger's head, updated to its
     prediction's tree, otherwise waits behind every run started before
-    it. Not one a slot is running or a tick has just started."""
+    it. Not one a slot is running or a tick has just started. As
+    (sha, pr, same, tree, covered): with the Merger's `batch`
+    (designs/0032), a head whose tree is one of its members' is matched
+    to the top's green, the same way, with `covered` naming the batch;
+    otherwise `covered` is None."""
     if not TEST_AHEAD or not checkout:
         return []
     tip = main_head(checkout, run)
@@ -4034,6 +4128,7 @@ def settled_heads(state, checkout, busy=(), when=None, run=sh,
                    older)
     key = records_key(state_dir, tip) \
         if FRESH_WAIT is not None and state_dir else None
+    members = {e["tree"] for e in batch[:-1]}
     found = []
     for sha, entry in sorted(state["waiting"].items()):
         if entry.get("main") or sha in busy or just_started(entry, when) \
@@ -4046,8 +4141,16 @@ def settled_heads(state, checkout, busy=(), when=None, run=sh,
         if same is None and tree and steps is not None:
             same = tested(state, tree, when, ok=True, accept=covers(
                 {"ran": steps, "base": tip}, older))
+        covered = None
+        if same is None and tree in members:
+            top = batch[-1]["tree"]
+            same = tested(state, top, when, ok=True, accept=every)
+            if same is None and steps is not None:
+                same = tested(state, top, when, ok=True, accept=covers(
+                    {"ran": steps, "base": tip}, older))
+            covered = batch_span(batch) if same is not None else None
         if same is not None and same != sha:
-            found.append((sha, entry["pr"], same, tree))
+            found.append((sha, entry["pr"], same, tree, covered))
     return found
 
 
