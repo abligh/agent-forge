@@ -187,3 +187,59 @@ main`, as today.
 - Stacks across forks, or onto a branch no pull request heads.
 - Merging several layers in one GitHub call. One squash per layer per
   tick keeps each layer's own commit, check and hand-back.
+
+## Amendment (2026-10-25): the Merger restacks a layer itself
+
+* Status: proposed
+
+**What went wrong.** Step 2 above assumed that once a layer is
+retargeted, merging `main` into it is clean, because both sides make
+the same changes. It usually isn't. The layer was approved on an older
+head of the layer below. That layer then gained commits before it
+merged (the Merger's own updates from `main`, and fixes), and `main`
+holds all of them as one squash commit. So `main` and the layer differ
+wherever those later commits touch lines the layer also changed.
+
+In one project, from 2026-10-24 to 2026-10-25, 8 layers were
+retargeted. Six conflicted with `main` at once and went back to their
+authors. Each author then did by hand what the Merger could have done:
+merge the final head of the layer below, then `main`. Several rebased
+instead, which loses the approval ("the approved commit is not in the
+head's history"). Every one then needed a review again. One layer took
+2 hours 35 minutes from its retarget to its merge, and authors began
+avoiding stacks.
+
+**The change.** `stacks.json` already records the head each layer below
+had when it merged, and a clean merge of that head already covers a
+layer's approval (`covers_head`'s `below`). So, in step 2, when
+merging `main` into a retargeted layer isn't clean:
+
+1. **`RESTACK`.** If merging the recorded head of the layer below into
+   the layer is clean (`git merge-tree`), the Merger makes that merge
+   on the layer's branch through GitHub's merges API (`POST
+   .../merges`, with base the layer's branch and head that commit), as
+   its one write for the tick. The approval covers the new head, as
+   for a merge of `main`. It posts the same note as after an `UPDATE`:
+   no review is needed again.
+2. **`UPDATE`**, on a later tick, as before. The layer now holds every
+   commit of the layer below, so its merge with `main` is clean unless
+   `main` has gained a change that conflicts with the layer's own.
+3. If either merge isn't clean, the layer goes back to its author as a
+   conflict, as today. The hand-back says which merge conflicted, so
+   the author does only that one, and says to merge, not rebase.
+
+A layer that is still based on its stack's branch below, because it
+waits to be retargeted, is never restacked: the Merger restacks only
+the layer it is about to update. A restack is tried once per approval
+and head, as `resolve` is (`restacked.json`).
+
+**What a project changes.** Nothing in its configuration: this is part
+of `merge.stacks`. Authors are told that the Merger restacks a layer
+itself after the layer below merges, so they don't merge or rebase the
+layer by hand unless it is handed back.
+
+**Order of work.** One pull request: `RESTACK` in `decide` and
+`carry_out`, the record and the printed line (`STACK #N: merged #Q's
+head <sha> into it`), the hand-back's wording, tests with a stack whose
+lower layer gained a commit after the upper one was approved, and
+docs/config.md's `merge.stacks`.
