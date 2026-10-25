@@ -307,6 +307,27 @@ it, the gate is unchanged, and green is only ever posted for a tree a
 real run turned green. What it costs is build time: a hand-back or a
 push spends the predictions behind it, at most `depth` + 1 runs.
 
+**With `merge.test_ahead.batch` above 1, one run covers several
+merges** (designs/0032; default 1, off). The first `batch` predictions
+are the batch, and the last of them its top: `ahead.json` says so as
+`batch` (`size`, and the batch's `trees`). `forge-pr-check` runs only
+the top, and once the top is green it posts green on each member's
+head as it is updated, `green: covered by batch ...`. The batch goes
+on, tick to tick, while what is left of it still leads the predictions
+unchanged; a push, a hand-back or a new order starts a new one. When
+the build check's state has the top red, the batch is halved, rounding
+up, until its top isn't red or it is one pull request, which is then
+checked as without batches: `BATCH #a..#b: top red, checking #a..#m`.
+A green top says `BATCH #a..#b: top <sha> green, merging N`. Each line
+is said once. A head whose green says it was covered is merged only
+while the last tick's batch still holds: that batch has its tree, its
+top's tree is green in the build check's state, and every pull request
+after it in the batch is still in the queue at the head predicted.
+Otherwise it waits for the new batch's top, so the default branch's
+tip is never a tree no run tested unless a member is handed back
+after others merged. The build check's state is read from its state
+directory, as for `merge.queued_stall_minutes`.
+
 **With `merge.hold_conflicting`, a pull request that conflicts with
 one ahead of it waits for that one instead of going round again**
 (default off). An author with several approved pull requests that
@@ -539,6 +560,14 @@ AHEAD_FILE = "ahead.json"
 AHEAD_REF = "refs/agent-forge-merger/ahead/"
 AHEAD_DATE = "2000-01-01T00:00:00Z"
 AHEAD_IDENTITY = ("forge-merger", "merger@agent-forge.invalid")
+# merge.test_ahead.batch (designs/0032): how many predictions one build
+# check run covers. The first that many are the batch, the last its
+# top: only the top is run, and its green covers the rest.
+AHEAD_BATCH = 1
+# What the build check's status says of a head its batch covered.
+COVERED_TEXT = "covered by batch"
+BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
+                     "waits for the new batch's top")
 # The most ticks one run makes: it ticks again straight after a merge.
 TICKS_PER_RUN = 10
 # The actions that leave a run in progress or about to start on the
@@ -640,7 +669,7 @@ def configure(project):
     global STATUS_CONTEXT, STATUS_CREATOR, BUILD_HOST, GATE, CI_WORKFLOW
     global STALL_AFTER, STALL_ALERT, STALL_TELL, STALL_RETELL
     global STALL_TO_OWNER, STALL_TITLE, STALL_LABELS, WAITING_OWNER
-    global TEST_AHEAD, AHEAD_DEPTH, HOLD_CONFLICTING, YIELD_PLACES
+    global TEST_AHEAD, AHEAD_DEPTH, AHEAD_BATCH, HOLD_CONFLICTING, YIELD_PLACES
     global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
     global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS, URGENT_LABEL
     global STACKS, STACK_MAX_RUN, RESOLVE, HOLD_LABELS, BLOCKED_BY
@@ -676,6 +705,7 @@ def configure(project):
     ahead = merge.get("test_ahead")
     TEST_AHEAD = ahead is not None
     AHEAD_DEPTH = (ahead or {}).get("depth", DEFAULT_AHEAD_DEPTH)
+    AHEAD_BATCH = (ahead or {}).get("batch", 1)
     HOLD_CONFLICTING = merge.get("hold_conflicting", False) is True
     YIELD_PLACES = merge.get("yield_after_hand_back", 0)
     YIELD_CAP = merge.get("yield_cap", 3)
@@ -1894,6 +1924,8 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
                                env, repo, run)
     if problem:
         return dict(back("author", problem), **notes)
+    if AHEAD_BATCH > 1 and COVERED_TEXT in said:
+        notes["covered"] = True
     return dict({"action": "MERGE"}, **notes)
 
 
@@ -2900,6 +2932,83 @@ def locked_order(state_dir, queue):
     return places
 
 
+def tree_verdict(check_state, tree):
+    """The build check's verdict on `tree` from its state: True when a
+    run of it, or a match to one, is green, False when it has only red
+    ones, None when it has none. A batch's cover of a tree is not a run
+    of it, so it doesn't count."""
+    oks = [r.get("ok") is True
+           for r in ((check_state or {}).get("results") or {}).values()
+           if isinstance(r, dict) and r.get("tree") == tree
+           and not r.get("covered")]
+    return any(oks) if oks else None
+
+
+def batch_size(entries, last, verdict):
+    """(size, red): how many of the predictions `entries` are the batch
+    (designs/0032), and the size before any red top split it, or None.
+    The batch `last` (ahead.json's, its `trees`) goes on while what is
+    left of it still leads the predictions: those that merged since are
+    gone from its front, the rest are unchanged. Otherwise a new one is
+    the first AHEAD_BATCH, ending at a tree already red. A red top
+    halves it, rounding up, until the top isn't red or only one is
+    left. `verdict(tree)` is `tree_verdict`'s answer."""
+    trees = [e["tree"] for e in entries]
+    old = (last or {}).get("trees") or []
+    size = 0
+    if old and old[-1] in trees:
+        i = trees.index(old[-1])
+        if i < len(old) and trees[:i + 1] == old[len(old) - i - 1:]:
+            size = i + 1
+    if not size:
+        size = min(AHEAD_BATCH, len(trees))
+        red = [k for k, t in enumerate(trees[:size]) if verdict(t) is False]
+        if red:
+            size = red[0] + 1
+    red = None
+    while size > 1 and verdict(trees[size - 1]) is False:
+        red = red or size
+        size = (size + 1) // 2
+    return size, red
+
+
+def batch_line(entries, size, red, verdict):
+    """The BATCH line for a batch of `size` (designs/0032), or None
+    when there is nothing to say: a red top split it, or its top is
+    green and its members are merging."""
+    if not entries:
+        return None
+    span = lambda n: "#%d..#%d" % (entries[0]["pr"], entries[n - 1]["pr"])
+    if red:
+        return "BATCH %s: top red, checking %s" % (span(red), span(size))
+    if size > 1 and verdict(entries[size - 1]["tree"]) is True:
+        return "BATCH %s: top %s green, merging %d" % (
+            span(size), entries[size - 1]["sha"][:10], size)
+    return None
+
+
+def batch_holds(last, pr, tree, queue, check_state):
+    """Whether the batch that covered pull request `pr`'s head (its
+    tree `tree`) still holds (designs/0032): the last tick's ahead.json
+    (`last`) names a batch with that tree, its top's tree is green, and
+    every pull request in it after this one is still in `queue` at the
+    head it was predicted at. A member is merged only then: otherwise
+    the default branch's tip could become a tree no run tested."""
+    batch = (last or {}).get("batch") or {}
+    entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
+    if len(entries) < 2 or [e.get("tree") for e in entries] \
+            != batch.get("trees"):
+        return False
+    at = [k for k, e in enumerate(entries)
+          if e.get("pr") == pr and e.get("tree") == tree]
+    if not at:
+        return False
+    heads = {p["number"]: p["headRefOid"] for p in queue}
+    return (all(heads.get(e.get("pr")) == e.get("head")
+                for e in entries[at[0] + 1:])
+            and tree_verdict(check_state, entries[-1]["tree"]) is True)
+
+
 def merged_one(record):
     """Whether the tick that wrote `record` merged a pull request."""
     return any(d.get("action") == "MERGE" and d.get("result") == "done"
@@ -3197,6 +3306,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                           run, below if pr["number"] in layers else (),
                           regenerated, when, restacks.get(pr["number"]))
         decision.update(pr=pr["number"], head=pr["headRefOid"])
+        if decision.get("covered") and not batch_holds(
+                load_json(os.path.join(state_dir, AHEAD_FILE), {}),
+                pr["number"], git(repo, "rev-parse", pr["headRefOid"]
+                                  + "^{tree}", run=run).stdout.strip(),
+                queue, check_state):
+            decision = {"action": "WAIT", "pr": pr["number"],
+                        "head": pr["headRefOid"],
+                        "reason": BATCH_WAIT_REASON}
         if (decision["action"] == "UPDATE"
                 and said.get(str(pr["number"])) == hand_back_key(
                     approval, pr["headRefOid"], CONFLICT_REASON)):
@@ -3387,9 +3504,23 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             entries = predict_ahead(repo, main_tip,
                                     acting + rest if acting else [], run)
             record["ahead"] = [e["pr"] for e in entries]
-            save_json(os.path.join(state_dir, AHEAD_FILE),
-                      {"at": record["at"], "base": main_tip, "repo": repo,
-                       "entries": entries})
+            said_ahead = {"at": record["at"], "base": main_tip,
+                          "repo": repo, "entries": entries}
+            if AHEAD_BATCH > 1 and entries:
+                last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+                verdict = lambda tree: tree_verdict(check_state, tree)
+                size, red = batch_size(entries, (last or {}).get("batch"),
+                                       verdict)
+                line = batch_line(entries, size, red, verdict)
+                said_ahead["batch"] = {
+                    "size": size, "trees": [e["tree"]
+                                            for e in entries[:size]]}
+                record["batch"] = [e["pr"] for e in entries[:size]]
+                if line:
+                    said_ahead["batch"]["said"] = line
+                    if line != ((last or {}).get("batch") or {}).get("said"):
+                        out(line)
+            save_json(os.path.join(state_dir, AHEAD_FILE), said_ahead)
     with open(os.path.join(state_dir, name), "a") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
     out("%s %d eligible, %d approved but held; %s" % (
@@ -3498,7 +3629,7 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
         if (RESOLVE or STACKS) and not args.dry_run:
             RESOLVE_IDENTITY = identity(project, ACT_AS)
         check_state = None
-        if QUEUED_STALL_AFTER is not None:
+        if QUEUED_STALL_AFTER is not None or AHEAD_BATCH > 1:
             check_state = load_check_state(
                 os.path.expanduser(args.check_state) if args.check_state
                 else locks.state_dir(project.name, "pr-check", environ))

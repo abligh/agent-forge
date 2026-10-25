@@ -109,7 +109,8 @@ SAID_SINCE = {"author": bool, "approvals": bool, "quiet": list}
 BLOCKED_BY = ("body", "everywhere")
 RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int}
 STACKS = {"max_run": int}
-TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool}
+TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
+              "batch": int}
 STALL_ALERT = {"tell": list, "retell_minutes": int,
                "owner_after_minutes": int, "title": str, "labels": list}
 # checks is shared with tools not here yet, so only these keys are
@@ -1012,6 +1013,13 @@ def _check_test_ahead(ahead, checks, problems):
         problems.append("%s.depth must be at least 0" % where)
     if _is(ahead.get("max_age_hours"), int) and ahead["max_age_hours"] < 1:
         problems.append("%s.max_age_hours must be at least 1" % where)
+    if _is(ahead.get("batch"), int):
+        # designs/0032: one run covers the first `batch` predictions,
+        # so there must be that many.
+        depth = ahead["depth"] if _is(ahead.get("depth"), int) else 3
+        if not 1 <= ahead["batch"] <= depth + 1:
+            problems.append("%s.batch must be at least 1 and at most "
+                            "depth + 1 (%d)" % (where, depth + 1))
     if isinstance(checks, dict) and checks.get("merger_first") is False:
         problems.append("%s puts the Merger's pull request first, so "
                         "checks.merger_first must not be false" % where)
