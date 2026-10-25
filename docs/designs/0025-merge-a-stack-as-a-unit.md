@@ -190,7 +190,7 @@ main`, as today.
 
 ## Amendment (2026-10-25): the Merger restacks a layer itself
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-25, https://github.com/abligh/agent-forge/issues/80#issuecomment-6400818866)
 
 **What went wrong.** Step 2 above assumed that once a layer is
 retargeted, merging `main` into it is clean, because both sides make
