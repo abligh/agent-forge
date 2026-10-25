@@ -565,8 +565,12 @@ approved again`. Off by default.
 Minutes. When no run of `ci_workflow` is listed for a head, the Merger
 looks at the head's check runs: while they show the workflow starting
 it waits; with none, it waits until this long after the head's commit
-and then hands the pull request back, `CI never started; push a new
-head`, rather than reporting a stall. Off by default.
+and then hands the pull request back, saying to close and reopen it
+(which starts CI on the same head, so its approvals still count) or
+push a new head, rather than reporting a stall. GitHub starts no CI on
+a pull request it takes to conflict with the base, and a head it
+judged wrongly keeps none until the pull request gets a new event.
+Off by default.
 
 ### `merge.queued_stall_minutes`
 
