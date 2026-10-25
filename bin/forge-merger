@@ -2953,7 +2953,11 @@ def next_layer(stack, prs, candidates, open_numbers, when, held):
             continue
         if pr.get("baseRefName") != entry["branch"]:
             continue
-        approval, why = eligible(pr, open_numbers, when, any_base=True)
+        # The layer below merged, though GitHub's lists can name it open
+        # for a tick or two after: a `Blocked-by:` it is no reason to
+        # end the stack.
+        approval, why = eligible(pr, open_numbers - {entry["after"]}, when,
+                                 any_base=True)
         if approval is None:
             held[str(pr["number"])] = "%s, which merged, but %s" % (
                 STACK_REASON % entry["after"], why)

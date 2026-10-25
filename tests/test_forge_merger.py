@@ -3886,6 +3886,21 @@ class Stacks(RepoCase):
         return pr(number, "2026-10-07T09:00:00Z", head=sha,
                   reviews=[review(REVIEWER, oid=sha)])
 
+    def test_a_layer_blocked_by_the_merged_layer_below_goes_on(self):
+        # GitHub went on listing #5 as open just after it merged, and a
+        # layer saying `Blocked-by: #5` fell out of the stack for good.
+        self.merge_bottom()
+        layer = self.layer()
+        layer["body"] = "Blocked-by: #5"
+        github = FakeGitHub(dict(answers(prs=[layer]), **{"--paginate": [5]}))
+        self.github = github
+        start = datetime.datetime(2026, 10, 7, 12, 1, 0,
+                                  tzinfo=datetime.timezone.utc)
+        record = m.tick(self.repo.path, self.state, github, tools_run(),
+                        lambda line: None, now=lambda: start, live=True)
+        self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
+                         [(6, "RETARGET")])
+
     def test_the_retargeted_layer_goes_first(self):
         self.merge_bottom()
         older = self.other()
