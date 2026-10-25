@@ -246,7 +246,7 @@ docs/config.md's `merge.stacks`.
 
 ## Amendment (2026-10-25, second): merge `main` against the layer below
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-25, https://github.com/abligh/agent-forge/issues/82#issuecomment-6401018526)
 
 **What the first amendment got wrong.** Its step 2 says that once a
 layer holds every commit of the layer below, merging `main` into it is
