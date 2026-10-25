@@ -100,10 +100,17 @@ who was busy and idle that `forge-stats` reads.
 **What merged.** When the rules' `merged_window` is above 0 (the
 default rules' merge notice, `router.merge_notice`), a run that isn't
 `--only`'s also reads the pull requests merged in the last that many
-minutes, with one GitHub search, and hands them over as `ctx.merged`.
-A dry run reads them too. A search that fails is printed
-(`NO-MERGED: …`) and handed over as None, which the rules read as
-unknown, never as "nothing merged".
+minutes, with one GitHub search, and hands them over as `ctx.merged`,
+with any fields the rules add (`graphql["Merged"]`). A dry run reads
+them too. A search that fails is printed (`NO-MERGED: …`) and handed
+over as None, which the rules read as unknown, never as "nothing
+merged".
+
+**What the last run decided.** A sending run writes every decision it
+made to `previous.json` in the state directory, by item key (an
+`--only` run replaces its items' keys alone); rules whose
+`wants_previous` is true are handed it, as the run began, as
+`ctx.previous`, or None when there is none or it can't be read.
 
 **A pull request that fixes a red nightly is routed first**
 (designs/0028): while forge-nightly's issue saying the nightly is red
@@ -240,12 +247,18 @@ def parse_time(stamp):
 # --- GitHub -----------------------------------------------------------------
 
 
-def prepare(node, typename):
-    """`node` as the rules see it: the `flatten` connections as lists and
-    `__typename` set."""
+def flattened(node):
+    """`node` with the rules' `flatten` connections as lists."""
     for field in RULES.flatten:
         if isinstance(node.get(field), dict):
             node[field] = node[field].get("nodes") or []
+    return node
+
+
+def prepare(node, typename):
+    """`node` as the rules see it: the `flatten` connections as lists and
+    `__typename` set."""
+    flattened(node)
     node["__typename"] = typename
     return node
 
@@ -284,28 +297,33 @@ def fetch(github):
     return prs, issues
 
 
-# The pull requests merged since a time: `fetch_merged`.
+# The pull requests merged since a time: `fetch_merged`, with the
+# fields the rules add (`graphql["Merged"]`).
 MERGED_QUERY = """
 query($q:String!, $cursor:String) {
   search(query:$q, type:ISSUE, first:100, after:$cursor) {
     pageInfo { hasNextPage endCursor }
-    nodes { ... on PullRequest { number title mergedAt author { login } } }
+    nodes { ... on PullRequest { number title mergedAt author { login }
+                                 %(Merged)s } }
   }
 }"""
 
 
 def fetch_merged(github, since):
-    """[{number, title, mergedAt, author}] for every pull request merged
-    at or after `since`, by GitHub's search, every page of it."""
+    """[{number, title, mergedAt, author, and the rules' `Merged`
+    fields}] for every pull request merged at or after `since`, by
+    GitHub's search, every page of it, with the rules' `flatten`
+    connections as lists."""
     q = "repo:%s is:pr is:merged merged:>=%s" % (REPO_SLUG,
                                                   merger.iso(since))
+    query = MERGED_QUERY % {"Merged": RULES.graphql.get("Merged", "")}
     merged, cursor = [], None
     while True:
-        args = ["graphql", "-f", "query=" + MERGED_QUERY, "-f", "q=" + q]
+        args = ["graphql", "-f", "query=" + query, "-f", "q=" + q]
         if cursor:
             args += ["-f", "cursor=" + cursor]
         page = github.api(*args)["data"]["search"]
-        merged += [n for n in page["nodes"]
+        merged += [flattened(n) for n in page["nodes"]
                    if isinstance(n, dict) and n.get("number")]
         if not page["pageInfo"]["hasNextPage"]:
             return merged
@@ -749,7 +767,8 @@ def recheck(github, ctx, wakes):
                 if n["number"] not in numbers or n["number"] in fresh]
     now = router.Context(ctx.roster, ctx.when, renewed(ctx.prs),
                          renewed(ctx.issues), only=ctx.only,
-                         directory=ctx.directory, merged=ctx.merged)
+                         directory=ctx.directory, merged=ctx.merged,
+                         previous=ctx.previous)
     again = {n: list(RULES.recheck(fresh[n], now)) if n in fresh else []
              for n in numbers}
     holding, withdrawn = [], []
@@ -763,6 +782,43 @@ def recheck(github, ctx, wakes):
             withdrawn.append((w, "closed" if d.item not in fresh
                               else "no longer decided"))
     return holding, withdrawn, []
+
+
+# The last sending run's decisions, for rules that want them
+# (`wants_previous`).
+PREVIOUS = "previous.json"
+
+
+def read_previous(state_dir):
+    """`previous.json` as `ctx.previous` hands it over, `{"at", "items"}`,
+    or None when there is none or it can't be read."""
+    value = merger.load_json(os.path.join(state_dir, PREVIOUS), None)
+    if not isinstance(value, dict) or not isinstance(value.get("items"),
+                                                     dict):
+        return None
+    return value
+
+
+def write_previous(state_dir, decisions, only, when):
+    """Record this run's `decisions` in `previous.json`, by item key:
+    each one's agent, rule, event, kind and why it was suppressed, with
+    the run's time. A run `only` some items replaces those items' keys
+    alone, keeping what the file had for the rest."""
+    items = {}
+    for d in decisions:
+        items.setdefault(item_key(d), []).append({
+            "agent": d.agent, "rule": d.rule, "event": d.event,
+            "kind": d.kind, "suppressed": d.suppressed})
+    if only:
+        before = read_previous(state_dir)
+        kept = dict(before["items"]) if before else {}
+        for n in only:
+            kept.pop(str(n), None)
+        kept.update(items)
+        items = kept
+    os.makedirs(state_dir, exist_ok=True)
+    merger.save_json(os.path.join(state_dir, PREVIOUS),
+                     {"at": merger.iso(when), "items": items})
 
 
 PRESENCE_LOG = "presence.jsonl"
@@ -830,10 +886,11 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
                 minutes=RULES.merged_window))
         except (RuntimeError, KeyError, TypeError, ValueError) as err:
             out("NO-MERGED: %s; no merge is announced" % err)
+    previous = read_previous(state_dir) if RULES.wants_previous else None
     ctx = router.Context(roster, when, prs, issues,
                          only=frozenset(only) if only else None,
                          directory=listing, merged=merged,
-                         state_dir=state_dir)
+                         state_dir=state_dir, previous=previous)
     decisions = decide(ctx)
     tally = RULES.summary(ctx)
     if only:
@@ -991,6 +1048,7 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
         os.makedirs(state_dir, exist_ok=True)
         merger.save_json(state_path, state)
         append_records(os.path.join(state_dir, "wakes.jsonl"), log, when)
+        write_previous(state_dir, decisions, only, when)
     else:
         record_dry_run(state_dir, decisions, would, only, when)
     if not stayed:

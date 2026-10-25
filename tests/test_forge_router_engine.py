@@ -1,7 +1,8 @@
 """Tests for bin/forge-router's engine on what the default rules never
 decide: several decisions for one item, decisions about no item, the
-sweep, kinds and sections, actions, reminder policies, recheck and the
-exit status. The rules are tests/router_rules.py, told by each test
+sweep, kinds and sections, actions, reminder policies, recheck, the
+exit status, the merged pull requests' fields and the previous run's
+decisions. The rules are tests/router_rules.py, told by each test
 what to decide; tests/test_forge_router.py tests the default rules.
 """
 
@@ -578,6 +579,147 @@ class ExitStatus(EngineCase):
         self.decide({41: [turn(41, "Ann")]})
         self.refuse = {"TeamAnn": "HTTP 503"}
         self.assertEqual(self.run_router(send=False), 0)
+
+
+def merged_search(*numbers):
+    """One page of the merged search, each pull request labelled."""
+    return {"data": {"search": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [{"number": n, "title": "x", "mergedAt": E1,
+                   "author": {"login": "ann"},
+                   "labels": {"nodes": [{"name": "Owner:Bea"}]}}
+                  for n in numbers]}}}
+
+
+class Merged(EngineCase):
+    """`graphql["Merged"]`: the module's fields on `ctx.merged`."""
+
+    def test_the_fields_are_asked_for_and_flattened(self):
+        self.rules.merged_window = 30
+        self.rules.graphql = dict(self.rules.graphql,
+                                  Merged="labels(first:20){nodes{name}}")
+        self.rules.flatten = ("labels",)
+        self.decide()
+        self.run_router(pages=[merged_search(50)])
+        query = next(a for a in self.github.calls[1]
+                     if a.startswith("query="))
+        self.assertIn("author { login }\n", query)
+        self.assertIn("labels(first:20){nodes{name}}", query)
+        (ctx,) = self.rules.contexts
+        self.assertEqual(ctx.merged[0]["labels"], [{"name": "Owner:Bea"}])
+        self.assertNotIn("__typename", ctx.merged[0])
+
+    def test_without_the_entry_the_search_asks_for_what_it_did(self):
+        self.rules.merged_window = 30
+        self.decide()
+        self.run_router(pages=[merged_search(50)])
+        query = next(a for a in self.github.calls[1]
+                     if a.startswith("query="))
+        self.assertNotIn("labels", query)
+        self.assertIn("number title mergedAt author { login }", query)
+
+
+class Previous(EngineCase):
+    """`previous.json` and `ctx.previous`: the last sending run's
+    decisions."""
+
+    def setUp(self):
+        super().setUp()
+        self.rules.wants_previous = True
+
+    def previous(self):
+        return json.loads(pathlib.Path(self.dir,
+                                       "previous.json").read_text())
+
+    def test_none_before_the_first_run(self):
+        self.decide()
+        self.run_router()
+        self.assertIsNone(self.rules.contexts[0].previous)
+
+    def test_a_sending_run_records_every_decision(self):
+        self.decide({41: [turn(41, "Ann"),
+                          turn(41, "Bea", kind="notice"),
+                          Decision(41, None, 1, None, None, suppressed="no")]},
+                    sweep=[Decision(None, "Ann", "red", E1, "main is red")])
+        self.run_router()
+        want = {"at": "2026-10-09T14:00:00Z", "items": {
+            "41": [{"agent": "Ann", "rule": "t", "event": E1,
+                    "kind": "turn", "suppressed": None},
+                   {"agent": "Bea", "rule": "t", "event": E1,
+                    "kind": "notice", "suppressed": None},
+                   {"agent": None, "rule": 1, "event": None,
+                    "kind": "turn", "suppressed": "no"}],
+            "-red": [{"agent": "Ann", "rule": "red", "event": E1,
+                      "kind": "turn", "suppressed": None}]}}
+        self.assertEqual(self.previous(), want)
+        self.decide()
+        self.run_router(when=later(minutes=1))
+        self.assertEqual(self.rules.contexts[1].previous, want)
+        self.assertEqual(self.previous(), {"at": "2026-10-09T14:01:00Z",
+                                           "items": {}})
+
+    def test_it_is_written_whether_or_not_the_rules_read_it(self):
+        self.rules.wants_previous = False
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router()
+        self.run_router(when=later(minutes=1))
+        self.assertEqual(list(self.previous()["items"]), ["41"])
+        self.assertIsNone(self.rules.contexts[1].previous)
+
+    def test_an_only_run_replaces_only_its_items(self):
+        self.decide({41: [turn(41, "Ann")], 43: [turn(43, "Bea")]},
+                    sweep=[Decision(None, "Ann", "red", E1, "main is red")])
+        self.run_router((41, 43))
+        self.decide({43: [turn(43, "Ann", E2)]})
+        self.run_router((41, 43), only={41, 43}, when=later(minutes=1))
+        got = self.previous()
+        self.assertEqual(sorted(got["items"]), ["-red", "43"])
+        self.assertEqual(got["items"]["43"][0]["event"], E2)
+
+    def test_a_dry_run_writes_nothing(self):
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router(send=False)
+        self.assertFalse(pathlib.Path(self.dir, "previous.json").exists())
+
+    def test_a_run_that_cant_read_the_queue_writes_nothing(self):
+        self.decide({41: [turn(41, "Ann")]})
+        with self.assertRaises(AssertionError):
+            self.run_router(github=GitHub())
+        self.assertFalse(pathlib.Path(self.dir, "previous.json").exists())
+
+    def test_unreadable_is_none(self):
+        os.makedirs(self.dir)
+        for text in ("not json", "[]", '{"at": "x"}', '{"items": []}'):
+            with self.subTest(text=text):
+                pathlib.Path(self.dir, "previous.json").write_text(text)
+                self.rules.contexts.clear()
+                self.decide()
+                self.run_router(send=False)
+                self.assertIsNone(self.rules.contexts[0].previous)
+
+    def test_the_recheck_is_handed_it_too(self):
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router()
+        seen = []
+
+        def recheck(item, ctx):
+            seen.append(ctx.previous)
+            return [turn(41, "Ann", E2)]
+        self.rules.recheck = recheck
+        self.decide({41: [turn(41, "Ann", E2)]})
+        self.run_router(when=later(minutes=1), pages=[{"data": {
+            "repository": {"n41": dict(node(41), __typename="Issue",
+                                       state="OPEN")}}}])
+        self.assertEqual(list(seen[0]["items"]), ["41"])
+
+    def test_a_module_without_it_reads_nothing(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "rules.py"), "w") as handle:
+                handle.write("graphql = {}\nRoster = None\n"
+                             "def configure(p, m): pass\n"
+                             "def decide(i, c): return []\n")
+            self.assertIs(router.load_rules("rules.py", root).wants_previous,
+                          False)
 
 
 if __name__ == "__main__":

@@ -11,9 +11,13 @@ it may give.
 A rules module is a Python module with:
 
     graphql      {"PullRequest": fields, "Issue": fields}: what the one
-                 query asks for besides `number`, which the engine needs
+                 query asks for besides `number`, which the engine needs;
+                 and "Merged": fields the merged search asks for besides
+                 `number title mergedAt author`, for `ctx.merged` (absent:
+                 none)
     flatten      the connections, by field name, that arrive as lists
-                 rather than {"nodes": [...]}
+                 rather than {"nodes": [...]}, in open items and in
+                 `ctx.merged` alike
     lookups      the `Lookup`s the engine runs after the query
     Roster       Roster(project): who is who. The engine asks it only
                  `is_agent(name)`, `session_name(name)` and, when it
@@ -38,6 +42,9 @@ A rules module is a Python module with:
                         in the last that many are read, as
                         `ctx.merged` (absent: 0, none read). Read after
                         `configure`, as `wants_directory` is
+    wants_previous      true when the rules read the previous run's
+                        decisions, `ctx.previous` (absent: false). Read
+                        after `configure`, as `wants_directory` is
 """
 
 import dataclasses
@@ -176,7 +183,12 @@ class Context:
     couldn't be: unknown, never "nothing merged". `state_dir` is the
     engine's state directory, where a module may keep files of its own:
     read them when deciding, and write them only from an `Action`, so
-    only a sending run changes them."""
+    only a sending run changes them. `previous` is the decisions the
+    last sending run made, `{"at": time, "items": {item key:
+    [{"agent", "rule", "event", "kind", "suppressed"}, ...]}}`, read
+    only for rules whose `wants_previous` is true, and None when it
+    wasn't read, there was no run before, or it couldn't be read: a rule
+    reads None as "unknown", never as "nothing was decided"."""
     roster: Any
     when: datetime.datetime
     prs: list
@@ -185,6 +197,7 @@ class Context:
     directory: Any = None
     merged: Any = None
     state_dir: str | None = None
+    previous: Any = None
 
     @property
     def items(self):
@@ -207,6 +220,7 @@ def load_rules(name, root=None):
             raise RulesError("rules %r has no %s" % (name, part))
     defaults = {"flatten": (), "lookups": (), "sweep": lambda ctx: [],
                 "wants_directory": False, "merged_window": 0,
+                "wants_previous": False,
                 "recheck": module.decide, "summary": lambda ctx: ""}
     for part, value in defaults.items():
         if not hasattr(module, part):
