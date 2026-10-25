@@ -420,6 +420,45 @@ class Offer(unittest.TestCase):
         self.assertEqual(rules.sweep(ctx), [])
 
 
+class NotOffered(unittest.TestCase):
+    """An agent whose entry says `"offer": false`."""
+
+    def sweep(self, issues, *entries):
+        data = example()
+        data["router"] = {"idle_offer": {"report_to": "LeadDev"}}
+        data["agents"]["UIDev"]["offer"] = False
+        project = config.Project(data, None)
+        r.configure(project)
+        self.addCleanup(r.configure, config.Project(example(), None))
+        got_prs, got_issues = r.fetch(FakeGitHub(response([], list(issues))))
+        return rules.sweep(router.Context(
+            rules.Roster(project), NOW, got_prs, got_issues,
+            directory=directory(*entries)))
+
+    def test_never_offered_work(self):
+        self.assertEqual(self.sweep([owned(30, owner="UIDev")],
+                                    entry("WidgetUIDev")), [])
+
+    def test_never_reported_idle(self):
+        self.assertEqual(self.sweep([], entry("WidgetUIDev")), [])
+
+    def test_others_are_as_before(self):
+        got = self.sweep([owned(30)], entry("WidgetUIDev"),
+                         entry("WidgetLeadDev"), entry("Helper"))
+        self.assertEqual([(d.agent, d.rule) for d in got],
+                         [("LeadDev", 16), ("LeadDev", 15)])
+
+    def test_the_roster_reads_it(self):
+        data = example()
+        data["agents"]["UIDev"].update(offer=False, areas={"paths": ["ui/"]})
+        roster = rules.Roster(config.Project(data, None))
+        self.assertEqual((roster.offered("UIDev"), roster.offered("LeadDev")),
+                         (False, True))
+        self.assertEqual(roster.areas("UIDev"), {"paths": ["ui/"],
+                                                 "labels": []})
+        self.assertIsNone(roster.areas("LeadDev"))
+
+
 class Report(unittest.TestCase):
 
     def setUp(self):

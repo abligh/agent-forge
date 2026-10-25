@@ -310,7 +310,9 @@ session that works as the agent: hers, then her twins', or her
 stand-in's while she is `away`. A wake goes to each of them, and counts
 as delivered when any one takes it. A stand-in's wake for an agent who
 is away says so on its second line ("For Reviewer, who is away;
-Reviewer2 stands in.").
+Reviewer2 stands in."). The default rules' roster also answers
+`areas(name)` and `offered(name)` from the agent's entry
+(docs/config.md), for a module whose roster is built on it.
 
 `ctx` carries the clock, the roster, every fetched item (so a rule
 can read other items: a blocker's state, a reviewer's load),
@@ -389,4 +391,6 @@ relay already answers `unknown-name`, and that is reported.
    (`graphql["Merged"]`), the previous run's decisions
    (`ctx.previous`), actions once a run (`each_run`), a turn already
    woken (`Decision.woken`), the grace period before a turn is
-   forgotten (`router.forget_minutes`) and `--seed`.
+   forgotten (`router.forget_minutes`), `--seed`, per-agent `areas`
+   and `offer` (`roster.areas`, `roster.offered`), `router.quiet_labels`,
+   and `router.merge_notice`'s `skip_label` and `to`.

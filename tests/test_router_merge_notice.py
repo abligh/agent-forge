@@ -109,8 +109,11 @@ class Configure(unittest.TestCase):
 
     def test_defaults(self):
         configure(self, {})
-        self.assertEqual(rules.MERGE_NOTICE, {"window_minutes": 30})
+        self.assertEqual(rules.MERGE_NOTICE, {"window_minutes": 30,
+                                              "skip_label": None,
+                                              "to": "author"})
         self.assertEqual(rules.merged_window, 30)
+        self.assertNotIn("Merged", rules.graphql)
 
     def test_a_window(self):
         configure(self, {"window_minutes": 90})
@@ -232,6 +235,70 @@ class Notice(unittest.TestCase):
         self.assertEqual([d.rule for d in got], [17])
 
 
+def labelled(number, *labels, **more):
+    """A merged pull request as the search gives it with `labels`."""
+    return dict(merged(number, **more),
+                labels=[{"name": l} for l in labels])
+
+
+class SkipAndTo(unittest.TestCase):
+    """`merge_notice.skip_label` and `merge_notice.to`."""
+
+    def notices(self, notice, *merges):
+        configure(self, notice)
+        return rules.sweep(context(merges=list(merges)))
+
+    def test_config(self):
+        problems = Config.problems
+        self.assertEqual(problems(self, {"to": "owner_label",
+                                         "skip_label": "No-followup"}), [])
+        self.assertEqual(problems(self, {"to": "author"}), [])
+        self.assertEqual(problems(self, {"to": "owner", "skip_label": ""}), [
+            "router.merge_notice.to must be one of author, owner_label",
+            "router.merge_notice.skip_label must not be empty"])
+
+    def test_labels_are_read_only_when_needed(self):
+        for notice, merged_labels in (({}, False),
+                                      ({"to": "author"}, False),
+                                      ({"skip_label": "x"}, True),
+                                      ({"to": "owner_label"}, True)):
+            with self.subTest(notice=notice):
+                configure(self, notice)
+                self.assertEqual("Merged" in rules.graphql, merged_labels)
+        configure(self, None)
+        self.assertNotIn("Merged", rules.graphql)
+
+    def test_the_search_asks_for_them(self):
+        configure(self, {"skip_label": "No-followup"})
+        github = FakeGitHub(search(labelled(50, "No-followup")))
+        (got,) = r.fetch_merged(github, NOW - datetime.timedelta(minutes=30))
+        self.assertEqual(got["labels"], [{"name": "No-followup"}])
+        self.assertTrue(any("labels(first:30)" in a
+                            for a in github.calls[0]))
+
+    def test_a_skipped_merge_tells_nobody(self):
+        got = self.notices({"skip_label": "No-followup"},
+                           labelled(50, "No-followup"), labelled(51, "Other"))
+        self.assertEqual([d.event.split()[0] for d in got], ["#51"])
+
+    def test_to_the_owner_label(self):
+        got = self.notices({"to": "owner_label"},
+                           labelled(50, "Owner:UIDev"), labelled(51))
+        self.assertEqual([(d.agent, d.event.split()[0]) for d in got],
+                         [("UIDev", "#50"), ("LeadDev", "#51")])
+
+    def test_an_owner_who_isnt_an_agent_is_the_engines_to_withhold(self):
+        got = self.notices({"to": "owner_label"},
+                           labelled(50, "Owner:someone"),
+                           labelled(51, author=OWNER))
+        self.assertEqual([(d.agent, d.event.split()[0]) for d in got],
+                         [("someone", "#50")])
+
+    def test_unset_tells_the_author_whatever_the_labels(self):
+        got = self.notices({}, labelled(50, "Owner:UIDev", "No-followup"))
+        self.assertEqual([d.agent for d in got], ["LeadDev"])
+
+
 class FetchMerged(unittest.TestCase):
 
     def setUp(self):
@@ -316,6 +383,15 @@ class Engine(unittest.TestCase):
         self.assertEqual(self.posts, [])
         self.assertTrue(any("merged at 13:50Z" in l for l in self.lines),
                         self.lines)
+
+    def test_a_labelled_owner_who_isnt_an_agent_is_withheld(self):
+        configure(self, {"to": "owner_label"})
+        self.assertEqual(self.run_router(search(labelled(50,
+                                                         "Owner:someone"))),
+                         0)
+        self.assertEqual(self.posts, [])
+        self.assertIn("-17 someone's, rule 17: withheld, someone is not an "
+                      "agent", self.lines)
 
     def test_not_searched_for_rules_that_dont_want_it(self):
         configure(self, None)

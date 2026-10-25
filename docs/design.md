@@ -52,8 +52,9 @@ project starts with the whole pipeline.
 * `repo`, `owner` (the human's login), `default_branch`;
 * `agents`: each agent's App (`app_id`, `installation_id`, `slug` where
   it isn't the default), `kind` (`developer` or `reviewer`),
-  `session_name`, and `areas`: path globs, matched against changed lines
-  to choose a reviewer, and used to offer work to a developer;
+  `session_name`, a reviewer's `reviews`: path globs, matched against
+  changed lines to choose a reviewer, and `areas`, used to offer work
+  to a developer;
 * `machinery`: the Apps acting for scheduled tools (the Merger);
 * `labels`: the owner, waiting and type labels the tools read;
 * `checks`: the required status context, the App that posts it, and the
@@ -116,7 +117,7 @@ delivery) with each project's rules as a module:
 * from one side: turns read from commits, never clocks (a review is at
   the head by SHA); a cooldown keyed on agent and event, so one event
   wakes once whichever rule matches it; reviewers chosen by changed
-  lines in their areas; one process under one lock; a dry-run journal;
+  lines their `reviews` globs match; one process under one lock; a dry-run journal;
 * from the other: a conflicted pull request goes to its owner; required
   checks read from branch protection; `Defer-until:` and `Blocked-by:`;
   a wake when a merge unblocks someone; reminders that back off with

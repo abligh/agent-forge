@@ -14,6 +14,11 @@ the configuration's `owner`.
 **Whose turn it is.** The first rule that matches decides; none means
 nobody's.
 
+With `router.quiet_labels`, an open item with one of those labels is
+nobody's under every rule below, suppressed `quiet: <label>` (the
+first of the list it has): no turn, no reminder, no offer of it (rule
+15) and no notice of it (rule 19). Off without the key.
+
 Pull requests:
 
 With `router.stuck` in the configuration, three rules come first, so
@@ -135,6 +140,9 @@ agents with nothing to do (off without it):
     hers to do is where she is meant to be. Not for `report_to` itself, and not
     without `report_to`.
 
+An agent whose entry says `"offer": false` is never offered work by
+rule 15 nor reported by rule 16.
+
 A directory that couldn't be read, or isn't complete, makes nobody
 idle: unknown is never idle.
 
@@ -149,7 +157,12 @@ With `router.merge_notice`, a run also tells authors of their merges
     what to do next. The event is the pull request and when it merged,
     so each merge is told once and never reminded. Nothing is said
     when the merges couldn't be read: unknown is never "nothing
-    merged".
+    merged". With `merge_notice.skip_label`, a pull request merged with
+    that label tells nobody. With `merge_notice.to: "owner_label"`, the
+    notice goes to the agent its `Owner:<Name>` label names, else, with
+    none, to its author; a name that isn't an agent is withheld (and
+    journalled) by the engine, as every wake is. Either adds `labels`
+    to the merged search.
 
 With `router.owners` (designs/0008), "the item owner" in rules 10, 12,
 14 and 15 is the agent an `Owner:<Name>` label names, else the author
@@ -239,6 +252,8 @@ wants_directory = False
 # `router.merge_notice`, with its defaults filled in, or None: off.
 MERGE_NOTICE = None
 DEFAULT_MERGE_WINDOW = 30
+# `router.quiet_labels`: labels that make an open item nobody's.
+QUIET_LABELS = ()
 # How far back, in minutes, the engine reads merges: 0, none.
 merged_window = 0
 # `router.stuck`: rules 0a, 0b and 0c, each off until set.
@@ -283,6 +298,9 @@ graphql = {
         }""",
 }
 ISSUE_FIELDS = graphql["Issue"]
+# With `merge_notice.skip_label` or `to: "owner_label"`: a merged pull
+# request's labels.
+MERGED_LABELS = "labels(first:30) { nodes { name } }"
 # With `router.owners`: when labels went on and off, for rule 18's event.
 OWNER_LABEL_EVENTS = """
         ownerLabels: timelineItems(last:30,
@@ -301,7 +319,7 @@ def configure(project, merger_tool):
     global OWNER_PREFIX, STATUS_CONTEXT, IDLE_OFFER, wants_directory
     global MERGE_NOTICE, merged_window
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
-    global UNREVIEWED
+    global UNREVIEWED, QUIET_LABELS
     merger = merger_tool
     labels = project.section("labels")
     MERGER = merger.ACT_AS
@@ -320,8 +338,17 @@ def configure(project, merger_tool):
     notice = project.section("router").get("merge_notice")
     MERGE_NOTICE = None if notice is None else {
         "window_minutes": notice.get("window_minutes",
-                                     DEFAULT_MERGE_WINDOW)}
+                                     DEFAULT_MERGE_WINDOW),
+        "skip_label": notice.get("skip_label"),
+        "to": notice.get("to", "author")}
     merged_window = MERGE_NOTICE["window_minutes"] if MERGE_NOTICE else 0
+    if MERGE_NOTICE and (MERGE_NOTICE["skip_label"]
+                         or MERGE_NOTICE["to"] == "owner_label"):
+        graphql["Merged"] = MERGED_LABELS
+    else:
+        graphql.pop("Merged", None)
+    QUIET_LABELS = tuple(project.section("router").get("quiet_labels")
+                         or ())
     stuck = project.section("router").get("stuck") or {}
     RETARGET = stuck.get("retarget") is True
     SELF_BLOCKED = stuck.get("self_blocked") is True
@@ -389,6 +416,17 @@ class Roster:
         """Every agent of kind `reviewer`, in the configuration's order."""
         return self.project.reviewers()
 
+    def areas(self, who):
+        """Her `areas`, {"paths": [globs], "labels": [names]}, or None
+        without them. The default rules don't read them: a module's
+        offer by area does."""
+        return self.project.areas(who)
+
+    def offered(self, who):
+        """Whether she may be offered idle work (rules 15 and 16): not
+        with `"offer": false`."""
+        return self.project.offered(who)
+
     def reviewer_logins(self):
         return {self.slug(n) for n in self.reviewers()}
 
@@ -444,6 +482,12 @@ def author_of(node):
 
 def labels_of(item):
     return [l.get("name") or "" for l in item.get("labels") or []]
+
+
+def quiet(item):
+    """The first of `router.quiet_labels` the item has, or None."""
+    labels = labels_of(item)
+    return next((l for l in QUIET_LABELS if l in labels), None)
 
 
 def owner_of(item):
@@ -561,6 +605,10 @@ def route_pr(pr, roster, when=None):
     `when` is the run's clock, for rule 0c; it defaults to now."""
     n, head = pr["number"], pr.get("headRefOid") or ""
     labels = labels_of(pr)
+    # `router.quiet_labels`, before every rule.
+    hushed = quiet(pr)
+    if hushed:
+        return nobody(n, None, "quiet: " + hushed)
     # Rules 0a, 0b and 0c, before rule 1: a draft can be stuck too.
     stuck = stuck_pr(pr, roster, when or merger.now_utc())
     if stuck:
@@ -791,6 +839,10 @@ def route_issue(issue, roster):
     labels = labels_of(issue)
     comments = issue.get("comments") or []
     owner = issue_owner(issue, roster)
+    # `router.quiet_labels`, before every rule.
+    hushed = quiet(issue)
+    if hushed:
+        return nobody(n, None, "quiet: " + hushed)
     # Rule 9.
     if WAITING_EXTERNAL in labels:
         return nobody(n, 9, WAITING_EXTERNAL)
@@ -1045,7 +1097,7 @@ def owned_issues(agent, ctx):
         until = deferred_until(issue)
         if WAITING_OWNER in labels or WAITING_EXTERNAL in labels \
                 or any(l.startswith(WAITING_PREFIX) for l in labels) \
-                or (until is not None and until > ctx.when):
+                or quiet(issue) or (until is not None and until > ctx.when):
             waiting += 1
         elif blocked(issue):
             held += 1
@@ -1091,7 +1143,8 @@ def idle_offers(ctx):
     report_to = IDLE_OFFER["report_to"]
     decisions = []
     for agent, (stamp, shell) in sorted(idle_sweep(ctx).items()):
-        if not ctx.roster.is_agent(agent) or has_turn(agent, ctx):
+        if not ctx.roster.is_agent(agent) or not ctx.roster.offered(agent) \
+                or has_turn(agent, ctx):
             continue
         actionable, held, waiting = owned_issues(agent, ctx)
         if actionable:
@@ -1146,7 +1199,9 @@ def unblocked_by_merge(number, ctx):
 def merge_notices(ctx):
     """Rule 17: a word to the author of each pull request an agent wrote
     that merged in the window, with what it unblocks and the author's
-    next item. Nothing when the merges are unknown."""
+    next item; or, with `to: "owner_label"`, to the agent its owner
+    label names. None for one labelled `skip_label`. Nothing when the
+    merges are unknown."""
     if not isinstance(ctx.merged, list):
         return []
     cutoff = ctx.when - datetime.timedelta(
@@ -1157,9 +1212,17 @@ def merge_notices(ctx):
         at = parse_stamp(pr.get("mergedAt"))
         if at is None or not cutoff <= at <= ctx.when:
             continue
-        agent = ctx.roster.who(author_of(pr))
-        if not ctx.roster.is_agent(agent):
+        if MERGE_NOTICE.get("skip_label") and \
+                MERGE_NOTICE["skip_label"] in labels_of(pr):
             continue
+        # A labelled owner who isn't an agent is the engine's to
+        # withhold and journal; an author who isn't is passed over.
+        agent = owner_of(pr) \
+            if MERGE_NOTICE.get("to") == "owner_label" else None
+        if agent is None:
+            agent = ctx.roster.who(author_of(pr))
+            if not ctx.roster.is_agent(agent):
+                continue
         title = (pr.get("title") or "").strip()
         text = "#%d%s merged at %s." % (
             pr["number"], ' "%s"' % title if title else "",
@@ -1209,7 +1272,7 @@ def uncovered(ctx):
     globs += UNREVIEWED["ignore"]
     found = {}
     for pr in ctx.prs:
-        if pr.get("isDraft"):
+        if pr.get("isDraft") or quiet(pr):
             continue
         for f in pr.get("files") or []:
             path = f.get("path") or ""
