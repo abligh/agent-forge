@@ -514,7 +514,16 @@ that merge on the layer's branch first (`RESTACK`, `STACK #N: merged
 #Q's head <sha> into it`), through GitHub's merges API, once per
 approval and head (`restacked.json`), and posts that no review is
 needed again; the next tick updates it as usual. If that merge
-conflicts, the hand-back says so, and to merge that head first. So
+conflicts, the hand-back says so, and to merge that head first. A
+layer that holds that head but still conflicts with the default branch,
+because the squash on it has none of the layer below's history, gets
+the default branch merged in against that head instead of the old
+merge base (`STACK-UPDATE`, `STACK #N: merged main into it against #Q's
+head <sha>`), when that is clean and the default branch's first-parent
+history has a commit with exactly that head's tree: committed as the
+Merger and pushed with a lease on the head, once per approval and head
+(`stack-updated.json`). Such a merge covers the layer's approval too,
+since `covers_head` makes it again from its parents. So
 authors don't merge or rebase a layer by hand after the layer below
 merges unless it is handed back. With `max_run`, after N layers
 merged in a row the next one keeps its usual place in the queue. The
