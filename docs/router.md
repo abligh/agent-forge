@@ -149,8 +149,10 @@ writes `previous.json` beside `state.json`: by item key, every decision
 it made (its agent, rule, event, kind and `suppressed`, woken or not),
 with the run's time, `{"at": time, "items": {key: [{"agent", "rule",
 "event", "kind", "suppressed"}, …]}}`. An `--only` run replaces only
-the keys of the items it routed, and keeps the rest. A dry run writes
-nothing. A module whose `wants_previous` is true is handed it, as read
+the keys of the items it routed, and keeps the rest, but sets `at` to
+its own time: so `at` is the last run that wrote the file, not when any
+one item was decided, and an item's entry may be older. A dry run
+writes nothing. A module whose `wants_previous` is true is handed it, as read
 at the start of the run, as `ctx.previous`: so it can say a merged pull
 request was someone's turn when it was last routed, or that a red
 workflow it reported last run is green now.
