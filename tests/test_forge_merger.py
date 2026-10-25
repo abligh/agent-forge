@@ -1008,7 +1008,8 @@ class GitHubApi(unittest.TestCase):
 class Tick(Decide):
 
     def tick(self, prs, issues=(), conclusions=("success",), live=False,
-             refuse=None, minutes=0, send=None, extra=None):
+             refuse=None, minutes=0, send=None, extra=None,
+             check_state=None):
         github = FakeGitHub(dict(answers(conclusions, prs=prs, issues=issues),
                                  **(extra or {})), refuse)
         self.github = github
@@ -1019,7 +1020,7 @@ class Tick(Decide):
         record = m.tick(self.repo.path, state, github, tools_run(),
                         lines.append,
                         now=lambda: start + datetime.timedelta(minutes=minutes),
-                        live=live, send=send)
+                        live=live, send=send, check_state=check_state)
         name = "merger.jsonl" if live else "dry-run.jsonl"
         with open(os.path.join(state, name)) as handle:
             written = [json.loads(l) for l in handle]
@@ -2652,6 +2653,106 @@ class PredictAhead(unittest.TestCase):
                          [".git", "a.txt", "b.txt", "base.txt", "shared.txt"])
 
 
+class Batches(unittest.TestCase):
+    """designs/0032: which predictions are the batch, and what is said
+    of it."""
+
+    def setUp(self):
+        m.configure(project(test_ahead={"batch": 4}))
+        self.addCleanup(m.configure, project())
+
+    def entries(self, *trees):
+        return [{"pr": 10 + k, "sha": "%d" % k * 40, "tree": t,
+                 "head": "h%d" % k} for k, t in enumerate(trees)]
+
+    def size(self, entries, last=None, red=(), green=()):
+        verdict = lambda t: False if t in red else True if t in green \
+            else None
+        return m.batch_size(entries, last, verdict)
+
+    def test_the_configuration(self):
+        self.assertEqual(m.AHEAD_BATCH, 4)
+        m.configure(project(test_ahead={}))
+        self.assertEqual(m.AHEAD_BATCH, 1)
+
+    def test_a_new_batch_is_the_first_few(self):
+        self.assertEqual(self.size(self.entries(*"abcde")), (4, None))
+        self.assertEqual(self.size(self.entries(*"ab")), (2, None))
+        self.assertEqual(self.size([]), (0, None))
+
+    def test_a_new_batch_ends_at_a_tree_already_red(self):
+        # Every prediction after a red one contains it.
+        self.assertEqual(self.size(self.entries(*"abcde"), red="b"),
+                         (1, 2))
+
+    def test_a_red_top_halves_it_down_to_one(self):
+        entries = self.entries(*"abcde")
+        self.assertEqual(self.size(entries, red="d"), (2, 4))
+        self.assertEqual(self.size(entries, red="db"), (1, 2))
+        self.assertEqual(self.size(entries, {"trees": list("abcd")},
+                                   red="db"), (1, 4))
+        self.assertEqual(self.size(entries, {"trees": list("ab")},
+                                   red="d", green="b"), (2, None))
+
+    def test_the_batch_goes_on_as_its_members_merge(self):
+        # #10 merged: what is left of the batch still leads.
+        last = {"trees": list("abcd")}
+        self.assertEqual(self.size(self.entries(*"bcdef"), last), (3, None))
+        self.assertEqual(self.size(self.entries(*"def"), last), (1, None))
+
+    def test_a_changed_member_starts_a_new_batch(self):
+        last = {"trees": list("abcd")}
+        self.assertEqual(self.size(self.entries(*"bxdef"), last), (4, None))
+        self.assertEqual(self.size(self.entries(*"xyz"), last), (3, None))
+
+    def test_the_lines(self):
+        entries = self.entries(*"abcd")
+        verdict = lambda t: t == "d" or None
+        self.assertEqual(m.batch_line(entries, 4, None, verdict),
+                         "BATCH #10..#13: top %s green, merging 4"
+                         % ("3" * 10))
+        self.assertEqual(m.batch_line(entries, 2, 4, verdict),
+                         "BATCH #10..#13: top red, checking #10..#11")
+        self.assertIsNone(m.batch_line(entries, 3, None, verdict))
+        self.assertIsNone(m.batch_line(entries, 1, None, verdict))
+        self.assertIsNone(m.batch_line([], 0, None, verdict))
+
+    def test_a_trees_verdict(self):
+        state = {"results": {
+            "1": {"tree": "a", "ok": False}, "2": {"tree": "a", "ok": True},
+            "3": {"tree": "b", "ok": False},
+            "4": {"tree": "c", "ok": True, "covered": "x"}}}
+        self.assertIs(m.tree_verdict(state, "a"), True)
+        self.assertIs(m.tree_verdict(state, "b"), False)
+        self.assertIsNone(m.tree_verdict(state, "c"))
+        self.assertIsNone(m.tree_verdict(None, "a"))
+
+    def holds(self, prs, tree="a", verdict=True, number=10):
+        entries = self.entries(*"abc")
+        last = {"entries": entries, "batch": {"size": 3,
+                                              "trees": list("abc")}}
+        state = {"results": {"r": {"tree": "c", "ok": verdict}}}
+        return m.batch_holds(last, number, tree, prs, state)
+
+    def queue(self, *heads):
+        return [{"number": 10 + k, "headRefOid": h}
+                for k, h in enumerate(heads)]
+
+    def test_a_member_merges_while_its_batch_holds(self):
+        self.assertTrue(self.holds(self.queue("new", "h1", "h2")))
+        self.assertTrue(self.holds(self.queue("x", "new", "h2")[1:],
+                                   tree="b", number=11))
+
+    def test_not_once_its_batch_breaks(self):
+        self.assertFalse(self.holds(self.queue("new", "h1", "pushed")))
+        self.assertFalse(self.holds(self.queue("new", "h1")))
+        self.assertFalse(self.holds(self.queue("new", "h1", "h2"),
+                                    verdict=False))
+        self.assertFalse(self.holds(self.queue("new", "h1", "h2"),
+                                    tree="other"))
+        self.assertFalse(m.batch_holds({}, 10, "a", [], {}))
+
+
 class TickAhead(RepoCase):
     """A live tick predicts from the pull request it acts on. Tick's
     helpers, without running its tests again."""
@@ -2678,6 +2779,79 @@ class TickAhead(RepoCase):
         self.assertEqual(m.AHEAD_DEPTH, 1)
         m.configure(project())
         self.assertIs(m.TEST_AHEAD, False)
+
+    def covered(self):
+        return {SLUG + "/commits/": [status(
+            description="green: covered by batch #6 (tested as 1234567890)")]}
+
+    def test_a_batch_is_written_with_the_predictions(self):
+        m.configure(project(test_ahead={"batch": 2}))
+        record, lines = self.tick([self.item(), self.other_pr()],
+                                  conclusions=(None,), live=True)
+        ahead = self.ahead_json()
+        self.assertEqual(ahead["batch"], {
+            "size": 2, "trees": [e["tree"] for e in ahead["entries"]]})
+        self.assertEqual(record["batch"], [5, 6])
+        top = ahead["entries"][1]
+        record, lines = self.tick([self.item(), self.other_pr()],
+                                  conclusions=(None,), live=True,
+                                  check_state={"results": {top["sha"]: {
+                                      "tree": top["tree"], "ok": True}}})
+        line = "BATCH #5..#6: top %s green, merging 2" % top["sha"][:10]
+        self.assertIn(line, lines)
+        self.assertEqual(self.ahead_json()["batch"]["said"], line)
+        # Said once.
+        _, lines = self.tick([self.item(), self.other_pr()],
+                             conclusions=(None,), live=True, minutes=1,
+                             check_state={"results": {top["sha"]: {
+                                 "tree": top["tree"], "ok": True}}})
+        self.assertNotIn(line, lines)
+
+    def test_a_red_top_splits_the_batch(self):
+        m.configure(project(test_ahead={"batch": 2}))
+        self.tick([self.item(), self.other_pr()], conclusions=(None,),
+                  live=True)
+        top = self.ahead_json()["entries"][1]
+        record, lines = self.tick(
+            [self.item(), self.other_pr()], conclusions=(None,), live=True,
+            check_state={"results": {top["sha"]: {"tree": top["tree"],
+                                                  "ok": False}}})
+        self.assertIn("BATCH #5..#6: top red, checking #5..#5", lines)
+        self.assertEqual(record["batch"], [5])
+        self.assertEqual(self.ahead_json()["batch"]["size"], 1)
+
+    def test_without_a_batch_nothing_is_said_of_one(self):
+        record, _ = self.tick([self.item(), self.other_pr()],
+                              conclusions=(None,), live=True)
+        self.assertNotIn("batch", self.ahead_json())
+        self.assertNotIn("batch", record)
+
+    def test_a_member_merges_only_while_its_batch_holds(self):
+        m.configure(project(test_ahead={"batch": 2}))
+        six = self.other_pr()
+        self.tick([self.item(), six], conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        green = {"results": {top["sha"]: {"tree": top["tree"], "ok": True}}}
+        record, _ = self.tick([self.item(), six], extra=self.covered(),
+                              check_state=green, minutes=1)
+        self.assertEqual(record["decisions"][0]["action"], "MERGE")
+        self.assertIs(record["decisions"][0]["covered"], True)
+        # #6 has a new head: the batch's run no longer stands for #5.
+        record, _ = self.tick([self.item(), dict(six, headRefOid="0" * 40)],
+                              extra=self.covered(), check_state=green,
+                              minutes=1)
+        self.assertEqual(record["decisions"][0]["action"], "WAIT")
+        self.assertEqual(record["decisions"][0]["reason"],
+                         m.BATCH_WAIT_REASON)
+
+    def test_a_covered_green_without_its_batch_waits(self):
+        m.configure(project(test_ahead={"batch": 2}))
+        record, _ = self.tick([self.item()], extra=self.covered())
+        self.assertEqual(record["decisions"][0]["action"], "WAIT")
+        # Without batches the description means nothing.
+        m.configure(project(test_ahead={}))
+        record, _ = self.tick([self.item()], extra=self.covered())
+        self.assertEqual(record["decisions"][0]["action"], "MERGE")
 
     def test_a_live_tick_predicts_from_the_one_it_acts_on(self):
         record, _ = self.tick([self.item(), self.other_pr()],
