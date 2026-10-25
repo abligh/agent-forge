@@ -1,6 +1,6 @@
 # 0032: Merge in batches
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-25, https://github.com/abligh/agent-forge/issues/87#issuecomment-6402913659)
 * Author: XMPPEngineer
 * Date: 2026-10-25
 
