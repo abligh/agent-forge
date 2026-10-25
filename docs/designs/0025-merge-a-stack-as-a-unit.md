@@ -243,3 +243,57 @@ layer by hand unless it is handed back.
 head <sha> into it`), the hand-back's wording, tests with a stack whose
 lower layer gained a commit after the upper one was approved, and
 docs/config.md's `merge.stacks`.
+
+## Amendment (2026-10-25, second): merge `main` against the layer below
+
+* Status: approved (Alex Bligh, 2026-10-25, https://github.com/abligh/agent-forge/issues/82#issuecomment-6401018526)
+
+**What the first amendment got wrong.** Its step 2 says that once a
+layer holds every commit of the layer below, merging `main` into it is
+clean unless `main` gained a conflicting change. It isn't when the layer
+changes lines the layer below also changed, which is the usual reason
+to stack. `main` holds the layer below as one squash commit, with none
+of its history, so the merge base is still the `main` the stack started
+from. Git then sees the layer below's version of a line on one side and
+the layer's version on the other, and calls it a conflict. A restack
+doesn't change that. Tested with git 2.43: when a layer edits a line the
+layer below added, restacking is clean but merging `main` still
+conflicts.
+
+**The change.** The squash commit's tree is the tree of the layer
+below's final head. The Merger merges `main` in before every merge, so
+that head already held `main`. The right base for merging `main` into
+a restacked layer is therefore that head, not the old `main`:
+
+1. **`RESTACK`**, as in the first amendment.
+2. **`STACK-UPDATE`**, in place of step 2's `UPDATE` for a layer whose
+   plain merge with `main` conflicts. The Merger computes `git
+   merge-tree --write-tree --merge-base=<Q's final head> <main>
+   <layer>`. If that is clean, it commits the result as a merge with
+   parents the layer's head and `main`'s tip, as its own identity, and
+   pushes it to the layer's branch with a lease on the head (as
+   `merge.resolve` does). It posts the same note as an `UPDATE`.
+3. Anything that isn't clean goes back to the author, as before.
+
+It is safe only under two conditions, and the Merger checks both
+every time:
+
+* the layer's head contains Q's final head (it was restacked);
+* a commit on `main`'s first-parent history has exactly Q's final
+  head's tree (the squash).
+
+If either fails, the merge base would let the layer silently undo the
+layer below's later changes, so the Merger doesn't try and hands the
+layer back as a conflict. (Tested: with the base set but no restack, a
+later change of the layer below was dropped without a conflict.)
+
+**Coverage.** `covers_head` also accepts a merge after the approval
+whose tree is exactly that merge, re-computed from its parents and
+`below` with the two checks above. It's as deterministic as a clean
+merge: no person chose any line of it.
+
+**Order of work.** In the same pull request as `RESTACK`: `STACK-UPDATE`
+in `decide` and `carry_out`, `covers_head`, the printed line (`STACK #N:
+merged main into it against #Q's head <sha>`), and a test of exactly
+this case (the layer edits a line the layer below added, and the layer
+below gains a commit after the layer was approved).
