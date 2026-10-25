@@ -1523,7 +1523,8 @@ def never_started(repo, head, github, now, run=sh):
                 "head" % CI_WORKFLOW}
     return {"action": "HAND-BACK", "to": "author", "reason": (
         "%s never started on the head in %d minutes, which no approval "
-        "changes; push a new head" % (
+        "changes; close and reopen it, which starts CI on the same head "
+        "and keeps its approvals, or push a new head" % (
             CI_WORKFLOW, CI_NEVER_STARTED.total_seconds() // 60))}
 
 

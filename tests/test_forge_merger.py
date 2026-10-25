@@ -4071,6 +4071,7 @@ class CiNeverStarted(Decide):
         self.assertEqual((got["action"], got["to"]), ("HAND-BACK", "author"))
         self.assertIn("never started", got["reason"])
         self.assertIn("push a new head", got["reason"])
+        self.assertIn("close and reopen it", got["reason"])
 
     def test_jobs_already_started_wait_however_old(self):
         got = self.decide_at(300, checks=["github-actions"])
