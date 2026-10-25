@@ -106,7 +106,12 @@ is used. A turn kept this way isn't reminded while it is undecided,
 since only decisions are due; decided again with the same event, it
 is the same turn: it isn't woken again, and its reminders count on. So
 an item decided on one run, not on the next and then again with the
-same event is woken once. An `--only` run then forgets nothing.
+same event is woken once. An `--only` run then forgets nothing. The
+same holds for a turn an item has moved on from: when its event
+changes, the old turn is kept beside the new one until its
+`decided_at` ages out, unreminded, and if the event goes back to the
+old value within that time, it is the old turn again and isn't woken.
+A module whose events only move forward never sees this.
 
 **A turn already woken.** A decision whose `woken` says why (`"Woke:
 comment 6390…"`) is one someone woke some other way. When its turn is
