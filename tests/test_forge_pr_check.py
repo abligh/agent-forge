@@ -235,6 +235,21 @@ class NoteHeads(StateCase):
         self.assertEqual(state["waiting"],
                          {SHA_A: {"pr": 7, "since": pc.iso(T0)}})
 
+    def test_a_new_head_gets_a_queued_status_once(self):
+        # Without it a head showed nothing until a slot came free, and
+        # on a busy host it looked as if no check had seen it.
+        posted = []
+        state = self.state()
+        post = lambda *a: posted.append(a)
+        self.note(state, [(7, SHA_A, REPO, False), (8, SHA_B, REPO, True)],
+                  post)
+        self.note(state, [(7, SHA_A, REPO, False)], post,
+                  when=T0 + datetime.timedelta(minutes=5))
+        self.assertEqual(posted, [(SHA_A, "pending", pc.queued_description(
+            state, SHA_A, T0))])
+        self.assertRegex(posted[0][2], r"^queued at \d\d:\d\dZ for a check "
+                         r"slot; 0 other heads waiting$")
+
     def test_skips_a_draft_and_a_head_already_checked(self):
         state = self.state()
         state["results"][SHA_B] = {"pr": 8}
@@ -663,8 +678,10 @@ class Tick(StateCase):
         self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
                   post=lambda *a: posts.append(a) or True)
         self.assertEqual(self.spawned, [(self.state_dir, SHA_A, 7, True, 1)])
-        self.assertEqual(posts, [(SHA_B, "success",
-                                  "green on build.example.org in 3s")])
+        self.assertEqual(posts, [
+            (SHA_A, "pending", "queued at %s for a check slot; 0 other "
+             "heads waiting" % T0.strftime("%H:%MZ")),
+            (SHA_B, "success", "green on build.example.org in 3s")])
         self.assertIs(self.state()["results"][SHA_B]["posted"], True)
 
     def test_starts_nothing_while_a_worker_holds_the_lock(self):
