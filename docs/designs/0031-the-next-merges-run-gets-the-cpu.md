@@ -1,6 +1,6 @@
 # 0031: The next merge's run gets the CPU
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-25, https://github.com/abligh/agent-forge/issues/72#issuecomment-6399698624)
 * Author: XMPPEngineer
 * Date: 2026-10-25
 
