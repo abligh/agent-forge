@@ -214,7 +214,9 @@ class RerunTick(base.StateCase):
         self.assertEqual(self.calls(is_events), [])
         self.assertEqual(self.calls(is_comment), [])
         self.assertEqual(len(self.calls(is_unlabel)), 1)
-        self.assertFalse(any(p[1] == "pending" for p in self.posts))
+        # Only a head new to the queue is posted pending: queued.
+        self.assertFalse(any(p[1] == "pending" and "again" in p[2]
+                             for p in self.posts))
 
     def test_a_green_head_just_loses_the_label(self):
         self.check_nothing_to_run({"results": {SHA_A: green()}})

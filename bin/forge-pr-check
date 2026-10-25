@@ -454,8 +454,10 @@ as the poster's App either way (`checks.poster`, default the Merger),
 minting its token with `forge-app-token`.
 
 **`--post` writes the status** as that App, which needs *Commit
-statuses: write*: `pending` when the steps start, then `success`, or
-`failure` naming the first failed step. A head refused or given up on
+statuses: write*: `pending` when a head is queued (`queued at HH:MMZ
+for a check slot; N other heads waiting`, the count as it was then) and
+again when the steps start, then `success`, or `failure` naming the
+first failed step. A head refused or given up on
 gets `error`, saying why, since the Merger would otherwise wait on it
 for a status that never comes. The Merger counts only statuses that App
 posted. A post GitHub refuses changes neither the verdict nor the exit
@@ -1305,6 +1307,20 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
         entry = state["waiting"][sha]
         if entry["pr"] in replaced and replaced[entry["pr"]] < entry["since"]:
             entry["since"] = replaced[entry["pr"]]
+    # A head waits unseen otherwise: pending is posted only when its
+    # steps start, and a busy host can keep it waiting half an hour.
+    if post is not None:
+        for sha in new:
+            post(sha, "pending", queued_description(state, sha, when))
+
+
+def queued_description(state, sha, when):
+    """What the pending status of a head just queued says: when, and how
+    many other heads were waiting then. Not updated as the queue moves:
+    the time says how old the count is."""
+    others = len(state["waiting"]) - 1
+    return "queued at %s for a check slot; %d other head%s waiting" % (
+        when.strftime("%H:%MZ"), others, "" if others == 1 else "s")
 
 
 def given_up(entry):
