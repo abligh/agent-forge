@@ -531,6 +531,53 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(checks={"cpu_weight": "high"}),
                          ["checks.cpu_weight must be an integer"])
 
+    def test_cpu_share_and_side_by_side(self):
+        # designs/0029.
+        steps = [{"name": "a", "run": ["a"], "light": True},
+                 {"name": "b", "run": ["b"], "after": ["a"],
+                  "caches": {"CARGO_TARGET_DIR": "cargo-wasm"}},
+                 {"name": "c", "run": ["c"], "alone": True, "after": ["b"]},
+                 {"name": "d", "run": ["d"], "alone": True, "after": ["c"]}]
+        self.assertEqual(self.problems(checks={
+            "cpu_share": "step", "side_by_side": {"max_steps": 3},
+            "steps": steps}), [])
+        self.assertEqual(self.problems(checks={
+            "cpu_share": "run", "side_by_side": {}}), [])
+        self.assertEqual(self.problems(checks={
+            "cpu_share": "head", "side_by_side": {"max_steps": 0,
+                                                  "steps": 2}}), [
+            "checks.cpu_share must be one of run, step",
+            "checks.side_by_side: unknown key 'steps'",
+            "checks.side_by_side.max_steps must be at least 1"])
+        self.assertEqual(self.problems(checks={"steps": [
+            {"name": "a", "run": ["a"], "after": "b", "light": 1,
+             "caches": {"X": "a/b"}}]}), [
+            "checks.steps[0].after must be a list",
+            "checks.steps[0].light must be true or false",
+            "checks.steps[0].caches must map variables to directory names"])
+
+    def test_after(self):
+        def steps(*entries):
+            return {"steps": [dict({"run": ["x"]}, **e) for e in entries]}
+        self.assertEqual(self.problems(checks=steps(
+            {"name": "a", "after": ["nobody", "a"]})), [
+            "checks.steps[0].after: 'nobody' is not a step's name",
+            "checks.steps[0].after: a step can't wait for itself"])
+        self.assertEqual(self.problems(checks=steps(
+            {"name": "a", "alone": True},
+            {"name": "b", "after": ["a"]})), [
+            "checks.steps[1].after: 'a' is alone, so it runs after every "
+            "step that isn't; 'b' would wait for ever"])
+        self.assertEqual(self.problems(checks=steps(
+            {"name": "a", "alone": True, "after": ["b"]},
+            {"name": "b", "alone": True})), [
+            "checks.steps[0].after: 'b' is alone and comes later, and "
+            "alone steps run in the configured order"])
+        self.assertEqual(self.problems(checks=steps(
+            {"name": "a", "after": ["c"]}, {"name": "b", "after": ["a"]},
+            {"name": "c", "after": ["b"]})), [
+            "checks.steps: `after` makes a cycle: a -> c -> b -> a"])
+
     def test_fast_lane(self):
         # designs/0006.
         self.assertEqual(self.problems(checks={
