@@ -1933,10 +1933,15 @@ def entry(pr, sha, tree, **more):
                 **more)
 
 
-def write_ahead(merger_dir, entries, when=T0, repo="/repo"):
+def write_ahead(merger_dir, entries, when=T0, repo="/repo", batch=None):
+    said = {"at": pc.iso(when), "base": "0" * 40, "repo": repo,
+            "entries": entries}
+    if batch:
+        # designs/0032: the first `batch` entries are the batch.
+        said["batch"] = {"size": batch,
+                         "trees": [e["tree"] for e in entries[:batch]]}
     with open(os.path.join(merger_dir, "ahead.json"), "w") as handle:
-        json.dump({"at": pc.iso(when), "base": "0" * 40, "repo": repo,
-                   "entries": entries}, handle)
+        json.dump(said, handle)
 
 
 def verdict(pr=4, ok=True, tree=TREE_1, finished=T0, **more):
@@ -1950,6 +1955,80 @@ def verdict(pr=4, ok=True, tree=TREE_1, finished=T0, **more):
 
 def empty():
     return {"waiting": {}, "results": {}, "refused": {}}
+
+
+TREE_3 = "3" * 40
+
+
+class Batch(unittest.TestCase):
+    """designs/0032: the Merger's batch, of which only the top is run."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.entries = [entry(7, SHA_P, TREE_1), entry(8, SHA_Q, TREE_3),
+                        entry(9, SHA_C, TREE_2)]
+
+    def test_the_batch_is_read(self):
+        write_ahead(self.dir, self.entries, batch=2)
+        self.assertEqual(pc.merger_batch(self.dir, T0), self.entries[:2])
+
+    def test_no_batch_of_two_or_more_is_none(self):
+        for size in (None, 1):
+            write_ahead(self.dir, self.entries, batch=size)
+            self.assertEqual(pc.merger_batch(self.dir, T0), [])
+        self.assertEqual(pc.merger_batch(os.path.join(self.dir, "no"), T0),
+                         [])
+
+    def test_a_batch_whose_trees_differ_is_none(self):
+        write_ahead(self.dir, self.entries, batch=2)
+        with open(os.path.join(self.dir, "ahead.json")) as handle:
+            said = json.load(handle)
+        said["batch"]["trees"] = [TREE_1, TREE_2]
+        with open(os.path.join(self.dir, "ahead.json"), "w") as handle:
+            json.dump(said, handle)
+        self.assertEqual(pc.merger_batch(self.dir, T0), [])
+
+    def test_the_top_is_the_front(self):
+        write_ahead(self.dir, self.entries, batch=2)
+        self.assertTrue(pc.is_front(self.dir, T0, SHA_Q, 8, ahead=True))
+        self.assertFalse(pc.is_front(self.dir, T0, SHA_P, 7, ahead=True))
+
+    def test_only_the_top_is_run(self):
+        state = empty()
+        self.assertEqual(pc.next_ahead(state, self.entries, when=T0,
+                                       batch=self.entries[:2]), (SHA_Q, 8))
+        state["results"][SHA_Q] = verdict(pr=8, tree=TREE_3)
+        self.assertIsNone(pc.next_ahead(state, self.entries, when=T0,
+                                        batch=self.entries[:2]))
+
+    def test_a_top_that_is_a_heads_own_tree_is_run_still(self):
+        top = dict(self.entries[1], same_as_head=True)
+        self.assertEqual(pc.next_ahead(empty(), self.entries, when=T0,
+                                       batch=[self.entries[0], top]),
+                         (SHA_Q, 8))
+
+    def test_a_covered_heads_own_tree_is_run(self):
+        # Its check is over, and no run tested its tree.
+        own = [entry(7, SHA_P, TREE_1, same_as_head=True, head=SHA_A)]
+        state = empty()
+        self.assertIsNone(pc.next_ahead(state, own, when=T0))
+        state["results"][SHA_A] = verdict(pr=7, covered="#7..#8",
+                                          matched=SHA_Q)
+        self.assertEqual(pc.next_ahead(state, own, when=T0), (SHA_P, 7))
+
+    def test_a_cover_is_not_a_verdict_on_the_tree(self):
+        state = empty()
+        state["results"][SHA_A] = verdict(covered="#7..#8", matched=SHA_Q)
+        self.assertIsNone(pc.tested(state, TREE_1, T0))
+
+    def test_the_status_says_which_batch(self):
+        record = verdict(pr=7, matched=SHA_Q, covered="#7..#8")
+        state, said = pc.final_status(record)
+        self.assertEqual(state, "success")
+        self.assertIn("covered by batch #7..#8 (tested as %s)" % SHA_Q[:10],
+                      said)
 
 
 class MergerAhead(unittest.TestCase):
@@ -2406,6 +2485,48 @@ class SettledHeads(StateCase):
         self.assertEqual(self.spawned, [])
         self.assertTrue(any("MATCHED #7 %s" % SHA_A[:10] in line
                             for line in self.lines))
+
+    def batched(self, results):
+        """A tick with #7's head on the tree of the first member of the
+        Merger's batch #7..#8, whose top is SHA_Q."""
+        self.write_state({"waiting": {SHA_A: {"pr": 7, "since": pc.iso(
+            T0 - datetime.timedelta(minutes=5))}}, "results": results})
+        merger = self.merger_says(7)
+        write_ahead(merger, [entry(7, SHA_P, TREE_1),
+                             entry(8, SHA_Q, TREE_3)],
+                    when=T0 - datetime.timedelta(minutes=1), batch=2)
+        self.spawned, posted = [], []
+        pc.tick(self.state_dir, "tok", self.run_with(), lambda *a:
+                self.spawned.append(a), self.lines.append, when=T0,
+                post=lambda *a: posted.append(a) or True, slots=1,
+                checkout="/repo", merger_dir=merger)
+        return posted
+
+    def test_a_member_is_covered_by_its_batchs_green_top(self):
+        posted = self.batched({SHA_Q: verdict(pr=8, tree=TREE_3,
+                                              ahead=True)})
+        record = self.state()["results"][SHA_A]
+        self.assertEqual((record["matched"], record["covered"]),
+                         (SHA_Q, "#7..#8"))
+        self.assertEqual(posted[0][:2], (SHA_A, "success"))
+        self.assertIn("covered by batch #7..#8 (tested as %s)"
+                      % SHA_Q[:10], posted[0][2])
+        self.assertTrue(any("COVERED #7 %s" % SHA_A[:10] in line
+                            for line in self.lines))
+
+    def test_a_member_waits_while_its_top_is_run(self):
+        posted = self.batched({})
+        self.assertEqual(posted, [])
+        self.assertIn(SHA_A, self.state()["waiting"])
+        # The slot goes to the top, not to the member.
+        self.assertEqual([a[1] for a in self.spawned], [SHA_Q])
+        self.assertTrue(any("HELD #7" in line and "batch #7..#8" in line
+                            for line in self.lines))
+
+    def test_a_red_top_leaves_the_member_to_its_own_run(self):
+        self.batched({SHA_Q: verdict(pr=8, tree=TREE_3, ok=False,
+                                     ahead=True)})
+        self.assertEqual([a[1] for a in self.spawned], [SHA_A])
 
     def test_a_head_without_the_tip_is_left_to_a_worker(self):
         # It would be checked merged with the tip: another tree.

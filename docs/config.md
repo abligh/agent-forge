@@ -358,6 +358,7 @@ turns it on with the defaults.
 | `depth` | `3` | How many pull requests behind the one the Merger acts on are predicted, so `depth` + 1 commits in all. Deeper keeps more slots busy, but tests further into a queue that new approvals reorder. |
 | `max_age_hours` | `24` | How long a green verdict counts for another commit with the same tree, on the same host with the same steps. The steps' digest can't see a toolchain upgrade on the host. |
 | `spare_slots_only` | `false` | Whether a prediction runs only when no ordinary head is waiting, in a slot that would otherwise stay idle. Without it, predictions go before every head but the Merger's own, one that has waited `checks.max_wait_minutes`, and the default branch's once it has waited `checks.depends_minutes`. For a host whose slots are mostly full and whose queue reorders often, where most predictions go unused. designs/0014. |
+| `batch` | `1` | How many predictions one run covers ([designs/0032](designs/0032-merge-in-batches.md)). With more than 1, only the batch's top, the last of the first `batch` predictions, is run; once it is green, each member's head is posted green as GitHub's update gives it the member's tree, and the Merger merges them one a tick with no run between. A red top halves the batch until the culprit is found. 3 or 4 suits a queue that grows by a few an hour; at most `depth` + 1. |
 
 How it works, and why it is safe:
 
@@ -395,6 +396,16 @@ How it works, and why it is safe:
   tree. Run such a check in `merge.gate`, on the real head, or leave
   `test_ahead` off. Without branch protection that requires heads to
   be up to date, the queue isn't serial and there is no wait to remove.
+* **Batches.** With `batch` above 1, the default branch's tip is still
+  always a tree a run turned green once a whole batch has merged, but
+  the commits between are not run on their own: if a later member
+  fixes what an earlier one broke, the default branch is broken for
+  the minute or two between those merges. A member's head is posted
+  `success` as `green on <host>: covered by batch #a..#b (tested as
+  <sha>)`, and the Merger merges it only while that batch still holds
+  (its later members unchanged and still queued); otherwise it waits
+  for the new batch's top. The default branch's own check is the
+  backstop if a batch stops halfway.
 * **The queue doesn't churn.** With `test_ahead`, a pull request the
   Merger last updated or waited on keeps its place: a blocker isn't
   promoted past it, since that would spend the run it is having and

@@ -2848,6 +2848,12 @@ class TickAhead(RepoCase):
         m.configure(project(test_ahead={"batch": 2}))
         record, _ = self.tick([self.item()], extra=self.covered())
         self.assertEqual(record["decisions"][0]["action"], "WAIT")
+        # A run of its own tree, since, lets it go.
+        tree = run_git(self.repo.path, "rev-parse", self.head + "^{tree}")
+        record, _ = self.tick([self.item()], extra=self.covered(),
+                              check_state={"results": {"x": {
+                                  "tree": tree, "ok": True}}})
+        self.assertEqual(record["decisions"][0]["action"], "MERGE")
         # Without batches the description means nothing.
         m.configure(project(test_ahead={}))
         record, _ = self.tick([self.item()], extra=self.covered())
