@@ -507,7 +507,16 @@ run is in flight for. It is then updated, checked and merged like any
 other. A layer that isn't eligible ends the stack, and is held as
 usual. A merge of the layer below's branch into a layer, made after
 its approval, covers its head when it is a clean merge and that
-branch's head has merged in this stack. With `max_run`, after N layers
+branch's head has merged in this stack. When the default branch
+conflicts with a retargeted layer that lacks the final head of the
+layer below, and merging that head into it is clean, the Merger makes
+that merge on the layer's branch first (`RESTACK`, `STACK #N: merged
+#Q's head <sha> into it`), through GitHub's merges API, once per
+approval and head (`restacked.json`), and posts that no review is
+needed again; the next tick updates it as usual. If that merge
+conflicts, the hand-back says so, and to merge that head first. So
+authors don't merge or rebase a layer by hand after the layer below
+merges unless it is handed back. With `max_run`, after N layers
 merged in a row the next one keeps its usual place in the queue. The
 tick's record says which stack is in progress under `stack`. Off by
 default.

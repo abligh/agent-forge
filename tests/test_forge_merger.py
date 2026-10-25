@@ -2748,7 +2748,7 @@ class TickAhead(RepoCase):
 
     def test_one_with_a_run_in_flight_keeps_its_place(self):
         # #5 is older, so it would go first; #6 is mid-run.
-        self.assertEqual(m.IN_FLIGHT, ("UPDATE", "RESOLVE", "WAIT"))
+        self.assertEqual(m.IN_FLIGHT, ("UPDATE", "RESOLVE", "RESTACK", "WAIT"))
         for action in m.IN_FLIGHT:
             with self.subTest(action=action):
                 self.assertEqual(self.keeps_place(action), 6)
@@ -3775,8 +3775,8 @@ class Stacks(RepoCase):
         return pr(5, head=self.lower,
                   reviews=[review(REVIEWER, oid=self.lower)])
 
-    def layer(self, base="b5", reviews=None):
-        return pr(6, T1, base=base, head=self.upper, reviews=[
+    def layer(self, base="b5", reviews=None, head=None):
+        return pr(6, T1, base=base, head=head or self.upper, reviews=[
             review(REVIEWER, oid=self.upper)] if reviews is None else reviews)
 
     def tick(self, prs, live=True, minutes=0):
@@ -3796,7 +3796,8 @@ class Stacks(RepoCase):
     def squash_bottom_onto_main(self):
         """What GitHub's squash merge of #5 leaves on main."""
         self.repo.branch("main", "main")
-        self.repo.commit("f.txt", "feature\n", "#5, squashed")
+        run_git(self.repo.path, "merge", "-q", "--squash", "feature")
+        run_git(self.repo.path, "commit", "-q", "-m", "#5, squashed")
         self.repo.push("main")
         self.repo.branch("feature", "feature")
 
@@ -3823,7 +3824,8 @@ class Stacks(RepoCase):
         self.assertEqual(record["stack"], [{"pr": 6, "after": 5}])
         self.assertEqual(self.stack_file(), {
             "at": "2026-10-07T12:00:00Z", "heads": [self.lower], "run": 1,
-            "pending": [{"pr": 6, "after": 5, "branch": "b5"}]})
+            "pending": [{"pr": 6, "after": 5, "branch": "b5",
+                         "head": self.lower}]})
         self.assertTrue(m.moved_a_stack(record))
 
     def test_the_next_tick_retargets_the_layer(self):
@@ -3904,6 +3906,99 @@ class Stacks(RepoCase):
     def test_a_dry_run_merge_records_nothing(self):
         self.tick([self.bottom(), self.layer()], live=False)
         self.assertIsNone(self.stack_file())
+
+    # The amendment's case: #6 was approved on an older head of #5, #5
+    # gained a commit before it merged, and main holds #5 as one squash.
+    LINES = ["1", "X", "3", "4", "5", "6", "7", "8", "9"]
+
+    def lines(self, **at):
+        return "".join(at.get("l%d" % n, line) + "\n"
+                       for n, line in enumerate(self.LINES, 1))
+
+    def lower_moves_on(self, upper, later):
+        """main has l.txt; #5 changes it, #6 (on it) makes it `upper`,
+        then #5 makes it `later`; both published, and #5 merged and
+        squashed. (Were l.txt new in #5, main and #6 would add it
+        differently, and only a merge against #5's head would help.)"""
+        self.repo.branch("main", "main")
+        self.repo.commit("l.txt", self.lines(l2="2"), "main l.txt")
+        self.repo.push("main")
+        self.repo.branch("feature", "feature")
+        self.repo.merge("origin/main")
+        first = self.repo.commit("l.txt", self.lines(), "lower l.txt")
+        self.repo.branch("upper", first)
+        self.upper = self.repo.commit("l.txt", upper, "upper l.txt")
+        self.repo.publish_pr(6, self.upper)
+        self.repo.branch("feature", "feature")
+        self.lower = self.repo.commit("l.txt", later, "lower again")
+        self.repo.publish_pr(5, self.lower)
+        self.merge_bottom()
+        record, _ = self.tick([self.layer()], minutes=1)
+        self.assertEqual(record["decisions"][0]["action"], "RETARGET")
+
+    def test_a_layer_main_conflicts_with_is_restacked(self):
+        # #5's later line 3 is next to its own line 2, which #6 also
+        # holds at its older version: main conflicts, the restack doesn't.
+        self.lower_moves_on(self.lines(l8="U"), self.lines(l3="Y"))
+        record, lines = self.tick([self.layer("main")], minutes=2)
+        self.assertEqual(record["decisions"], [{
+            "action": "RESTACK", "pr": 6, "head": self.upper, "after": 5,
+            "below": self.lower, "branch": "b6", "result": "done"}])
+        self.assertEqual(self.github.writes[0], (
+            "POST", SLUG + "/merges", {
+                "base": "b6", "head": self.lower,
+                "commit_message": "Merge #5's final head %s into b6"
+                                  % self.lower[:10]}))
+        note = self.github.writes[1][2]["body"]
+        self.assertIn("Merged #5's final head %s into this" % self.lower[:10],
+                      note)
+        self.assertIn("no review is needed again", note)
+        self.assertIn("STACK #6: merged #5's head %s into it"
+                      % self.lower[:12], lines)
+        # What GitHub's merge makes: covered by the approval, and main
+        # now merges into it cleanly.
+        self.repo.branch("upper", "upper")
+        head = self.repo.merge("feature")
+        self.repo.publish_pr(6, head)
+        record, _ = self.tick([self.layer("main", head=head)], minutes=3)
+        self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
+                         [(6, "UPDATE")])
+
+    def test_a_restack_is_tried_once_per_head(self):
+        self.lower_moves_on(self.lines(l8="U"), self.lines(l3="Y"))
+        self.tick([self.layer("main")], minutes=2)
+        record, _ = self.tick([self.layer("main")], minutes=3)
+        self.assertEqual([(d["action"], d.get("result"))
+                          for d in record["decisions"]], [
+            ("RESTACK", "failed: already tried at this head"),
+            ("HAND-BACK", "done")])
+        self.assertEqual(record["decisions"][1]["reason"], (
+            "%s, and the Merger could not merge #5's final head %s into it"
+            % (m.CONFLICT_REASON, self.lower[:10])))
+        self.assertNotIn("/merges", self.github.writes[0][1])
+
+    def test_a_restack_that_conflicts_goes_to_the_author(self):
+        # #5 later changes the line #6 changed: a real conflict.
+        self.lower_moves_on(self.lines(l8="U"), self.lines(l8="V"))
+        record, _ = self.tick([self.layer("main")], minutes=2)
+        self.assertEqual([(d["action"], d.get("to"), d.get("result"))
+                          for d in record["decisions"]],
+                         [("HAND-BACK", "author", "done")])
+        self.assertEqual(record["decisions"][0]["reason"],
+                         m.RESTACK_REASON % (m.CONFLICT_REASON, 5,
+                                             self.lower[:10]))
+        body = self.github.writes[0][2]["body"]
+        self.assertIn("Merge #5's final head, %s, into the branch first, "
+                      "then `main`." % self.lower[:10], body)
+        self.assertNotIn("/merges", "".join(w[1] for w in self.github.writes))
+
+    def test_a_dry_run_says_it_would_restack(self):
+        self.lower_moves_on(self.lines(l8="U"), self.lines(l3="Y"))
+        record, lines = self.tick([self.layer("main")], live=False,
+                                  minutes=2)
+        self.assertEqual(record["decisions"][0]["action"], "RESTACK")
+        self.assertIn("STACK #6: would have merged #5's head %s into it"
+                      % self.lower[:12], lines)
 
 
 # designs/0026: settings for a project with stricter holds.

@@ -419,6 +419,18 @@ SIGNATURE = "— Merger"
 UPDATE_NOTE = ("Merged `%s` into this, cleanly, on top of %s. The approval "
                "of that head still covers the new one, so no review is "
                "needed again: the Merger checks it and merges it.\n\n%s")
+# What it says once it has merged the final head of the merged layer
+# below into a stack's layer (designs/0025, RESTACK).
+RESTACK_NOTE = ("Merged #%d's final head %s into this, cleanly, on top of %s, "
+                "since #%d merged. The approval of that head still covers "
+                "the new one, so no review is needed again: the Merger "
+                "merges `%s` in next, then checks it and merges it.\n\n%s")
+# The reason a layer goes back when the restack itself conflicts: the
+# author merges that head first, then `main`.
+RESTACK_REASON = ("%s, and merging #%d's final head %s into it conflicts "
+                  "too")
+RESTACK_DETAIL = ("Merge #%d's final head, %s, into the branch first, then "
+                  "`%s`.")
 # The required check: the commit status the build check posts, counted
 # only when the poster's App created it (REST's login, with its "[bot]"
 # suffix). Any other account with write access could post a status by
@@ -524,7 +536,7 @@ AHEAD_IDENTITY = ("forge-merger", "merger@agent-forge.invalid")
 TICKS_PER_RUN = 10
 # The actions that leave a run in progress or about to start on the
 # pull request: with test_ahead, it keeps its place in the queue.
-IN_FLIGHT = ("UPDATE", "RESOLVE", "WAIT")
+IN_FLIGHT = ("UPDATE", "RESOLVE", "RESTACK", "WAIT")
 # merge.hold_conflicting: hold one that conflicts with one ahead of it.
 HOLD_CONFLICTING = False
 HOLD_REASON = "conflicts with #%d, ahead of it in the queue"
@@ -556,6 +568,7 @@ STACK_MAX_RUN = 0
 STACK_FILE = "stacks.json"
 STACK_FOR = datetime.timedelta(hours=24)
 STACK_REASON = "stacked on #%d"
+RESTACKED_FILE = "restacked.json"
 ROW_AFTER = 2
 ROW_FOR = datetime.timedelta(minutes=60)
 ROW_REASON = "conflicts with #%d, which has right of way"
@@ -1706,11 +1719,14 @@ def fetch_open_issues(github):
 
 
 def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
-           regenerated=None, now=None):
+           regenerated=None, now=None, restack=None):
     """The action for one eligible pull request, as a dictionary with
     `action`, and `to` and `reason` for a hand-back. Reads, never
     writes. `below` and `regenerated` are passed to `covers_head`;
-    `now` is the tick's clock."""
+    `now` is the tick's clock. `restack`, for a stack's layer, is (the
+    number of the layer below, which merged, and its final head): when
+    `main` conflicts with the layer and the layer lacks that head, a
+    clean merge of it is RESTACK (designs/0025)."""
     number, head = pr["number"], pr["headRefOid"]
     approver = APPROVERS.get(login(approval), "a reviewer")
 
@@ -1743,6 +1759,18 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
         merged = git(repo, "merge-tree", "--write-tree", "--name-only",
                      "--no-messages", main_tip, head, run=run)
         if merged.returncode == 1:
+            if restack is not None and not is_ancestor(repo, restack[1],
+                                                       head, run):
+                after, lower = restack
+                again = git(repo, "merge-tree", "--write-tree", "--name-only",
+                            "--no-messages", head, lower, run=run)
+                if again.returncode == 0:
+                    return {"action": "RESTACK", "after": after,
+                            "below": lower, "branch": pr["headRefName"]}
+                if again.returncode == 1:
+                    return dict(back("author", RESTACK_REASON % (
+                        CONFLICT_REASON, after, lower[:10])),
+                        detail=RESTACK_DETAIL % (after, lower[:10], MAIN))
             rule = resolve_rule(conflicted_paths(merged.stdout))
             if RESOLVE and rule is not None:
                 return {"action": "RESOLVE", "rule": rule}
@@ -1902,6 +1930,19 @@ def carry_out(decision, approval, github, said):
             github.write("POST", "repos/%s/issues/%d/comments"
                          % (REPO_SLUG, number), body=UPDATE_NOTE % (
                              MAIN, head[:10], SIGNATURE))
+    elif decision["action"] == "RESTACK":
+        # GitHub's merges API takes no lease on the head: a push between
+        # reading it and this write is merged with, and judged afresh.
+        lower = decision["below"]
+        ok, why = github.write(
+            "POST", "repos/%s/merges" % REPO_SLUG, base=decision["branch"],
+            head=lower, commit_message="Merge #%d's final head %s into %s" % (
+                decision["after"], lower[:10], decision["branch"]))
+        if ok:
+            github.write("POST", "repos/%s/issues/%d/comments"
+                         % (REPO_SLUG, number), body=RESTACK_NOTE % (
+                             decision["after"], lower[:10], head[:10],
+                             decision["after"], MAIN, SIGNATURE))
     elif decision["action"] == "MERGE":
         ok, why = github.write("PUT", path + "/merge", sha=head,
                                merge_method="squash")
@@ -2859,7 +2900,8 @@ def note_merge(state_dir, stack, pr, prs, when):
                     and not p.get("isDraft")),
                    key=lambda p: (p["createdAt"], p["number"]))
     pending += [{"pr": p["number"], "after": pr["number"],
-                 "branch": pr["headRefName"]} for p in above]
+                 "branch": pr["headRefName"], "head": pr["headRefOid"]}
+                for p in above]
     heads = list(stack.get("heads", ()))
     if was_layer or above:
         heads.append(pr["headRefOid"])
@@ -2876,7 +2918,24 @@ def resolve_once(state_dir, repo, decision, approval, branch, main_tip,
     push that worked moves the head, so a second try at the same head
     means the first failed, and it would fail again. A repeat answers
     with the first try's failure, so its hand-back is said once."""
-    path = os.path.join(state_dir, RESOLVED_FILE)
+    return once(os.path.join(state_dir, RESOLVED_FILE), decision, approval,
+                lambda: resolve(repo, decision, branch, main_tip, github, run))
+
+
+def restack_once(state_dir, decision, approval, github, said):
+    """RESTACK, at most once per approval and head (RESTACKED_FILE), as
+    `resolve_once`: "done", or "failed: why"."""
+    def attempt():
+        result = carry_out(decision, approval, github, said)
+        return result if result == "done" else "failed: " + result
+    return once(os.path.join(state_dir, RESTACKED_FILE), decision, approval,
+                attempt)
+
+
+def once(path, decision, approval, attempt):
+    """`attempt()` unless the file at `path` says it was tried for this
+    approval and head; then the first try's failure, or "failed: already
+    tried at this head"."""
     tried = load_json(path, {})
     key = {"approved": approval.get("submittedAt"), "head": decision["head"]}
     before = tried.get(str(decision["pr"])) or {}
@@ -2886,7 +2945,7 @@ def resolve_once(state_dir, repo, decision, approval, branch, main_tip,
                 else "failed: already tried at this head")
     tried[str(decision["pr"])] = key
     save_json(path, tried)
-    result = resolve(repo, decision, branch, main_tip, github, run)
+    result = attempt()
     tried[str(decision["pr"])] = dict(key, result=result)
     save_json(path, tried)
     return result
@@ -3032,11 +3091,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         stopped = 0
     below = tuple(stack.get("heads", ())) if stack else ()
     layers = {e["pr"] for e in stack.get("pending", ())} if stack else set()
+    restacks = {e["pr"]: (e["after"], e["head"])
+                for e in (stack or {}).get("pending", ()) if e.get("head")}
     for at, pr in enumerate([] if retarget is not None else queue):
         approval = approvals[pr["number"]]
         decision = decide(pr, approval, repo, main_tip, github, github.env,
                           run, below if pr["number"] in layers else (),
-                          regenerated, when)
+                          regenerated, when, restacks.get(pr["number"]))
         decision.update(pr=pr["number"], head=pr["headRefOid"])
         if (decision["action"] == "UPDATE"
                 and said.get(str(pr["number"])) == hand_back_key(
@@ -3055,7 +3116,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 pr, approval, github, said, live, LOST_HEAD_REASON))
             continue
         before = said.get(str(pr["number"])) or {}
-        if (UPDATE_ONCE and decision["action"] in ("UPDATE", "RESOLVE")
+        if (UPDATE_ONCE
+                and decision["action"] in ("UPDATE", "RESOLVE", "RESTACK")
                 and before.get("approved")
                 and before["approved"] == approval.get("submittedAt")):
             # Handed back under this approval: not updated again. An
@@ -3093,11 +3155,28 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             decision["result"] = resolve_once(
                 state_dir, repo, decision, approval, pr["headRefName"],
                 main_tip, github, run)
+        elif live and decision["action"] == "RESTACK":
+            decision["result"] = restack_once(state_dir, decision, approval,
+                                              github, said)
         elif live:
             result = carry_out(decision, approval, github, said)
             if result is not None:
                 decision["result"] = result
         record["decisions"].append(decision)
+        if decision["action"] == "RESTACK":
+            if decision.get("result", "done") == "done":
+                out("STACK #%d: %smerged #%d's head %s into it" % (
+                    pr["number"], "" if live else "would have ",
+                    decision["after"], short(decision["below"])))
+            else:
+                record["decisions"].append(conflict_hand_back(
+                    pr, approval, github, said, live,
+                    "%s, and the Merger could not merge #%d's final head "
+                    "%s into it" % (CONFLICT_REASON, decision["after"],
+                                    decision["below"][:10]),
+                    RESTACK_DETAIL % (decision["after"],
+                                      decision["below"][:10], MAIN)))
+                continue
         if (decision["action"] == "RESOLVE"
                 and decision.get("result", "").startswith("failed")):
             # Resolving it didn't work, so it is an ordinary conflict
