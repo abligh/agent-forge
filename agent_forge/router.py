@@ -11,9 +11,13 @@ it may give.
 A rules module is a Python module with:
 
     graphql      {"PullRequest": fields, "Issue": fields}: what the one
-                 query asks for besides `number`, which the engine needs
+                 query asks for besides `number`, which the engine needs;
+                 and "Merged": fields the merged search asks for besides
+                 `number title mergedAt author`, for `ctx.merged` (absent:
+                 none)
     flatten      the connections, by field name, that arrive as lists
-                 rather than {"nodes": [...]}
+                 rather than {"nodes": [...]}, in open items and in
+                 `ctx.merged` alike
     lookups      the `Lookup`s the engine runs after the query
     Roster       Roster(project): who is who. The engine asks it only
                  `is_agent(name)`, `session_name(name)` and, when it
@@ -31,6 +35,8 @@ A rules module is a Python module with:
     recheck(item, ctx)  decide again just before delivery (absent: decide)
     summary(ctx)        a phrase for the run's last line, or "" (may be
                         absent)
+    each_run(ctx)       [Action] done once a sending run that isn't
+                        `--only`'s, after delivery (may be absent)
     wants_directory     true when the rules read the relay's directory,
                         `ctx.directory` (absent: false). Read after
                         `configure`, so it may depend on the project
@@ -38,6 +44,9 @@ A rules module is a Python module with:
                         in the last that many are read, as
                         `ctx.merged` (absent: 0, none read). Read after
                         `configure`, as `wants_directory` is
+    wants_previous      true when the rules read the previous run's
+                        decisions, `ctx.previous` (absent: false). Read
+                        after `configure`, as `wants_directory` is
 """
 
 import dataclasses
@@ -139,7 +148,10 @@ class Decision:
     them. A decision about no item (`item` None) is keyed on its rule in
     the item's place. `kind` is one of KINDS; `actions` are `Action`s
     done before the wake; `reminder` is a `Reminder`, or None for the
-    configuration's fixed `relay.remind_seconds`."""
+    configuration's fixed `relay.remind_seconds`. `woken` says why the
+    agent already knows (someone woke her some other way): a new turn
+    with it is recorded as woken, not sent; on a turn already recorded
+    it changes nothing."""
     item: int | None
     agent: str | None
     rule: Any
@@ -149,6 +161,7 @@ class Decision:
     suppressed: str | None = None
     actions: tuple = ()
     reminder: Any = None
+    woken: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -176,7 +189,12 @@ class Context:
     couldn't be: unknown, never "nothing merged". `state_dir` is the
     engine's state directory, where a module may keep files of its own:
     read them when deciding, and write them only from an `Action`, so
-    only a sending run changes them."""
+    only a sending run changes them. `previous` is the decisions the
+    last sending run made, `{"at": time, "items": {item key:
+    [{"agent", "rule", "event", "kind", "suppressed"}, ...]}}`, read
+    only for rules whose `wants_previous` is true, and None when it
+    wasn't read, there was no run before, or it couldn't be read: a rule
+    reads None as "unknown", never as "nothing was decided"."""
     roster: Any
     when: datetime.datetime
     prs: list
@@ -185,6 +203,7 @@ class Context:
     directory: Any = None
     merged: Any = None
     state_dir: str | None = None
+    previous: Any = None
 
     @property
     def items(self):
@@ -207,6 +226,7 @@ def load_rules(name, root=None):
             raise RulesError("rules %r has no %s" % (name, part))
     defaults = {"flatten": (), "lookups": (), "sweep": lambda ctx: [],
                 "wants_directory": False, "merged_window": 0,
+                "wants_previous": False, "each_run": lambda ctx: (),
                 "recheck": module.decide, "summary": lambda ctx: ""}
     for part, value in defaults.items():
         if not hasattr(module, part):

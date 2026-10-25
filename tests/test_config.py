@@ -64,6 +64,30 @@ class Check(unittest.TestCase):
         data["agents"]["LeadDev"]["twins"] = "WidgetLeadDev2"
         self.assertEqual(len(config.check(data)), 1)
 
+    def test_areas_and_offer(self):
+        data = example()
+        data["agents"]["LeadDev"]["areas"] = {"paths": ["build/"],
+                                              "labels": ["Area:build"]}
+        data["agents"]["UIDev"]["areas"] = {}
+        data["agents"]["Helper"]["offer"] = False
+        self.assertEqual(config.check(data), [])
+        data["agents"]["LeadDev"]["areas"] = {"paths": "build/",
+                                              "labels": ["", 3],
+                                              "owners": []}
+        data["agents"]["UIDev"]["areas"] = ["ui/"]
+        data["agents"]["Helper"]["offer"] = "no"
+        self.assertEqual(config.check(data), [
+            "agents.LeadDev.areas.paths must be a list",
+            "agents.LeadDev.areas: unknown key 'owners'",
+            "agents.LeadDev.areas.labels must be a list of label names",
+            "agents.UIDev.areas must be an object",
+            "agents.Helper.offer must be true or false"])
+        data["agents"]["LeadDev"]["areas"] = {"paths": ["", "x"]}
+        data["agents"]["UIDev"]["areas"] = {}
+        data["agents"]["Helper"]["offer"] = True
+        self.assertEqual(config.check(data), [
+            "agents.LeadDev.areas.paths must be a list of path globs"])
+
     def test_away_names_another_agent_who_is_here(self):
         data = example()
         data["agents"]["UIDev"]["away"] = "LeadDev"
@@ -616,6 +640,23 @@ class Check(unittest.TestCase):
             "router.rules must be a string",
             "router: unknown key 'rule'"])
 
+    def test_router_quiet_labels(self):
+        self.assertEqual(self.problems(router={
+            "quiet_labels": ["Status:venue"]}), [])
+        self.assertEqual(self.problems(router={"quiet_labels": ["", 1]}), [
+            "router.quiet_labels must be a list of label names"])
+        self.assertEqual(self.problems(router={"quiet_labels": "x"}), [
+            "router.quiet_labels must be a list"])
+
+    def test_router_forget_minutes(self):
+        for minutes in (0, 360):
+            self.assertEqual(self.problems(router={
+                "forget_minutes": minutes}), [])
+        self.assertEqual(self.problems(router={"forget_minutes": -1}), [
+            "router.forget_minutes must be at least 0"])
+        self.assertEqual(self.problems(router={"forget_minutes": "6h"}), [
+            "router.forget_minutes must be an integer"])
+
     def test_receiver(self):
         self.assertEqual(self.problems(receiver={
             "port": 0, "path": "hook", "max_body": 10 ** 8, "colour": 1,
@@ -821,6 +862,19 @@ class ProjectQueries(unittest.TestCase):
                          ["WidgetLeadDev", "WidgetLeadDev2", "Spare"])
         self.assertEqual(p.by_session()["WidgetLeadDev2"], "LeadDev")
         self.assertEqual(p.by_session()["Helper"], "Helper")
+
+    def test_areas_and_offered(self):
+        self.assertIsNone(self.p.areas("LeadDev"))
+        self.assertTrue(self.p.offered("LeadDev"))
+        data = example()
+        data["agents"]["LeadDev"]["areas"] = {"labels": ["Area:build"]}
+        data["agents"]["LeadDev"]["offer"] = False
+        data["agents"]["UIDev"]["offer"] = True
+        p = config.Project(data, None)
+        self.assertEqual(p.areas("LeadDev"), {"paths": [],
+                                              "labels": ["Area:build"]})
+        self.assertEqual((p.offered("LeadDev"), p.offered("UIDev")),
+                         (False, True))
 
     def test_a_stand_in_works_for_an_agent_who_is_away(self):
         self.assertEqual(self.p.stand_in("LeadDev"), "LeadDev")

@@ -1,7 +1,9 @@
 """Tests for bin/forge-router's engine on what the default rules never
 decide: several decisions for one item, decisions about no item, the
-sweep, kinds and sections, actions, reminder policies, recheck and the
-exit status. The rules are tests/router_rules.py, told by each test
+sweep, kinds and sections, actions, reminder policies, recheck, the
+exit status, the merged pull requests' fields, the previous run's
+decisions, actions once a run, a turn already woken, the grace period
+before a turn is forgotten and the seed. The rules are tests/router_rules.py, told by each test
 what to decide; tests/test_forge_router.py tests the default rules.
 """
 
@@ -81,14 +83,16 @@ class EngineCase(unittest.TestCase):
         self.rules.SWEEP = list(sweep)
 
     def run_router(self, numbers=(41,), send=True, when=NOW, only=None,
-                   pages=(), github=None, remind_s=7200):
+                   pages=(), github=None, remind_s=7200, forget_s=0,
+                   seed=False):
         self.github = github or GitHub(
             base.response([node(n) for n in numbers], []), *pages,
             events=self.events)
         self.lines.clear()
         self.posts.clear()
         return r.run(self.github, self.roster, self.dir, send, self.post,
-                     only, self.lines.append, when=when, remind_s=remind_s)
+                     only, self.lines.append, when=when, remind_s=remind_s,
+                     forget_s=forget_s, seed=seed)
 
     def state(self):
         return json.loads(pathlib.Path(self.dir, "state.json").read_text())
@@ -578,6 +582,444 @@ class ExitStatus(EngineCase):
         self.decide({41: [turn(41, "Ann")]})
         self.refuse = {"TeamAnn": "HTTP 503"}
         self.assertEqual(self.run_router(send=False), 0)
+
+
+def merged_search(*numbers):
+    """One page of the merged search, each pull request labelled."""
+    return {"data": {"search": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [{"number": n, "title": "x", "mergedAt": E1,
+                   "author": {"login": "ann"},
+                   "labels": {"nodes": [{"name": "Owner:Bea"}]}}
+                  for n in numbers]}}}
+
+
+class Merged(EngineCase):
+    """`graphql["Merged"]`: the module's fields on `ctx.merged`."""
+
+    def test_the_fields_are_asked_for_and_flattened(self):
+        self.rules.merged_window = 30
+        self.rules.graphql = dict(self.rules.graphql,
+                                  Merged="labels(first:20){nodes{name}}")
+        self.rules.flatten = ("labels",)
+        self.decide()
+        self.run_router(pages=[merged_search(50)])
+        query = next(a for a in self.github.calls[1]
+                     if a.startswith("query="))
+        self.assertIn("author { login }\n", query)
+        self.assertIn("labels(first:20){nodes{name}}", query)
+        (ctx,) = self.rules.contexts
+        self.assertEqual(ctx.merged[0]["labels"], [{"name": "Owner:Bea"}])
+        self.assertNotIn("__typename", ctx.merged[0])
+
+    def test_without_the_entry_the_search_asks_for_what_it_did(self):
+        self.rules.merged_window = 30
+        self.decide()
+        self.run_router(pages=[merged_search(50)])
+        query = next(a for a in self.github.calls[1]
+                     if a.startswith("query="))
+        self.assertNotIn("labels", query)
+        self.assertIn("number title mergedAt author { login }", query)
+
+
+class Previous(EngineCase):
+    """`previous.json` and `ctx.previous`: the last sending run's
+    decisions."""
+
+    def setUp(self):
+        super().setUp()
+        self.rules.wants_previous = True
+
+    def previous(self):
+        return json.loads(pathlib.Path(self.dir,
+                                       "previous.json").read_text())
+
+    def test_none_before_the_first_run(self):
+        self.decide()
+        self.run_router()
+        self.assertIsNone(self.rules.contexts[0].previous)
+
+    def test_a_sending_run_records_every_decision(self):
+        self.decide({41: [turn(41, "Ann"),
+                          turn(41, "Bea", kind="notice"),
+                          Decision(41, None, 1, None, None, suppressed="no")]},
+                    sweep=[Decision(None, "Ann", "red", E1, "main is red")])
+        self.run_router()
+        want = {"at": "2026-10-09T14:00:00Z", "items": {
+            "41": [{"agent": "Ann", "rule": "t", "event": E1,
+                    "kind": "turn", "suppressed": None},
+                   {"agent": "Bea", "rule": "t", "event": E1,
+                    "kind": "notice", "suppressed": None},
+                   {"agent": None, "rule": 1, "event": None,
+                    "kind": "turn", "suppressed": "no"}],
+            "-red": [{"agent": "Ann", "rule": "red", "event": E1,
+                      "kind": "turn", "suppressed": None}]}}
+        self.assertEqual(self.previous(), want)
+        self.decide()
+        self.run_router(when=later(minutes=1))
+        self.assertEqual(self.rules.contexts[1].previous, want)
+        self.assertEqual(self.previous(), {"at": "2026-10-09T14:01:00Z",
+                                           "items": {}})
+
+    def test_it_is_written_whether_or_not_the_rules_read_it(self):
+        self.rules.wants_previous = False
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router()
+        self.run_router(when=later(minutes=1))
+        self.assertEqual(list(self.previous()["items"]), ["41"])
+        self.assertIsNone(self.rules.contexts[1].previous)
+
+    def test_an_only_run_replaces_only_its_items(self):
+        self.decide({41: [turn(41, "Ann")], 43: [turn(43, "Bea")]},
+                    sweep=[Decision(None, "Ann", "red", E1, "main is red")])
+        self.run_router((41, 43))
+        self.decide({43: [turn(43, "Ann", E2)]})
+        self.run_router((41, 43), only={41, 43}, when=later(minutes=1))
+        got = self.previous()
+        self.assertEqual(sorted(got["items"]), ["-red", "43"])
+        self.assertEqual(got["items"]["43"][0]["event"], E2)
+
+    def test_a_dry_run_writes_nothing(self):
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router(send=False)
+        self.assertFalse(pathlib.Path(self.dir, "previous.json").exists())
+
+    def test_a_run_that_cant_read_the_queue_writes_nothing(self):
+        self.decide({41: [turn(41, "Ann")]})
+        with self.assertRaises(AssertionError):
+            self.run_router(github=GitHub())
+        self.assertFalse(pathlib.Path(self.dir, "previous.json").exists())
+
+    def test_unreadable_is_none(self):
+        os.makedirs(self.dir)
+        for text in ("not json", "[]", '{"at": "x"}', '{"items": []}'):
+            with self.subTest(text=text):
+                pathlib.Path(self.dir, "previous.json").write_text(text)
+                self.rules.contexts.clear()
+                self.decide()
+                self.run_router(send=False)
+                self.assertIsNone(self.rules.contexts[0].previous)
+
+    def test_the_recheck_is_handed_it_too(self):
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router()
+        seen = []
+
+        def recheck(item, ctx):
+            seen.append(ctx.previous)
+            return [turn(41, "Ann", E2)]
+        self.rules.recheck = recheck
+        self.decide({41: [turn(41, "Ann", E2)]})
+        self.run_router(when=later(minutes=1), pages=[{"data": {
+            "repository": {"n41": dict(node(41), __typename="Issue",
+                                       state="OPEN")}}}])
+        self.assertEqual(list(seen[0]["items"]), ["41"])
+
+    def test_a_module_without_it_reads_nothing(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "rules.py"), "w") as handle:
+                handle.write("graphql = {}\nRoster = None\n"
+                             "def configure(p, m): pass\n"
+                             "def decide(i, c): return []\n")
+            self.assertIs(router.load_rules("rules.py", root).wants_previous,
+                          False)
+
+
+class Heartbeat(router.Action):
+    """An `each_run` action: records what it saw, and may fail."""
+
+    def __init__(self, test, name="beat", fail=None):
+        self.test, self.name, self.fail = test, name, fail
+
+    def describe(self):
+        return "rewrite the %s" % self.name
+
+    def run(self, github, repo):
+        state = pathlib.Path(self.test.dir, "state.json")
+        self.test.events.append("beat")
+        self.test.beats.append((repo, state.exists()))
+        if isinstance(self.fail, Exception):
+            raise self.fail
+        return (False, self.fail) if self.fail else (True, "")
+
+
+class EachRun(EngineCase):
+    """`each_run(ctx)`: actions once a sending run, after delivery."""
+
+    def setUp(self):
+        super().setUp()
+        self.beats, self.given = [], []
+
+    def each(self, *actions):
+        def each_run(ctx):
+            self.given.append(ctx)
+            return list(actions)
+        self.rules.each_run = each_run
+
+    def test_once_after_delivery_and_recording(self):
+        self.each(Heartbeat(self))
+        self.decide({41: [turn(41, "Ann")]})
+        self.assertEqual(self.run_router(), 0)
+        self.assertEqual(self.events, ["api", "post", "beat"])
+        self.assertEqual(self.beats, [("example/widget", True)])
+        self.assertIn("DONE rewrite the beat", self.lines)
+        self.assertEqual(self.given[0].when, NOW)
+        self.assertEqual([w["outcome"] for w in self.journal()], ["sent"])
+
+    def test_on_every_run_due_or_not(self):
+        self.each(Heartbeat(self))
+        self.decide()
+        self.run_router()
+        self.run_router(when=later(minutes=1))
+        self.assertEqual(len(self.beats), 2)
+
+    def test_not_on_an_only_run(self):
+        self.each(Heartbeat(self))
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router(only={41})
+        self.run_router(only={41}, send=False)
+        self.assertEqual((self.beats, self.given), ([], []))
+
+    def test_a_dry_run_prints_them_and_does_nothing(self):
+        self.each(Heartbeat(self), Heartbeat(self, "status"))
+        self.decide()
+        self.assertEqual(self.run_router(send=False), 0)
+        self.assertEqual(self.beats, [])
+        self.assertEqual(self.lines[-2:], ["WOULD rewrite the beat",
+                                           "WOULD rewrite the status"])
+        self.assertEqual(self.journal(), [])
+
+    def test_a_failed_one_is_journalled_and_the_rest_go_on(self):
+        self.each(Heartbeat(self, fail="HTTP 403"),
+                  Heartbeat(self, "status", fail=RuntimeError("bang")),
+                  Heartbeat(self, "last"))
+        self.decide({41: [turn(41, "Ann")]})
+        self.assertEqual(self.run_router(), 0)
+        self.assertEqual(len(self.beats), 3)
+        self.assertIn("ACTION FAILED: rewrite the beat: HTTP 403", self.lines)
+        self.assertIn("ACTION FAILED: rewrite the status: bang", self.lines)
+        self.assertEqual(self.journal()[1:], [
+            {"kind": "run", "outcome": "failed: rewrite the beat: HTTP 403",
+             "at": "2026-10-09T14:00:00Z"},
+            {"kind": "run", "outcome": "failed: rewrite the status: bang",
+             "at": "2026-10-09T14:00:00Z"}])
+
+    def test_the_exit_status_is_the_wakes(self):
+        self.each(Heartbeat(self, fail="HTTP 500"))
+        self.decide({41: [turn(41, "Ann")]})
+        self.refuse = {"TeamAnn": "HTTP 503"}
+        self.assertEqual(self.run_router(), 2)
+        self.assertEqual(len(self.beats), 1)
+
+    def test_rules_that_raise_or_give_something_else(self):
+        def boom(ctx):
+            raise RuntimeError("no state")
+        for each_run, why in ((boom, "no state"),
+                              (lambda ctx: ["x"], "'x' is not an Action")):
+            with self.subTest(why=why):
+                self.rules.each_run = each_run
+                self.decide()
+                self.assertEqual(self.run_router(), 0)
+                self.assertIn("ACTION FAILED: each_run: " + why, self.lines)
+                self.assertEqual(self.journal()[-1]["outcome"],
+                                 "failed: each_run: " + why)
+
+    def test_none_without_it(self):
+        self.decide({41: [turn(41, "Ann")]})
+        self.assertEqual(self.rules.each_run(None), ())
+        self.run_router()
+        self.assertEqual(self.events, ["api", "post"])
+
+
+class Woken(EngineCase):
+    """`Decision.woken`: a turn someone woke some other way."""
+
+    WOKEN = "Woke: comment 700"
+
+    def test_recorded_as_woken_and_not_sent(self):
+        self.decide({41: [turn(41, "Ann", woken=self.WOKEN,
+                               actions=(AddLabel(41, "x"),))]})
+        self.assertEqual(self.run_router(), 0)
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.state()["items"]["41"], {
+            "agent": "Ann", "rule": "t", "event": E1,
+            "woken_at": "2026-10-09T14:00:00Z"})
+        self.assertIn("#41 Ann's, rule t: marked woken: Woke: comment 700",
+                      self.lines)
+        (rec,) = self.journal()
+        self.assertEqual((rec["outcome"], rec["actions"]),
+                         ("marked woken: Woke: comment 700",
+                          ["add label x to #41"]))
+        self.assertEqual(len(self.github.writes), 1)
+        self.assertIn("1 marked woken", self.lines[-1])
+
+    def test_then_an_ordinary_turn(self):
+        self.decide({41: [turn(41, "Ann", woken=self.WOKEN)]})
+        self.run_router(remind_s=600)
+        self.run_router(when=later(seconds=599), remind_s=600)
+        self.assertEqual(self.posts, [])
+        self.run_router(when=later(seconds=600), remind_s=600)
+        self.assertEqual(self.posts, [("TeamAnn", "From: Router\nYour turn:"
+                                       "\n#41 for Ann (reminder)\n")])
+        self.assertEqual(self.state()["items"]["41"]["reminders"], 1)
+        self.decide({41: [turn(41, "Ann", E2)]})
+        self.run_router(when=later(seconds=601), remind_s=600)
+        self.assertEqual(len(self.posts), 1)
+
+    def test_no_effect_on_a_turn_already_recorded(self):
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router(remind_s=600)
+        self.decide({41: [turn(41, "Ann", woken=self.WOKEN)]})
+        self.run_router(when=later(seconds=600), remind_s=600)
+        self.assertEqual(len(self.posts), 1)
+
+    def test_a_dry_run_says_so(self):
+        self.decide({41: [turn(41, "Ann", woken=self.WOKEN)]})
+        self.run_router(send=False)
+        self.assertIn("#41 Ann's, rule t: marked woken: Woke: comment 700",
+                      self.lines)
+        self.assertEqual([w["outcome"] for w in self.journal("dry-run.jsonl")],
+                         ["would be marked woken: Woke: comment 700"])
+        self.assertFalse(pathlib.Path(self.dir, "state.json").exists())
+
+    def test_not_an_agent_is_withheld_as_ever(self):
+        self.decide({41: [turn(41, "Carl", woken=self.WOKEN)]})
+        self.run_router()
+        self.assertTrue(self.state()["items"]["41"]["withheld"])
+
+    def test_it_must_say_why(self):
+        self.decide({41: [turn(41, "Ann", woken=True)]})
+        with self.assertRaises(ValueError):
+            self.run_router()
+
+
+class Forget(EngineCase):
+    """`router.forget_minutes`: a turn no run decides is kept a while."""
+
+    HOUR = 3600
+
+    def test_without_it_an_undecided_turn_is_forgotten_at_once(self):
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router()
+        self.assertNotIn("decided_at", self.state()["items"]["41"])
+        self.decide()
+        self.run_router(when=later(minutes=1))
+        self.assertEqual(self.state()["items"], {})
+
+    def test_a_flap_within_it_is_one_turn(self):
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router(forget_s=self.HOUR, remind_s=7200)
+        self.decide()
+        self.run_router(when=later(minutes=30), forget_s=self.HOUR)
+        self.assertEqual(self.state()["items"]["41"]["decided_at"],
+                         "2026-10-09T14:00:00Z")
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router(when=later(minutes=50), forget_s=self.HOUR)
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.state()["items"]["41"]["decided_at"],
+                         "2026-10-09T14:50:00Z")
+        # Its reminder counts from the wake, as if it never flapped.
+        self.run_router(when=later(hours=2), forget_s=self.HOUR)
+        self.assertEqual(self.posts, [("TeamAnn", "From: Router\nYour turn:"
+                                       "\n#41 for Ann (reminder)\n")])
+
+    def test_forgotten_once_it_has_passed(self):
+        self.decide({41: [turn(41, "Ann")], 43: [turn(43, "Bea")]})
+        self.run_router((41, 43), forget_s=self.HOUR)
+        self.decide({43: [turn(43, "Bea")]})
+        self.run_router((41, 43), when=later(minutes=60), forget_s=self.HOUR)
+        self.assertEqual(sorted(self.state()["items"]), ["41", "43"])
+        self.run_router((41, 43), when=later(minutes=61), forget_s=self.HOUR)
+        self.assertEqual(sorted(self.state()["items"]), ["43"])
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router((41, 43), when=later(minutes=62), forget_s=self.HOUR)
+        self.assertEqual([s for s, _ in self.posts], ["TeamAnn"])
+
+    def test_not_reminded_while_undecided(self):
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router(forget_s=10 * self.HOUR, remind_s=600)
+        self.decide()
+        self.run_router(when=later(hours=1), forget_s=10 * self.HOUR,
+                        remind_s=600)
+        self.assertEqual(self.posts, [])
+
+    def test_a_record_from_before_it_counts_from_its_wake(self):
+        os.makedirs(self.dir)
+        pathlib.Path(self.dir, "state.json").write_text(json.dumps(
+            {"items": {"41": {"agent": "Ann", "rule": "t", "event": E1,
+                              "woken_at": "2026-10-09T13:30:00Z"}}}))
+        self.decide()
+        self.run_router(forget_s=self.HOUR)
+        self.assertIn("41", self.state()["items"])
+        self.run_router(when=later(minutes=31), forget_s=self.HOUR)
+        self.assertEqual(self.state()["items"], {})
+
+    def test_an_only_run_forgets_nothing(self):
+        self.decide({41: [turn(41, "Ann"), turn(41, "Bea")]})
+        self.run_router(forget_s=self.HOUR)
+        self.decide({41: [turn(41, "Bea")]})
+        self.run_router(only={41}, when=later(hours=2), forget_s=self.HOUR)
+        self.assertEqual(len(self.state()["items"]["41"]), 2)
+        self.run_router(when=later(hours=2), forget_s=self.HOUR)
+        self.assertEqual(self.state()["items"]["41"]["agent"], "Bea")
+
+    def test_from_the_configuration(self):
+        project = base.config.Project(dict(base.example(), router={
+            "forget_minutes": 360}), None)
+        r.configure(project)
+        self.addCleanup(r.configure, base.config.Project(base.example(),
+                                                         None))
+        self.assertEqual(r.FORGET_MINUTES, 360)
+        r.RULES = self.rules
+        self.decide({41: [turn(41, "Ann")]})
+        r.run(GitHub(base.response([node(41)], [])), self.roster, self.dir,
+              True, self.post, None, self.lines.append, when=NOW)
+        self.decide()
+        r.run(GitHub(base.response([node(41)], [])), self.roster, self.dir,
+              True, self.post, None, self.lines.append, when=later(hours=5))
+        self.assertIn("41", self.state()["items"])
+
+
+class Seed(EngineCase):
+    """`--seed`: a first run that records turns and wakes nobody."""
+
+    def test_every_due_turn_is_recorded_as_woken_and_nothing_sent(self):
+        beats = []
+        self.rules.each_run = lambda ctx: beats.append(ctx) or []
+        self.decide({41: [turn(41, "Ann", actions=(AddLabel(41, "x"),)),
+                          turn(41, "Bea", kind="notice")]},
+                    sweep=[Decision(None, "Ann", "red", E1, "main is red")])
+        self.assertEqual(self.run_router(seed=True), 0)
+        self.assertEqual((self.posts, self.github.writes, beats), ([], [], []))
+        self.assertEqual(sorted(self.state()["items"]), ["-red", "41"])
+        self.assertEqual(self.state()["items"]["-red"]["woken_at"],
+                         "2026-10-09T14:00:00Z")
+        self.assertEqual([(w["agent"], w["outcome"]) for w in self.journal()],
+                         [("Ann", "seeded"), ("Bea", "seeded"),
+                          ("Ann", "seeded")])
+        self.assertTrue(pathlib.Path(self.dir, "previous.json").exists())
+        self.assertEqual(self.lines[-1],
+                         "SEEDED 1 open, 3 turn(s) recorded as woken")
+        # The next run wakes only what began since.
+        self.decide({41: [turn(41, "Ann", actions=(AddLabel(41, "x"),)),
+                          turn(41, "Bea", E2, kind="notice")]},
+                    sweep=[Decision(None, "Ann", "red", E1, "main is red")])
+        self.run_router(when=later(minutes=1))
+        self.assertEqual([s for s, _ in self.posts], ["TeamBea"])
+
+    def test_refused_on_a_state_that_records_a_turn(self):
+        self.decide({41: [turn(41, "Ann")]})
+        self.run_router()
+        self.assertEqual(self.run_router(seed=True, when=later(minutes=1)), 2)
+        self.assertEqual(self.github.calls, [])
+        self.assertTrue(self.lines[0].startswith("SEED REFUSED: "))
+
+    def test_an_empty_state_may_be_seeded(self):
+        os.makedirs(self.dir)
+        pathlib.Path(self.dir, "state.json").write_text('{"items": {}}')
+        self.decide({41: [turn(41, "Ann")]})
+        self.assertEqual(self.run_router(seed=True), 0)
+        self.assertEqual(self.posts, [])
 
 
 if __name__ == "__main__":

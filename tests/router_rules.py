@@ -10,10 +10,12 @@ reminder policies. The engine loads it as a project's rules file, with
 graphql = {"PullRequest": "title", "Issue": "title"}
 
 # Set by a test: the decisions `decide` gives, by item number, and the
-# ones `sweep` gives. `swept` records `ctx.only` for each sweep.
+# ones `sweep` gives. `swept` records `ctx.only` for each sweep, and
+# `contexts` the whole context.
 DECISIONS = {}
 SWEEP = []
 swept = []
+contexts = []
 
 
 class Roster:
@@ -41,4 +43,5 @@ def decide(item, ctx):
 
 def sweep(ctx):
     swept.append(ctx.only)
+    contexts.append(ctx)
     return list(SWEEP)

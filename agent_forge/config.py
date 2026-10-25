@@ -61,7 +61,9 @@ NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
        "slug": str, "key": str}
 AGENT = dict(APP, session_name=str, twins=list, kind=str, reviews=list,
-             away=str)
+             away=str, areas=dict, offer=bool)
+# An agent's areas (designs/0030): what is hers, for a rules module.
+AREAS = {"paths": list, "labels": list}
 IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list, "crontabs": dict}
 # forge-memory-sync, -check and -trim (agent_forge/memory.py).
@@ -172,9 +174,12 @@ LABELS = {"owner_prefix": str, "status_prefix": str,
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
-          "stuck": dict, "owners": dict, "unreviewed": dict}
+          "stuck": dict, "owners": dict, "unreviewed": dict,
+          "forget_minutes": int, "quiet_labels": list}
 IDLE_OFFER = {"idle_minutes": int, "shell_minutes": int, "report_to": str}
-MERGE_NOTICE = {"window_minutes": int}
+MERGE_NOTICE = {"window_minutes": int, "skip_label": str, "to": str}
+# Whom `router.merge_notice.to` tells of a merge.
+MERGE_NOTICE_TO = ("author", "owner_label")
 STUCK = {"retarget": bool, "self_blocked": bool, "draft_hours": int}
 OWNERS = {"triage": str}
 UNREVIEWED = {"ignore": list, "depth2": list}
@@ -473,6 +478,13 @@ def check(data):
             _check_owners(router["owners"], data["agents"], problems)
         if isinstance(router.get("unreviewed"), dict):
             _check_unreviewed(router["unreviewed"], router, problems)
+        if _is(router.get("forget_minutes"), int) and \
+                router["forget_minutes"] < 0:
+            problems.append("router.forget_minutes must be at least 0")
+        if isinstance(router.get("quiet_labels"), list) and not all(
+                isinstance(l, str) and l for l in router["quiet_labels"]):
+            problems.append("router.quiet_labels must be a list of label "
+                            "names")
     merge = data.get("merge", {})
     if _fields("merge", merge, MERGE, problems):
         for i, argv in enumerate(merge.get("gate", [])):
@@ -593,6 +605,15 @@ def check(data):
                                         for s in entry["twins"]):
             problems.append("%s.twins must be a list of session names"
                             % where)
+        if isinstance(entry.get("areas"), dict) and _fields(
+                where + ".areas", entry["areas"], AREAS, problems):
+            for key, what in (("paths", "path globs"),
+                              ("labels", "label names")):
+                values = entry["areas"].get(key)
+                if isinstance(values, list) and not all(
+                        isinstance(v, str) and v for v in values):
+                    problems.append("%s.areas.%s must be a list of %s"
+                                    % (where, key, what))
         if "slug" not in entry and not suffix:
             problems.append("%s: no slug, and no naming.app_slug_suffix to "
                             "make one" % where)
@@ -1044,6 +1065,13 @@ def _check_merge_notice(notice, problems):
     their authors of."""
     where = "router.merge_notice"
     _fields(where, notice, MERGE_NOTICE, problems)
+    if isinstance(notice.get("to"), str) and \
+            notice["to"] not in MERGE_NOTICE_TO:
+        problems.append("%s.to must be one of %s"
+                        % (where, ", ".join(MERGE_NOTICE_TO)))
+    if isinstance(notice.get("skip_label"), str) and \
+            not notice["skip_label"]:
+        problems.append("%s.skip_label must not be empty" % where)
     if _is(notice.get("window_minutes"), int) and \
             notice["window_minutes"] < 1:
         problems.append("%s.window_minutes must be at least 1" % where)
@@ -1181,6 +1209,20 @@ class Project:
 
     def kind(self, name):
         return self.agents[name].get("kind", "developer")
+
+    def areas(self, name):
+        """The agent's `areas`, {"paths": [globs], "labels": [names]},
+        each filled in, or None for an agent without them."""
+        areas = self.agents.get(name, {}).get("areas")
+        if not isinstance(areas, dict):
+            return None
+        return {"paths": list(areas.get("paths") or []),
+                "labels": list(areas.get("labels") or [])}
+
+    def offered(self, name):
+        """Whether the agent may be offered idle work: not when her
+        entry says `"offer": false`."""
+        return self.agents.get(name, {}).get("offer") is not False
 
     def reviewers(self):
         """Reviewer agents, in the configuration's order."""

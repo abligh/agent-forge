@@ -65,7 +65,10 @@ The engine runs one pass:
    rules `forge-router` already has.
 6. **Record.** State only for what was delivered (and for what was
    withheld or surfaced, once); the journal for every wake sent,
-   failed, withheld, withdrawn or surfaced.
+   failed, withheld, withdrawn or surfaced; and every decision the run
+   made, for the next run's rules (`previous.json`, below).
+7. **Once a run.** The module's `each_run` actions, on a sending run
+   that isn't `--only`'s (below).
 
 **Several decisions per item.** `decide` may return any number for
 one item: one agent's turn, a notice to another, a relook to its
@@ -92,6 +95,72 @@ none), or `withheld` or `surfaced` with `at`. A run forgets the turns
 of an item key that it decided but no longer gave, and every item key
 it didn't decide at all, unless it was `--only`; an item key whose
 wake failed is left as it was, as it always has been.
+
+**A grace period before a turn is forgotten.** With
+`router.forget_minutes` above 0 (the default, 0, is the above), each
+recorded turn also keeps `decided_at`, the last run that decided it,
+and a run that doesn't decide a turn forgets it only once `decided_at`
+is more than `forget_minutes` old. A turn recorded before has no
+`decided_at`, and its `woken_at` (or, withheld or surfaced, its `at`)
+is used. A turn kept this way isn't reminded while it is undecided,
+since only decisions are due; decided again with the same event, it
+is the same turn: it isn't woken again, and its reminders count on. So
+an item decided on one run, not on the next and then again with the
+same event is woken once. An `--only` run then forgets nothing. The
+same holds for a turn an item has moved on from: when its event
+changes, the old turn is kept beside the new one until its
+`decided_at` ages out, unreminded, and if the event goes back to the
+old value within that time, it is the old turn again and isn't woken.
+A module whose events only move forward never sees this.
+
+**A turn already woken.** A decision whose `woken` says why (`"Woke:
+comment 6390…"`) is one someone woke some other way. When its turn is
+new it isn't sent: it is recorded as woken at this run's time,
+journalled as `marked woken: <why>`, printed so, and its actions are
+done, as for a sent wake. From then on it is an ordinary recorded turn:
+its reminders run from that time, and a new event is a new turn. On a
+turn already recorded, `woken` has no effect. A dry run prints it and
+journals `would be marked woken: <why>`.
+
+**Actions once a run.** A module's `each_run(ctx)` gives `Action`s that
+belong to no turn, such as rewriting a status block in an issue body
+or posting a commit status on each open pull request. A sending run
+that read the queue, and isn't `--only`'s, does them once, in order,
+after delivery and recording, under the router's lock, through the
+engine's GitHub client. A dry run prints each (`WOULD …`). A failed one
+(GitHub refused it, it raised, or `each_run` itself raised or gave
+something not an `Action`) is printed (`ACTION FAILED: …`) and
+journalled in `wakes.jsonl` as `{"kind": "run", "outcome": "failed:
+<what>: <why>"}`; the others still run. Like a failed decision action,
+it doesn't change the exit status: they run on every run, so the next
+tries again. A module that wants one only every N minutes compares
+`ctx.when` with what an `Action` of its own wrote in `state_dir`.
+
+**`--seed`.** A project switching from a router of its own starts with
+empty state, so its first sending run would wake every open turn at
+once. `--seed` is a run, under the lock, that decides as a sending run
+does (with no recheck: it sends nothing), then records every due turn
+as woken at this run's time, sends nothing, does no actions and no
+`each_run`, and journals each as `seeded`. Withheld and surfaced
+decisions are recorded as on any run, without their actions. It writes
+`previous.json` too, and ends `SEEDED <n> open, <m> turn(s) recorded
+as woken`. A run after it wakes only turns that began since. It refuses
+(`SEED REFUSED: …`, exit 2) a state directory that already records a
+turn, so it can't silence a live router by mistake, and it can't be
+`--only`'s. Run it once, just after the old router's last run.
+
+**The previous run's decisions.** Each sending run that read the queue
+writes `previous.json` beside `state.json`: by item key, every decision
+it made (its agent, rule, event, kind and `suppressed`, woken or not),
+with the run's time, `{"at": time, "items": {key: [{"agent", "rule",
+"event", "kind", "suppressed"}, …]}}`. An `--only` run replaces only
+the keys of the items it routed, and keeps the rest, but sets `at` to
+its own time: so `at` is the last run that wrote the file, not when any
+one item was decided, and an item's entry may be older. A dry run
+writes nothing. A module whose `wants_previous` is true is handed it, as read
+at the start of the run, as `ctx.previous`: so it can say a merged pull
+request was someone's turn when it was last routed, or that a red
+workflow it reported last run is green now.
 
 **Kinds.** A `turn` is the agent's to act on. A `notice` (for its
 information) and a `relook` (worth looking at again) are sent with the
@@ -151,8 +220,9 @@ when some was delivered and the rest stays due; 2 when the queue
 couldn't be read, or something was due and none of it was delivered.
 The last was 1 before: a router that delivered nothing hasn't done its
 job, and 2 is what a scheduler reports as broken. A wake that stays due
-is one the relay didn't take or a recheck couldn't fetch; one withheld
-or withdrawn isn't due.
+is one the relay didn't take or a recheck couldn't fetch; one withheld,
+withdrawn or marked woken isn't due. A failed action, a decision's or
+`each_run`'s, never changes it. A refused `--seed` is 2.
 
 ## The interface
 
@@ -165,7 +235,8 @@ repository, read from the cron checkout, so it is reviewed there.
 ```python
 class Rules(Protocol):                # a module, not a class
     graphql: Mapping[str, str]    # fields besides `number`, by type:
-                                  #   PullRequest, Issue
+                                  #   PullRequest, Issue; and Merged,
+                                  #   the merged search's PullRequest
     flatten: Sequence[str]        # connections handed over as lists
     lookups: Sequence[Lookup]     # what to fetch besides
     Roster: type                  # Roster(project): who is who
@@ -175,7 +246,10 @@ class Rules(Protocol):                # a module, not a class
     def sweep(ctx) -> Sequence[Decision]: ...         # optional
     def recheck(item, ctx) -> Sequence[Decision]: ... # optional
     def summary(ctx) -> str: ...                      # optional
+    def each_run(ctx) -> Sequence[Action]: ...        # optional
     wants_directory: bool         # optional: read the relay's directory
+    merged_window: int            # optional: minutes of merges to read
+    wants_previous: bool          # optional: read the last run's decisions
 
 @dataclass(frozen=True)
 class Lookup:
@@ -208,6 +282,7 @@ class Decision:
     suppressed: str | None = None # decided, not sent, and why
     actions: tuple = ()           # Actions, done before delivery
     reminder: Reminder | None = None   # None: relay.remind_seconds
+    woken: str | None = None      # already woken some other way: why
 
 ONCE: Reminder                    # woken once, never reminded
 ```
@@ -217,8 +292,9 @@ here: `configure` sets them up for the project, and is given
 `forge-merger`, so a rule can use the Merger's own tests (what an
 approval is, whether anything was said since, what `Blocked-by:` names)
 rather than a copy that could drift. `sweep` defaults to deciding
-nothing, `recheck` to `decide`, and `summary`, a phrase for the run's
-last line ("1 waiting on the owner"), to none.
+nothing, `recheck` to `decide`, `summary`, a phrase for the run's
+last line ("1 waiting on the owner"), to none, and `each_run` to no
+actions.
 
 **`item`** is the GraphQL node with the `flatten` connections as lists
 and `__typename` set, so `decide` can tell a pull request from an
@@ -241,7 +317,9 @@ session that works as the agent: hers, then her twins', or her
 stand-in's while she is `away`. A wake goes to each of them, and counts
 as delivered when any one takes it. A stand-in's wake for an agent who
 is away says so on its second line ("For Reviewer, who is away;
-Reviewer2 stands in.").
+Reviewer2 stands in."). The default rules' roster also answers
+`areas(name)` and `offered(name)` from the agent's entry
+(docs/config.md), for a module whose roster is built on it.
 
 `ctx` carries the clock, the roster, every fetched item (so a rule
 can read other items: a blocker's state, a reviewer's load),
@@ -255,9 +333,12 @@ is printed (`NO-DIRECTORY: …`) and handed over as None, which a module
 must read as unknown, not as nobody. The default rules want it only
 for `router.idle_offer` (rules 15 and 16). `merged`, likewise, is the
 pull requests merged in the last `merged_window` minutes (each with
-`number`, `title`, `mergedAt` and `author`), read by one GitHub search
-on a run that isn't `--only`'s, only for a module whose
-`merged_window` is above 0; a search that fails is printed
+`number`, `title`, `mergedAt` and `author`, and the fields the module's
+`graphql["Merged"]` adds to the search's `PullRequest` fragment, with
+its `flatten` connections as lists: `"Merged":
+"labels(first:20){nodes{name}}"` gives each a `labels` list), read by
+one GitHub search on a run that isn't `--only`'s, only for a module
+whose `merged_window` is above 0; a search that fails is printed
 (`NO-MERGED: …`) and handed over as None, which a module must read as
 unknown, not as nothing merged. The default rules want it only for
 `router.merge_notice` (rule 17). `state_dir` is the engine's state
@@ -265,9 +346,12 @@ directory, where a module may keep files of its own: it reads them
 when deciding and writes them only from an `Action`, so only a sending
 run changes them. The default rules keep `unreviewed.json` there for
 `router.unreviewed` (rule 19): which issue each area no reviewer
-covers has, and which pull requests it has told. A later step may add
-the previous run's decisions and the configuration; until then a
-module keeps what it needs from `configure`.
+covers has, and which pull requests it has told. `previous` is the
+last sending run's decisions (`previous.json`, above), read only for a
+module whose `wants_previous` is true after `configure`; it is None on
+the first run, or when the file can't be read, which a module must read
+as unknown, not as nothing decided before. The configuration is the
+module's from `configure`.
 
 **Who wrote something** is the module's `author`. The default rules
 read the login. A module whose agents share a login reads the
@@ -307,3 +391,13 @@ relay already answers `unknown-name`, and that is reported.
    load it as the engine does.
 4. The larger project writes its rules module in its own repository and
    compares its journal with its current router's before switching.
+5. What that module needs that it couldn't write
+   ([designs/0030](designs/0030-what-a-projects-own-router-rules-need.md)),
+   each off, or changing nothing, until a module or the configuration
+   uses it. Done so far: the merged pull requests' fields
+   (`graphql["Merged"]`), the previous run's decisions
+   (`ctx.previous`), actions once a run (`each_run`), a turn already
+   woken (`Decision.woken`), the grace period before a turn is
+   forgotten (`router.forget_minutes`), `--seed`, per-agent `areas`
+   and `offer` (`roster.areas`, `roster.offered`), `router.quiet_labels`,
+   and `router.merge_notice`'s `skip_label` and `to`.

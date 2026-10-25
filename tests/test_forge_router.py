@@ -1352,8 +1352,9 @@ class Main(unittest.TestCase):
         calls = []
 
         def fake_run(github, roster, state_dir, send, post, only, out,
-                     remind_s, directory=None):
+                     remind_s, directory=None, seed=False):
             self.directory = directory
+            self.seed = seed
             calls.append((github.env["GH_TOKEN"], state_dir, send, only,
                           remind_s))
             return run() if run else 0
@@ -1375,6 +1376,19 @@ class Main(unittest.TestCase):
         rc, calls = self.main(["--send", "--only", "41,22"])
         self.assertEqual(calls, [("token", self.dir, True, {41, 22}, 7200)])
         self.assertTrue(os.path.exists(os.path.join(self.dir, "lock")))
+
+    def test_seed_is_a_sending_run_under_the_lock(self):
+        rc, calls = self.main(["--seed"])
+        self.assertEqual((rc, calls),
+                         (0, [("token", self.dir, True, None, 7200)]))
+        self.assertTrue(self.seed)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "lock")))
+        self.main(["--send"])
+        self.assertFalse(self.seed)
+
+    def test_seed_is_never_only_some_items(self):
+        self.assertEqual(self.main(["--seed", "--only", "41"]), (2, []))
+        self.assertIn("BAD-ARGS: --seed", self.lines[0])
 
     def test_the_reminder_comes_from_the_environment(self):
         self.assertEqual(self.main([], environ={
