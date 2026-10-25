@@ -381,10 +381,15 @@ class Order(unittest.TestCase):
         self.assertEqual([p["number"] for p in got], [4, 9])
 
 
+def git_env():
+    """The environment every test's git runs in: an identity of its own,
+    so a host with no global one runs the same."""
+    return dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+
+
 def run_git(cwd, *args):
-    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
-    got = subprocess.run(["git", "-C", str(cwd)] + list(args), env=env,
+    got = subprocess.run(["git", "-C", str(cwd)] + list(args), env=git_env(),
                          capture_output=True, text=True)
     if got.returncode != 0:
         raise AssertionError("git %s: %s" % (" ".join(args), got.stderr))
@@ -4269,8 +4274,11 @@ class Resolve(unittest.TestCase):
             self.state, m.RESOLVE_CHECKED), {}), {"%s 0" % new: True})
 
     def test_a_hand_made_merge_with_stale_files_does_not_cover(self):
-        subprocess.run(["git", "-C", self.repo.path, "merge", "-q",
-                        "origin/main"], capture_output=True)
+        got = subprocess.run(["git", "-C", self.repo.path, "merge", "-q",
+                              "origin/main"], env=git_env(),
+                             capture_output=True, text=True)
+        # Stopping on the conflict is the point; failing any other way isn't.
+        self.assertIn("CONFLICT", got.stdout + got.stderr)
         self.write("gen.txt", "base\nf\n")
         run_git(self.repo.path, "add", "src/m")
         new = self.commit("hand merge")
