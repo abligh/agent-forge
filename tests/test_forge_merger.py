@@ -3299,6 +3299,31 @@ class EarlyConflicts(RepoCase):
         self.assertNotIn(6, [d["pr"] for d in record["decisions"]])
         self.assertEqual([c for c in self.comments() if "/6/" in c[0]], [])
 
+    def early(self, six, said, layers=()):
+        github = FakeGitHub({})
+        got = m.early_conflicts(self.repo.path, self.repo.main_tip(), [six],
+                                {6: m.approval_of(six)}, github, said, True,
+                                tools_run(), layers)
+        return got, github.writes
+
+    def test_a_stack_layer_is_left_to_its_restack(self):
+        six = self.behind()
+        self.assertEqual(self.early(six, {}, layers={6}), ([], []))
+        got, writes = self.early(six, {})
+        self.assertEqual([d["pr"] for d in got], [6])
+
+    def test_a_conflict_already_told_in_other_words_is_not_told_again(self):
+        # A layer's restack hand-back, then this plain one, replaced each
+        # other in `said`, and each was posted again every tick.
+        six = self.behind()
+        said = {"6": m.hand_back_key(
+            m.approval_of(six), six["headRefOid"],
+            m.RESTACK_REASON % (m.CONFLICT_REASON, 5, "0" * 10))}
+        self.assertEqual(self.early(six, said), ([], []))
+        said["6"]["reason"] = "the Merger's gate failed"
+        got, _ = self.early(six, said)
+        self.assertEqual([d["pr"] for d in got], [6])
+
     def test_one_behind_that_is_clean_is_left_alone(self):
         record, _ = self.tick([self.item(), self.other_pr()],
                               conclusions=(None,), live=True)
