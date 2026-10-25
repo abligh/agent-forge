@@ -2477,20 +2477,29 @@ def ci_rerun(decision, github, state_dir, when, live, out):
 
 
 def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
-                    run=sh):
+                    run=sh, layers=()):
     """merge.early_conflicts: the hand-backs for the candidates the tick
     didn't reach (`rest`, behind the one it stopped at) whose heads
     conflict with main. Without it, such a pull request is told only
     when it reaches the front, which in a busy queue can be hours after
     the merge that made the conflict, hours its author could have spent
-    on the fix. One already told for this approval and head is skipped,
-    and so is one git can't compare (it is decided when it is reached,
-    as before)."""
+    on the fix. One already told of a conflict for this approval and
+    head is skipped, whatever the words, and so is one git can't compare
+    (it is decided when it is reached, as before). So is a stack's layer
+    (`layers`): the Merger restacks it when it is reached, and its own
+    hand-back says which merge conflicted. Told the plain conflict here,
+    a layer's two hand-backs replaced each other in `said` and each was
+    posted again, every tick."""
     decisions = []
     for pr in rest:
         approval = approvals[pr["number"]]
-        if said.get(str(pr["number"])) == hand_back_key(
-                approval, pr["headRefOid"], CONFLICT_REASON):
+        before = said.get(str(pr["number"])) or {}
+        key = hand_back_key(approval, pr["headRefOid"], CONFLICT_REASON)
+        if (pr["number"] in layers
+                or ({k: before.get(k) for k in ("approved", "head")}
+                    == {k: key[k] for k in ("approved", "head")}
+                    and (before.get("reason") or "").startswith(
+                        CONFLICT_REASON))):
             continue
         have_head(repo, pr, run)
         if is_ancestor(repo, main_tip, pr["headRefOid"], run):
@@ -2944,7 +2953,11 @@ def next_layer(stack, prs, candidates, open_numbers, when, held):
             continue
         if pr.get("baseRefName") != entry["branch"]:
             continue
-        approval, why = eligible(pr, open_numbers, when, any_base=True)
+        # The layer below merged, though GitHub's lists can name it open
+        # for a tick or two after: a `Blocked-by:` it is no reason to
+        # end the stack.
+        approval, why = eligible(pr, open_numbers - {entry["after"]}, when,
+                                 any_base=True)
         if approval is None:
             held[str(pr["number"])] = "%s, which merged, but %s" % (
                 STACK_REASON % entry["after"], why)
@@ -3349,7 +3362,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     if EARLY_CONFLICTS:
         record["decisions"] += early_conflicts(
             repo, main_tip, queue[stopped:], approvals, github, said, live,
-            run)
+            run, layers)
     if live:
         minutes = stalled_for(state_dir, waiting, when, check_state)
         if minutes is not None and "stalled" not in record:
