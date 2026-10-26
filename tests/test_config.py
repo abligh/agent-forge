@@ -479,6 +479,21 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"test_ahead": {"depth": 0}}),
                          [])
 
+    def test_merge_test_ahead_batches(self):
+        self.assertEqual(self.problems(merge={"test_ahead": {
+            "depth": 15, "batch": 8, "batches": 2}}), [])
+        self.assertEqual(self.problems(merge={"test_ahead": {
+            "depth": 7, "batch": 8, "batches": 2}}), [
+            "merge.test_ahead.batches x batch must be at most depth + 1 (8)"])
+        self.assertEqual(self.problems(merge={"test_ahead": {
+            "batches": 2}}), [
+            "merge.test_ahead.batches above 1 needs batch above 1"])
+        self.assertEqual(self.problems(merge={"test_ahead": {
+            "batches": 0}}), ["merge.test_ahead.batches must be at least 1"])
+        self.assertEqual(self.problems(merge={"test_ahead": {
+            "batches": True}}),
+            ["merge.test_ahead.batches must be an integer"])
+
     def test_merge_test_ahead_batch(self):
         self.assertEqual(self.problems(merge={"test_ahead": {"batch": 4}}),
                          [])

@@ -2732,6 +2732,62 @@ class Batches(unittest.TestCase):
         self.assertEqual(self.size(self.entries(*"bxdef"), last), (4, None))
         self.assertEqual(self.size(self.entries(*"xyz"), last), (3, None))
 
+    def later(self, entries, size, last=None, red=(), started=()):
+        verdict = lambda t: False if t in red else None
+        return m.later_batches(entries, size, last, verdict,
+                               lambda sha, tree: tree in started)
+
+    def test_later_batches_follow_the_first(self):
+        # designs/0035 part 2: up to batches - 1 more, end to end.
+        m.configure(project(test_ahead={"batch": 2, "batches": 3,
+                                        "depth": 7}))
+        entries = self.entries(*"abcdefg")
+        self.assertEqual(self.later(entries, 2), [
+            {"size": 2, "trees": list("cd")},
+            {"size": 2, "trees": list("ef")}])
+        self.assertEqual(self.later(entries[:5], 2),
+                         [{"size": 2, "trees": list("cd")},
+                          {"size": 1, "trees": ["e"]}])
+        m.configure(project(test_ahead={"batch": 2}))
+        self.assertEqual(self.later(entries, 2), [])
+
+    def test_a_started_batch_is_fixed_and_the_next_grows(self):
+        m.configure(project(test_ahead={"batch": 3, "batches": 3,
+                                        "depth": 8}))
+        # #12's run started when the second batch was only c.
+        first = self.later(self.entries(*"abc"), 2, started="c")
+        self.assertEqual(first, [{"size": 1, "trees": ["c"], "fixed": True}])
+        # d and e arrived since: the fixed one keeps its size, and they
+        # make the next.
+        self.assertEqual(self.later(self.entries(*"abcde"), 2, first), [
+            {"size": 1, "trees": ["c"], "fixed": True},
+            {"size": 2, "trees": list("de")}])
+        # A change in it unfixes it.
+        self.assertEqual(self.later(self.entries(*"abxde"), 2, first), [
+            {"size": 3, "trees": list("xde")}])
+
+    def test_nothing_after_a_red_batch(self):
+        m.configure(project(test_ahead={"batch": 2, "batches": 3,
+                                        "depth": 7}))
+        entries = self.entries(*"abcdefg")
+        self.assertEqual(self.later(entries, 2, red="b"), [])
+        self.assertEqual(self.later(entries, 2, red="d"), [
+            {"size": 2, "trees": list("cd")}])
+        self.assertEqual(self.later(entries, 0), [])
+
+    def test_a_fixed_later_batch_follows_a_merged_one(self):
+        # The first batch merged; the later one, fixed, is the batch now
+        # at its own size, so its top's run counts for it.
+        later = [{"size": 2, "trees": list("ef"), "fixed": True}]
+        self.assertEqual(m.batch_size(self.entries(*"efgh"),
+                                      {"trees": list("abcd")},
+                                      lambda t: None, later), (2, None))
+        # Not one that wasn't fixed: that is a new batch.
+        later[0].pop("fixed")
+        self.assertEqual(m.batch_size(self.entries(*"efgh"),
+                                      {"trees": list("abcd")},
+                                      lambda t: None, later), (4, None))
+
     def test_the_lines(self):
         entries = self.entries(*"abcd")
         verdict = lambda t: t == "d" or None
@@ -2881,6 +2937,29 @@ class TickAhead(RepoCase):
                              check_state={"results": {top["sha"]: {
                                  "tree": top["tree"], "ok": True}}})
         self.assertNotIn(line, lines)
+
+    def test_later_batches_are_written_and_fixed_once_started(self):
+        # designs/0035 part 2.
+        m.configure(project(test_ahead={"batch": 2, "batches": 2,
+                                        "depth": 3}))
+        self.repo.branch("third", "origin/main")
+        sha = self.repo.commit("t.txt", "third\n", "third")
+        self.repo.publish_pr(7, sha)
+        self.repo.branch("feature", "feature")
+        third = pr(7, T1, head=sha, reviews=[review(REVIEWER, oid=sha)])
+        prs = [self.item(), self.other_pr(), third]
+        record, _ = self.tick(prs, conclusions=(None,), live=True)
+        ahead = self.ahead_json()
+        self.assertEqual(record["batch"], [5, 6])
+        self.assertEqual(record["later"], [[7]])
+        top = ahead["entries"][2]
+        self.assertEqual(ahead["later"], [{"size": 1,
+                                           "trees": [top["tree"]]}])
+        self.tick(prs, conclusions=(None,), live=True, minutes=1,
+                  check_state={"results": {},
+                               "ahead_started": {top["sha"]: "x"}})
+        self.assertEqual(self.ahead_json()["later"], [
+            {"size": 1, "trees": [top["tree"]], "fixed": True}])
 
     def test_a_red_top_splits_the_batch(self):
         m.configure(project(test_ahead={"batch": 2}))
