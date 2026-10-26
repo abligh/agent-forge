@@ -4609,6 +4609,36 @@ class Stacks(RepoCase):
             check_state={"results": {"x" * 40: {"tree": "t3", "ok": True}}})
         self.assertEqual(record["queue"], [4, 3, 6])
 
+    def test_a_layer_waits_for_a_green_later_batch_once_the_batch_merged(self):
+        # Seen on 2026-10-26: the batch merged, the one predicted on it
+        # was green, and a layer back from below went in front of it.
+        m.configure(project(stacks={}, test_ahead={"batch": 2,
+                                                   "batches": 2}))
+        self.merge_bottom()
+        older = self.other(4)
+        self.repo.branch("other", "origin/main")
+        sha = self.repo.commit("p.txt", "oldest\n", "oldest")
+        self.repo.publish_pr(3, sha)
+        self.repo.branch("feature", "feature")
+        oldest = pr(3, "2026-10-07T08:00:00Z", head=sha,
+                    reviews=[review(REVIEWER, oid=sha)])
+        m.save_json(os.path.join(self.state, m.AHEAD_FILE), {
+            "at": "2026-10-07T12:01:00Z", "entries": [
+                {"pr": 9, "head": "9" * 40, "tree": "t9"},
+                {"pr": 3, "head": sha, "tree": "t3"},
+                {"pr": 4, "head": older["headRefOid"], "tree": "t4"}],
+            "batch": {"size": 1, "trees": ["t9"]},
+            "later": [{"size": 2, "trees": ["t3", "t4"], "fixed": True}]})
+
+        def queue(ok):
+            record, _ = self.tick(
+                [oldest, older, self.layer("main")], live=False, minutes=2,
+                check_state={"results": {"x" * 40: {"tree": "t4",
+                                                    "ok": ok}}})
+            return record["queue"]
+        self.assertEqual(queue(True), [3, 4, 6])
+        self.assertEqual(queue(None)[0], 6)
+
     def test_max_run_lets_the_queue_have_a_turn(self):
         m.configure(project(stacks={"max_run": 1}))
         self.merge_bottom()
