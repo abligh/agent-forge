@@ -892,6 +892,12 @@ class Decide(RepoCase):
             self.assertEqual(got["to"], "author", name)
             self.assertIn("%s exited 1: refused here" % name, got["reason"])
 
+    def test_a_tool_refusal_names_the_description_it_judged(self):
+        got = self.decide(results={"closing-keywords": (1, "refused")})
+        self.assertEqual(got["text"], m.description(self.item()))
+        got = self.decide(runs=[ci_run("failure")])
+        self.assertNotIn("text", got)
+
     def test_the_tools_are_given_the_pull_request_and_range(self):
         seen = []
         base = tools_run()
@@ -3227,6 +3233,52 @@ class TickAhead(RepoCase):
         self.assertFalse([d for d in record["decisions"] if d.get("ahead")])
         self.assertFalse([w for w in self.github.writes
                           if "/issues/6/comments" in str(w)])
+
+    def test_a_new_description_lets_a_gate_hand_back_rejoin(self):
+        # Seen on 2026-10-26: handed back for an undeclared closing
+        # keyword, fixed by an edit of the body two minutes later, and
+        # still out of every batch an hour on: neither the head nor the
+        # approval had changed.
+        m.configure(project(test_ahead={"batch": 3}))
+        self.repo.branch("third", "origin/main")
+        sha = self.repo.commit("t.txt", "third\n", "third")
+        self.repo.publish_pr(7, sha)
+        self.repo.branch("feature", "feature")
+        prs = [self.item(), self.other_pr(),
+               pr(7, T1, head=sha, reviews=[review(REVIEWER, oid=sha)])]
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              run=self.gate_refuses(6))
+        self.assertEqual(record["ahead"], [5, 7])
+        prs[1] = dict(prs[1], body="Closes #9.")
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              minutes=1, run=self.gate_refuses(0))
+        # Behind the batch already predicted, which it doesn't disturb.
+        self.assertEqual(record["ahead"], [5, 7, 6])
+        # Refused again for the new description, it is said again: the
+        # author has a new answer to read.
+        before = len([w for w in self.github.writes
+                      if "/issues/6/comments" in str(w)])
+        prs[1] = dict(prs[1], body="Closes #8.")
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              minutes=2, run=self.gate_refuses(6))
+        self.assertEqual(record["ahead"], [5, 7])
+        self.assertEqual(len([w for w in self.github.writes
+                              if "/issues/6/comments" in str(w)]),
+                         before + 1)
+
+    def test_a_new_description_does_not_undo_other_hand_backs(self):
+        six = self.other_pr()
+        approval = m.approval_of(six)
+        said = {"6": m.hand_back_key(approval, six["headRefOid"],
+                                     m.CONFLICT_REASON)}
+        self.assertTrue(m.handed_back(said, dict(six, body="new"), approval))
+        said = {"6": m.hand_back_key(approval, six["headRefOid"], "gate",
+                                     m.description(six))}
+        self.assertTrue(m.handed_back(said, six, approval))
+        self.assertFalse(m.handed_back(said, dict(six, body="new"),
+                                       approval))
+        self.assertFalse(m.handed_back(said, dict(six, title="new"),
+                                       approval))
 
     def test_a_member_that_passes_is_checked_once(self):
         m.configure(project(test_ahead={"batch": 2}))
