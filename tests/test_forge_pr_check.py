@@ -1933,13 +1933,21 @@ def entry(pr, sha, tree, **more):
                 **more)
 
 
-def write_ahead(merger_dir, entries, when=T0, repo="/repo", batch=None):
+def write_ahead(merger_dir, entries, when=T0, repo="/repo", batch=None,
+                later=()):
     said = {"at": pc.iso(when), "base": "0" * 40, "repo": repo,
             "entries": entries}
     if batch:
         # designs/0032: the first `batch` entries are the batch.
         said["batch"] = {"size": batch,
                          "trees": [e["tree"] for e in entries[:batch]]}
+    if later:
+        # designs/0035 part 2: the batches after it, by size.
+        said["later"], at = [], batch
+        for size in later:
+            said["later"].append({"size": size, "trees": [
+                e["tree"] for e in entries[at:at + size]]})
+            at += size
     with open(os.path.join(merger_dir, "ahead.json"), "w") as handle:
         json.dump(said, handle)
 
@@ -2022,6 +2030,55 @@ class Batch(unittest.TestCase):
         state = empty()
         state["results"][SHA_A] = verdict(covered="#7..#8", matched=SHA_Q)
         self.assertIsNone(pc.tested(state, TREE_1, T0))
+
+    def later(self):
+        """Batches of 2 and 1 and 1: #7..#8, then #9, then #10."""
+        entries = self.entries + [entry(10, SHA_A, "4" * 40)]
+        write_ahead(self.dir, entries, batch=2, later=(1, 1))
+        return entries
+
+    def test_the_later_tops_are_read(self):
+        entries = self.later()
+        self.assertEqual(pc.merger_later(self.dir, T0), entries[2:])
+        # One whose trees aren't those that follow ends the list.
+        with open(os.path.join(self.dir, "ahead.json")) as handle:
+            said = json.load(handle)
+        said["later"][1]["trees"] = [TREE_1]
+        with open(os.path.join(self.dir, "ahead.json"), "w") as handle:
+            json.dump(said, handle)
+        self.assertEqual(pc.merger_later(self.dir, T0), entries[2:3])
+        write_ahead(self.dir, entries, batch=2)
+        self.assertEqual(pc.merger_later(self.dir, T0), [])
+
+    def test_a_later_top_runs_while_the_top_is_running(self):
+        entries = self.later()
+        tops = pc.merger_later(self.dir, T0)
+        state = empty()
+        self.assertEqual(pc.next_ahead(state, entries, when=T0,
+                                       batch=entries[:2], later=tops),
+                         (SHA_Q, 8))
+        self.assertEqual(pc.next_ahead(state, entries, busy={SHA_Q},
+                                       when=T0, batch=entries[:2],
+                                       later=tops), (SHA_C, 9))
+        self.assertEqual(pc.next_ahead(state, entries, busy={SHA_Q, SHA_C},
+                                       when=T0, batch=entries[:2],
+                                       later=tops), (SHA_A, 10))
+        # Not without them: the caller passes none when a head waits.
+        self.assertIsNone(pc.next_ahead(state, entries, busy={SHA_Q},
+                                        when=T0, batch=entries[:2]))
+
+    def test_nothing_after_a_red_top(self):
+        entries = self.later()
+        tops = pc.merger_later(self.dir, T0)
+        state = empty()
+        state["results"][SHA_Q] = verdict(pr=8, tree=TREE_3, ok=False)
+        self.assertIsNone(pc.next_ahead(state, entries, when=T0,
+                                        batch=entries[:2], later=tops))
+        state = empty()
+        state["results"][SHA_C] = verdict(pr=9, tree=TREE_2, ok=False)
+        self.assertIsNone(pc.next_ahead(state, entries, busy={SHA_Q},
+                                        when=T0, batch=entries[:2],
+                                        later=tops))
 
     def test_the_status_says_which_batch(self):
         record = verdict(pr=7, matched=SHA_Q, covered="#7..#8")

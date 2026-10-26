@@ -110,7 +110,7 @@ BLOCKED_BY = ("body", "everywhere")
 RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int}
 STACKS = {"max_run": int, "wait_hours": int}
 TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
-              "batch": int, "stacks": bool}
+              "batch": int, "stacks": bool, "batches": int}
 STALL_ALERT = {"tell": list, "retell_minutes": int,
                "owner_after_minutes": int, "title": str, "labels": list}
 # checks is shared with tools not here yet, so only these keys are
@@ -1063,6 +1063,18 @@ def _check_test_ahead(ahead, checks, problems):
         if not 1 <= ahead["batch"] <= depth + 1:
             problems.append("%s.batch must be at least 1 and at most "
                             "depth + 1 (%d)" % (where, depth + 1))
+    if _is(ahead.get("batches"), int):
+        # designs/0035 part 2: up to `batches` batches of up to `batch`
+        # each are predicted end to end.
+        depth = ahead["depth"] if _is(ahead.get("depth"), int) else 3
+        batch = ahead["batch"] if _is(ahead.get("batch"), int) else 1
+        if ahead["batches"] < 1:
+            problems.append("%s.batches must be at least 1" % where)
+        elif ahead["batches"] > 1 and batch < 2:
+            problems.append("%s.batches above 1 needs batch above 1" % where)
+        elif ahead["batches"] * batch > depth + 1:
+            problems.append("%s.batches x batch must be at most depth + 1 "
+                            "(%d)" % (where, depth + 1))
     if isinstance(checks, dict) and checks.get("merger_first") is False:
         problems.append("%s puts the Merger's pull request first, so "
                         "checks.merger_first must not be false" % where)

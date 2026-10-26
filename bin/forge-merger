@@ -339,6 +339,18 @@ tip is never a tree no run tested unless a member is handed back
 after others merged. The build check's state is read from its state
 directory, as for `merge.queued_stall_minutes`.
 
+**With `merge.test_ahead.batches` above 1, batches run side by side**
+(designs/0035 part 2; default 1). Up to that many batches are predicted
+end to end, each from the top of the one before, and those after the
+first are `later` in `ahead.json` (`size`, `trees`) and the record.
+`forge-pr-check` runs their tops in spare slots. Once a later batch's
+top has started (the build check's `ahead_started`, or a verdict on its
+tree), it is `fixed`: its size stays while its trees still come next.
+The first that isn't fixed takes newly ready pull requests at its end,
+up to `batch`. When the batch before has merged, a fixed one is the
+batch at its own size, so its top's green covers it at once. Nothing
+follows a red first batch, or a later one whose top is red.
+
 **With `merge.test_ahead.stacks`, a stack's ready layers join their
 base's batch** (designs/0035): each is predicted straight after the
 pull request it is stacked on, while it would be eligible but for its
@@ -584,6 +596,11 @@ AHEAD_IDENTITY = ("forge-merger", "merger@agent-forge.invalid")
 # check run covers. The first that many are the batch, the last its
 # top: only the top is run, and its green covers the rest.
 AHEAD_BATCH = 1
+# merge.test_ahead.batches (designs/0035 part 2): how many batches are
+# predicted end to end. Those after the first are `later` in ahead.json,
+# and the build check runs their tops in spare slots. One whose top's
+# run has started is `fixed`; the first that isn't grows at its end.
+AHEAD_BATCHES = 1
 # merge.test_ahead.stacks (designs/0035): a stack's ready layers are
 # predicted straight after their base, so they join its batch. A queued
 # pull request a layer pushed out of the batch is `owed` in ahead.json,
@@ -709,7 +726,7 @@ def configure(project):
     global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS, URGENT_LABEL
     global STACKS, STACK_MAX_RUN, STACK_WAIT, RESOLVE, HOLD_LABELS, BLOCKED_BY
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
-    global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS
+    global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -741,6 +758,7 @@ def configure(project):
     TEST_AHEAD = ahead is not None
     AHEAD_DEPTH = (ahead or {}).get("depth", DEFAULT_AHEAD_DEPTH)
     AHEAD_BATCH = (ahead or {}).get("batch", 1)
+    AHEAD_BATCHES = (ahead or {}).get("batches", 1)
     HOLD_CONFLICTING = merge.get("hold_conflicting", False) is True
     YIELD_PLACES = merge.get("yield_after_hand_back", 0)
     YIELD_CAP = merge.get("yield_cap", 3)
@@ -3067,6 +3085,14 @@ def predicted(state_dir):
             if isinstance(entry, dict)}
 
 
+def ahead_started(check_state, sha, tree):
+    """Whether the build check has started a run of the prediction
+    `sha`, or has a verdict on its tree."""
+    started = (check_state or {}).get("ahead_started")
+    return (isinstance(started, dict) and sha in started) \
+        or tree_verdict(check_state, tree) is not None
+
+
 def tree_verdict(check_state, tree):
     """The build check's verdict on `tree` from its state: True when a
     run of it, or a match to one, is green, False when it has only red
@@ -3079,22 +3105,28 @@ def tree_verdict(check_state, tree):
     return any(oks) if oks else None
 
 
-def batch_size(entries, last, verdict):
+def batch_size(entries, last, verdict, later=()):
     """(size, red): how many of the predictions `entries` are the batch
     (designs/0032), and the size before any red top split it, or None.
     The batch `last` (ahead.json's, its `trees`) goes on while what is
     left of it still leads the predictions: those that merged since are
-    gone from its front, the rest are unchanged. Otherwise a new one is
-    the first AHEAD_BATCH, ending at a tree already red. A red top
-    halves it, rounding up, until the top isn't red or only one is
-    left. `verdict(tree)` is `tree_verdict`'s answer."""
+    gone from its front, the rest are unchanged. Once it is gone, the
+    first of the `later` batches (designs/0035 part 2) follows it if it
+    was fixed and still leads them, since its top's run counts for it.
+    Otherwise a new one is the first AHEAD_BATCH, ending at a tree
+    already red. A red top halves it, rounding up, until the top isn't
+    red or only one is left. `verdict(tree)` is `tree_verdict`'s
+    answer."""
     trees = [e["tree"] for e in entries]
-    old = (last or {}).get("trees") or []
     size = 0
-    if old and old[-1] in trees:
-        i = trees.index(old[-1])
-        if i < len(old) and trees[:i + 1] == old[len(old) - i - 1:]:
-            size = i + 1
+    for old in [(last or {}).get("trees") or []] + [
+            b.get("trees") or [] for b in list(later)[:1]
+            if isinstance(b, dict) and b.get("fixed")]:
+        if old and old[-1] in trees:
+            i = trees.index(old[-1])
+            if i < len(old) and trees[:i + 1] == old[len(old) - i - 1:]:
+                size = i + 1
+                break
     if not size:
         size = min(AHEAD_BATCH, len(trees))
         red = [k for k, t in enumerate(trees[:size]) if verdict(t) is False]
@@ -3105,6 +3137,39 @@ def batch_size(entries, last, verdict):
         red = red or size
         size = (size + 1) // 2
     return size, red
+
+
+def later_batches(entries, size, last, verdict, started):
+    """designs/0035 part 2: the batches after the first `size` of the
+    predictions `entries`, end to end, as [{size, trees, fixed?}], at
+    most AHEAD_BATCHES - 1 of them. A batch of the last tick's (`last`,
+    ahead.json's `later`) that was `fixed` keeps its size while its
+    trees still come next; the first that isn't takes up to
+    AHEAD_BATCH, so it grows at its end until its top's run starts
+    (`started(sha, tree)`), and is fixed from then on. Nothing follows
+    a red first batch, nor a later one whose top is red: each later
+    tree contains it."""
+    trees = [e["tree"] for e in entries]
+    if size < 1 or verdict(trees[size - 1]) is False:
+        return []
+    fixed = [b["trees"] for b in (last or ())
+             if isinstance(b, dict) and b.get("fixed")
+             and isinstance(b.get("trees"), list) and b["trees"]]
+    out, at = [], size
+    while len(out) < AHEAD_BATCHES - 1 and at < len(trees):
+        # Matched by its trees, not its place: the first of them moves
+        # up once the batch before it has merged.
+        kept = [t for t in fixed if trees[at:at + len(t)] == t]
+        n = len(kept[0]) if kept else min(AHEAD_BATCH, len(trees) - at)
+        top = entries[at + n - 1]
+        batch = {"size": n, "trees": trees[at:at + n]}
+        if kept or started(top["sha"], top["tree"]):
+            batch["fixed"] = True
+        out.append(batch)
+        if verdict(top["tree"]) is False:
+            break
+        at += n
+    return out
 
 
 def batch_line(entries, size, red, verdict):
@@ -3730,12 +3795,27 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if AHEAD_BATCH > 1 and entries:
                 verdict = lambda tree: tree_verdict(check_state, tree)
                 size, red = batch_size(entries, (last or {}).get("batch"),
-                                       verdict)
+                                       verdict, (last or {}).get("later")
+                                       or ())
                 line = batch_line(entries, size, red, verdict)
                 said_ahead["batch"] = {
                     "size": size, "trees": [e["tree"]
                                             for e in entries[:size]]}
                 record["batch"] = [e["pr"] for e in entries[:size]]
+                if AHEAD_BATCHES > 1:
+                    later = later_batches(
+                        entries, 0 if red else size,
+                        (last or {}).get("later"), verdict,
+                        lambda sha, tree: ahead_started(check_state, sha,
+                                                        tree))
+                    if later:
+                        said_ahead["later"] = later
+                        at, record["later"] = size, []
+                        for batch in later:
+                            record["later"].append([
+                                e["pr"] for e in
+                                entries[at:at + batch["size"]]])
+                            at += batch["size"]
                 if line:
                     said_ahead["batch"]["said"] = line
                     if line != ((last or {}).get("batch") or {}).get("said"):

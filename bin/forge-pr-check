@@ -195,6 +195,14 @@ head is matched to it, and a head's own tree in the predictions is run
 after all when a batch covered that head. A red top leaves each head
 to its own run, and the Merger halves the batch.
 
+**With `merge.test_ahead.batches` above 1, later batches' tops run in
+spare slots** (designs/0035 part 2). `ahead.json`'s `later` names the
+batches after the first, by size and trees. Once the batch's top is
+running or has a verdict, step 2 starts the first later top that needs
+a run, but only for a slot no ordinary head would take. Nothing after
+a red top: each later tree contains it. A later top's green counts once
+the Merger makes that batch the batch, by its tree.
+
 An entry is checked out from the object store its worktree shares with
 the Merger's checkout, so nothing is fetched and nothing is pushed; the
 Merger and this tool must therefore use the same checkout (`repo` in
@@ -1948,6 +1956,32 @@ def merger_batch(merger_dir, when, repo=None):
     return entries[:size]
 
 
+def merger_later(merger_dir, when, repo=None):
+    """designs/0035 part 2: the tops of the Merger's later batches, the
+    ones after its batch, in order, or [] when there are none, or
+    ahead.json can't be read as merger_batch reads it, or a later
+    batch's `trees` aren't those of the entries that follow."""
+    batch = merger_batch(merger_dir, when, repo)
+    if not batch:
+        return []
+    entries = merger_ahead(merger_dir, when, repo)
+    try:
+        with open(os.path.join(merger_dir, "ahead.json")) as handle:
+            later = json.load(handle).get("later") or []
+        tops, at = [], len(batch)
+        for b in later:
+            size, trees = b["size"], b["trees"]
+            if not isinstance(size, int) or isinstance(size, bool) \
+                    or size < 1 or [e["tree"] for e in
+                                    entries[at:at + size]] != trees:
+                break
+            tops.append(entries[at + size - 1])
+            at += size
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return []
+    return tops
+
+
 def is_front(merger_dir, when, sha, pr, ahead=False, repo=None):
     """designs/0031: whether sha's run is one the next merge waits on,
     as the Merger's files say at `when`: with `ahead`, the first of its
@@ -2026,7 +2060,8 @@ def tested(state, tree, when, ok=None, accept=None):
     return best[0] if best else None
 
 
-def next_ahead(state, ahead, busy=(), when=None, busy_trees=(), batch=()):
+def next_ahead(state, ahead, busy=(), when=None, busy_trees=(), batch=(),
+               later=()):
     """(sha, pr) of the first of the Merger's predictions, `ahead`, that
     is worth a run, or None: not running in a slot (`busy`) or started
     less than START_GRACE before `when`, not given up on, not the head's
@@ -2039,10 +2074,12 @@ def next_ahead(state, ahead, busy=(), when=None, busy_trees=(), batch=()):
     tick anyway. With a `batch` (designs/0032), only its top, even when
     the top is a head's own tree. Nor is a head's own tree left to its
     check when a batch covered that head: its check is over, and no run
-    tested the tree."""
+    tested the tree. After the batch's top, the tops of its `later`
+    batches (designs/0035 part 2), in order: the caller passes them only
+    for a spare slot."""
     started = state.get("ahead_started", {})
     when = when or now_utc()
-    for entry in batch[-1:] or ahead:
+    for entry in (batch[-1:] + list(later)) if batch else ahead:
         sha = entry["sha"]
         if tested(state, entry["tree"], when, ok=False) is not None \
                 and tested(state, entry["tree"], when, ok=True) is None:
@@ -2960,9 +2997,13 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                         or put_first(state["waiting"][pick[0]])
                         or (pick[1] == 0 and (urgent or held or main_due(
                             state["waiting"][pick[0]], when))))):
-                    predicted = next_ahead(state, ahead, taken, when,
-                                           busy_trees(taken, checkout, run),
-                                           batch)
+                    # A later batch's top only in a slot no head
+                    # wants (designs/0035 part 2).
+                    predicted = next_ahead(
+                        state, ahead, taken, when,
+                        busy_trees(taken, checkout, run), batch,
+                        merger_later(merger_dir, when, checkout)
+                        if pick is None else ())
             if predicted is not None:
                 state.setdefault("ahead_started", {})[predicted[0]] = \
                     iso(when)
