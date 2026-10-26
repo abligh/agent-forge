@@ -319,7 +319,7 @@ Part 2 now comes before part 3, since that is where the time goes:
 
 ## Amendment (2026-10-26, second): a red batch keeps its suspects, and a covered member needs no estimate
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-26, https://github.com/abligh/agent-forge/issues/124#issuecomment-6415961308)
 
 **Why.** On one project, 09:00 to 11:30Z on 26 October, 17 of 21 batch
 tops were red and 12 pull requests merged, against 59 in the nine
