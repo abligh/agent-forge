@@ -174,7 +174,7 @@ Two things to expect at step 3:
 
 ## Amendment (2026-10-26): a step's share is never less than its run's
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-26, https://github.com/abligh/agent-forge/issues/133#issuecomment-6417470485)
 
 **Why.** With `cpu_share: "step"` turned on, a day's long test step was
 slower at every level of load than the day before. CPU seconds per
