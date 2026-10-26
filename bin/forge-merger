@@ -3933,15 +3933,21 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # its run. Predicted past the batch is not in it: on 2026-10-26
         # a layer predicted 16th went in front of a green batch's six
         # members left to merge.
-        late = (set(first) - batch_members(state_dir, queue)
-                if TEST_AHEAD and (in_flight is not None or green_batch(
-                    state_dir, queue, check_state)) else set())
+        merging = TEST_AHEAD and (in_flight is not None or green_batch(
+            state_dir, queue, check_state))
+        members = batch_members(state_dir, queue) if merging else set()
+        late = set(first) - members if merging else set()
         places = locked_order(state_dir, queue) if late else {}
+        # An urgent pull request goes ahead of a layer that comes back,
+        # though not ahead of the batch being merged (Alex, 2026-10-26:
+        # a pin waited behind four layers in turn, an hour and a half).
         queue.sort(key=lambda pr: (
             pr["number"] != in_flight,
-            0 if pr["number"] in first and pr["number"] not in late
-            else 1 if pr["number"] in places
-            else 2 if pr["number"] in late else 3))
+            0 if pr["number"] in members
+            else 1 if urgent(pr) and pr["number"] not in first
+            else 2 if pr["number"] in first and pr["number"] not in late
+            else 3 if pr["number"] in places
+            else 4 if pr["number"] in late else 5))
     if MAIN_RED_FIXES & {pr["number"] for pr in queue}:
         # A red default branch's fix goes first, behind only the one in
         # flight and a green batch still merging, whose run is spent

@@ -4639,6 +4639,15 @@ class Stacks(RepoCase):
         self.assertEqual(queue(True), [3, 4, 6])
         self.assertEqual(queue(None)[0], 6)
 
+    def test_an_urgent_one_goes_ahead_of_a_layer_that_comes_back(self):
+        # 2026-10-26: an urgent pin waited behind four layers in turn.
+        m.configure(urgent_project(stacks={}, test_ahead={"batch": 2}))
+        self.merge_bottom()
+        older = labelled(self.other(4), "Priority:urgent")
+        record, _ = self.tick([older, self.layer("main")], live=False,
+                              minutes=2)
+        self.assertEqual(record["queue"], [4, 6])
+
     def test_max_run_lets_the_queue_have_a_turn(self):
         m.configure(project(stacks={"max_run": 1}))
         self.merge_bottom()
