@@ -363,6 +363,15 @@ up to `batch`. When the batch before has merged, a fixed one is the
 batch at its own size, so its top's green covers it at once. Nothing
 follows a red first batch, or a later one whose top is red.
 
+**A member is checked before its batch** (designs/0035, fourth
+amendment). Before predicting, the Merger runs, for each pull request
+it would predict on the default branch, the checks that don't depend
+on its place: the approval covers the head, and each `merge.gate`
+tool. One that fails is handed back at once, as at merge time, with
+`CHECKED-AHEAD #n: <reason>; handed back before its batch`, and isn't
+predicted. Results are kept in `checked.json` by head, approved commit
+and description, so each runs once; merge time checks again.
+
 **A red batch keeps its suspects** (designs/0035, second amendment).
 When a batch's top is red, its members become its suspects, kept in
 `suspects.json` with their heads and the red top's tree, and the batch
@@ -481,6 +490,7 @@ token, GitHub or git failed) or the head it waits on is `STALLED`.
 import argparse
 import base64
 import datetime
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -662,6 +672,7 @@ COVERED_TEXT = "covered by batch"
 # designs/0035, second amendment: a red batch's members, kept until the
 # red one among them is found.
 SUSPECTS_FILE = "suspects.json"
+CHECKED_FILE = "checked.json"
 # designs/0011, amendment: a head red only where the tip it was merged
 # with is red itself waits for the tip to be fixed, not handed back.
 BASE_RED_REASON = ("%s is red only in %s, as %s is at %s; waits for it to "
@@ -2680,6 +2691,45 @@ def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
     return decisions
 
 
+def checked_ahead(state_dir, repo, pr, approval, main_tip, env, run=sh,
+                  regenerated=None):
+    """designs/0035, fourth amendment: (to, reason) when `pr` would be
+    handed back at merge time for something its place in the queue
+    doesn't change (its approval doesn't cover its head, or a
+    `merge.gate` tool refuses it), else None. Checked once per head,
+    approved commit, title and body (CHECKED_FILE); merge time checks
+    again, as before."""
+    approved = (approval.get("commit") or {}).get("oid")
+    approver = APPROVERS.get(login(approval), "a reviewer")
+    if not approved:
+        return approver, "the approval names no commit"
+    text = "%s\n%s" % (pr.get("title") or "", pr.get("body") or "")
+    key = "%s %s %s" % (pr["headRefOid"], approved,
+                        hashlib.sha256(text.encode()).hexdigest()[:16])
+    path = os.path.join(state_dir, CHECKED_FILE)
+    checked = load_json(path, {})
+    entry = checked.get(str(pr["number"]))
+    if isinstance(entry, dict) and entry.get("key") == key:
+        return tuple(entry["failed"]) if entry.get("failed") else None
+    if fetch_pr(repo, pr["number"], pr["headRefOid"], run).returncode != 0:
+        return None
+    covered, why = covers_head(repo, approved, pr["headRefOid"],
+                               "refs/remotes/origin/" + MAIN, run, (),
+                               regenerated)
+    if covered is None:
+        return None
+    failed = None if covered else (approver, why)
+    for argv in GATE if failed is None else ():
+        problem = tool_problem(gate_args(argv, repo, pr["number"], main_tip,
+                                         pr["headRefOid"]), env, repo, run)
+        if problem:
+            failed = ("author", problem)
+            break
+    checked[str(pr["number"])] = {"key": key, "failed": failed}
+    save_json(path, checked)
+    return failed
+
+
 def handed_back(said, pr, approval):
     """Whether `pr` was handed back under the approval it has now, at the
     head it has now: it would only be handed back again, so it is not
@@ -4244,6 +4294,27 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # and its members waited for a new run of their own.
         if TEST_AHEAD and retarget is None:
             acting = [pr for pr in queue if pr["number"] == waiting_on]
+            for pr in [pr for pr in queue if pr["number"] != waiting_on
+                       and pr.get("baseRefName", MAIN) == MAIN
+                       and not handed_back(said, pr, approvals[pr["number"]])
+                       ][:AHEAD_DEPTH] if AHEAD_BATCH > 1 else ():
+                # Found before its batch is predicted, not from the middle
+                # of it (designs/0035, fourth amendment).
+                failed = checked_ahead(state_dir, repo, pr,
+                                       approvals[pr["number"]], main_tip,
+                                       github.env, run, regenerated)
+                if not failed:
+                    continue
+                decision = {"action": "HAND-BACK", "to": failed[0],
+                            "reason": failed[1], "pr": pr["number"],
+                            "head": pr["headRefOid"], "ahead": True}
+                if live:
+                    decision["result"] = carry_out(
+                        decision, approvals[pr["number"]], github, said)
+                record["decisions"].append(decision)
+                out("CHECKED-AHEAD #%d: %s; %shanded back before its batch"
+                    % (pr["number"], failed[1].splitlines()[0],
+                       "" if live else "would be "))
             rest = [pr for pr in queue if pr["number"] != waiting_on
                     and not handed_back(said, pr, approvals[pr["number"]])]
             ahead_queue = acting + rest if acting else []

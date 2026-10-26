@@ -1028,7 +1028,7 @@ class Tick(Decide):
 
     def tick(self, prs, issues=(), conclusions=("success",), live=False,
              refuse=None, minutes=0, send=None, extra=None,
-             check_state=None):
+             check_state=None, run=None):
         github = FakeGitHub(dict(answers(conclusions, prs=prs, issues=issues),
                                  **(extra or {})), refuse)
         self.github = github
@@ -1036,7 +1036,7 @@ class Tick(Decide):
         state = self.state = os.path.join(self.tmp.name, "state")
         start = datetime.datetime(2026, 10, 7, 12, 0, 0,
                                   tzinfo=datetime.timezone.utc)
-        record = m.tick(self.repo.path, state, github, tools_run(),
+        record = m.tick(self.repo.path, state, github, run or tools_run(),
                         lines.append,
                         now=lambda: start + datetime.timedelta(minutes=minutes),
                         live=live, send=send, check_state=check_state)
@@ -3181,6 +3181,65 @@ class TickAhead(RepoCase):
         self.assertEqual(saved["merged"], [5])
         self.assertEqual(record["ahead"], [6, 7])
         self.assertFalse([l for l in lines if l.startswith("BATCH ")])
+
+    def gate_refuses(self, number, calls=None):
+        """`run` whose closing-keywords gate refuses pull request
+        `number`, counting its calls in `calls`."""
+        def run(args, cwd=None, env=None):
+            if os.path.basename(args[0]) == "closing-keywords":
+                if calls is not None:
+                    calls.append(args[args.index("--pr") + 1])
+                if args[args.index("--pr") + 1] == str(number):
+                    return subprocess.CompletedProcess(
+                        args, 1, "#9 closes from a commit, undeclared", "")
+            return tools_run()(args, cwd, env)
+        return run
+
+    def test_a_member_the_gate_refuses_goes_back_before_its_batch(self):
+        # designs/0035, fourth amendment. Seen on 2026-10-26: the third
+        # member of a green batch of eight was handed back mid-merge
+        # for a closing keyword, and every member after it ran again.
+        m.configure(project(test_ahead={"batch": 3}))
+        self.repo.branch("third", "origin/main")
+        sha = self.repo.commit("t.txt", "third\n", "third")
+        self.repo.publish_pr(7, sha)
+        self.repo.branch("feature", "feature")
+        prs = [self.item(), self.other_pr(),
+               pr(7, T1, head=sha, reviews=[review(REVIEWER, oid=sha)])]
+        calls = []
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  run=self.gate_refuses(6, calls))
+        back = [d for d in record["decisions"] if d.get("ahead")]
+        self.assertEqual([(d["pr"], d["action"], d["to"]) for d in back],
+                         [(6, "HAND-BACK", "author")])
+        self.assertEqual(back[0]["result"], "done")
+        self.assertIn("CHECKED-AHEAD #6", " ".join(lines))
+        self.assertEqual(record["ahead"], [5, 7])
+        self.assertEqual(record["batch"], [5, 7])
+        # Once per head: the next tick runs the gate for no one again.
+        calls.clear()
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              minutes=1, run=self.gate_refuses(6, calls))
+        self.assertEqual(calls, [])
+        self.assertEqual(record["ahead"], [5, 7])
+
+    def test_a_member_that_passes_is_checked_once(self):
+        m.configure(project(test_ahead={"batch": 2}))
+        prs = [self.item(), self.other_pr()]
+        calls = []
+        self.tick(prs, conclusions=(None,), live=True,
+                  run=self.gate_refuses(0, calls))
+        self.assertEqual(calls, ["6"])
+        calls.clear()
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              minutes=1, run=self.gate_refuses(0, calls))
+        self.assertEqual(calls, [])
+        self.assertEqual(record["ahead"], [5, 6])
+        # A new description is checked again.
+        prs[1] = dict(prs[1], body="Closes #9.")
+        self.tick(prs, conclusions=(None,), live=True, minutes=2,
+                  run=self.gate_refuses(0, calls))
+        self.assertEqual(calls, ["6"])
 
     def test_without_a_batch_nothing_is_said_of_one(self):
         record, _ = self.tick([self.item(), self.other_pr()],

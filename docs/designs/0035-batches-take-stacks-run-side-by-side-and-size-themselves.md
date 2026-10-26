@@ -441,7 +441,7 @@ batch, as it does while a merge is in flight. No new key.
 
 ## Amendment (2026-10-26, fourth): a member is checked before its batch is predicted
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-26, in the terminal: "#144, #146 and sort of #148 approved"; https://github.com/abligh/agent-forge/issues/147)
 
 **Why.** On one project on 26 October, 14 pull requests were handed
 back from the middle of the current batch. Each one gave every member
