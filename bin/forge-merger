@@ -136,7 +136,13 @@ on `main`, a layer goes first in the queue, after only the one a
 `test_ahead` run is in flight for, and is updated, checked and merged
 like any other; a merge of a merged layer's head into it, made after its
 approval, covers its head like a merge of `main` when it is clean. A
-layer that isn't eligible ends the stack and is held as usual. With
+layer that isn't eligible ends the stack and is held as usual, unless
+`merge.stacks.wait_hours` is set (designs/0033): then it stays in
+`stacks.json`, held as `stacked on #Q, which merged; waiting for: <why>`
+and judged again every tick, and is retargeted once it is eligible but
+for its base, keeping its usual place in the queue (the layers above it
+still go first once it merges). After `wait_hours` it leaves the stack,
+and the Merger says so once on it (the record's `stack_waited`). With
 `max_run`, once that many layers merged in a row the next keeps its
 usual place. The record's `stack` lists the layers still to come.
 
@@ -608,6 +614,15 @@ STACK_MAX_RUN = 0
 STACK_FILE = "stacks.json"
 STACK_FOR = datetime.timedelta(hours=24)
 STACK_REASON = "stacked on #%d"
+# designs/0033: merge.stacks.wait_hours, how long a layer that wasn't
+# ready when the layer below merged stays in its stack; None drops it.
+STACK_WAIT = None
+STACK_WAIT_REASON = "%s, which merged; waiting for: %s"
+# What the Merger says, once, on a layer that waited out STACK_WAIT.
+STACK_WAITED_NOTE = ("Not-a-review\n\nThis layer waited %d hours for its "
+                     "approval after #%d merged, and the Merger no longer "
+                     "retargets it. Retarget it to `%s` and ask for its "
+                     "approvals again.\n\n%s")
 RESTACKED_FILE = "restacked.json"
 STACK_UPDATED_FILE = "stack-updated.json"
 # How far back `main`'s first-parent history is searched for the squash
@@ -663,7 +678,8 @@ def configure(project):
     (default none: nobody has it; `after_conflicts`, default 2, and
     `minutes`, default 60) and `code_owners` (default false) and
     `stacks` (default none: a stacked pull request is held; `max_run`,
-    default 0, no limit), and design 0026's `resolve`, `hold_labels`,
+    default 0, no limit; `wait_hours`, default none: a layer that isn't
+    ready when the layer below merges leaves the stack), and design 0026's `resolve`, `hold_labels`,
     `blocked_by`, `said_since`, `update_once`, `ci_never_started`,
     `queued_stall_minutes` and `read_as` (each off unless set). The
     `checks` section: `context` and `poster` (default the merger).
@@ -676,7 +692,7 @@ def configure(project):
     global TEST_AHEAD, AHEAD_DEPTH, AHEAD_BATCH, HOLD_CONFLICTING, YIELD_PLACES
     global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
     global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS, URGENT_LABEL
-    global STACKS, STACK_MAX_RUN, RESOLVE, HOLD_LABELS, BLOCKED_BY
+    global STACKS, STACK_MAX_RUN, STACK_WAIT, RESOLVE, HOLD_LABELS, BLOCKED_BY
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
     global QUEUED_STALL_AFTER, READ_AS
     merge, checks = project.section("merge"), project.section("checks")
@@ -724,6 +740,8 @@ def configure(project):
     stacks = merge.get("stacks")
     STACKS = stacks is not None
     STACK_MAX_RUN = (stacks or {}).get("max_run", 0)
+    wait = (stacks or {}).get("wait_hours")
+    STACK_WAIT = datetime.timedelta(hours=wait) if wait else None
     RESOLVE = tuple({"paths": frozenset(rule["paths"]),
                      "command": tuple(rule["command"]),
                      "check": tuple(rule["check"])}
@@ -3036,7 +3054,9 @@ def load_stack(state_dir, prs, when):
     """The stack in progress (designs/0025), from STACK_FILE: `heads`
     merged so far, `run` (layers merged in a row) and `pending`, each
     `{"pr", "after", "branch"}`, with the pull requests no longer open
-    left out. Empty when there is none, or it is older than STACK_FOR."""
+    left out. Empty when there is none, or it is older than STACK_FOR,
+    except that with STACK_WAIT a layer waiting for its approval
+    (designs/0033: `since`) keeps the stack, `next_layer` timing it."""
     state = load_json(os.path.join(state_dir, STACK_FILE), {})
     if not isinstance(state, dict) or not state.get("pending"):
         return {}
@@ -3044,30 +3064,35 @@ def load_stack(state_dir, prs, when):
         at = parse_time(state.get("at") or "")
     except ValueError:
         return {}
-    if when - at > STACK_FOR:
-        return {}
     open_now = {pr["number"] for pr in prs}
-    state["pending"] = [e for e in state["pending"] if e.get("pr") in open_now]
+    state["pending"] = [e for e in state["pending"] if e.get("pr") in open_now
+                        and (when - at <= STACK_FOR
+                             or (STACK_WAIT and (e.get("since")
+                                                 or e.get("waited"))))]
     return state if state["pending"] else {}
 
 
 def next_layer(stack, prs, candidates, open_numbers, when, held):
-    """(stack, retarget): `stack` without the layers that end it, and
-    the first layer still based on the merged branch below it that is
-    eligible but for its base, as (pull request, number below), or None.
-    A layer already on `main` stays while it is a candidate. A layer
-    that isn't eligible ends the stack there and is held as usual, its
-    reason saying the layer below merged."""
+    """(stack, retarget, expired): `stack` without the layers that end
+    it, the first layer still based on the merged branch below it that
+    is eligible but for its base, as (pull request, number below), or
+    None, and the entries of layers that waited out STACK_WAIT. A layer
+    already on `main` stays while it is a candidate. A layer that isn't
+    eligible ends the stack there and is held as usual, its reason
+    saying the layer below merged; with STACK_WAIT it stays instead,
+    marked `since` it began waiting, and is judged again each tick until
+    it is eligible (then `waited`, so it keeps its usual place in the
+    queue) or STACK_WAIT has passed (designs/0033)."""
     by_number = {pr["number"]: pr for pr in prs}
     chosen = {pr["number"] for pr in candidates}
-    pending, retarget = [], None
+    pending, retarget, expired = [], None, []
     for entry in stack["pending"]:
         pr = by_number.get(entry["pr"])
         if pr is None:
             continue
         if pr.get("baseRefName") == MAIN:
             if pr["number"] in chosen:
-                pending.append(entry)
+                pending.append(done_waiting(entry))
             continue
         if pr.get("baseRefName") != entry["branch"]:
             continue
@@ -3077,13 +3102,51 @@ def next_layer(stack, prs, candidates, open_numbers, when, held):
         approval, why = eligible(pr, open_numbers - {entry["after"]}, when,
                                  any_base=True)
         if approval is None:
+            since = entry.get("since") or iso(when)
+            if STACK_WAIT and when - parse_time(since) <= STACK_WAIT:
+                held[str(pr["number"])] = STACK_WAIT_REASON % (
+                    STACK_REASON % entry["after"], why)
+                pending.append(dict(entry, since=since))
+                continue
             held[str(pr["number"])] = "%s, which merged, but %s" % (
                 STACK_REASON % entry["after"], why)
+            if entry.get("since"):
+                expired.append(entry)
             continue
+        entry = done_waiting(entry)
         pending.append(entry)
         if retarget is None:
             retarget = (pr, entry["after"])
-    return dict(stack, pending=pending) if pending else {}, retarget
+    return (dict(stack, pending=pending) if pending else {}, retarget,
+            expired)
+
+
+def done_waiting(entry):
+    """`entry`, marked `waited` rather than `since` if it was waiting."""
+    if not entry.get("since"):
+        return entry
+    entry = dict(entry, waited=True)
+    entry.pop("since")
+    return entry
+
+
+def tell_waited(github, expired, live):
+    """[{pr, after, result}] for each layer that waited out STACK_WAIT;
+    when `live`, STACK_WAITED_NOTE is posted on it. Said once, since the
+    layer then leaves `stacks.json`."""
+    told = []
+    for entry in expired:
+        item = {"pr": entry["pr"], "after": entry["after"]}
+        if live:
+            ok, why = github.write(
+                "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG,
+                                                       entry["pr"]),
+                body=STACK_WAITED_NOTE % (
+                    int(STACK_WAIT.total_seconds() // 3600), entry["after"],
+                    MAIN, SIGNATURE))
+            item["result"] = "done" if ok else "refused: " + why
+        told.append(item)
+    return told
 
 
 def save_stack(state_dir, stack):
@@ -3255,13 +3318,16 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         queue.sort(key=lambda pr: (pr["number"] != in_flight, places.get(
             pr["number"], len(places))))
     stack, retarget = (load_stack(state_dir, prs, when) if STACKS else {}), None
+    expired = []
     if stack:
-        stack, retarget = next_layer(stack, prs, candidates, open_numbers,
-                                     when, held)
+        stack, retarget, expired = next_layer(stack, prs, candidates,
+                                              open_numbers, when, held)
     if STACKS and live:
         save_stack(state_dir, stack)
     if stack:
-        first = [e["pr"] for e in stack.get("pending", ())]
+        # A layer that waited for its approval keeps its usual place.
+        first = [e["pr"] for e in stack.get("pending", ())
+                 if not e.get("waited")]
         if STACK_MAX_RUN and stack.get("run", 0) >= STACK_MAX_RUN:
             first = []
         queue.sort(key=lambda pr: (pr["number"] != in_flight,
@@ -3280,8 +3346,12 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     if RIGHT_OF_WAY:
         record["right_of_way"] = row
     if stack:
-        record["stack"] = [{"pr": e["pr"], "after": e["after"]}
+        record["stack"] = [dict({"pr": e["pr"], "after": e["after"]},
+                                **({"waiting": True} if e.get("since")
+                                   else {}))
                            for e in stack["pending"]]
+    if expired:
+        record["stack_waited"] = tell_waited(github, expired, live)
     said_path = os.path.join(state_dir, "handed-back.json")
     said = load_json(said_path, {})
     if spoken or os.path.exists(os.path.join(state_dir, HELD_FILE)):

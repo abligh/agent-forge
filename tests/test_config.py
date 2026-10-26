@@ -450,6 +450,18 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"stacks": True}),
                          ["merge.stacks must be an object"])
 
+    def test_merge_stacks_wait_hours(self):
+        for hours in (1, 72, 168):
+            self.assertEqual(self.problems(merge={"stacks": {
+                "wait_hours": hours}}), [])
+        for hours in (0, 169):
+            self.assertEqual(self.problems(merge={"stacks": {
+                "wait_hours": hours}}),
+                ["merge.stacks.wait_hours must be 1 to 168"])
+        self.assertEqual(self.problems(merge={"stacks": {
+            "wait_hours": "72"}}),
+            ["merge.stacks.wait_hours must be an integer"])
+
     def test_merge_test_ahead(self):
         self.assertEqual(self.problems(merge={"test_ahead": {
             "depth": -1, "max_age_hours": 0, "width": 2,
