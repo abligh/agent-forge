@@ -504,7 +504,8 @@ default.
 
 ### `merge.stacks`
 
-`{"max_run": N}` (default 0, no limit; designs/0025). A pull request
+`{"max_run": N, "wait_hours": H}` (`max_run` default 0, no limit;
+designs/0025; `wait_hours` default none, designs/0033). A pull request
 whose base branch is another open pull request's head branch is
 stacked on it, and held as `stacked on #Q` rather than as based on
 another branch, so it can be reviewed and approved while it waits.
@@ -516,7 +517,17 @@ when it is eligible but for its base, and once its base is the default
 branch it goes first in the queue, after only the one a `test_ahead`
 run is in flight for. It is then updated, checked and merged like any
 other. A layer that isn't eligible ends the stack, and is held as
-usual. A merge of the layer below's branch into a layer, made after
+usual. With `wait_hours` (1 to 168), it stays in the stack instead,
+held as `stacked on #Q, which merged; waiting for: <why>`, and is
+judged again every tick: once it is eligible but for its base it is
+retargeted, and takes its usual place in the queue rather than the
+first (it became ready after those ahead of it), while the layers above
+it still go first once it merges. The merged heads below it are kept
+while it waits, and it counts its own `wait_hours` from when it began
+waiting. After that it leaves the stack, held as without the setting,
+and the Merger says once on it that it no longer retargets it, so its
+author retargets it and asks for its approvals again (the record's
+`stack_waited`). A merge of the layer below's branch into a layer, made after
 its approval, covers its head when it is a clean merge and that
 branch's head has merged in this stack. When the default branch
 conflicts with a retargeted layer that lacks the final head of the

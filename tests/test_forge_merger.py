@@ -4163,6 +4163,88 @@ class Stacks(RepoCase):
         self.tick([self.bottom(), self.layer()], live=False)
         self.assertIsNone(self.stack_file())
 
+    # designs/0033: with wait_hours, a layer that isn't ready waits.
+
+    WAITING = ("stacked on #5, which merged; waiting for: no Reviewer "
+               "approval")
+
+    def wait(self, hours=24):
+        m.configure(project(stacks={"wait_hours": hours}))
+        self.merge_bottom()
+        record, lines = self.tick([self.layer(reviews=[])], minutes=1)
+        self.assertEqual(self.github.writes, [])
+        self.assertEqual(record["held"], {"6": self.WAITING})
+        self.assertEqual(record["stack"], [{"pr": 6, "after": 5,
+                                            "waiting": True}])
+        return record
+
+    def test_a_layer_that_is_not_eligible_waits(self):
+        self.wait()
+        self.assertEqual(self.stack_file()["pending"], [{
+            "pr": 6, "after": 5, "branch": "b5", "head": self.lower,
+            "since": "2026-10-07T12:01:00Z"}])
+        # Judged again each tick, waiting since the first.
+        record, _ = self.tick([self.layer(reviews=[])], minutes=30)
+        self.assertEqual(record["held"], {"6": self.WAITING})
+        self.assertEqual(self.stack_file()["pending"][0]["since"],
+                         "2026-10-07T12:01:00Z")
+
+    def test_a_waiting_layer_is_retargeted_once_approved(self):
+        self.wait()
+        record, lines = self.tick([self.layer()], minutes=40)
+        self.assertEqual([(d["pr"], d["action"], d.get("result"))
+                          for d in record["decisions"]],
+                         [(6, "RETARGET", "done")])
+        self.assertIn("STACK #6: retargeted to main after #5 merged; "
+                      "0 above", lines)
+        self.assertEqual(self.stack_file()["pending"], [{
+            "pr": 6, "after": 5, "branch": "b5", "head": self.lower,
+            "waited": True}])
+
+    def test_a_layer_that_waited_keeps_its_usual_place(self):
+        self.wait()
+        self.tick([self.layer()], minutes=40)
+        older = self.other()
+        record, _ = self.tick([older, self.layer("main")], live=False,
+                              minutes=41)
+        self.assertEqual(record["queue"], [4, 6])
+        self.assertEqual(record["stack"], [{"pr": 6, "after": 5}])
+
+    def test_a_waiting_layer_outlives_a_day_old_stack(self):
+        self.wait(hours=48)
+        record, _ = self.tick([self.layer(reviews=[])], minutes=60 * 25)
+        self.assertEqual(record["held"], {"6": self.WAITING})
+        record, _ = self.tick([self.layer()], minutes=60 * 26)
+        self.assertEqual([(d["pr"], d["action"])
+                          for d in record["decisions"]], [(6, "RETARGET")])
+
+    def test_after_wait_hours_it_leaves_the_stack_and_is_told(self):
+        self.wait()
+        record, _ = self.tick([self.layer(reviews=[])], minutes=60 * 24 + 2)
+        self.assertEqual(record["held"], {
+            "6": "stacked on #5, which merged, but no Reviewer approval"})
+        self.assertNotIn("stack", record)
+        self.assertIsNone(self.stack_file())
+        self.assertEqual(record["stack_waited"], [
+            {"pr": 6, "after": 5, "result": "done"}])
+        (method, path, body), = self.github.writes
+        self.assertEqual((method, path), ("POST", SLUG + "/issues/6/comments"))
+        self.assertTrue(body["body"].startswith("Not-a-review\n\n"))
+        self.assertIn("This layer waited 24 hours for its approval after #5 "
+                      "merged, and the Merger no longer retargets it. "
+                      "Retarget it to `main` and ask for its approvals "
+                      "again.", body["body"])
+        # Said once: it has left the stack.
+        record, _ = self.tick([self.layer(reviews=[])], minutes=60 * 24 + 3)
+        self.assertEqual(self.github.writes, [])
+        self.assertNotIn("stack_waited", record)
+
+    def test_a_dry_run_says_nothing_of_one_waited_out(self):
+        self.wait()
+        record, _ = self.tick([self.layer(reviews=[])], live=False,
+                              minutes=60 * 24 + 2)
+        self.assertEqual(record["stack_waited"], [{"pr": 6, "after": 5}])
+
     # The amendment's case: #6 was approved on an older head of #5, #5
     # gained a commit before it merged, and main holds #5 as one squash.
     LINES = ["1", "X", "3", "4", "5", "6", "7", "8", "9"]

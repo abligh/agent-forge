@@ -108,7 +108,7 @@ RESOLVE_RULE = {"paths": list, "command": list, "check": list}
 SAID_SINCE = {"author": bool, "approvals": bool, "quiet": list}
 BLOCKED_BY = ("body", "everywhere")
 RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int}
-STACKS = {"max_run": int}
+STACKS = {"max_run": int, "wait_hours": int}
 TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "batch": int}
 STALL_ALERT = {"tell": list, "retell_minutes": int,
@@ -523,6 +523,9 @@ def check(data):
             _fields("merge.stacks", stacks, STACKS, problems)
             if _is(stacks.get("max_run"), int) and stacks["max_run"] < 0:
                 problems.append("merge.stacks.max_run must be at least 0")
+            if _is(stacks.get("wait_hours"), int) and \
+                    not 1 <= stacks["wait_hours"] <= 168:
+                problems.append("merge.stacks.wait_hours must be 1 to 168")
         _check_merge_0026(merge, data, problems)
     for name, allowed in (("labels", LABELS), ("relay", RELAY)):
         section = data.get(name, {})
