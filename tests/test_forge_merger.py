@@ -2727,6 +2727,15 @@ class Batches(unittest.TestCase):
         self.assertEqual(self.size(self.entries(*"bcdef"), last), (3, None))
         self.assertEqual(self.size(self.entries(*"def"), last), (1, None))
 
+    def test_two_members_with_one_tree_keep_the_batch(self):
+        # Seen on 2026-10-26: one member added nothing on top of the one
+        # before it, so the top's tree came twice. Found at its first
+        # place, the batch looked changed, and a new top ran again.
+        last = {"trees": list("abcdd")}
+        self.assertEqual(self.size(self.entries(*"bcddef"), last),
+                         (4, None))
+        self.assertEqual(self.size(self.entries(*"ddef"), last), (2, None))
+
     def test_a_changed_member_starts_a_new_batch(self):
         last = {"trees": list("abcd")}
         self.assertEqual(self.size(self.entries(*"bxdef"), last), (4, None))
