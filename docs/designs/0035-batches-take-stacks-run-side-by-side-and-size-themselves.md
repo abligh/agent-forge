@@ -438,3 +438,50 @@ green covered none of them, and the seven waited for a new run.
 queue at the head it was predicted at, counts as running until it has
 merged. A layer that comes back meanwhile goes first in the next
 batch, as it does while a merge is in flight. No new key.
+
+## Amendment (2026-10-26, fourth): a member is checked before its batch is predicted
+
+* Status: proposed
+
+**Why.** On one project on 26 October, 14 pull requests were handed
+back from the middle of the current batch. Each one gave every member
+after it a new tree, so the batch's run, green or not, covered none of
+them, and the batch waited for a new run of 10 to 20 minutes. Nine of
+the 14 were known before the batch was predicted, from the pull request
+alone:
+
+* 5: a merge commit after the approval whose tree is not the clean
+  merge of its parents (`covers_head`);
+* 2: the approval no longer covers the head;
+* 2: a `merge.gate` tool refused it (`forge-closing-keywords`: a
+  commit message closes an issue the body doesn't declare). The last,
+  at 19:49Z, was the third member of a green batch of eight.
+
+The other 5 were the pull request's own status check going red, which
+is a run, not a check, and stays as it is.
+
+**Change.** Before it predicts, the Merger runs the checks that
+`decide` runs at merge time and that don't depend on a pull request's
+place in the queue, for each pull request it would predict:
+
+1. **What runs.** The approval names a commit and covers the head
+   (`covers_head`, as at merge time), and each `merge.gate` tool, with
+   the default branch's tip as `{base}`.
+2. **A failure is handed back at once**, as `decide` would at merge
+   time: the same reason, to the same person, once per head. The pull
+   request is not predicted, so the batch is made of the rest.
+3. **Once per head.** A result is kept in `checked.json` in the state
+   directory, keyed by the head, the approved commit, and the pull
+   request's title and body, which `forge-closing-keywords` reads. A
+   new head, approval or description checks it again. The tip moving
+   does not, so a merge doesn't re-run every check in the queue.
+4. **Merge time is unchanged.** `decide` still runs every check, so a
+   check that would pass ahead and fail at merge time is caught as
+   today.
+
+**Cost.** One run of each gate tool per new head, a few seconds each,
+instead of one per merge attempt. No new key: it applies wherever
+`batch` is above 1.
+
+**Order of work.** `forge-merger`: the checks before `predict_ahead`,
+`checked.json`, tests; `docs/config.md`; a release.
