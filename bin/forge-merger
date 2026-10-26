@@ -14,7 +14,11 @@ still covers, nobody has spoken since, and nothing it names in a
   blockers), and with them those that fix a red nightly
   (designs/0028): while forge-nightly's issue saying so is open, each
   open pull request that closes it, read from forge-nightly's state
-  (agent_forge/nightly.py);
+  (agent_forge/nightly.py), and those that fix a red default branch
+  (designs/0011, amendment): while forge-pr-check's issue saying so is
+  open, each open pull request that closes it, read from its
+  state.json (`main_red.fixes`). These go ahead of the predicted ones
+  too, behind only the one in flight and a green batch still merging;
 * then the pull requests another open one is blocked by, held or not;
 * then the rest, oldest-opened first;
 * with `merge.yield_after_hand_back`, each that was handed back lately
@@ -381,6 +385,19 @@ suspects are left and every one merged, the first red was flaky:
 `BATCH-FLAKE #a..#b: every suspect merged green; the red top's tree
 <tree> was a flake`.
 
+**A red that is only the base's names no suspect** (designs/0011,
+amendment). When every step a batch top's tree failed also failed in
+the default branch's own run of the base it was predicted on, the top
+is taken as not yet judged: no search starts, nothing is handed back,
+and `BATCH-BASE-RED #a..#b: red only in <steps>, as <base> is` is
+logged once. A head whose own check is red only where the tip it was
+merged with is red waits instead of being handed back, while the
+red-default-branch issue is open, and is updated (checked afresh) once
+it is closed. **Urgent pull requests are batched apart**: a batch, the
+first or a later one, ends where its members change between urgent and
+not, so a pin change at the front doesn't wait on, or get searched
+with, the rest.
+
 **With `merge.test_ahead.stacks`, a stack's ready layers join their
 base's batch** (designs/0035): each is predicted straight after the
 pull request it is stacked on, while it would be eligible but for its
@@ -610,6 +627,10 @@ URGENT_LABEL = None
 # The pull requests that fix a red nightly (designs/0028), taken as if
 # urgent; read from forge-nightly's state by `main` (and the router's).
 NIGHTLY_FIXES = frozenset()
+# The pull requests that close forge-pr-check's open issue saying the
+# default branch is red (designs/0011, amendment), taken as urgent and
+# put first; read from its state.json by `main`.
+MAIN_RED_FIXES = frozenset()
 STALL_ALERT_NAME = "stall-alert.json"
 # `merge.test_ahead`: whether the next pull requests' commits are
 # predicted for the build check to test ahead, and how many behind the
@@ -641,6 +662,10 @@ COVERED_TEXT = "covered by batch"
 # designs/0035, second amendment: a red batch's members, kept until the
 # red one among them is found.
 SUSPECTS_FILE = "suspects.json"
+# designs/0011, amendment: a head red only where the tip it was merged
+# with is red itself waits for the tip to be fixed, not handed back.
+BASE_RED_REASON = ("%s is red only in %s, as %s is at %s; waits for it to "
+                   "be fixed")
 BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
                      "waits for the new batch's top")
 # The most ticks one run makes: it ticks again straight after a merge.
@@ -1107,8 +1132,9 @@ def eligible(pr, open_numbers, now=None, stacked=None, any_base=False):
 
 
 def urgent(pr):
-    """Whether `pr` carries `labels.urgent`, or fixes a red nightly."""
-    if pr.get("number") in NIGHTLY_FIXES:
+    """Whether `pr` carries `labels.urgent`, or fixes a red nightly or
+    a red default branch."""
+    if pr.get("number") in NIGHTLY_FIXES | MAIN_RED_FIXES:
         return True
     return bool(URGENT_LABEL) and URGENT_LABEL in [
         (n or {}).get("name") for n in
@@ -3136,6 +3162,28 @@ def green_batch(state_dir, queue, check_state):
                for e in entries)
 
 
+def batch_members(state_dir, queue):
+    """The pull requests in the last tick's batch (AHEAD_FILE) that are
+    still in `queue` at the head they were predicted at."""
+    last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+    if not isinstance(last, dict) or not isinstance(last.get("batch"), dict):
+        return set()
+    trees = last["batch"].get("trees") or []
+    heads = {pr["number"]: pr["headRefOid"] for pr in queue}
+    return {e.get("pr") for e in last.get("entries") or ()
+            if isinstance(e, dict) and e.get("tree") in trees
+            and heads.get(e.get("pr")) in (e.get("head"), e.get("sha"))}
+
+
+def fixes_first(queue, in_flight, members):
+    """`queue` with MAIN_RED_FIXES first, behind only `in_flight` and a
+    green batch's `members` (designs/0011, amendment); the rest keep
+    their order."""
+    return sorted(queue, key=lambda pr: (
+        pr["number"] != in_flight, pr["number"] not in members,
+        pr["number"] not in MAIN_RED_FIXES))
+
+
 def predicted(state_dir):
     """The pull requests the last live tick predicted (AHEAD_FILE), at
     any head."""
@@ -3166,7 +3214,74 @@ def tree_verdict(check_state, tree):
     return any(oks) if oks else None
 
 
-def batch_size(entries, last, verdict, later=()):
+def main_red_fixes(check_state):
+    """The pull requests forge-pr-check found closing its open issue
+    saying the default branch is red (`main_red.fixes`), as a
+    frozenset; empty when no such issue is open (designs/0011,
+    amendment)."""
+    red = (check_state or {}).get("main_red")
+    if not isinstance(red, dict) or not red.get("issue"):
+        return frozenset()
+    fixes = red.get("fixes")
+    return frozenset(n for n in fixes if isinstance(n, int)
+                     and not isinstance(n, bool)) \
+        if isinstance(fixes, list) else frozenset()
+
+
+def base_red_only(check_state, records, base):
+    """The steps, sorted, when every one of the red verdicts `records`
+    failed only steps that the default branch's own run of `base` failed
+    too: the red is the base's (designs/0011, amendment). None when any
+    is green or failed a step the base passed, or the base has no red
+    run of its own."""
+    results = (check_state or {}).get("results") or {}
+    own = results.get(base) if isinstance(base, str) else None
+    if not records or not isinstance(own, dict) or not own.get("main") \
+            or own.get("ok") is not False:
+        return None
+    broken = set(own.get("failed") or ())
+    steps = set()
+    for r in records:
+        failed = r.get("failed") if isinstance(r, dict) else None
+        if r.get("ok") is not False or not failed \
+                or not set(failed) <= broken:
+            return None
+        steps |= set(failed)
+    return sorted(steps)
+
+
+def tree_base_red(check_state, tree, base):
+    """base_red_only for the runs of `tree` (not covers of it)."""
+    return base_red_only(check_state, [
+        r for r in ((check_state or {}).get("results") or {}).values()
+        if isinstance(r, dict) and r.get("tree") == tree
+        and not r.get("covered")], base)
+
+
+def head_base_red(check_state, head):
+    """base_red_only for the verdict on `head` merged with the default
+    branch, against the tip it was merged with."""
+    r = ((check_state or {}).get("results") or {}).get(head)
+    if not isinstance(r, dict) or not r.get("base_red"):
+        return None
+    return base_red_only(check_state, [r], r.get("base"))
+
+
+def urgent_cap(entries, at, n, urgents):
+    """`n`, cut so the batch of the predictions `entries` from `at`
+    doesn't mix urgent pull requests (`urgents`, numbers) with others
+    (designs/0011, amendment, part 3): it ends where the first one's
+    kind changes."""
+    if not urgents or n < 2:
+        return n
+    first = entries[at]["pr"] in urgents
+    for k in range(1, n):
+        if (entries[at + k]["pr"] in urgents) != first:
+            return k
+    return n
+
+
+def batch_size(entries, last, verdict, later=(), urgents=frozenset()):
     """(size, red): how many of the predictions `entries` are the batch
     (designs/0032), and the size before any red top split it, or None.
     The batch `last` (ahead.json's, its `trees`) goes on while what is
@@ -3189,7 +3304,7 @@ def batch_size(entries, last, verdict, later=()):
                 size = i + 1
                 break
     if not size:
-        size = min(AHEAD_BATCH, len(trees))
+        size = urgent_cap(entries, 0, min(AHEAD_BATCH, len(trees)), urgents)
         red = [k for k, t in enumerate(trees[:size]) if verdict(t) is False]
         if red:
             size = red[0] + 1
@@ -3200,7 +3315,8 @@ def batch_size(entries, last, verdict, later=()):
     return size, red
 
 
-def later_batches(entries, size, last, verdict, started):
+def later_batches(entries, size, last, verdict, started,
+                  urgents=frozenset()):
     """designs/0035 part 2: the batches after the first `size` of the
     predictions `entries`, end to end, as [{size, trees, fixed?}], at
     most AHEAD_BATCHES - 1 of them. A batch of the last tick's (`last`,
@@ -3221,7 +3337,8 @@ def later_batches(entries, size, last, verdict, started):
         # Matched by its trees, not its place: the first of them moves
         # up once the batch before it has merged.
         kept = [t for t in fixed if trees[at:at + len(t)] == t]
-        n = len(kept[0]) if kept else min(AHEAD_BATCH, len(trees) - at)
+        n = len(kept[0]) if kept else urgent_cap(
+            entries, at, min(AHEAD_BATCH, len(trees) - at), urgents)
         top = entries[at + n - 1]
         batch = {"size": n, "trees": trees[at:at + n]}
         if kept or started(top["sha"], top["tree"]):
@@ -3813,6 +3930,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             0 if pr["number"] in first and pr["number"] not in late
             else 1 if pr["number"] in places
             else 2 if pr["number"] in late else 3))
+    if MAIN_RED_FIXES & {pr["number"] for pr in queue}:
+        # A red default branch's fix goes first, behind only the one in
+        # flight and a green batch still merging, whose run is spent
+        # either way (designs/0011, amendment).
+        merging = TEST_AHEAD and green_batch(state_dir, queue, check_state)
+        queue = fixes_first(queue, in_flight, batch_members(
+            state_dir, queue) if merging else set())
     saved = load_suspects(state_dir) \
         if TEST_AHEAD and AHEAD_BATCH > 1 else None
     if saved:
@@ -3882,6 +4006,23 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                           run, below if pr["number"] in layers else (),
                           regenerated, when, restacks.get(pr["number"]))
         decision.update(pr=pr["number"], head=pr["headRefOid"])
+        steps = head_base_red(check_state, pr["headRefOid"]) \
+            if decision["action"] == "HAND-BACK" and decision.get(
+                "reason", "").startswith(STATUS_CONTEXT + " is failure") \
+            else None
+        if steps and ((check_state.get("main_red") or {}).get("issue")):
+            base = (check_state["results"][pr["headRefOid"]].get("base")
+                    or "")
+            decision = {"action": "WAIT", "pr": pr["number"],
+                        "head": pr["headRefOid"],
+                        "reason": BASE_RED_REASON % (
+                            STATUS_CONTEXT, ", ".join(steps), MAIN,
+                            base[:10])}
+        elif steps:
+            # The tip is green again: the head is brought up to date,
+            # which checks it afresh, rather than handed back.
+            decision = {"action": "UPDATE", "pr": pr["number"],
+                        "head": pr["headRefOid"]}
         tree = git(repo, "rev-parse", pr["headRefOid"] + "^{tree}",
                    run=run).stdout.strip() if decision.get("covered") \
             else None
@@ -4113,11 +4254,16 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                           "repo": repo, "entries": entries}
             if owed:
                 said_ahead["owed"] = record["owed"] = owed
-            verdict = lambda tree: tree_verdict(check_state, tree)
+            # A red that is only the base's own judges nothing
+            # (designs/0011, amendment): it waits for the base to change.
+            verdict = lambda tree: None if tree_base_red(
+                check_state, tree, main_tip) else tree_verdict(
+                    check_state, tree)
+            urgents = {pr["number"] for pr in ahead_queue if urgent(pr)}
             if AHEAD_BATCH > 1 and entries and not searching:
                 size, red = batch_size(entries, (last or {}).get("batch"),
                                        verdict, (last or {}).get("later")
-                                       or ())
+                                       or (), urgents)
                 if red:
                     # A red top: its members are the suspects, and the
                     # search for the red one starts this tick.
@@ -4136,8 +4282,15 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if AHEAD_BATCH > 1 and entries and not searching:
                 size, red = batch_size(entries, (last or {}).get("batch"),
                                        verdict, (last or {}).get("later")
-                                       or ())
+                                       or (), urgents)
                 line = batch_line(entries, size, red, verdict)
+                steps = tree_base_red(check_state, entries[size - 1]["tree"],
+                                      main_tip)
+                if steps:
+                    line = ("BATCH-BASE-RED #%d..#%d: red only in %s, as %s "
+                            "is; waits for %s to change" % (
+                                entries[0]["pr"], entries[size - 1]["pr"],
+                                ", ".join(steps), main_tip[:10], MAIN))
                 said_ahead["batch"] = {
                     "size": size, "trees": [e["tree"]
                                             for e in entries[:size]]}
@@ -4147,7 +4300,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         entries, 0 if red else size,
                         (last or {}).get("later"), verdict,
                         lambda sha, tree: ahead_started(check_state, sha,
-                                                        tree))
+                                                        tree), urgents)
                     if later:
                         said_ahead["later"] = later
                         at, record["later"] = size, []
@@ -4219,7 +4372,7 @@ def load_check_state(state_dir):
 
 def main(argv=None, run=sh, out=print, environ=None, mint=mint,
          sender=None, identity=commit_identity):
-    global RESOLVE_IDENTITY, NIGHTLY_FIXES
+    global RESOLVE_IDENTITY, NIGHTLY_FIXES, MAIN_RED_FIXES
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(
         prog="forge-merger", description=__doc__.splitlines()[0])
@@ -4273,6 +4426,7 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
             check_state = load_check_state(
                 os.path.expanduser(args.check_state) if args.check_state
                 else locks.state_dir(project.name, "pr-check", environ))
+        MAIN_RED_FIXES = main_red_fixes(check_state)
         # Only a live tick, and only with a stall alert, is given the
         # relay: a dry run messages nobody.
         send = ((sender or relay_sender)(project, environ)
