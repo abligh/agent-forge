@@ -316,3 +316,109 @@ Part 2 now comes before part 3, since that is where the time goes:
 | --- | --- | --- |
 | `merge.test_ahead.batches` | `1` | Now the most batches in flight at once. A later batch runs as soon as a slot is spare, with the members it has. |
 | `merge.test_ahead.blocked_by` | `false` | A pull request blocked only by queued, approved pull requests is predicted straight after its last blocker. |
+
+## Amendment (2026-10-26, second): a red batch keeps its suspects, and a covered member needs no estimate
+
+* Status: approved (Alex Bligh, 2026-10-26, https://github.com/abligh/agent-forge/issues/124#issuecomment-6415961308)
+
+**Why.** On one project, 09:00 to 11:30Z on 26 October, 17 of 21 batch
+tops were red and 12 pull requests merged, against 59 in the nine
+hours before. 14 of the 17 reds held one pull request that was red with
+the default branch since another merged at 07:17Z. Its batches were red
+from 08:33Z. It was handed back at 11:17Z, when it had reached the
+front of the queue and was tested alone. Two things went wrong.
+
+* **Part 3's search didn't happen.** Part 3 says the search for a red
+  batch's first red member needs nothing built: a red verdict is kept
+  by tree, and a new batch ends at a tree already red. But that tree
+  changes whenever anything joins the queue in front of the red member.
+  That happened over and over: a hand-back's return, a stack layer, a
+  pull request owed a place. Each change gave the red tree a new one,
+  which had no verdict, and the batch grew back to `batch` with the red
+  member still in it. Each cycle merged the green half, about 4 pull
+  requests, for one red run and one green one, about 25 minutes.
+* **Covered members ran anyway.** A member is covered by its batch's
+  green top only when its own estimate of the steps it would run
+  (`lane_steps`) was worked out against the default branch's current
+  tip. Every merge moves the tip. So the next member, updated a moment
+  later, has no estimate yet, and it waits for a slot and runs. After
+  one batch's top went green at 10:21Z, its members ran for 49 s and
+  161 s, and the batch took 9 minutes to merge.
+
+### 1. A red batch's members are its suspects until the red one is found
+
+1. **Suspects.** When a batch's top is red, its members that haven't
+   merged become its **suspects**, in their order, with their heads.
+   `forge-merger` keeps them in `suspects.json` in its state directory,
+   with the red top's tree.
+2. **Only the suspects are tested.** While there are suspects, the
+   current batch is made of suspects only, and nothing joins in front
+   of them or among them. A pull request that becomes ready, a
+   returning stack layer, or one owed a place goes behind the suspects,
+   in the next batch. Later batches (part 2) are not predicted on top
+   of suspects, as part 2's rule 4 says for unresolved members.
+3. **A suspect that changes leaves.** A suspect that is pushed to,
+   handed back, unapproved or closed is no longer a suspect. Its new
+   head is new evidence, and it is queued again as any pull request is.
+   A tip that moves for another reason, such as a hand merge, doesn't
+   end the search: the suspects are predicted again on the new tip.
+4. **The search ends** when one suspect is shown red on its own, on top
+   of every suspect before it, and is handed back as a red is today. It
+   also ends when no suspects are left. If every suspect merges green,
+   the first red was flaky, and the Merger logs `BATCH-FLAKE` with the
+   red top's tree. The batch then grows again from the queue.
+
+### 2. The search runs front to back, in spare slots at once
+
+The suspects' prefixes are nested: the first one, the first two, and
+so on, each a prediction on the one before. When a prefix is green,
+every shorter prefix is covered by it. The search therefore runs as a
+front-to-back search that merges as it goes, with several cut points
+tested at once:
+
+1. **Cut points.** With m slots free for it (the current batch's slot,
+   plus spare slots as part 2 counts them), the Merger tests the
+   prefixes at m evenly spaced cut points of the suspects. The last cut
+   point, the whole set, is already known red and isn't run again.
+2. **The verdicts.** The longest green prefix merges, its members
+   covered as any batch's. The shortest red prefix bounds the search.
+   The suspects become the members after the green prefix, up to and
+   including the last member of that red prefix. A red prefix one
+   member longer than a green one names its last member as red: it is
+   handed back. Runs of prefixes longer than a red one are stopped,
+   which frees their slots.
+3. **Examples.** 8 suspects, only the 7th red, 3 slots: prefixes 3 and
+   6 run together. Both are green, so 1 to 6 merge, and the suspects
+   are 7 and 8. Prefix 7 then runs alone and is red, so the 7th is
+   handed back and the 8th joins the next batch. That is 2 rounds after
+   the first red, where halving takes 3, and none of them regrows the
+   batch. With 1 slot this is designs/0032's halving, with the
+   suspects kept.
+
+### 3. A covered member needs no estimate of its own
+
+`forge-pr-check` covers a waiting head whose tree is a member of the
+Merger's batch, and which contains the default branch's tip, with the
+top's green when the top's run selected the steps the head would run.
+Today that needs the head's own estimate against the current tip.
+Instead, the top's own selection is enough when the top's base is an
+ancestor of the head. The member's changes against that base are a
+subset of the top's, so every step chosen for the member is one the
+top ran. With designs/0010's dependency records, the records the top's
+selection read are the ones the member's would read, or older ones.
+The head is then `COVERED` at once, on the tick that sees it. The
+estimate is still used when it exists and is newer.
+
+### 4. Order of work, changed
+
+Part 3's first item, "nothing is built for this part", is withdrawn.
+This amendment's sections go first, since they are where today's time
+went:
+
+1. `forge-pr-check`: section 3; tests; a release.
+2. `forge-merger` and `forge-pr-check`: sections 1 and 2:
+   `suspects.json`, the prefixes at cut points, stopping longer runs,
+   `BATCH-FLAKE`; tests; `docs/config.md`; a release.
+3. Then the first amendment's `blocked_by`, and part 3's report.
+
+No new key: both changes apply wherever `batch` is above 1.
