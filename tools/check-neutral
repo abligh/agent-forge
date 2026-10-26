@@ -6,7 +6,9 @@ none of them, nor the hosts they run on. The words that mustn't appear
 are kept OUTSIDE the repository, one per line, in the file
 $FORGE_FORBIDDEN_WORDS (default ~/.config/agent-forge/forbidden-words),
 so the list itself is never published. Matching ignores case and finds
-a word anywhere, inside identifiers and paths too.
+a word inside identifiers and paths too (`word2`, `word_cron`,
+`wordEngineer`), but not inside a longer lower-case word: `zorb` is not
+found in `zorbing`.
 
     check-neutral            check every tracked file; exit 1 on a hit
     check-neutral --staged   check what is staged (the pre-commit hook)
@@ -39,7 +41,11 @@ def hits(text, words):
     """(line number, word) for each line of `text` holding a word."""
     if not words:
         return []
-    pattern = re.compile("|".join(re.escape(w) for w in words), re.IGNORECASE)
+    # The look-arounds are case-sensitive: a capital or a digit after
+    # the word starts an identifier's next part, a lower-case letter
+    # carries on an ordinary word.
+    pattern = re.compile("(?<![a-z])(?i:%s)(?![a-z])" % "|".join(
+        re.escape(w) for w in words))
     found = []
     for number, line in enumerate(text.splitlines(), 1):
         for match in pattern.finditer(line):
