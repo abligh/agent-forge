@@ -1,6 +1,6 @@
 # 0035: Batches take stacks, run side by side, and size themselves
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-26, https://github.com/abligh/agent-forge/issues/108#issuecomment-6409275365)
 * Author: XMPPEngineer
 * Date: 2026-10-26
 
