@@ -116,7 +116,11 @@ behind, and the default branch's traced run still goes first when due.
 while forge-nightly's issue saying the nightly is red is open, each open
 pull request that closes it is treated as if it carried `labels.urgent`.
 The numbers are read from forge-nightly's state
-(agent_forge/nightly.py), once a tick.
+(agent_forge/nightly.py), once a tick. **So does one that fixes a red
+default branch** (designs/0011, amendment): while the
+`checks.main_red_issue` issue is open, each open pull request whose
+title or body (outside code) closes it, read each tick and kept as
+`main_red.fixes` in state.json, where the Merger reads it too.
 
 **With `labels.rerun`, a red head can be run once more** (designs/0022).
 A tick that finds the label on an open pull request whose head is red
@@ -749,6 +753,10 @@ URGENT_LABEL = None
 # The pull requests that fix a red nightly (designs/0028), put first as
 # if urgent; read from forge-nightly's state by `main`.
 NIGHTLY_FIXES = frozenset()
+# The pull requests that close the open checks.main_red_issue issue
+# (designs/0011, amendment), put first as if urgent; found each tick by
+# `tick` and kept as state.json's main_red.fixes.
+MAIN_RED_FIXES = frozenset()
 # labels.rerun: the label that runs a red head once more (designs/0022),
 # or None.
 RERUN_LABEL = None
@@ -1308,6 +1316,50 @@ def gh(args, token, run=sh):
     return run(["gh", "api"] + args, env=dict(os.environ, GH_TOKEN=token))
 
 
+def closing_keywords():
+    """forge-closing-keywords, beside this file, as a module: its rule
+    for which issues a pull request closes."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader(
+        "forge_closing_keywords", os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            "forge-closing-keywords"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def red_fixes(token, number, run=sh, keywords=None):
+    """The open pull requests whose title or body (outside code) closes
+    issue `number` by a closing keyword, as a sorted list, or None if
+    GitHub could not be read (designs/0011, amendment). The Merger's
+    gate refuses a commit message that closes an issue the body doesn't
+    declare, so the title and body are the whole answer."""
+    got = gh(["--paginate", "repos/%s/pulls?state=open&per_page=100"
+              % REPO_SLUG, "--jq", '.[] | [.number, ((.title // "") + "\\n"'
+              ' + (.body // "") | tojson)] | @tsv'], token, run)
+    if got.returncode != 0:
+        return None
+    keywords = keywords or closing_keywords()
+    pattern = keywords.closing_re(REPO_SLUG)
+    fixes = set()
+    for line in got.stdout.splitlines():
+        pr, _, text = line.partition("\t")
+        try:
+            text = json.loads(text)
+        except ValueError:
+            continue
+        if not pr.isdigit() or not isinstance(text, str):
+            continue
+        found = [int(next(g for g in m if g))
+                 for m in pattern.findall(keywords.blank_code(text))]
+        if number in found:
+            fixes.add(int(pr))
+    return sorted(fixes)
+
+
 def open_heads(token, run=sh, why=None):
     """[(pr, sha, head repository, draft, author, labels)] for every open
     pull request, or None if GitHub could not be read, with the reason
@@ -1483,7 +1535,7 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
         if author:
             state["waiting"][sha]["author"] = author
         if URGENT_LABEL and URGENT_LABEL in labels \
-                or pr in NIGHTLY_FIXES:
+                or pr in NIGHTLY_FIXES | MAIN_RED_FIXES:
             state["waiting"][sha]["urgent"] = True
         else:
             state["waiting"][sha].pop("urgent", None)
@@ -2938,9 +2990,22 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         for pr, sha, draft, repo in labelled:
             if rerun_kind(seen, sha, draft, repo) != "nothing":
                 labellers[sha] = labelled_by(pr, token, run)
+    # checks.main_red_issue: the pull requests that close the open issue
+    # go first (designs/0011, amendment), read outside the lock.
+    global MAIN_RED_FIXES
+    issue = (seen.get("main_red") or {}).get("issue") \
+        if MAIN_RED_ISSUE is not None else None
+    fixes = red_fixes(token, issue, run) if issue else []
     todo = []
     with state_lock(state_dir):
         state = load(state_dir)
+        red = state.get("main_red")
+        if fixes is not None and isinstance(red, dict) \
+                and red.get("issue") == issue and issue:
+            red["fixes"] = fixes
+        MAIN_RED_FIXES = frozenset(
+            (red or {}).get("fixes") or () if isinstance(red, dict)
+            and red.get("issue") else ())
         if labelled:
             todo = take_reruns(state, labelled, labellers, when, state_dir,
                                out)

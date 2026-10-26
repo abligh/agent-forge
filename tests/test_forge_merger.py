@@ -5470,3 +5470,91 @@ class Main0026(unittest.TestCase):
         self.run_main({}, ["--check-state", check])
         self.assertNotIn("check_state", self.ticks[0])
 
+
+
+class RedMain(unittest.TestCase):
+    """designs/0011, amendment: a red default branch's fix goes first,
+    a red that is the base's names no suspect, and urgent pull requests
+    are batched apart."""
+
+    def setUp(self):
+        m.configure(project(test_ahead={"batch": 4}))
+        self.addCleanup(m.configure, project())
+        self.addCleanup(setattr, m, "MAIN_RED_FIXES", frozenset())
+
+    def state(self, **results):
+        return {"main_red": {"issue": 9, "fixes": [5, True, "6"]},
+                "results": results}
+
+    def entries(self, *prs):
+        return [{"pr": n, "sha": "%d" % k * 40, "tree": "t%d" % k,
+                 "head": "h%d" % k} for k, n in enumerate(prs)]
+
+    def test_the_fixes_are_read_only_while_the_issue_is_open(self):
+        self.assertEqual(m.main_red_fixes(self.state()), frozenset({5}))
+        self.assertEqual(m.main_red_fixes({"main_red": {"fixes": [5]}}),
+                         frozenset())
+        self.assertEqual(m.main_red_fixes(None), frozenset())
+
+    def test_a_fix_is_urgent(self):
+        m.MAIN_RED_FIXES = frozenset({5})
+        self.assertTrue(m.urgent(pr(5, T3)))
+        self.assertFalse(m.urgent(pr(3, T0)))
+
+    def test_a_fix_goes_first_behind_the_one_in_flight_and_a_green_batch(self):
+        m.MAIN_RED_FIXES = frozenset({5})
+        queue = [pr(3, T0), pr(4, T1), pr(6, T2), pr(5, T3)]
+        number = lambda q: [p["number"] for p in q]
+        self.assertEqual(number(m.fixes_first(queue, None, set())),
+                         [5, 3, 4, 6])
+        self.assertEqual(number(m.fixes_first(queue, 3, set())),
+                         [3, 5, 4, 6])
+        self.assertEqual(number(m.fixes_first(queue, 3, {3, 4})),
+                         [3, 4, 5, 6])
+
+    def test_a_red_only_where_the_base_is_red_is_the_bases(self):
+        base = "b" * 40
+        state = self.state(**{
+            base: {"main": True, "ok": False, "failed": ["web", "doc"]},
+            "x": {"tree": "t", "ok": False, "failed": ["web"]},
+            "c": {"tree": "t", "ok": True, "covered": "#1..#2"}})
+        self.assertEqual(m.tree_base_red(state, "t", base), ["web"])
+        state["results"]["y"] = {"tree": "t", "ok": False,
+                                 "failed": ["rust"]}
+        self.assertIsNone(m.tree_base_red(state, "t", base))
+
+    def test_a_red_with_a_green_base_or_none_is_its_own(self):
+        base = "b" * 40
+        red = {"x": {"tree": "t", "ok": False, "failed": ["web"]}}
+        self.assertIsNone(m.tree_base_red(self.state(**red), "t", base))
+        green = dict(red, **{base: {"main": True, "ok": True,
+                                    "failed": []}})
+        self.assertIsNone(m.tree_base_red(self.state(**green), "t", base))
+        self.assertIsNone(m.tree_base_red(self.state(), "t", base))
+
+    def test_a_head_red_only_where_its_tip_was(self):
+        base = "b" * 40
+        state = self.state(**{
+            base: {"main": True, "ok": False, "failed": ["web"]},
+            "h": {"ok": False, "failed": ["web"], "base": base,
+                  "base_red": True},
+            "g": {"ok": False, "failed": ["web"], "base": base}})
+        self.assertEqual(m.head_base_red(state, "h"), ["web"])
+        self.assertIsNone(m.head_base_red(state, "g"))
+        self.assertIsNone(m.head_base_red(state, "missing"))
+
+    def test_urgent_ones_are_a_batch_of_their_own(self):
+        entries = self.entries(5, 6, 3, 4, 7)
+        none = lambda t: None
+        self.assertEqual(m.batch_size(entries, None, none, (), {5, 6}),
+                         (2, None))
+        self.assertEqual(m.batch_size(entries, None, none, (), {4}),
+                         (3, None))
+        self.assertEqual(m.batch_size(entries, None, none), (4, None))
+
+    def test_a_later_batch_stops_at_an_urgent_one(self):
+        m.configure(project(test_ahead={"batch": 4, "batches": 3}))
+        entries = self.entries(3, 4, 5, 6, 7, 8)
+        got = m.later_batches(entries, 2, None, lambda t: None,
+                              lambda sha, tree: False, {6})
+        self.assertEqual([b["size"] for b in got], [1, 1])

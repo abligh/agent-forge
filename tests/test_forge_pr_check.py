@@ -3118,3 +3118,37 @@ class FinalStatusMatched(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RedMainFixes(unittest.TestCase):
+    """designs/0011, amendment: the pull requests that close the open
+    red-default-branch issue go first."""
+
+    def lines(self, *prs):
+        return "".join("%d\t%s\n" % (n, json.dumps(text))
+                       for n, text in prs)
+
+    def test_a_pull_request_closing_the_issue_is_a_fix(self):
+        out = self.lines(
+            (4, "Fix the test\nCloses #9, main red at abc."),
+            (5, "Unrelated\nRefs #9."),
+            (6, "Quoted\n`Fixes #9` is what it would say."),
+            (7, "fixes: #9 in the title\n"),
+            (8, "Closes #90\n"))
+        got = pc.red_fixes("t", 9, run=lambda args, **kw: done(args,
+                                                                out=out))
+        self.assertEqual(got, [4, 7])
+
+    def test_an_unreadable_list_is_none(self):
+        self.assertIsNone(pc.red_fixes(
+            "t", 9, run=lambda args, **kw: done(args, rc=1)))
+
+    def test_a_fix_is_queued_as_urgent(self):
+        self.addCleanup(setattr, pc, "MAIN_RED_FIXES", frozenset())
+        pc.MAIN_RED_FIXES = frozenset({2})
+        state = {"waiting": {}, "results": {}, "refused": {}}
+        pc.note_heads(state, [(1, SHA_A, pc.REPO_SLUG, False),
+                              (2, SHA_B, pc.REPO_SLUG, False)],
+                      T0, tempfile.mkdtemp(), out=lambda *a: None)
+        self.assertTrue(state["waiting"][SHA_B].get("urgent"))
+        self.assertFalse(state["waiting"][SHA_A].get("urgent"))

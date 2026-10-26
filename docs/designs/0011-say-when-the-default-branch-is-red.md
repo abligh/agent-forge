@@ -152,9 +152,24 @@ The same test covers a pull request handed back as red: a head whose
 merged run is red only where the base is red ("itself red here") is
 held as `base red`, not handed back.
 
+### 3. Urgent pull requests are a batch of their own
+
+(Alex, 2026-10-26, in the terminal: "if there are urgent labelled
+issues, they all should be gathered in their own little batch with
+nothing non-urgent? Often they are pin changes and this avoids them
+being stuck at the front of a large batch that gets bisected".)
+
+A batch, the first or a later one, never mixes urgent pull requests
+(`labels.urgent`, a red nightly's fix, a red default branch's) with
+others: it ends where its members change from one kind to the other.
+The rest are predicted on top as the next batch and run beside it, so
+they lose nothing, and an urgent one merges as soon as its own top is
+green, never waiting on or searched with the others.
+
 ### Cost
 
-One list over the pull requests already fetched, a tick. While the
+One more list of the open pull requests a tick, only while the issue is
+open. While the
 default branch is red and nobody has fixed it, nothing whose red is
 the base's merges. With part 1 the fix is first in the next batch, so
 that is one batch's run.
@@ -164,3 +179,6 @@ that is one batch's run.
 1. forge-pr-check: `main_red.fixes`, taken as urgent; tests.
 2. forge-merger: those as urgent; `BATCH-BASE-RED`, and the base-red
    hold for a single pull request; tests.
+3. forge-merger: urgent batches apart; tests.
+
+Implemented: all three, in one release.
