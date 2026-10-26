@@ -4294,6 +4294,15 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                                       red))
                     searching = True
             if searching and entries:
+                # A suspect merged this tick is still predicted first,
+                # from the tip before it: the rest are predicted on it,
+                # and the search goes on with them.
+                merged = set(saved.get("merged") or ())
+                while entries and entries[0]["pr"] in merged:
+                    entries = entries[1:]
+                said_ahead["entries"] = entries
+                record["ahead"] = [e["pr"] for e in entries]
+            if searching and entries:
                 searching = suspect_round(
                     state_dir, saved, entries, verdict, last, said_ahead,
                     record, out)
