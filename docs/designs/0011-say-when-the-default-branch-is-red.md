@@ -96,3 +96,71 @@ merge, which is what the main check being replaced already cost.
 The second project's main check has filed an issue on each red tip
 since its own design. Its operators rely on it: it is how a flaky test
 or a bad merge gets an owner.
+
+## Amendment (2026-10-26): its fix goes first, and a red it caused names no suspect
+
+* Status: proposed
+* Author: XMPPEngineer
+
+### Why
+
+Two pull requests passed alone and together turned the default
+branch red. The fix was approved and green within twenty minutes, but
+it went to the back of a 36-long queue: nothing put it first. Until it
+merged, two things went wrong:
+- every run that reached the broken step failed, each with "(itself
+  red here)";
+- a batch whose top contained that step would go red. Under
+  designs/0035 its search would then end by naming a member that had
+  nothing to do with it and handing it back.
+
+A red nightly's fix already goes first (designs/0028). A red default
+branch is the same problem.
+
+### 1. A pull request that closes the open issue goes first
+
+While the `main_red_issue` issue is open, each open pull request that
+closes it is treated as if it carried `labels.urgent`, both by
+forge-pr-check (it is run first) and by the Merger (it is merged and
+predicted first). "Closes" means what designs/0028 means:
+- GitHub's closing references;
+- `Closes`/`Fixes`/`Resolves #n` in the title, the body (outside code)
+  or a commit message.
+
+forge-pr-check works out the numbers each tick, from the pull requests
+it already lists, and keeps them as `main_red.fixes` in state.json.
+The Merger reads them there, as it reads the nightly's from
+forge-nightly's state. Once the issue is closed the list is empty, and
+the pull requests go back to their ordinary places. A person's
+`labels.urgent` is unchanged.
+
+### 2. A batch red only where its base is red is not searched
+
+The Merger looks at the red verdict on a batch's top tree. If every
+step it failed also failed in the default branch's own run of the
+batch's base, the red is the base's. Then:
+- the top is treated as not yet judged, not as red;
+- no suspects are taken and nothing is handed back;
+- `BATCH-BASE-RED #a..#b: red only in <steps>, as <base> is` is
+  logged once.
+
+Once the base changes, because a fix merged, the batch is predicted
+again on the new base. If the top fails a step the base passed, the
+red is the batch's own, and designs/0035's search runs as now.
+
+The same test covers a pull request handed back as red: a head whose
+merged run is red only where the base is red ("itself red here") is
+held as `base red`, not handed back.
+
+### Cost
+
+One list over the pull requests already fetched, a tick. While the
+default branch is red and nobody has fixed it, nothing whose red is
+the base's merges. With part 1 the fix is first in the next batch, so
+that is one batch's run.
+
+### Steps
+
+1. forge-pr-check: `main_red.fixes`, taken as urgent; tests.
+2. forge-merger: those as urgent; `BATCH-BASE-RED`, and the base-red
+   hold for a single pull request; tests.
