@@ -4311,6 +4311,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 if live:
                     decision["result"] = carry_out(
                         decision, approvals[pr["number"]], github, said)
+                    # Saved now: `said` was written before this, and a
+                    # hand-back not kept is said again every tick.
+                    save_json(said_path, said)
                 record["decisions"].append(decision)
                 out("CHECKED-AHEAD #%d: %s; %shanded back before its batch"
                     % (pr["number"], failed[1].splitlines()[0],
