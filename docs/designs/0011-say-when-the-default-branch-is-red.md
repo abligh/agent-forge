@@ -99,7 +99,7 @@ or a bad merge gets an owner.
 
 ## Amendment (2026-10-26): its fix goes first, and a red it caused names no suspect
 
-* Status: proposed
+* Status: approved (Alex, 2026-10-26, at 365f9f387, <https://github.com/abligh/agent-forge/issues/137#issuecomment-6420260033>)
 * Author: XMPPEngineer
 
 ### Why
