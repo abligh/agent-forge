@@ -237,7 +237,7 @@ A project then sets each key in its own configuration. Parts 1 and 3
 
 ## Amendment (2026-10-26): batches grow at the end, `Blocked-by:` queues, part 2 first
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-26, https://github.com/abligh/agent-forge/issues/118#issuecomment-6411078124)
 
 **Why.** A pull request that becomes ready while a batch runs waits for
 that batch to merge before anything tests it, even when slots are free.
