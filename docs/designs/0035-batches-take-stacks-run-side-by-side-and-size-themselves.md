@@ -33,15 +33,11 @@ This design makes three changes, each off unless set:
    batches, each predicted on the batch before, run while the current
    one runs. When the batches below a top all go green and merge, its
    verdict is already in.
-3. **A red batch searches for its first red member, and batches size
-   themselves.** A red batch is bisected for the first member that
-   turns it red: everything before that member merges, and that member
-   is handed back. The batch isn't refilled until then, so its other
-   members aren't retested. Each batch's outcome is recorded. A report
-   estimates the pull requests' red rate from the outcomes, simulates
-   the queue, and gives the size that costs the fewest runs per pull
-   request, retests included. Later, the Merger can set the size
-   itself.
+3. **Batches size themselves.** Each batch's outcome is recorded. A
+   report estimates the pull requests' red rate from the outcomes,
+   simulates the queue, and gives each size's runs per pull request,
+   retests included, and how long a pull request waits. Later, the
+   Merger can set the size itself.
 
 ## Evidence
 
@@ -133,18 +129,17 @@ K × `batch`:
 
 ### 3. A red batch searches for its first red member; batches size themselves
 
-1. **The search, not a restart.** Today (designs/0032) a red top halves
-   the batch until a prefix is green, merges that prefix, and then
-   starts a new full batch from the queue. The rest of the old batch,
-   with the bad pull request still in it, goes into that new batch. It
-   turns red again and is halved again, so the bad pull request's
-   batchmates are tested over and over. With `search: true`, a red
-   batch is instead searched for its **first red member**: bisect over
-   its prefixes, each already predicted, until prefix k is green and
-   prefix k + 1 is red. Then members 1 to k merge, covered by prefix k's
-   run, and member k + 1 is handed back: it is red on top of the ones
-   before it, and its hand-back says so. The members after it are
-   unresolved, and they start the next new batch.
+1. **The search already exists.** designs/0032's split is already a
+   search for a red batch's first red member. A red verdict is kept by
+   tree, and a new batch ends at a tree already red. So once a red
+   batch's green half has merged, the next batch is the rest of the old
+   batch up to its red top, halved again, rather than a full batch
+   refilled from the queue. A batch of 8 with only its 8th member red
+   tests 8, then 1–4 (green, merged), then 5–6 (green, merged), then
+   7 (green, merged), and the 8th is left to its own run. The search
+   starts again only when the predictions change under it: a push, a
+   hand-back, a new approval order or a retarget gives the red tree a
+   new one, which has no verdict. Nothing is built for this part.
 2. **Each batch's outcome.** When a batch is done, `forge-merger`
    appends one line to `batches.jsonl` in its state directory: the size
    tried, the number merged, the runs it took, the pull request handed
@@ -157,33 +152,34 @@ K × `batch`:
    the default branch was red, or while a flaky test was logged
    (`FLAKE`): then every pull request looks bad at once, and q would
    come out far too high.
-4. **What the report measures: runs per pull request.** Runs are what
-   the hosts spend, so the report's measure is runs per pull request
-   leaving the queue (merged or handed back), retests included. It
-   also gives how many runs each pull request was in, since a flaky
-   test catches a pull request that is tested more often. Both come
-   from a simulation of the queue under the project's own rules, not
-   from a formula per batch: a formula per batch misses the retests of
-   a red batch's remaining members. Simulated, for 200,000 pull
-   requests:
+4. **What the report measures.** For each size, from a simulation of
+   the queue under the project's own rules (a formula per batch misses
+   the retests of a red batch's remaining members):
+   * **runs per pull request** leaving the queue (merged or handed
+     back), retests included: what the hosts spend;
+   * **the wait**, in runs, from a pull request's first run to its
+     merge or hand-back, mean and 90th percentile: what its author
+     sees;
+   * **how many runs each pull request was in**, since a flaky test
+     catches a pull request that is tested more often.
 
-   | q | rule | 1 | 2 | 4 | 5 | 8 | 16 |
-   | --- | --- | --- | --- | --- | --- | --- | --- |
-   | 2% | halve and restart | 1.00 | 0.54 | 0.35 | 0.33 | 0.28 | 0.29 |
-   | 2% | search | 1.00 | 0.52 | 0.30 | 0.26 | 0.19 | 0.15 |
-   | 5% | halve and restart | 1.00 | 0.61 | 0.49 | 0.51 | 0.51 | 0.61 |
-   | 5% | search | 1.00 | 0.56 | 0.37 | 0.34 | 0.30 | 0.29 |
-   | 10% | halve and restart | 1.00 | 0.72 | 0.72 | 0.82 | 0.87 | 1.11 |
-   | 10% | search | 1.00 | 0.63 | 0.49 | 0.48 | 0.47 | 0.52 |
+   Simulated for 100,000 pull requests:
 
-   Runs per pull request; lower is better. Under halve-and-restart,
-   anything above 4 costs more at q = 10%, and 16 costs more than no
-   batch at all. With the search, 8 is as good as or better than every
-   smaller size up to q = 10%, and each pull request is in 2.5 runs at
-   most. A pull request in a batch of 16 at q = 10% is in 4.6 runs.
+   | q | | 4 | 5 | 8 | 16 | 32 |
+   | --- | --- | --- | --- | --- | --- | --- |
+   | 2% | runs per pull request | 0.30 | 0.26 | 0.20 | 0.15 | 0.14 |
+   | | wait, mean (p90) | 1.2 (1) | 1.3 (1) | 1.6 (4) | 2.5 (6) | 4.6 (12) |
+   | 5% | runs per pull request | 0.37 | 0.34 | 0.30 | 0.29 | 0.31 |
+   | | wait, mean (p90) | 1.5 (3) | 1.7 (4) | 2.4 (5) | 4.6 (10) | 10.0 (18) |
+   | 10% | runs per pull request | 0.49 | 0.48 | 0.47 | 0.52 | 0.60 |
+   | | wait, mean (p90) | 2.0 (4) | 2.4 (4) | 3.8 (8) | 8.3 (15) | 19.1 (30) |
+
+   8 costs fewer runs than 5 at every rate up to 10%. Beyond 8 the
+   gain depends on the red rate and is small, while the wait doubles
+   with each doubling of the size.
 5. **The best size.** The report gives the size with the fewest runs
-   per pull request for the fitted q, under the rule in force, and how
-   many runs each pull request was in at that size.
+   per pull request for the fitted q whose 90th-percentile wait is
+   within `wait_runs` (default 6), and that size's figures.
 6. **`batch: "auto"`, later.** With `"auto"` and `batch_max`, the
    Merger starts each new batch at the report's best size (at least 2,
    at most `batch_max`) for the last `hours`. It is built only after the
@@ -209,9 +205,7 @@ K × `batch`:
 * **Part 2:** runs thrown away when an earlier batch goes red. With 90%
   of runs green and K = 2, about one later run in ten is spent. Each
   is a slot that would otherwise have been idle.
-* **Part 3:** the search uses predictions that already exist, so it
-  costs no extra runs: it saves the retests. A report simulates the
-  queue from one line per batch.
+* **Part 3:** one line per batch, and a simulation for the report.
 * **Throughput.** With parts 1 and 2, batch 8 and K = 2, two runs in
   flight cover up to sixteen merges, against three today. At the
   observed red rates that is several times the arrivals of about 12 an
@@ -223,16 +217,16 @@ K × `batch`:
 | --- | --- | --- |
 | `merge.test_ahead.stacks` | `false` | A stack's ready layers join their base's batch, straight after it; anything they displaced goes first in the next batch. Needs `merge.stacks` and `batch` above 1. |
 | `merge.test_ahead.batches` | `1` | How many batches are predicted and run at once. Later tops run only in spare slots. `depth` + 1 must be at least `batches` × `batch`. |
-| `merge.test_ahead.search` | `false` | A red batch is bisected for its first red member; those before it merge, it is handed back, and the batch isn't refilled until then (part 3). |
 | `merge.test_ahead.batch` | `1` | Gains `"auto"` (part 3, built last): the report's best size, at most `batch_max`. |
 | `merge.test_ahead.batch_max` | none | With `batch: "auto"`, the largest size it may choose. `depth` + 1 must be at least `batches` × `batch_max`. |
+| `merge.test_ahead.wait_runs` | `6` | The report's and `"auto"`'s limit on a pull request's 90th-percentile wait, in runs. |
 
 ## Order of work
 
 1. `forge-merger`: layers in the prediction, `owed` in `ahead.json`,
    the fairness rule; tests. `docs/config.md`. A release.
-2. `forge-merger`: `search`, `batches.jsonl` and `--batch-report`;
-   tests. A release.
+2. `forge-merger`: `batches.jsonl` and `--batch-report`; tests. A
+   release.
 3. `forge-merger` and `forge-pr-check`: K batches in `ahead.json`,
    later tops in spare slots, unresolved members left out, discarding
    on an earlier red; tests. `docs/config.md`. A release.
