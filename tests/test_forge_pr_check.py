@@ -2777,6 +2777,30 @@ class SettledHeads(StateCase):
         self.assertTrue(any("COVERED #7 %s" % SHA_A[:10] in line
                             for line in self.lines))
 
+    def test_a_running_member_is_stopped_once_its_top_covers_it(self):
+        # Seen on 2026-10-26: the Merger updated #4651 to its batch's
+        # tree, and a free slot ran it for 10 minutes before the cover.
+        self.write_state({"waiting": {SHA_A: {
+            "pr": 7, "since": pc.iso(T0 - datetime.timedelta(minutes=5)),
+            "started": pc.iso(T0)}},
+            "results": {SHA_Q: verdict(pr=8, tree=TREE_3, ahead=True)}})
+        merger = self.merger_says(7)
+        write_ahead(merger, [entry(7, SHA_P, TREE_1),
+                             entry(8, SHA_Q, TREE_3)],
+                    when=T0 - datetime.timedelta(minutes=1), batch=2)
+        self.hold(1, "#7 %s %s pid=4242" % (SHA_A, pc.iso(T0)))
+        stopped, posted = [], []
+        pc.tick(self.state_dir, "tok", self.run_with(),
+                lambda *a: None, self.lines.append, when=T0,
+                post=lambda *a: posted.append(a) or True, slots=1,
+                checkout="/repo", merger_dir=merger,
+                stop=lambda pid: stopped.append(pid) or True)
+        self.assertEqual(stopped, [4242])
+        self.assertEqual(self.state()["results"][SHA_A]["covered"], "#7..#8")
+        self.assertEqual(posted[0][:2], (SHA_A, "success"))
+        self.assertTrue(any("STOPPED-COVERED #7 %s" % SHA_A[:10] in line
+                            for line in self.lines))
+
     def test_a_member_waits_while_its_top_is_run(self):
         posted = self.batched({})
         self.assertEqual(posted, [])

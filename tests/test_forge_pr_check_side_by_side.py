@@ -115,6 +115,18 @@ class CpuShare(unittest.TestCase):
             share = pc.cpu_share("/nowhere", {"CHECK_CPUS": "5"}, environ={})
             self.assertEqual((share(), share()), (10, 30))
 
+    def test_per_step_never_less_than_the_runs_share(self):
+        # Seen on 2026-10-26: test-rust, taken after the build, found
+        # the other slots filled and ran on 4.4 CPUs, not 7.5.
+        with mock.patch.object(pc, "CPU_SHARE", "step"), \
+                mock.patch.object(pc, "busy_slots", lambda state_dir: 6), \
+                mock.patch.object(pc, "online_cpus", lambda: 30), \
+                mock.patch.object(pc, "FAST_LANE_S", None), \
+                mock.patch.object(pc, "SLOTS", 6):
+            share = pc.cpu_share("/nowhere", {"CHECK_CPUS": "15"},
+                                 environ={})
+            self.assertEqual(share(), 15)
+
     def test_side_by_side_splits_the_runs_own(self):
         with mock.patch.object(pc, "SIDE_BY_SIDE", 4):
             share = pc.cpu_share("/nowhere", {"CHECK_CPUS": "12"},

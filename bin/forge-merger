@@ -3113,6 +3113,29 @@ def locked_order(state_dir, queue):
     return places
 
 
+def green_batch(state_dir, queue, check_state):
+    """Whether the last tick's batch (AHEAD_FILE) is green and not yet
+    merged: its top's tree is green, and a member is still in `queue`
+    at the head it was predicted at. Between one member's merge and
+    the next, no merge is in flight, but the batch is still merging: a
+    layer that comes back then waits for the next batch, as it does
+    while a merge is in flight, since joining in front would change
+    every member's tree and spend the top's green."""
+    last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+    if not isinstance(last, dict) or not isinstance(last.get("batch"), dict):
+        return False
+    trees = last["batch"].get("trees")
+    entries = last.get("entries")
+    if not isinstance(trees, list) or not trees \
+            or not isinstance(entries, list) \
+            or tree_verdict(check_state, trees[-1]) is not True:
+        return False
+    heads = {pr["number"]: pr["headRefOid"] for pr in queue}
+    return any(isinstance(e, dict) and e.get("tree") in trees
+               and heads.get(e.get("pr")) in (e.get("head"), e.get("sha"))
+               for e in entries)
+
+
 def predicted(state_dir):
     """The pull requests the last live tick predicted (AHEAD_FILE), at
     any head."""
@@ -3782,7 +3805,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # first in the next batch, not into that one, which would spend
         # its run.
         late = (set(first) - predicted(state_dir)
-                if TEST_AHEAD and in_flight is not None else set())
+                if TEST_AHEAD and (in_flight is not None or green_batch(
+                    state_dir, queue, check_state)) else set())
         places = locked_order(state_dir, queue) if late else {}
         queue.sort(key=lambda pr: (
             pr["number"] != in_flight,

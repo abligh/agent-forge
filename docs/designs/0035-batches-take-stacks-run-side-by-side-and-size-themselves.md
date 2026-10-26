@@ -422,3 +422,19 @@ went:
 3. Then the first amendment's `blocked_by`, and part 3's report.
 
 No new key: both changes apply wherever `batch` is above 1.
+
+## Amendment (2026-10-26, third): a green batch finishes merging first
+
+* Status: approved (Alex Bligh, 2026-10-26, in the terminal: "#134 approved"; https://github.com/abligh/agent-forge/issues/135)
+
+**Why.** At 14:12Z on 26 October a batch of 8 went green, and its
+first member merged. Between that merge and the next, no merge was in
+flight, so the three stack layers whose bases had just merged counted
+as "no batch running" and went first. Part 1 lets a returning layer go
+first only then. Every member behind them got a new tree, the top's
+green covered none of them, and the seven waited for a new run.
+
+**Change.** A batch whose top is green, with a member still in the
+queue at the head it was predicted at, counts as running until it has
+merged. A layer that comes back meanwhile goes first in the next
+batch, as it does while a merge is in flight. No new key.

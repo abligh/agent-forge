@@ -14,8 +14,9 @@ configuration's `stats_watch.figures`:
     check_wait     the wait for a slot, p90, in minutes: the same
     pr_turnaround  a pull-request head's wait and run, median: the same
     merge_time     joined the queue to merged, median: the same
-    merge_rate     merges an hour: under the baseline's over `ratio`,
-                   judged only when approved pull requests waited
+    merge_rate     merges an hour: under `limit`, or under the
+                   baseline's over `ratio`, judged only when approved
+                   pull requests waited
     slots_busy     the slots busy, in percent: over `limit`
     main_red       red build checks of the default branch: any
     nightly_red_hours  the hours since the last green nightly ended
@@ -32,7 +33,7 @@ the window, so `min_samples` doesn't apply to it either.
 
 **One open issue per figure.** A figure out of line opens an issue
 labelled `label` (default `stats-watch`) and `<labels.owner_prefix><owner>`
-(whose it is), with the window's and the baseline's figures, the rule
+(whose it is: the figure's own `owner`, else the watch's), with the window's and the baseline's figures, the rule
 that tripped and the `forge-stats` command to see more. The issue is
 found again by that label and its `Figure: <name>` line, so an issue an
 earlier run filed is found even without this tool's state. While the
@@ -209,8 +210,13 @@ def judge(figure, rules, window, baseline, min_samples):
     have_base = (ratio is not None and base is not None
                  and base_n >= min_samples and base > 0)
     if figure == "merge_rate":
+        floor = rules.get("limit")
+        if floor is not None and value < floor:
+            return OUT, "%s, under the limit of %s" % (
+                show(figure, value), show(figure, floor))
         if not have_base:
-            return UNJUDGED, "no baseline to compare with"
+            return (IN, show(figure, value)) if floor is not None \
+                else (UNJUDGED, "no baseline to compare with")
         if value < base / ratio:
             return OUT, "%s, under the baseline's %s over %g" % (
                 show(figure, value), show(figure, base), ratio)
@@ -242,9 +248,14 @@ class Watch:
         self.baseline = datetime.timedelta(days=self.cfg["baseline_days"])
         self.remind = datetime.timedelta(hours=self.cfg["remind_hours"])
 
-    def owner_label(self):
+    def owner(self, figure):
+        """Whose `figure`'s issue is: its own `owner`, else the watch's."""
+        rules = (self.cfg.get("figures") or {}).get(figure) or {}
+        return rules.get("owner") or self.cfg["owner"]
+
+    def owner_label(self, figure):
         prefix = self.project.section("labels").get("owner_prefix", "Owner:")
-        return prefix + self.cfg["owner"]
+        return prefix + self.owner(figure)
 
     def signature(self):
         return ("Written by forge-stats-watch, agent-forge's watch on how "
@@ -285,7 +296,7 @@ class Watch:
             "whole window (%d h). It only reports: what the slowdown means "
             "is %s's to decide." % (self.cfg["remind_hours"],
                                     self.cfg["window_hours"],
-                                    self.cfg["owner"]),
+                                    self.owner(figure)),
             "Figure: %s" % figure, self.signature()])
 
 
@@ -410,12 +421,13 @@ def act(watch, token, call, figure, verdict, why, entry, rules, window,
             ok, got = write("POST", "/repos/%s/issues" % repo, {
                 "title": title,
                 "body": watch.open_body(figure, rules, why, window, baseline),
-                "labels": [watch.cfg["label"], watch.owner_label()]}, 201)
+                "labels": [watch.cfg["label"], watch.owner_label(figure)]},
+                201)
             if not ok:
                 return entry, False
             number = got.get("number")
             say("%sOPEN %s: %s, for %s" % (would, figure, title,
-                                            watch.cfg["owner"]))
+                                            watch.owner(figure)))
             return {"issue": number, "opened": iso(now), "told": iso(now)}, \
                 True
         try:

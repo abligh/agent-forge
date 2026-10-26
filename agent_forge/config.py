@@ -87,7 +87,8 @@ STATS_WATCH = {"owner": str, "window_hours": int, "baseline_days": int,
 STATS_WATCH_FIGURES = {
     "check_run": ("limit", "ratio"), "check_wait": ("limit", "ratio"),
     "pr_turnaround": ("limit", "ratio"), "merge_time": ("limit", "ratio"),
-    "merge_rate": ("ratio",), "slots_busy": ("limit",), "main_red": (),
+    "merge_rate": ("limit", "ratio"), "slots_busy": ("limit",),
+    "main_red": (),
     "nightly_red_hours": ("limit",)}
 # forge-nightly (designs/0028): a red nightly is a red main.
 NIGHTLY = {"workflow": str, "job": str, "owners": dict, "labels": list,
@@ -401,6 +402,11 @@ def _check_stats_watch(watch, data, problems):
             continue
         for key, value in rules.items():
             if key.startswith("_"):
+                continue
+            if key == "owner":
+                if not isinstance(value, str) or value not in data["agents"]:
+                    problems.append("%s.owner %r is not an agent"
+                                    % (at, value))
                 continue
             if key not in STATS_WATCH_FIGURES[figure]:
                 problems.append("%s: unknown key %r" % (at, key))
