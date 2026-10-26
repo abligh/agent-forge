@@ -146,6 +146,20 @@ class Check(unittest.TestCase):
         self.assertEqual(config.check(data),
                          ["checks.host_fault_text must be a list"])
 
+    def test_cache_fault_text_takes_lists_of_non_empty_strings(self):
+        data = example()
+        data["checks"]["cache_fault_text"] = [["rust-lld: error:",
+                                               "undefined symbol"]]
+        self.assertEqual(config.check(data), [])
+        data["checks"]["cache_fault_text"] = [[], ["", "x"], "x", [3]]
+        problems = config.check(data)
+        self.assertEqual(len(problems), 4)
+        self.assertIn("checks.cache_fault_text: [] is not a list of "
+                      "non-empty strings", problems)
+        data["checks"]["cache_fault_text"] = "undefined symbol"
+        self.assertEqual(config.check(data),
+                         ["checks.cache_fault_text must be a list"])
+
     def test_the_example_is_good(self):
         self.assertEqual(config.check(example()), [])
 

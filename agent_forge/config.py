@@ -123,7 +123,8 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "fresh": dict, "first_authors": list, "max_wait_minutes": int,
           "main": str, "main_red_issue": dict, "drop_env": list,
           "keep_ignored": list, "red_comment": bool, "instances": dict,
-          "host_fault_text": list, "step_alert": dict, "cpu_share": str,
+          "host_fault_text": list, "cache_fault_text": list,
+          "step_alert": dict, "cpu_share": str,
           "side_by_side": dict, "merger_cpu_weight": int,
           "docker_slices": dict, "pull_requests": dict}
 # checks.docker_slices (designs/0031): the slices each step's
@@ -150,7 +151,8 @@ INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight",
                       "step_timeout_minutes", "caches", "cache_limit",
                       "keep_ignored", "drop_env", "merge_default",
                       "red_comment", "max_wait_minutes", "host_fault_text",
-                      "step_alert", "cpu_share", "side_by_side")
+                      "cache_fault_text", "step_alert", "cpu_share",
+                      "side_by_side")
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main", "main_red_issue")
 INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
@@ -862,6 +864,13 @@ def _check_checks(checks, data, problems, where="checks"):
             if not isinstance(text, str) or not text.strip():
                 problems.append("%s.host_fault_text: %r is not a non-empty "
                                 "string" % (where, text))
+    if isinstance(checks.get("cache_fault_text"), list):
+        for entry in checks["cache_fault_text"]:
+            if not (isinstance(entry, list) and entry and all(
+                    isinstance(text, str) and text.strip()
+                    for text in entry)):
+                problems.append("%s.cache_fault_text: %r is not a list of "
+                                "non-empty strings" % (where, entry))
     if isinstance(checks.get("first_authors"), list):
         agents = data.get("agents", {})
         for name in checks["first_authors"]:

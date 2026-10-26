@@ -69,6 +69,15 @@ given up on with `error`, until `labels.rerun` (below) tries it again.
 A red verdict says the head is broken, and
 its author would otherwise be sent to fix what isn't hers.
 
+**A stale build cache is cleared, and the head run again**
+(`checks.cache_fault_text`, designs/0022's amendment of 2026-10-26). A
+red whose failed step's tail holds every string of one of its entries
+records no verdict, and `verdicts.log` says `CACHE-FAULT`. While the
+slot's lock is still held, every directory directly in an
+`incremental` directory under the slot's caches is removed, and the
+head runs again at once in the same slot. That isn't `labels.rerun`'s
+rerun, nor a host fault. If it matches again, the red stands.
+
 **A run of a head that is no longer its pull request's is stopped.**
 When a tick finds a slot running a head that no open pull request has
 any more (a new push, an update from `main`, or a closed pull request),
@@ -885,6 +894,7 @@ def configure(project, instance=None):
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
     global MAIN_NEWEST
     global RED_COMMENT, RERUN_LABEL, HOST_FAULT_EXTRA, STEP_ALERT
+    global CACHE_FAULT_TEXT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
     global PULL_REQUESTS, HOST_LOCK
     INSTANCE = instance
@@ -953,6 +963,8 @@ def configure(project, instance=None):
     HOST_FAULT_EXTRA = tuple(checks.get("host_fault_text", ()))
     HOST_LOCK = dict(checks["lock"]) \
         if instance is not None and checks.get("lock") else None
+    CACHE_FAULT_TEXT = tuple(tuple(entry) for entry
+                             in checks.get("cache_fault_text", ()))
     MAIN_EVERY = checks.get("main", "needed") in ("every", "newest")
     MAIN_NEWEST = checks.get("main") == "newest"
     MAIN_RED_ISSUE = dict(checks["main_red_issue"]) \
@@ -2753,6 +2765,52 @@ def host_fault(results):
                 return r["name"], "its output says %s" % json.dumps(
                     text, ensure_ascii=False)
     return None
+
+
+# checks.cache_fault_text (designs/0022, amendment of 2026-10-26): each
+# a tuple of strings that, all in a failed step's tail, say the slot's
+# build cache went stale, not the head.
+CACHE_FAULT_TEXT = ()
+
+
+def cache_fault(results):
+    """(step, entry) for the first failed step whose tail holds every
+    string of one of checks.cache_fault_text's entries, or None."""
+    for r in results:
+        if r["rc"] == 0:
+            continue
+        for entry in CACHE_FAULT_TEXT:
+            if all(text in r["tail"] for text in entry):
+                return r["name"], entry
+    return None
+
+
+def clear_incremental(state_dir, slot):
+    """Remove every directory directly in an `incremental` directory
+    under the slot's caches (`cache_folders`), the unit the pruning
+    removes whole, and return how many went. Only what resolves inside
+    a cache of this slot's, under state_dir, is removed: a cache that
+    is a link, or a link inside one, is left alone. Called with the
+    slot's lock held, so no run is using the caches."""
+    top = os.path.realpath(state_dir)
+    roots = []
+    for folder in cache_folders():
+        root = os.path.join(state_dir, slot_name(folder, slot))
+        real = os.path.realpath(root)
+        if os.path.isdir(root) and not os.path.islink(root) \
+                and os.path.dirname(real) == top:
+            roots.append(real)
+    gone = 0
+    for path in incremental_sessions(roots):
+        real = os.path.realpath(path)
+        if not any(real.startswith(root + os.sep) for root in roots):
+            continue
+        try:
+            shutil.rmtree(real)
+        except OSError:
+            continue
+        gone += 1
+    return gone
 
 
 def count_error(state_dir, sha, ahead, key="errors"):
@@ -5277,9 +5335,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             else:
                 wrap = trace_wrapper(state_dir, slot, tracer, files)
         kept = os.path.join(state_dir, RESULTS_DIR, sha)
-        shutil.rmtree(kept, ignore_errors=True)
         logs = os.path.join(state_dir, LOGS_DIR, sha)
-        shutil.rmtree(logs, ignore_errors=True)
         share, step_caches = cpu_share(state_dir, env), None
         if SIDE_BY_SIDE is not None:
             step_caches = {
@@ -5297,23 +5353,57 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                                      sha[:10], why), now_utc(), out)
                 return 2
         phases.mark("setup")
-        steps_began = time.monotonic()
-        # A test's own `run` stands in for every program, steps too.
-        ok, results = check(wt, env, run, steps=steps,
-                            prefix=memory_cap(memory_max, env, run, out),
-                            wrap=wrap, kept=kept, logs=logs,
-                            stream=sh_logged if run is sh else None,
-                            share=share, caches=step_caches,
-                            side_by_side=SIDE_BY_SIDE,
-                            front=None if front is None or slot == LANE
-                            or main else lambda: front(clock()))
-        steps_took = time.monotonic() - steps_began
-        phases.mark("steps")
-        for r in results:
-            out("  %-20s rc=%-3d %4ds" % (r["name"], r["rc"], r["seconds"]))
-            if r["rc"] != 0:
-                for line in r["tail"].splitlines():
-                    out("    | " + line)
+        # How many incremental directories a stale cache cost, once it
+        # has been cleared for this head (checks.cache_fault_text).
+        cleared = None
+        while True:
+            shutil.rmtree(kept, ignore_errors=True)
+            shutil.rmtree(logs, ignore_errors=True)
+            steps_began = time.monotonic()
+            # A test's own `run` stands in for every program, steps too.
+            ok, results = check(wt, env, run, steps=steps,
+                                prefix=memory_cap(memory_max, env, run, out),
+                                wrap=wrap, kept=kept, logs=logs,
+                                stream=sh_logged if run is sh else None,
+                                share=share, caches=step_caches,
+                                side_by_side=SIDE_BY_SIDE,
+                                front=None if front is None or slot == LANE
+                                or main else lambda: front(clock()))
+            steps_took = time.monotonic() - steps_began
+            phases.mark("steps")
+            for r in results:
+                out("  %-20s rc=%-3d %4ds" % (r["name"], r["rc"],
+                                              r["seconds"]))
+                if r["rc"] != 0:
+                    for line in r["tail"].splitlines():
+                        out("    | " + line)
+            stale = cache_fault(results) \
+                if not ok and host_fault(results) is None else None
+            if stale is None or cleared is not None:
+                break
+            # No verdict: the slot's incremental state goes while its
+            # lock is held, and the head runs again now, in this slot.
+            # Not labels.rerun's rerun, and not a host fault.
+            cleared = clear_incremental(state_dir, slot)
+            for path in files.values():
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            files.clear()
+            log(state_dir, "CACHE-FAULT%s %s %s in %s: %s: its tail has %s; "
+                "no verdict; cleared %d incremental directories, and run "
+                "again now" % (" AHEAD" if ahead else "", name, sha[:10],
+                               slot_label(slot), stale[0],
+                               json.dumps(list(stale[1]), ensure_ascii=False),
+                               cleared), now_utc(), out)
+        if stale is not None:
+            log(state_dir, "CACHE-FAULT%s %s %s in %s: %s: its tail has %s "
+                "again, after its cache was cleared; the red stands"
+                % (" AHEAD" if ahead else "", name, sha[:10],
+                   slot_label(slot), stale[0],
+                   json.dumps(list(stale[1]), ensure_ascii=False)),
+                now_utc(), out)
         finished = clock()
         for r in results:
             if "results_dropped" in r:
