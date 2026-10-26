@@ -425,7 +425,7 @@ No new key: both changes apply wherever `batch` is above 1.
 
 ## Amendment (2026-10-26, third): a green batch finishes merging first
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-26, in the terminal: "#134 approved"; https://github.com/abligh/agent-forge/issues/135)
 
 **Why.** At 14:12Z on 26 October a batch of 8 went green, and its
 first member merged. Between that merge and the next, no merge was in

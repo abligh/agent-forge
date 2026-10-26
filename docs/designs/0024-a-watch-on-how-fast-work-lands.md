@@ -143,7 +143,7 @@ checks have tests of their own.
 
 ## Amendment (2026-10-26): a figure's own owner, and a floor on merges an hour
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-26, in the terminal: "#134 approved"; https://github.com/abligh/agent-forge/issues/135)
 
 **Why.** On 26 October the queue-to-merge figure was out of line all
 day, but every issue went to the watch's one owner. That owner looks
