@@ -2968,6 +2968,19 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     current = {head[1] for head in heads}
     halt = merger_stop(merger_dir, when, checkout) \
         if TEST_AHEAD and merger_dir else set()
+    batch = merger_batch(merger_dir, when, checkout) \
+        if TEST_AHEAD and merger_dir else []
+    # A head a slot is running that its batch's green top now covers:
+    # the Merger updated it to its predicted tree, and a free slot took
+    # it before the cover could. Its run is stopped and it is matched.
+    covering = {}
+    if batch and busy:
+        unstarted = dict(state, waiting={
+            sha: {k: v for k, v in entry.items() if k != "started"}
+            for sha, entry in state["waiting"].items()})
+        covering = {got[0]: got for got in settled_heads(
+            unstarted, checkout, (), when, run, state_dir, batch)
+            if got[4] and got[0] in busy}
     for slot, holder in holders.items():
         if holder is None:
             continue
@@ -2979,6 +2992,18 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 "open pull request; %s the run in %s (pid %d), since %s"
                 % (pr, sha[:10], "stopping" if sent else "could not stop",
                    slot_label(slot), pid, since), when, out)
+        elif got and not got[4] and got[1] in covering and got[3]:
+            pr, sha, since, pid, _ = got
+            sent = stop(pid)
+            log(state_dir, "STOPPED-COVERED #%d %s: the top of the Merger's "
+                "batch %s is green; %s the run in %s (pid %d), since %s"
+                % (pr, sha[:10], covering[sha][4], "stopping" if sent
+                   else "could not stop", slot_label(slot), pid, since),
+                when, out)
+            if sent:
+                matched(state_dir, *covering[sha][:4], when, post, out,
+                        covered=covering[sha][4])
+                queued.discard(sha)
         elif got and got[4] and got[1] in halt and got[3]:
             pr, sha, since, pid, _ = got
             sent = stop(pid)
@@ -2998,8 +3023,6 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                    else os.path.basename(lock_path(state_dir, slot)),
                    len(queued - busy)))
     # A head that would only be matched is matched now, slot or none.
-    batch = merger_batch(merger_dir, when, checkout) \
-        if TEST_AHEAD and merger_dir else []
     for sha, pr, same, tree, covered in settled_heads(
             state, checkout, busy, when, run, state_dir, batch):
         matched(state_dir, sha, pr, same, tree, when, post, out,
