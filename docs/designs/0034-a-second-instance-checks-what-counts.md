@@ -1,6 +1,6 @@
 # 0034: A second instance checks what counts
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-26, https://github.com/abligh/agent-forge/pull/99#issuecomment-6406712511)
 * Author: XMPPEngineer
 * Date: 2026-10-26
 
