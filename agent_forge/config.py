@@ -158,6 +158,10 @@ INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
 # And from the block alone, never `checks`: a context the Merger requires
 # can't leave heads unrun (designs/0034).
 INSTANCE_ONLY = ("pull_requests",)
+# An instance's host's own exclusive lock, which agents sharing the
+# machine take with `mkdir` (agent-forge issue 54): {dir, wait_minutes}.
+# Instance-only, and checked here rather than as a `checks` key.
+INSTANCE_LOCK = {"dir": str, "wait_minutes": int}
 # An instance's name names its state directory and its log lines.
 INSTANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # checks.drop_env: a variable's name, or a prefix ending in `*`.
@@ -1012,8 +1016,17 @@ def _check_instances(instances, data, problems):
                                 "belongs to the context the Merger requires"
                                 % (where, key))
             elif key not in INSTANCE_OWN + INSTANCE_INHERITED \
-                    + INSTANCE_BLOCK_ONLY + INSTANCE_ONLY:
+                    + INSTANCE_BLOCK_ONLY + INSTANCE_ONLY + ("lock",):
                 problems.append("%s: unknown key %r" % (where, key))
+        if "lock" in block:
+            lock = block["lock"]
+            if _fields(where + ".lock", lock, INSTANCE_LOCK, problems):
+                if not lock.get("dir"):
+                    problems.append("%s.lock: missing 'dir'" % where)
+                if _is(lock.get("wait_minutes"), int) \
+                        and lock["wait_minutes"] < 1:
+                    problems.append("%s.lock.wait_minutes must be at least 1"
+                                    % where)
         for key in ("context", "steps"):
             if key not in block:
                 problems.append("%s: missing %r" % (where, key))
