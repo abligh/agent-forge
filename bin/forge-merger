@@ -3308,11 +3308,13 @@ def batch_size(entries, last, verdict, later=(), urgents=frozenset()):
     for old in [(last or {}).get("trees") or []] + [
             b.get("trees") or [] for b in list(later)[:1]
             if isinstance(b, dict) and b.get("fixed")]:
-        if old and old[-1] in trees:
-            i = trees.index(old[-1])
-            if i < len(old) and trees[:i + 1] == old[len(old) - i - 1:]:
-                size = i + 1
-                break
+        # What is left of it is a suffix of it that leads the trees. Not
+        # found by its top's tree: two members can have the same one (a
+        # change that adds nothing on top of the one before it).
+        left = [k for k in range(len(old)) if old[k:] == trees[:len(old) - k]]
+        if left:
+            size = len(old) - left[0]
+            break
     if not size:
         size = urgent_cap(entries, 0, min(AHEAD_BATCH, len(trees)), urgents)
         red = [k for k, t in enumerate(trees[:size]) if verdict(t) is False]
