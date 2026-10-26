@@ -133,7 +133,8 @@ and the run goes on. The next tick retargets the first such layer that
 is eligible but for its base to `main` (`RETARGET`, printing `STACK #N:
 retargeted to main after #Q merged; K above`), as its only write. Once
 on `main`, a layer goes first in the queue, after only the one a
-`test_ahead` run is in flight for, and is updated, checked and merged
+`test_ahead` run is in flight for (or, while that run's batch doesn't
+hold the layer, after that batch), and is updated, checked and merged
 like any other; a merge of a merged layer's head into it, made after its
 approval, covers its head like a merge of `main` when it is clean. A
 layer that isn't eligible ends the stack and is held as usual, unless
@@ -3056,6 +3057,16 @@ def locked_order(state_dir, queue):
     return places
 
 
+def predicted(state_dir):
+    """The pull requests the last live tick predicted (AHEAD_FILE), at
+    any head."""
+    last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+    entries = last.get("entries") if isinstance(last, dict) else None
+    return {entry.get("pr") for entry in
+            (entries if isinstance(entries, list) else ())
+            if isinstance(entry, dict)}
+
+
 def tree_verdict(check_state, tree):
     """The build check's verdict on `tree` from its state: True when a
     run of it, or a match to one, is green, False when it has only red
@@ -3428,8 +3439,17 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                  if not e.get("waited")]
         if STACK_MAX_RUN and stack.get("run", 0) >= STACK_MAX_RUN:
             first = []
-        queue.sort(key=lambda pr: (pr["number"] != in_flight,
-                                   pr["number"] not in first))
+        # A layer that comes back while a batch it isn't in runs goes
+        # first in the next batch, not into that one, which would spend
+        # its run.
+        late = (set(first) - predicted(state_dir)
+                if TEST_AHEAD and in_flight is not None else set())
+        places = locked_order(state_dir, queue) if late else {}
+        queue.sort(key=lambda pr: (
+            pr["number"] != in_flight,
+            0 if pr["number"] in first and pr["number"] not in late
+            else 1 if pr["number"] in places
+            else 2 if pr["number"] in late else 3))
     held_by = (conflicts_ahead(repo, queue, run, main_tip)
                if HOLD_CONFLICTING else {})
     for number, ahead in held_by.items():
