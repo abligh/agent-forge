@@ -131,3 +131,67 @@ project can then name an outside service's outage, such as a package
 registry's error, without agent-forge knowing that service. It needs
 no label, and it settles some reds before anyone would want to run
 them again.
+
+## Amendment (2026-10-26): a stale build cache is cleared, and the head run again
+
+* Status: approved (Alex Bligh, 2026-10-26, https://github.com/abligh/agent-forge/issues/126#issuecomment-6415958707)
+
+**Why.** A slot's build cache can go stale in a way the build tool
+doesn't notice. A rerun of the same head reuses the same stale cache,
+so it is red again, and so is every other head the slot runs that
+needs the same artifact. On one project:
+
+* **2026-10-20.** A pull request was red twice, on two heads, at a
+  WebAssembly link. The linker reported undefined symbols in one
+  crate's own codegen units. The cache's object files were left over
+  from an earlier compilation, and the build tool kept reusing them.
+  Clearing that crate's incremental state by hand fixed it.
+* **2026-10-26.** A pull request that changed only documentation was
+  red twice in the fast lane: first on its head, then on its one
+  rerun. Each failure was the same link failure, with undefined
+  symbols for generic code the lane's release build had compiled
+  earlier, against a different standard library build. Heads checked
+  in other slots against the same default branch were green, and so
+  was the branch itself. Moving the lane's cache aside by hand fixed
+  it.
+
+Neither red was the change's. Each cost the author a rerun or a push,
+and a reviewer's queued approval waited behind it.
+
+**The change.** `checks.cache_fault_text`, an optional list. Each
+entry is a list of strings. A red whose failed step's tail contains
+every string of some entry is a **stale cache**:
+
+1. **No verdict.** The red isn't recorded, as for a host fault. The
+   log says `CACHE-FAULT`, with the head, the slot, the step and the
+   entry that matched.
+2. **The slot's incremental state is cleared.** Every directory
+   directly in an `incremental` directory under the slot's caches
+   (`checks.caches`, and the step's own `caches`) is removed. That is
+   the unit the cache pruning already removes whole, never a single
+   file. The build's other output stays, so the next run rebuilds the
+   project's own code without incremental reuse, not its dependencies.
+   This happens while the slot's lock is still held, so no other run
+   is using the cache.
+3. **The head runs again** at once, at the front of the queue, in the
+   same slot. It isn't the rerun `labels.rerun` gives, and it doesn't
+   use that rerun up.
+4. **Once per head.** If the same head matches again after its cache
+   was cleared, the red stands, recorded as any red is, and the log
+   says the cache was already cleared. The cause is then not the cache,
+   or not only the cache.
+5. **Nothing else counts.** A cache fault isn't a host fault, so it
+   doesn't count toward MAX_ERRORS' `error`.
+
+A project names its own build tool's symptom. For a Rust project that
+might be `[["rust-lld: error:", "undefined symbol"]]`. agent-forge
+knows no build tool.
+
+**Cost.** One run of the head, and one slower build in that slot,
+since its own code rebuilds without incremental reuse. Against that,
+the head isn't red, and the slot stops turning every head that needs
+the same artifact red.
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `checks.cache_fault_text` | none | A list of lists of strings. A red whose failed step's tail has every string of one list is a stale cache: no verdict, the slot's incremental state is cleared, and the head is run again once. |
