@@ -4256,6 +4256,53 @@ class Stacks(RepoCase):
         record, _ = self.tick([self.bottom(), self.layer()])
         self.assertEqual(record["ahead"], [5])
 
+    def hand_tick(self, pulls, minutes=1):
+        """A live tick with only #6 open, and GitHub answering the
+        closed pull requests from b5 with `pulls`."""
+        github = FakeGitHub(dict(answers(prs=[self.layer()]), **{
+            SLUG + "/pulls?state=closed": pulls}))
+        self.github = github
+        start = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                                  tzinfo=datetime.timezone.utc)
+        return m.tick(self.repo.path, self.state, github, tools_run(),
+                      lambda line: None, now=lambda: start
+                      + datetime.timedelta(minutes=minutes), live=True), github
+
+    def test_a_base_merged_by_hand_still_retargets_its_layer(self):
+        # #5 merged on GitHub, not by the Merger: #6 was held as based on
+        # b5 for ever.
+        self.squash_bottom_onto_main()
+        merged = [{"number": 5, "merged_at": "2026-10-07T11:59:00Z",
+                   "base": {"ref": "main"}, "head": {"sha": self.lower}}]
+        record, github = self.hand_tick(merged)
+        self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
+                         [(6, "RETARGET")])
+        self.assertEqual(github.writes, [
+            ("PATCH", SLUG + "/pulls/6", {"base": "main"})])
+        self.assertEqual(self.stack_file()["pending"], [{
+            "pr": 6, "after": 5, "branch": "b5", "head": self.lower}])
+
+    def test_a_base_with_no_merged_pull_request_is_asked_hourly(self):
+        record, github = self.hand_tick([{"number": 5, "merged_at": None,
+                                          "base": {"ref": "main"},
+                                          "head": {"sha": self.lower}}])
+        self.assertEqual(record["held"], {"6": "based on b5, not main"})
+        asked = lambda g: [c for c in g.calls if "state=closed" in c[0]]
+        self.assertEqual(len(asked(github)), 1)
+        _, github = self.hand_tick([], minutes=30)
+        self.assertEqual(asked(github), [])
+        _, github = self.hand_tick([], minutes=62)
+        self.assertEqual(len(asked(github)), 1)
+
+    def test_a_base_the_merger_merged_is_not_asked_about(self):
+        # Its layers were recorded then; one that left the stack stays out.
+        self.merge_bottom()
+        m.save_stack(self.state, {})
+        record, github = self.hand_tick([], minutes=2)
+        self.assertEqual([c for c in github.calls if "state=closed" in c[0]],
+                         [])
+        self.assertEqual(record["held"], {"6": "based on b5, not main"})
+
     def test_the_next_tick_retargets_the_layer(self):
         self.merge_bottom()
         record, lines = self.tick([self.layer()], live=False, minutes=1)

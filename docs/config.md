@@ -531,7 +531,10 @@ while it waits, and it counts its own `wait_hours` from when it began
 waiting. After that it leaves the stack, held as without the setting,
 and the Merger says once on it that it no longer retargets it, so its
 author retargets it and asks for its approvals again (the record's
-`stack_waited`). A merge of the layer below's branch into a layer, made after
+`stack_waited`). A layer whose base was merged without the Merger, by
+hand on GitHub, is found and retargeted the same way: the Merger asks
+GitHub about a branch that is no open pull request's head, once an
+hour while none from it has merged (`merged-elsewhere.json`). A merge of the layer below's branch into a layer, made after
 its approval, covers its head when it is a clean merge and that
 branch's head has merged in this stack. When the default branch
 conflicts with a retargeted layer that lacks the final head of the
