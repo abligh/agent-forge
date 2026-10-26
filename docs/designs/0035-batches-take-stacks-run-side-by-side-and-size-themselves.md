@@ -234,3 +234,85 @@ K × `batch`:
 
 A project then sets each key in its own configuration. Parts 1 and 3
 (less the auto mode) go first: they cost no extra runs.
+
+## Amendment (2026-10-26): batches grow at the end, `Blocked-by:` queues, part 2 first
+
+* Status: proposed
+
+**Why.** A pull request that becomes ready while a batch runs waits for
+that batch to merge before anything tests it, even when slots are free.
+On one project at 07:55Z on 26 October, the Merger predicted only the
+running batch (8 pull requests), and 3 of the host's 6 slots were
+busy. A pull request whose `Blocked-by:` names another that is approved
+and queued is held until that one merges, and is first tested only
+then. Neither wait is needed. The Merger knows the exact tree each
+member will put on the default branch before any run reports, so it can
+test what comes next on top of it at once.
+
+### 1. A running batch is fixed; the next one grows at its end
+
+Part 2 as approved predicts K batches end to end and runs the later
+tops in spare slots. This amendment says how a batch is filled:
+
+1. **A batch whose top's run has started is fixed.** Nothing joins it,
+   and nothing in it moves (designs/0025's third amendment already
+   keeps a returning stack layer out of it).
+2. **The first batch whose run hasn't started grows at its end.** A
+   pull request that becomes ready goes there, in its queue order,
+   until that batch reaches `batch` members. Then a new batch starts
+   behind it.
+3. **A later batch starts its run as soon as a slot is spare**, with
+   the members it has then, one or more. It doesn't wait to fill up:
+   a run started now with 3 members merges them sooner than one
+   started later with 8. From then on, rule 1 applies to it.
+4. **`batches` becomes a cap.** At most K batches are in flight at
+   once, the current one included. With no spare slot, nothing extra
+   runs, as approved.
+
+A batch that grows at its end changes no tree below its new members,
+so it never spends a run that has started.
+
+### 2. `Blocked-by:` queues behind its blocker: `merge.test_ahead.blocked_by: true`
+
+Today a pull request whose `Blocked-by:` names an open one is not
+eligible until that one merges. With this key:
+
+1. **Who is queued.** A pull request that would be eligible but for its
+   `Blocked-by:`, where every open number it names is a pull request in
+   the queue, approved at its head. A blocker that is an issue, held,
+   handed back or not approved keeps it held, as today.
+2. **Where it goes.** Straight after the last of its blockers, as part 1
+   puts a stack's layer after its base: in the same batch if that batch
+   hasn't started and has room, with the same owed fairness, or else
+   first in the next one.
+3. **The prediction** is its head merged onto the commit before it, as
+   for any member. One that conflicts is left out, as a layer is.
+4. **Merging it.** It stays held as blocked until its blockers have
+   merged. Then it is updated, covered by its batch's green top and
+   merged like any other member, with no run of its own.
+5. **If a blocker leaves the queue** (a push, a hand-back, a new
+   `Blocked-by:`), the pull requests it blocks leave the prediction
+   with it and are held as today.
+
+An author can then file the next piece of work as soon as the one it
+needs is approved, either as a stacked branch (part 1) or based on the
+default branch with a `Blocked-by:` line, and nobody waits for the
+first to merge before the second is tested.
+
+### 3. Order of work, changed
+
+Part 2 now comes before part 3, since that is where the time goes:
+
+1. Done: part 1 (v0.4.116), and the third amendment of designs/0025
+   (v0.4.117).
+2. `forge-merger` and `forge-pr-check`: K batches in `ahead.json`, the
+   fixed and growing rules above, later tops in spare slots, unresolved
+   members left out, discarding on an earlier red; tests;
+   `docs/config.md`; a release.
+3. `forge-merger`: `blocked_by`; tests; `docs/config.md`; a release.
+4. Part 3: `batches.jsonl` and `--batch-report`, then `batch: "auto"`.
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `merge.test_ahead.batches` | `1` | Now the most batches in flight at once. A later batch runs as soon as a slot is spare, with the members it has. |
+| `merge.test_ahead.blocked_by` | `false` | A pull request blocked only by queued, approved pull requests is predicted straight after its last blocker. |
