@@ -4226,6 +4226,40 @@ class Stacks(RepoCase):
                           record["decisions"][0]["action"]), (6, "UPDATE"))
         self.assertEqual(record["stack"], [{"pr": 6, "after": 5}])
 
+    def test_a_layer_back_mid_batch_waits_for_the_next(self):
+        # #4654: a layer whose base merged went first, into the batch
+        # being run, and each one that came back spent that batch's run.
+        m.configure(project(stacks={}, test_ahead={"batch": 2}))
+        self.merge_bottom()
+        older = self.other(4)
+        self.repo.branch("other", "origin/main")
+        sha = self.repo.commit("p.txt", "oldest\n", "oldest")
+        self.repo.publish_pr(3, sha)
+        self.repo.branch("feature", "feature")
+        oldest = pr(3, "2026-10-07T08:00:00Z", head=sha,
+                    reviews=[review(REVIEWER, oid=sha)])
+
+        def queue(predicted):
+            m.save_json(os.path.join(self.state, m.AHEAD_FILE), {
+                "at": "2026-10-07T12:01:00Z", "entries": [
+                    {"pr": p["number"], "head": p["headRefOid"]}
+                    for p in predicted]})
+            m.save_json(os.path.join(self.state, "next.json"), {
+                "at": "2026-10-07T12:01:00Z", "pr": 4, "action": "WAIT"})
+            record, _ = self.tick([oldest, older, self.layer("main")],
+                                  live=False, minutes=2)
+            return record["queue"]
+        # Behind #4's batch, then first in the next.
+        self.assertEqual(queue([older, oldest]), [4, 3, 6])
+        # In the running batch itself, it keeps its place there.
+        self.assertEqual(queue([older, self.layer("main"), oldest]),
+                         [4, 6, 3])
+        # With no batch running, it goes first.
+        os.remove(os.path.join(self.state, "next.json"))
+        record, _ = self.tick([oldest, older, self.layer("main")],
+                              live=False, minutes=2)
+        self.assertEqual(record["queue"][0], 6)
+
     def test_max_run_lets_the_queue_have_a_turn(self):
         m.configure(project(stacks={"max_run": 1}))
         self.merge_bottom()

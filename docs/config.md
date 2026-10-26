@@ -516,7 +516,9 @@ goes on: the next tick retargets such a layer to the default branch
 (`RETARGET`, `STACK #N: retargeted to main after #Q merged; K above`)
 when it is eligible but for its base, and once its base is the default
 branch it goes first in the queue, after only the one a `test_ahead`
-run is in flight for. It is then updated, checked and merged like any
+run is in flight for. While such a run is in flight, a layer that
+isn't in that run's batch goes after the batch instead, first in the
+next one, so it doesn't change the batch being run. It is then updated, checked and merged like any
 other. A layer that isn't eligible ends the stack, and is held as
 usual. With `wait_hours` (1 to 168), it stays in the stack instead,
 held as `stacked on #Q, which merged; waiting for: <why>`, and is

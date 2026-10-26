@@ -297,3 +297,28 @@ in `decide` and `carry_out`, `covers_head`, the printed line (`STACK #N:
 merged main into it against #Q's head <sha>`), and a test of exactly
 this case (the layer edits a line the layer below added, and the layer
 below gains a commit after the layer was approved).
+
+## Amendment (2026-10-26, third): a layer back mid-batch waits for the next batch
+
+* Status: approved (Alex Bligh, 2026-10-26, in the terminal session: "re failed stack layers - fine")
+
+**What went wrong.** With `merge.test_ahead` batches (designs/0032), a
+layer whose base has merged still went first in the queue, after only
+the pull request a run is in flight for. So a layer that came back
+while a batch was being run (its resolution re-approved, say) went
+into that batch. Its top changed, and the run in flight no longer
+counted. In one hour on one project, three layers came back like this
+one after another, and the batch's run was spent three times before
+anything merged.
+
+**The change.** While a run is in flight, a layer that isn't one of the
+pull requests that run's batch predicted (`ahead.json`, at any head)
+goes after them, ahead of the rest. It goes first in the next
+batch instead of into the running one, so it waits at most one run. A
+layer that is in the batch, as designs/0035 puts a ready layer, keeps
+its place there, even once updating it has changed its head. With no
+run in flight, a layer goes first, as before.
+
+**Order of work.** One pull request: the queue's order in
+`forge-merger`, its usage text, docs/config.md's `merge.stacks`, and a
+test of a layer coming back while a batch it isn't in is running.
