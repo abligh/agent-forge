@@ -2684,9 +2684,10 @@ class SettledHeads(StateCase):
         self.assertTrue(any("MATCHED #7 %s" % SHA_A[:10] in line
                             for line in self.lines))
 
-    def batched(self, results):
+    def batched(self, results, contains=None):
         """A tick with #7's head on the tree of the first member of the
-        Merger's batch #7..#8, whose top is SHA_Q."""
+        Merger's batch #7..#8, whose top is SHA_Q. `contains(a, b)`
+        answers git's --is-ancestor, yes by default."""
         self.write_state({"waiting": {SHA_A: {"pr": 7, "since": pc.iso(
             T0 - datetime.timedelta(minutes=5))}}, "results": results})
         merger = self.merger_says(7)
@@ -2694,11 +2695,33 @@ class SettledHeads(StateCase):
                              entry(8, SHA_Q, TREE_3)],
                     when=T0 - datetime.timedelta(minutes=1), batch=2)
         self.spawned, posted = [], []
-        pc.tick(self.state_dir, "tok", self.run_with(), lambda *a:
+        run = self.run_with()
+        if contains is not None:
+            run.rules.insert(0, (lambda a: "--is-ancestor" in a, lambda a:
+                                 done(a, 0 if contains(a[-2], a[-1]) else 1)))
+        pc.tick(self.state_dir, "tok", run, lambda *a:
                 self.spawned.append(a), self.lines.append, when=T0,
                 post=lambda *a: posted.append(a) or True, slots=1,
                 checkout="/repo", merger_dir=merger)
         return posted
+
+    def test_a_member_with_no_estimate_is_covered_by_its_tops_base(self):
+        # Seen on 2026-10-26: after a batch's top went green, each
+        # member, updated just after a merge moved the tip, had no
+        # estimate yet, and ran for a slot.
+        top = verdict(pr=8, tree=TREE_3, ahead=True,
+                      selection={"ran": ["lint"], "base": SHA_B})
+        posted = self.batched({SHA_Q: top})
+        self.assertEqual(self.state()["results"][SHA_A]["covered"], "#7..#8")
+        self.assertEqual(posted[0][:2], (SHA_A, "success"))
+        self.assertEqual(self.spawned, [])
+
+    def test_a_member_not_on_its_tops_base_is_run(self):
+        top = verdict(pr=8, tree=TREE_3, ahead=True,
+                      selection={"ran": ["lint"], "base": SHA_B})
+        self.batched({SHA_Q: top}, contains=lambda a, b: a != SHA_B)
+        self.assertIn(SHA_A, self.state()["waiting"])
+        self.assertEqual([a[1] for a in self.spawned], [SHA_A])
 
     def test_a_member_is_covered_by_its_batchs_green_top(self):
         posted = self.batched({SHA_Q: verdict(pr=8, tree=TREE_3,

@@ -4434,7 +4434,9 @@ def settled_heads(state, checkout, busy=(), when=None, run=sh,
     (sha, pr, same, tree, covered): with the Merger's `batch`
     (designs/0032), a head whose tree is one of its members' is matched
     to the top's green, the same way, with `covered` naming the batch;
-    otherwise `covered` is None."""
+    otherwise `covered` is None. A member with no estimate is covered
+    too when the top's steps were chosen against a base the member's
+    head contains (`based_below`)."""
     if not TEST_AHEAD or not checkout:
         return []
     tip = main_head(checkout, run)
@@ -4469,10 +4471,25 @@ def settled_heads(state, checkout, busy=(), when=None, run=sh,
             if same is None and steps is not None:
                 same = tested(state, top, when, ok=True, accept=covers(
                     {"ran": steps, "base": tip}, older))
+            if same is None:
+                same = tested(state, top, when, ok=True,
+                              accept=based_below(sha, older))
             covered = batch_span(batch) if same is not None else None
         if same is not None and same != sha:
             found.append((sha, entry["pr"], same, tree, covered))
     return found
+
+
+def based_below(sha, older):
+    """accept(record) for `tested`: whether a batch top's verdict was
+    chosen against a base that head sha contains (designs/0035, second
+    amendment, section 3). The member's changes against that base are
+    a subset of the top's, so every step chosen for it is one the top
+    ran, and it needs no estimate of its own."""
+    def accept(record):
+        base = (record.get("selection") or {}).get("base")
+        return isinstance(base, str) and older(base, sha)
+    return accept
 
 
 def estimated(entry, tip, key=None):
