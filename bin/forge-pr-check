@@ -20,7 +20,10 @@ merges on that status (`forge-merger`).
 (`$FORGE_PR_CHECK_INSTANCE`; designs/0021): another instance of the
 check, on another host, with that block's context, steps, host and
 poster, its own state directory (`pr-check-<name>`) and log lines that
-name it. Without one, the check is the one `checks` describes.
+name it. Without one, the check is the one `checks` describes. With
+the block's `pull_requests` (designs/0034), it runs only the heads of
+pull requests that change a path the block's globs match or carry its
+label; the rest it leaves alone, posting nothing.
 
 **The cron tick returns at once and the check runs detached.**
 `forge-cron-run` holds locks while a job runs, so a long test run under
@@ -531,6 +534,7 @@ and 2 when the question could not be asked.
 
 import argparse
 import datetime
+import fnmatch
 import gzip
 import hashlib
 import json
@@ -793,6 +797,20 @@ MAIN_EVERY = False
 MAIN_NEWEST = False
 # checks.main_red_issue (designs/0011): {"label", "title"}, or None.
 MAIN_RED_ISSUE = None
+# checks.instances.<name>.pull_requests (designs/0034): (paths, label),
+# the heads this instance runs: those whose pull request changes a path
+# one of `paths` matches, or carries `label`. None runs every head.
+PULL_REQUESTS = None
+# Which heads were found in or out of that scope, so each pull
+# request's files are read from GitHub once a head.
+SCOPE_FILE = "scope.json"
+# GitHub's files list stops at this many; a pull request that long is
+# run rather than judged from part of its paths.
+FILES_LIMIT = 3000
+# What a head queued here before it was left out is posted, so its
+# pending status ends: green, since this context gates nothing.
+OUT_OF_SCOPE_TEXT = ("not run: this pull request changes no path this "
+                     "check runs")
 # checks.step_alert (designs/0019), with its defaults filled in and
 # `owner_label`; None when off.
 STEP_ALERT = None
@@ -860,6 +878,7 @@ def configure(project, instance=None):
     global MAIN_NEWEST
     global RED_COMMENT, RERUN_LABEL, HOST_FAULT_EXTRA, STEP_ALERT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
+    global PULL_REQUESTS
     INSTANCE = instance
     if instance is None:
         checks, HOST = project.section("checks"), project.host
@@ -928,6 +947,10 @@ def configure(project, instance=None):
     MAIN_NEWEST = checks.get("main") == "newest"
     MAIN_RED_ISSUE = dict(checks["main_red_issue"]) \
         if "main_red_issue" in checks else None
+    # The configuration allows it in an instance's block only.
+    scope = checks.get("pull_requests") if instance is not None else None
+    PULL_REQUESTS = (tuple(scope.get("paths", ())), scope.get("label")) \
+        if scope else None
     RED_COMMENT = bool(checks.get("red_comment", False))
     STEP_ALERT = None
     if "step_alert" in checks:
@@ -1298,6 +1321,109 @@ def open_heads(token, run=sh, why=None):
                       fields[3] == "true", (fields[4:] or [""])[0],
                       [str(name) for name in labels]))
     return heads
+
+
+def changed_paths(pr, token, run=sh):
+    """The paths pull request `pr` changes since its merge base, as
+    GitHub lists its files, both names of a rename; None when GitHub
+    couldn't be read, and None too for a list GitHub cut short."""
+    got = gh(["--paginate", "repos/%s/pulls/%d/files?per_page=100"
+              % (REPO_SLUG, pr), "--jq",
+              '.[] | .filename, (.previous_filename // empty)'], token, run)
+    if got.returncode != 0:
+        return None
+    paths = [line for line in got.stdout.splitlines() if line]
+    return None if len(paths) >= FILES_LIMIT else paths
+
+
+def files_count(pr, token, run=sh):
+    """How many files pull request `pr` changes, as GitHub counts them,
+    or 0 when it couldn't be read."""
+    got = gh(["repos/%s/pulls/%d" % (REPO_SLUG, pr), "--jq",
+              ".changed_files"], token, run)
+    text = (got.stdout or "").strip() if got.returncode == 0 else ""
+    return int(text) if text.isdigit() else 0
+
+
+def touches(paths, globs):
+    """Whether any of `paths` matches one of `globs`, by `fnmatchcase`
+    on the path from the repository's top, as a reviewer's `reviews`
+    globs match: `*` crosses `/` too, so `desktop/mac/*` is everything
+    under it."""
+    return any(fnmatch.fnmatchcase(path, glob)
+               for path in paths for glob in globs)
+
+
+def in_scope(heads, state_dir, token, run=sh, out=print, when=None):
+    """`heads`, less the pull requests' heads this instance doesn't run
+    (PULL_REQUESTS, designs/0034): one is run when its pull request
+    carries the label, or changes a path the globs match. A draft, and
+    a head already judged here, is kept as it is: they are no new run.
+    Each head's paths are read from GitHub once and remembered in
+    SCOPE_FILE; a head whose paths can't be read is left out until they
+    can be, and a long one GitHub cuts short is run. A head left out is
+    said once, in verdicts.log. Returns (heads kept, [(pr, sha)] newly
+    left out)."""
+    if PULL_REQUESTS is None:
+        return heads, []
+    globs, label = PULL_REQUESTS
+    when = when or now_utc()
+    path = os.path.join(state_dir, SCOPE_FILE)
+    try:
+        with open(path) as handle:
+            known = json.load(handle)
+    except (OSError, ValueError):
+        known = {}
+    if not isinstance(known, dict):
+        known = {}
+    results = load(state_dir)["results"]
+    kept, scope, dropped = [], {}, []
+    for head in heads:
+        pr, sha, draft = head[0], head[1], head[3]
+        labels = head[5] if len(head) > 5 else []
+        was = known.get(sha) if isinstance(known.get(sha), dict) else {}
+        if draft or sha in results:
+            kept.append(head)
+            if was:
+                scope[sha] = was
+            continue
+        entry = {"pr": pr}
+        # A labelled one is run whatever it changes: its paths are read
+        # only once the label is off.
+        labelled = bool(label) and label in labels
+        if labelled:
+            entry["labelled"] = True
+        if "in" in was:
+            entry["in"] = was["in"]
+        elif labelled:
+            pass
+        elif globs:
+            paths = changed_paths(pr, token, run)
+            if paths is not None:
+                entry["in"] = touches(paths, globs)
+            elif files_count(pr, token, run) >= FILES_LIMIT:
+                entry["in"] = True
+        else:
+            entry["in"] = False
+        if "in" not in entry and not labelled:
+            out("SCOPE-UNKNOWN #%d %s: could not list its files; asked "
+                "again next tick" % (pr, sha[:10]))
+            continue
+        scope[sha] = entry
+        if labelled or entry["in"]:
+            kept.append(head)
+        elif not was or was.get("in") or was.get("labelled"):
+            dropped.append((pr, sha))
+            log(state_dir, "OUT-OF-SCOPE #%d %s: changes no path this "
+                "instance runs%s" % (pr, sha[:10],
+                                     ", and has no %s label" % label
+                                     if label else ""), when, out)
+    if scope != known:
+        fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".scope.")
+        with os.fdopen(fd, "w") as handle:
+            json.dump(scope, handle, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    return kept, dropped
 
 
 def note_heads(state, heads, when, state_dir, out=print, post=None):
@@ -2670,6 +2796,9 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         out("NO-PULLS: could not list %s's open pull requests: %s"
             % (REPO_SLUG, why[0] if why else "no reason given"))
         return 2
+    # An instance runs only the pull requests its block names; to the
+    # rest of the tick, the others aren't open (designs/0034).
+    heads, dropped = in_scope(heads, state_dir, token, run, out, when)
     slots = slots or slots_from_env()
     lane = FAST_LANE_S is not None and DEPENDS and bool(checkout)
     holders = {slot: running(state_dir, slot)
@@ -2701,6 +2830,9 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         if labelled:
             todo = take_reruns(state, labelled, labellers, when, state_dir,
                                out)
+        # One left out after it was queued here has a pending status
+        # that would otherwise never end.
+        unrun = [(pr, sha) for pr, sha in dropped if sha in state["waiting"]]
         note_heads(state, heads, when, state_dir, out, post)
         if head_of_main and queue_main(state, head_of_main, when, state_dir,
                                        busy, needs):
@@ -2716,6 +2848,9 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         queued = set(state["waiting"])
     if todo:
         finish_reruns(todo, token, run, post, out)
+    if post is not None:
+        for pr, sha in unrun:
+            post(sha, "success", OUT_OF_SCOPE_TEXT)
     current = {head[1] for head in heads}
     for slot, holder in holders.items():
         if holder is None:

@@ -233,6 +233,144 @@ if __name__ == "__main__":
     unittest.main()
 
 
+SCOPE = {"paths": ["desktop/mac/*", "crates/*/src/mac/*"], "label": "Check:mac"}
+
+
+class PullRequestsValidation(unittest.TestCase):
+    """designs/0034: a block's pull_requests."""
+
+    def test_a_block_may_set_it(self):
+        self.assertEqual(config.check(with_mac(pull_requests=SCOPE)), [])
+        self.assertEqual(config.check(with_mac(
+            pull_requests={"label": "Check:mac"})), [])
+
+    def test_checks_itself_may_not(self):
+        data = example()
+        data["checks"]["pull_requests"] = SCOPE
+        self.assertEqual(config.check(data), [
+            "checks.pull_requests: only an instance may set it, since the "
+            "Merger requires checks.context on every head"])
+
+    def test_it_needs_paths_or_a_label(self):
+        self.assertEqual(config.check(with_mac(pull_requests={})), [
+            "checks.instances.mac.pull_requests needs paths or a label: "
+            "otherwise no pull request is run"])
+        self.assertEqual(config.check(with_mac(pull_requests={
+            "paths": ["", 3], "label": " ", "path": []})), [
+            "checks.instances.mac.pull_requests: unknown key 'path'",
+            "checks.instances.mac.pull_requests.paths: each must be a "
+            "non-empty string",
+            "checks.instances.mac.pull_requests.label must not be empty"])
+
+    def test_configure_reads_it_for_the_instance_only(self):
+        self.addCleanup(pc.configure, config.Project(example(), None))
+        pc.configure(config.Project(with_mac(pull_requests=SCOPE), None),
+                     "mac")
+        self.assertEqual(pc.PULL_REQUESTS, (tuple(SCOPE["paths"]),
+                                            "Check:mac"))
+        pc.configure(config.Project(with_mac(pull_requests=SCOPE), None))
+        self.assertIsNone(pc.PULL_REQUESTS)
+
+
+def is_files(args):
+    return args[:2] == ["gh", "api"] and any("/files?" in a for a in args)
+
+
+class PullRequests(StateCase):
+    """designs/0034: an instance with pull_requests runs only the heads
+    whose pull requests change its paths or carry its label."""
+
+    def setUp(self):
+        super().setUp()
+        pc.configure(config.Project(with_mac(pull_requests=SCOPE), None),
+                     "mac")
+        self.addCleanup(pc.configure, config.Project(example(), None))
+        self.files = {7: "desktop/mac/App.swift\nREADME.md\n",
+                      8: "web/src/app.ts\n", 9: "docs/x.md\n"}
+
+    def tick(self, heads, post=None, files_rc=0):
+        rows = "".join("%d\t%s\t%s\t%s\t\t%s\n" % (pr, sha, base.REPO, draft,
+                                                    json.dumps(labels))
+                       for pr, sha, draft, labels in heads)
+
+        def files(args):
+            pr = int([a for a in args if "/files?" in a][0]
+                     .split("/pulls/")[1].split("/")[0])
+            return base.done(args, files_rc, self.files.get(pr, ""))
+        self.run = base.FakeRun((base.is_pulls, base.done([], 0, rows)),
+                                (is_files, files))
+        self.spawned = []
+        return pc.tick(self.state_dir, "tok", self.run,
+                       lambda *a: self.spawned.append(a), self.lines.append,
+                       when=T0, post=post, slots=1)
+
+    def file_calls(self):
+        return [c for c in self.run.calls if is_files(c["args"])]
+
+    def test_only_a_head_that_changes_its_paths_is_queued(self):
+        posts = []
+        self.tick([(7, base.SHA_A, "false", []), (8, base.SHA_B, "false", [])],
+                  post=lambda *a: posts.append(a) or True)
+        self.assertEqual(sorted(self.state()["waiting"]), [base.SHA_A])
+        self.assertEqual([p[0] for p in posts], [base.SHA_A])
+        self.assertIn("OUT-OF-SCOPE mac #8 bbbbbbbbbb: changes no path this "
+                      "instance runs, and has no Check:mac label",
+                      [l.split(" ", 1)[1] for l in self.lines])
+
+    def test_a_star_crosses_directories(self):
+        self.assertTrue(pc.touches(["desktop/mac/Sub/App.swift"],
+                                   ["desktop/mac/*"]))
+        self.assertTrue(pc.touches(["crates/widget-native/src/mac/a.rs"],
+                                   ["crates/*/src/mac/*"]))
+        self.assertFalse(pc.touches(["desktop/macos.md"], ["desktop/mac/*"]))
+
+    def test_the_label_runs_any_head_without_reading_its_files(self):
+        self.tick([(8, base.SHA_B, "false", ["Check:mac"])])
+        self.assertEqual(sorted(self.state()["waiting"]), [base.SHA_B])
+        self.assertEqual(self.file_calls(), [])
+
+    def test_a_label_added_later_queues_the_head(self):
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(self.state()["waiting"], {})
+        self.tick([(8, base.SHA_B, "false", ["Check:mac"])])
+        self.assertEqual(sorted(self.state()["waiting"]), [base.SHA_B])
+
+    def test_files_are_read_once_a_head_and_said_once(self):
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(len(self.file_calls()), 1)
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(self.file_calls(), [])
+        self.assertEqual(sum("OUT-OF-SCOPE" in l for l in self.lines), 1)
+
+    def test_a_head_whose_files_cant_be_read_waits_for_them(self):
+        self.tick([(7, base.SHA_A, "false", [])], files_rc=1)
+        self.assertEqual(self.state()["waiting"], {})
+        self.assertIn("SCOPE-UNKNOWN #7 aaaaaaaaaa: could not list its "
+                      "files; asked again next tick", self.lines)
+        self.tick([(7, base.SHA_A, "false", [])])
+        self.assertEqual(sorted(self.state()["waiting"]), [base.SHA_A])
+
+    def test_a_queued_head_left_out_is_posted_not_run(self):
+        # Queued before the block had pull_requests, or while labelled.
+        self.tick([(8, base.SHA_B, "false", ["Check:mac"])])
+        posts = []
+        self.tick([(8, base.SHA_B, "false", [])],
+                  post=lambda *a: posts.append(a) or True)
+        self.assertEqual(self.state()["waiting"], {})
+        self.assertEqual(posts, [(base.SHA_B, "success",
+                                  pc.OUT_OF_SCOPE_TEXT)])
+
+    def test_drafts_are_not_read(self):
+        self.tick([(8, base.SHA_B, "true", [])])
+        self.assertEqual(self.file_calls(), [])
+
+    def test_without_it_every_head_runs(self):
+        pc.configure(config.Project(with_mac(), None), "mac")
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(sorted(self.state()["waiting"]), [base.SHA_B])
+        self.assertEqual(self.file_calls(), [])
+
+
 class MainNewest(StateCase):
     """designs/0034: an instance checks the default branch's newest tip
     first, and keeps its own red-default-branch issue."""

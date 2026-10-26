@@ -836,6 +836,7 @@ platform. Without an instance, `forge-pr-check` runs as before.
 | `depends`, `tracer`, `depends_minutes`, `fast_lane`, `reuse`, `fresh`, `main` | The block only, else the default: they describe the first host's tracer. |
 | `main_red_issue` | The block only, never inherited: the instance's own issue while its newest default-branch verdict is red (designs/0034), titled by default `The default branch is red for <context> at <sha>`. Its `poster`'s App then needs `issues: write`. |
 | `first_authors`, `merger_first`, `merger_cpu_weight`, `docker_slices` | `checks` only, and refused in a block: they belong to the context the Merger requires. `merge.test_ahead` doesn't apply to an instance either. |
+| `pull_requests` | The block only, and refused in `checks`, whose context the Merger requires on every head: `{"paths": [glob, ...], "label": name}`, either left out but not both. See below. |
 
 Any other key in a block is refused. An instance's name is lower-case
 letters, digits and hyphens. It keeps its own state directory
@@ -843,6 +844,24 @@ letters, digits and hyphens. It keeps its own state directory
 after the first word (`GREEN mac #7 …`), and its workers and chained
 ticks are started with the same `--instance`. The Merger still requires
 `checks.context` alone, so an instance's red can't stall merges.
+
+**`pull_requests`: which heads an instance runs** (designs/0034). A
+pull request's head is run only when the pull request carries
+`label`, or changes a path one of `paths` matches; any other head gets
+no status from this instance at all. The paths are GitHub's list of
+the pull request's files since its merge base (both names of a
+rename), read once a head and kept in `scope.json` in the instance's
+state directory. A glob is matched by `fnmatchcase` on the path from
+the repository's top, as a reviewer's `reviews` globs are, so `*`
+crosses `/` too: `desktop/mac/*` is everything under `desktop/mac`. A
+pull request GitHub lists 3,000 or more files for is run. One whose
+files can't be read waits until they can (`SCOPE-UNKNOWN`). A head
+left out says so once in `verdicts.log` (`OUT-OF-SCOPE`); if it had
+been queued here, while labelled or before `pull_requests` was set,
+its pending status is ended with a green `not run: this pull request
+changes no path this check runs`. A label put on later queues the
+head on the next tick. Without `pull_requests` every head is run, as
+before.
 
 Two instances on one host share `forge-cron-run`'s per-tool lock, so
 their ticks run one after the other. Ticks return at once, so neither

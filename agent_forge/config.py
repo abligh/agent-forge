@@ -125,10 +125,13 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "keep_ignored": list, "red_comment": bool, "instances": dict,
           "host_fault_text": list, "step_alert": dict, "cpu_share": str,
           "side_by_side": dict, "merger_cpu_weight": int,
-          "docker_slices": dict}
+          "docker_slices": dict, "pull_requests": dict}
 # checks.docker_slices (designs/0031): the slices each step's
 # containers go in, the next merge's run's and every other's.
 DOCKER_SLICES = {"front": str, "other": str}
+# checks.instances.<name>.pull_requests (designs/0034): which pull
+# requests' heads an instance runs.
+PULL_REQUESTS = {"paths": list, "label": str}
 # checks.cpu_share (designs/0029): when a step's CHECK_CPUS is taken.
 CPU_SHARES = ("run", "step")
 # checks.side_by_side (designs/0029): a run's steps side by side.
@@ -152,6 +155,9 @@ INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main", "main_red_issue")
 INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
                         "merger_cpu_weight", "docker_slices")
+# And from the block alone, never `checks`: a context the Merger requires
+# can't leave heads unrun (designs/0034).
+INSTANCE_ONLY = ("pull_requests",)
 # An instance's name names its state directory and its log lines.
 INSTANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # checks.drop_env: a variable's name, or a prefix ending in `*`.
@@ -816,6 +822,14 @@ def _check_checks(checks, data, problems, where="checks"):
                             "\"newest\" (or %s.depends): otherwise the "
                             "default branch is never checked"
                             % (where, where, where))
+    if isinstance(checks.get("pull_requests"), dict):
+        if where == "checks":
+            problems.append("checks.pull_requests: only an instance may set "
+                            "it, since the Merger requires checks.context "
+                            "on every head")
+        else:
+            _check_pull_requests(checks["pull_requests"], problems,
+                                 where + ".pull_requests")
     if isinstance(checks.get("step_alert"), dict):
         _check_step_alert(checks["step_alert"], data, problems,
                           where + ".step_alert")
@@ -954,6 +968,21 @@ def _check_after(steps, problems, where):
         visit(name, [])
 
 
+def _check_pull_requests(scope, problems, where):
+    """A block's pull_requests (designs/0034): `paths`, globs, and
+    `label`, a label's name; at least one of them, or no head would
+    ever run."""
+    _fields(where, scope, PULL_REQUESTS, problems)
+    if isinstance(scope.get("paths"), list) and not all(
+            isinstance(g, str) and g.strip() for g in scope["paths"]):
+        problems.append("%s.paths: each must be a non-empty string" % where)
+    if isinstance(scope.get("label"), str) and not scope["label"].strip():
+        problems.append("%s.label must not be empty" % where)
+    if not scope.get("paths") and not scope.get("label"):
+        problems.append("%s needs paths or a label: otherwise no pull "
+                        "request is run" % where)
+
+
 def _check_instances(instances, data, problems):
     """checks.instances (designs/0021): each block is a `checks` section
     of its own, with `context` and `steps` required, `host` a string,
@@ -975,7 +1004,7 @@ def _check_instances(instances, data, problems):
                                 "belongs to the context the Merger requires"
                                 % (where, key))
             elif key not in INSTANCE_OWN + INSTANCE_INHERITED \
-                    + INSTANCE_BLOCK_ONLY:
+                    + INSTANCE_BLOCK_ONLY + INSTANCE_ONLY:
                 problems.append("%s: unknown key %r" % (where, key))
         for key in ("context", "steps"):
             if key not in block:
@@ -984,7 +1013,7 @@ def _check_instances(instances, data, problems):
             problems.append("%s.host must be a string" % where)
         own = {k: v for k, v in block.items()
                if k in INSTANCE_OWN + INSTANCE_INHERITED + INSTANCE_BLOCK_ONLY
-               and k != "host"}
+               + INSTANCE_ONLY and k != "host"}
         _check_checks(own, data, problems, where)
 
 
