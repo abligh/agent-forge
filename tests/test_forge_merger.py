@@ -3216,12 +3216,17 @@ class TickAhead(RepoCase):
         self.assertIn("CHECKED-AHEAD #6", " ".join(lines))
         self.assertEqual(record["ahead"], [5, 7])
         self.assertEqual(record["batch"], [5, 7])
-        # Once per head: the next tick runs the gate for no one again.
+        # Once per head: the next tick runs the gate for no one again,
+        # and says nothing again. Seen on 2026-10-26: the hand-back was
+        # never saved, and its comment went out on every tick.
         calls.clear()
         record, _ = self.tick(prs, conclusions=(None,), live=True,
                               minutes=1, run=self.gate_refuses(6, calls))
         self.assertEqual(calls, [])
         self.assertEqual(record["ahead"], [5, 7])
+        self.assertFalse([d for d in record["decisions"] if d.get("ahead")])
+        self.assertFalse([w for w in self.github.writes
+                          if "/issues/6/comments" in str(w)])
 
     def test_a_member_that_passes_is_checked_once(self):
         m.configure(project(test_ahead={"batch": 2}))
