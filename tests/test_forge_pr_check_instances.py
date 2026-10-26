@@ -60,6 +60,16 @@ class Validation(unittest.TestCase):
         self.assertEqual(config.check(with_mac(slot=2)), [
             "checks.instances.mac: unknown key 'slot'"])
 
+    def test_a_host_lock_is_checked(self):
+        # agent-forge issue 54: the host's own `mkdir` lock.
+        self.assertEqual(config.check(with_mac(
+            lock={"dir": "~/.machine.lock", "wait_minutes": 60})), [])
+        self.assertEqual(config.check(with_mac(
+            lock={"wait_minutes": 0, "path": "x"})), [
+            "checks.instances.mac.lock: unknown key 'path'",
+            "checks.instances.mac.lock: missing 'dir'",
+            "checks.instances.mac.lock.wait_minutes must be at least 1"])
+
     def test_a_blocks_own_keys_are_checked_under_its_name(self):
         self.assertEqual(config.check(with_mac(
             slots=0, poster="Nobody", host=7,

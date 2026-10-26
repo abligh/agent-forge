@@ -886,7 +886,7 @@ def configure(project, instance=None):
     global MAIN_NEWEST
     global RED_COMMENT, RERUN_LABEL, HOST_FAULT_EXTRA, STEP_ALERT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
-    global PULL_REQUESTS
+    global PULL_REQUESTS, HOST_LOCK
     INSTANCE = instance
     if instance is None:
         checks, HOST = project.section("checks"), project.host
@@ -951,6 +951,8 @@ def configure(project, instance=None):
     RERUN_LABEL = project.section("labels").get("rerun") \
         if instance is None else None
     HOST_FAULT_EXTRA = tuple(checks.get("host_fault_text", ()))
+    HOST_LOCK = dict(checks["lock"]) \
+        if instance is not None and checks.get("lock") else None
     MAIN_EVERY = checks.get("main", "needed") in ("every", "newest")
     MAIN_NEWEST = checks.get("main") == "newest"
     MAIN_RED_ISSUE = dict(checks["main_red_issue"]) \
@@ -3356,9 +3358,139 @@ def slot_tmp(state_dir, slot):
     return os.path.join(state_dir, slot_name(TMP_DIR, slot))
 
 
-def fresh_tmp(path):
+# checks.instances.<name>.lock (agent-forge issue 54): the host's own
+# exclusive lock, a directory agents sharing the machine take with
+# `mkdir`, as {"dir", "wait_minutes"}; None for none.
+HOST_LOCK = None
+# Minutes a run waits for another holder of HOST_LOCK, by default.
+HOST_LOCK_WAIT_MINUTES = 60
+# Seconds between looks at a held HOST_LOCK.
+HOST_LOCK_POLL_S = 30
+
+
+def lock_owner(folder):
+    """What the holder of the lock directory `folder` wrote in its
+    `owner` file, else what can be said without one."""
+    try:
+        with open(os.path.join(folder, "owner")) as handle:
+            return handle.read().strip() or "an empty owner file"
+    except OSError:
+        return "no owner file"
+
+
+def take_host_lock(state_dir, name, sha, when, out=print,
+                   sleep=time.sleep, clock=time.monotonic):
+    """Take HOST_LOCK for the run of `name` at `sha` before its first
+    step: `mkdir` its directory and write `owner` (who, what, since),
+    the format agents read, so one waiting sees the check as the
+    holder. While another holder has it, wait, looking every
+    HOST_LOCK_POLL_S, up to its `wait_minutes`. The directory once
+    taken, else None after the wait, with why: (folder, why)."""
+    folder = os.path.expanduser(HOST_LOCK["dir"])
+    wait = 60 * HOST_LOCK.get("wait_minutes", HOST_LOCK_WAIT_MINUTES)
+    deadline = clock() + wait
+    told = False
+    while True:
+        try:
+            os.mkdir(folder)
+            break
+        except FileExistsError:
+            if clock() >= deadline:
+                return None, "the host's lock %s is held (%s); gave up " \
+                    "after %d minutes" % (folder, lock_owner(folder),
+                                          wait // 60)
+            if not told:
+                out("  waiting for the host's lock %s, held: %s"
+                    % (folder, lock_owner(folder)))
+                told = True
+            sleep(HOST_LOCK_POLL_S)
+    owner = "forge-pr-check%s %s %s pid %d since %s" % (
+        " " + INSTANCE if INSTANCE else "", name, sha[:10], os.getpid(),
+        iso(when))
+    with open(os.path.join(folder, "owner"), "w") as handle:
+        handle.write(owner + "\n")
+    return folder, None
+
+
+def release_host_lock(folder):
+    """Let go of a HOST_LOCK this process took: only while its `owner`
+    still names this process, so a lock someone broke and took since is
+    left alone."""
+    if folder is None:
+        return
+    if (" pid %d since " % os.getpid()) in lock_owner(folder):
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+# Seconds a stray process has after TERM before it is sent KILL.
+STRAY_GRACE_S = 5
+
+
+def strays(path):
+    """[(pid, command)] of this user's processes, other than this one,
+    whose command line names `path`, a slot's TMPDIR. A step can start
+    something outside every process group a stop signals, such as an
+    application a UI-test harness launches; only the path it was given
+    identifies it then (issue 53). `ps` works the same here and on
+    macOS."""
+    try:
+        got = subprocess.run(["ps", "-U", str(os.getuid()), "-ww", "-o",
+                              "pid=,command="], capture_output=True,
+                             text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    # The path itself or a file in it: not a sibling such as tmp-2.
+    names = re.compile(re.escape(path.rstrip("/")) + r"(?=/|\s|$)")
+    found = []
+    for line in got.stdout.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if pid.isdigit() and int(pid) != os.getpid() \
+                and names.search(command):
+            found.append((int(pid), command.strip()))
+    return found
+
+
+def end_strays(state_dir, path, when, out=print, find=None,
+               kill=os.kill, sleep=time.sleep):
+    """End the processes `find` says name `path`, before it is removed:
+    TERM, then KILL after STRAY_GRACE_S, each one logged `STRAY`. A
+    fallback behind the group kills, not a replacement for them."""
+    found = (find or strays)(path)
+    for pid, command in found:
+        log(state_dir, "STRAY %d: its command line names %s; ended: %s"
+            % (pid, path, command[:200]), when, out)
+        try:
+            kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    left = [pid for pid, _ in found]
+    waited = 0.0
+    while left and waited < STRAY_GRACE_S:
+        sleep(0.5)
+        waited += 0.5
+        left = [pid for pid in left if alive(pid, kill)]
+    for pid in left:
+        try:
+            kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def alive(pid, kill=os.kill):
+    """Whether pid is still a process this user may signal."""
+    try:
+        kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def fresh_tmp(path, state_dir=None, when=None, out=print):
     """Empty path, a slot's TMPDIR, and make it again, private: what a
-    stopped or killed run left there goes."""
+    stopped or killed run left there goes, and so does any process
+    still using it (end_strays)."""
+    if state_dir is not None:
+        end_strays(state_dir, path, when or now_utc(), out)
     shutil.rmtree(path, ignore_errors=True)
     os.makedirs(path, mode=0o700, exist_ok=True)
 
@@ -4954,10 +5086,11 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     # Only then is the next tick started, since a chained tick would at
     # once pick a head that is still waiting.
     settled = False
+    host_lock = None
     phases.mark("lock")
     wt = os.path.join(state_dir, slot_name("wt", slot))
     # Under the slot's lock: what a run killed outright left goes.
-    fresh_tmp(slot_tmp(state_dir, slot))
+    fresh_tmp(slot_tmp(state_dir, slot), state_dir, out=out)
     if ahead:
         # A prediction is no pull request's head: it gets no status.
         post = None
@@ -5136,6 +5269,16 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 step: {name_: os.path.join(state_dir, slot_name(folder, slot))
                        for name_, folder in own.items()}
                 for step, own in STEP_CACHES.items()}
+        if HOST_LOCK is not None:
+            host_lock, why = take_host_lock(state_dir, name, sha,
+                                            now_utc(), out)
+            if host_lock is None:
+                # The host is busy, not broken: not counted toward
+                # MAX_ERRORS' error.
+                log(state_dir, "HOST-FAULT%s %s %s: %s; no verdict, tried "
+                    "again later" % (" AHEAD" if ahead else "", name,
+                                     sha[:10], why), now_utc(), out)
+                return 2
         phases.mark("setup")
         steps_began = time.monotonic()
         # A test's own `run` stands in for every program, steps too.
@@ -5353,6 +5496,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         signal.signal(signal.SIGTERM, lambda signum, frame: None)
         # Under the slot's lock, so no run in it is building meanwhile.
         prune_slot_caches(state_dir, slot, out)
+        release_host_lock(host_lock)
+        end_strays(state_dir, slot_tmp(state_dir, slot), now_utc(), out)
         shutil.rmtree(slot_tmp(state_dir, slot), ignore_errors=True)
         held.close()
         # After the lock is free, so the started tick can take it.

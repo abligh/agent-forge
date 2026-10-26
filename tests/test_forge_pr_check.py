@@ -1680,6 +1680,147 @@ class Worker(StateCase):
         self.assertEqual(self.lines[-1], "CHAIN-FAILED: OSError: no fork")
 
 
+class Strays(StateCase):
+    """Issue 53: a process still naming a slot's TMPDIR is ended before
+    the directory goes."""
+
+    def test_one_naming_the_tmpdir_is_found_and_a_sibling_s_is_not(self):
+        tmp = os.path.join(self.state_dir, "tmp")
+        os.makedirs(tmp)
+        code = "import time; time.sleep(60)"
+        mine = subprocess.Popen([sys.executable, "-c", code,
+                                 os.path.join(tmp, "app.sock")])
+        other = subprocess.Popen([sys.executable, "-c", code, tmp + "-2"])
+        self.addCleanup(other.kill)
+        self.addCleanup(mine.kill)
+        deadline = time.monotonic() + 10
+        found = []
+        while not found and time.monotonic() < deadline:
+            found = pc.strays(tmp)
+            time.sleep(0.1)
+        self.assertEqual([pid for pid, _ in found], [mine.pid])
+        lines = []
+        pc.end_strays(self.state_dir, tmp, pc.now_utc(), lines.append)
+        self.assertIsNotNone(mine.wait(10), "ended")
+        self.assertIsNone(other.poll(), "a sibling slot's is left alone")
+        self.assertIn("STRAY %d: its command line names %s" % (mine.pid, tmp),
+                      lines[0])
+
+    def test_term_first_then_kill_for_one_that_stays(self):
+        sent = []
+
+        def kill(pid, sig):
+            sent.append((pid, sig))
+            if sig == 0 and pid == 2:
+                raise ProcessLookupError
+
+        pc.end_strays(self.state_dir, "/t", pc.now_utc(), lambda line: None,
+                      find=lambda path: [(1, "app /t/x"), (2, "b /t")],
+                      kill=kill, sleep=lambda s: None)
+        self.assertEqual(sent[:2], [(1, signal.SIGTERM), (2, signal.SIGTERM)])
+        self.assertIn((1, signal.SIGKILL), sent)
+        self.assertNotIn((2, signal.SIGKILL), sent, "it had gone")
+        log = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertEqual(log.count(" STRAY "), 2)
+
+    def test_none_found_sends_nothing(self):
+        sent = []
+        pc.end_strays(self.state_dir, "/t", pc.now_utc(), lambda line: None,
+                      find=lambda path: [], kill=lambda *a: sent.append(a))
+        self.assertEqual(sent, [])
+
+
+class HostLock(StateCase):
+    """Issue 54: a host instance takes its host's own `mkdir` lock
+    around a run, as agents sharing the machine do."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = os.path.join(self.state_dir, "machine.lock")
+        patcher = mock.patch.object(pc, "HOST_LOCK", {"dir": self.folder,
+                                                      "wait_minutes": 1})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_taken_with_an_owner_file_and_let_go(self):
+        folder, why = pc.take_host_lock(self.state_dir, "#7", "a" * 40,
+                                        pc.now_utc())
+        self.assertEqual((folder, why), (self.folder, None))
+        owner = pc.lock_owner(self.folder)
+        self.assertIn("#7 aaaaaaaaaa pid %d since " % os.getpid(), owner)
+        pc.release_host_lock(folder)
+        self.assertFalse(os.path.exists(self.folder))
+
+    def test_a_holder_is_waited_for_then_given_up_on_naming_it(self):
+        os.mkdir(self.folder)
+        pathlib.Path(self.folder, "owner").write_text("SyncDev timing X\n")
+        ticks = iter([0, 30, 61])
+        slept, said = [], []
+        folder, why = pc.take_host_lock(
+            self.state_dir, "#7", "a" * 40, pc.now_utc(), said.append,
+            sleep=slept.append, clock=lambda: next(ticks))
+        self.assertIsNone(folder)
+        self.assertIn("is held (SyncDev timing X); gave up after 1 minutes",
+                      why)
+        self.assertEqual(len(said), 1, "said once, not every look")
+        self.assertEqual(slept, [pc.HOST_LOCK_POLL_S])
+        pc.release_host_lock(None)
+        self.assertTrue(os.path.isdir(self.folder), "not ours: left alone")
+
+    def test_one_freed_while_waiting_is_taken(self):
+        os.mkdir(self.folder)
+
+        def sleep(seconds):
+            os.rmdir(self.folder)
+        folder, _ = pc.take_host_lock(self.state_dir, "#7", "a" * 40,
+                                      pc.now_utc(), lambda line: None,
+                                      sleep=sleep)
+        self.assertEqual(folder, self.folder)
+
+    def test_a_lock_someone_else_holds_now_is_not_released(self):
+        os.mkdir(self.folder)
+        pathlib.Path(self.folder, "owner").write_text(
+            "someone pid 1 since then\n")
+        pc.release_host_lock(self.folder)
+        self.assertTrue(os.path.isdir(self.folder))
+
+
+class WorkerHostLock(Worker):
+    """The worker holds the host lock across its steps, and a lock it
+    can't have is a host fault with no verdict."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = os.path.join(self.state_dir, "machine.lock")
+        patcher = mock.patch.object(pc, "HOST_LOCK", {"dir": self.folder})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_held_during_the_steps_and_let_go_after(self):
+        self.queue()
+        seen = []
+
+        def look(args):
+            seen.append(pc.lock_owner(self.folder))
+            return done(args)
+        run = self.run_for()
+        run.rules.insert(0, (lambda a: a == ["make", "test"], look))
+        self.work(run)
+        self.assertIn(" pid %d since " % os.getpid(), seen[0])
+        self.assertFalse(os.path.exists(self.folder))
+
+    def test_a_lock_it_cannot_have_is_a_host_fault(self):
+        self.queue()
+        with mock.patch.object(pc, "take_host_lock",
+                               return_value=(None, "the host's lock is held")):
+            run = self.run_for()
+            self.assertEqual(self.work(run), 2)
+        self.assertFalse([c for c in run.calls if c["args"] == ["make", "test"]])
+        log = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertIn("HOST-FAULT #7 aaaaaaaaaa: the host's lock is held; "
+                      "no verdict", log)
+
+
 class HolderFields(unittest.TestCase):
 
     def test_a_line_naming_its_process(self):
