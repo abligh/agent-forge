@@ -3142,6 +3142,37 @@ class TickAhead(RepoCase):
         self.assertEqual([e["pr"] for e in m.load_suspects(
             self.state)["suspects"]], [5])
 
+    def test_a_suspect_that_merges_keeps_the_search(self):
+        # Seen on 2026-10-26: the first suspect merged on its green, and
+        # the same tick, still predicting it first, found no suspect at
+        # the front and ended the search unsaid.
+        m.configure(project(test_ahead={"batch": 3}))
+        self.repo.branch("third", "origin/main")
+        sha = self.repo.commit("t.txt", "third\n", "third")
+        self.repo.publish_pr(7, sha)
+        self.repo.branch("feature", "feature")
+        prs = [self.item(), self.other_pr(),
+               pr(7, T1, head=sha, reviews=[review(REVIEWER, oid=sha)])]
+        self.tick(prs, conclusions=(None,), live=True)
+        entries = self.ahead_json()["entries"]
+        red = {"results": {entries[2]["sha"]: {"tree": entries[2]["tree"],
+                                               "ok": False}}}
+        self.tick(prs, conclusions=(None,), live=True, check_state=red)
+        # One slot: the first two are checked, and are green.
+        half = self.ahead_json()["entries"][1]
+        self.assertEqual(self.ahead_json()["batch"]["size"], 2)
+        green = {"results": dict(red["results"], **{half["sha"]: {
+            "tree": half["tree"], "ok": True}})}
+        record, lines = self.tick(prs, extra=self.covered(), live=True,
+                                  minutes=1, check_state=green)
+        self.assertEqual(record["decisions"][0]["action"], "MERGE")
+        saved = m.load_suspects(self.state)
+        self.assertIsNotNone(saved, lines)
+        self.assertEqual([e["pr"] for e in saved["suspects"]], [6, 7])
+        self.assertEqual(saved["merged"], [5])
+        self.assertEqual(record["ahead"], [6, 7])
+        self.assertFalse([l for l in lines if l.startswith("BATCH ")])
+
     def test_without_a_batch_nothing_is_said_of_one(self):
         record, _ = self.tick([self.item(), self.other_pr()],
                               conclusions=(None,), live=True)
