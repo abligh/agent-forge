@@ -4069,6 +4069,19 @@ class Stacks(RepoCase):
                          "head": self.lower}]})
         self.assertTrue(m.moved_a_stack(record))
 
+    def test_a_retargeting_tick_keeps_the_batch(self):
+        # designs/0032: the batch #5 merged from goes on after the tick
+        # that retargets #6. Written empty there, it was forgotten and
+        # its members waited for a new run.
+        m.configure(project(stacks={}, test_ahead={"batch": 2}))
+        self.merge_bottom()
+        path = os.path.join(self.state, m.AHEAD_FILE)
+        before = m.load_json(path, None)
+        self.assertIn("batch", before)
+        record, _ = self.tick([self.layer()], minutes=1)
+        self.assertEqual(record["decisions"][0]["action"], "RETARGET")
+        self.assertEqual(m.load_json(path, None), before)
+
     def test_the_next_tick_retargets_the_layer(self):
         self.merge_bottom()
         record, lines = self.tick([self.layer()], live=False, minutes=1)
@@ -4565,6 +4578,15 @@ class FetchPr(Decide):
         got = m.fetch_pr(self.repo.path, 7, "e" * 40)
         self.assertNotEqual(got.returncode, 0)
         self.assertIn("refs/pull/7/head", got.stderr)
+
+    def test_a_pull_ref_left_at_an_old_commit_is_fetched_by_sha(self):
+        # GitHub's ref stayed at #5's old head while the API named the
+        # new one; decide() then read it as a head that moved, for ever.
+        newer = self.repo.commit("n.txt", "newer\n", "newer")
+        run_git(self.repo.path, "push", "-q", "origin", "HEAD:refs/heads/b5")
+        self.assertEqual(m.fetch_pr(self.repo.path, 5, newer).returncode, 0)
+        self.assertEqual(run_git(self.repo.path, "rev-parse", m.PR_REF % 5),
+                         newer)
 
     def test_the_pull_ref_is_used_when_it_exists(self):
         self.assertEqual(m.fetch_pr(self.repo.path, 5, "f" * 40).returncode, 0)

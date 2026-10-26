@@ -1221,8 +1221,16 @@ def fetch_pr(repo, number, head, run=sh):
     fetched = git(repo, "fetch", "-q", "origin",
                   "+refs/pull/%d/head:%s" % (number, PR_REF % number),
                   run=run)
-    if fetched.returncode == 0:
+    if fetched.returncode == 0 and git(
+            repo, "rev-parse", PR_REF % number,
+            run=run).stdout.strip() == head:
         return fetched
+    # GitHub can also leave `refs/pull/N/head` at an old commit while the
+    # API names a newer head: on 2026-10-26 one pull request's ref stayed
+    # behind for nine hours, and it was skipped on every tick as "the head
+    # moved while reading". A head that really moved can't be fetched by
+    # the old SHA's ref either way, and GitHub refuses a write pinned to
+    # it, so the SHA is the fallback here too.
     if git(repo, "fetch", "-q", "origin", head, run=run).returncode != 0:
         return fetched
     return git(repo, "update-ref", PR_REF % number, head, run=run)
@@ -3580,7 +3588,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                      if d["pr"] == waiting_on]
             said_next["action"] = acted[-1] if acted else None
         save_json(os.path.join(state_dir, "next.json"), said_next)
-        if TEST_AHEAD:
+        # A tick that retargets a stack's layer judges nothing, so it
+        # predicts nothing. It leaves ahead.json as the last tick wrote
+        # it: written empty, the batch the queue is merging was forgotten,
+        # and its members waited for a new run of their own.
+        if TEST_AHEAD and retarget is None:
             acting = [pr for pr in queue if pr["number"] == waiting_on]
             rest = [pr for pr in queue if pr["number"] != waiting_on
                     and not handed_back(said, pr, approvals[pr["number"]])]
