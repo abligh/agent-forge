@@ -2780,6 +2780,54 @@ class Batches(unittest.TestCase):
         self.assertFalse(m.batch_holds({}, 10, "a", [], {}))
 
 
+class WithLayers(unittest.TestCase):
+    """designs/0035: a stack's ready layers go straight after their base,
+    and what they push out of the batch is owed a place."""
+
+    def prs(self, *numbers, head="h"):
+        return [{"number": n, "headRefOid": "%s%d" % (head, n)}
+                for n in numbers]
+
+    def run_it(self, queue, layers, last=None, size=3):
+        by = {pr["number"]: pr for pr in queue}
+        layers_of = lambda pr: [(l, {}) for l in layers.get(pr["number"], ())]
+        out, owed = m.with_layers(queue, layers_of, last or {}, size)
+        return [pr["number"] for pr in out], owed
+
+    def test_layers_go_after_their_base(self):
+        self.assertEqual(self.run_it(self.prs(1, 2, 3),
+                                     {1: self.prs(11, 12)}),
+                         ([1, 11, 12, 2, 3], [2, 3]))
+
+    def test_without_layers_nothing_is_owed(self):
+        self.assertEqual(self.run_it(self.prs(1, 2, 3), {}), ([1, 2, 3], []))
+
+    def test_an_owed_pull_request_is_not_pushed_out_again(self):
+        self.assertEqual(self.run_it(self.prs(1, 2, 3),
+                                     {1: self.prs(11, 12)}, {"owed": [2]}),
+                         ([1, 11, 2, 3], [3]))
+
+    def test_owed_until_a_batch_includes_it(self):
+        self.assertEqual(self.run_it(self.prs(1, 2, 3, 4), {},
+                                     {"owed": [4]}), ([1, 2, 3, 4], [4]))
+        self.assertEqual(self.run_it(self.prs(4, 5), {}, {"owed": [4]}),
+                         ([4, 5], []))
+
+    def test_a_running_batch_takes_no_new_layer(self):
+        last = {"entries": [{"pr": n, "head": "h%d" % n} for n in (1, 2, 3)],
+                "batch": {"size": 3}}
+        self.assertEqual(self.run_it(self.prs(1, 2, 3), {1: self.prs(11)},
+                                     last), ([1, 2, 3], []))
+        # One it predicted already stays.
+        last["entries"].insert(1, {"pr": 11, "head": "h11"})
+        self.assertEqual(self.run_it(self.prs(1, 2, 3), {1: self.prs(11)},
+                                     last), ([1, 11, 2, 3], [3]))
+        # A layer of one outside the running batch joins.
+        self.assertEqual(self.run_it(self.prs(1, 2, 3, 4),
+                                     {4: self.prs(41)}, last, size=3),
+                         ([1, 2, 3, 4, 41], []))
+
+
 class TickAhead(RepoCase):
     """A live tick predicts from the pull request it acts on. Tick's
     helpers, without running its tests again."""
@@ -4081,6 +4129,53 @@ class Stacks(RepoCase):
         record, _ = self.tick([self.layer()], minutes=1)
         self.assertEqual(record["decisions"][0]["action"], "RETARGET")
         self.assertEqual(m.load_json(path, None), before)
+
+    def test_a_ready_layer_joins_its_bases_batch(self):
+        # designs/0035: #6 is predicted straight after #5, so the run of
+        # #5's batch covers it too.
+        m.configure(project(stacks={},
+                            test_ahead={"batch": 2, "stacks": True}))
+        record = self.merge_bottom()
+        self.assertEqual(record["ahead"], [5, 6])
+        ahead = m.load_json(os.path.join(self.state, m.AHEAD_FILE), None)
+        self.assertEqual([e["pr"] for e in ahead["entries"]], [5, 6])
+        self.assertEqual(ahead["batch"]["size"], 2)
+
+    def test_the_base_merges_on_its_batchs_green_with_the_layer_held(self):
+        # #6 is still held as stacked when #5's covered head merges; the
+        # batch holds while #6 is ready at the head predicted.
+        m.configure(project(stacks={},
+                            test_ahead={"batch": 2, "stacks": True}))
+        covered = {SLUG + "/commits/": [status(
+            description="green: covered by batch #5..#6 (tested as x)")]}
+        start = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                                  tzinfo=datetime.timezone.utc)
+
+        def tick(check_state=None):
+            github = FakeGitHub(dict(answers(prs=[self.bottom(),
+                                                  self.layer()]), **covered))
+            return m.tick(self.repo.path, self.state, github, tools_run(),
+                          lambda line: None, now=lambda: start, live=True,
+                          check_state=check_state)
+        record = tick()
+        self.assertEqual(record["decisions"][0]["action"], "WAIT")
+        self.assertEqual(record["batch"], [5, 6])
+        top = m.load_json(os.path.join(self.state, m.AHEAD_FILE),
+                          None)["entries"][1]
+        record = tick({"results": {top["sha"]: {"tree": top["tree"],
+                                                "ok": True}}})
+        self.assertEqual(record["decisions"][0]["action"], "MERGE")
+
+    def test_a_layer_not_yet_approved_stays_out(self):
+        m.configure(project(stacks={},
+                            test_ahead={"batch": 2, "stacks": True}))
+        record, _ = self.tick([self.bottom(), self.layer(reviews=[])])
+        self.assertEqual(record["ahead"], [5])
+        # Without the setting, an approved one stays out too.
+        m.configure(project(stacks={}, test_ahead={"batch": 2}))
+        self.state = os.path.join(self.tmp.name, "without")
+        record, _ = self.tick([self.bottom(), self.layer()])
+        self.assertEqual(record["ahead"], [5])
 
     def test_the_next_tick_retargets_the_layer(self):
         self.merge_bottom()
