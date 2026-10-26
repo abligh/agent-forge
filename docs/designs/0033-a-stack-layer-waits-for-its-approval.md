@@ -1,6 +1,6 @@
 # 0033: A stack layer waits for its approval
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-26, https://github.com/abligh/agent-forge/issues/94#issuecomment-6406381058)
 * Author: XMPPEngineer
 * Date: 2026-10-26
 
