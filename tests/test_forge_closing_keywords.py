@@ -77,7 +77,8 @@ class World:
     --not BASE` print (default: the pull request's shas; FAIL: an
     error); `base` the pull request's base (None: unreadable); `facts`
     the GraphQL answer's fields (None: unreadable); `kinds` {number:
-    "issue" or "pr"} (None: every number is an issue; a number missing
+    "issue", "closed" (an issue already closed) or "pr"} (None: every
+    number is an open issue; a number missing
     from it can't be looked up); `branch` the checked-out branch (None:
     unreadable); `open_pr` that branch's open pull request (None: the
     lookup fails); `below` {number: (merged, [full sha, ...])} for the
@@ -157,6 +158,7 @@ class World:
             issue = {"number": number}
             if kind == "pr":
                 issue["pull_request"] = {}
+            issue["state"] = "closed" if kind == "closed" else "open"
             return 200, issue
         return 404, {}
 
@@ -620,6 +622,17 @@ class MainThroughThePullRequest(unittest.TestCase):
         self.assertIn("#1879", err)
 
 
+    def test_a_commit_closing_an_issue_already_closed_passes(self):
+        world = the_branch("subject\n\nfixes #1072\x00",
+                           facts={"declared": [], "body": "plain"},
+                           kinds={1072: "closed"})
+        code, out, err = world.main(["a..b", "--pr", "1253"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("will close on merge:         (nothing)", out)
+        world.kinds = {1072: "issue"}
+        self.assertEqual(world.main(["a..b", "--pr", "1253"])[0], 1)
+
+
 class ASubjectOnlyCloser(unittest.TestCase):
 
     SUBJECT_ONLY = ("httpserve: bound the constants (Fixes #1816)\n\n"
@@ -798,6 +811,16 @@ class IsIssue(unittest.TestCase):
         self.assertIs(tool.is_issue(1004, answering(
             200, {"number": 1004, "pull_request": {}})), False)
 
+    def test_a_closed_issue_is_false(self):
+        # Seen on 2026-10-26: a commit brought in from another pull
+        # request's branch, which had merged by squash, kept its "fixes"
+        # in this branch's history. The issue was closed already, and
+        # the author got past the refusal by declaring it.
+        self.assertIs(tool.is_issue(1072, answering(
+            200, {"number": 1072, "state": "closed"})), False)
+        self.assertIs(tool.is_issue(1072, answering(
+            200, {"number": 1072, "state": "open"})), True)
+
     def test_a_failed_lookup_is_none_not_true(self):
         self.assertIsNone(tool.is_issue(1, answering(404, {})))
 
@@ -830,6 +853,13 @@ class SurveyFiltersPullRequests(unittest.TestCase):
             "subject\n\ncloses #1004 and fixes #1072\x00",
             {1004: "pr", 1072: "issue"})
         self.assertEqual(from_commits, {1072})
+
+    def test_a_closed_issue_closer_is_dropped(self):
+        undeclared, from_commits, _ = self.survey(
+            "subject\n\nfixes #1072, merged with its own pull request\x00",
+            {1072: "closed"})
+        self.assertEqual(from_commits, set())
+        self.assertEqual(undeclared, set())
 
     def test_an_unresolvable_number_refuses_rather_than_guessing(self):
         undeclared, unknown, known = self.survey(
