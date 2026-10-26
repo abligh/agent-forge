@@ -134,7 +134,7 @@ them again.
 
 ## Amendment (2026-10-26): a stale build cache is cleared, and the head run again
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-26, https://github.com/abligh/agent-forge/issues/126#issuecomment-6415958707)
 
 **Why.** A slot's build cache can go stale in a way the build tool
 doesn't notice. A rerun of the same head reuses the same stale cache,
