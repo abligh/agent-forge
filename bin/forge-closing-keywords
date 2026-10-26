@@ -39,6 +39,22 @@ and refuses:
 * a title keyword, at two or more commits, the body does not declare;
 * a body keyword GitHub will act on whose sentence is a denial.
 
+**`--below M` leaves out a merged stack layer's commits.** When the
+layer below a stacked pull request has merged, the Merger merges that
+layer's final head into it (designs/0025), so the pull request's
+commits since the default branch include the lower layer's: the
+default branch holds those as one squash commit, not as themselves.
+Their keywords closed their issues when that layer merged, and that
+layer's own run of this check judged them, so they are no finding here.
+`--below M` (one or more, each a merged pull request) drops every
+commit that is one of M's. The Merger's gate fills `{below}` with the
+merged layer's number, and leaves the argument out when there is none:
+
+    forge-closing-keywords --pr {pr} --include-subject --below {below}
+
+A pull request named that has not merged is exit 2: leaving out an
+open one's commits would pass keywords nobody has judged.
+
 A subject keyword is reported, not refused, without
 `--include-subject`: a subject is composed, so a keyword there is
 usually meant. The gate passes the flag because a subject can also
@@ -339,6 +355,35 @@ def not_reachable_from(rng, base, cwd=None, run=proc.sh):
     if got.returncode != 0:
         return None
     return set(got.stdout.split())
+
+
+def merged_commits(pr, github, repo=None):
+    """The full shas of merged pull request `pr`'s commits, as a set, or
+    (None, why) when it can't be read or hasn't merged."""
+    status, body = github.get("/repos/%s/pulls/%d" % (repo or REPO_NAME, pr))
+    if status != 200 or not isinstance(body, dict):
+        return None, "could not read pull request %d" % pr
+    if not body.get("merged_at"):
+        return None, ("pull request %d has not merged, so its commits are "
+                      "not judged yet and can't be left out" % pr)
+    records = pr_commits(pr, github, repo)
+    if not records:
+        return None, "could not read pull request %d's commits" % pr
+    return set(sha for sha, _m in records), None
+
+
+def without_below(messages, below, github):
+    """(messages less those that are commits of the merged pull requests
+    `below`, how many were left out), or (None, why)."""
+    shas = set()
+    for number in below:
+        got, why = merged_commits(number, github)
+        if got is None:
+            return None, why
+        shas |= got
+    kept = [(sha, m) for sha, m in messages
+            if not any(full.startswith(sha) for full in shas)]
+    return kept, len(messages) - len(kept)
 
 
 def subject_closers(messages):
@@ -716,7 +761,15 @@ def main(argv=None, run=proc.sh, call=forge_github.api_call,
                              "--check-body then reports only the keywords "
                              "you did not declare, which is the verdict "
                              "every other mode gives")
+    parser.add_argument("--below", type=int, nargs="*", metavar="M",
+                        default=[],
+                        help="merged stack layers below the pull request: "
+                             "their commits are left out, as their own "
+                             "merge already closed what they close")
     args = parser.parse_args(argv)
+    if args.below and args.pr is None:
+        parser.error("--below leaves a merged layer's commits out of a pull "
+                     "request's, so it needs --pr N")
 
     if args.check_body:
         if args.surface is None:
@@ -759,6 +812,15 @@ def main(argv=None, run=proc.sh, call=forge_github.api_call,
         if got is None:
             return 2
         messages, examined = got
+        if args.below:
+            kept, dropped = without_below(messages, args.below, github)
+            if kept is None:
+                err("%s, so what the merge will close was not judged"
+                    % dropped)
+                return 2
+            messages = kept
+            examined += ", less %d of merged %s's" % (
+                dropped, ", ".join("#%d" % n for n in args.below))
     else:
         messages = commit_messages(examined, run=run)
         if messages is None:

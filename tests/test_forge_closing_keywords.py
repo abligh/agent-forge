@@ -80,11 +80,13 @@ class World:
     "issue" or "pr"} (None: every number is an issue; a number missing
     from it can't be looked up); `branch` the checked-out branch (None:
     unreadable); `open_pr` that branch's open pull request (None: the
-    lookup fails)."""
+    lookup fails); `below` {number: (merged, [full sha, ...])} for the
+    pull requests `--below` names."""
 
     def __init__(self, log=None, pr_log=SAME, range_out=None, fresh=None,
                  base="main", facts=SAME, kinds=None, branch="mine",
-                 open_pr=None):
+                 open_pr=None, below=None):
+        self.below = below or {}
         self.log = log
         self.pr_log = log if pr_log is SAME else pr_log
         self.range_out = range_out
@@ -125,6 +127,13 @@ class World:
         if not path.startswith(prefix):
             return 404, {}
         rest = path[len(prefix):]
+        for number, (merged, shas) in self.below.items():
+            if rest == "pulls/%d" % number:
+                return 200, {"merged_at": "2026-10-25T21:06:31Z"
+                             if merged else None}
+            if rest.startswith("pulls/%d/commits?" % number):
+                return 200, [{"sha": sha, "commit": {"message": "m"}}
+                             for sha in shas]
         if rest.startswith("pulls?state=open"):
             if self.open_pr is None:
                 return 502, {}
@@ -1380,6 +1389,54 @@ class TheCommitsComeFromThePullRequest(unittest.TestCase):
         code, _, err = world.main(["--pr", "1972"])
         self.assertEqual(code, 2)
         self.assertIn("could not read pull request 1972's commits", err)
+
+
+class ALowerLayersCommits(unittest.TestCase):
+    """A restacked layer carries the merged layer below's commits, whose
+    keywords that layer's merge already closed (agent-forge #92)."""
+
+    LOG = ("lower: the bars (Closes #4466)\n\nbody\x00"
+           "upper: the panels\n\nnothing\x00")
+
+    def world(self, merged=True, shas=None):
+        return World(log=self.LOG, facts={"declared": ()}, below={
+            4474: (merged, full_shas(self.LOG)[:1] if shas is None
+                   else shas)})
+
+    def test_without_below_the_lower_keyword_is_a_finding(self):
+        code, _out, err = self.world().main(["--pr", "4479",
+                                             "--include-subject"])
+        self.assertEqual(code, 1)
+        self.assertIn("#4466", err)
+
+    def test_below_leaves_the_lower_layers_commits_out(self):
+        code, out, _err = self.world().main(
+            ["--pr", "4479", "--include-subject", "--below", "4474"])
+        self.assertEqual(code, 0)
+        self.assertIn("1 commit(s) examined, from pull request 4479's "
+                      "commits, less 1 of merged #4474's", out)
+
+    def test_an_empty_below_is_no_below(self):
+        code, _out, _err = self.world().main(
+            ["--pr", "4479", "--include-subject", "--below"])
+        self.assertEqual(code, 1)
+
+    def test_a_layer_that_has_not_merged_is_two(self):
+        code, _out, err = self.world(merged=False).main(
+            ["--pr", "4479", "--below", "4474"])
+        self.assertEqual(code, 2)
+        self.assertIn("pull request 4474 has not merged", err)
+
+    def test_commits_it_could_not_read_are_two(self):
+        code, _out, err = self.world(shas=[]).main(
+            ["--pr", "4479", "--below", "4474"])
+        self.assertEqual(code, 2)
+        self.assertIn("could not read pull request 4474's commits", err)
+
+    def test_below_needs_a_pull_request(self):
+        with self.assertRaises(SystemExit), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.world().main(["a..b", "--below", "4474"])
 
 
 class NotReachableFrom(unittest.TestCase):
