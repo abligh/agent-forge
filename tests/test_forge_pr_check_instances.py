@@ -2,6 +2,7 @@
 build check, on another host, with its own context, steps, poster,
 resources and state directory."""
 
+import datetime
 import json
 import os
 import unittest
@@ -49,12 +50,11 @@ class Validation(unittest.TestCase):
 
     def test_the_mergers_keys_are_refused(self):
         problems = config.check(with_mac(
-            merger_first=True, first_authors=["LeadDev"],
-            main_red_issue={"label": "red"}))
+            merger_first=True, first_authors=["LeadDev"]))
         self.assertEqual(sorted(problems), sorted(
             "checks.instances.mac.%s: only checks may set it, since it "
             "belongs to the context the Merger requires" % key
-            for key in ("merger_first", "first_authors", "main_red_issue")))
+            for key in ("merger_first", "first_authors")))
 
     def test_an_unknown_key_is_refused(self):
         self.assertEqual(config.check(with_mac(slot=2)), [
@@ -231,3 +231,67 @@ class InstanceMain(base.Main):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MainNewest(StateCase):
+    """designs/0034: an instance checks the default branch's newest tip
+    first, and keeps its own red-default-branch issue."""
+
+    def tearDown(self):
+        pc.configure(config.Project(example(), None))
+        super().tearDown()
+
+    def test_a_block_may_set_main_newest_and_its_own_red_issue(self):
+        self.assertEqual(config.check(with_mac(
+            main="newest", main_red_issue={"label": "mac-red"})), [])
+        self.assertEqual(config.check(with_mac(
+            main_red_issue={"label": "mac-red"})), [
+            "checks.instances.mac.main_red_issue needs "
+            "checks.instances.mac.main \"every\" or \"newest\" (or "
+            "checks.instances.mac.depends): otherwise the default branch "
+            "is never checked"])
+
+    def test_the_red_issue_is_not_inherited(self):
+        data = with_mac(main="newest")
+        data["checks"].update(main="every", main_red_issue={"label": "red"})
+        pc.configure(config.Project(data, None), "mac")
+        self.assertIsNone(pc.MAIN_RED_ISSUE)
+        data["checks"]["instances"]["mac"]["main_red_issue"] = {
+            "label": "mac-red"}
+        pc.configure(config.Project(data, None), "mac")
+        self.assertEqual(pc.MAIN_RED_ISSUE, {"label": "mac-red"})
+        self.assertTrue(pc.MAIN_EVERY)
+        self.assertTrue(pc.MAIN_NEWEST)
+
+    def waiting(self, since_main):
+        return {"waiting": {
+            base.SHA_A: {"pr": 7, "since": pc.iso(T0 - datetime.timedelta(
+                hours=2))},
+            base.SHA_B: {"pr": 0, "main": True, "since": pc.iso(since_main)}},
+            "results": {}, "refused": {}}
+
+    def test_the_newest_tip_goes_before_any_pull_request_at_once(self):
+        pc.configure(config.Project(with_mac(main="newest"), None), "mac")
+        self.assertEqual(pc.next_head(self.waiting(T0), when=T0),
+                         (base.SHA_B, 0))
+
+    def test_with_every_it_still_waits_its_turn(self):
+        pc.configure(config.Project(with_mac(main="every"), None), "mac")
+        self.assertEqual(pc.next_head(self.waiting(T0), when=T0),
+                         (base.SHA_A, 7))
+
+    def test_a_tip_overtaken_while_waiting_is_dropped(self):
+        pc.configure(config.Project(with_mac(main="newest"), None), "mac")
+        state = self.waiting(T0)
+        self.assertTrue(pc.queue_main(state, (base.SHA_C, "t"), T0,
+                                      self.state_dir))
+        self.assertEqual(sorted(s for s, w in state["waiting"].items()
+                                if w.get("main")), [base.SHA_C])
+
+    def test_its_issue_names_its_context(self):
+        pc.configure(config.Project(with_mac(
+            main="newest", main_red_issue={"label": "mac-red"}), None), "mac")
+        text = pc.red_text(base.SHA_C, [("test-ios", "boom")], [], None)
+        self.assertTrue(text.startswith("`main` is red for `ci/mac` at "
+                                        "cccccccccc on mac-1: test-ios."))
+        self.assertIn("closed when a later tip is green for `ci/mac`", text)

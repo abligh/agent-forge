@@ -788,6 +788,9 @@ FRESH_WAIT = None
 # checks.main "every" (designs/0011): every new default-branch head is
 # run, depends or not; otherwise only when a dependency record needs it.
 MAIN_EVERY = False
+# checks.main "newest" (designs/0034): as "every", and the newest
+# default-branch head goes before any pull request's at once.
+MAIN_NEWEST = False
 # checks.main_red_issue (designs/0011): {"label", "title"}, or None.
 MAIN_RED_ISSUE = None
 # checks.step_alert (designs/0019), with its defaults filled in and
@@ -807,6 +810,9 @@ RED_COMMENT = False
 RED_COMMENT_CHARS = 12000
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 DEFAULT_RED_TITLE = "The default branch is red at {sha}"
+# An instance's own issue (designs/0034) names its context, so the two
+# are told apart.
+INSTANCE_RED_TITLE = "The default branch is red for {context} at {sha}"
 # With fresh, how many of the newest records each step keeps, and how
 # many of the newest records a step may be chosen from.
 FRESH_KEEP = 20
@@ -851,6 +857,7 @@ def configure(project, instance=None):
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     global TRACE_MATCHED_MAIN, CHAIN_WRITES_ONLY, DIRS_BY_NAMES, OUTPUTS
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
+    global MAIN_NEWEST
     global RED_COMMENT, RERUN_LABEL, HOST_FAULT_EXTRA, STEP_ALERT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
     INSTANCE = instance
@@ -917,7 +924,8 @@ def configure(project, instance=None):
     RERUN_LABEL = project.section("labels").get("rerun") \
         if instance is None else None
     HOST_FAULT_EXTRA = tuple(checks.get("host_fault_text", ()))
-    MAIN_EVERY = checks.get("main", "needed") == "every"
+    MAIN_EVERY = checks.get("main", "needed") in ("every", "newest")
+    MAIN_NEWEST = checks.get("main") == "newest"
     MAIN_RED_ISSUE = dict(checks["main_red_issue"]) \
         if "main_red_issue" in checks else None
     RED_COMMENT = bool(checks.get("red_comment", False))
@@ -1697,7 +1705,8 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
 
     A default-branch head (checks.depends, pr 0) goes after every pull
     request's, except the newest, which goes first of all once it has
-    waited DEPENDS_WAIT, or at once when `urgent` (checks.fresh: a
+    waited DEPENDS_WAIT, at once with checks.main "newest" (designs/0034),
+    or at once when `urgent` (checks.fresh: a
     waiting head runs a step only because its record is stale). Urgent
     is not reason enough to go before the Merger's pull request when
     its head has no stale step: the default branch's run would not
@@ -1724,7 +1733,7 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
                 when - parse(waiting[newest]["since"]) >= DEPENDS_WAIT
         except (TypeError, ValueError):
             due = True
-        if due or urgent or not heads:
+        if due or urgent or MAIN_NEWEST or not heads:
             return newest, 0
     # labels.urgent: a person has put this pull request first.
     hot = [s for s in heads
@@ -2047,8 +2056,9 @@ def signature():
 
 def red_text(sha, failed, commits, green):
     """The body of the issue a red default-branch head opens."""
-    lines = ["`%s` is red at %s%s: %s." % (
-        MAIN, sha[:10], on_host(), ", ".join(n for n, _ in failed)
+    lines = ["`%s` is red%s at %s%s: %s." % (
+        MAIN, "" if INSTANCE is None else " for `%s`" % STATUS_CONTEXT,
+        sha[:10], on_host(), ", ".join(n for n, _ in failed)
         or "a step failed")]
     if green:
         lines.append("")
@@ -2059,8 +2069,9 @@ def red_text(sha, failed, commits, green):
         lines += ["", "**%s**, the end of its output:" % name, "",
                   "```", text.rstrip(), "```"]
     lines += ["", "Every pull request's check is against this tip until "
-              "it is green again; this issue is closed then.", "",
-              signature()]
+              "it is green again; this issue is closed then." if INSTANCE
+              is None else "This issue is closed when a later tip is "
+              "green for `%s`." % STATUS_CONTEXT, "", signature()]
     return "\n".join(lines)
 
 
@@ -2168,8 +2179,10 @@ def report_main(state_dir, repo, sha, ok, failed, same, write, out=print,
                        "%s..%s" % (green, sha)])
             if got.returncode == 0:
                 commits = got.stdout.splitlines()[:50]
-        title = MAIN_RED_ISSUE.get("title", DEFAULT_RED_TITLE).replace(
-            "{sha}", sha[:10])
+        title = MAIN_RED_ISSUE.get("title", DEFAULT_RED_TITLE
+                                   if INSTANCE is None
+                                   else INSTANCE_RED_TITLE).replace(
+            "{sha}", sha[:10]).replace("{context}", STATUS_CONTEXT)
         body = {"title": title, "body": red_text(sha, failed, commits, green)}
         labels = list(MAIN_RED_ISSUE.get("labels", [])) + (
             [MAIN_RED_ISSUE["label"]] if MAIN_RED_ISSUE.get("label") else [])
