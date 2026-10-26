@@ -37,8 +37,9 @@ class MainConfig(unittest.TestCase):
     def test_main_is_needed_or_every(self):
         self.assertEqual(self.problems(main="every"), [])
         self.assertEqual(self.problems(main="needed"), [])
+        self.assertEqual(self.problems(main="newest"), [])
         self.assertEqual(self.problems(main="always"), [
-            "checks.main must be one of needed, every"])
+            "checks.main must be one of needed, every, newest"])
 
     def test_a_red_issue_needs_a_default_branch_that_is_checked(self):
         self.assertEqual(self.problems(main="every",
