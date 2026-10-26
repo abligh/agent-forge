@@ -30,6 +30,12 @@ class Hits(unittest.TestCase):
                                  ["zorblax"]),
                          [(1, "zorblax"), (1, "zorblax")])
 
+    def test_not_inside_a_longer_word(self):
+        # "among" held a forbidden word, and a design couldn't say it.
+        text = "zorbing\nZORB2 zorb_cron zorbEngineer x.zorb.y Zorb\nazorb\n"
+        self.assertEqual(cn.hits(text, ["zorb"]),
+                         [(2, "zorb")] * 5)
+
     def test_no_words_no_hits(self):
         self.assertEqual(cn.hits("anything", []), [])
 
