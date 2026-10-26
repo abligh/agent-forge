@@ -171,3 +171,30 @@ Two things to expect at step 3:
 - Tests that time out under load fail more often, since a slot's
   steps load the host more than one step did. They are the project's
   to fix.
+
+## Amendment (2026-10-26): a step's share is never less than its run's
+
+* Status: proposed
+
+**Why.** With `cpu_share: "step"` turned on, a day's long test step was
+slower at every level of load than the day before. CPU seconds per
+test were the same, so no test got dearer, and the host wasn't
+oversubscribed. What changed was how many CPUs the step ran on: about
+4.4 over its testing wall, against about 7.5 before.
+
+The run's share and a step's share use the same rule, from the slots
+busy at the time. The run's is taken as the run starts. A long test
+step's is taken after the build, by which time the other slots have
+usually filled. On a host that is nearly always busy, the step's share
+therefore comes out lower than the run's. Section 1 meant to give a
+late step the CPUs that finished runs let go, not to take CPUs from it.
+
+**Change.** With `cpu_share: "step"`, a step's `CHECK_CPUS` is the
+larger of the run's share, taken as the run starts as with `"run"`,
+and the share worked out as the step starts. A step never gets fewer
+CPUs than `"run"` would have given it, and still gets more when slots
+have emptied since its run began. A host that sets `CHECK_CPUS` itself
+still wins, and side by side, the steps running still split the share.
+
+No new key. Rollout: release the change, then compare a day with
+`"step"` against a day with `"run"` again.
