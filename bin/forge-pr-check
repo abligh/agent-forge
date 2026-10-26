@@ -3416,8 +3416,14 @@ def cpu_share(state_dir, env, environ=None):
     if "CHECK_CPUS" in environ:
         return None
     if CPU_SHARE == "step":
+        # Never less than the run's own share, taken as it started
+        # (designs/0029's amendment): a long step taken after the build
+        # found the other slots filled, and got less than "run" gave.
+        run_share = int(env["CHECK_CPUS"]) if "CHECK_CPUS" in env else 1
+
         def share():
-            return check_cpus(busy=max(1, busy_slots(state_dir)))
+            return max(run_share,
+                       check_cpus(busy=max(1, busy_slots(state_dir))))
         return share
     if SIDE_BY_SIDE is not None and "CHECK_CPUS" in env:
         whole = int(env["CHECK_CPUS"])
