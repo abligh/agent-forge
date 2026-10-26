@@ -494,6 +494,20 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"test_ahead": {
             "batch": "2"}}), ["merge.test_ahead.batch must be an integer"])
 
+    def test_merge_test_ahead_stacks(self):
+        # designs/0035: a layer joins its base's batch.
+        self.assertEqual(self.problems(merge={"stacks": {}, "test_ahead": {
+            "batch": 2, "stacks": True}}), [])
+        need = ["merge.test_ahead.stacks needs merge.stacks and "
+                "merge.test_ahead.batch above 1"]
+        self.assertEqual(self.problems(merge={"test_ahead": {
+            "batch": 2, "stacks": True}}), need)
+        self.assertEqual(self.problems(merge={"stacks": {}, "test_ahead": {
+            "stacks": True}}), need)
+        self.assertEqual(self.problems(merge={"stacks": {}, "test_ahead": {
+            "batch": 2, "stacks": "yes"}}),
+            ["merge.test_ahead.stacks must be true or false"])
+
     def test_merge_yield_after_hand_back(self):
         self.assertEqual(self.problems(merge={"yield_after_hand_back": 2,
                                               "yield_cap": 4}), [])

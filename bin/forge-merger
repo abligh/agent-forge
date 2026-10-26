@@ -338,6 +338,15 @@ tip is never a tree no run tested unless a member is handed back
 after others merged. The build check's state is read from its state
 directory, as for `merge.queued_stall_minutes`.
 
+**With `merge.test_ahead.stacks`, a stack's ready layers join their
+base's batch** (designs/0035): each is predicted straight after the
+pull request it is stacked on, while it would be eligible but for its
+base and its approval covers its head. A layer joins only a batch not
+yet being run. The batch holds while the layer is still ready at the
+head predicted, held as stacked until the layer below merges. A queued
+pull request a layer pushed out of the batch is `owed` (ahead.json),
+and no layer pushes an owed one out again.
+
 **With `merge.hold_conflicting`, a pull request that conflicts with
 one ahead of it waits for that one instead of going round again**
 (default off). An author with several approved pull requests that
@@ -574,6 +583,11 @@ AHEAD_IDENTITY = ("forge-merger", "merger@agent-forge.invalid")
 # check run covers. The first that many are the batch, the last its
 # top: only the top is run, and its green covers the rest.
 AHEAD_BATCH = 1
+# merge.test_ahead.stacks (designs/0035): a stack's ready layers are
+# predicted straight after their base, so they join its batch. A queued
+# pull request a layer pushed out of the batch is `owed` in ahead.json,
+# and no layer may push an owed one out again.
+AHEAD_STACKS = False
 # What the build check's status says of a head its batch covered.
 COVERED_TEXT = "covered by batch"
 BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
@@ -694,7 +708,7 @@ def configure(project):
     global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS, URGENT_LABEL
     global STACKS, STACK_MAX_RUN, STACK_WAIT, RESOLVE, HOLD_LABELS, BLOCKED_BY
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
-    global QUEUED_STALL_AFTER, READ_AS
+    global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -742,6 +756,8 @@ def configure(project):
     STACK_MAX_RUN = (stacks or {}).get("max_run", 0)
     wait = (stacks or {}).get("wait_hours")
     STACK_WAIT = datetime.timedelta(hours=wait) if wait else None
+    AHEAD_STACKS = (STACKS and AHEAD_BATCH > 1
+                    and (ahead or {}).get("stacks") is True)
     RESOLVE = tuple({"paths": frozenset(rule["paths"]),
                      "command": tuple(rule["command"]),
                      "check": tuple(rule["check"])}
@@ -2591,6 +2607,79 @@ def handed_back(said, pr, approval):
         before.get("head") == pr["headRefOid"]
 
 
+def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
+                 regenerated=None, rules=None):
+    """designs/0035: the layers stacked on `base`, climbing the stack,
+    that would be eligible but for their base, each with an approval
+    that covers its head, as [(pull request, approval)]. The first that
+    isn't ready ends the climb, as does a layer with another beside it,
+    since which goes first is the author's to say."""
+    layers, below, numbers = [], base, {base["number"]}
+    while True:
+        above = [pr for pr in prs
+                 if pr.get("baseRefName") == below.get("headRefName")]
+        if len(above) != 1:
+            return layers
+        layer = above[0]
+        approval, _ = eligible(layer, open_numbers - numbers, when,
+                               any_base=True)
+        oid = ((approval or {}).get("commit") or {}).get("oid")
+        if not oid or handed_back(said, layer, approval):
+            return layers
+        have_head(repo, layer, run)
+        if git(repo, "cat-file", "-e", oid + "^{commit}",
+               run=run).returncode != 0 or not covers_head(
+                repo, oid, layer["headRefOid"], "refs/remotes/origin/" + MAIN,
+                run, (below["headRefOid"],), regenerated)[0]:
+            return layers
+        if rules and code_owner_wait(repo, layer, rules,
+                                     "refs/remotes/origin/" + MAIN, run,
+                                     regenerated):
+            return layers
+        layers.append((layer, approval))
+        below = layer
+        numbers.add(layer["number"])
+
+
+def with_layers(queue, layers_of, last, size):
+    """(queue, owed): `queue` with each pull request's ready layers
+    (`layers_of(pr)`, from `ready_layers`) straight after it
+    (designs/0035), and the numbers owed a place. `last` is the last
+    tick's ahead.json, `size` the batch's. A layer doesn't join a batch
+    already being run, which its prediction would change, unless it was
+    predicted there already; and it may not push a pull request that is
+    owed out of the first `size`. A pull request a layer pushes out of
+    the first `size` is owed until a batch includes it."""
+    last = last if isinstance(last, dict) else {}
+    entries = [e for e in last.get("entries") or () if isinstance(e, dict)]
+    before = {e.get("pr"): e.get("head") for e in entries}
+    running = {e.get("pr") for e in
+               entries[:(last.get("batch") or {}).get("size") or 0]}
+    numbers = [pr["number"] for pr in queue]
+    plain = numbers[:size]
+    owed = [n for n in last.get("owed") or () if n in numbers]
+    out, placed = [], set()
+    for pr in queue:
+        if pr["number"] in placed:
+            continue
+        out.append(pr)
+        placed.add(pr["number"])
+        for layer, _ in layers_of(pr):
+            if layer["number"] in placed or (
+                    pr["number"] in running
+                    and before.get(layer["number"]) != layer["headRefOid"]):
+                break
+            batch = ([p["number"] for p in out] + [layer["number"]]
+                     + [n for n in numbers if n not in placed])[:size]
+            if any(n in plain and n not in batch for n in owed):
+                break
+            out.append(layer)
+            placed.add(layer["number"])
+    batch = {p["number"] for p in out[:size]}
+    return out, [n for n in numbers
+                 if n not in batch and (n in owed or n in plain)]
+
+
 def have_head(repo, pr, run=sh):
     """Fetch `pr`'s head unless the checkout has it already: only the
     pull requests a tick decided on were fetched."""
@@ -3275,6 +3364,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 spoken.append((pr, approval_of(pr), said_after[0]))
     regenerated = (remembered(state_dir, lambda sha, rule: regenerated_in(
         repo, sha, rule, run)) if RESOLVE else None)
+    rules = None
     if CODE_OWNERS:
         rules = codeowners_rules(repo, "refs/remotes/origin/" + MAIN, run)
         for pr in list(candidates):
@@ -3387,6 +3477,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     layers = {e["pr"] for e in stack.get("pending", ())} if stack else set()
     restacks = {e["pr"]: (e["after"], e["head"])
                 for e in (stack or {}).get("pending", ()) if e.get("head")}
+    # A stack's layer in a batch (designs/0035) is held as stacked until
+    # the layer below merges; the batch holds while it is still ready.
+    batch_layers = [pr for pr in prs if AHEAD_STACKS
+                    and pr.get("baseRefName") != MAIN
+                    and str(pr["number"]) in held
+                    and eligible(pr, open_numbers, when,
+                                 any_base=True)[0] is not None]
     for at, pr in enumerate([] if retarget is not None else queue):
         approval = approvals[pr["number"]]
         decision = decide(pr, approval, repo, main_tip, github, github.env,
@@ -3400,7 +3497,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # its tree itself (a batch split down to it) is green.
         if tree and not batch_holds(
                 load_json(os.path.join(state_dir, AHEAD_FILE), {}),
-                pr["number"], tree, queue, check_state) \
+                pr["number"], tree, queue + batch_layers, check_state) \
                 and tree_verdict(check_state, tree) is not True:
             decision = {"action": "WAIT", "pr": pr["number"],
                         "head": pr["headRefOid"],
@@ -3596,13 +3693,21 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             acting = [pr for pr in queue if pr["number"] == waiting_on]
             rest = [pr for pr in queue if pr["number"] != waiting_on
                     and not handed_back(said, pr, approvals[pr["number"]])]
-            entries = predict_ahead(repo, main_tip,
-                                    acting + rest if acting else [], run)
+            ahead_queue = acting + rest if acting else []
+            last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+            owed = None
+            if AHEAD_STACKS and ahead_queue:
+                ahead_queue, owed = with_layers(
+                    ahead_queue, lambda pr: ready_layers(
+                        repo, pr, prs, open_numbers, when, said, run,
+                        regenerated, rules), last, AHEAD_BATCH)
+            entries = predict_ahead(repo, main_tip, ahead_queue, run)
             record["ahead"] = [e["pr"] for e in entries]
             said_ahead = {"at": record["at"], "base": main_tip,
                           "repo": repo, "entries": entries}
+            if owed:
+                said_ahead["owed"] = record["owed"] = owed
             if AHEAD_BATCH > 1 and entries:
-                last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
                 verdict = lambda tree: tree_verdict(check_state, tree)
                 size, red = batch_size(entries, (last or {}).get("batch"),
                                        verdict)

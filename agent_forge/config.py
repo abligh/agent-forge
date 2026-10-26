@@ -110,7 +110,7 @@ BLOCKED_BY = ("body", "everywhere")
 RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int}
 STACKS = {"max_run": int, "wait_hours": int}
 TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
-              "batch": int}
+              "batch": int, "stacks": bool}
 STALL_ALERT = {"tell": list, "retell_minutes": int,
                "owner_after_minutes": int, "title": str, "labels": list}
 # checks is shared with tools not here yet, so only these keys are
@@ -514,6 +514,14 @@ def check(data):
         if isinstance(merge.get("test_ahead"), dict):
             _check_test_ahead(merge["test_ahead"], data.get("checks"),
                               problems)
+            if merge["test_ahead"].get("stacks") is True and (
+                    "stacks" not in merge
+                    or not _is(merge["test_ahead"].get("batch"), int)
+                    or merge["test_ahead"]["batch"] < 2):
+                # designs/0035: a layer joins its base's batch, so there
+                # must be stacks and batches.
+                problems.append("merge.test_ahead.stacks needs merge.stacks "
+                                "and merge.test_ahead.batch above 1")
         for key in ("yield_after_hand_back", "yield_cap"):
             if _is(merge.get(key), int) and merge[key] < 1:
                 problems.append("merge.%s must be at least 1" % key)
