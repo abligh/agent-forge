@@ -3139,40 +3139,50 @@ def locked_order(state_dir, queue):
     return places
 
 
-def green_batch(state_dir, queue, check_state):
-    """Whether the last tick's batch (AHEAD_FILE) is green and not yet
-    merged: its top's tree is green, and a member is still in `queue`
-    at the head it was predicted at. Between one member's merge and
-    the next, no merge is in flight, but the batch is still merging: a
-    layer that comes back then waits for the next batch, as it does
-    while a merge is in flight, since joining in front would change
-    every member's tree and spend the top's green."""
+def current_batch(state_dir, queue):
+    """(trees, members) of the batch the last tick (AHEAD_FILE) was
+    merging: its batch while a member is still in `queue` at the head
+    it was predicted at, else the first of its `later` batches while one
+    of that is. Once a batch has merged, the one predicted on it comes
+    next, and its top's run counts for it: on 2026-10-26 a layer went in
+    front of a green later batch just after the batch below it merged.
+    ([], set()) when there is none."""
     last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
-    if not isinstance(last, dict) or not isinstance(last.get("batch"), dict):
-        return False
-    trees = last["batch"].get("trees")
+    if not isinstance(last, dict):
+        return [], set()
     entries = last.get("entries")
-    if not isinstance(trees, list) or not trees \
-            or not isinstance(entries, list) \
-            or tree_verdict(check_state, trees[-1]) is not True:
-        return False
+    if not isinstance(entries, list):
+        return [], set()
     heads = {pr["number"]: pr["headRefOid"] for pr in queue}
-    return any(isinstance(e, dict) and e.get("tree") in trees
-               and heads.get(e.get("pr")) in (e.get("head"), e.get("sha"))
-               for e in entries)
+    batches = [last.get("batch")] + list((last.get("later") or [])[:1])
+    for batch in batches:
+        trees = batch.get("trees") if isinstance(batch, dict) else None
+        if not isinstance(trees, list) or not trees:
+            continue
+        members = {e.get("pr") for e in entries
+                   if isinstance(e, dict) and e.get("tree") in trees
+                   and heads.get(e.get("pr")) is not None
+                   and heads[e["pr"]] in (e.get("head"), e.get("sha"))}
+        if members:
+            return trees, members
+    return [], set()
+
+
+def green_batch(state_dir, queue, check_state):
+    """Whether the batch being merged (current_batch) is green: its
+    top's tree is. Between one member's merge and the next, no merge is
+    in flight, but the batch is still merging: a layer that comes back
+    then waits for the next batch, as it does while a merge is in
+    flight, since joining in front would change every member's tree and
+    spend the top's green."""
+    trees, members = current_batch(state_dir, queue)
+    return bool(members) and tree_verdict(check_state, trees[-1]) is True
 
 
 def batch_members(state_dir, queue):
-    """The pull requests in the last tick's batch (AHEAD_FILE) that are
-    still in `queue` at the head they were predicted at."""
-    last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
-    if not isinstance(last, dict) or not isinstance(last.get("batch"), dict):
-        return set()
-    trees = last["batch"].get("trees") or []
-    heads = {pr["number"]: pr["headRefOid"] for pr in queue}
-    return {e.get("pr") for e in last.get("entries") or ()
-            if isinstance(e, dict) and e.get("tree") in trees
-            and heads.get(e.get("pr")) in (e.get("head"), e.get("sha"))}
+    """The pull requests of the batch being merged (current_batch) still
+    in `queue` at the head they were predicted at."""
+    return current_batch(state_dir, queue)[1]
 
 
 def fixes_first(queue, in_flight, members):
@@ -3920,16 +3930,24 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             first = []
         # A layer that comes back while a batch it isn't in runs goes
         # first in the next batch, not into that one, which would spend
-        # its run.
-        late = (set(first) - predicted(state_dir)
-                if TEST_AHEAD and (in_flight is not None or green_batch(
-                    state_dir, queue, check_state)) else set())
+        # its run. Predicted past the batch is not in it: on 2026-10-26
+        # a layer predicted 16th went in front of a green batch's six
+        # members left to merge.
+        merging = TEST_AHEAD and (in_flight is not None or green_batch(
+            state_dir, queue, check_state))
+        members = batch_members(state_dir, queue) if merging else set()
+        late = set(first) - members if merging else set()
         places = locked_order(state_dir, queue) if late else {}
+        # An urgent pull request goes ahead of a layer that comes back,
+        # though not ahead of the batch being merged (Alex, 2026-10-26:
+        # a pin waited behind four layers in turn, an hour and a half).
         queue.sort(key=lambda pr: (
             pr["number"] != in_flight,
-            0 if pr["number"] in first and pr["number"] not in late
-            else 1 if pr["number"] in places
-            else 2 if pr["number"] in late else 3))
+            0 if pr["number"] in members
+            else 1 if urgent(pr) and pr["number"] not in first
+            else 2 if pr["number"] in first and pr["number"] not in late
+            else 3 if pr["number"] in places
+            else 4 if pr["number"] in late else 5))
     if MAIN_RED_FIXES & {pr["number"] for pr in queue}:
         # A red default branch's fix goes first, behind only the one in
         # flight and a green batch still merging, whose run is spent
