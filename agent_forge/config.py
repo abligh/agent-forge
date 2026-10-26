@@ -152,8 +152,8 @@ INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight",
                       "red_comment", "max_wait_minutes", "host_fault_text",
                       "step_alert", "cpu_share", "side_by_side")
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
-                       "reuse", "fresh", "main")
-INSTANCE_CHECKS_ONLY = ("main_red_issue", "first_authors", "merger_first",
+                       "reuse", "fresh", "main", "main_red_issue")
+INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
                         "merger_cpu_weight", "docker_slices")
 # And from the block alone, never `checks`: a context the Merger requires
 # can't leave heads unrun (designs/0034).
@@ -163,7 +163,9 @@ INSTANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # checks.drop_env: a variable's name, or a prefix ending in `*`.
 DROP_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\*?$")
 # checks.main: which default-branch heads are run (designs/0011).
-MAIN_MODES = ("needed", "every")
+# `newest` (designs/0034): every head too, but the newest goes first at
+# once, before any pull request's.
+MAIN_MODES = ("needed", "every", "newest")
 MAIN_RED_ISSUE = {"label": str, "labels": list, "title": str}
 # checks.cache_limit: a size in systemd's style, at least one byte.
 SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
@@ -814,11 +816,12 @@ def _check_checks(checks, data, problems, where="checks"):
     if isinstance(checks.get("main_red_issue"), dict):
         _fields(where + ".main_red_issue", checks["main_red_issue"],
                 MAIN_RED_ISSUE, problems)
-        if checks.get("main", "needed") != "every" \
+        if checks.get("main", "needed") not in ("every", "newest") \
                 and not checks.get("depends"):
-            problems.append("checks.main_red_issue needs checks.main "
-                            "\"every\" (or checks.depends): otherwise the "
-                            "default branch is never checked")
+            problems.append("%s.main_red_issue needs %s.main \"every\" or "
+                            "\"newest\" (or %s.depends): otherwise the "
+                            "default branch is never checked"
+                            % (where, where, where))
     if isinstance(checks.get("pull_requests"), dict):
         if where == "checks":
             problems.append("checks.pull_requests: only an instance may set "
