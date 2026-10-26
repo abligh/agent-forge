@@ -1,4 +1,4 @@
-# 0035: Batches take stacks, and run side by side
+# 0035: Batches take stacks, run side by side, and size themselves
 
 * Status: proposed
 * Author: XMPPEngineer
@@ -7,7 +7,7 @@
 ## Summary
 
 With batches (designs/0032), one run of the batch's top covers every
-merge in the batch. Two limits remain:
+merge in the batch. Three limits remain:
 
 1. **A stack's layers can't share a batch.** A layer is held until the
    layer below has merged, then retargeted on a tick of its own
@@ -19,7 +19,11 @@ merge in the batch. Two limits remain:
    while the current one runs, but its top isn't run until the current
    batch has merged. The host's other slots sit idle meanwhile.
 
-This design makes two changes, each off unless set:
+3. **The batch size is a guess.** A project picks `batch` by hand,
+   with nothing to tell it whether a larger or smaller one would merge
+   more per run.
+
+This design makes three changes, each off unless set:
 
 1. **A stack joins its base's batch.** When a batch takes a stack's
    bottom layer, the layers above it that are ready go into the same
@@ -29,6 +33,11 @@ This design makes two changes, each off unless set:
    batches, each predicted on the batch before, run while the current
    one runs. When the batches below a top all go green and merge, its
    verdict is already in.
+3. **Batches report how they went, and can size themselves.** Each
+   batch's outcome is recorded: the size tried, the size that merged,
+   and the runs it took. A report estimates the pull requests' red
+   rate from them and gives the best size, a power of two. Later, the
+   Merger can set the size itself.
 
 ## Evidence
 
@@ -103,14 +112,58 @@ K × `batch`:
    no run of their own.
 4. **A red earlier batch.** Every later batch's tree contains the red
    one. So its runs are thrown away, even if they're green. The red
-   batch splits as designs/0032 says, and the later batches are
-   predicted again behind it.
+   batch splits as designs/0032 says. While it splits, its members
+   that haven't merged are **unresolved**: one of them is red, and
+   which isn't known yet. The later batches are predicted again
+   without them, from the queue behind them, so a spare slot isn't
+   spent on a tree that is probably red. Once the split ends (the
+   culprit handed back, or a half merged), the unresolved members go
+   back to the front of the queue, in their old order, and the next
+   new batch starts with them.
 5. **A red later batch, while the earlier one is green.** It splits as
    designs/0032 says, when it becomes the current batch. The halves'
    runs can start early, in spare slots.
 6. **Anything that changes a batch** (a push, a hand-back, a new
    approval order) re-predicts from that batch up, as designs/0032's
    rule 5 does for one batch. The batches below it are untouched.
+
+### 3. Batches size themselves: an outcome record, a report, and `batch: "auto"`
+
+1. **Each batch's outcome.** When a batch is done (merged, or split
+   down to its culprit), `forge-merger` appends one line to
+   `batches.jsonl` in its state directory: the size tried, the size
+   that merged, the runs it took, the culprit if one was handed back,
+   and whether the default branch's own check was red at the time.
+2. **The red rate.** If each pull request is red on its own with
+   probability q, a batch of N is green with probability (1 − q)^N.
+   `forge-merger --batch-report` fits q to the outcomes of the last
+   `hours` (default 24) by maximum likelihood. It leaves out batches run
+   while the default branch was red, or while a flaky test was logged
+   (`FLAKE`): then every pull request looks bad at once, and q would
+   come out far too high.
+3. **The best size.** From q, the report gives the expected merges per
+   run for each size, and the best. For example:
+
+   | q | 4 | 5 | 8 | 9 | 16 | 17 |
+   | --- | --- | --- | --- | --- | --- | --- |
+   | 1% | 3.67 | 4.41 | 6.67 | 7.17 | 11.20 | 11.35 |
+   | 3% | 3.14 | 3.53 | 4.90 | 4.96 | 6.61 | 6.39 |
+   | 5% | 2.71 | 2.90 | 3.79 | 3.69 | 4.43 | 4.19 |
+   | 10% | 1.97 | 1.94 | 2.26 | 2.08 | 2.13 | 1.96 |
+
+4. **Powers of two.** Sizes 5 to 8 all take up to four runs to find a
+   bad pull request, so a size just above a power of two pays for an
+   extra halving and gains little: at q = 10%, 5 merges fewer per run
+   than 4. The report recommends only powers of two. A batch whose size
+   isn't one first splits at the largest power of two below it
+   (12 → 8 → 4 → 2 → 1, not 12 → 6 → 3 → 2 → 1), so every split
+   after the first is a clean half.
+5. **`batch: "auto"`, later.** With `"auto"` and `batch_max`, the
+   Merger starts each new batch at the report's best power of two
+   (at most `batch_max`, at least 2) for the last `hours`. It is
+   built only after the report has shown its estimate is steady from
+   one day to the next. Until then, a project reads the report and sets
+   `batch` itself.
 
 ## What it doesn't change
 
@@ -131,9 +184,12 @@ K × `batch`:
 * **Part 2:** runs thrown away when an earlier batch goes red. With 90%
   of runs green and K = 2, about one later run in ten is spent. Each
   is a slot that would otherwise have been idle.
-* **Throughput.** With both, batch 5 and K = 2, two runs in flight
-  cover up to ten merges, against three today: about 40 an hour at
-  most, against arrivals of about 12.
+* **Part 3:** one line per batch, and git-free arithmetic for the
+  report.
+* **Throughput.** With parts 1 and 2, batch 8 and K = 2, two runs in
+  flight cover up to sixteen merges, against three today. At the
+  observed red rates that is several times the arrivals of about 12 an
+  hour.
 
 ## Configuration
 
@@ -141,14 +197,19 @@ K × `batch`:
 | --- | --- | --- |
 | `merge.test_ahead.stacks` | `false` | A stack's ready layers join their base's batch, straight after it; anything they displaced goes first in the next batch. Needs `merge.stacks` and `batch` above 1. |
 | `merge.test_ahead.batches` | `1` | How many batches are predicted and run at once. Later tops run only in spare slots. `depth` + 1 must be at least `batches` × `batch`. |
+| `merge.test_ahead.batch` | `1` | Gains `"auto"` (part 3, built last): the report's best power of two, at most `batch_max`. |
+| `merge.test_ahead.batch_max` | none | With `batch: "auto"`, the largest size it may choose. `depth` + 1 must be at least `batches` × `batch_max`. |
 
 ## Order of work
 
 1. `forge-merger`: layers in the prediction, `owed` in `ahead.json`,
    the fairness rule; tests. `docs/config.md`. A release.
-2. `forge-merger` and `forge-pr-check`: K batches in `ahead.json`,
-   later tops in spare slots, discarding on an earlier red; tests.
-   `docs/config.md`. A release.
+2. `forge-merger`: `batches.jsonl`, `--batch-report`, and the split at
+   the largest power of two; tests. A release.
+3. `forge-merger` and `forge-pr-check`: K batches in `ahead.json`,
+   later tops in spare slots, unresolved members left out, discarding
+   on an earlier red; tests. `docs/config.md`. A release.
+4. `batch: "auto"`, once a few days of reports agree.
 
-A project then sets each key in its own configuration. Part 1 is the
-cheaper of the two and goes first.
+A project then sets each key in its own configuration. Parts 1 and 3's
+record and report are cheap and go first.
