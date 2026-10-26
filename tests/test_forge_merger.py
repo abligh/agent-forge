@@ -2836,6 +2836,137 @@ class Batches(unittest.TestCase):
         self.assertFalse(m.batch_holds({}, 10, "a", [], {}))
 
 
+class Suspects(unittest.TestCase):
+    """designs/0035, second amendment: a red batch keeps its suspects,
+    and their prefixes are tested front to back at cut points."""
+
+    def cuts(self, n, green=0, red=None, slots=3):
+        trees = [str(k) for k in range(1, n + 1)]
+        verdict = lambda t: (True if int(t) <= green else
+                             False if red and int(t) >= red else None)
+        return m.suspect_cuts(trees, verdict, slots)
+
+    def test_the_example(self):
+        # 8 suspects, the 7th red, 3 slots: prefixes 3 and 6 first.
+        self.assertEqual(self.cuts(8, red=8), (0, 8, [3, 6]))
+        # Both green: 1 to 6 merge, and prefix 7 is run alone.
+        self.assertEqual(self.cuts(8, green=6, red=8), (6, 8, [7]))
+        # It is red: one longer than the green one, so it is named.
+        self.assertEqual(self.cuts(8, green=6, red=7), (6, 7, []))
+
+    def test_one_slot_halves(self):
+        self.assertEqual(self.cuts(8, red=8, slots=1), (0, 8, [4]))
+        self.assertEqual(self.cuts(8, red=4, slots=1), (0, 4, [2]))
+        self.assertEqual(self.cuts(2, red=2, slots=1), (0, 2, [1]))
+
+    def test_without_a_known_red_the_whole_set_is_a_cut(self):
+        # The tip moved for another reason: every tree is new.
+        self.assertEqual(self.cuts(8, slots=3), (0, None, [4, 8]))
+        self.assertEqual(self.cuts(3, green=3), (3, None, []))
+
+    def test_the_batches_of_a_round(self):
+        self.assertEqual(m.suspect_batches(0, [3, 6]), (3, [3]))
+        self.assertEqual(m.suspect_batches(6, [7]), (6, [1]))
+        self.assertEqual(m.suspect_batches(6, []), (6, []))
+        self.assertEqual(m.suspect_batches(0, []), (0, []))
+
+    def saved(self, *numbers):
+        return {"suspects": [{"pr": n, "head": "h%d" % n} for n in numbers],
+                "tree": "t", "merged": [], "left": []}
+
+    def queue(self, *numbers, pushed=()):
+        return [{"number": n, "headRefOid": "new" if n in pushed
+                 else "h%d" % n} for n in numbers]
+
+    def test_a_suspect_that_changes_leaves(self):
+        saved, line = m.suspects_left(
+            self.saved(5, 6, 7), self.queue(5, 6, 7, pushed=(6,)),
+            {"decisions": []}, {}, {})
+        self.assertEqual([e["pr"] for e in saved["suspects"]], [5, 7])
+        self.assertEqual(saved["left"], [6])
+        self.assertIsNone(line)
+
+    def test_every_suspect_merged_is_a_flake(self):
+        saved = self.saved(6)
+        saved["merged"] = [5]
+        record = {"decisions": [{"pr": 6, "action": "MERGE",
+                                 "result": "done"}]}
+        saved, line = m.suspects_left(saved, self.queue(), record, {}, {})
+        self.assertIsNone(saved)
+        self.assertEqual(line, "BATCH-FLAKE #5..#6: every suspect merged "
+                         "green; the red top's tree t was a flake")
+
+    def test_none_left_after_a_change_is_no_flake(self):
+        saved = self.saved(5)
+        saved["merged"] = [4]
+        saved, line = m.suspects_left(saved, self.queue(5, pushed=(5,)),
+                                      {"decisions": []}, {}, {})
+        self.assertIsNone(saved)
+        self.assertIsNone(line)
+
+    def test_suspects_lead_the_queue(self):
+        queue = self.queue(9, 6, 5, pushed=(6,))
+        self.assertEqual(m.suspect_place(self.saved(5, 6), queue), {5: 0})
+
+    def entries(self, *trees):
+        return [{"pr": 10 + k, "sha": "%d" % k * 40, "tree": t,
+                 "head": "h%d" % (10 + k)} for k, t in enumerate(trees)]
+
+    def round(self, saved, entries, red=(), green=(), last=None):
+        verdict = lambda t: False if t in red else True if t in green \
+            else None
+        said, record, lines = {}, {}, []
+        with tempfile.TemporaryDirectory() as state_dir:
+            going = m.suspect_round(state_dir, saved, entries, verdict, last,
+                                    said, record, lines.append)
+            kept = m.load_suspects(state_dir)
+        return going, said, record, lines, kept
+
+    def test_a_round_writes_the_batch_and_the_later_cuts(self):
+        m.configure(project(test_ahead={"batch": 8, "batches": 3,
+                                        "depth": 9}))
+        self.addCleanup(m.configure, project())
+        saved = self.saved(*range(10, 18))
+        going, said, record, lines, kept = self.round(
+            saved, self.entries(*"abcdefgh"), red="h")
+        self.assertTrue(going)
+        self.assertEqual(said["batch"], {"size": 3, "trees": list("abc"),
+                                         "suspects": True})
+        self.assertEqual(said["later"], [{"size": 3, "trees": list("def")}])
+        self.assertEqual((record["batch"], record["later"]),
+                         ([10, 11, 12], [[13, 14, 15]]))
+        self.assertEqual(lines, ["SUSPECTS #10..#17: green to none, red "
+                                 "from #17; checking #10..#12, #10..#15"])
+        self.assertEqual(len(kept["suspects"]), 8)
+
+    def test_a_shorter_red_stops_the_longer_runs(self):
+        m.configure(project(test_ahead={"batch": 8, "batches": 3,
+                                        "depth": 9}))
+        self.addCleanup(m.configure, project())
+        entries = self.entries(*"abcdefgh")
+        going, said, record, _, kept = self.round(
+            self.saved(*range(10, 18)), entries, red="fh", green="abc")
+        self.assertTrue(going)
+        # 1 to 3 merge; prefixes 4 and 5 run; 6 bounds it.
+        self.assertEqual(said["batch"]["size"], 3)
+        self.assertEqual(said["later"], [{"size": 1, "trees": ["d"]},
+                                         {"size": 1, "trees": ["e"]}])
+        self.assertEqual(said["stop"], sorted(e["sha"] for e in entries[6:]))
+        self.assertEqual([e["pr"] for e in kept["suspects"]],
+                         [10, 11, 12, 13, 14, 15])
+
+    def test_a_red_suspect_at_the_front_ends_the_search(self):
+        m.configure(project(test_ahead={"batch": 4}))
+        self.addCleanup(m.configure, project())
+        going, said, _, lines, kept = self.round(
+            self.saved(10, 11), self.entries(*"ab"), red="ab")
+        self.assertFalse(going)
+        self.assertEqual(said, {})
+        self.assertEqual(lines, ["SUSPECTS #10..#11: #10 is red on its "
+                                 "own; the search ends"])
+        self.assertIsNone(kept)
+
+
 class WithLayers(unittest.TestCase):
     """designs/0035: a stack's ready layers go straight after their base,
     and what they push out of the batch is owed a place."""
@@ -2970,9 +3101,46 @@ class TickAhead(RepoCase):
             [self.item(), self.other_pr()], conclusions=(None,), live=True,
             check_state={"results": {top["sha"]: {"tree": top["tree"],
                                                   "ok": False}}})
-        self.assertIn("BATCH #5..#6: top red, checking #5..#5", lines)
+        # designs/0035, second amendment: its members are the suspects,
+        # and with one slot the first half is checked.
+        self.assertIn("BATCH #5..#6: top red; its 2 members are the "
+                      "suspects", lines)
+        self.assertIn("SUSPECTS #5..#6: green to none, red from #6; "
+                      "checking #5..#5", lines)
         self.assertEqual(record["batch"], [5])
         self.assertEqual(self.ahead_json()["batch"]["size"], 1)
+        saved = m.load_suspects(self.state)
+        self.assertEqual([e["pr"] for e in saved["suspects"]], [5, 6])
+        self.assertEqual(saved["tree"], top["tree"])
+
+    def test_the_suspects_keep_their_places_and_nothing_joins(self):
+        # Seen on 2026-10-26: a red batch's halves regrew to the full
+        # batch with the red one still in it, whenever one joined in
+        # front.
+        m.configure(project(test_ahead={"batch": 3}))
+        self.repo.branch("third", "origin/main")
+        sha = self.repo.commit("t.txt", "third\n", "third")
+        self.repo.publish_pr(4, sha)
+        self.repo.branch("feature", "feature")
+        early = pr(4, T0, head=sha, reviews=[review(REVIEWER, oid=sha)])
+        self.tick([self.item(), self.other_pr()], conclusions=(None,),
+                  live=True)
+        top = self.ahead_json()["entries"][1]
+        red = {"results": {top["sha"]: {"tree": top["tree"], "ok": False}}}
+        self.tick([self.item(), self.other_pr()], conclusions=(None,),
+                  live=True, check_state=red)
+        # #4, older, would go first: it waits behind the suspects.
+        record, _ = self.tick([early, self.item(), self.other_pr()],
+                              conclusions=(None,), live=True, minutes=1,
+                              check_state=red)
+        self.assertEqual(record["ahead"][:2], [5, 6])
+        self.assertEqual(record["batch"], [5])
+        # #6 is pushed to: it leaves, and the search has #5 alone.
+        six = dict(self.other_pr(), headRefOid=self.head)
+        self.tick([self.item(), six], conclusions=(None,), live=True,
+                  minutes=2, check_state=red)
+        self.assertEqual([e["pr"] for e in m.load_suspects(
+            self.state)["suspects"]], [5])
 
     def test_without_a_batch_nothing_is_said_of_one(self):
         record, _ = self.tick([self.item(), self.other_pr()],
