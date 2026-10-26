@@ -113,6 +113,16 @@ class Judge(unittest.TestCase):
         self.assertEqual(self.judge("merge_rate", (1, 6), (2, 300))[0],
                          tool.IN)
 
+    def test_merge_rate_trips_under_its_limit(self):
+        # Seen on 2026-10-26: 5.2 an hour all afternoon was in line by
+        # the ratio alone.
+        rules = {"limit": 6, "ratio": 2}
+        got = self.judge("merge_rate", (5.2, 6), (7, 300), rules)
+        self.assertEqual(got, (tool.OUT, "5.2 an hour, under the limit "
+                               "of 6.0 an hour"))
+        self.assertEqual(self.judge("merge_rate", (6, 6), None,
+                                    rules)[0], tool.IN)
+
     def test_merge_rate_with_nothing_waiting_is_not_judged(self):
         got = self.judge("merge_rate", (0, 0), (2, 300))
         self.assertEqual(got, (tool.UNJUDGED,
@@ -223,6 +233,18 @@ class Main(unittest.TestCase):
         # The next hour finds it open: no second issue, no reminder yet.
         self.assertEqual(self.main(now=NOW + HOUR), 0)
         self.assertEqual(len(self.gh.writes), 1)
+
+    def test_a_figure_names_its_own_owner(self):
+        with open(self.config) as handle:
+            data = json.load(handle)
+        data["stats_watch"]["figures"]["check_run"]["owner"] = "Reviewer"
+        with open(self.config, "w") as handle:
+            json.dump(data, handle)
+        self.window = stats(ran=14)
+        self.main()
+        [(_, _, body)] = self.gh.writes
+        self.assertEqual(body["labels"], ["stats-watch", "Owner:Reviewer"])
+        self.assertIn("is Reviewer's to decide", body["body"])
 
     def test_it_files_as_the_app_named_by_as(self):
         with open(self.config) as handle:

@@ -4307,7 +4307,7 @@ class Stacks(RepoCase):
         return pr(6, T1, base=base, head=head or self.upper, reviews=[
             review(REVIEWER, oid=self.upper)] if reviews is None else reviews)
 
-    def tick(self, prs, live=True, minutes=0):
+    def tick(self, prs, live=True, minutes=0, check_state=None):
         github = FakeGitHub(answers(prs=prs))
         self.github = github
         lines = []
@@ -4324,7 +4324,7 @@ class Stacks(RepoCase):
         record = m.tick(self.repo.path, self.state, github, run,
                         lines.append,
                         now=lambda: start + datetime.timedelta(minutes=minutes),
-                        live=live)
+                        live=live, check_state=check_state)
         if not live:
             self.assertEqual(github.writes, [])
         return record, lines
@@ -4553,6 +4553,36 @@ class Stacks(RepoCase):
         record, _ = self.tick([oldest, older, self.layer("main")],
                               live=False, minutes=2)
         self.assertEqual(record["queue"][0], 6)
+
+    def test_a_layer_back_between_a_green_batchs_merges_waits(self):
+        # Seen on 2026-10-26: a batch of 8 went green and its first
+        # member merged; three layers whose bases had just merged went
+        # in front of the other seven, and the top's green was spent.
+        m.configure(project(stacks={}, test_ahead={"batch": 2}))
+        self.merge_bottom()
+        older = self.other(4)
+        self.repo.branch("other", "origin/main")
+        sha = self.repo.commit("p.txt", "oldest\n", "oldest")
+        self.repo.publish_pr(3, sha)
+        self.repo.branch("feature", "feature")
+        oldest = pr(3, "2026-10-07T08:00:00Z", head=sha,
+                    reviews=[review(REVIEWER, oid=sha)])
+        m.save_json(os.path.join(self.state, m.AHEAD_FILE), {
+            "at": "2026-10-07T12:01:00Z", "entries": [
+                {"pr": 4, "head": older["headRefOid"], "tree": "t4"},
+                {"pr": 3, "head": sha, "tree": "t3"}],
+            "batch": {"size": 2, "trees": ["t4", "t3"]}})
+
+        def queue(ok):
+            record, _ = self.tick(
+                [oldest, older, self.layer("main")], live=False, minutes=2,
+                check_state={"results": {"x" * 40: {"tree": "t3",
+                                                    "ok": ok}}})
+            return record["queue"]
+        # No merge is in flight, but the batch's top is green.
+        self.assertEqual(queue(True), [4, 3, 6])
+        # A red top is no batch to wait for.
+        self.assertEqual(queue(False)[0], 6)
 
     def test_max_run_lets_the_queue_have_a_turn(self):
         m.configure(project(stacks={"max_run": 1}))

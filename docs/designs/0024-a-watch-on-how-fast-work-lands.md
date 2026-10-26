@@ -140,3 +140,22 @@ checks have tests of their own.
    build-check host.
 3. Run `--dry-run` against the last week first, so that the first live
    issue is not an old one.
+
+## Amendment (2026-10-26): a figure's own owner, and a floor on merges an hour
+
+* Status: proposed
+
+**Why.** On 26 October the queue-to-merge figure was out of line all
+day, but every issue went to the watch's one owner. That owner looks
+after the build check, not the Merger, and read the issues as load.
+Merges an hour stayed at 5.2 to 6.2 all afternoon, against about 7 the
+night before. With `ratio` 2 against the baseline, that counted as in
+line.
+
+**Change.**
+1. Any figure may name its own `owner`, one of `agents`. Its issue is
+   labelled for that agent and says it's theirs to decide. A figure
+   without one keeps the watch's `owner`.
+2. `merge_rate` takes a `limit`, a floor: it's out of line under it,
+   judged with or without a baseline, and still only when approved
+   pull requests waited.

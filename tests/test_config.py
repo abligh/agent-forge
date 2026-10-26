@@ -297,7 +297,8 @@ class Check(unittest.TestCase):
             "owner": "Merger", "window_hours": 0, "label": " ",
             "as": "Nobody", "colour": 1, "figures": {
                 "check_run": {"limit": 0, "ratio": 1},
-                "merge_rate": {"limit": 3, "ratio": True},
+                "merge_rate": {"limit": 3, "ratio": True,
+                               "owner": "Nobody"},
                 "main_red": [], "speed": {}}}), [
             "stats_watch: unknown key 'colour'",
             "stats_watch.owner 'Merger' is not an agent",
@@ -307,8 +308,8 @@ class Check(unittest.TestCase):
             "stats_watch.label must not be empty",
             "stats_watch.figures.check_run.limit must be a number above 0",
             "stats_watch.figures.check_run.ratio must be more than 1",
-            "stats_watch.figures.merge_rate: unknown key 'limit'",
             "stats_watch.figures.merge_rate.ratio must be a number above 0",
+            "stats_watch.figures.merge_rate.owner 'Nobody' is not an agent",
             "stats_watch.figures.main_red must be an object",
             "stats_watch.figures.speed: unknown figure (one of check_run, "
             "check_wait, pr_turnaround, merge_time, merge_rate, "
