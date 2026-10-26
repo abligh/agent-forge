@@ -913,6 +913,25 @@ class Decide(RepoCase):
             ["forge-commit-identity",
              "%s..%s" % (self.repo.main_tip(), self.head)]])
 
+    def test_a_stack_layer_names_the_layer_below_to_the_gate(self):
+        seen = []
+        base = tools_run()
+
+        def run(args, cwd=None, env=None):
+            if os.path.basename(args[0]) == "closing-keywords":
+                seen.append(args[1:])
+            return base(args, cwd, env)
+        item = self.item()
+        gate = (("tools/closing-keywords", "--pr", "{pr}", "--below",
+                 "{below}"),)
+        with mock.patch.object(m, "GATE", gate):
+            for restack in ((4, "0" * 40), None):
+                m.decide(item, m.approval_of(item), self.repo.path,
+                         self.repo.main_tip(), FakeGitHub(answers()), {},
+                         run, restack=restack)
+        self.assertEqual(seen, [["--pr", "5", "--below", "4"],
+                                ["--pr", "5", "--below"]])
+
     def test_an_unreviewed_commit_goes_to_the_approver(self):
         head = self.repo.commit("f.txt", "later\n", "unreviewed")
         self.repo.publish_pr(5, head)
@@ -2505,6 +2524,14 @@ class Configure(unittest.TestCase):
         self.assertEqual(
             m.gate_args(GATE[1], "/r", 7, "b", "h"),
             [os.path.join(m.BIN, "forge-commit-identity"), "b..h"])
+
+    def test_below_is_the_merged_layers_number_or_left_out(self):
+        argv = ["forge-closing-keywords", "--pr", "{pr}", "--below",
+                "{below}"]
+        self.assertEqual(m.gate_args(argv, "/r", 7, "b", "h", 6)[1:],
+                         ["--pr", "7", "--below", "6"])
+        self.assertEqual(m.gate_args(argv, "/r", 7, "b", "h")[1:],
+                         ["--pr", "7", "--below"])
 
     def test_a_forge_tool_named_by_path_runs_from_the_checkout(self):
         self.assertEqual(m.gate_args(["tools/forge-x"], "/r", 1, "b", "h"),

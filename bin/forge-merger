@@ -209,7 +209,10 @@ or a value that is not a time, holds it.
 * every run of the Actions workflow `merge.ci_workflow` (default `ci`)
   on it succeeded. `""` means the project has no such workflow;
 * every gate tool in `merge.gate` exits 0. Each is an argument list
-  with `{pr}`, `{base}` (main's tip) and `{head}` filled in; the
+  with `{pr}`, `{base}` (main's tip) and `{head}` filled in, and an
+  argument that is exactly `{below}` replaced by the number of a
+  stack's merged layer below it (designs/0025), or left out when it
+  isn't one; the
   default is `forge-commit-identity {base}..{head}`. A `forge-` tool
   runs from this installation, anything else from the checkout.
 
@@ -469,8 +472,8 @@ STATUS_CREATOR = ""
 
 # Where the build check runs, for the STALLED line.
 BUILD_HOST = ""
-# The gate tools, as argument lists before `{pr}`, `{base}` and
-# `{head}` are filled in.
+# The gate tools, as argument lists before `{pr}`, `{base}`, `{head}`
+# and `{below}` are filled in.
 DEFAULT_GATE = (("forge-commit-identity", "{base}..{head}"),)
 DEFAULT_CONTEXT = "vm/build-and-test"
 GATE = DEFAULT_GATE
@@ -1921,7 +1924,8 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
     for argv in GATE:
         if problem:
             break
-        problem = tool_problem(gate_args(argv, repo, number, main_tip, head),
+        problem = tool_problem(gate_args(argv, repo, number, main_tip, head,
+                                         restack[0] if restack else None),
                                env, repo, run)
     if problem:
         return dict(back("author", problem), **notes)
@@ -1930,12 +1934,16 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
     return dict({"action": "MERGE"}, **notes)
 
 
-def gate_args(argv, repo, number, base, head):
+def gate_args(argv, repo, number, base, head, below=None):
     """A gate tool's argument list, filled in: `{pr}`, `{base}` and
-    `{head}` in any argument, and the tool's path, from this
+    `{head}` in any argument, an argument that is exactly `{below}` by
+    the number of the merged stack layer below (designs/0025), or by
+    nothing when there is none, and the tool's path, from this
     installation for a `forge-` tool and from `repo` otherwise."""
     filled = [a.replace("{pr}", str(number)).replace("{base}", base)
-              .replace("{head}", head) for a in argv]
+              .replace("{head}", head) for a in argv
+              if a != "{below}" or below is not None]
+    filled = [str(below) if a == "{below}" else a for a in filled]
     tool = filled[0]
     if os.sep not in tool and tool.startswith("forge-"):
         filled[0] = os.path.join(BIN, tool)
