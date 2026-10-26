@@ -2130,6 +2130,28 @@ class Batch(unittest.TestCase):
         self.assertEqual(pc.merger_batch(os.path.join(self.dir, "no"), T0),
                          [])
 
+    def edit_ahead(self, **more):
+        with open(os.path.join(self.dir, "ahead.json")) as handle:
+            said = json.load(handle)
+        said.update(more)
+        with open(os.path.join(self.dir, "ahead.json"), "w") as handle:
+            json.dump(said, handle)
+
+    def test_a_batch_of_suspects_may_be_one(self):
+        # designs/0035, second amendment: a cut at the first suspect.
+        write_ahead(self.dir, self.entries, batch=1)
+        self.edit_ahead(batch={"size": 1, "trees": [TREE_1],
+                               "suspects": True})
+        self.assertEqual(pc.merger_batch(self.dir, T0), self.entries[:1])
+
+    def test_the_runs_to_stop_are_read(self):
+        write_ahead(self.dir, self.entries, batch=2)
+        self.assertEqual(pc.merger_stop(self.dir, T0), set())
+        self.edit_ahead(stop=[SHA_C, "short", 7])
+        self.assertEqual(pc.merger_stop(self.dir, T0), {SHA_C})
+        self.assertEqual(pc.merger_stop(os.path.join(self.dir, "no"), T0),
+                         set())
+
     def test_a_batch_whose_trees_differ_is_none(self):
         write_ahead(self.dir, self.entries, batch=2)
         with open(os.path.join(self.dir, "ahead.json")) as handle:
@@ -2437,6 +2459,26 @@ class TickAhead(Tick):
         write_ahead(merger, list(entries), when=T0 - datetime.timedelta(
             minutes=1))
         return merger
+
+    def test_a_prediction_longer_than_a_red_one_is_stopped(self):
+        # designs/0035, second amendment: it contains the red prefix.
+        merger = self.merger(entries=[entry(2, SHA_P, TREE_1),
+                                      entry(3, SHA_C, TREE_2)])
+        with open(os.path.join(merger, "ahead.json")) as handle:
+            said = json.load(handle)
+        said["stop"] = [SHA_C]
+        with open(os.path.join(merger, "ahead.json"), "w") as handle:
+            json.dump(said, handle)
+        self.hold(1, "#3 %s %s pid=4242 ahead" % (SHA_C, pc.iso(T0)))
+        self.hold(2, "#2 %s %s pid=4343 ahead" % (SHA_P, pc.iso(T0)))
+        stopped = []
+        run = FakeRun((is_pulls, done([], 0, heads_tsv())))
+        pc.tick(self.state_dir, "tok", run, lambda *a: None,
+                self.lines.append, when=T0, slots=2, merger_dir=merger,
+                stop=lambda pid: stopped.append(pid) or True)
+        self.assertEqual(stopped, [4242])
+        self.assertTrue(any("STOPPED-AHEAD #3 %s: a shorter prefix" %
+                            SHA_C[:10] in line for line in self.lines))
 
     def test_a_prediction_runs_while_the_mergers_head_is_not_waiting(self):
         self.write_state({"waiting": {SHA_B: {

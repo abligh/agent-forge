@@ -359,6 +359,28 @@ up to `batch`. When the batch before has merged, a fixed one is the
 batch at its own size, so its top's green covers it at once. Nothing
 follows a red first batch, or a later one whose top is red.
 
+**A red batch keeps its suspects** (designs/0035, second amendment).
+When a batch's top is red, its members become its suspects, kept in
+`suspects.json` with their heads and the red top's tree, and the batch
+isn't halved. While there are suspects they lead the queue in their
+order, and nothing is predicted in front of them or among them: a
+layer or a pull request newly ready goes behind them. A suspect that
+is pushed to, handed back, unapproved or closed leaves. Each tick the
+suspects' prefixes, nested predictions, are judged by the build
+check's verdicts on their trees: the longest green one is the batch
+and merges, and the shortest red one bounds the search. The prefixes
+between them are tested at evenly spaced cut points, one in the
+batch's slot and the rest as `later` batches, `batches` - 1 of them
+(at least one), so `forge-pr-check` runs them side by side; the whole
+set, already red, isn't run again. A prediction for a prefix longer
+than a red one is listed as `stop` in `ahead.json`, and the build
+check stops its run. A red prefix one longer than a green one names
+its last member: `SUSPECTS #a..#b: #n is red on its own; the search
+ends`, and it is checked and handed back as without batches. When no
+suspects are left and every one merged, the first red was flaky:
+`BATCH-FLAKE #a..#b: every suspect merged green; the red top's tree
+<tree> was a flake`.
+
 **With `merge.test_ahead.stacks`, a stack's ready layers join their
 base's batch** (designs/0035): each is predicted straight after the
 pull request it is stacked on, while it would be eligible but for its
@@ -616,6 +638,9 @@ AHEAD_BATCHES = 1
 AHEAD_STACKS = False
 # What the build check's status says of a head its batch covered.
 COVERED_TEXT = "covered by batch"
+# designs/0035, second amendment: a red batch's members, kept until the
+# red one among them is found.
+SUSPECTS_FILE = "suspects.json"
 BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
                      "waits for the new batch's top")
 # The most ticks one run makes: it ticks again straight after a merge.
@@ -3222,6 +3247,167 @@ def batch_holds(last, pr, tree, queue, check_state):
             and tree_verdict(check_state, entries[-1]["tree"]) is True)
 
 
+def load_suspects(state_dir):
+    """designs/0035, second amendment: the search in progress, from
+    SUSPECTS_FILE, as {suspects: [{pr, head}], tree, merged, left,
+    said?}, or None when there is none."""
+    saved = load_json(os.path.join(state_dir, SUSPECTS_FILE), None)
+    if not isinstance(saved, dict) or not isinstance(
+            saved.get("suspects"), list):
+        return None
+    saved["suspects"] = [e for e in saved["suspects"]
+                         if isinstance(e, dict) and isinstance(
+                             e.get("pr"), int) and isinstance(
+                             e.get("head"), str)]
+    for key in ("merged", "left"):
+        if not isinstance(saved.get(key), list):
+            saved[key] = []
+    return saved
+
+
+def suspect_place(saved, queue):
+    """{number: place} of the suspects in `queue` still at the head they
+    were suspected at, in their order: they go first, so nothing joins
+    in front of them or among them."""
+    heads = {pr["number"]: pr["headRefOid"] for pr in queue}
+    places = {}
+    for e in (saved or {}).get("suspects") or ():
+        if heads.get(e["pr"]) == e["head"] and e["pr"] not in places:
+            places[e["pr"]] = len(places)
+    return places
+
+
+def suspect_cuts(trees, verdict, slots):
+    """(green, red, cuts) for the suspects' prefixes, whose trees are
+    `trees` in order (designs/0035, second amendment, section 2):
+    `green` the longest prefix whose tree is green (0 for none), `red`
+    the shortest longer one whose tree is red, or None, and `cuts` the
+    prefix lengths to test now, evenly spaced between them. With
+    `slots` (merge.test_ahead.batches) there are that many cut points
+    and the last, the whole red set, isn't run; with one slot, one cut,
+    designs/0032's halving. When no prefix is known red the whole set
+    is one of the cuts."""
+    n = len(trees)
+    green = max([k for k in range(1, n + 1) if verdict(trees[k - 1])
+                 is True], default=0)
+    reds = [k for k in range(green + 1, n + 1)
+            if verdict(trees[k - 1]) is False]
+    red = reds[0] if reds else None
+    runs = max(1, slots - 1)
+    span = (red or n) - green
+    parts = runs + 1 if red else runs
+    cuts = sorted({green - (-span * k // parts) for k in range(1, parts + 1)})
+    return green, red, [c for c in cuts
+                        if green < c and (c < red if red else c <= n)]
+
+
+def suspect_batches(green, cuts):
+    """The batch's size and the `later` batches' sizes for a round of
+    the search: the green prefix merges as the batch while the cuts
+    after it run as later ones; with none green, the first cut is the
+    batch."""
+    ends = ([green] if green else []) + list(cuts)
+    sizes = [b - a for a, b in zip([0] + ends, ends)]
+    return (sizes[0], sizes[1:]) if sizes else (0, [])
+
+
+def suspects_line(entries, n, green, red, cuts):
+    """The SUSPECTS line for a round of the search."""
+    span = lambda a, b: "#%d..#%d" % (entries[a]["pr"], entries[b - 1]["pr"])
+    return "SUSPECTS %s: green to %s, red from %s; checking %s" % (
+        span(0, n), "#%d" % entries[green - 1]["pr"] if green else "none",
+        "#%d" % entries[red - 1]["pr"] if red else "none",
+        ", ".join(span(0, c) for c in cuts) or "nothing")
+
+
+def suspects_left(saved, queue, record, approvals, said):
+    """(saved, line): the search `saved` with the suspects that merged
+    this tick (`record`'s decisions) moved to `merged`, and those no
+    longer in `queue` at their head, or handed back, moved to `left`.
+    With none left, the search is over: `line` says BATCH-FLAKE when
+    every suspect merged, and the saved search is None."""
+    done = {d["pr"] for d in record["decisions"]
+            if d.get("action") == "MERGE" and d.get("result") == "done"}
+    heads = {pr["number"]: pr for pr in queue}
+    kept = []
+    for e in saved["suspects"]:
+        pr = heads.get(e["pr"])
+        if e["pr"] in done:
+            saved["merged"].append(e["pr"])
+        elif pr is None or pr["headRefOid"] != e["head"] or handed_back(
+                said, pr, approvals.get(e["pr"])):
+            saved["left"].append(e["pr"])
+        else:
+            kept.append(e)
+    saved["suspects"] = kept
+    if kept:
+        return saved, None
+    line = None
+    if saved["merged"] and not saved["left"] and not saved.get("named"):
+        every = saved["merged"]
+        line = ("BATCH-FLAKE #%d..#%d: every suspect merged green; the red "
+                "top's tree %s was a flake" % (every[0], every[-1],
+                                               saved.get("tree")))
+    return None, line
+
+
+def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
+                  record, out):
+    """One tick of the search (designs/0035, second amendment): the
+    batch and `later` batches written into `said_ahead` for the
+    suspects at the front of the predictions `entries`, the runs to
+    stop as `stop`, and the search saved. Whether it goes on: False
+    once a suspect is red on its own at the front, which is then
+    checked as without batches, or when no suspect is predicted."""
+    path = os.path.join(state_dir, SUSPECTS_FILE)
+    numbers = {e["pr"] for e in saved["suspects"]}
+    n = 0
+    while n < len(entries) and entries[n]["pr"] in numbers:
+        n += 1
+    trees = [e["tree"] for e in entries[:n]]
+    green, red, cuts = suspect_cuts(trees, verdict, AHEAD_BATCHES)
+    if not n or (red == 1 and not green):
+        if n:
+            out("SUSPECTS #%d..#%d: #%d is red on its own; the search ends"
+                % (entries[0]["pr"], entries[n - 1]["pr"], entries[0]["pr"]))
+        if os.path.exists(path):
+            os.remove(path)
+        return False
+    size, later = suspect_batches(green, cuts)
+    said_ahead["batch"] = {"size": size, "trees": trees[:size],
+                           "suspects": True}
+    record["batch"] = [e["pr"] for e in entries[:size]]
+    at, said_ahead["later"], record["later"] = size, [], []
+    for k in later[:max(1, AHEAD_BATCHES - 1)]:
+        said_ahead["later"].append({"size": k, "trees": trees[at:at + k]})
+        record["later"].append([e["pr"] for e in entries[at:at + k]])
+        at += k
+    if not said_ahead["later"]:
+        del said_ahead["later"], record["later"]
+    if red:
+        # The suspects are those up to the shortest red prefix; longer
+        # prefixes contain it, so their runs are stopped, and the
+        # members past it go behind, in the next batch.
+        saved["stop_trees"] = sorted(set(saved.get("stop_trees") or ())
+                                     | set(trees[red:n]))
+        saved["suspects"] = [{"pr": e["pr"], "head": e["head"]}
+                             for e in entries[:red]]
+        if red == green + 1:
+            saved["named"] = entries[red - 1]["pr"]
+    longer = set(saved.get("stop_trees") or ())
+    stop = {e.get("sha") for e in list(entries) + list(
+        (last or {}).get("entries") or ())
+        if isinstance(e, dict) and e.get("tree") in longer}
+    if stop - {None}:
+        said_ahead["stop"] = sorted(stop - {None})
+    line = suspects_line(entries, n, green, red, cuts)
+    if line != saved.get("said"):
+        out(line)
+        saved["said"] = line
+    save_json(path, saved)
+    return True
+
+
 def merged_one(record):
     """Whether the tick that wrote `record` merged a pull request."""
     return any(d.get("action") == "MERGE" and d.get("result") == "done"
@@ -3603,6 +3789,15 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             0 if pr["number"] in first and pr["number"] not in late
             else 1 if pr["number"] in places
             else 2 if pr["number"] in late else 3))
+    saved = load_suspects(state_dir) \
+        if TEST_AHEAD and AHEAD_BATCH > 1 else None
+    if saved:
+        # A red batch's suspects lead while the search goes on: nothing
+        # joins in front of them or among them (designs/0035, second
+        # amendment).
+        places = suspect_place(saved, queue)
+        queue.sort(key=lambda pr: (pr["number"] != in_flight, places.get(
+            pr["number"], len(places))))
     held_by = (conflicts_ahead(repo, queue, run, main_tip)
                if HOLD_CONFLICTING else {})
     for number, ahead in held_by.items():
@@ -3869,7 +4064,21 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             ahead_queue = acting + rest if acting else []
             last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
             owed = None
-            if AHEAD_STACKS and ahead_queue:
+            if saved:
+                saved, ended = suspects_left(saved, ahead_queue, record,
+                                             approvals, said)
+                if ended:
+                    out(ended)
+                if saved is None and os.path.exists(os.path.join(
+                        state_dir, SUSPECTS_FILE)):
+                    os.remove(os.path.join(state_dir, SUSPECTS_FILE))
+            searching = bool(saved and saved["suspects"])
+            if searching:
+                # Layers and pull requests owed a place wait behind the
+                # suspects, in the next batch.
+                owed = [n for n in (last or {}).get("owed") or ()
+                        if n in {pr["number"] for pr in ahead_queue}]
+            elif AHEAD_STACKS and ahead_queue:
                 ahead_queue, owed = with_layers(
                     ahead_queue, lambda pr: ready_layers(
                         repo, pr, prs, open_numbers, when, said, run,
@@ -3880,8 +4089,27 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                           "repo": repo, "entries": entries}
             if owed:
                 said_ahead["owed"] = record["owed"] = owed
-            if AHEAD_BATCH > 1 and entries:
-                verdict = lambda tree: tree_verdict(check_state, tree)
+            verdict = lambda tree: tree_verdict(check_state, tree)
+            if AHEAD_BATCH > 1 and entries and not searching:
+                size, red = batch_size(entries, (last or {}).get("batch"),
+                                       verdict, (last or {}).get("later")
+                                       or ())
+                if red:
+                    # A red top: its members are the suspects, and the
+                    # search for the red one starts this tick.
+                    saved = {"suspects": [{"pr": e["pr"], "head": e["head"]}
+                                          for e in entries[:red]],
+                             "tree": entries[red - 1]["tree"],
+                             "at": record["at"], "merged": [], "left": []}
+                    out("BATCH #%d..#%d: top red; its %d members are the "
+                        "suspects" % (entries[0]["pr"], entries[red - 1]["pr"],
+                                      red))
+                    searching = True
+            if searching and entries:
+                searching = suspect_round(
+                    state_dir, saved, entries, verdict, last, said_ahead,
+                    record, out)
+            if AHEAD_BATCH > 1 and entries and not searching:
                 size, red = batch_size(entries, (last or {}).get("batch"),
                                        verdict, (last or {}).get("later")
                                        or ())

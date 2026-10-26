@@ -1954,7 +1954,8 @@ def merger_batch(merger_dir, when, repo=None):
     """designs/0032: the Merger's batch, the predictions one run covers,
     its top last, or [] when there is none of two or more, or ahead.json
     can't be read as merger_ahead reads it, or its `batch` doesn't name
-    the trees of its first entries."""
+    the trees of its first entries. A batch of a red batch's suspects
+    (designs/0035, second amendment) may be one."""
     entries = merger_ahead(merger_dir, when, repo)
     if not entries:
         return []
@@ -1962,9 +1963,10 @@ def merger_batch(merger_dir, when, repo=None):
         with open(os.path.join(merger_dir, "ahead.json")) as handle:
             batch = json.load(handle)["batch"]
         size, trees = batch["size"], batch["trees"]
-    except (OSError, ValueError, KeyError, TypeError):
+        least = 1 if batch.get("suspects") is True else 2
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return []
-    if not isinstance(size, int) or isinstance(size, bool) or size < 2 \
+    if not isinstance(size, int) or isinstance(size, bool) or size < least \
             or [e["tree"] for e in entries[:size]] != trees:
         return []
     return entries[:size]
@@ -1994,6 +1996,21 @@ def merger_later(merger_dir, when, repo=None):
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return []
     return tops
+
+
+def merger_stop(merger_dir, when, repo=None):
+    """designs/0035, second amendment: the predictions whose runs the
+    Merger says to stop (ahead.json's `stop`), prefixes of a red batch's
+    suspects longer than one already red, or an empty set when ahead.json
+    can't be read as merger_ahead reads it."""
+    if not merger_ahead(merger_dir, when, repo):
+        return set()
+    try:
+        with open(os.path.join(merger_dir, "ahead.json")) as handle:
+            stop = json.load(handle).get("stop") or []
+        return {sha for sha in stop if isinstance(sha, str) and len(sha) == 40}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return set()
 
 
 def is_front(merger_dir, when, sha, pr, ahead=False, repo=None):
@@ -2949,6 +2966,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         for pr, sha in unrun:
             post(sha, "success", OUT_OF_SCOPE_TEXT)
     current = {head[1] for head in heads}
+    halt = merger_stop(merger_dir, when, checkout) \
+        if TEST_AHEAD and merger_dir else set()
     for slot, holder in holders.items():
         if holder is None:
             continue
@@ -2960,6 +2979,14 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 "open pull request; %s the run in %s (pid %d), since %s"
                 % (pr, sha[:10], "stopping" if sent else "could not stop",
                    slot_label(slot), pid, since), when, out)
+        elif got and got[4] and got[1] in halt and got[3]:
+            pr, sha, since, pid, _ = got
+            sent = stop(pid)
+            log(state_dir, "STOPPED-AHEAD #%d %s: a shorter prefix of a red "
+                "batch's suspects is red; %s the run in %s (pid %d), since "
+                "%s" % (pr, sha[:10], "stopping" if sent else
+                        "could not stop", slot_label(slot), pid, since),
+                when, out)
         elif got:
             out("RUNNING #%d %s since %s%s; %d waiting"
                 % (got[0], got[1][:10], got[2],
