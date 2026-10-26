@@ -3920,8 +3920,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             first = []
         # A layer that comes back while a batch it isn't in runs goes
         # first in the next batch, not into that one, which would spend
-        # its run.
-        late = (set(first) - predicted(state_dir)
+        # its run. Predicted past the batch is not in it: on 2026-10-26
+        # a layer predicted 16th went in front of a green batch's six
+        # members left to merge.
+        late = (set(first) - batch_members(state_dir, queue)
                 if TEST_AHEAD and (in_flight is not None or green_batch(
                     state_dir, queue, check_state)) else set())
         places = locked_order(state_dir, queue) if late else {}

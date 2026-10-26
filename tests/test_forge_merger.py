@@ -4584,6 +4584,31 @@ class Stacks(RepoCase):
         # A red top is no batch to wait for.
         self.assertEqual(queue(False)[0], 6)
 
+    def test_a_layer_predicted_past_a_green_batch_still_waits(self):
+        # Seen on 2026-10-26: a layer predicted 16th, behind both
+        # batches, counted as predicted and went in front of a green
+        # batch's six members left to merge.
+        m.configure(project(stacks={}, test_ahead={"batch": 2}))
+        self.merge_bottom()
+        older = self.other(4)
+        self.repo.branch("other", "origin/main")
+        sha = self.repo.commit("p.txt", "oldest\n", "oldest")
+        self.repo.publish_pr(3, sha)
+        self.repo.branch("feature", "feature")
+        oldest = pr(3, "2026-10-07T08:00:00Z", head=sha,
+                    reviews=[review(REVIEWER, oid=sha)])
+        layer = self.layer("main")
+        m.save_json(os.path.join(self.state, m.AHEAD_FILE), {
+            "at": "2026-10-07T12:01:00Z", "entries": [
+                {"pr": 4, "head": older["headRefOid"], "tree": "t4"},
+                {"pr": 3, "head": sha, "tree": "t3"},
+                {"pr": 6, "head": layer["headRefOid"], "tree": "t6"}],
+            "batch": {"size": 2, "trees": ["t4", "t3"]}})
+        record, _ = self.tick(
+            [oldest, older, layer], live=False, minutes=2,
+            check_state={"results": {"x" * 40: {"tree": "t3", "ok": True}}})
+        self.assertEqual(record["queue"], [4, 3, 6])
+
     def test_max_run_lets_the_queue_have_a_turn(self):
         m.configure(project(stacks={"max_run": 1}))
         self.merge_bottom()
