@@ -570,6 +570,17 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"yield_ignores_conflicts": 1}),
                          ["merge.yield_ignores_conflicts must be true or false"])
 
+    def test_merge_age_first(self):
+        self.assertEqual(self.problems(merge={
+            "age_first": {"after_minutes": 90}}), [])
+        self.assertEqual(self.problems(merge={"age_first": {}}), [])
+        self.assertEqual(self.problems(merge={"age_first": {
+            "after_minutes": 0, "width": 1}}), [
+            "merge.age_first: unknown key 'width'",
+            "merge.age_first.after_minutes must be at least 1"])
+        self.assertEqual(self.problems(merge={"age_first": 90}),
+                         ["merge.age_first must be an object"])
+
     def test_merge_hold_conflicting(self):
         self.assertEqual(self.problems(merge={"hold_conflicting": True}), [])
         self.assertEqual(self.problems(merge={"hold_conflicting": "yes"}),

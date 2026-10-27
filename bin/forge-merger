@@ -468,6 +468,17 @@ only the one a `test_ahead` run is in flight for, and never yields.
 The record's `right_of_way` says who has it, `{pr, head, since}`, or
 null. Of several that earned it, the first in the order above has it.
 
+**With `merge.age_first`, a pull request that has waited long goes
+first** (default off; designs/0037). A tick remembers when it first
+saw each pull request as a candidate (`waiting-since.json` in the state
+directory), through hand-backs and new heads, until it merges, closes,
+or has been no candidate for 24 hours. One that has waited
+`after_minutes` is overdue (the record's `overdue`, minutes waited):
+it goes ahead of every candidate but the one in flight, urgent ones
+and the members of a batch being merged, the longest waiting first;
+predictions are never made past it while it conflicts with one ahead;
+a newer one's right of way doesn't hold it; and it never yields.
+
 **With `test_ahead`, the pull request a run is in flight for keeps its
 place.** When the last tick updated or waited on a pull request that
 is still a candidate, it stays first, and no blocker (a pull request
@@ -742,6 +753,12 @@ ROW_AFTER = 2
 ROW_FOR = datetime.timedelta(minutes=60)
 ROW_REASON = "conflicts with #%d, which has right of way"
 ROW_FILE = "right-of-way.json"
+# merge.age_first (designs/0037): a candidate that has waited AGE_FIRST
+# since a tick first saw it as one is overdue, and goes first. AGE_FILE
+# remembers when; an entry no candidate for AGE_FORGET is dropped.
+AGE_FIRST = None
+AGE_FILE = "waiting-since.json"
+AGE_FORGET = datetime.timedelta(hours=24)
 # Design 0026: settings for a project with stricter holds, each off
 # unless set.
 # merge.resolve: [{paths, command, check}], conflicts in generated
@@ -804,6 +821,7 @@ def configure(project):
     global STACKS, STACK_MAX_RUN, STACK_WAIT, RESOLVE, HOLD_LABELS, BLOCKED_BY
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
+    global AGE_FIRST
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -847,6 +865,9 @@ def configure(project):
     RIGHT_OF_WAY = row is not None
     ROW_AFTER = (row or {}).get("after_conflicts", 2)
     ROW_FOR = datetime.timedelta(minutes=(row or {}).get("minutes", 60))
+    age = merge.get("age_first")
+    AGE_FIRST = (None if age is None else datetime.timedelta(
+        minutes=age.get("after_minutes", 90)))
     stacks = merge.get("stacks")
     STACKS = stacks is not None
     STACK_MAX_RUN = (stacks or {}).get("max_run", 0)
@@ -2875,6 +2896,50 @@ def conflicts_ahead(repo, queue, run=sh, main_ref=None):
     return held
 
 
+def waiting_since(path, candidates, prs, when, save=True):
+    """{pr: when a tick first saw it as a candidate} for `candidates`,
+    remembered in `path` ({pr: {since, seen}}, written when `save`). An
+    entry outlives a hand-back and a new head: a conflict is mostly what
+    merged after the approval (designs/0037). It is dropped once its pull
+    request isn't open, or hasn't been a candidate for AGE_FORGET."""
+    open_numbers = {str(pr["number"]) for pr in prs}
+    kept = {}
+    for key, entry in load_json(path, {}).items():
+        try:
+            seen = parse_time(entry["seen"])
+            parse_time(entry["since"])
+        except (ValueError, TypeError, KeyError):
+            continue
+        if key in open_numbers and when - seen < AGE_FORGET:
+            kept[key] = entry
+    for pr in candidates:
+        entry = kept.setdefault(str(pr["number"]), {"since": iso(when)})
+        entry["seen"] = iso(when)
+    if save:
+        save_json(path, kept)
+    return {pr["number"]: parse_time(kept[str(pr["number"])]["since"])
+            for pr in candidates}
+
+
+def overdue_first(queue, since, when, keep=None, members=()):
+    """(`queue` with its overdue candidates first, {pr: minutes waited}
+    for those): each that has waited AGE_FIRST since `since` says, the
+    longest waiting first. Only `keep`, the one in flight, the members
+    of a batch being merged and urgent ones stay ahead of them; the rest
+    keep their order."""
+    waited = {pr["number"]: when - since[pr["number"]] for pr in queue
+              if pr["number"] in since}
+    late = {n: w for n, w in waited.items() if w >= AGE_FIRST}
+    if not late:
+        return queue, {}
+    zero = datetime.timedelta(0)
+    queue = sorted(queue, key=lambda pr: (
+        pr["number"] != keep, pr["number"] not in members,
+        not urgent(pr), pr["number"] not in late,
+        -late.get(pr["number"], zero)))
+    return queue, {n: int(w.total_seconds() // 60) for n, w in late.items()}
+
+
 def right_of_way(repo, prs, records, path, when, main_ref, run=sh,
                  save=True):
     """{pr, head, since} for the pull request that has right of way, or
@@ -3137,7 +3202,8 @@ def tell_spoken(state_dir, github, prs, spoken, live):
     return told
 
 
-def predict_ahead(repo, main_tip, queue, run=sh, depth=None):
+def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
+                  overdue=()):
     """The commits the first `depth` + 1 pull requests in `queue`
     (default AHEAD_DEPTH) will have once those ahead of each have
     merged, as [{pr, head, sha, tree}], each also written as
@@ -3149,12 +3215,13 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None):
     S(k-1) as its parent, which is what GitHub's update makes once the
     one before has merged. One that conflicts with what is ahead of it
     is left out and the list goes on past it (the next tick puts it
-    behind the predicted ones: see `locked_order`); anything else git
-    can't do ends the list. An entry whose tree is
-    its head's own says `same_as_head`, since the head's own check
-    tests it. The commits carry a fixed identity and date and no
-    signature, so the same prediction is the same commit on every
-    tick."""
+    behind the predicted ones: see `locked_order`), unless it is in
+    `overdue` (designs/0037), when the list ends there, so that nothing
+    is predicted past it; anything else git can't do ends the list. An
+    entry whose tree is its head's own says `same_as_head`, since the
+    head's own check tests it. The commits carry a fixed identity and
+    date and no signature, so the same prediction is the same commit on
+    every tick."""
     depth = AHEAD_DEPTH if depth is None else depth
     name, email = AHEAD_IDENTITY
     env = dict(os.environ, GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
@@ -3168,7 +3235,8 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None):
         have_head(repo, pr, run)
         merged = git(repo, "merge-tree", "--write-tree", "--no-messages",
                      parent, head, run=run)
-        if merged.returncode == 1 and entries:
+        if merged.returncode == 1 and entries \
+                and pr["number"] not in overdue:
             # It conflicts with one predicted ahead of it: skip it, so
             # that those behind it are still tested ahead.
             continue
@@ -3972,6 +4040,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # already having, and every prediction behind it.
         queue.sort(key=lambda pr: pr["number"] != in_flight)
     os.makedirs(state_dir, exist_ok=True)
+    since, overdue = {}, {}
+    if AGE_FIRST is not None:
+        since = waiting_since(os.path.join(
+            state_dir, AGE_FILE if live else "dry-run-" + AGE_FILE),
+            candidates, prs, when)
     row_held = {}
     if RIGHT_OF_WAY:
         row = right_of_way(repo, prs, records, os.path.join(
@@ -3981,6 +4054,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # Nothing that conflicts with it merges first; it goes first
         # once it is a candidate, after only the one in flight.
         others = [pr for pr in queue if pr["number"] != row["pr"]]
+        if since:
+            # One that has waited longer and is overdue isn't held for
+            # it (designs/0037): it goes first, and the holder waits.
+            mine = since.get(row["pr"], when)
+            others = [pr for pr in others if not (
+                pr["number"] in since and since[pr["number"]] < mine
+                and when - since[pr["number"]] >= AGE_FIRST)]
         for number in conflicts_with(repo, row["head"], others, run):
             row_held[number] = row["pr"]
             held[str(number)] = ROW_REASON % row["pr"]
@@ -4028,6 +4108,17 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             else 2 if pr["number"] in first and pr["number"] not in late
             else 3 if pr["number"] in places
             else 4 if pr["number"] in late else 5))
+    if since:
+        # Overdue ones go first (designs/0037), behind only the one in
+        # flight, urgent ones and a batch being merged, whose runs are
+        # spent either way.
+        merging = TEST_AHEAD and (in_flight is not None or green_batch(
+            state_dir, queue, check_state))
+        queue, overdue = overdue_first(
+            queue, since, when, in_flight,
+            batch_members(state_dir, queue) if merging else set())
+        for number in overdue:
+            yielded.pop(number, None)
     if MAIN_RED_FIXES & {pr["number"] for pr in queue}:
         # A red default branch's fix goes first, behind only the one in
         # flight and a green batch still merging, whose run is spent
@@ -4057,6 +4148,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         record["yielded"] = {str(n): p for n, p in sorted(yielded.items())}
     if RIGHT_OF_WAY:
         record["right_of_way"] = row
+    if AGE_FIRST is not None:
+        record["overdue"] = {str(n): w for n, w in sorted(overdue.items())}
     if stack:
         record["stack"] = [dict({"pr": e["pr"], "after": e["after"]},
                                 **({"waiting": True} if e.get("since")
@@ -4375,7 +4468,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     ahead_queue, lambda pr: ready_layers(
                         repo, pr, prs, open_numbers, when, said, run,
                         regenerated, rules), last, AHEAD_BATCH)
-            entries = predict_ahead(repo, main_tip, ahead_queue, run)
+            entries = predict_ahead(repo, main_tip, ahead_queue, run,
+                                    overdue=overdue)
             record["ahead"] = [e["pr"] for e in entries]
             said_ahead = {"at": record["at"], "base": main_tip,
                           "repo": repo, "entries": entries}

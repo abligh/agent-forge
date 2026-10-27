@@ -104,11 +104,12 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "early_conflicts": bool, "stacks": dict, "resolve": list,
          "hold_labels": list, "blocked_by": str, "said_since": dict,
          "update_once": bool, "ci_never_started": int,
-         "queued_stall_minutes": int, "read_as": str}
+         "queued_stall_minutes": int, "read_as": str, "age_first": dict}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
 SAID_SINCE = {"author": bool, "approvals": bool, "quiet": list}
 BLOCKED_BY = ("body", "everywhere")
 RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int}
+AGE_FIRST = {"after_minutes": int}
 STACKS = {"max_run": int, "wait_hours": int}
 TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "batch": int, "stacks": bool, "batches": int}
@@ -547,6 +548,12 @@ def check(data):
                 if _is(row.get(key), int) and row[key] < 1:
                     problems.append("merge.right_of_way.%s must be at least 1"
                                     % key)
+        if isinstance(merge.get("age_first"), dict):
+            age = merge["age_first"]
+            _fields("merge.age_first", age, AGE_FIRST, problems)
+            if _is(age.get("after_minutes"), int) and age["after_minutes"] < 1:
+                problems.append("merge.age_first.after_minutes must be at "
+                                "least 1")
         if isinstance(merge.get("stacks"), dict):
             stacks = merge["stacks"]
             _fields("merge.stacks", stacks, STACKS, problems)
