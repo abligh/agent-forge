@@ -3184,10 +3184,12 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                         or (pick[1] == 0 and (urgent or held or main_due(
                             state["waiting"][pick[0]], when))))):
                     # A later batch's top only in a slot no head
-                    # wants (designs/0035 part 2).
+                    # wants (designs/0035 part 2). A held head's tree
+                    # isn't being checked: it waits for the prediction,
+                    # so counting it would leave both waiting.
                     predicted = next_ahead(
                         state, ahead, taken, when,
-                        busy_trees(taken, checkout, run), batch,
+                        busy_trees(taken - set(twins), checkout, run), batch,
                         merger_later(merger_dir, when, checkout)
                         if pick is None else ())
             if predicted is not None:
