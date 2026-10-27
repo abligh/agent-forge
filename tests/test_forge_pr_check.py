@@ -3125,8 +3125,10 @@ class RedMainFixes(unittest.TestCase):
     red-default-branch issue go first."""
 
     def lines(self, *prs):
-        return "".join("%d\t%s\n" % (n, json.dumps(text))
-                       for n, text in prs)
+        # As jq's @tsv writes them: a backslash doubled, so tojson's
+        # "\n" arrives as "\\n".
+        return "".join("%d\t%s\n" % (n, json.dumps(text).replace(
+            "\\", "\\\\")) for n, text in prs)
 
     def test_a_pull_request_closing_the_issue_is_a_fix(self):
         out = self.lines(
@@ -3138,6 +3140,15 @@ class RedMainFixes(unittest.TestCase):
         got = pc.red_fixes("t", 9, run=lambda args, **kw: done(args,
                                                                 out=out))
         self.assertEqual(got, [4, 7])
+
+    def test_a_body_that_opens_with_the_keyword_is_a_fix(self):
+        # The title and body are joined by a newline, which @tsv
+        # escapes: read raw, it glued an "n" to "Fixes".
+        out = self.lines((4, "web: a fix (issue 9)\nFixes #9: main is red."),
+                         (5, "Tab\tin the title\nCloses #9."))
+        got = pc.red_fixes("t", 9, run=lambda args, **kw: done(args,
+                                                                out=out))
+        self.assertEqual(got, [4, 5])
 
     def test_an_unreadable_list_is_none(self):
         self.assertIsNone(pc.red_fixes(
