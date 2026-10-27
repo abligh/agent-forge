@@ -2810,6 +2810,30 @@ class SettledHeads(StateCase):
         self.assertTrue(any("HELD #7" in line and "batch #7..#8" in line
                             for line in self.lines))
 
+    def test_a_batch_of_the_heads_own_tree_runs_its_top(self):
+        # Seen on 2026-10-27: a red batch's one suspect was #4885's own
+        # tree. The head waited for the top, and the top was passed over
+        # because the waiting head's tree counted as one being checked,
+        # so neither ran and the queue stalled.
+        self.write_state({"waiting": {SHA_A: {"pr": 7, "since": pc.iso(
+            T0 - datetime.timedelta(minutes=5))}}})
+        merger = self.merger_says(7)
+        write_ahead(merger, [entry(7, SHA_P, TREE_1, same_as_head=True)],
+                    when=T0 - datetime.timedelta(minutes=1), batch=1)
+        with open(os.path.join(merger, "ahead.json")) as handle:
+            said = json.load(handle)
+        said["batch"]["suspects"] = True
+        with open(os.path.join(merger, "ahead.json"), "w") as handle:
+            json.dump(said, handle)
+        self.spawned = []
+        pc.tick(self.state_dir, "tok", self.run_with(), lambda *a:
+                self.spawned.append(a), self.lines.append, when=T0,
+                post=lambda *a: True, slots=2, checkout="/repo",
+                merger_dir=merger)
+        self.assertEqual([a[1] for a in self.spawned], [SHA_P])
+        self.assertTrue(any("HELD #7" in line and "batch #7..#7" in line
+                            for line in self.lines))
+
     def test_a_red_top_leaves_the_member_to_its_own_run(self):
         self.batched({SHA_Q: verdict(pr=8, tree=TREE_3, ok=False,
                                      ahead=True)})
