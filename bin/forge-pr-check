@@ -1331,6 +1331,17 @@ def closing_keywords():
     return module
 
 
+def untsv(field):
+    """A field of jq's `@tsv` as it was: `@tsv` writes a backslash as
+    two, and a tab, newline or carriage return as `\\t`, `\\n` or `\\r`.
+    A `tojson` string read without this keeps its escapes doubled, so
+    the newline between a title and a body comes back as a backslash
+    and an "n" glued to the body's first word."""
+    return re.sub(r"\\([\\tnr])",
+                  lambda m: {"t": "\t", "n": "\n", "r": "\r"}.get(
+                      m.group(1), m.group(1)), field)
+
+
 def red_fixes(token, number, run=sh, keywords=None):
     """The open pull requests whose title or body (outside code) closes
     issue `number` by a closing keyword, as a sorted list, or None if
@@ -1348,7 +1359,7 @@ def red_fixes(token, number, run=sh, keywords=None):
     for line in got.stdout.splitlines():
         pr, _, text = line.partition("\t")
         try:
-            text = json.loads(text)
+            text = json.loads(untsv(text))
         except ValueError:
             continue
         if not pr.isdigit() or not isinstance(text, str):

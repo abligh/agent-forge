@@ -62,7 +62,11 @@ arrive from another branch, and then only a declaration in the body
 says the close is meant.
 
 A keyword naming a pull request rather than an issue closes nothing,
-so it is never flagged; one that cannot be looked up is exit 2, since
+so it is never flagged, and neither is one naming an issue that is
+already closed: a commit another pull request brought in and merged
+by squash keeps its keyword in this branch's history, but the issue
+closed when that one merged, and closing it again does nothing. One
+that cannot be looked up is exit 2, since
 treating it as either would be wrong in one direction or the other.
 When the body declares an issue that `closingIssuesReferences` does not
 list yet, the refusal says to wait and run again: that field lags a
@@ -527,14 +531,15 @@ def will_close(facts, messages):
 
 
 def is_issue(number, github, repo=None):
-    """True if `number` is an issue, False if a pull request (which a
-    keyword cannot close), None if the lookup failed: "could not tell"
-    is not "is an issue"."""
+    """True if `number` is an open issue, False if a pull request (which
+    a keyword cannot close) or an issue already closed (which the merge
+    closes no further), None if the lookup failed: "could not tell" is
+    not "is an issue"."""
     status, body = github.get("/repos/%s/issues/%d"
                               % (repo or REPO_NAME, number))
     if status != 200 or not isinstance(body, dict) or "number" not in body:
         return None
-    return "pull_request" not in body
+    return "pull_request" not in body and body.get("state") != "closed"
 
 
 def survey(rng=None, pr=None, cwd=None, run=proc.sh, github=None,

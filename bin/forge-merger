@@ -307,7 +307,10 @@ A pull request that conflicts with those predicted ahead of it is
 left out, and the list goes on past it, so one conflict doesn't stop
 the rest being tested ahead; a Q0 that conflicts with `main` ends it.
 Pull requests already handed back under their current approval and
-head are left out. The commits never leave this host: they are local
+head are left out; one a `merge.gate` tool refused rejoins once its
+title or body changes, since a gate may read them and the author's fix
+for, say, an undeclared closing keyword is an edit of the body. The
+commits never leave this host: they are local
 commits under `refs/agent-forge-merger/ahead/<k>` in this checkout,
 with a fixed author, committer and date and no signature, so the same
 inputs give the same SHA and a prediction is never tested twice. Their
@@ -888,7 +891,7 @@ query($owner:String!, $name:String!, $cursor:String) {
     pullRequests(states:OPEN, first:50, after:$cursor) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        number createdAt isDraft baseRefName headRefName headRefOid body
+        number title createdAt isDraft baseRefName headRefName headRefOid body
         author { login }
         labels(first:50) { nodes { name } }
         reviews(last:100) {
@@ -2057,14 +2060,17 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
         if unfinished:
             notes["ci_unfinished"] = unfinished
         return dict({"action": "WAIT", "reason": problem}, **notes)
+    if problem:
+        return dict(back("author", problem), **notes)
     for argv in GATE:
-        if problem:
-            break
         problem = tool_problem(gate_args(argv, repo, number, main_tip, head,
                                          restack[0] if restack else None),
                                env, repo, run)
-    if problem:
-        return dict(back("author", problem), **notes)
+        if problem:
+            # A gate tool may read the description, so the hand-back is
+            # for this one: a new description is a new question.
+            return dict(back("author", problem), text=description(pr),
+                        **notes)
     if AHEAD_BATCH > 1 and COVERED_TEXT in said:
         notes["covered"] = True
     return dict({"action": "MERGE"}, **notes)
@@ -2164,11 +2170,32 @@ def hand_back_text(decision, approver):
                paths_text(decision.get("paths")), SIGNATURE))
 
 
-def hand_back_key(approval, head, reason):
+def hand_back_key(approval, head, reason, text=None):
     """What `handed-back.json` keeps per pull request: the hand-back
-    already said for this approval, head and reason."""
-    return {"approved": approval.get("submittedAt"), "head": head,
-            "reason": reason}
+    already said for this approval, head and reason, and for a
+    `merge.gate` tool's refusal, the description (`description`) it
+    was judged on."""
+    key = {"approved": approval.get("submittedAt"), "head": head,
+           "reason": reason}
+    if text is not None:
+        key["text"] = text
+    return key
+
+
+def description(pr):
+    """A short hash of `pr`'s title and body: what a `merge.gate` tool
+    that reads the description was given."""
+    text = "%s\n%s" % (pr.get("title") or "", pr.get("body") or "")
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def description_moved(before, pr):
+    """Whether `before`, a hand-back from `handed-back.json`, was for a
+    gate's refusal of another description than `pr` has now: the
+    author's fix for a closing keyword is a new description, at the
+    same head and approval. A record without one keeps the head and
+    approval as its only key."""
+    return bool(before.get("text")) and before["text"] != description(pr)
 
 
 def carry_out(decision, approval, github, said):
@@ -2211,7 +2238,8 @@ def carry_out(decision, approval, github, said):
     elif decision["action"] == "RETARGET":
         ok, why = github.write("PATCH", path, base=MAIN)
     elif decision["action"] == "HAND-BACK":
-        key = hand_back_key(approval, head, decision["reason"])
+        key = hand_back_key(approval, head, decision["reason"],
+                            decision.get("text"))
         if said.get(str(number)) == key:
             return "already said"
         ok, why = github.write(
@@ -2703,9 +2731,7 @@ def checked_ahead(state_dir, repo, pr, approval, main_tip, env, run=sh,
     approver = APPROVERS.get(login(approval), "a reviewer")
     if not approved:
         return approver, "the approval names no commit"
-    text = "%s\n%s" % (pr.get("title") or "", pr.get("body") or "")
-    key = "%s %s %s" % (pr["headRefOid"], approved,
-                        hashlib.sha256(text.encode()).hexdigest()[:16])
+    key = "%s %s %s" % (pr["headRefOid"], approved, description(pr))
     path = os.path.join(state_dir, CHECKED_FILE)
     checked = load_json(path, {})
     entry = checked.get(str(pr["number"]))
@@ -2732,12 +2758,14 @@ def checked_ahead(state_dir, repo, pr, approval, main_tip, env, run=sh,
 
 def handed_back(said, pr, approval):
     """Whether `pr` was handed back under the approval it has now, at the
-    head it has now: it would only be handed back again, so it is not
+    head it has now, and for a gate's refusal, with the description it
+    has now: it would only be handed back again, so it is not
     predicted."""
     before = said.get(str(pr["number"])) or {}
     return bool(before.get("approved")) and \
         before["approved"] == approval.get("submittedAt") and \
-        before.get("head") == pr["headRefOid"]
+        before.get("head") == pr["headRefOid"] and \
+        not description_moved(before, pr)
 
 
 def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
@@ -4126,7 +4154,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 and decision["action"] in ("UPDATE", "RESOLVE", "RESTACK",
                                            "STACK-UPDATE")
                 and before.get("approved")
-                and before["approved"] == approval.get("submittedAt")):
+                and before["approved"] == approval.get("submittedAt")
+                and not description_moved(before, pr)):
             # Handed back under this approval: not updated again. An
             # update spends a build on a head that comes back for the
             # same reason. Only the update is withheld: a head already
@@ -4308,6 +4337,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 decision = {"action": "HAND-BACK", "to": failed[0],
                             "reason": failed[1], "pr": pr["number"],
                             "head": pr["headRefOid"], "ahead": True}
+                if failed[0] == "author":
+                    # A gate's refusal (an approval that doesn't cover
+                    # the head goes to its reviewer).
+                    decision["text"] = description(pr)
                 if live:
                     decision["result"] = carry_out(
                         decision, approvals[pr["number"]], github, said)
