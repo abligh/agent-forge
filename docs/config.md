@@ -247,6 +247,12 @@ records write sets:
   does; with `chain_writes_only`, a step whose record has no write set
   counts too. If any do, it runs traced instead (`MAIN-TRACE` in
   `verdicts.log`), at most once every `depends_minutes` in each slot.
+* **`match_main_unrecorded`** (with `trace_matched_main`): without it,
+  a default-branch head is matched only once its tree has a record,
+  and a prediction writes none, so every merge is run in full. With
+  it, the head is matched though its tree has no record, and
+  `trace_matched_main` decides whether it runs traced instead, at most
+  once every `depends_minutes` on the whole host (designs/0036).
 * **`chain_writes_only`**: a path the tree doesn't have chains only the
   digests of the earlier steps that wrote it: it is in a step's write
   set or its `outputs`, beneath one of them, or a directory with one
@@ -818,6 +824,7 @@ default, forgets at once. docs/router.md has the detail.
 | `reuse` | none | `{"max_age_days": 7}`: don't run a step on inputs a green run here already passed (designs/0009; see below). Refused without `depends`. |
 | `reuse.max_age_days` | `7` | How long a step's green verdict stands for the same inputs, counted from the run that ran it. At least 1. |
 | `reuse.trace_matched_main` | `false` | Run a default-branch head that would be matched traced instead, when a step's record at its tree is missing or stale, at most once every `depends_minutes` in each slot (designs/0018; see above). Refused unless `main` is `every`. |
+| `reuse.match_main_unrecorded` | `false` | Match a default-branch head to a green run of its tree though the tree has no record, and let `trace_matched_main` trace it instead at most once every `depends_minutes` on the host, not in each slot (designs/0036; see above). Refused unless `trace_matched_main` is on. |
 | `reuse.chain_writes_only` | `false` | A path a step read that the tree lacks chains only the earlier steps that wrote it (their write sets and `outputs`), not every earlier step (designs/0018). |
 | `reuse.dirs_by_names` | `false` | A directory read with a file read beneath it is digested by its entry names, not its tree (designs/0018). |
 | `fresh` | none | `{"wait_minutes": 15}`: every green run writes a dependency record, each step is chosen from its own freshest record, and a head that runs a step only because its record is stale waits for a fresh one (designs/0010; see below). Refused without `depends`. |

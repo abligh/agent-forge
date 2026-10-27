@@ -180,7 +180,8 @@ SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 FAST_LANE = {"max_seconds": int}
 # checks.reuse: a step's green verdict reused for unchanged inputs.
 REUSE = {"max_age_days": int, "trace_matched_main": bool,
-         "chain_writes_only": bool, "dirs_by_names": bool}
+         "chain_writes_only": bool, "dirs_by_names": bool,
+         "match_main_unrecorded": bool}
 # checks.fresh: records from every run, and heads that wait for one.
 FRESH = {"wait_minutes": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool,
@@ -1141,7 +1142,8 @@ def _check_reuse(checks, problems, section="checks"):
     be to stand for unchanged inputs. The inputs are read from the
     dependency record, so it needs `depends`. Its switches
     (designs/0018) are booleans; `trace_matched_main` needs `main`
-    "every", the only mode that matches a default-branch head."""
+    "every", the only mode that matches a default-branch head, and
+    `match_main_unrecorded` (designs/0036) needs `trace_matched_main`."""
     where = section + ".reuse"
     reuse = checks["reuse"]
     _fields(where, reuse, REUSE, problems)
@@ -1155,6 +1157,12 @@ def _check_reuse(checks, problems, section="checks"):
         problems.append("%s.trace_matched_main needs %s.main \"every\": "
                         "only then is a default-branch head matched"
                         % (where, section))
+    if reuse.get("match_main_unrecorded") is True \
+            and reuse.get("trace_matched_main") is not True:
+        problems.append("%s.match_main_unrecorded needs "
+                        "%s.trace_matched_main: it is what traces a "
+                        "matched head when the records need it"
+                        % (where, where))
 
 
 def _check_idle_offer(offer, agents, problems):
