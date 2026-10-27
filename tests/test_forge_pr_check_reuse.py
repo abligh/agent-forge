@@ -76,6 +76,16 @@ class Configure(unittest.TestCase):
                       '"every": only then is a default-branch head matched',
                       config.check(self.data(depends=True, reuse={
                           "trace_matched_main": True})))
+        self.assertIn("checks.reuse.match_main_unrecorded needs "
+                      "checks.reuse.trace_matched_main: it is what traces "
+                      "a matched head when the records need it",
+                      config.check(self.data(depends=True, main="every",
+                                             reuse={"match_main_unrecorded":
+                                                    True})))
+        self.assertEqual(config.check(self.data(
+            depends=True, main="every", reuse={
+                "trace_matched_main": True,
+                "match_main_unrecorded": True})), [])
         data = self.data(depends=True)
         data["checks"]["steps"][0]["outputs"] = ["../up", "", "a/*", 3]
         problems = config.check(data)
@@ -522,6 +532,51 @@ class TraceMatchedMain(DigestCase):
         self.assertFalse(traced(1, when + pc.DEPENDS_WAIT / 2))
         self.assertTrue(traced(2, when + pc.DEPENDS_WAIT / 2))
         self.assertTrue(traced(1, when + pc.DEPENDS_WAIT))
+
+    def unrecorded(self, files):
+        """green_elsewhere, with no record at the new tree: a prediction's
+        run, which writes none."""
+        tip, other = self.green_elsewhere(files)
+        tree = git("rev-parse", tip + "^{tree}", cwd=self.seed)
+        os.remove(os.path.join(trace.records_dir(self.state_dir),
+                               tree + ".json"))
+        return tip, other
+
+    def test_an_unrecorded_tree_runs_in_full_without_the_switch(self):
+        tip, _ = self.unrecorded({"Z": "z\n"})
+        self.assertEqual(self.work_main(tip), 0)
+        self.assertEqual(self.ran(), ["a", "b", "c"])
+        self.assertNotIn("matched", self.state()["results"][tip])
+
+    def test_with_the_switch_an_unrecorded_tree_is_matched(self):
+        # designs/0036: on one project, no default-branch head was ever
+        # matched, since its prediction writes no record.
+        tip, other = self.unrecorded({"Z": "z\n"})
+        with mock.patch.object(pc, "MATCH_MAIN_UNRECORDED", True):
+            self.assertEqual(self.work_main(tip), 0)
+        self.assertEqual(self.ran(), [])
+        self.assertEqual(self.state()["results"][tip]["matched"], other)
+
+    def test_with_the_switch_a_stale_record_still_runs_it_traced(self):
+        tip, _ = self.unrecorded({"B": "b2\n"})
+        with mock.patch.object(pc, "MATCH_MAIN_UNRECORDED", True):
+            self.assertEqual(self.work_main(tip), 0)
+        self.assertEqual(self.ran(), ["a", "b", "c"])
+        self.assertIn("MAIN-TRACE main %s" % tip[:10], self.logged())
+
+    def test_with_the_switch_once_every_depends_minutes_on_the_host(self):
+        tip, _ = self.green_elsewhere({"B": "b2\n"})
+        tree = git("rev-parse", tip + "^{tree}", cwd=self.seed)
+        git("checkout", "-q", "--detach", "--force", tip, cwd=self.repo)
+        when = T0 + DAY
+
+        def traced(slot, at):
+            return pc.trace_matched(self.state_dir, self.repo, tip, tree,
+                                    slot, at, pc.sh, self.lines.append)
+        with mock.patch.object(pc, "MATCH_MAIN_UNRECORDED", True):
+            self.assertTrue(traced(1, when))
+            self.assertFalse(traced(2, when + pc.DEPENDS_WAIT / 2))
+            self.assertTrue(traced(2, when + pc.DEPENDS_WAIT))
 
     def test_missing_write_sets_count_with_chain_writes_only(self):
         tip, _ = self.green_elsewhere({"Z": "z\n"})

@@ -640,8 +640,12 @@ STEP_ENTRIES = {}
 # traced when a step's record is missing or stale; `chain_writes_only`,
 # only a missing path an earlier step wrote (its write set, or its
 # `outputs`) chains that step's digest; `dirs_by_names`, a directory
-# with a file read beneath it is digested by its entry names.
+# with a file read beneath it is digested by its entry names;
+# `match_main_unrecorded` (designs/0036), with trace_matched_main, a
+# default-branch head is matched though its tree has no record, and
+# runs traced instead at most once every depends_minutes on the host.
 TRACE_MATCHED_MAIN = False
+MATCH_MAIN_UNRECORDED = False
 CHAIN_WRITES_ONLY = False
 DIRS_BY_NAMES = False
 # Each step's declared `outputs`, by name: paths it leaves behind that
@@ -899,6 +903,7 @@ def configure(project, instance=None):
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     global TRACE_MATCHED_MAIN, CHAIN_WRITES_ONLY, DIRS_BY_NAMES, OUTPUTS
+    global MATCH_MAIN_UNRECORDED
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
     global MAIN_NEWEST
     global RED_COMMENT, RERUN_LABEL, HOST_FAULT_EXTRA, STEP_ALERT
@@ -945,6 +950,7 @@ def configure(project, instance=None):
         "max_age_days", DEFAULT_REUSE_DAYS)) if "reuse" in checks else None
     reuse = checks.get("reuse", {})
     TRACE_MATCHED_MAIN = reuse.get("trace_matched_main", False)
+    MATCH_MAIN_UNRECORDED = reuse.get("match_main_unrecorded", False)
     CHAIN_WRITES_ONLY = reuse.get("chain_writes_only", False)
     DIRS_BY_NAMES = reuse.get("dirs_by_names", False)
     OUTPUTS = {s["name"]: [o.strip("/") for o in s["outputs"]]
@@ -4516,11 +4522,17 @@ def trace_matched(state_dir, wt, sha, tree, slot, when, run=sh, out=print):
     record is missing or stale at its tree (`main_needs`; with
     CHAIN_WRITES_ONLY, also one with no write set), and this slot
     hasn't traced one instead of matching it in the last
-    DEPENDS_WAIT. Logged MAIN-TRACE when it does."""
+    DEPENDS_WAIT; with MATCH_MAIN_UNRECORDED (designs/0036), no slot
+    has. Logged MAIN-TRACE when it does."""
     if not (TRACE_MATCHED_MAIN and DEPENDS and MAIN_EVERY):
         return False
     with state_lock(state_dir):
-        last = load(state_dir).get("main_traced", {}).get(str(slot))
+        traced = load(state_dir).get("main_traced", {})
+    if MATCH_MAIN_UNRECORDED:
+        stamps = [t for t in traced.values() if isinstance(t, str)]
+        last = max(stamps) if stamps else None
+    else:
+        last = traced.get(str(slot))
     try:
         if last is not None and when - parse(last) < DEPENDS_WAIT:
             return False
@@ -5381,12 +5393,16 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 settled = True
                 return matched(state_dir, sha, pr, same, tree, started,
                                post, out)
-        if main and MAIN_EVERY and tree and (not DEPENDS or os.path.exists(
-                os.path.join(trace.records_dir(state_dir), tree + ".json"))):
+        if main and MAIN_EVERY and tree and (
+                not DEPENDS or MATCH_MAIN_UNRECORDED or os.path.exists(
+                    os.path.join(trace.records_dir(state_dir),
+                                 tree + ".json"))):
             # designs/0011: a default-branch head whose tree a green run
             # here already passed (usually the Merger's prediction) isn't
             # run again. With depends, only once its tree has a record,
-            # since writing that is what the traced run is for.
+            # since writing that is what the traced run is for; with
+            # MATCH_MAIN_UNRECORDED (designs/0036), trace_matched
+            # decides instead whether the records need it.
             with state_lock(state_dir):
                 same = tested(load(state_dir), tree, started, ok=True)
             if same is not None and same != sha and not trace_matched(

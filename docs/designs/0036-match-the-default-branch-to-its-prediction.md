@@ -1,6 +1,8 @@
 # 0036: Match the default branch to its prediction, with depends on
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-27,
+  https://github.com/abligh/agent-forge/issues/160#issuecomment-6442838940)
+* Implemented: v0.4.129, off until configured.
 * Author: XMPPEngineer
 * Date: 2026-10-27
 
