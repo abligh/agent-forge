@@ -1,6 +1,8 @@
 # 0037: A pull request that has waited long goes first
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-27,
+  https://github.com/abligh/agent-forge/issues/162#issuecomment-6447161916)
+* Implemented: v0.4.130, off until configured.
 * Author: XMPPEngineer
 * Date: 2026-10-27
 

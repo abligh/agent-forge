@@ -2640,6 +2640,15 @@ class PredictAhead(unittest.TestCase):
         self.assertEqual(run_git(self.repo.path, "rev-parse",
                                  got[1]["sha"] + "^"), got[0]["sha"])
 
+    def test_an_overdue_one_that_conflicts_ends_the_list(self):
+        # designs/0037: nothing is predicted past an overdue one.
+        q = [self.pr_on(1, self.base, {"shared.txt": "ONE\n"}),
+             self.pr_on(2, self.base, {"shared.txt": "uno\n"}),
+             self.pr_on(3, self.base, {"c.txt": "c\n"})]
+        got = m.predict_ahead(self.repo.path, self.base, q, depth=1,
+                              overdue={2: 95})
+        self.assertEqual([e["pr"] for e in got], [1])
+
     def test_the_first_conflicting_with_main_ends_the_list(self):
         self.repo.branch("main2", self.base)
         self.repo.commit("shared.txt", "main's\n", "main moves")
@@ -4211,6 +4220,159 @@ class RightOfWay(RepoCase):
         self.assertEqual(record["right_of_way"]["pr"], 6)
         self.assertEqual(record["held"],
                          {"5": "conflicts with #6, which has right of way"})
+
+
+class AgeFirst(RepoCase):
+    """merge.age_first (designs/0037): a candidate that has waited long
+    goes first. #6, opened after #5, goes behind it until it has waited
+    `after_minutes` since a tick first saw it as a candidate."""
+
+    item = Decide.item
+    tick = Tick.tick
+    other_pr = Tick.other_pr
+    rival = HoldConflicting.rival
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        m.configure(project(age_first={}))
+        self.addCleanup(m.configure, project())
+        self.state = os.path.join(self.tmp.name, "state")
+
+    def unapproved(self):
+        return pr(5, head=self.head, reviews=[])
+
+    def remembered(self, name="dry-run-" + m.AGE_FILE):
+        with open(os.path.join(self.state, name)) as handle:
+            return json.load(handle)
+
+    def test_the_configuration(self):
+        self.assertEqual(m.AGE_FIRST, datetime.timedelta(minutes=90))
+        m.configure(project(age_first={"after_minutes": 30}))
+        self.assertEqual(m.AGE_FIRST, datetime.timedelta(minutes=30))
+        m.configure(project())
+        self.assertIsNone(m.AGE_FIRST)
+
+    def test_off_by_default(self):
+        m.configure(project())
+        other = self.other_pr()
+        self.tick([self.unapproved(), other], conclusions=(None,))
+        record, _ = self.tick([self.item(), other], conclusions=(None,),
+                              minutes=200)
+        self.assertEqual(record["queue"], [5, 6])
+        self.assertNotIn("overdue", record)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state, "dry-run-" + m.AGE_FILE)))
+
+    def test_an_overdue_one_goes_first(self):
+        other = self.other_pr()
+        record, _ = self.tick([self.unapproved(), other],
+                              conclusions=(None,))
+        self.assertEqual(record["overdue"], {})
+        record, _ = self.tick([self.item(), other], conclusions=(None,),
+                              minutes=89)
+        self.assertEqual((record["queue"], record["overdue"]), ([5, 6], {}))
+        record, _ = self.tick([self.item(), other], conclusions=(None,),
+                              minutes=90)
+        self.assertEqual(record["queue"], [6, 5])
+        self.assertEqual(record["overdue"], {"6": 90})
+        self.assertEqual(self.remembered()["6"],
+                         {"since": "2026-10-07T12:00:00Z",
+                          "seen": "2026-10-07T13:30:00Z"})
+
+    def test_the_longest_waiting_goes_first(self):
+        other = self.other_pr()
+        self.tick([self.unapproved(), other], conclusions=(None,))
+        self.tick([self.item(), other], conclusions=(None,), minutes=10)
+        record, _ = self.tick([self.item(), other], conclusions=(None,),
+                              minutes=100)
+        self.assertEqual(record["queue"], [6, 5])
+        self.assertEqual(record["overdue"], {"5": 90, "6": 100})
+
+    def test_the_clock_survives_a_hand_back_and_a_new_head(self):
+        other = self.other_pr()
+        self.tick([self.item()], conclusions=(None,))
+        self.tick([self.unapproved(), other], conclusions=(None,),
+                  minutes=30)
+        self.assertEqual(self.remembered()["5"]["since"],
+                         "2026-10-07T12:00:00Z")
+        record, _ = self.tick([self.item(), other], conclusions=(None,),
+                              minutes=90)
+        self.assertEqual(record["overdue"], {"5": 90})
+
+    def test_one_long_no_candidate_or_closed_is_forgotten(self):
+        other = self.other_pr()
+        self.tick([self.item(), other], conclusions=(None,))
+        record, _ = self.tick([self.unapproved(), other],
+                              conclusions=(None,), minutes=24 * 60 - 1)
+        self.assertIn("5", self.remembered())
+        self.tick([self.unapproved(), other], conclusions=(None,),
+                  minutes=24 * 60)
+        self.assertNotIn("5", self.remembered())
+        self.tick([other], conclusions=(None,), minutes=24 * 60 + 1)
+        self.assertEqual(list(self.remembered()), ["6"])
+
+    def test_a_live_tick_keeps_its_own_clock(self):
+        self.tick([self.item()], conclusions=(None,), live=True)
+        self.assertIn("5", self.remembered(m.AGE_FILE))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state, "dry-run-" + m.AGE_FILE)))
+
+    def test_an_overdue_one_never_yields(self):
+        m.configure(project(age_first={}, yield_after_hand_back=1))
+        other = self.other_pr()
+        self.tick([self.item()], conclusions=(None,))
+        os.makedirs(self.state, exist_ok=True)
+        with open(os.path.join(self.state, "dry-run.jsonl"), "a") as handle:
+            handle.write(json.dumps(hand_back(
+                5, "2026-10-07T13:00:00Z")) + "\n")
+        record, _ = self.tick([self.item(), other], conclusions=(None,),
+                              minutes=89)
+        self.assertEqual(record["queue"], [6, 5])
+        record, _ = self.tick([self.item(), other], conclusions=(None,),
+                              minutes=95)
+        self.assertEqual((record["queue"], record["yielded"]), ([5, 6], {}))
+
+    def test_it_goes_ahead_of_those_predicted(self):
+        # #6 was predicted, so with test_ahead it keeps its place ahead
+        # of #5 until #5 is overdue; then the prediction is spent.
+        m.configure(project(age_first={}, test_ahead={}))
+        other = self.other_pr()
+        self.tick([self.item()], conclusions=(None,))
+        self.tick([self.unapproved(), other], conclusions=(None,),
+                  minutes=1)
+        for minutes, queue in ((89, [6, 5]), (90, [5, 6])):
+            m.save_json(os.path.join(self.state, m.AHEAD_FILE),
+                        {"at": "2026-10-07T12:00:00Z", "entries": [
+                            {"pr": 6, "head": other["headRefOid"]}]})
+            record, _ = self.tick([self.item(), other],
+                                  conclusions=(None,), minutes=minutes)
+            self.assertEqual(record["queue"][:2], queue)
+
+    def test_right_of_way_does_not_hold_one_that_has_waited_longer(self):
+        m.configure(project(age_first={"after_minutes": 30},
+                            right_of_way={}))
+        os.makedirs(self.state, exist_ok=True)
+        with open(os.path.join(self.state, "dry-run.jsonl"), "a") as handle:
+            for k in range(2):
+                handle.write(json.dumps(hand_back(
+                    5, "2026-10-07T11:%02d:00Z" % (10 + k),
+                    head=str(k) * 40, reason=m.CONFLICT_REASON)) + "\n")
+        rival = self.rival()
+        record, _ = self.tick([self.unapproved(), rival],
+                              conclusions=(None,))
+        self.assertEqual(list(record["held"]), ["6"])
+        record, _ = self.tick([self.item(), rival], conclusions=(None,),
+                              minutes=29)
+        self.assertEqual((record["queue"], list(record["held"])),
+                         ([5], ["6"]))
+        record, _ = self.tick([self.item(), rival], conclusions=(None,),
+                              minutes=30)
+        self.assertEqual(record["right_of_way"]["pr"], 5)
+        self.assertNotIn("6", record["held"])
+        self.assertEqual(record["queue"], [6, 5])
 
 
 class CodeownersMatch(unittest.TestCase):
