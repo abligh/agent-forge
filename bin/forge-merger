@@ -257,7 +257,13 @@ both SHAs, it goes back to its author (once per approval and head; a
 push makes GitHub read the head again) and the queue moves past it.
 That hand-back is not the pull request's own failure, so it never
 counts toward `merge.yield_after_hand_back`. `waiting.json` in the
-state directory says since when the tick has waited on which head.
+state directory says since when the tick has waited on which head. A
+head first in the batch (`merge.test_ahead.batch`) is never checked on
+its own: it waits for the batch top's prediction, whose tree includes
+it. Once the build check has started that top (its `ahead_started`),
+the wait is timed from the later of the top's start and the wait's, so
+a top that is running isn't called a stall, and one that hangs still
+is, `STALL_AFTER` after it started.
 
 **`next.json` names the pull request the tick stopped at**: `{"at":
 ..., "pr": N}`, the first in the queue it neither handed back nor
@@ -2333,9 +2339,37 @@ def stalled_for(state_dir, waiting, when, check_state=None):
             limit = QUEUED_STALL_AFTER
         else:
             since = max(began, started)
+    if waiting.get("action") == "WAIT":
+        top = batch_top_started(state_dir, waiting, check_state)
+        if top is not None:
+            limit, since = STALL_AFTER, max(since, top)
     if when - since < limit:
         return None
     return int(waited.total_seconds() // 60)
+
+
+def batch_top_started(state_dir, waiting, check_state):
+    """When the build check started the top of the batch `waiting`'s
+    head is first in, by the last tick's AHEAD_FILE and the check's
+    `ahead_started`, or None: not first in a batch, or its top not
+    started. Such a head is never checked on its own: it waits for the
+    top, whose tree includes it (designs/0032), so its wait is timed
+    from the top's start, as a head the check runs is from its own."""
+    started = (check_state or {}).get("ahead_started")
+    if not isinstance(started, dict):
+        return None
+    last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+    entries = last.get("entries") if isinstance(last, dict) else None
+    batch = last.get("batch") if isinstance(last, dict) else None
+    try:
+        size = int((batch or {}).get("size") or 0)
+        first, top = entries[0], entries[size - 1]
+        if size < 1 or (first["pr"], first["head"]) != (waiting["pr"],
+                                                         waiting["head"]):
+            return None
+        return parse_time(started.get(top["sha"]))
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return None
 
 
 def where_to_look():

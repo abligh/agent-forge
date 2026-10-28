@@ -109,6 +109,13 @@ class Config(unittest.TestCase):
                          ["router.idle_offer.shell_minutes must be an "
                           "integer"])
 
+    def test_hand_over_above_an_integer_of_at_least_zero(self):
+        self.assertEqual(self.problems({"hand_over_above": 0}), [])
+        self.assertEqual(self.problems({"hand_over_above": -1}),
+                         ["router.idle_offer.hand_over_above must be at "
+                          "least 0"])
+        self.assertEqual(len(self.problems({"hand_over_above": "3"})), 1)
+
     def test_report_to_is_an_agent(self):
         self.assertEqual(self.problems({"report_to": "Merger"}),
                          ["router.idle_offer.report_to: 'Merger' is not an "
@@ -129,7 +136,7 @@ class Configure(unittest.TestCase):
         configure(self, {})
         self.assertEqual(rules.IDLE_OFFER,
                          {"idle_minutes": 10, "shell_minutes": None,
-                          "report_to": None})
+                          "report_to": None, "hand_over_above": None})
         self.assertTrue(rules.wants_directory)
 
     def test_the_rules_load_with_it(self):
@@ -525,6 +532,59 @@ class Report(unittest.TestCase):
     def test_nobody_without_report_to(self):
         configure(self, {})
         self.assertEqual(self.sweep([], [], entry("WidgetUIDev")), [])
+
+
+class HandOver(unittest.TestCase):
+    """designs/0038: the report asks for an issue someone else holds."""
+
+    def setUp(self):
+        configure(self, {"report_to": "LeadDev", "hand_over_above": 2})
+
+    def sweep(self, *issues):
+        return rules.sweep(context((), issues, directory(
+            entry("WidgetUIDev"))))
+
+    def test_off_without_the_key(self):
+        configure(self, {"report_to": "LeadDev"})
+        got = self.sweep(*[owned(n) for n in (30, 31, 32, 33)])
+        self.assertEqual(got[0].line, "UIDev has been idle since 13:30Z with "
+                         "nothing it can act on (no open issues of its own).")
+
+    def test_more_than_hand_over_above_unstarted(self):
+        got = self.sweep(owned(30, created=T1), owned(31, created=T0),
+                         owned(32, created=T2))
+        self.assertEqual(got[0].line, "UIDev has been idle since 13:30Z with "
+                         "nothing it can act on (no open issues of its own). "
+                         "LeadDev owns 3 actionable issues it hasn't started "
+                         "(#31, #30, #32): hand one to UIDev, or say why not.")
+
+    def test_not_at_hand_over_above(self):
+        got = self.sweep(owned(30), owned(31))
+        self.assertNotIn("hasn't started", got[0].line)
+
+    def test_in_progress_blocked_waiting_or_in_hand_are_started(self):
+        got = self.sweep(owned(30, labels=["Status:in-progress"]),
+                         owned(31, body="Blocked-by: #40\n"),
+                         owned(40, owner="Reviewer"),
+                         owned(32, labels=["Status:waiting-owner"]),
+                         owned(33), owned(34))
+        self.assertNotIn("hasn't started", got[0].line)
+
+    def test_the_most_then_the_oldest(self):
+        got = self.sweep(*[owned(n, owner="Reviewer", created=T1)
+                           for n in (40, 41, 42)],
+                         *[owned(n, created=T0) for n in (30, 31, 32)])
+        self.assertIn("LeadDev owns 3", got[0].line)
+        got = self.sweep(*[owned(n, owner="Reviewer", created=T1)
+                           for n in (40, 41, 42, 43)],
+                         *[owned(n, created=T0) for n in (30, 31, 32)])
+        self.assertIn("Reviewer owns 4", got[0].line)
+
+    def test_at_most_ten_listed(self):
+        got = self.sweep(*[owned(n) for n in range(30, 42)])
+        self.assertIn("LeadDev owns 12 actionable issues it hasn't started "
+                      "(#30, #31, #32, #33, #34, #35, #36, #37, #38, #39, "
+                      "...)", got[0].line)
 
 
 class Engine(unittest.TestCase):
