@@ -233,7 +233,11 @@ or a value that is not a time, holds it.
   stack's merged layer below it (designs/0025), or left out when it
   isn't one; the
   default is `forge-commit-identity {base}..{head}`. A `forge-` tool
-  runs from this installation, anything else from the checkout.
+  runs from this installation, anything else from the checkout. A tool
+  that exits 3 refuses for now, not for good, as
+  `forge-closing-keywords` does while GitHub's closingIssuesReferences
+  lags a body edit: the hand-back is said once, and the gate is asked
+  again 5 minutes (GATE_RETRY) after it was last asked.
 
 The checkout is the cron checkout (`$FORGE_CRON_CHECKOUT`), kept at
 `origin/main` by `forge-cron-run`, and the gate tools run there, so a
@@ -315,7 +319,9 @@ the rest being tested ahead; a Q0 that conflicts with `main` ends it.
 Pull requests already handed back under their current approval and
 head are left out; one a `merge.gate` tool refused rejoins once its
 title or body changes, since a gate may read them and the author's fix
-for, say, an undeclared closing keyword is an edit of the body. The
+for, say, an undeclared closing keyword is an edit of the body, and one
+a gate refused for now (exit 3) rejoins once the gate, asked again,
+passes. The
 commits never leave this host: they are local
 commits under `refs/agent-forge-merger/ahead/<k>` in this checkout,
 with a fixed author, committer and date and no signature, so the same
@@ -580,6 +586,13 @@ BUILD_HOST = ""
 # The gate tools, as argument lists before `{pr}`, `{base}`, `{head}`
 # and `{below}` are filled in.
 DEFAULT_GATE = (("forge-commit-identity", "{base}..{head}"),)
+# A gate that exits GATE_RETRY_EXIT refuses for now, not for good (as
+# `forge-closing-keywords` does while GitHub's closingIssuesReferences
+# lags the body): its hand-back is said once, and the gate is asked again
+# GATE_RETRY after it was last asked, at the same head, approval and
+# description.
+GATE_RETRY_EXIT = 3
+GATE_RETRY = datetime.timedelta(minutes=5)
 DEFAULT_CONTEXT = "vm/build-and-test"
 GATE = DEFAULT_GATE
 # How a Not-a-review hand-back heads each kind of path, in the order it
@@ -1909,6 +1922,17 @@ def tool_problem(args, env, cwd, run=sh):
                                  tail(got.stdout + "\n" + got.stderr))
 
 
+def gate_problem(args, env, cwd, run=sh):
+    """(problem, retry) for a gate tool: `tool_problem`'s answer, and
+    whether the tool refused only for now (GATE_RETRY_EXIT)."""
+    got = run(args, cwd=cwd, env=env)
+    if got.returncode == 0:
+        return None, False
+    return ("%s exited %d: %s" % (os.path.basename(args[0]), got.returncode,
+                                  tail(got.stdout + "\n" + got.stderr)),
+            got.returncode == GATE_RETRY_EXIT)
+
+
 def parse_pages(text):
     """`gh api`'s output as one value. With `--paginate`, gh prints one
     JSON document per page, so several arrays are joined into one;
@@ -2090,12 +2114,14 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
     if problem:
         return dict(back("author", problem), **notes)
     for argv in GATE:
-        problem = tool_problem(gate_args(argv, repo, number, main_tip, head,
-                                         restack[0] if restack else None),
-                               env, repo, run)
+        problem, retry = gate_problem(
+            gate_args(argv, repo, number, main_tip, head,
+                      restack[0] if restack else None), env, repo, run)
         if problem:
             # A gate tool may read the description, so the hand-back is
             # for this one: a new description is a new question.
+            if retry:
+                notes.update(retry=True, at=iso(now or now_utc()))
             return dict(back("author", problem), text=description(pr),
                         **notes)
     if AHEAD_BATCH > 1 and COVERED_TEXT in said:
@@ -2267,13 +2293,23 @@ def carry_out(decision, approval, github, said):
     elif decision["action"] == "HAND-BACK":
         key = hand_back_key(approval, head, decision["reason"],
                             decision.get("text"))
-        if said.get(str(number)) == key:
+        if decision.get("retry"):
+            # A refusal for now: kept with when it was asked, so that
+            # `handed_back` asks again GATE_RETRY later. Refused again
+            # the same way, it is not said again; only the time moves.
+            key["retry"] = True
+            asked = dict(key, at=decision.get("at") or iso(now_utc()))
+        before = said.get(str(number))
+        if isinstance(before, dict) and \
+                {k: v for k, v in before.items() if k != "at"} == key:
+            if decision.get("retry"):
+                said[str(number)] = asked
             return "already said"
         ok, why = github.write(
             "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG, number),
             body=hand_back_text(decision, approver))
         if ok:
-            said[str(number)] = key
+            said[str(number)] = asked if decision.get("retry") else key
     else:
         return None
     return "done" if ok else "refused: " + why
@@ -2775,13 +2811,15 @@ def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
 
 
 def checked_ahead(state_dir, repo, pr, approval, main_tip, env, run=sh,
-                  regenerated=None):
+                  regenerated=None, when=None):
     """designs/0035, fourth amendment: (to, reason) when `pr` would be
     handed back at merge time for something its place in the queue
     doesn't change (its approval doesn't cover its head, or a
     `merge.gate` tool refuses it), else None. Checked once per head,
     approved commit, title and body (CHECKED_FILE); merge time checks
-    again, as before."""
+    again, as before. A gate's refusal for now (GATE_RETRY_EXIT) comes
+    back as (to, reason, True) and is checked again GATE_RETRY after
+    `when`, the clock it was checked by."""
     approved = (approval.get("commit") or {}).get("oid")
     approver = APPROVERS.get(login(approval), "a reviewer")
     if not approved:
@@ -2790,7 +2828,8 @@ def checked_ahead(state_dir, repo, pr, approval, main_tip, env, run=sh,
     path = os.path.join(state_dir, CHECKED_FILE)
     checked = load_json(path, {})
     entry = checked.get(str(pr["number"]))
-    if isinstance(entry, dict) and entry.get("key") == key:
+    if isinstance(entry, dict) and entry.get("key") == key \
+            and not retry_due(entry, when):
         return tuple(entry["failed"]) if entry.get("failed") else None
     if fetch_pr(repo, pr["number"], pr["headRefOid"], run).returncode != 0:
         return None
@@ -2799,28 +2838,49 @@ def checked_ahead(state_dir, repo, pr, approval, main_tip, env, run=sh,
                                regenerated)
     if covered is None:
         return None
-    failed = None if covered else (approver, why)
+    failed, retry = (None if covered else (approver, why)), False
     for argv in GATE if failed is None else ():
-        problem = tool_problem(gate_args(argv, repo, pr["number"], main_tip,
-                                         pr["headRefOid"]), env, repo, run)
+        problem, retry = gate_problem(
+            gate_args(argv, repo, pr["number"], main_tip, pr["headRefOid"]),
+            env, repo, run)
         if problem:
-            failed = ("author", problem)
+            failed = ("author", problem, True) if retry else \
+                ("author", problem)
             break
     checked[str(pr["number"])] = {"key": key, "failed": failed}
+    if failed and retry and when is not None:
+        checked[str(pr["number"])].update(retry=True, at=iso(when))
     save_json(path, checked)
     return failed
 
 
-def handed_back(said, pr, approval):
+def handed_back(said, pr, approval, when=None):
     """Whether `pr` was handed back under the approval it has now, at the
     head it has now, and for a gate's refusal, with the description it
     has now: it would only be handed back again, so it is not
-    predicted."""
+    predicted. A gate's refusal for now (GATE_RETRY_EXIT) stops counting
+    GATE_RETRY after it was last asked, by the clock `when`, so that the
+    gate is asked again. Seen on 2026-10-28: refused because GitHub had
+    not yet linked a declared issue, a pull request stayed out of every
+    prediction for over an hour after the link appeared."""
     before = said.get(str(pr["number"])) or {}
     return bool(before.get("approved")) and \
         before["approved"] == approval.get("submittedAt") and \
         before.get("head") == pr["headRefOid"] and \
-        not description_moved(before, pr)
+        not description_moved(before, pr) and \
+        not retry_due(before, when)
+
+
+def retry_due(before, when):
+    """Whether `before`, a hand-back from `handed-back.json` or an entry
+    of `checked.json`, was a gate's refusal for now that is due to be
+    asked again at `when`. Without a clock, never."""
+    if not before.get("retry") or when is None:
+        return False
+    try:
+        return when - parse_time(before["at"]) >= GATE_RETRY
+    except (KeyError, TypeError, ValueError):
+        return True
 
 
 def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
@@ -2840,7 +2900,7 @@ def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
         approval, _ = eligible(layer, open_numbers - numbers, when,
                                any_base=True)
         oid = ((approval or {}).get("commit") or {}).get("oid")
-        if not oid or handed_back(said, layer, approval):
+        if not oid or handed_back(said, layer, approval, when):
             return layers
         have_head(repo, layer, run)
         if git(repo, "cat-file", "-e", oid + "^{commit}",
@@ -4282,12 +4342,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                                            "STACK-UPDATE")
                 and before.get("approved")
                 and before["approved"] == approval.get("submittedAt")
-                and not description_moved(before, pr)):
+                and not description_moved(before, pr)
+                and not before.get("retry")):
             # Handed back under this approval: not updated again. An
             # update spends a build on a head that comes back for the
             # same reason. Only the update is withheld: a head already
             # up to date is decided as before, and a new approval is a
-            # new question.
+            # new question. A gate's refusal for now isn't the
+            # author's to fix, so it doesn't withhold one.
             decision = {"action": "SKIP", "pr": pr["number"],
                         "head": pr["headRefOid"],
                         "reason": "handed back under this approval (%s); "
@@ -4452,13 +4514,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             acting = [pr for pr in queue if pr["number"] == waiting_on]
             for pr in [pr for pr in queue if pr["number"] != waiting_on
                        and pr.get("baseRefName", MAIN) == MAIN
-                       and not handed_back(said, pr, approvals[pr["number"]])
+                       and not handed_back(said, pr, approvals[pr["number"]],
+                                           when)
                        ][:AHEAD_DEPTH] if AHEAD_BATCH > 1 else ():
                 # Found before its batch is predicted, not from the middle
                 # of it (designs/0035, fourth amendment).
                 failed = checked_ahead(state_dir, repo, pr,
                                        approvals[pr["number"]], main_tip,
-                                       github.env, run, regenerated)
+                                       github.env, run, regenerated, when)
                 if not failed:
                     continue
                 decision = {"action": "HAND-BACK", "to": failed[0],
@@ -4468,6 +4531,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     # A gate's refusal (an approval that doesn't cover
                     # the head goes to its reviewer).
                     decision["text"] = description(pr)
+                if failed[2:] == (True,):
+                    decision.update(retry=True, at=iso(when))
                 if live:
                     decision["result"] = carry_out(
                         decision, approvals[pr["number"]], github, said)
@@ -4479,7 +4544,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     % (pr["number"], failed[1].splitlines()[0],
                        "" if live else "would be "))
             rest = [pr for pr in queue if pr["number"] != waiting_on
-                    and not handed_back(said, pr, approvals[pr["number"]])]
+                    and not handed_back(said, pr, approvals[pr["number"]],
+                                        when)]
             ahead_queue = acting + rest if acting else []
             last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
             owed = None

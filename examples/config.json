@@ -46,7 +46,7 @@
                             "title": "forge-merger: the queue is stalled on #{pr}",
                             "labels": ["bug", "Owner:LeadDev"]}},
   "closing_keywords": {"enforced_by": "the Merger",
-                       "rerun": "run the check again (the Merger does, on its next tick)"},
+                       "rerun": "run the check again (the Merger does, within a few minutes)"},
   "docs": {"paths": ["README.md", "docs"], "width": 80, "roles": "docs/roles.md"},
   "identity": {"unattributed_domain": "@build.example.org",
                "unattributed_name": "Anonymous Agent"},

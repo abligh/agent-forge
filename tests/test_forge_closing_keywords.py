@@ -422,7 +422,7 @@ class AFieldThatLagsTheBody(unittest.TestCase):
 
     def test_a_declared_body_with_an_empty_field_says_wait(self):
         code, _, err = self.run_main("Fixes #1816\n")
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertIn("#1816 is declared by a closing keyword in pull "
                       "request 1819's body", err)
         self.assertIn("run the check again", err)
@@ -444,7 +444,7 @@ class AFieldThatLagsTheBody(unittest.TestCase):
         code, _, err = self.run_main(
             "Fixes #1816\n", log=self.SUBJECT,
             argv=("a..b", "--pr", "1819", "--include-subject"))
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertIn("run the check again", err)
         self.assertNotIn("new branch", err)
 
@@ -452,9 +452,19 @@ class AFieldThatLagsTheBody(unittest.TestCase):
         code, _, err = self.run_main("Fixes #1816\n",
                                      title="t (Fixes #1816)",
                                      log="no keyword\n\nnone\x00")
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertIn("run the check again", err)
         self.assertNotIn("retitle", err)
+
+    def test_a_lag_beside_a_real_finding_is_a_plain_refusal(self):
+        # 3 says only "ask again later": with anything else to fix, the
+        # author has work to do, so it is 1.
+        code, _, err = self.run_main(
+            "Fixes #1816\n",
+            log="one\n\nfixes #1816\x00two\n\nfixes #1817\x00")
+        self.assertEqual(code, 1)
+        self.assertIn("#1817 will close on merge and the pull request does "
+                      "not say so", err)
 
     def test_once_the_field_settles_it_passes(self):
         code, _, err = self.run_main("Fixes #1816\n", declared=[1816])
@@ -464,7 +474,7 @@ class AFieldThatLagsTheBody(unittest.TestCase):
         rerun = "re-run the failed job (`gh run rerun --failed <run>`)"
         code, _, err = self.run_main("Fixes #1816\n",
                                      the_project=project(rerun=rerun))
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertIn("gh run rerun --failed", err)
         self.assertNotIn("Merger", err)
 
@@ -599,7 +609,7 @@ class MainThroughThePullRequest(unittest.TestCase):
         _, _, err = self.run_main(REAL_1253, [1159])
         self.assertIn("Reword so no closing keyword sits in front of the "
                       "number, then run the check again (the Merger does, "
-                      "on its next tick).", err)
+                      "within a few minutes).", err)
 
     def test_a_meant_close_prints_the_set_and_is_zero(self):
         code, out, _ = self.run_main("Fixes #1251.", [1251])

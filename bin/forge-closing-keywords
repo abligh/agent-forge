@@ -92,12 +92,15 @@ configuration's `repo`; the default range starts at `default_branch`.
 `closing_keywords.enforced_by` names what refuses a pull request this
 check fails (default "the Merger") and `closing_keywords.rerun` says
 how to run it again once GitHub catches up (default: the Merger does,
-on its next tick); a project running it in CI names its workflow there.
+within a few minutes); a project running it in CI names its workflow there.
 Reads only, as `$FORGE_AGENT`'s App if set, else `$GH_TOKEN`, which the
 Merger sets for its gates, else anonymously.
 
 Exit 0 when nothing closes that is not declared and nothing closes from
-a denial, 1 when something does, and 2 when the question could not be
+a denial, 1 when something does, 3 when every such issue is declared in
+the body and only GitHub's `closingIssuesReferences` has yet to list it
+(a refusal for now: run it again in a few minutes, as the Merger does),
+and 2 when the question could not be
 asked: no configuration, an unreadable range or file, a pull request
 whose declaration or commits could not be fetched, a range that is not
 that pull request's branch, an empty range, or `--include-subject` on a
@@ -124,7 +127,7 @@ REPO_NAME = "example/widget"
 DEFAULT_RANGE = "origin/main..HEAD"
 # What refuses a pull request this check fails, and how to run it again.
 DEFAULT_ENFORCED_BY = "the Merger"
-DEFAULT_RERUN = "run the check again (the Merger does, on its next tick)"
+DEFAULT_RERUN = "run the check again (the Merger does, within a few minutes)"
 ENFORCED_BY = DEFAULT_ENFORCED_BY
 RERUN = DEFAULT_RERUN
 
@@ -426,6 +429,10 @@ def pr_facts(pr, github, repo=None):
             "title": node.get("title") or "",
             "body": node.get("body") or "",
             "commits": commits if isinstance(commits, int) else None}
+
+
+# The status for a refusal that is only GitHub's field lagging the body.
+LAG_EXIT = 3
 
 
 def lag_note(number, pr):
@@ -971,7 +978,16 @@ def main(argv=None, run=proc.sh, call=forge_github.api_call,
               "in that subject is meant -- `--include-subject` judges it "
               "rather than reporting it."
               % (PROG, number, " (%s)" % ", ".join(where) if where else ""))
-    return 1 if (undeclared or negated or undeclared_title) else 0
+    if not (undeclared or negated or undeclared_title):
+        return 0
+    # Every refusal only waiting on GitHub's field to catch up with the
+    # body: the same refusal, with its own status so that a caller can
+    # ask again later instead of handing the pull request back for good.
+    if not negated and all(n in lagging and n not in deniers
+                           for n in undeclared) \
+            and all(n in lagging for n in undeclared_title):
+        return LAG_EXIT
+    return 1
 
 
 if __name__ == "__main__":

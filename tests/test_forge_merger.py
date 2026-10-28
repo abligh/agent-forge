@@ -3289,6 +3289,101 @@ class TickAhead(RepoCase):
         self.assertFalse(m.handed_back(said, dict(six, title="new"),
                                        approval))
 
+    def gate_lags(self, number, lagging, calls=None):
+        """`run` whose closing-keywords gate refuses pull request
+        `number` for now (exit 3, GitHub's field lagging the body)
+        while `lagging[0]` is true."""
+        def run(args, cwd=None, env=None):
+            if os.path.basename(args[0]) == "closing-keywords":
+                if calls is not None:
+                    calls.append(args[args.index("--pr") + 1])
+                if args[args.index("--pr") + 1] == str(number) \
+                        and lagging[0]:
+                    return subprocess.CompletedProcess(
+                        args, 3, "", "#9 is declared by a closing keyword "
+                        "in pull request 6's body, but GitHub's "
+                        "closingIssuesReferences does not list it yet.")
+            return tools_run()(args, cwd, env)
+        return run
+
+    def test_a_refusal_for_now_is_asked_again(self):
+        # Seen on 2026-10-28: handed back ahead because GitHub had not
+        # yet linked an issue the body declared, the pull request was
+        # never checked again, though the link appeared minutes later,
+        # and sat out of every prediction for over an hour.
+        m.configure(project(test_ahead={"batch": 3}))
+        self.repo.branch("third", "origin/main")
+        sha = self.repo.commit("t.txt", "third\n", "third")
+        self.repo.publish_pr(7, sha)
+        self.repo.branch("feature", "feature")
+        prs = [self.item(), self.other_pr(),
+               pr(7, T1, head=sha, reviews=[review(REVIEWER, oid=sha)])]
+        lagging, calls = [True], []
+
+        def comments():
+            return len([w for w in self.github.writes
+                        if "/issues/6/comments" in str(w)])
+
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              run=self.gate_lags(6, lagging, calls))
+        self.assertEqual(record["ahead"], [5, 7])
+        back = [d for d in record["decisions"] if d.get("ahead")]
+        self.assertEqual([(d["pr"], d.get("retry")) for d in back],
+                         [(6, True)])
+        self.assertEqual(comments(), 1)
+        # Within GATE_RETRY: not asked again, and nothing said.
+        calls.clear()
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              minutes=2, run=self.gate_lags(6, lagging, calls))
+        self.assertEqual(calls, [])
+        self.assertEqual(record["ahead"], [5, 7])
+        self.assertEqual(comments(), 0)
+        # Due, and still lagging: asked again, said no second time.
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              minutes=6, run=self.gate_lags(6, lagging, calls))
+        self.assertEqual(calls, ["6"])
+        self.assertEqual(record["ahead"], [5, 7])
+        self.assertEqual(comments(), 0)
+        # The link appears, nothing else changes: it rejoins.
+        lagging[0] = False
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              minutes=12,
+                              run=self.gate_lags(6, lagging, calls))
+        self.assertIn(6, record["ahead"])
+        self.assertEqual(comments(), 0)
+
+    def test_a_refusal_for_good_is_not_asked_again(self):
+        # The control: exit 1 stays handed back at the same head,
+        # approval and description, however long it waits.
+        m.configure(project(test_ahead={"batch": 3}))
+        prs = [self.item(), self.other_pr()]
+        calls = []
+        self.tick(prs, conclusions=(None,), live=True,
+                  run=self.gate_refuses(6, calls))
+        calls.clear()
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              minutes=60, run=self.gate_refuses(6, calls))
+        self.assertEqual(calls, [])
+        self.assertNotIn(6, record["ahead"])
+
+    def test_retry_due(self):
+        six = self.other_pr()
+        approval = m.approval_of(six)
+        key = dict(m.hand_back_key(approval, six["headRefOid"], "gate",
+                                   m.description(six)),
+                   retry=True, at="2026-10-07T12:00:00Z")
+        said = {"6": key}
+        at = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                               tzinfo=datetime.timezone.utc)
+        self.assertTrue(m.handed_back(said, six, approval))
+        self.assertTrue(m.handed_back(said, six, approval,
+                                      at + datetime.timedelta(minutes=4)))
+        self.assertFalse(m.handed_back(said, six, approval,
+                                       at + m.GATE_RETRY))
+        plain = {"6": dict(key, retry=False)}
+        self.assertTrue(m.handed_back(plain, six, approval,
+                                      at + datetime.timedelta(hours=9)))
+
     def test_a_member_that_passes_is_checked_once(self):
         m.configure(project(test_ahead={"batch": 2}))
         prs = [self.item(), self.other_pr()]
