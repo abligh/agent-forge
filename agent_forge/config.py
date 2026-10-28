@@ -199,7 +199,8 @@ RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
           "stuck": dict, "owners": dict, "unreviewed": dict,
           "forget_minutes": int, "quiet_labels": list}
-IDLE_OFFER = {"idle_minutes": int, "shell_minutes": int, "report_to": str}
+IDLE_OFFER = {"idle_minutes": int, "shell_minutes": int, "report_to": str,
+              "hand_over_above": int}
 MERGE_NOTICE = {"window_minutes": int, "skip_label": str, "to": str}
 # Whom `router.merge_notice.to` tells of a merge.
 MERGE_NOTICE_TO = ("author", "owner_label")
@@ -1180,6 +1181,9 @@ def _check_idle_offer(offer, agents, problems):
     for key in ("idle_minutes", "shell_minutes"):
         if _is(offer.get(key), int) and offer[key] < 1:
             problems.append("%s.%s must be at least 1" % (where, key))
+    if _is(offer.get("hand_over_above"), int) and \
+            offer["hand_over_above"] < 0:
+        problems.append("%s.hand_over_above must be at least 0" % where)
     if isinstance(offer.get("report_to"), str) and \
             offer["report_to"] not in agents:
         problems.append("%s.report_to: %r is not an agent"

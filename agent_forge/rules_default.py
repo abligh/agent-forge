@@ -138,7 +138,14 @@ agents with nothing to do (off without it):
     plans the work knows, once per idle period. A collaborator works
     on the project only when given something: idle with nothing of
     hers to do is where she is meant to be. Not for `report_to` itself, and not
-    without `report_to`.
+    without `report_to`. With `idle_offer.hand_over_above` (designs/0038),
+    the report also names the agent owning the most unstarted issues,
+    when that is more than `hand_over_above`, and asks for one of them
+    to be handed to the idle developer: an issue is unstarted when it is
+    actionable, as above, and isn't labelled `in-progress` (after the
+    labels' `status_prefix`). The most is the larger count, then the
+    owner of the oldest such issue; the list is oldest first, at most
+    ten.
 
 An agent whose entry says `"offer": false` is never offered work by
 rule 15 nor reported by rule 16.
@@ -246,6 +253,10 @@ OWNER_PREFIX = "Owner:"
 STATUS_CONTEXT = "vm/build-and-test"
 # `router.idle_offer`, with its defaults filled in, or None: off.
 IDLE_OFFER = None
+# A label saying its issue is being worked on (designs/0038).
+IN_PROGRESS = "Status:in-progress"
+# How many unstarted issues rule 16 names at most (designs/0038).
+HAND_OVER_LIST = 10
 DEFAULT_IDLE_MINUTES = 10
 # The engine reads the relay's directory only for the idle offer.
 wants_directory = False
@@ -319,7 +330,7 @@ def configure(project, merger_tool):
     global OWNER_PREFIX, STATUS_CONTEXT, IDLE_OFFER, wants_directory
     global MERGE_NOTICE, merged_window
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
-    global UNREVIEWED, QUIET_LABELS
+    global UNREVIEWED, QUIET_LABELS, IN_PROGRESS
     merger = merger_tool
     labels = project.section("labels")
     MERGER = merger.ACT_AS
@@ -333,7 +344,9 @@ def configure(project, merger_tool):
     IDLE_OFFER = None if offer is None else {
         "idle_minutes": offer.get("idle_minutes", DEFAULT_IDLE_MINUTES),
         "shell_minutes": offer.get("shell_minutes"),
-        "report_to": offer.get("report_to")}
+        "report_to": offer.get("report_to"),
+        "hand_over_above": offer.get("hand_over_above")}
+    IN_PROGRESS = labels.get("status_prefix", "Status:") + "in-progress"
     wants_directory = IDLE_OFFER is not None
     notice = project.section("router").get("merge_notice")
     MERGE_NOTICE = None if notice is None else {
@@ -1175,10 +1188,42 @@ def idle_offers(ctx):
             if n) or "no open issues of its own"
         decisions.append(Decision(
             None, report_to, 16, "%s %s" % (agent, stamp),
-            "%s has been idle since %s with nothing it can act on (%s)." % (
-                agent, since_text(stamp, ctx.when), why),
+            "%s has been idle since %s with nothing it can act on (%s).%s"
+            % (agent, since_text(stamp, ctx.when), why,
+               hand_over(agent, ctx)),
             reminder=ONCE))
     return decisions
+
+
+def hand_over(idle, ctx):
+    """Rule 16's ask for an issue to hand to `idle` (designs/0038): " P
+    owns K actionable issues it hasn't started (#a, ...): hand one to
+    D, or say why not.", or "" without `hand_over_above`, or when no
+    agent owns more unstarted issues than that."""
+    above = IDLE_OFFER.get("hand_over_above")
+    if above is None:
+        return ""
+    best = None
+    for agent in sorted(ctx.roster.agents):
+        if agent == idle:
+            continue
+        unstarted = [i for i in owned_issues(agent, ctx)[0]
+                     if IN_PROGRESS not in labels_of(i)]
+        if len(unstarted) <= above:
+            continue
+        key = (-len(unstarted), unstarted[0].get("createdAt") or "",
+               unstarted[0]["number"])
+        if best is None or key < best[0]:
+            best = (key, agent, unstarted)
+    if best is None:
+        return ""
+    _, agent, unstarted = best
+    listed = ", ".join("#%d" % i["number"]
+                       for i in unstarted[:HAND_OVER_LIST])
+    return (" %s owns %d actionable issues it hasn't started (%s%s): hand "
+            "one to %s, or say why not." % (
+                agent, len(unstarted), listed,
+                ", ..." if len(unstarted) > HAND_OVER_LIST else "", idle))
 
 
 # --- the merge notice (rule 17) -----------------------------------------------

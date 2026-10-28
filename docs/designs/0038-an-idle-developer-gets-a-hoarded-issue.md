@@ -1,6 +1,8 @@
 # 0038: An idle developer gets an issue someone else isn't starting
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-10-28,
+  https://github.com/abligh/agent-forge/issues/165#issuecomment-6459528758)
+* Implemented: v0.4.131, off until configured.
 * Author: XMPPEngineer
 * Date: 2026-10-28
 
@@ -44,12 +46,12 @@ more than `hand_over_above`, the report adds:
 > P owns K actionable issues it hasn't started (#a, #b, #c, …): hand
 > one to D, or say why not.
 
-P is the agent with the most (the oldest owner breaks a tie), and the
-list is P's unstarted issues, oldest first, at most ten. The report
-still goes to `report_to`, once per idle period, as today; `report_to`
-plans the work and moves the `Owner:` label. When P is `report_to`
-itself, the message is the same, so the agent hoarding is asked
-directly.
+P is the agent with the most (the owner of the oldest such issue breaks
+a tie), and the list is P's unstarted issues, oldest first, at most
+ten. The report still goes to `report_to`, once per idle period, as
+today; `report_to` plans the work and moves the `Owner:` label. When P
+is `report_to` itself, the message is the same, so the agent hoarding
+is asked directly.
 
 `hand_over_above` keeps the value of context: an owner may hold that
 many unstarted issues it knows best before anyone is asked to take

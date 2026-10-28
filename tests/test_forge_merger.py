@@ -5519,6 +5519,66 @@ class QueuedStall(unittest.TestCase):
         self.assertEqual(self.stalled(30, {}), 30)
 
 
+class BatchTopStall(unittest.TestCase):
+    """A head first in the batch waits for its top's prediction: timed
+    from when the build check started the top."""
+
+    START = QueuedStall.START
+    HEAD = "h" * 40
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = tmp.name
+        m.configure(project())
+        self.addCleanup(m.configure, project())
+        self.ahead({"size": 2}, [
+            {"pr": 5, "head": self.HEAD, "sha": "p" * 40, "tree": "t1"},
+            {"pr": 6, "head": "j" * 40, "sha": "q" * 40, "tree": "t2"}])
+
+    def ahead(self, batch, entries):
+        m.save_json(os.path.join(self.state, m.AHEAD_FILE),
+                    {"at": "2026-10-07T12:00:00Z", "batch": batch,
+                     "entries": entries})
+
+    def stalled(self, minutes, started, pr=5, action="WAIT"):
+        waiting = {"pr": pr, "head": self.HEAD, "action": action}
+        check = {"waiting": {}, "ahead_started": started}
+        m.stalled_for(self.state, waiting, self.START, check)
+        return m.stalled_for(
+            self.state, waiting,
+            self.START + datetime.timedelta(minutes=minutes), check)
+
+    def test_timed_from_the_tops_start(self):
+        started = {"q" * 40: "2026-10-07T12:16:00Z"}
+        self.assertIsNone(self.stalled(31, started))
+        self.assertEqual(self.stalled(46, started), 46)
+
+    def test_a_top_not_started_is_as_before(self):
+        self.assertEqual(self.stalled(30, {"p" * 40: "2026-10-07T12:16:00Z"}),
+                         30)
+
+    def test_not_first_in_the_batch_is_as_before(self):
+        self.assertEqual(self.stalled(
+            30, {"q" * 40: "2026-10-07T12:16:00Z"}, pr=6), 30)
+
+    def test_a_top_started_before_the_wait_counts_from_the_wait(self):
+        self.assertEqual(self.stalled(
+            30, {"q" * 40: "2026-10-07T11:00:00Z"}), 30)
+
+    def test_a_refused_write_is_as_before(self):
+        self.assertEqual(self.stalled(
+            30, {"q" * 40: "2026-10-07T12:16:00Z"}, action="UPDATE"), 30)
+
+    def test_no_or_a_bad_ahead_file_is_as_before(self):
+        self.ahead(None, None)
+        self.assertEqual(self.stalled(
+            30, {"q" * 40: "2026-10-07T12:16:00Z"}), 30)
+        self.ahead({"size": "x"}, [])
+        self.assertEqual(self.stalled(
+            30, {"q" * 40: "2026-10-07T12:16:00Z"}), 30)
+
+
 GEN = """#!/bin/sh
 # Lists src/ in gen.txt; --check exits 1 when gen.txt is out of date.
 [ "$1" = --broken ] && { echo "broken here" >&2; exit 3; }

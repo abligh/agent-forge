@@ -692,6 +692,7 @@ be read, or isn't complete, makes nobody idle. Off without the key;
 | `idle_minutes` | `10` | How long an agent's directory entry must have been `idle` before it is offered anything: long enough to skip the pause between two turns of one task. |
 | `shell_minutes` | none (off) | How long an agent's entry must have been `shell` (its turn ended, a background task still running) before it counts as idle. Longer than `idle_minutes`, because the agent often acts on a background build when it finishes; 20 is a reasonable start. Needs agents and relay on an xmpp-mcp that reports `shell`. |
 | `report_to` | none | The agent told about a developer (not a reviewer or a collaborator) that is idle with nothing it can act on, such as whoever plans the work. Not told about itself. Without it, nobody is told. |
+| `hand_over_above` | none (off) | With `report_to`: when an agent owns more than this many issues it could act on but hasn't started (no `in-progress` label after `labels.status_prefix`), the report about an idle developer also names the agent owning the most, lists them (oldest first, at most ten), and asks for one to be handed over (designs/0038). An owner may keep this many for context; 3 is a reasonable start. Nothing is reassigned automatically. |
 
 ### `router.merge_notice`
 
