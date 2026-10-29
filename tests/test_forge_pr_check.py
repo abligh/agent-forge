@@ -2595,6 +2595,24 @@ class TickAhead(Tick):
         self.assertEqual(self.spawned, [(self.state_dir, SHA_B, 8, False, 2)])
         self.assertNotIn(SHA_P, self.state().get("ahead_started", {}))
 
+    def test_the_mergers_head_held_for_its_batch_puts_the_top_first(self):
+        # 2026-10-29: #5586's head was held for its batch's top, and
+        # heads that had waited max_wait took every free slot for 32
+        # minutes, so the next merge waited on a run nobody started.
+        why = "its tree is in the Merger's batch"
+        self.write_state({"waiting": {
+            SHA_A: {"pr": 7, "since": pc.iso(T0)},
+            SHA_B: {"pr": 8, "since": pc.iso(
+                T0 - datetime.timedelta(minutes=31))}}})
+        with mock.patch.object(pc, "MAX_WAIT",
+                               datetime.timedelta(minutes=30)), \
+                mock.patch.object(pc, "batch_heads",
+                                  lambda *a, **k: {SHA_A: why}):
+            self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
+                      merger_dir=self.merger())
+        self.assertEqual(self.spawned[0][1], SHA_P)
+        self.assertIn("HELD #7 %s: %s" % (SHA_A[:10], why), self.lines)
+
     def test_put_first(self):
         self.assertTrue(pc.put_first({"urgent": True}))
         self.assertFalse(pc.put_first({"urgent": True, "errors": 1}))
