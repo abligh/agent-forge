@@ -208,11 +208,12 @@ STUCK = {"retarget": bool, "self_blocked": bool, "draft_hours": int}
 OWNERS = {"triage": str}
 UNREVIEWED = {"ignore": list, "depth2": list}
 RECEIVER = {"address": str, "port": int, "path": str, "secret_file": str,
-            "max_body": int, "ticks": dict, "route": list}
+            "max_body": int, "ticks": dict, "route": list,
+            "run_timeout": int}
 # The webhook events forge-receiver reads; `receiver.ticks` keys are
 # these. bin/forge-receiver says when each one gives a tool work.
 RECEIVER_EVENTS = ("issues", "issue_comment", "pull_request",
-                   "pull_request_review", "status", "push")
+                   "pull_request_review", "status", "check_suite", "push")
 # The receiver reads at most eight digits of Content-Length.
 RECEIVER_MAX_BODY = 99999999
 CLOSING_KEYWORDS = {"enforced_by": str, "rerun": str}
@@ -1262,6 +1263,9 @@ def _check_receiver(receiver, problems):
     if _is(cap, int) and not 1 <= cap <= RECEIVER_MAX_BODY:
         problems.append("receiver.max_body must be from 1 to %d"
                         % RECEIVER_MAX_BODY)
+    run_timeout = receiver.get("run_timeout")
+    if _is(run_timeout, int) and run_timeout < 1:
+        problems.append("receiver.run_timeout must be at least 1")
     for event, tools in receiver.get("ticks", {}).items():
         where = "receiver.ticks.%s" % event
         if event.startswith("_"):
