@@ -189,6 +189,10 @@ none can merge anything before it has its verdict), nor before a head
 put first on purpose (`labels.urgent`, `checks.first_authors`) or one
 that has waited `max_wait_minutes`.
 
+When a head of the Merger's own pull request is held for its batch's
+top (below), that top goes first instead, before every other waiting
+head: its run is the one the next merge waits on.
+
 Nothing after an entry whose tree is red here is started: every later
 prediction contains that pull request, so it would only be red too.
 
@@ -3164,6 +3168,14 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 save(state_dir, state)
         # What the lane just took is as good as running.
         taken = set(busy) | set(twins) | ({fast[0]} if fast else set())
+        # A head of the Merger's own pull request held for its batch's
+        # top: the top's run is the one the next merge waits on, so it
+        # goes first, as the head itself would (2026-10-29: #5586 waited
+        # 32 minutes while overdue heads took every free slot).
+        front_held = first_pr is not None and any(
+            state["waiting"].get(s, {}).get("pr") == first_pr
+            and not state["waiting"].get(s, {}).get("main")
+            for s in twins)
         if free:
             pick = next_head(state, taken | set(held), first_pr, when,
                              cheap, urgent) if fresh else \
@@ -3182,7 +3194,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 # own verdict, and a pick put before it would otherwise
                 # let predictions starve both. With spare_slots_only
                 # (designs/0014), never before an ordinary pick.
-                if not merger_head_waits(state, first_pr, taken, when) and (
+                if front_held or not merger_head_waits(
+                        state, first_pr, taken, when) and (
                         pick is None or not SPARE_ONLY and not (
                         pick[1] == first_pr
                         or overdue(state["waiting"][pick[0]], when)
