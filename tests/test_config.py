@@ -760,7 +760,7 @@ class Check(unittest.TestCase):
             "issues": ["", [], ["tools/x"], [".x"], [1], 2]}}), [
             "receiver.ticks.release: not an event the receiver reads "
             "(issues, issue_comment, pull_request, pull_request_review, "
-            "status, push)",
+            "status, check_suite, push)",
             "receiver.ticks.status must be a list"] + [
             "receiver.ticks.issues[%d] must be a tool's name or a non-empty "
             "list of strings starting with one" % i for i in range(6)])

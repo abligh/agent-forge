@@ -13,8 +13,13 @@ latency, not merges or wakes, because cron's runs still happen.
 
 Its settings are the `receiver` section of the project's configuration,
 read from the cron checkout (`$FORGE_CRON_CHECKOUT`, or `--checkout`)
-once, at start; a change takes effect on a restart.
-docs/config.md lists the keys. It listens on `address`:`port` (default
+at start. docs/config.md lists the keys. **It restarts itself:** every
+WATCH_S it looks at the configuration and at its own file (followed
+through links, so a forge-install of a new release counts), and when
+either has changed it logs `RESTART:`, lets a run in progress finish,
+and exits 0. The service manager starts the new one, so the unit needs
+`Restart=always` (examples/forge-receiver.service has it). Keys still
+waiting out their debounce are left to cron. It listens on `address`:`port` (default
 127.0.0.1:8789; `$FORGE_RECEIVER_PORT` or `--port` override the port),
 at `path` (default `/hook`), usually behind a TLS proxy. It faces the
 internet, so a delivery is checked in this order, and nothing is parsed
@@ -29,7 +34,11 @@ before the signature:
    secret, compared with `hmac.compare_digest`, or `401`.
    `X-Hub-Signature` (SHA-1) is never accepted;
 4. an `X-GitHub-Delivery` seen in the last DEDUPE_KEEP is answered
-   `202` and dropped;
+   `202` and dropped. The IDs are kept in `seen-deliveries.json` in the
+   state directory (`agent_forge.locks.state_dir(project, "receiver")`),
+   so a restart remembers them. A delivery whose handling fails is
+   forgotten again and answered `500`, so GitHub's redelivery can bring
+   it back;
 5. what the event gives work, below. Anything else, `ping` included, is
    answered `202` and ignored.
 
@@ -41,26 +50,35 @@ tools work only when:
   `opened`, `reopened`, `synchronize` or `ready_for_review`;
 * `pull_request_review`: an approval was submitted;
 * `status`: the build check's status (`checks.context`) went `success`;
+* `check_suite`: a suite `completed` with the conclusion `success`;
 * `push`: to the default branch, after which an approved head is
   behind it and needs updating;
 * `issues`, `issue_comment`: any delivery naming an item.
 
 **Routing.** With `route` set (an argument list with `{items}` in it),
 the item each `issues`, `issue_comment`, `pull_request` and
-`pull_request_review` event names, an `int`, is routed too. A `status`
+`pull_request_review` event names, an `int`, is routed too, and so is
+each pull request a `completed` `check_suite` lists, whatever its
+conclusion (GitHub Actions' results move turns too). A `status`
 for `checks.context` names a commit, which the worker maps to its open
 pull requests with one API call as the Merger's App (`merge.merger`);
 other contexts are ignored. Without `route`, nothing is routed and no
 token is minted.
 
 It answers `202` and never runs anything in the request. A worker waits
-DEBOUNCE_S after a key's first event, so a burst on one item makes one
-run, then ticks each tool due, in the order the table first names them,
-and then the router once with `{items}` as `N[,N]`. Each runs as
+until DEBOUNCE_S have passed since a key's latest event, so a burst on
+one item makes one run, but no longer than DEBOUNCE_CAP_S after its
+first, so a steady stream can't hold it off for ever. Then it ticks each
+tool due, in the order the table first names them, and then the router
+once with `{items}` as `N[,N]`. Each runs as
 
     forge-cron-run TOOL [ARGS...]
 
-with an argument list, never a shell, and `$FORGE_CRON_CHECKOUT` set:
+with an argument list, never a shell, a leading `~` in any argument
+made the run's HOME, at most `run_timeout` seconds (default 600; one
+that runs over is stopped, logged as `TIMEOUT:` and the worker carries
+on, so one stuck run can't hold up every event behind it), and
+`$FORGE_CRON_CHECKOUT` set:
 from the reviewed checkout, under the cron jobs' locks, logging where
 cron's runs log. A `forge-` tool is this installation's, anything else
 the project's `tools/`. An extra tick changes nothing but timing: the
@@ -73,12 +91,9 @@ The secret is read once, at start, from `secret_file` (default
 0600. It refuses to start if the file is missing, empty or readable by
 anyone else. The secret is never printed.
 
-**Seams, not yet built.** De-duplication is in memory (`Seen`), so a
-restart forgets it; one that survives a restart would keep its IDs in
-the state directory (`agent_forge.locks.state_dir(project,
-"receiver")`). A sweep that asks GitHub to redeliver what was missed
-would hand each recovered delivery to `accept`, which does everything
-after the signature.
+**A seam, not yet built.** A sweep that asks GitHub to redeliver what
+was missed would hand each recovered delivery to `accept`, which does
+everything after the signature, against the same `Seen`.
 
 Exit 2 when it cannot start (no checkout or configuration, no secret,
 the port taken); otherwise it runs until stopped.
@@ -94,15 +109,23 @@ import os
 import re
 import stat
 import sys
+import tempfile
 import threading
 import time
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(BIN))
-from agent_forge import config, github as forge_github, proc  # noqa: E402
+from agent_forge import config, github as forge_github, locks, proc  # noqa: E402,E501
 
 DEDUPE_KEEP = 5000
 DEBOUNCE_S = 20
+# The longest a key waits after its first event, however many follow.
+DEBOUNCE_CAP_S = 3 * DEBOUNCE_S
+# How often it looks for a changed configuration or a new install.
+WATCH_S = 5
+# The exit status proc.sh gives a run it stopped at its timeout.
+TIMED_OUT = 124
+SEEN_FILE = "seen-deliveries.json"
 DEFAULT_CONTEXT = "vm/build-and-test"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # The `pull_request` actions that leave a head for the build check.
@@ -138,6 +161,8 @@ TOOL_ORDER = []
 # The router's argument list, with "{items}" to fill; None to route
 # nothing.
 ROUTE = None
+# Seconds a tick or the router may run before it is stopped.
+RUN_TIMEOUT = 600
 
 
 def configure(project):
@@ -146,6 +171,7 @@ def configure(project):
     repository and its default branch."""
     global REPO_SLUG, MAIN_REF, STATUS_CONTEXT, ACT_AS, ADDRESS, PORT
     global PATH, MAX_BODY, SECRET_FILE, TICKS, TOOL_ORDER, ROUTE
+    global RUN_TIMEOUT
     receiver = project.section("receiver")
     REPO_SLUG = project.repo
     MAIN_REF = "refs/heads/" + project.default_branch
@@ -167,6 +193,7 @@ def configure(project):
                         for t in tools]
         TOOL_ORDER += [t for t in TICKS[event] if t not in TOOL_ORDER]
     ROUTE = tuple(receiver["route"]) if receiver.get("route") else None
+    RUN_TIMEOUT = receiver.get("run_timeout", 600)
 
 
 def expand(path, environ):
@@ -250,6 +277,19 @@ def keys_for(event, payload):
         if payload.get("state") == "success":
             keys += ticks(event)
         return keys, None if keys else "nothing to route or tick"
+    if event == "check_suite":
+        suite = payload.get("check_suite")
+        if payload.get("action") != "completed" or not isinstance(
+                suite, dict):
+            return [], "a check suite not completed"
+        prs = suite.get("pull_requests")
+        found = sorted({n for pr in (prs if isinstance(prs, list) else [])
+                        if isinstance(pr, dict)
+                        for n in [number(pr.get("number"))] if n})
+        keys = [("item", n) for n in found] if ROUTE else []
+        if suite.get("conclusion") == "success":
+            keys += ticks(event)
+        return keys, None if keys else "nothing to route or tick"
     if event == "push":
         if payload.get("ref") != MAIN_REF:
             return [], "a push to %s" % (payload.get("ref") or "-")
@@ -259,13 +299,47 @@ def keys_for(event, payload):
 
 
 class Seen:
-    """The last `keep` delivery IDs, oldest dropped first. In memory: the
-    seam for de-duplication that survives a restart."""
+    """The last `keep` delivery IDs, oldest dropped first. With a `path`
+    they are kept in that file, a JSON list, so a restart remembers
+    them; a file missing or unreadable starts empty, since forgetting
+    costs only a run that changes nothing."""
 
-    def __init__(self, keep=DEDUPE_KEEP):
+    def __init__(self, keep=DEDUPE_KEEP, path=None):
         self.keep = keep
+        self.path = path
         self.ids = collections.OrderedDict()
         self.lock = threading.Lock()
+        for delivery in self.load()[-keep:]:
+            self.ids[delivery] = None
+
+    def load(self):
+        if not self.path:
+            return []
+        try:
+            with open(self.path) as handle:
+                got = json.load(handle)
+        except (OSError, ValueError):
+            return []
+        return [d for d in got if isinstance(d, str)] \
+            if isinstance(got, list) else []
+
+    def save(self):
+        """Write the IDs atomically: a new file renamed over the old."""
+        if not self.path:
+            return
+        where = os.path.dirname(self.path) or "."
+        tmp = None
+        try:  # a full disk costs only memory across a restart
+            fd, tmp = tempfile.mkstemp(prefix=".seen-", dir=where)
+            with os.fdopen(fd, "w") as handle:
+                json.dump(list(self.ids), handle)
+            os.replace(tmp, self.path)
+        except OSError:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     def first(self, delivery):
         """True the first time `delivery` is offered."""
@@ -275,31 +349,43 @@ class Seen:
             self.ids[delivery] = None
             while len(self.ids) > self.keep:
                 self.ids.popitem(last=False)
+            self.save()
             return True
+
+    def forget(self, delivery):
+        """Drop `delivery`, so a redelivery of it is taken again."""
+        with self.lock:
+            if self.ids.pop(delivery, False) is None:
+                self.save()
 
 
 class Debouncer:
-    """Collects keys; `due` hands back those whose first event is
-    `wait_s` old."""
+    """Collects keys; `due` hands back those whose latest event is
+    `wait_s` old, or whose first is `cap_s` old. `pending` maps each key
+    to (first, latest)."""
 
-    def __init__(self, wait_s=DEBOUNCE_S, clock=time.monotonic):
+    def __init__(self, wait_s=DEBOUNCE_S, clock=time.monotonic, cap_s=None):
         self.wait_s = wait_s
+        self.cap_s = 3 * wait_s if cap_s is None else cap_s
         self.clock = clock
         self.pending = {}
         self.cond = threading.Condition()
 
     def add(self, kind, value):
         with self.cond:
-            self.pending.setdefault((kind, value), self.clock())
+            now = self.clock()
+            first, _ = self.pending.get((kind, value), (now, now))
+            self.pending[(kind, value)] = (first, now)
             self.cond.notify()
 
     def due(self):
         """Remove and return the keys whose wait is over, oldest first."""
         with self.cond:
             now = self.clock()
-            ready = sorted((k for k, t in self.pending.items()
-                            if now - t >= self.wait_s),
-                           key=self.pending.get)
+            ready = sorted((k for k, (first, latest) in self.pending.items()
+                            if now - latest >= self.wait_s
+                            or now - first >= self.cap_s),
+                           key=lambda k: self.pending[k][0])
             for key in ready:
                 del self.pending[key]
             return ready
@@ -328,11 +414,16 @@ def accept(event, delivery, body, seen, debouncer):
         payload = json.loads(body)
     except ValueError:
         return 400, "not JSON", "not JSON"
-    keys, why = keys_for(event, payload)
-    if not keys:
-        return 202, "ignored", "ignored (%s)" % why
-    for kind, value in keys:
-        debouncer.add(kind, value)
+    try:
+        keys, why = keys_for(event, payload)
+        if not keys:
+            return 202, "ignored", "ignored (%s)" % why
+        for kind, value in keys:
+            debouncer.add(kind, value)
+    except Exception as err:  # GitHub redelivers what was answered 500
+        if delivery:
+            seen.forget(delivery)
+        return 500, "failed", "FAILED: %s: %s" % (type(err).__name__, err)
     return 202, "accepted", ", ".join("%s %s" % (kind, shown(kind, value))
                                       for kind, value in keys)
 
@@ -396,14 +487,28 @@ def current_bin():
     return os.path.dirname(os.path.realpath(__file__))
 
 
-def cron_command(argv, here=None):
-    """`argv` as forge-cron-run runs it, from the current installation."""
-    return [os.path.join(here or current_bin(), "forge-cron-run")] + list(argv)
+def cron_command(argv, here=None, env=None):
+    """`argv` as forge-cron-run runs it, from the current installation,
+    with a leading ~ in any argument made `env`'s HOME."""
+    env = os.environ if env is None else env
+    return [os.path.join(here or current_bin(), "forge-cron-run")] + [
+        expand(a, env) for a in argv]
 
 
-def router_command(items, here=None):
+def router_command(items, here=None, env=None):
     numbers = ",".join(str(n) for n in items)
-    return cron_command([a.replace("{items}", numbers) for a in ROUTE], here)
+    return cron_command([a.replace("{items}", numbers) for a in ROUTE], here,
+                        env)
+
+
+def run_one(command, name, out, run, env):
+    """Run `command` under RUN_TIMEOUT and report how it ended."""
+    got = run(command, env=env, timeout=RUN_TIMEOUT)
+    if got.returncode == TIMED_OUT:
+        out("TIMEOUT: %s stopped after %ds" % (name, RUN_TIMEOUT))
+    else:
+        out("%s exit %d" % (name, got.returncode))
+    return got.returncode
 
 
 def route(keys, github_for, out, run=proc.sh, env=None):
@@ -412,17 +517,14 @@ def route(keys, github_for, out, run=proc.sh, env=None):
     tools = {value for kind, value in keys if kind == "tool"}
     for argv in [t for t in TOOL_ORDER if t in tools]:
         out("ticking %s" % " ".join(argv))
-        got = run(cron_command(argv), env=env)
-        out("%s exit %d" % (argv[0], got.returncode))
+        run_one(cron_command(argv, env=env), argv[0], out, run, env)
     if not ROUTE:
         return None
     items = items_of([k for k in keys if k[0] != "tool"], github_for, out)
     if not items:
         return None
     out("routing %s" % ", ".join("#%d" % n for n in items))
-    got = run(router_command(items), env=env)
-    out("%s exit %d" % (ROUTE[0], got.returncode))
-    return got.returncode
+    return run_one(router_command(items, env=env), ROUTE[0], out, run, env)
 
 
 def worker(debouncer, github_for, out, stop, run=proc.sh, env=None):
@@ -435,6 +537,43 @@ def worker(debouncer, github_for, out, stop, run=proc.sh, env=None):
                 out("ROUTE-FAILED: %s" % err)
             continue
         debouncer.wait(1)
+
+
+class Watch:
+    """What the receiver started from: its own file and the
+    configuration, each followed through links to (path, inode, mtime).
+    `changed` names the first that is no longer so, or None."""
+
+    def __init__(self, paths):
+        self.paths = list(paths)
+        self.marks = [self.mark(p) for p in self.paths]
+
+    @staticmethod
+    def mark(path):
+        real = os.path.realpath(path)
+        try:
+            info = os.stat(real)
+        except OSError:
+            return (real, None, None)
+        return (real, info.st_ino, info.st_mtime_ns)
+
+    def changed(self):
+        for path, was in zip(self.paths, self.marks):
+            if self.mark(path) != was:
+                return path
+        return None
+
+
+def watch_loop(watch, stop, out, on_change, interval=WATCH_S):
+    """Until `stop`, look every `interval` s; on a change, say so, call
+    `on_change` once and return."""
+    while not stop.wait(interval):
+        what = watch.changed()
+        if what:
+            out("RESTART: %s changed; exiting so the service manager starts "
+                "the new one" % what)
+            on_change()
+            return
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -540,8 +679,12 @@ def main(argv=None, out=None, environ=None, run=proc.sh):
     if port is None:
         port = int(environ.get("FORGE_RECEIVER_PORT") or PORT)
     debouncer = Debouncer()
+    seen = Seen(path=os.path.join(
+        locks.state_dir(project.name, "receiver", environ), SEEN_FILE))
+    watch = Watch([os.path.abspath(__file__),
+                   os.path.join(checkout, config.CONFIG_NAME)])
     try:
-        server = make_server(port, secret, out, debouncer)
+        server = make_server(port, secret, out, debouncer, seen)
     except OSError as err:
         out("NO-PORT: %s:%d: %s" % (ADDRESS, port, err.strerror))
         return 2
@@ -554,8 +697,11 @@ def main(argv=None, out=None, environ=None, run=proc.sh):
 
     env = dict(environ, FORGE_CRON_CHECKOUT=checkout)
     stop = threading.Event()
-    threading.Thread(target=worker, args=(debouncer, github_for, out, stop,
-                                          run, env), daemon=True).start()
+    work = threading.Thread(target=worker, args=(
+        debouncer, github_for, out, stop, run, env), daemon=True)
+    work.start()
+    threading.Thread(target=watch_loop, args=(
+        watch, stop, out, server.shutdown, WATCH_S), daemon=True).start()
     out("listening on %s:%d%s" % (ADDRESS, port, PATH))
     try:
         server.serve_forever()
@@ -564,6 +710,9 @@ def main(argv=None, out=None, environ=None, run=proc.sh):
     finally:
         stop.set()
         server.server_close()
+        # A run in progress finishes: the service manager would stop
+        # what it started along with this process.
+        work.join(RUN_TIMEOUT)
     return 0
 
 

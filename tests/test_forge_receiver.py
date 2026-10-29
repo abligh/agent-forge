@@ -348,20 +348,213 @@ class DedupeTest(unittest.TestCase):
         self.assertFalse(seen.first("d"))
 
 
+class PersistentSeenTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = os.path.join(tmp.name, rc.SEEN_FILE)
+
+    def test_a_restart_remembers_the_ids(self):
+        seen = rc.Seen(path=self.path)
+        self.assertTrue(seen.first("a"))
+        self.assertTrue(seen.first("b"))
+        again = rc.Seen(path=self.path)
+        self.assertFalse(again.first("a"))
+        self.assertTrue(again.first("c"))
+
+    def test_the_bound_holds_across_a_restart(self):
+        seen = rc.Seen(keep=2, path=self.path)
+        for d in "abc":
+            seen.first(d)
+        with open(self.path) as handle:
+            self.assertEqual(json.load(handle), ["b", "c"])
+        self.assertEqual(list(rc.Seen(keep=1, path=self.path).ids), ["c"])
+
+    def test_a_missing_or_corrupt_file_starts_empty(self):
+        self.assertEqual(list(rc.Seen(path=self.path).ids), [])
+        for junk in ("not json", '{"a": 1}', '["a", 3]'):
+            with open(self.path, "w") as handle:
+                handle.write(junk)
+            seen = rc.Seen(path=self.path)
+            self.assertEqual(list(seen.ids), ["a"] if "[" in junk else [])
+            self.assertTrue(seen.first("z"))
+
+    def test_the_write_is_atomic_and_leaves_no_temporary_file(self):
+        seen = rc.Seen(path=self.path)
+        seen.first("a")
+        self.assertEqual(os.listdir(os.path.dirname(self.path)),
+                         [rc.SEEN_FILE])
+
+    def test_a_forgotten_delivery_is_taken_again(self):
+        seen = rc.Seen(path=self.path)
+        seen.first("a")
+        seen.forget("a")
+        seen.forget("never")
+        self.assertTrue(rc.Seen(path=self.path).first("a"))
+
+    def test_without_a_path_nothing_is_written(self):
+        seen = rc.Seen()
+        seen.first("a")
+        self.assertEqual(os.listdir(os.path.dirname(self.path)), [])
+
+
+class AcceptFailureTest(unittest.TestCase):
+    def setUp(self):
+        configure()
+        self.addCleanup(configure)
+
+    def test_a_delivery_that_fails_is_forgotten_and_answered_500(self):
+        class Broken(rc.Debouncer):
+            def add(self, kind, value):
+                raise RuntimeError("disk full")
+        seen = rc.Seen()
+        body = json.dumps({"issue": {"number": 4}}).encode()
+        got = rc.accept("issues", "d-9", body, seen, Broken())
+        self.assertEqual(got[:2], (500, "failed"))
+        self.assertEqual(got[2], "FAILED: RuntimeError: disk full")
+        good = rc.Debouncer(clock=Clock())
+        self.assertEqual(rc.accept("issues", "d-9", body, seen, good)[:2],
+                         (202, "accepted"))
+
+    def test_bad_json_stays_seen(self):
+        seen = rc.Seen()
+        rc.accept("issues", "d-1", b"nope", seen, rc.Debouncer())
+        self.assertFalse(seen.first("d-1"))
+
+
+class CheckSuiteTest(unittest.TestCase):
+    def setUp(self):
+        configure(ticks={"check_suite": ["forge-merger"]})
+        self.addCleanup(configure)
+
+    def suite(self, **kw):
+        data = {"conclusion": "success",
+                "pull_requests": [{"number": 8}, {"number": 3}]}
+        data.update(kw)
+        return {"action": "completed", "check_suite": data}
+
+    def test_a_green_suite_routes_its_prs_and_ticks(self):
+        keys, why = rc.keys_for("check_suite", self.suite())
+        self.assertEqual(keys, [("item", 3), ("item", 8),
+                                ("tool", MERGER)])
+
+    def test_a_red_suite_routes_only(self):
+        keys, _ = rc.keys_for("check_suite", self.suite(conclusion="failure"))
+        self.assertEqual(keys, [("item", 3), ("item", 8)])
+
+    def test_bad_numbers_are_dropped(self):
+        keys, _ = rc.keys_for("check_suite", self.suite(
+            conclusion="failure", pull_requests=[
+                {"number": True}, {"number": "4"}, {"number": -1}, "x",
+                {"number": 6}]))
+        self.assertEqual(keys, [("item", 6)])
+        keys, why = rc.keys_for("check_suite", self.suite(
+            conclusion="failure", pull_requests="x"))
+        self.assertEqual((keys, why), ([], "nothing to route or tick"))
+
+    def test_only_a_completed_suite_counts(self):
+        payload = self.suite()
+        payload["action"] = "requested"
+        self.assertEqual(rc.keys_for("check_suite", payload),
+                         ([], "a check suite not completed"))
+        self.assertEqual(rc.keys_for("check_suite", {"action": "completed"}),
+                         ([], "a check suite not completed"))
+
+    def test_without_a_route_only_the_tick(self):
+        configure(ticks={"check_suite": ["forge-merger"]}, route=None)
+        self.assertEqual(rc.keys_for("check_suite", self.suite())[0],
+                         [("tool", MERGER)])
+
+    def test_the_configuration_takes_check_suite(self):
+        data = example()
+        data["receiver"]["ticks"]["check_suite"] = ["forge-merger"]
+        self.assertEqual(config.check(data), [])
+
+
+class WatchTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.conf = os.path.join(tmp.name, "config.json")
+        with open(self.conf, "w") as handle:
+            handle.write("{}")
+        for v in ("v1", "v2"):
+            os.makedirs(os.path.join(tmp.name, v))
+            with open(os.path.join(tmp.name, v, "forge-receiver"),
+                      "w") as handle:
+                handle.write(v)
+        self.link = os.path.join(tmp.name, "current")
+        os.symlink("v1", self.link)
+        self.me = os.path.join(self.link, "forge-receiver")
+
+    def test_nothing_changed(self):
+        self.assertIsNone(rc.Watch([self.me, self.conf]).changed())
+
+    def test_a_new_install_is_a_change(self):
+        watch = rc.Watch([self.me, self.conf])
+        os.remove(self.link)
+        os.symlink("v2", self.link)
+        self.assertEqual(watch.changed(), self.me)
+
+    def test_a_rewritten_configuration_is_a_change(self):
+        watch = rc.Watch([self.me, self.conf])
+        tmp = self.conf + ".new"
+        with open(tmp, "w") as handle:
+            handle.write('{"x": 1}')
+        os.replace(tmp, self.conf)
+        self.assertEqual(watch.changed(), self.conf)
+
+    def test_a_vanished_file_is_a_change(self):
+        watch = rc.Watch([self.me, self.conf])
+        os.remove(self.conf)
+        self.assertEqual(watch.changed(), self.conf)
+
+    def test_the_loop_says_so_and_calls_back_once(self):
+        lines, calls = [], []
+        watch = rc.Watch([self.conf])
+        os.remove(self.conf)
+        stop = threading.Event()
+        rc.watch_loop(watch, stop, lines.append, lambda: calls.append(1),
+                      interval=0.01)
+        self.assertEqual(calls, [1])
+        self.assertTrue(lines[0].startswith("RESTART: %s changed"
+                                            % self.conf))
+
+    def test_the_loop_ends_on_stop(self):
+        stop = threading.Event()
+        stop.set()
+        rc.watch_loop(rc.Watch([self.conf]), stop, print,
+                      lambda: self.fail("called"), interval=0.01)
+
+
 class DebounceTest(unittest.TestCase):
-    def test_a_burst_makes_one_key_due_after_the_wait(self):
+    def test_a_burst_makes_one_key_due_after_its_latest_event(self):
         clock = Clock()
         d = rc.Debouncer(wait_s=20, clock=clock)
         d.add("item", 5)
         clock.now += 15
         d.add("item", 5)
         d.add("item", 6)
-        self.assertEqual(d.due(), [])
         clock.now += 5
-        self.assertEqual(d.due(), [("item", 5)])
+        self.assertEqual(d.due(), [])  # 5's latest event is 5 s old
         clock.now += 15
-        self.assertEqual(d.due(), [("item", 6)])
+        self.assertEqual(d.due(), [("item", 5), ("item", 6)])
         self.assertEqual(d.due(), [])
+
+    def test_a_steady_stream_is_due_at_the_cap(self):
+        clock = Clock()
+        d = rc.Debouncer(wait_s=20, clock=clock)
+        self.assertEqual(d.cap_s, 60)
+        for _ in range(5):
+            d.add("item", 5)
+            self.assertEqual(d.due(), [])
+            clock.now += 12
+        self.assertEqual(d.due(), [("item", 5)])
+
+    def test_the_cap_follows_the_module_s_default(self):
+        self.assertEqual(rc.DEBOUNCE_CAP_S, 3 * rc.DEBOUNCE_S)
+        self.assertEqual(rc.Debouncer().cap_s, rc.DEBOUNCE_CAP_S)
 
     def test_items_and_commits_due_together(self):
         clock = Clock()
@@ -467,6 +660,44 @@ class RouteTest(unittest.TestCase):
         self.assertEqual(self.runs, [])
         self.assertTrue(self.lines[0].startswith("LOOKUP-FAILED: "))
 
+    def test_a_leading_tilde_is_the_run_s_home(self):
+        configure(ticks={"push": [["forge-merger", "--state-dir",
+                                   "~/m", "a~b"]]},
+                  route=["forge-router", "--state-dir", "~/r", "--only",
+                         "{items}", "~"])
+        rc.route([("tool", ("forge-merger", "--state-dir", "~/m", "a~b")),
+                  ("item", 2)], lambda: None, self.lines.append, self.run_,
+                 env={"HOME": "/h"})
+        self.assertEqual([c[1:] for c, _ in self.runs], [
+            ["forge-merger", "--state-dir", "/h/m", "a~b"],
+            ["forge-router", "--state-dir", "/h/r", "--only", "2", "/h"]])
+
+    def test_each_run_has_the_timeout(self):
+        configure(run_timeout=42)
+        rc.route([("tool", MERGER), ("item", 1)], lambda: None,
+                 self.lines.append, self.run_)
+        self.assertEqual([kw["timeout"] for _, kw in self.runs], [42, 42])
+        configure()
+        self.assertEqual(rc.RUN_TIMEOUT, 600)
+
+    def test_a_run_over_its_time_is_reported_and_the_rest_go_on(self):
+        def slow(command, **kw):
+            self.runs.append((command, kw))
+            return done(command, rc=rc.TIMED_OUT) \
+                if "forge-pr-check" in command else done(command)
+        rc.route([("tool", BUILD), ("tool", MERGER), ("item", 1)],
+                 lambda: None, self.lines.append, slow)
+        self.assertEqual(len(self.runs), 3)
+        self.assertIn("TIMEOUT: forge-pr-check stopped after 600s",
+                      self.lines)
+        self.assertIn("forge-merger exit 0", self.lines)
+
+    def test_the_configuration_checks_the_timeout(self):
+        data = example()
+        data["receiver"]["run_timeout"] = 0
+        self.assertIn("receiver.run_timeout must be at least 1",
+                      config.check(data))
+
     def test_without_a_route_nothing_is_routed_or_minted(self):
         configure(route=None)
 
@@ -571,6 +802,31 @@ class MainTest(unittest.TestCase):
         self.assertTrue(self.lines[-1].startswith(
             "NO-PORT: 127.0.0.1:%d: " % port))
 
+    def test_a_changed_configuration_exits_0_and_ids_persist(self):
+        secret = os.path.join(self.home, "secret")
+        with open(secret, "wb") as handle:
+            handle.write(SECRET)
+        os.chmod(secret, 0o600)
+        state = os.path.join(self.home, "state")
+        conf = os.path.join(self.checkout, config.CONFIG_NAME)
+
+        def touch():
+            with open(conf) as handle:
+                data = handle.read()
+            os.remove(conf)
+            with open(conf, "w") as handle:
+                handle.write(data)
+        timer = threading.Timer(0.2, touch)
+        self.addCleanup(timer.cancel)
+        timer.start()
+        with unittest.mock.patch.object(rc, "WATCH_S", 0.05):
+            got = self.main(["--port", "0"], FORGE_STATE_DIR=state)
+        self.assertEqual(got, 0)
+        self.assertTrue(any(line.startswith("RESTART: %s changed" % conf)
+                            for line in self.lines), self.lines)
+        self.assertTrue(os.path.isdir(os.path.join(state, "widget",
+                                                   "receiver")))
+
 
 class UnitTest(unittest.TestCase):
     def test_the_unit_runs_the_installed_copy_on_the_cron_checkout(self):
@@ -609,3 +865,13 @@ class InstalledBinTest(unittest.TestCase):
             first))), "v1")
         self.assertEqual(os.path.basename(os.path.dirname(os.path.dirname(
             second))), "v2")
+
+
+class SeenUnwritable(unittest.TestCase):
+    def test_a_state_directory_it_cannot_write_loses_only_persistence(self):
+        """A full disk or a missing directory never loses the delivery:
+        `first` still answers, from memory."""
+        with tempfile.TemporaryDirectory() as root:
+            seen = rc.Seen(path=os.path.join(root, "gone", "seen.json"))
+            self.assertTrue(seen.first("a"))
+            self.assertFalse(seen.first("a"))
