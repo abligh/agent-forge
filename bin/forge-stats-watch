@@ -14,9 +14,10 @@ configuration's `stats_watch.figures`:
     check_wait     the wait for a slot, p90, in minutes: the same
     pr_turnaround  a pull-request head's wait and run, median: the same
     merge_time     joined the queue to merged, median: the same
-    merge_rate     merges an hour: under `limit`, or under the
-                   baseline's over `ratio`, judged only when approved
-                   pull requests waited
+    merge_rate     merges an hour while the queue held an approved
+                   pull request: under `limit`, or under the
+                   baseline's over `ratio`, judged only when the queue
+                   held one for an hour or more
     slots_busy     the slots busy, in percent: over `limit`
     main_red       red build checks of the default branch: any
     nightly_red_hours  the hours since the last green nightly ended
@@ -26,7 +27,9 @@ configuration's `stats_watch.figures`:
 A figure from fewer than `min_samples` (default 5) samples is not
 judged, nor a `ratio` against a baseline that thin. merge_rate's
 samples are the approved pull requests that waited in the queue during
-the window, so a quiet night, with nothing to merge, is never a fault.
+the window, and its hours are only those in which the queue held at
+least one, so a quiet spell, with little or nothing to merge, is never
+a fault (designs/0024, second amendment).
 main_red is a count, not a statistic, so one red is enough, and
 nightly_red_hours is a reading of forge-nightly's state at the end of
 the window, so `min_samples` doesn't apply to it either.
@@ -138,6 +141,21 @@ def forge_stats(environ):
     return stats
 
 
+MIN_HELD_HOURS = 1
+
+
+def merge_rate(queue, hours):
+    """Merges an hour over the hours the queue held an approved pull
+    request; None when it held one for less than MIN_HELD_HOURS. An
+    older forge-stats, without `held_seconds`, gives merges over the
+    whole window."""
+    held = queue.get("held_seconds")
+    if held is None:
+        return queue.get("merges", 0) / hours if hours else None
+    held /= 3600
+    return queue.get("merges", 0) / held if held >= MIN_HELD_HOURS else None
+
+
 def figures(stats, hours):
     """{figure: (value, samples)} from forge-stats' JSON over `hours`,
     in the units `limit` is given in; values None where there were no
@@ -159,8 +177,7 @@ def figures(stats, hours):
         "pr_turnaround": minutes(
             check.get("pull_request_seen_to_verdict") or {}, "median"),
         "merge_time": minutes(queue.get("queue_to_merge") or {}, "median"),
-        "merge_rate": ((queue.get("merges", 0) / hours if hours else None),
-                       waiting),
+        "merge_rate": (merge_rate(queue, hours), waiting),
         "slots_busy": (None if busy is None else 100 * busy, ran),
         "main_red": ((check.get("red") or {}).get("main", 0),
                      (check.get("runs") or {}).get("main", 0)),
@@ -204,6 +221,9 @@ def judge(figure, rules, window, baseline, min_samples):
                     "red for %s" % show(figure, value))
     if figure == "merge_rate" and not n:
         return UNJUDGED, "no approved pull request waited"
+    if figure == "merge_rate" and value is None:
+        return UNJUDGED, ("the queue held approved work for under %d h"
+                          % MIN_HELD_HOURS)
     if value is None or n < min_samples:
         return UNJUDGED, "%d samples, fewer than %d" % (n, min_samples)
     ratio = rules.get("ratio")
