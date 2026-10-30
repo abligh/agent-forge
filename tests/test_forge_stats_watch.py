@@ -29,7 +29,7 @@ def spread(minutes, n=10, p90=None):
 
 
 def stats(ran=6, waited=2, pr=8, merge=20, merges=12, waiting=12,
-          busy=0.5, main_red=0, main_runs=6, n=10):
+          busy=0.5, main_red=0, main_runs=6, n=10, held=None):
     """forge-stats' JSON, with the figures the watch reads."""
     return {"check": {
         "ran": spread(ran, n), "waited": spread(waited, n, waited),
@@ -37,7 +37,8 @@ def stats(ran=6, waited=2, pr=8, merge=20, merges=12, waiting=12,
         "busy_share": busy, "red": {"main": main_red} if main_red else {},
         "runs": {"main": main_runs}},
         "queue": {"queue_to_merge": spread(merge, n), "merges": merges,
-                  "waiting": waiting}}
+                  "waiting": waiting,
+                  **({} if held is None else {"held_seconds": held * 3600})}}
 
 
 class FakeGitHub:
@@ -127,6 +128,11 @@ class Judge(unittest.TestCase):
         got = self.judge("merge_rate", (0, 0), (2, 300))
         self.assertEqual(got, (tool.UNJUDGED,
                                "no approved pull request waited"))
+
+    def test_merge_rate_held_under_an_hour_is_not_judged(self):
+        got = self.judge("merge_rate", (None, 6), (8, 300), {"limit": 6})
+        self.assertEqual(got, (tool.UNJUDGED, "the queue held approved "
+                               "work for under 1 h"))
 
     def test_main_red_trips_on_any(self):
         self.assertEqual(self.judge("main_red", (1, 1))[0], tool.OUT)
@@ -448,3 +454,33 @@ class ForgeStats(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MergeRateOverHeldHours(unittest.TestCase):
+    """designs/0024, second amendment: merges an hour counts only the
+    hours the queue held an approved pull request."""
+
+    def test_a_quiet_afternoon_is_not_a_slow_queue(self):
+        # 32 merges in 6 h is 5.3 an hour, but the queue held work for
+        # only 2.7 h of them: 11.9 an hour while there was work.
+        rate, n = tool.figures(stats(merges=32, waiting=32, held=2.7),
+                               6)["merge_rate"]
+        self.assertAlmostEqual(rate, 32 / 2.7)
+        self.assertEqual(tool.judge("merge_rate", {"limit": 6},
+                                    (rate, n), (None, 0), 5)[0], tool.IN)
+
+    def test_a_slow_queue_with_work_waiting_is_still_out(self):
+        rate, n = tool.figures(stats(merges=12, waiting=20, held=6),
+                               6)["merge_rate"]
+        self.assertEqual(rate, 2)
+        self.assertEqual(tool.judge("merge_rate", {"limit": 6},
+                                    (rate, n), (None, 0), 5)[0], tool.OUT)
+
+    def test_held_under_an_hour_gives_no_rate(self):
+        self.assertEqual(tool.figures(stats(merges=3, waiting=5,
+                                            held=0.5), 6)["merge_rate"],
+                         (None, 5))
+
+    def test_without_held_seconds_the_whole_window_counts(self):
+        self.assertEqual(tool.figures(stats(merges=12), 6)["merge_rate"],
+                         (2, 12))

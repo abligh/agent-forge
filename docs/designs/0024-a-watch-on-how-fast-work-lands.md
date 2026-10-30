@@ -159,3 +159,30 @@ line.
 2. `merge_rate` takes a `limit`, a floor: it's out of line under it,
    judged with or without a baseline, and still only when approved
    pull requests waited.
+
+## Second amendment (2026-10-30): merges an hour while there is work to merge
+
+* Status: approved (Alex Bligh, 2026-10-30, in the terminal: "agent-forge #172 - yes!"; https://github.com/abligh/agent-forge/issues/172)
+
+**Why.** `merge_rate` is judged only when approved pull requests
+waited, so that a low rate with nothing to merge is not reported as a
+slow queue. But `forge-stats` counts as waiting every pull request
+that was in the queue at any tick of the window, and every merged one
+was, so any merge made the rate judged. On 30 October a 6 h window had
+32 merges, 10, 11 and 7 an hour in its first three hours, then 3, 3
+and 0 as authors went idle, the queue empty from the fifth hour. The
+watch reported 5.3 an hour, under the limit of 6. The queue had held
+approved work for 2.7 h of the 6, and merged 11.8 an hour while it
+did.
+
+**Change.**
+1. `forge-stats` also reports, for the merge queue, how long the
+   queue held at least one approved pull request in the window
+   (`held_seconds`): from each tick of the Merger to the next, the
+   queue is as the first saw it, and the last tick's state lasts to
+   the window's end, so a Merger that stops ticking while work waits
+   counts as slow, not idle. The report gives merges an hour over
+   that time beside merges an hour over the window.
+2. `merge_rate` is merges over those hours, for the window and the
+   baseline alike, and is not judged when the queue held work for less
+   than an hour. `limit` and `ratio` apply to it as before.

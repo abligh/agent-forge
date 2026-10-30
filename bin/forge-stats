@@ -23,8 +23,10 @@ defaults to the last `--hours` (24) up to now.
 **The merge queue** (`merger.jsonl`):
 - merges in the window, and per hour;
 - how many approved pull requests waited in the queue during the
-  window (`waiting`, in the JSON), so a low rate with nothing to merge
-  can be told from a slow queue;
+  window (`waiting`, in the JSON), and for how long the queue held at
+  least one (`held_seconds`): merges over that time is the rate while
+  there was work to merge, so a low rate with little to merge can be
+  told from a slow queue;
 - for each merge, the time since its head last joined the queue;
 - hand-backs by cause, each (pull request, head, cause) counted once.
 
@@ -201,9 +203,18 @@ def queue_stats(records, since, until):
     """Merges, queue times and hand-backs from merger.jsonl's records."""
     entered, previous = {}, set()
     merges, in_queue, handed, waiting = [], [], set(), set()
+    held, held_from = 0.0, None
+
+    def overlap(start, end):
+        return max(0.0, (min(end, until) - max(start, since))
+                   .total_seconds())
     for record in records:
         at = parse_time(record["at"])
         queue = set(record.get("queue") or [])
+        # From one tick to the next, the queue is as the first saw it.
+        if held_from is not None:
+            held += overlap(held_from, at)
+        held_from = at if queue else None
         for pr in queue - previous:
             entered[pr] = at
         previous = queue
@@ -221,13 +232,18 @@ def queue_stats(records, since, until):
             elif action == "HAND-BACK":
                 handed.add((pr, decision.get("head"),
                             cause_of(decision.get("reason") or "")))
+    if held_from is not None:
+        # The last tick held work: it held it to the window's end, or
+        # to when the Merger stopped ticking, which is no faster.
+        held += overlap(held_from, until)
     hours = collections.Counter(at.strftime("%Y-%m-%dT%H") for _, at in merges)
     causes = collections.Counter(c for _, _, c in handed)
     return {"merges": len(merges), "merged": [pr for pr, _ in merges],
             "merged_at": {pr: at for pr, at in merges},
             "per_hour": dict(sorted(hours.items())),
             "queue_to_merge": summary(in_queue),
-            "hand_backs": dict(causes), "waiting": len(waiting)}
+            "hand_backs": dict(causes), "waiting": len(waiting),
+            "held_seconds": held}
 
 
 QUERY = """query($owner: String!, $name: String!) {
@@ -596,8 +612,12 @@ def report(name, since, until, check, queue, approval, authors,
                      % (100 * check["busy_share"], check["slots"],
                         check["busy_seconds"] / 3600))
     lines += ["", "Merge queue"]
-    lines.append("  merges: %d (%.1f an hour)"
-                 % (queue["merges"], queue["merges"] / hours if hours else 0))
+    held = queue["held_seconds"] / 3600
+    lines.append("  merges: %d (%.1f an hour; %s)"
+                 % (queue["merges"], queue["merges"] / hours if hours else 0,
+                    "%.1f an hour over the %.1f h the queue held work"
+                    % (queue["merges"] / held, held) if held
+                    else "the queue never held work"))
     if queue["per_hour"]:
         lines.append("  per hour: " + " ".join(
             "%s:%d" % (h[-2:], n) for h, n in queue["per_hour"].items()))

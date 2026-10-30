@@ -108,6 +108,20 @@ class Queue(unittest.TestCase):
         self.assertEqual(tool.queue_stats(RECORDS[:1], SINCE, UNTIL)
                          ["waiting"], 0)
 
+    def test_how_long_the_queue_held_approved_work(self):
+        # From the window's start: #7 queued (held since 23:50) to the
+        # empty tick at 00:18, 18 min; #8 from 01:00 to the window's
+        # end, 60 min, the last tick in it still holding #8.
+        self.assertEqual(self.got["held_seconds"], 78 * 60)
+        self.assertEqual(tool.queue_stats(
+            [tick("2026-10-12T00:10:00Z", [])], SINCE, UNTIL)
+            ["held_seconds"], 0)
+        # A Merger that stops ticking while work waits held it to the
+        # window's end: a stalled queue is not an idle one.
+        self.assertEqual(tool.queue_stats(
+            [tick("2026-10-12T01:30:00Z", [8])], SINCE, UNTIL)
+            ["held_seconds"], 30 * 60)
+
     def test_causes(self):
         self.assertEqual(tool.cause_of("vm/x is failure: red"), "red")
         self.assertEqual(tool.cause_of("abc, after the approval, is not "
@@ -431,7 +445,8 @@ class Main(unittest.TestCase):
         self.assertIn("widget, 2026-10-12T00:00Z to 2026-10-12T02:00Z", text)
         self.assertIn("runs: 4 (main 1, prediction 1, pull request 2)", text)
         self.assertIn("slots busy: 5% of 2 slots", text)
-        self.assertIn("merges: 2 (1.0 an hour)", text)
+        self.assertIn("merges: 2 (1.0 an hour; 1.5 an hour over the 1.3 h "
+                      "the queue held work)", text)
         self.assertIn("hand-backs: conflict 1", text)
         self.assertNotIn("Approval to merge", text)
 
