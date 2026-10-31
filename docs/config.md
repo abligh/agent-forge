@@ -61,7 +61,7 @@ starts with `_` is a comment, at any level.
 | `checks` | no | The build check, `forge-pr-check`; see below. |
 | `labels` | no | The labels tools read: `owner_prefix` (default `Owner:`; `Owner:<Name>` says whose an item is), `status_prefix` (default `Status:`), `waiting_on_owner` (default `Status:waiting-owner`: the owner's turn), `waiting_external` (default `Status:waiting-external`: nobody's) and `urgent` (default none: off), a label that puts a pull request first: its waiting head is checked before every other pull request's (before `first_authors` and `max_wait_minutes`; a head that failed to prepare still goes behind, and the default branch's traced run still goes first when due), and the Merger takes it before every other candidate but the one a run is in flight for and, with `merge.test_ahead`, those already predicted. Several urgent ones go oldest first. A label anyone with triage access can set, so it is for a person to use sparingly, not agents. `rerun` (default none: off), a label that runs a red head once more ([designs/0022](designs/0022-run-a-red-head-again.md)): on a posting tick, `forge-pr-check` moves the head's red verdict into `reruns` in its state (with who put the label on, from the pull request's events, and when), queues the head as if new, takes the label off, logs `RERUN #<pr> <sha>: was red(<steps>); queued by <login>` and posts pending. The second verdict stands and its description says `(run again after red(<steps>))`. On a head already run again, the label comes off with a comment saying so; on a green, pending or unrun head it just comes off. On a head given up on after `MAX_ERRORS` failures to prepare it or host faults, it clears those counts so the head is tried again in its place, logs `RERUN #<pr> <sha>: given up after <why>; queued again by <login>` and posts pending; that doesn't use up the head's one run again. Anyone with triage access can set it; once per head bounds what it costs. The poster's App needs `issues: write`. The default branch's red head, which has no pull request, is run again the same way, once, by the label on the open `checks.main_red_issue` issue; the label comes off the issue. An instance (`checks.instances`) ignores it. |
 | `relay` | no | Where `forge-router` posts wakes, `forge-merger` its stall messages (`merge.stall_alert`) and `forge-queue` its end-of-job messages: `url`, the xmpp-webhook-relay's base (default `http://127.0.0.1:8788`), `token_file`, its environment file holding `WEBHOOK_TOKEN` (default `~/.config/xmpp-webhook-relay/token`), `remind_seconds`, how long before a turn is woken again (default 7200), and `room`, the room the agents share. |
-| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, `merge_notice` their merge notice, `stuck` their rules for stuck pull requests, `owners` their reading of whose an issue is, and `unreviewed` their issue for paths no reviewer covers (all below). `forget_minutes`, the engine's, is how long a turn no run decides is kept before it is forgotten (default 0: at once; below). `quiet_labels` lists labels that make an item nobody's turn under every default rule (below). Every key is checked. |
+| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, `merge_notice` their merge notice, `stuck` their rules for stuck pull requests, `owners` their reading of whose an issue is, `unreviewed` their issue for paths no reviewer covers, and `red_first` their putting red builds first (all below). `forget_minutes`, the engine's, is how long a turn no run decides is kept before it is forgotten (default 0: at once; below). `quiet_labels` lists labels that make an item nobody's turn under every default rule (below). Every key is checked. |
 | `closing_keywords` | no | How `forge-closing-keywords` words a refusal: `enforced_by`, what refuses a pull request it fails (default `the Merger`), and `rerun`, how to run it again once GitHub's `closingIssuesReferences` catches up with a body edit (default `run the check again (the Merger does, within a few minutes)`). A project that runs it in CI names its workflow and `gh run rerun --failed <run>`. The issues it judges are `repo`'s, and its default range starts at `default_branch`. The Merger runs it as a gate: `["forge-closing-keywords", "--pr", "{pr}", "--include-subject"]`. |
 
 ### An agent
@@ -786,6 +786,35 @@ the reasons.
 | --- | --- | --- |
 | `ignore` | none | Globs, matched as the reviewer choice matches `reviews`, of paths no reviewer needs to cover, such as a configuration directory a code owner reviews (`[".agent-forge/**"]`). Each a non-empty string. |
 | `depth2` | none | Top-level directories whose areas are two segments deep, such as one holding many packages (`["crates"]`: `crates/foo/` is an area of its own). Each a directory name with no `/`. |
+
+### `router.red_first`
+
+forge-nightly and forge-pr-check keep an issue open while the nightly
+or the default branch is red, owned by whoever owns the failed steps,
+but nothing makes its owner put other work down for it. With
+`red_first`, such an issue (forge-nightly's `issue` while its
+nightly.json is fresh and says it is open, and forge-pr-check's
+`main_red.issue`, both read from their state on the router's host) is
+its owner's turn at once, busy or not, and reminded as any turn
+(rule 20), until an open pull request by anyone references it (a
+closing reference, or `#N`, its URL or "issue N" in the body) or the
+owner comments on it. A new red run (for the default branch, the
+poster's next comment on the issue) wakes her again. In the idle
+offer, red-build issues come before the owner's other issues. With
+`router.idle_offer` too, a red-build issue no pull request references,
+red for `fallback_hours` with no comment by its owner for as long, is
+offered to the developer idle longest, other than its owner, once for
+each time it is reported red (rule 21); nothing is reassigned
+automatically. A quiet label, or a label starting `Status:waiting-`,
+parks it, as for any issue. Off without the key; `{}` turns it on
+with the defaults. `agent_forge/rules_default.py` (rules 20 and 21)
+has the detail, and
+[designs/0039](designs/0039-red-builds-go-first-for-their-owner.md)
+the reasons.
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `fallback_hours` | `2` | How long a red-build issue may go with no pull request referencing it and no comment by its owner before an idle developer is offered it. A number above 0. |
 
 ### `router.quiet_labels`
 

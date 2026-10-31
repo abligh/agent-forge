@@ -115,6 +115,26 @@ Issues:
     don't need it: the Merger holds a blocked one and takes it up
     itself. What the named items are now is the `blockers` lookup.
 
+With `router.red_first` (designs/0039), a red-build issue is one a
+build tool on this host keeps open while a build is red: forge-nightly's
+(`issue` in its nightly.json, while `issue_open` and the file is
+fresh) and forge-pr-check's (`main_red.issue` in its state.json). Its
+**red event** is when its build was last reported red: for the
+nightly, the end of its newest red run, else when the issue was
+opened; for the default branch, the issue's newest comment by the
+build check's poster, else its creation. It is **in hand** when an
+open pull request, by anyone, references it (as rule 15 reads a
+reference). It is **parked** when it has a quiet label or a label
+starting `Status:waiting-` (the labels' `status_prefix`). The
+`red builds` lookup reads the tools' state. Off without the key:
+
+20. after rules 9-11 and 18, and before rule 12: an open red-build
+    issue with an owner (the item owner), not parked, not in hand, on
+    which the owner hasn't commented since its red event: the owner's,
+    "red builds go first", reminded as any turn. The event is the red
+    event, so a new red run wakes her again; her comment ends it, and
+    the rules below then apply.
+
 With `router.idle_offer` in the configuration, a run also sweeps for
 agents with nothing to do (off without it):
 
@@ -129,6 +149,8 @@ agents with nothing to do (off without it):
     lines name is closed or merged (a number naming nothing is left
     out, as for rule 14), and no open pull request by the agent
     references it (a closing reference, `#N` or its URL in the body).
+    With `router.red_first`, red-build issues come first (oldest first
+    among themselves), and the offer says "Red builds go first".
     The event is when the idle period began, and it is about no item,
     so it is offered once per idle period, never reminded, and the
     next idle period offers again. An agent idle through `shell` is
@@ -149,6 +171,18 @@ agents with nothing to do (off without it):
 
 An agent whose entry says `"offer": false` is never offered work by
 rule 15 nor reported by rule 16.
+
+With `router.red_first` as well (designs/0039; off without either):
+
+21. an open red-build issue, not parked and not in hand, whose red
+    event is at least `red_first.fallback_hours` old and whose owner
+    hasn't commented on it for as long: the idle developer (as rule 16
+    reads one) idle longest, the name breaking a tie, other than its
+    owner or her stand-in and with no turn from rules 0a-14 and 18-20,
+    is offered it, "take it". One issue a developer, and she is then
+    offered nothing by rules 15 and 16 that run. The event is the issue
+    and its red event, so it is said once to her for each red event,
+    never reminded. With no such developer nothing is said.
 
 A directory that couldn't be read, or isn't complete, makes nobody
 idle: unknown is never idle.
@@ -234,6 +268,7 @@ import fnmatch
 import os
 import re
 
+from agent_forge import locks, nightly, state
 from agent_forge.router import ONCE, Action, Decision, Lookup
 
 # The Merger's hand-back names the head it judged, in both its forms.
@@ -279,6 +314,15 @@ WAITING_PREFIX = "Status:waiting-"
 OWNERS = None
 # `router.unreviewed` (designs/0027), {"ignore", "depth2"}, or None: off.
 UNREVIEWED = None
+# `router.red_first` (designs/0039), {"fallback_hours"}, or None: off.
+RED_FIRST = None
+DEFAULT_FALLBACK_HOURS = 2
+# The project, from `configure`: whose tools' state the red-build lookup
+# reads.
+PROJECT = None
+# The environment that lookup finds those state directories by; None:
+# the process's.
+ENVIRON = None
 
 # What the rules read of each open item, besides its number.
 graphql = {
@@ -330,8 +374,9 @@ def configure(project, merger_tool):
     global OWNER_PREFIX, STATUS_CONTEXT, IDLE_OFFER, wants_directory
     global MERGE_NOTICE, merged_window
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
-    global UNREVIEWED, QUIET_LABELS, IN_PROGRESS
+    global UNREVIEWED, QUIET_LABELS, IN_PROGRESS, RED_FIRST, PROJECT
     merger = merger_tool
+    PROJECT = project
     labels = project.section("labels")
     MERGER = merger.ACT_AS
     OWNER = project.owner.lower()
@@ -374,6 +419,9 @@ def configure(project, merger_tool):
         "ignore": list(gaps.get("ignore") or []),
         "depth2": list(gaps.get("depth2") or [])}
     graphql["Issue"] = ISSUE_FIELDS + (OWNER_LABEL_EVENTS if OWNERS else "")
+    red = project.section("router").get("red_first")
+    RED_FIRST = None if red is None else {
+        "fallback_hours": red.get("fallback_hours", DEFAULT_FALLBACK_HOURS)}
 
 
 # --- who is who -------------------------------------------------------------
@@ -846,8 +894,10 @@ def deferred_until(pr):
 # --- issues -----------------------------------------------------------------
 
 
-def route_issue(issue, roster):
-    """The turn for one issue, as `turn` or `nobody` builds it."""
+def route_issue(issue, roster, ctx=None):
+    """The turn for one issue, as `turn` or `nobody` builds it. `ctx`,
+    the run's, is what rule 20 reads the open pull requests and the
+    clock from; without it rule 20 never applies."""
     n = issue["number"]
     labels = labels_of(issue)
     comments = issue.get("comments") or []
@@ -867,6 +917,10 @@ def route_issue(issue, roster):
     # Rule 18, with `router.owners`: nothing below can wake anyone.
     if OWNERS is not None and owner is None:
         return unowned(issue, roster)
+    # Rule 20, with `router.red_first`.
+    red = red_turn(issue, owner, comments, roster, ctx)
+    if red:
+        return red
     # Rule 12.
     if owner:
         mine = {roster.login_of(owner)}
@@ -945,7 +999,7 @@ def decide(item, ctx):
     """The one decision for an open item."""
     if item.get("__typename") == "PullRequest":
         return [as_decision(route_pr(item, ctx.roster, ctx.when))]
-    return [as_decision(route_issue(item, ctx.roster))]
+    return [as_decision(route_issue(item, ctx.roster, ctx))]
 
 
 # A decision rests on nothing a later fetch could change but GitHub.
@@ -953,15 +1007,21 @@ recheck = decide
 
 
 def sweep(ctx):
-    """Rules 15 and 16, the idle offer, rule 17, the merge notice, and
+    """Rules 15 and 16, the idle offer, rule 21, a red build's fallback
+    (which needs the idle offer too), rule 17, the merge notice, and
     rule 19, the paths no reviewer covers, each when it is configured;
     nothing on a run started by an event
-    (`ctx.only`), whose items are all it may decide about."""
+    (`ctx.only`), whose items are all it may decide about. An agent
+    rule 21 offers a red build to is offered nothing else that run."""
     if ctx.only is not None:
         return []
     decisions = []
     if IDLE_OFFER is not None:
-        decisions += idle_offers(ctx)
+        taken = set()
+        if RED_FIRST is not None:
+            fallbacks, taken = red_fallbacks(ctx)
+            decisions += fallbacks
+        decisions += idle_offers(ctx, skip=taken)
     if MERGE_NOTICE is not None:
         decisions += merge_notices(ctx)
     if UNREVIEWED is not None:
@@ -1116,7 +1176,9 @@ def owned_issues(agent, ctx):
             held += 1
         elif issue["number"] not in in_hand:
             actionable.append(issue)
-    actionable.sort(key=lambda i: (i.get("createdAt") or "", i["number"]))
+    # With `router.red_first`, red-build issues first (designs/0039).
+    actionable.sort(key=lambda i: (red_build(i) is None,
+                                   i.get("createdAt") or "", i["number"]))
     return actionable, held, waiting
 
 
@@ -1125,7 +1187,7 @@ def has_turn(agent, ctx):
     for item in ctx.prs + ctx.issues:
         decided = route_pr(item, ctx.roster, ctx.when) \
             if item.get("__typename") == "PullRequest" \
-            else route_issue(item, ctx.roster)
+            else route_issue(item, ctx.roster, ctx)
         if decided["who"] == agent:
             return True
     return False
@@ -1149,26 +1211,29 @@ def counted(n, one, many):
 NOT_REPORTED = ("reviewer", "collaborator")
 
 
-def idle_offers(ctx):
+def idle_offers(ctx, skip=()):
     """Rules 15 and 16: an offer to each idle agent with an actionable
     issue and no turn, and a report to `report_to` of each idle
-    developer with none."""
+    developer with none. Agents in `skip` (rule 21's) are left out."""
     report_to = IDLE_OFFER["report_to"]
     decisions = []
     for agent, (stamp, shell) in sorted(idle_sweep(ctx).items()):
-        if not ctx.roster.is_agent(agent) or not ctx.roster.offered(agent) \
-                or has_turn(agent, ctx):
+        if agent in skip or not ctx.roster.is_agent(agent) \
+                or not ctx.roster.offered(agent) or has_turn(agent, ctx):
             continue
         actionable, held, waiting = owned_issues(agent, ctx)
         if actionable:
             issue = actionable[0]
             title = (issue.get("title") or "").strip()
+            red = red_build(issue)
             decisions.append(Decision(
                 None, agent, 15, stamp,
-                "#%d%s is yours and nothing blocks it: start it, or say on "
+                "#%d%s is yours and %s: start it, or say on "
                 "the issue why not (a %s or %s label, or a Blocked-by: "
                 "line). You have been idle since %s.%s" % (
                     issue["number"], ' "%s"' % title if title else "",
+                    "says %s is red. Red builds go first" % red["what"]
+                    if red else "nothing blocks it",
                     WAITING_OWNER, WAITING_EXTERNAL,
                     since_text(stamp, ctx.when),
                     " A background task of yours has been running since "
@@ -1224,6 +1289,164 @@ def hand_over(idle, ctx):
             "one to %s, or say why not." % (
                 agent, len(unstarted), listed,
                 ", ..." if len(unstarted) > HAND_OVER_LIST else "", idle))
+
+
+# --- red builds first (rules 20 and 21) ----------------------------------------
+
+
+# Where forge-pr-check keeps the default branch's red issue.
+CHECK_STATE = "state.json"
+STAMP = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def as_stamp(text):
+    """A time as GitHub writes one ("2026-10-31T05:40:00Z"), from any
+    ISO 8601 time with a zone, or None."""
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        return nightly.parse_time(text).strftime(STAMP)
+    except (TypeError, ValueError):
+        return None
+
+
+def red_builds(project, environ=None, now=None):
+    """{issue number: (what is red, the red event or None)} for the
+    issues the build tools keep open while a build is red: forge-nightly's
+    (`issue` in nightly.json, while `issue_open` and the file is fresh,
+    as `nightly.current` reads it; its event is when its newest red run
+    ended, else when the issue was opened) and forge-pr-check's
+    (`main_red.issue` in its state.json; its event is the issue's to
+    read, so None here). Nothing that can't be read is red."""
+    found = {}
+    data = nightly.current(project, environ, now)
+    number = data.get("issue")
+    if data.get("issue_open") and isinstance(number, int) \
+            and not isinstance(number, bool):
+        red = data.get("red") if isinstance(data.get("red"), dict) else {}
+        found[number] = ("the nightly", as_stamp(red.get("ended"))
+                         or as_stamp(data.get("opened")))
+    check = state.load(os.path.join(locks.state_dir(
+        project.name, "pr-check", environ, create=False), CHECK_STATE))
+    main = check.get("main_red")
+    number = main.get("issue") if isinstance(main, dict) else None
+    if isinstance(number, int) and not isinstance(number, bool) \
+            and number not in found:
+        found[number] = ("the default branch", None)
+    return found
+
+
+def red_event(issue, event):
+    """The red event of the default branch's issue: its newest comment
+    by the build check's poster (each red head after the first says so
+    there), else its creation. `event`, when known already, wins."""
+    if event:
+        return event
+    poster = strip_bot(merger.STATUS_CREATOR)
+    said = last_by(issue.get("comments") or [], {poster}) if poster else ""
+    return as_stamp(said or issue.get("createdAt"))
+
+
+def attach_red_builds(github, repo, prs, issues):
+    """Rules 20 and 21's lookup, with `router.red_first`: give each open
+    issue a build tool keeps open while a build is red `redBuild`,
+    {"what": "the nightly" or "the default branch", "event": when it
+    was last reported red}. It reads those tools' state on this host,
+    not GitHub."""
+    if RED_FIRST is None or PROJECT is None:
+        return
+    found = red_builds(PROJECT, ENVIRON)
+    for issue in issues:
+        if issue["number"] not in found:
+            continue
+        what, event = found[issue["number"]]
+        event = red_event(issue, event)
+        if event:
+            issue["redBuild"] = {"what": what, "event": event}
+
+
+def red_build(issue):
+    """The issue's `redBuild`, with `router.red_first`, or None."""
+    red = issue.get("redBuild") if RED_FIRST is not None else None
+    return red if isinstance(red, dict) and red.get("event") else None
+
+
+def in_hand(number, ctx):
+    """Whether an open pull request, by anyone, references the issue."""
+    return any(number in referenced_by(pr) for pr in ctx.prs)
+
+
+def parked(issue):
+    """Whether a person has parked the issue: a quiet label, or a label
+    saying what it waits for."""
+    labels = labels_of(issue)
+    return bool(quiet(issue)) or WAITING_OWNER in labels \
+        or WAITING_EXTERNAL in labels \
+        or any(l.startswith(WAITING_PREFIX) for l in labels)
+
+
+def red_turn(issue, owner, comments, roster, ctx):
+    """Rule 20: an open red-build issue the owner hasn't commented on
+    since its red event, and that no open pull request references, is
+    the owner's turn, reminded as any turn is. None otherwise."""
+    red = red_build(issue)
+    if red is None or ctx is None or not owner or parked(issue):
+        return None
+    n = issue["number"]
+    if in_hand(n, ctx) or \
+            last_by(comments, {roster.login_of(owner)}) >= red["event"]:
+        return None
+    return turn(n, owner, 20, red["event"],
+                "says %s is red (since %s), and no pull request references "
+                "it. Red builds go first: put other work down and fix it, "
+                "or say on the issue who is fixing it." % (
+                    red["what"], since_text(red["event"], ctx.when)))
+
+
+def red_fallbacks(ctx):
+    """Rule 21: ([Decision], {agent offered}): each open red-build issue
+    not parked and not in hand, whose red event is `fallback_hours` old
+    and whose owner hasn't commented on it for as long, offered to the
+    idle developer idle longest (the name breaks a tie), other than its
+    owner (or her stand-in), with no turn of her own and of a kind rule
+    16 reports; one issue each. Said once for each red event."""
+    hours = RED_FIRST["fallback_hours"]
+    cutoff = (ctx.when - datetime.timedelta(hours=hours)).strftime(STAMP)
+    pool = sorted(
+        (parse_stamp(stamp), agent)
+        for agent, (stamp, _) in idle_sweep(ctx).items()
+        if ctx.roster.is_agent(agent) and ctx.roster.offered(agent)
+        and ctx.roster.project.kind(agent) not in NOT_REPORTED
+        and not has_turn(agent, ctx))
+    decisions, taken = [], set()
+    for issue in sorted(ctx.issues, key=lambda i: i["number"]):
+        red = red_build(issue)
+        n = issue["number"]
+        if red is None or parked(issue) or in_hand(n, ctx) \
+                or red["event"] > cutoff:
+            continue
+        owner = issue_owner(issue, ctx.roster)
+        if owner and last_by(issue.get("comments") or [],
+                             {ctx.roster.login_of(owner)}) >= cutoff:
+            continue
+        away = {owner, ctx.roster.stand_in(owner)} if owner else set()
+        pick = next((a for _, a in pool
+                     if a not in away and a not in taken), None)
+        if pick is None:
+            continue
+        taken.add(pick)
+        decisions.append(Decision(
+            None, pick, 21, "#%d %s" % (n, red["event"]),
+            "#%d says %s is red since %s, and for %s h no pull request has "
+            "referenced it and %s. You are idle: take it (move its owner "
+            "label to %s and say so on the issue) and fix it first, unless a pull "
+            "request is about to reference it." % (
+                n, red["what"], since_text(red["event"], ctx.when),
+                "%g" % hours,
+                "its owner, %s, hasn't commented" % owner if owner
+                else "nobody owns it", OWNER_PREFIX + pick),
+            reminder=ONCE))
+    return decisions, taken
 
 
 # --- the merge notice (rule 17) -----------------------------------------------
@@ -1613,4 +1836,5 @@ def attach_bases(github, repo, prs, issues):
 
 
 lookups = (Lookup("blockers", attach_blockers),
-           Lookup("bases", attach_bases))
+           Lookup("bases", attach_bases),
+           Lookup("red builds", attach_red_builds))

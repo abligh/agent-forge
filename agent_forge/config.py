@@ -18,6 +18,7 @@ comments. docs/config.md describes each key.
 
 import fnmatch
 import json
+import math
 import os
 import re
 
@@ -199,7 +200,7 @@ RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
           "stuck": dict, "owners": dict, "unreviewed": dict,
-          "forget_minutes": int, "quiet_labels": list}
+          "forget_minutes": int, "quiet_labels": list, "red_first": dict}
 IDLE_OFFER = {"idle_minutes": int, "shell_minutes": int, "report_to": str,
               "hand_over_above": int}
 MERGE_NOTICE = {"window_minutes": int, "skip_label": str, "to": str}
@@ -208,6 +209,8 @@ MERGE_NOTICE_TO = ("author", "owner_label")
 STUCK = {"retarget": bool, "self_blocked": bool, "draft_hours": int}
 OWNERS = {"triage": str}
 UNREVIEWED = {"ignore": list, "depth2": list}
+# designs/0039: its keys, each a number checked by `_check_red_first`.
+RED_FIRST = ("fallback_hours",)
 RECEIVER = {"address": str, "port": int, "path": str, "secret_file": str,
             "max_body": int, "ticks": dict, "route": list,
             "run_timeout": int}
@@ -512,6 +515,8 @@ def check(data):
             _check_owners(router["owners"], data["agents"], problems)
         if isinstance(router.get("unreviewed"), dict):
             _check_unreviewed(router["unreviewed"], router, problems)
+        if isinstance(router.get("red_first"), dict):
+            _check_red_first(router["red_first"], problems)
         if _is(router.get("forget_minutes"), int) and \
                 router["forget_minutes"] < 0:
             problems.append("router.forget_minutes must be at least 0")
@@ -1230,6 +1235,21 @@ def _check_owners(owners, agents, problems):
             owners["triage"] not in agents:
         problems.append("%s.triage: %r is not an agent"
                         % (where, owners["triage"]))
+
+
+def _check_red_first(red, problems):
+    """router.red_first (designs/0039): how long a red-build issue may
+    go untouched before an idle developer is offered it."""
+    where = "router.red_first"
+    for key, value in red.items():
+        if key.startswith("_"):
+            continue
+        if key not in RED_FIRST:
+            problems.append("%s: unknown key %r" % (where, key))
+        elif not _is(value, (int, float)) or not math.isfinite(value) \
+                or value <= 0:
+            problems.append("%s.%s must be a number above 0"
+                            % (where, key))
 
 
 def _check_unreviewed(gaps, router, problems):

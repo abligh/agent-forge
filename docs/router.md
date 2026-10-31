@@ -346,7 +346,13 @@ directory, where a module may keep files of its own: it reads them
 when deciding and writes them only from an `Action`, so only a sending
 run changes them. The default rules keep `unreviewed.json` there for
 `router.unreviewed` (rule 19): which issue each area no reviewer
-covers has, and which pull requests it has told. `previous` is the
+covers has, and which pull requests it has told. With
+`router.red_first` (rules 20 and 21), the default rules' `red builds`
+lookup reads, rather than GitHub, the state forge-nightly and
+forge-pr-check keep on the same host, to know which open issues say a
+build is red; rule 20 reads `prs` for whether a pull request
+references one, and rule 21, run in `sweep` beside the idle offer,
+reads `directory` too. `previous` is the
 last sending run's decisions (`previous.json`, above), read only for a
 module whose `wants_previous` is true after `configure`; it is None on
 the first run, or when the file can't be read, which a module must read
