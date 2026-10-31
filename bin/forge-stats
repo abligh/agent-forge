@@ -18,7 +18,12 @@ defaults to the last `--hours` (24) up to now.
 - the time each run spent waiting for a slot, and running;
 - how busy the slots were: the run time of runs that finished in the
   window, over `checks.slots` times the window. The fast lane's runs
-  count, but not its slot, so near 100% means heads queue.
+  count, but not its slot, so near 100% means heads queue;
+- the CPU time of the default branch's runs (`main_cpu`, from the
+  check's `state.json`, which records each step's CPU seconds): each
+  run's total over its steps, and each step's, for the runs that
+  finished in the window. The default branch's runs are the steady
+  series: a pull request's run may test only what it changed.
 
 **The merge queue** (`merger.jsonl`):
 - merges in the window, and per hour;
@@ -553,6 +558,58 @@ def actions_text(actions, top=10):
     return lines
 
 
+def main_cpu_stats(results, since, until):
+    """{"total": summary, "steps": {step: summary}} of the CPU seconds
+    of the default branch's runs that finished in the window, from the
+    check's `results` (state.json): each run's sum over its steps, and
+    each step's. A run without `step_cpu` (from before v0.4.44) is left
+    out."""
+    totals, steps = [], collections.defaultdict(list)
+    for result in (results or {}).values():
+        if not isinstance(result, dict) or not result.get("main"):
+            continue
+        cpu = result.get("step_cpu")
+        if not isinstance(cpu, dict) or not cpu:
+            continue
+        try:
+            when = parse_time(result["finished"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if not since <= when < until:
+            continue
+        values = {k: v for k, v in cpu.items()
+                  if isinstance(v, (int, float))}
+        totals.append(round(sum(values.values()), 2))
+        for step, value in values.items():
+            steps[step].append(value)
+    return {"total": summary(totals),
+            "steps": {k: summary(v) for k, v in sorted(steps.items())}}
+
+
+def read_results(pr_dir):
+    """The build check's `results` from its state.json, or {}."""
+    try:
+        with open(os.path.join(pr_dir, "state.json")) as handle:
+            saved = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    results = saved.get("results") if isinstance(saved, dict) else None
+    return results if isinstance(results, dict) else {}
+
+
+def cpu_text(cpu, top=3):
+    """The report's line for the default branch's CPU."""
+    total = cpu["total"]
+    if not total["n"]:
+        return "  default branch's runs, CPU: none in the window"
+    heavy = sorted(cpu["steps"].items(),
+                   key=lambda kv: -(kv[1]["median"] or 0))[:top]
+    return ("  default branch's runs, CPU: median %.0f s, p90 %.0f s (%d)"
+            "; heaviest steps by median: %s" % (
+                total["median"], total["p90"], total["n"], ", ".join(
+                    "%s %.0f s" % (k, v["median"]) for k, v in heavy)))
+
+
 def nightly_stats(project, until, environ):
     """{"red_hours": ...} from forge-nightly's state: 0 while the newest
     nightly it judged is green, else the hours from `red_since` (the end
@@ -611,6 +668,8 @@ def report(name, since, until, check, queue, approval, authors,
         lines.append("  slots busy: %.0f%% of %d slots (%.1f slot-hours)"
                      % (100 * check["busy_share"], check["slots"],
                         check["busy_seconds"] / 3600))
+    if check.get("main_cpu") is not None:
+        lines.append(cpu_text(check["main_cpu"]))
     lines += ["", "Merge queue"]
     held = queue["held_seconds"] / 3600
     lines.append("  merges: %d (%.1f an hour; %s)"
@@ -710,6 +769,7 @@ def main(argv=None, out=print, environ=None, now=None,
         out("NO-RECORDS: nothing in %s or %s" % (pr_dir, merger_dir))
         return 2
     check = check_stats(verdicts, since, until, slots)
+    check["main_cpu"] = main_cpu_stats(read_results(pr_dir), since, until)
     queue = queue_stats(records, since, until)
     approval, authors = None, {}
     presence = read_lines(os.path.join(

@@ -85,6 +85,46 @@ class Check(unittest.TestCase):
         self.assertEqual(self.got["busy_share"], round(720 / 14400, 3))
 
 
+class MainCpu(unittest.TestCase):
+    """designs/0024, third amendment: the default branch's CPU."""
+
+    RESULTS = {
+        "a": {"main": True, "finished": "2026-10-12T00:30:00Z",
+              "step_cpu": {"test": 100.0, "vet": 10.0}},
+        "b": {"main": True, "finished": "2026-10-12T01:30:00Z",
+              "step_cpu": {"test": 300.0, "vet": 20.0}},
+        "c": {"main": True, "finished": "2026-10-12T01:40:00Z",
+              "step_cpu": {"test": 200.0}},
+        # Not the default branch, outside the window, or no step_cpu.
+        "d": {"main": False, "finished": "2026-10-12T01:00:00Z",
+              "step_cpu": {"test": 9000.0}},
+        "e": {"main": True, "finished": "2026-10-11T23:00:00Z",
+              "step_cpu": {"test": 9000.0}},
+        "f": {"main": True, "finished": "2026-10-12T01:00:00Z"},
+        "g": {"main": True, "step_cpu": {"test": 9000.0}},
+    }
+
+    def test_each_run_s_total_and_each_step(self):
+        got = tool.main_cpu_stats(self.RESULTS, SINCE, UNTIL)
+        self.assertEqual(got["total"]["n"], 3)
+        self.assertEqual(got["total"]["median"], 200.0)
+        self.assertEqual(got["total"]["max"], 320.0)
+        self.assertEqual(got["steps"]["test"]["median"], 200.0)
+        self.assertEqual(got["steps"]["test"]["n"], 3)
+        self.assertEqual(got["steps"]["vet"]["n"], 2)
+
+    def test_none_is_empty(self):
+        got = tool.main_cpu_stats({}, SINCE, UNTIL)
+        self.assertEqual((got["total"]["n"], got["steps"]), (0, {}))
+        self.assertIn("none in the window", tool.cpu_text(got))
+
+    def test_the_report_line(self):
+        got = tool.cpu_text(tool.main_cpu_stats(self.RESULTS, SINCE, UNTIL))
+        self.assertEqual(got, "  default branch's runs, CPU: median 200 s, "
+                         "p90 320 s (3); heaviest steps by median: "
+                         "test 200 s, vet 10 s")
+
+
 class Queue(unittest.TestCase):
 
     def setUp(self):
@@ -533,6 +573,19 @@ class Main(unittest.TestCase):
              "--json"], self.out.append, self.env, call=fake, token="tok"), 0)
         self.assertIsNone(json.loads(self.out[0])["actions"])
         self.assertFalse(any("/actions/" in u for u in fake.urls))
+
+    def test_json_has_the_default_branch_s_cpu(self):
+        self.write()
+        with open(os.path.join(self.dir.name, "widget", "pr-check",
+                               "state.json"), "w") as f:
+            json.dump({"results": MainCpu.RESULTS}, f)
+        self.assertEqual(self.main("--no-github", "--json"), 0)
+        got = json.loads(self.out[0])["check"]["main_cpu"]
+        self.assertEqual(got["steps"]["test"]["median"], 200.0)
+        self.out.clear()
+        self.assertEqual(self.main("--no-github"), 0)
+        self.assertIn("default branch's runs, CPU: median 200 s",
+                      self.out[0])
 
     def test_json(self):
         self.write()
