@@ -1,5 +1,5 @@
-"""Tests for agent_forge/nightly.py: the fixes of a red nightly, as
-forge-nightly's state tells the other tools."""
+"""Tests for agent_forge/nightly.py: the fixes of a red nightly, and
+what forge-nightly last wrote, as its state tells the other tools."""
 import datetime
 import json
 import os
@@ -66,6 +66,16 @@ class Fixes(unittest.TestCase):
                 with open(path, "w") as handle:
                     handle.write(text)
                 self.assertEqual(self.fixes(), frozenset())
+
+    def test_current_is_the_file_while_fresh(self):
+        self.write(at="2026-10-23T11:55:00Z", issue=7, issue_open=True)
+        self.assertEqual(nightly.current(self.project, self.env, NOW),
+                         {"at": "2026-10-23T11:55:00Z", "issue": 7,
+                          "issue_open": True})
+        self.assertEqual(nightly.current(
+            self.project, self.env, NOW + datetime.timedelta(hours=1)), {})
+        del self.project.data["nightly"]
+        self.assertEqual(nightly.current(self.project, self.env, NOW), {})
 
 
 if __name__ == "__main__":
