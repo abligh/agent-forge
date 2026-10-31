@@ -62,8 +62,9 @@ on the next tick, and not commented on.
 Everything is written as the App named by `nightly.as` (default
 `merge.merger`, else `Merger`), with a token minted as forge-app-token
 does; it needs Actions (to dispatch), Issues and Pull requests. State
-(the issue, the last run judged, the last green and red runs, the
-fixes, the dispatch and the escalations done) is kept in
+(the issue, the last run judged, the last green and red runs, each
+with its start and end, the fixes, the dispatch and the escalations
+done) is kept in
 ~/.local/state/agent-forge/<project>/nightly/nightly.json, and
 `forge-stats` reads `nightly_red_hours` from it. `--dry-run` prints
 what it would do and changes nothing, on GitHub, in the state or on
@@ -178,6 +179,15 @@ def decisive_jobs(jobs, name):
     """The jobs named `name`, or a matrix's `name (...)`."""
     return [j for j in jobs if j.get("name") == name
             or (j.get("name") or "").startswith(name + " (")]
+
+
+def green_record(run):
+    """What nightly.json keeps of the last green run. `started` is when
+    the run began, so the router can tell which labelled issues' fixes
+    it holds (designs/0040)."""
+    return {"run": run["id"], "sha": run["head_sha"],
+            "started": run.get("run_started_at") or run.get("created_at"),
+            "ended": run["updated_at"]}
 
 
 def verdict(jobs):
@@ -496,8 +506,7 @@ class Tick:
                         "escalated", "dispatched"):
                 saved.pop(key, None)
             saved["fixes"] = []
-            saved["green"] = {"run": run["id"], "sha": sha,
-                              "ended": run["updated_at"]}
+            saved["green"] = green_record(run)
             saved["newest"] = "green"
             return True
         if got != "red":
@@ -780,9 +789,7 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
                 green = next((r for r in done
                               if r.get("conclusion") in GREEN), None)
                 if green:
-                    saved["green"] = {"run": green["id"],
-                                      "sha": green["head_sha"],
-                                      "ended": green["updated_at"]}
+                    saved["green"] = green_record(green)
             if saved.get("issue") is None:
                 found = tick.find_issue()
                 if found is not None:

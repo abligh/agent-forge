@@ -244,6 +244,8 @@ class Main(unittest.TestCase):
                                                  "vet-advisories"])
         self.assertEqual(saved["red_since"], stamp(NOW - 26 * HOUR))
         self.assertEqual(saved["green"]["sha"], GREEN_SHA)
+        # The last green run, found among the runs, keeps its start too.
+        self.assertEqual(saved["green"]["started"], stamp(NOW - 27 * HOUR))
         self.assertIn("RED run 2 at bbbbbbbbbb: test-slow, vet-advisories",
                       self.out)
 
@@ -311,6 +313,10 @@ class Main(unittest.TestCase):
         self.assertNotIn("issue", saved)
         self.assertEqual((saved["newest"], saved["fixes"],
                           saved["green"]["run"]), ("green", [], 3))
+        # Its start too, for the router's rule 22 (designs/0040).
+        self.assertEqual(saved["green"], {
+            "run": 3, "sha": NEXT_SHA, "started": stamp(NOW - HOUR),
+            "ended": stamp(NOW)})
 
     def test_a_cancelled_run_is_neither(self):
         self.gh.runs = [run(2, RED_SHA, "cancelled")]

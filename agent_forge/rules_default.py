@@ -135,6 +135,28 @@ starting `Status:waiting-` (the labels' `status_prefix`). The
     event, so a new red run wakes her again; her comment ends it, and
     the rules below then apply.
 
+With `router.nightly_wake` (designs/0040), the issue's decision above
+comes with a second one, beside it rather than in its place, so rule
+22 neither hides rules 12-20 nor is hidden by them (off without the
+key):
+
+22. an open issue carrying `nightly_wake.label`, with an owner (the
+    item owner), not parked (as rule 20 reads it, but for that label
+    itself), whose label was last put on (its newest `LabeledEvent`
+    among the last 30 label events fetched; none found wakes nobody)
+    before the last green nightly run started: the owner's, "check it
+    on that build now", naming the run, its commit and when it went
+    green. A label that old means the fixes were in the build. It
+    applies whatever the issue's `Defer-until:` says: no rule above
+    reads one on an issue (only rule 15's offer does). The event is the
+    run's end, so it is said once for each green run, never reminded;
+    while the label stays on, a later green run wakes her again. The
+    green run is `green` in forge-nightly's nightly.json, while the
+    file is fresh; one without `started` wakes nobody. The `green
+    nightly` lookup reads it. An issue carrying the label is also not
+    actionable for rules 15-17 or rule 16's unstarted count: it waits,
+    as a waiting label makes it wait, and rule 22 wakes it.
+
 With `router.idle_offer` in the configuration, a run also sweeps for
 agents with nothing to do (off without it):
 
@@ -145,7 +167,8 @@ agents with nothing to do (off without it):
     still runs), with no turn from rules 0a-14, which owns an actionable issue: the
     agent's, offered the oldest such issue by creation. An issue is
     actionable when it is labelled `Owner:<Name>`, is waiting neither
-    on the owner nor on someone outside, every item its `Blocked-by:`
+    on the owner nor on someone outside (nor, with
+    `router.nightly_wake`, on a nightly: rule 22), every item its `Blocked-by:`
     lines name is closed or merged (a number naming nothing is left
     out, as for rule 14), and no open pull request by the agent
     references it (a closing reference, `#N` or its URL in the body).
@@ -317,8 +340,10 @@ UNREVIEWED = None
 # `router.red_first` (designs/0039), {"fallback_hours"}, or None: off.
 RED_FIRST = None
 DEFAULT_FALLBACK_HOURS = 2
-# The project, from `configure`: whose tools' state the red-build lookup
-# reads.
+# `router.nightly_wake` (designs/0040), {"label"}, or None: off.
+NIGHTLY_WAKE = None
+# The project, from `configure`: whose tools' state the red-build and
+# green-nightly lookups read.
 PROJECT = None
 # The environment that lookup finds those state directories by; None:
 # the process's.
@@ -356,7 +381,8 @@ ISSUE_FIELDS = graphql["Issue"]
 # With `merge_notice.skip_label` or `to: "owner_label"`: a merged pull
 # request's labels.
 MERGED_LABELS = "labels(first:30) { nodes { name } }"
-# With `router.owners`: when labels went on and off, for rule 18's event.
+# With `router.owners` or `router.nightly_wake`: when labels went on and
+# off, for rule 18's event and rule 22's label time.
 OWNER_LABEL_EVENTS = """
         ownerLabels: timelineItems(last:30,
                                    itemTypes:[LABELED_EVENT, UNLABELED_EVENT]) {
@@ -375,6 +401,7 @@ def configure(project, merger_tool):
     global MERGE_NOTICE, merged_window
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
     global UNREVIEWED, QUIET_LABELS, IN_PROGRESS, RED_FIRST, PROJECT
+    global NIGHTLY_WAKE
     merger = merger_tool
     PROJECT = project
     labels = project.section("labels")
@@ -418,10 +445,13 @@ def configure(project, merger_tool):
     UNREVIEWED = None if gaps is None else {
         "ignore": list(gaps.get("ignore") or []),
         "depth2": list(gaps.get("depth2") or [])}
-    graphql["Issue"] = ISSUE_FIELDS + (OWNER_LABEL_EVENTS if OWNERS else "")
     red = project.section("router").get("red_first")
     RED_FIRST = None if red is None else {
         "fallback_hours": red.get("fallback_hours", DEFAULT_FALLBACK_HOURS)}
+    wake = project.section("router").get("nightly_wake")
+    NIGHTLY_WAKE = None if wake is None else {"label": wake.get("label")}
+    graphql["Issue"] = ISSUE_FIELDS + (
+        OWNER_LABEL_EVENTS if OWNERS or NIGHTLY_WAKE else "")
 
 
 # --- who is who -------------------------------------------------------------
@@ -996,10 +1026,15 @@ def as_decision(d):
 
 
 def decide(item, ctx):
-    """The one decision for an open item."""
+    """The decisions for an open item: the one its rules give, and for
+    an issue, with `router.nightly_wake`, rule 22's beside it."""
     if item.get("__typename") == "PullRequest":
         return [as_decision(route_pr(item, ctx.roster, ctx.when))]
-    return [as_decision(route_issue(item, ctx.roster, ctx))]
+    decisions = [as_decision(route_issue(item, ctx.roster, ctx))]
+    woken = nightly_turn(item, ctx.roster, ctx)
+    if woken:
+        decisions.append(as_decision(woken))
+    return decisions
 
 
 # A decision rests on nothing a later fetch could change but GitHub.
@@ -1152,8 +1187,9 @@ def blocked(issue):
 def owned_issues(agent, ctx):
     """(actionable, blocked, waiting): the agent's issues (`Owner:<Name>`)
     that it can act on, oldest first, and how many it can't, because
-    something they name is open, or they wait on someone or until a
-    `Defer-until:` time still to come, or its own
+    something they name is open, or they wait on someone, on a nightly
+    (`router.nightly_wake`'s label) or until a `Defer-until:` time still
+    to come, or its own
     open pull request already references them."""
     mine = ctx.roster.login_of(agent)
     in_hand = set()
@@ -1170,7 +1206,8 @@ def owned_issues(agent, ctx):
         until = deferred_until(issue)
         if WAITING_OWNER in labels or WAITING_EXTERNAL in labels \
                 or any(l.startswith(WAITING_PREFIX) for l in labels) \
-                or quiet(issue) or (until is not None and until > ctx.when):
+                or quiet(issue) or awaits_nightly(issue) \
+                or (until is not None and until > ctx.when):
             waiting += 1
         elif blocked(issue):
             held += 1
@@ -1378,8 +1415,10 @@ def in_hand(number, ctx):
 
 def parked(issue):
     """Whether a person has parked the issue: a quiet label, or a label
-    saying what it waits for."""
-    labels = labels_of(issue)
+    saying what it waits for (other than `router.nightly_wake`'s, which
+    rule 22 reads)."""
+    labels = [l for l in labels_of(issue)
+              if NIGHTLY_WAKE is None or l != NIGHTLY_WAKE["label"]]
     return bool(quiet(issue)) or WAITING_OWNER in labels \
         or WAITING_EXTERNAL in labels \
         or any(l.startswith(WAITING_PREFIX) for l in labels)
@@ -1447,6 +1486,89 @@ def red_fallbacks(ctx):
                 else "nobody owns it", OWNER_PREFIX + pick),
             reminder=ONCE))
     return decisions, taken
+
+
+# --- a green nightly wakes what waits for it (rule 22) -------------------------
+
+
+def green_nightly(project, environ=None, now=None):
+    """The last green nightly run, {"run", "sha", "started", "ended"}, as
+    forge-nightly keeps it in nightly.json while the file is fresh (as
+    `nightly.current` reads it), its times as GitHub writes them; None
+    when there is none, or it lacks any of them (a record from before
+    forge-nightly kept `started` wakes nobody)."""
+    green = nightly.current(project, environ, now).get("green")
+    if not isinstance(green, dict):
+        return None
+    run, sha = green.get("run"), green.get("sha")
+    started, ended = as_stamp(green.get("started")), as_stamp(
+        green.get("ended"))
+    if not (isinstance(run, int) and not isinstance(run, bool)
+            and isinstance(sha, str) and sha and started and ended):
+        return None
+    return {"run": run, "sha": sha, "started": started, "ended": ended}
+
+
+def attach_green_nightly(github, repo, prs, issues):
+    """Rule 22's lookup, with `router.nightly_wake`: give each open issue
+    carrying its label `greenNightly`, the last green nightly run as
+    `green_nightly` reads it. It reads forge-nightly's state on this
+    host, not GitHub."""
+    if NIGHTLY_WAKE is None or PROJECT is None:
+        return
+    green = None
+    for issue in issues:
+        if not awaits_nightly(issue):
+            continue
+        if green is None:
+            green = green_nightly(PROJECT, ENVIRON) or {}
+        if green:
+            issue["greenNightly"] = dict(green)
+
+
+def awaits_nightly(issue):
+    """Whether the issue carries `router.nightly_wake`'s label."""
+    return NIGHTLY_WAKE is not None and \
+        NIGHTLY_WAKE["label"] in labels_of(issue)
+
+
+def labelled_at(issue, label):
+    """When `label` was last put on the issue: its newest `LabeledEvent`
+    among those fetched, as GitHub writes a time, or None."""
+    nodes = (issue.get("ownerLabels") or {}).get("nodes") or []
+    times = [as_stamp(e.get("createdAt")) for e in nodes
+             if isinstance(e, dict)
+             and (e.get("label") or {}).get("name") == label
+             and "createdAt" in e]
+    times = [t for t in times if t]
+    return max(times) if times else None
+
+
+def nightly_turn(issue, roster, ctx):
+    """Rule 22: an open issue carrying `router.nightly_wake`'s label,
+    with an owner, not parked, labelled before the last green nightly
+    run started (so its fixes are in that build), is its owner's turn,
+    once for that run: the event is the run's end. A `Defer-until:` on
+    the issue doesn't hold it. None otherwise."""
+    if NIGHTLY_WAKE is None or ctx is None or not awaits_nightly(issue):
+        return None
+    green = issue.get("greenNightly")
+    if not isinstance(green, dict) or not green.get("started") \
+            or not green.get("ended"):
+        return None
+    owner = issue_owner(issue, roster)
+    if not owner or parked(issue):
+        return None
+    labelled = labelled_at(issue, NIGHTLY_WAKE["label"])
+    if labelled is None or labelled >= green["started"]:
+        return None
+    n = issue["number"]
+    return turn(n, owner, 22, green["ended"],
+                "waits for a nightly check, and nightly run %s (%s, green "
+                "at %s) includes its fixes: check it on that build now." % (
+                    green["run"], green["sha"][:7],
+                    since_text(green["ended"], ctx.when)),
+                reminder=ONCE)
 
 
 # --- the merge notice (rule 17) -----------------------------------------------
@@ -1837,4 +1959,5 @@ def attach_bases(github, repo, prs, issues):
 
 lookups = (Lookup("blockers", attach_blockers),
            Lookup("bases", attach_bases),
-           Lookup("red builds", attach_red_builds))
+           Lookup("red builds", attach_red_builds),
+           Lookup("green nightly", attach_green_nightly))
