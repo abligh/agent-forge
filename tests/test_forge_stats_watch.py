@@ -154,6 +154,29 @@ class Judge(unittest.TestCase):
         self.assertEqual(tool.figures(stats(), 6)["nightly_red_hours"],
                          (None, 0))
 
+    def test_main_cpu_for_the_run_or_one_step(self):
+        cpu = {"total": {"n": 8, "median": 4000.0},
+               "steps": {"test": {"n": 7, "median": 3000.0}}}
+        got = dict(stats(), check=dict(stats()["check"], main_cpu=cpu))
+        self.assertEqual(tool.figures(got, 6)["main_cpu"], (4000.0, 8))
+        self.assertEqual(tool.figures(got, 6, {"main_cpu": {
+            "step": "test"}})["main_cpu"], (3000.0, 7))
+        self.assertEqual(tool.figures(got, 6, {"main_cpu": {
+            "step": "gone"}})["main_cpu"], (None, 0))
+        self.assertEqual(tool.figures(stats(), 6)["main_cpu"], (None, 0))
+        # 2026-10-23 to 10-31: test-rust's CPU on main went 1400 -> 4000.
+        self.assertEqual(tool.judge("main_cpu", {"ratio": 1.3},
+                                    (3000.0, 7), (1400.0, 600), 5),
+                         (tool.OUT, "3000 CPU-s, over 1.3 x the "
+                          "baseline's 1400 CPU-s"))
+        self.assertEqual(tool.judge("main_cpu", {"limit": 2500},
+                                    (3000.0, 7), (None, 0), 5),
+                         (tool.OUT, "3000 CPU-s, over the limit of "
+                          "2500 CPU-s"))
+        self.assertEqual(tool.judge("main_cpu", {"ratio": 1.3},
+                                    (1500.0, 7), (1400.0, 600), 5)[0],
+                         tool.IN)
+
     def test_too_few_samples_is_not_judged(self):
         for figure in ("check_run", "slots_busy", "merge_rate"):
             with self.subTest(figure=figure):

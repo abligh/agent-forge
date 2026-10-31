@@ -313,11 +313,26 @@ class Check(unittest.TestCase):
             "stats_watch.figures.main_red must be an object",
             "stats_watch.figures.speed: unknown figure (one of check_run, "
             "check_wait, pr_turnaround, merge_time, merge_rate, "
-            "slots_busy, main_red, nightly_red_hours)"])
+            "slots_busy, main_red, nightly_red_hours, main_cpu)"])
         self.assertEqual(self.problems(stats_watch={}),
                          ["stats_watch: missing 'owner'"])
         self.assertEqual(self.problems(stats_watch=[]),
                          ["'stats_watch' must be an object"])
+
+    def test_stats_watch_main_cpu_takes_a_step(self):
+        def problems(rules):
+            return self.problems(stats_watch={
+                "owner": "LeadDev", "figures": {"main_cpu": rules}})
+        self.assertEqual(problems({"step": "test", "ratio": 1.3,
+                                   "limit": 3000}), [])
+        self.assertEqual(problems({}), [])
+        self.assertEqual(problems({"step": ""}), [
+            "stats_watch.figures.main_cpu.step must be a step's name"])
+        self.assertEqual(problems({"step": 3}), [
+            "stats_watch.figures.main_cpu.step must be a step's name"])
+        self.assertEqual(self.problems(stats_watch={
+            "owner": "LeadDev", "figures": {"check_run": {"step": "x"}}}),
+            ["stats_watch.figures.check_run: unknown key 'step'"])
 
     def test_nightly(self):
         data = example()

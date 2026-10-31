@@ -186,3 +186,39 @@ did.
 2. `merge_rate` is merges over those hours, for the window and the
    baseline alike, and is not judged when the queue held work for less
    than an hour. `limit` and `ratio` apply to it as before.
+
+## Third amendment (2026-10-31): what a run costs in CPU
+
+* Status: approved (Alex Bligh, 2026-10-31, in the terminal: "yes please"; https://github.com/abligh/agent-forge/issues/175)
+
+**Why.** The figures the watch judges are all times and counts, and
+every one of them is moved by how busy the host is. None says what a
+run costs. A project's tests can grow until every check pays several
+times what it did, and nothing reports it until the checks are slow
+for everyone, by which time the cost is spread over dozens of tests.
+In one project a default-branch run's CPU time went from a median of
+1,964 s to 6,151 s in eight days, and its slowest step from 1,430 s
+to 3,857 s, while the check-time figures blamed the host's load. The
+check already records each step's CPU seconds (`step_cpu`, beside
+`step_seconds`, in its state's `results`); nothing read them.
+
+**Change.**
+1. `forge-stats` reports the CPU time of the default branch's runs
+   that finished in the window (`check.main_cpu` in the JSON): each
+   run's total over its steps, and each step's, as `{n, median, p90,
+   max}`, read from the check's `state.json`. The default branch's
+   runs are the steady series: a pull request's run may test only
+   what it changed, so its CPU varies with the change. The report
+   gives the median, the p90 and the heaviest steps.
+2. A new figure, `main_cpu`: a default-branch run's CPU seconds,
+   median, over all its steps or, with `step`, that step's. It is
+   out of line over `limit` (CPU seconds) or over `ratio` times the
+   baseline's, with `min_samples` as for the other figures. CPU time
+   is less moved by the host's load than run time, if not unmoved:
+   cache and memory contention still inflate it, which is why the
+   rule is a ratio over a week's baseline and not a fine threshold.
+3. The issue names the step in its rules.
+
+**What it doesn't do.** It says that the cost grew, not which test
+grew it; a project's own per-test ledger, if it has one, says that.
+It changes no gate: like every figure, it only reports.

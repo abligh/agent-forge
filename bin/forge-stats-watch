@@ -23,6 +23,12 @@ configuration's `stats_watch.figures`:
     nightly_red_hours  the hours since the last green nightly ended
                    (forge-nightly, designs/0028), 0 while the newest
                    is green: over `limit`, else any above 0
+    main_cpu       a default-branch run's CPU seconds, median, over all
+                   its steps or, with `step`, that step's: over `limit`
+                   (CPU seconds), or over `ratio` x the baseline's. The
+                   cost every check pays grows unseen as tests are added
+                   (designs/0024, third amendment); CPU time, unlike run
+                   time, is little moved by how busy the host is
 
 A figure from fewer than `min_samples` (default 5) samples is not
 judged, nor a `ratio` against a baseline that thin. merge_rate's
@@ -96,6 +102,7 @@ WHAT = {
     "slots_busy": ("the build check's slots busy", "%"),
     "main_red": ("red build checks of the default branch", "red"),
     "nightly_red_hours": ("the hours since the last green nightly", "h"),
+    "main_cpu": ("a default-branch run's CPU time, median", "CPU-s"),
 }
 FIGURE_RE = re.compile(r"^Figure: ([a-z_]+)\s*$", re.MULTILINE)
 OUT, IN, UNJUDGED = "out", "in", "unjudged"
@@ -156,13 +163,18 @@ def merge_rate(queue, hours):
     return queue.get("merges", 0) / held if held >= MIN_HELD_HOURS else None
 
 
-def figures(stats, hours):
+def figures(stats, hours, watched=None):
     """{figure: (value, samples)} from forge-stats' JSON over `hours`,
     in the units `limit` is given in; values None where there were no
-    samples. None stats (no records) give every figure no samples."""
+    samples. None stats (no records) give every figure no samples.
+    `watched` is the configuration's figures, for main_cpu's `step`."""
     if not stats:
         return {name: (None, 0) for name in WHAT}
     check, queue = stats.get("check") or {}, stats.get("queue") or {}
+    cpu = check.get("main_cpu") or {}
+    step = ((watched or {}).get("main_cpu") or {}).get("step")
+    cpu = ((cpu.get("steps") or {}).get(step) if step
+           else cpu.get("total")) or {}
 
     def minutes(part, key):
         value, n = part.get(key), part.get("n", 0)
@@ -182,6 +194,7 @@ def figures(stats, hours):
         "main_red": ((check.get("red") or {}).get("main", 0),
                      (check.get("runs") or {}).get("main", 0)),
         "nightly_red_hours": (red_hours, 0 if red_hours is None else 1),
+        "main_cpu": (cpu.get("median"), cpu.get("n", 0)),
     }
 
 
@@ -195,6 +208,8 @@ def show(figure, value):
         return "%.1f h" % value
     if figure == "merge_rate":
         return "%.1f an hour" % value
+    if figure == "main_cpu":
+        return "%.0f CPU-s" % value
     if unit == "%":
         return "%.0f%%" % value
     return "%.1f min" % value
@@ -292,7 +307,7 @@ class Watch:
                 show(figure, baseline[0]), baseline[1])])
 
     def rules_text(self, figure, rules):
-        parts = []
+        parts = ["step `%s`" % rules["step"]] if "step" in rules else []
         if "limit" in rules:
             parts.append("limit %s" % show(figure, rules["limit"]))
         if "ratio" in rules:
@@ -366,9 +381,9 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
     stats = stats or forge_stats(environ)
     start = now - watch.window
     try:
-        window = figures(stats(start, now), cfg["window_hours"])
+        window = figures(stats(start, now), cfg["window_hours"], watched)
         baseline = figures(stats(start - watch.baseline, start),
-                           cfg["baseline_days"] * 24)
+                           cfg["baseline_days"] * 24, watched)
     except (RuntimeError, OSError, ValueError) as error:
         err("%s: skipping this hour: %s" % (PROG, error))
         return 2

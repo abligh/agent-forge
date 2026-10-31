@@ -89,7 +89,8 @@ STATS_WATCH_FIGURES = {
     "pr_turnaround": ("limit", "ratio"), "merge_time": ("limit", "ratio"),
     "merge_rate": ("limit", "ratio"), "slots_busy": ("limit",),
     "main_red": (),
-    "nightly_red_hours": ("limit",)}
+    "nightly_red_hours": ("limit",),
+    "main_cpu": ("limit", "ratio", "step")}
 # forge-nightly (designs/0028): a red nightly is a red main.
 NIGHTLY = {"workflow": str, "job": str, "owners": dict, "labels": list,
            "retry_hours": int, "escalate_hours": list, "as": str,
@@ -414,6 +415,9 @@ def _check_stats_watch(watch, data, problems):
                 continue
             if key not in STATS_WATCH_FIGURES[figure]:
                 problems.append("%s: unknown key %r" % (at, key))
+            elif key == "step":
+                if not isinstance(value, str) or not value.strip():
+                    problems.append("%s.step must be a step's name" % at)
             elif not _is(value, (int, float)) or value <= 0:
                 problems.append("%s.%s must be a number above 0"
                                 % (at, key))
