@@ -4377,6 +4377,21 @@ class AgeFirst(RepoCase):
                          {"since": "2026-10-07T12:00:00Z",
                           "seen": "2026-10-07T13:30:00Z"})
 
+    def test_a_green_batch_s_members_keep_their_order(self):
+        # 2026-10-31: an overdue member moved up inside a green batch,
+        # which changed every tree after it, so the green covered none
+        # of them and the batch waited out a new top's run.
+        when = datetime.datetime(2026, 10, 31, 0, 29)
+        queue = [pr(n) for n in (10, 11, 12, 13)]
+        since = {10: when - datetime.timedelta(minutes=30),
+                 11: when - datetime.timedelta(minutes=95),
+                 13: when - datetime.timedelta(minutes=100)}
+        out, overdue = m.overdue_first(queue, since, when, None, {10, 11})
+        self.assertEqual([p["number"] for p in out], [10, 11, 13, 12])
+        self.assertEqual(overdue, {11: 95, 13: 100})
+        out, _ = m.overdue_first(queue, since, when, None, set())
+        self.assertEqual([p["number"] for p in out], [13, 11, 10, 12])
+
     def test_the_longest_waiting_goes_first(self):
         other = self.other_pr()
         self.tick([self.unapproved(), other], conclusions=(None,))
@@ -6047,6 +6062,14 @@ class RedMain(unittest.TestCase):
         self.assertEqual(number(m.fixes_first(queue, 3, set())),
                          [3, 5, 4, 6])
         self.assertEqual(number(m.fixes_first(queue, 3, {3, 4})),
+                         [3, 4, 5, 6])
+
+    def test_a_fix_in_a_green_batch_keeps_its_place_in_it(self):
+        # The batch's green covers its trees in its order only.
+        m.MAIN_RED_FIXES = frozenset({5})
+        queue = [pr(3, T0), pr(4, T1), pr(5, T3), pr(6, T2)]
+        number = lambda q: [p["number"] for p in q]
+        self.assertEqual(number(m.fixes_first(queue, None, {3, 4, 5})),
                          [3, 4, 5, 6])
 
     def test_a_red_only_where_the_base_is_red_is_the_bases(self):

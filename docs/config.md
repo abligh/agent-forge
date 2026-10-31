@@ -506,7 +506,9 @@ has waited N minutes is overdue, and the tick's record lists it under
 
 - goes ahead of every other candidate but the one a `test_ahead` run is
   in flight for, urgent ones and the members of a batch being merged,
-  the longest waiting first, ahead of those already predicted;
+  the longest waiting first, ahead of those already predicted. One that
+  is itself a member keeps its place in the batch: the batch's green
+  covers its trees in that order only;
 - is never predicted past while it conflicts with one predicted ahead
   of it: the prediction ends there;
 - isn't held for a newer candidate's `right_of_way`;

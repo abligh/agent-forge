@@ -487,7 +487,9 @@ directory), through hand-backs and new heads, until it merges, closes,
 or has been no candidate for 24 hours. One that has waited
 `after_minutes` is overdue (the record's `overdue`, minutes waited):
 it goes ahead of every candidate but the one in flight, urgent ones
-and the members of a batch being merged, the longest waiting first;
+and the members of a batch being merged, the longest waiting first
+(an overdue member keeps its place in the batch, whose green covers
+its trees in that order only);
 predictions are never made past it while it conflicts with one ahead;
 a newer one's right of way doesn't hold it; and it never yields.
 
@@ -3020,7 +3022,10 @@ def overdue_first(queue, since, when, keep=None, members=()):
     for those): each that has waited AGE_FIRST since `since` says, the
     longest waiting first. Only `keep`, the one in flight, the members
     of a batch being merged and urgent ones stay ahead of them; the rest
-    keep their order."""
+    keep their order. The members keep theirs too, overdue or not: the
+    batch's green covers its trees in that order only, and on 2026-10-31
+    an overdue member moved up inside a green batch of seven, which
+    then merged two and waited out a new top's run."""
     waited = {pr["number"]: when - since[pr["number"]] for pr in queue
               if pr["number"] in since}
     late = {n: w for n, w in waited.items() if w >= AGE_FIRST}
@@ -3028,9 +3033,10 @@ def overdue_first(queue, since, when, keep=None, members=()):
         return queue, {}
     zero = datetime.timedelta(0)
     queue = sorted(queue, key=lambda pr: (
-        pr["number"] != keep, pr["number"] not in members,
-        not urgent(pr), pr["number"] not in late,
-        -late.get(pr["number"], zero)))
+        pr["number"] != keep, pr["number"] not in members) + (
+        (False, False, zero) if pr["number"] in members else (
+            not urgent(pr), pr["number"] not in late,
+            -late.get(pr["number"], zero))))
     return queue, {n: int(w.total_seconds() // 60) for n, w in late.items()}
 
 
@@ -3428,10 +3434,12 @@ def batch_members(state_dir, queue):
 def fixes_first(queue, in_flight, members):
     """`queue` with MAIN_RED_FIXES first, behind only `in_flight` and a
     green batch's `members` (designs/0011, amendment); the rest keep
-    their order."""
+    their order, and so do the members, among which a fix doesn't move
+    up (see overdue_first)."""
     return sorted(queue, key=lambda pr: (
         pr["number"] != in_flight, pr["number"] not in members,
-        pr["number"] not in MAIN_RED_FIXES))
+        pr["number"] not in members
+        and pr["number"] not in MAIN_RED_FIXES))
 
 
 def predicted(state_dir):
