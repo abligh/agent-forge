@@ -318,6 +318,57 @@ class Main(unittest.TestCase):
             "run": 3, "sha": NEXT_SHA, "started": stamp(NOW - HOUR),
             "ended": stamp(NOW)})
 
+    def test_without_release_jobs_only_a_green_run_is_published(self):
+        self.red_night()
+        self.gh.jobs[2] = red_jobs() + [{"id": 903, "name": "release",
+                                         "conclusion": "success",
+                                         "steps": []}]
+        self.main()
+        self.assertNotIn("published", self.saved())
+        self.gh.runs.insert(0, run(3, NEXT_SHA, "success", ended=NOW))
+        self.gh.jobs[3] = GREEN_JOBS
+        self.main(now=NOW + HOUR)
+        saved = self.saved()
+        self.assertEqual(saved["published"], saved["green"])
+
+    def published_night(self, release="success", mac="success"):
+        self.data["nightly"]["release_jobs"] = ["release", "release-mac"]
+        self.save_config()
+        self.red_night()
+        self.gh.jobs[2] = [
+            j for j in red_jobs() if j["name"] != "release"] + [
+            {"id": 903, "name": "release", "conclusion": release,
+             "steps": []},
+            {"id": 904, "name": "release-mac (arm64)", "conclusion": mac,
+             "steps": []}]
+        self.main()
+        return self.saved()
+
+    def test_a_red_run_whose_release_jobs_succeeded_published(self):
+        saved = self.published_night()
+        # Still red, and its builds are out (designs/0040).
+        self.assertEqual(saved["newest"], "red")
+        self.assertEqual(saved["published"], {
+            "run": 2, "sha": RED_SHA, "started": stamp(NOW - 3 * HOUR),
+            "ended": stamp(NOW - 2 * HOUR)})
+        self.assertIn("PUBLISHED run 2 at bbbbbbbbbb", self.out)
+
+    def test_a_failed_or_missing_release_job_publishes_nothing(self):
+        for release, mac in (("failure", "success"), ("success", "skipped")):
+            with self.subTest(release=release, mac=mac):
+                self.setUp()
+                self.assertNotIn("published",
+                                 self.published_night(release, mac))
+        self.setUp()
+        self.data["nightly"]["release_jobs"] = ["release", "release-win"]
+        self.save_config()
+        self.red_night()
+        self.gh.jobs[2] = [j for j in red_jobs() if j["name"] != "release"] \
+            + [{"id": 903, "name": "release", "conclusion": "success",
+                "steps": []}]
+        self.main()
+        self.assertNotIn("published", self.saved())
+
     def test_a_cancelled_run_is_neither(self):
         self.gh.runs = [run(2, RED_SHA, "cancelled")]
         self.gh.jobs = {2: [{"id": 9, "name": "build-and-test",

@@ -11,6 +11,9 @@ dispatched (`schedule`, `workflow_dispatch`), and judges the newest
 completed one it has not judged yet by the jobs named `nightly.job`
 (or `<job> (...)`, a matrix's): green when each succeeded, red when
 one failed or timed out, and neither (cancelled, say) otherwise.
+A judged run whose `nightly.release_jobs` all succeeded published its
+builds, red or not, and is kept as `published` (without the key, a
+green run is), for forge-router's rule 22 (designs/0040).
 
 **One issue while the nightly is red.** A red run with no issue open
 opens one, titled `The nightly is red at <sha>`, labelled
@@ -63,7 +66,8 @@ Everything is written as the App named by `nightly.as` (default
 `merge.merger`, else `Merger`), with a token minted as forge-app-token
 does; it needs Actions (to dispatch), Issues and Pull requests. State
 (the issue, the last run judged, the last green and red runs, each
-with its start and end, the fixes, the dispatch and the escalations
+with its start and end, the last run that published its builds, the
+fixes, the dispatch and the escalations
 done) is kept in
 ~/.local/state/agent-forge/<project>/nightly/nightly.json, and
 `forge-stats` reads `nightly_red_hours` from it. `--dry-run` prints
@@ -181,13 +185,29 @@ def decisive_jobs(jobs, name):
             or (j.get("name") or "").startswith(name + " (")]
 
 
-def green_record(run):
-    """What nightly.json keeps of the last green run. `started` is when
-    the run began, so the router can tell which labelled issues' fixes
-    it holds (designs/0040)."""
+def run_record(run):
+    """What nightly.json keeps of the last green run, and of the last
+    run that published its builds. `started` is when the run began, so
+    the router can tell which labelled issues' fixes it holds
+    (designs/0040)."""
     return {"run": run["id"], "sha": run["head_sha"],
             "started": run.get("run_started_at") or run.get("created_at"),
             "ended": run["updated_at"]}
+
+
+def published(jobs, release_jobs, got):
+    """Whether a run published its builds: each of `release_jobs` (by
+    name, or a matrix's `name (...)`) ran and every such job succeeded,
+    whatever the deciding jobs said. Without `release_jobs`, only a
+    green run counts, as before designs/0040's amendment."""
+    if not release_jobs:
+        return got == "green"
+    for name in release_jobs:
+        found = decisive_jobs(jobs, name)
+        if not found or any(j.get("conclusion") not in GREEN
+                            for j in found):
+            return False
+    return True
 
 
 def verdict(jobs):
@@ -482,9 +502,15 @@ class Tick:
         jobs = self.get("/repos/%s/actions/runs/%d/jobs?per_page=100"
                         % (self.repo, run["id"]),
                         "the jobs of run %s" % run["id"]).get("jobs") or []
+        every = jobs
         jobs = decisive_jobs(jobs, self.cfg["job"])
         got = verdict(jobs)
         sha = run["head_sha"]
+        if published(every, self.cfg.get("release_jobs"), got):
+            # Red or green, its builds are out: rule 22 (designs/0040).
+            saved["published"] = run_record(run)
+            if got != "green":
+                self.out("PUBLISHED run %s at %s" % (run["id"], sha[:10]))
         number = saved.get("issue")
         if got == "green":
             self.out("GREEN run %s at %s" % (run["id"], sha[:10]))
@@ -506,7 +532,7 @@ class Tick:
                         "escalated", "dispatched"):
                 saved.pop(key, None)
             saved["fixes"] = []
-            saved["green"] = green_record(run)
+            saved["green"] = run_record(run)
             saved["newest"] = "green"
             return True
         if got != "red":
@@ -789,7 +815,7 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
                 green = next((r for r in done
                               if r.get("conclusion") in GREEN), None)
                 if green:
-                    saved["green"] = green_record(green)
+                    saved["green"] = run_record(green)
             if saved.get("issue") is None:
                 found = tick.find_issue()
                 if found is not None:
