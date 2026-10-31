@@ -61,7 +61,7 @@ starts with `_` is a comment, at any level.
 | `checks` | no | The build check, `forge-pr-check`; see below. |
 | `labels` | no | The labels tools read: `owner_prefix` (default `Owner:`; `Owner:<Name>` says whose an item is), `status_prefix` (default `Status:`), `waiting_on_owner` (default `Status:waiting-owner`: the owner's turn), `waiting_external` (default `Status:waiting-external`: nobody's) and `urgent` (default none: off), a label that puts a pull request first: its waiting head is checked before every other pull request's (before `first_authors` and `max_wait_minutes`; a head that failed to prepare still goes behind, and the default branch's traced run still goes first when due), and the Merger takes it before every other candidate but the one a run is in flight for and, with `merge.test_ahead`, those already predicted. Several urgent ones go oldest first. A label anyone with triage access can set, so it is for a person to use sparingly, not agents. `rerun` (default none: off), a label that runs a red head once more ([designs/0022](designs/0022-run-a-red-head-again.md)): on a posting tick, `forge-pr-check` moves the head's red verdict into `reruns` in its state (with who put the label on, from the pull request's events, and when), queues the head as if new, takes the label off, logs `RERUN #<pr> <sha>: was red(<steps>); queued by <login>` and posts pending. The second verdict stands and its description says `(run again after red(<steps>))`. On a head already run again, the label comes off with a comment saying so; on a green, pending or unrun head it just comes off. On a head given up on after `MAX_ERRORS` failures to prepare it or host faults, it clears those counts so the head is tried again in its place, logs `RERUN #<pr> <sha>: given up after <why>; queued again by <login>` and posts pending; that doesn't use up the head's one run again. Anyone with triage access can set it; once per head bounds what it costs. The poster's App needs `issues: write`. The default branch's red head, which has no pull request, is run again the same way, once, by the label on the open `checks.main_red_issue` issue; the label comes off the issue. An instance (`checks.instances`) ignores it. |
 | `relay` | no | Where `forge-router` posts wakes, `forge-merger` its stall messages (`merge.stall_alert`) and `forge-queue` its end-of-job messages: `url`, the xmpp-webhook-relay's base (default `http://127.0.0.1:8788`), `token_file`, its environment file holding `WEBHOOK_TOKEN` (default `~/.config/xmpp-webhook-relay/token`), `remind_seconds`, how long before a turn is woken again (default 7200), and `room`, the room the agents share. |
-| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, `merge_notice` their merge notice, `stuck` their rules for stuck pull requests, `owners` their reading of whose an issue is, `unreviewed` their issue for paths no reviewer covers, and `red_first` their putting red builds first (all below). `forget_minutes`, the engine's, is how long a turn no run decides is kept before it is forgotten (default 0: at once; below). `quiet_labels` lists labels that make an item nobody's turn under every default rule (below). Every key is checked. |
+| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, `merge_notice` their merge notice, `stuck` their rules for stuck pull requests, `owners` their reading of whose an issue is, `unreviewed` their issue for paths no reviewer covers, `red_first` their putting red builds first, and `nightly_wake` their waking issues that wait for a nightly when one goes green (all below). `forget_minutes`, the engine's, is how long a turn no run decides is kept before it is forgotten (default 0: at once; below). `quiet_labels` lists labels that make an item nobody's turn under every default rule (below). Every key is checked. |
 | `closing_keywords` | no | How `forge-closing-keywords` words a refusal: `enforced_by`, what refuses a pull request it fails (default `the Merger`), and `rerun`, how to run it again once GitHub's `closingIssuesReferences` catches up with a body edit (default `run the check again (the Merger does, within a few minutes)`). A project that runs it in CI names its workflow and `gh run rerun --failed <run>`. The issues it judges are `repo`'s, and its default range starts at `default_branch`. The Merger runs it as a gate: `["forge-closing-keywords", "--pr", "{pr}", "--include-subject"]`. |
 
 ### An agent
@@ -815,6 +815,33 @@ the reasons.
 | Key | Default | What it is |
 | --- | --- | --- |
 | `fallback_hours` | `2` | How long a red-build issue may go with no pull request referencing it and no comment by its owner before an idle developer is offered it. A number above 0. |
+
+### `router.nightly_wake`
+
+An issue whose fixes have merged may still wait for a check on a
+nightly build; its owner labels it as waiting and often defers it to
+the next scheduled nightly. A red nightly run again (designs/0028)
+that ends green makes the same build sooner. With `nightly_wake`, an
+open issue carrying `label`, with an owner and not parked (a quiet
+label or another label starting `Status:waiting-`), whose label was
+last put on before the last green nightly run started, is its owner's
+turn once for that run, "check it on that build now", naming the run,
+its commit and when it went green (rule 22), whatever its
+`Defer-until:` says. The run is `green` in forge-nightly's nightly.json
+on the router's host, while the file is fresh; a record without
+`started` (written before forge-nightly kept it) wakes nobody. A later
+green run wakes her again while the label stays on, so she takes it
+off once she has checked, and puts it back when a new fix merges.
+An issue carrying the label is also not actionable for the idle offer,
+the merge notice or the hand-over count: it waits, as a waiting label
+makes it wait. Needs the `nightly` section. Off without the key.
+`agent_forge/rules_default.py` (rule 22) has the detail, and
+[designs/0040](designs/0040-a-green-nightly-wakes-what-waits-for-it.md)
+the reasons.
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `label` | required | The label marking an issue as waiting for a nightly check, such as `"awaiting-nightly"`. A non-empty string. |
 
 ### `router.quiet_labels`
 

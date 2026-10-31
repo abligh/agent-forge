@@ -200,7 +200,8 @@ RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
           "stuck": dict, "owners": dict, "unreviewed": dict,
-          "forget_minutes": int, "quiet_labels": list, "red_first": dict}
+          "forget_minutes": int, "quiet_labels": list, "red_first": dict,
+          "nightly_wake": dict}
 IDLE_OFFER = {"idle_minutes": int, "shell_minutes": int, "report_to": str,
               "hand_over_above": int}
 MERGE_NOTICE = {"window_minutes": int, "skip_label": str, "to": str}
@@ -211,6 +212,8 @@ OWNERS = {"triage": str}
 UNREVIEWED = {"ignore": list, "depth2": list}
 # designs/0039: its keys, each a number checked by `_check_red_first`.
 RED_FIRST = ("fallback_hours",)
+# designs/0040: the label marking an issue as waiting for a nightly check.
+NIGHTLY_WAKE = {"label": str}
 RECEIVER = {"address": str, "port": int, "path": str, "secret_file": str,
             "max_body": int, "ticks": dict, "route": list,
             "run_timeout": int}
@@ -517,6 +520,9 @@ def check(data):
             _check_unreviewed(router["unreviewed"], router, problems)
         if isinstance(router.get("red_first"), dict):
             _check_red_first(router["red_first"], problems)
+        if isinstance(router.get("nightly_wake"), dict):
+            _check_nightly_wake(router["nightly_wake"], "nightly" in data,
+                                problems)
         if _is(router.get("forget_minutes"), int) and \
                 router["forget_minutes"] < 0:
             problems.append("router.forget_minutes must be at least 0")
@@ -1250,6 +1256,20 @@ def _check_red_first(red, problems):
                 or value <= 0:
             problems.append("%s.%s must be a number above 0"
                             % (where, key))
+
+
+def _check_nightly_wake(wake, nightly, problems):
+    """router.nightly_wake (designs/0040): the label marking an issue as
+    waiting for a nightly check. It reads forge-nightly's state, so it
+    needs the `nightly` section."""
+    where = "router.nightly_wake"
+    _fields(where, wake, NIGHTLY_WAKE, problems)
+    if "label" not in wake:
+        problems.append("%s: missing 'label'" % where)
+    elif isinstance(wake["label"], str) and not wake["label"].strip():
+        problems.append("%s.label must not be empty" % where)
+    if not nightly:
+        problems.append("%s needs the nightly section" % where)
 
 
 def _check_unreviewed(gaps, router, problems):

@@ -1,7 +1,8 @@
 """Tests for agent_forge.rules_default as the engine sees it: the
 interface. Most rules are tested through bin/forge-router, in
 tests/test_forge_router.py; red builds first (`router.red_first`,
-rules 20 and 21, designs/0039) are tested here."""
+rules 20 and 21, designs/0039) and a green nightly's wake
+(`router.nightly_wake`, rule 22, designs/0040) are tested here."""
 import datetime
 import json
 import os
@@ -81,7 +82,8 @@ class Interface(unittest.TestCase):
     def test_what_it_asks_github_for(self):
         self.assertEqual(sorted(rules.graphql), ["Issue", "PullRequest"])
         self.assertEqual([l.name for l in rules.lookups],
-                         ["blockers", "bases", "red builds"])
+                         ["blockers", "bases", "red builds",
+                          "green nightly"])
 
 
 # --- red builds first (designs/0039) ----------------------------------------
@@ -96,9 +98,13 @@ NIGHTLY_LINE = ("#40 says the nightly is red (since 11:00Z), and no pull "
 
 
 def red_project(red_first=None, idle_offer=None, quiet_labels=None,
-                nightly=False):
+                nightly=False, nightly_wake=None, owners=None):
     data = example()
     data["router"] = {}
+    if nightly_wake is not None:
+        data["router"]["nightly_wake"] = nightly_wake
+    if owners is not None:
+        data["router"]["owners"] = owners
     if red_first is not None:
         data["router"]["red_first"] = red_first
     if idle_offer is not None:
@@ -471,6 +477,266 @@ class RedBuilds(unittest.TestCase):
             "what": "the default branch", "event": "2026-10-09T08:00:00Z"})
         self.assertEqual(again["redBuild"]["event"], "2026-10-09T10:00:00Z")
         self.assertNotIn("redBuild", other)
+
+
+# --- a green nightly wakes what waits for it (designs/0040) -----------------
+
+WAITS = "awaiting-nightly"
+GREEN = {"run": 77, "sha": "c0ffee1" + "0" * 33,
+         "started": "2026-10-09T12:00:00Z", "ended": "2026-10-09T13:30:00Z"}
+GREEN_LINE = ("#60 waits for a nightly check, and nightly run 77 (c0ffee1, "
+              "green at 13:30Z) includes its fixes: check it on that build "
+              "now.")
+
+
+def waiting_issue(number=60, owner="LeadDev", labels=(),
+                  labelled="2026-10-09T11:00:00Z", green=GREEN, body="",
+                  events=()):
+    item = issue(number, (["Owner:" + owner] if owner else [])
+                 + [WAITS] + list(labels))
+    item["title"] = "item %d" % number
+    item["body"] = body
+    nodes = list(events)
+    if labelled:
+        nodes.append({"createdAt": labelled, "label": {"name": WAITS}})
+    item["ownerLabels"] = {"nodes": nodes}
+    if green is not None:
+        item["greenNightly"] = dict(green)
+    return item
+
+
+def wake_project(**more):
+    more.setdefault("nightly", True)
+    more.setdefault("nightly_wake", {"label": WAITS})
+    return red_project(**more)
+
+
+class NightlyWakeConfig(unittest.TestCase):
+
+    def problems(self, wake, nightly=True):
+        # forge-nightly needs someone for steps nobody owns.
+        data = dict(example(), router={"nightly_wake": wake,
+                                       "owners": {"triage": "LeadDev"}})
+        if nightly:
+            data["nightly"] = {"workflow": "nightly.yaml", "job": "build"}
+        return config.check(data)
+
+    def test_valid(self):
+        self.assertEqual(self.problems({"label": WAITS}), [])
+
+    def test_every_key_is_checked(self):
+        self.assertEqual(self.problems({"label": WAITS, "hours": 1}),
+                         ["router.nightly_wake: unknown key 'hours'"])
+        self.assertEqual(self.problems({}),
+                         ["router.nightly_wake: missing 'label'"])
+        self.assertEqual(self.problems({"label": " "}),
+                         ["router.nightly_wake.label must not be empty"])
+        self.assertEqual(self.problems({"label": 3}),
+                         ["router.nightly_wake.label must be a string"])
+        self.assertEqual(self.problems(True),
+                         ["router.nightly_wake must be an object"])
+
+    def test_it_needs_the_nightly_section(self):
+        self.assertEqual(self.problems({"label": WAITS}, nightly=False),
+                         ["router.nightly_wake needs the nightly section"])
+
+    def test_configure(self):
+        rules.configure(red_project(nightly=True), merger)
+        self.addCleanup(rules.configure, PROJECT, merger)
+        self.assertIsNone(rules.NIGHTLY_WAKE)
+        self.assertNotIn("ownerLabels", rules.graphql["Issue"])
+        rules.configure(wake_project(), merger)
+        self.assertEqual(rules.NIGHTLY_WAKE, {"label": WAITS})
+        # Label events are fetched for it, without `router.owners` too.
+        self.assertIn("ownerLabels", rules.graphql["Issue"])
+
+
+class Rule22(RedFirstCase):
+
+    def setUp(self):
+        self.use(wake_project())
+
+    def wakes(self, item, **more):
+        ctx = self.ctx(issues=[item] + list(more.pop("others", ())), **more)
+        return [d for d in rules.decide(item, ctx) if d.rule == 22]
+
+    def test_off_without_the_key(self):
+        self.use(red_project(nightly=True))
+        self.assertEqual(self.wakes(waiting_issue()), [])
+        # Nor does the lookup read anything.
+        item = waiting_issue(green=None)
+        rules.attach_green_nightly(None, "example/widget", [], [item])
+        self.assertNotIn("greenNightly", item)
+
+    def test_labelled_before_the_run_started(self):
+        self.assertEqual(self.wakes(waiting_issue()), [router.Decision(
+            60, "LeadDev", 22, GREEN["ended"], GREEN_LINE,
+            reminder=router.ONCE)])
+
+    def test_beside_the_issues_own_decision(self):
+        # A comment by someone else is still rule 12's, and rule 22 is
+        # given beside it, neither hiding the other.
+        item = waiting_issue()
+        item["comments"] = [note(UIDEV, "2026-10-09T13:00:00Z")]
+        got = rules.decide(item, self.ctx(issues=[item]))
+        self.assertEqual([(d.agent, d.rule) for d in got],
+                         [("LeadDev", 12), ("LeadDev", 22)])
+
+    def test_not_when_labelled_after_it_started(self):
+        self.assertEqual(self.wakes(waiting_issue(
+            labelled="2026-10-09T12:30:00Z")), [])
+        self.assertEqual(self.wakes(waiting_issue(
+            labelled=GREEN["started"])), [])
+
+    def test_the_newest_time_the_label_went_on(self):
+        older = {"createdAt": "2026-10-08T09:00:00Z",
+                 "label": {"name": WAITS}}
+        other = {"createdAt": "2026-10-09T13:00:00Z",
+                 "label": {"name": "bug"}}
+        self.assertEqual(len(self.wakes(waiting_issue(
+            events=[older, other]))), 1)
+        self.assertEqual(self.wakes(waiting_issue(
+            labelled="2026-10-09T12:30:00Z", events=[older])), [])
+        # No event for it among those fetched: unknown wakes nobody.
+        self.assertEqual(self.wakes(waiting_issue(labelled=None,
+                                                  events=[other])), [])
+
+    def test_not_when_parked(self):
+        for label in ("Status:waiting-owner", "Status:waiting-external",
+                      "Status:waiting-backlog"):
+            with self.subTest(label=label):
+                self.assertEqual(self.wakes(waiting_issue(
+                    labels=[label])), [])
+        self.use(wake_project(quiet_labels=["parked"]))
+        self.assertEqual(self.wakes(waiting_issue(labels=["parked"])), [])
+
+    def test_its_own_label_doesnt_park_it(self):
+        self.use(wake_project(nightly_wake={
+            "label": "Status:waiting-nightly"}))
+        item = waiting_issue()
+        item["labels"] = [{"name": "Owner:LeadDev"},
+                          {"name": "Status:waiting-nightly"}]
+        item["ownerLabels"]["nodes"][0]["label"]["name"] = \
+            "Status:waiting-nightly"
+        self.assertEqual(len(self.wakes(item)), 1)
+
+    def test_not_without_an_owner(self):
+        self.assertEqual(self.wakes(waiting_issue(owner=None)), [])
+        # With `router.owners`, a label naming no agent is no owner.
+        self.use(wake_project(owners={"triage": "LeadDev"}))
+        item = waiting_issue(owner="Nobody")
+        item["author"] = {"login": "someone"}
+        self.assertEqual(self.wakes(item), [])
+
+    def test_a_future_defer_until_doesnt_hold_it(self):
+        item = waiting_issue(body="Defer-until: 2026-10-10T03:17:00Z")
+        self.assertIsNotNone(rules.deferred_until(item))
+        self.assertGreater(rules.deferred_until(item), NOW)
+        self.assertEqual(len(self.wakes(item)), 1)
+
+    def test_no_green_run_wakes_nobody(self):
+        self.assertEqual(self.wakes(waiting_issue(green=None)), [])
+        self.assertEqual(self.wakes(waiting_issue(
+            green=dict(GREEN, started=None))), [])
+
+    def test_a_new_green_run_is_a_new_event(self):
+        later = dict(GREEN, run=78, started="2026-10-10T03:17:00Z",
+                     ended="2026-10-10T04:20:00Z")
+        [got] = self.wakes(waiting_issue(green=later),
+                           when=datetime.datetime(
+                               2026, 10, 10, 5, 0,
+                               tzinfo=datetime.timezone.utc))
+        self.assertEqual((got.event, got.line), (
+            "2026-10-10T04:20:00Z",
+            "#60 waits for a nightly check, and nightly run 78 (c0ffee1, "
+            "green at 04:20Z) includes its fixes: check it on that build "
+            "now."))
+
+    def test_without_the_runs_context_it_never_applies(self):
+        self.assertIsNone(rules.nightly_turn(waiting_issue(), self.roster,
+                                             None))
+
+
+class NightlyWaitIsNotActionable(RedFirstCase):
+    """An issue carrying the label waits: rule 15 offers her real work."""
+
+    def setUp(self):
+        self.use(wake_project(idle_offer={}))
+
+    def offer(self):
+        waiting = waiting_issue(green=None)
+        waiting["createdAt"] = "2026-09-01T09:00:00Z"
+        ctx = self.ctx(issues=[waiting, plain_issue(30)],
+                       directory=listing(entry("WidgetLeadDev")))
+        return [d for d in rules.sweep(ctx) if d.rule == 15]
+
+    def test_the_label_waits_with_or_without_defer_until(self):
+        [got] = self.offer()
+        self.assertTrue(got.line.startswith('#30 "item 30" is yours'),
+                        got.line)
+        actionable, _, waiting = rules.owned_issues(
+            "LeadDev", self.ctx(issues=[waiting_issue(), plain_issue(30)]))
+        self.assertEqual(([i["number"] for i in actionable], waiting),
+                         ([30], 1))
+
+    def test_without_the_key_it_is_actionable(self):
+        self.use(red_project(idle_offer={}, nightly=True))
+        [got] = self.offer()
+        self.assertTrue(got.line.startswith('#60 "item 60" is yours'),
+                        got.line)
+
+
+class GreenNightly(unittest.TestCase):
+    """Which run is the last green one: forge-nightly's state."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.env = {"FORGE_STATE_DIR": tmp.name, "HOME": tmp.name}
+        self.project = wake_project()
+        self.now = NOW
+
+    def write(self, data):
+        path = os.path.join(self.env["FORGE_STATE_DIR"], "widget", "nightly")
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, "nightly.json"), "w") as handle:
+            json.dump(data, handle)
+
+    def found(self):
+        return rules.green_nightly(self.project, self.env, self.now)
+
+    def test_the_green_run_while_fresh(self):
+        self.write({"at": "2026-10-09T13:55:00Z", "green": dict(
+            GREEN, started="2026-10-09T12:00:00+00:00")})
+        self.assertEqual(self.found(), GREEN)
+        self.now = NOW + datetime.timedelta(hours=1)
+        self.assertIsNone(self.found())
+
+    def test_nothing_without_the_file_or_a_whole_record(self):
+        self.assertIsNone(self.found())
+        for missing in ("run", "sha", "started", "ended"):
+            with self.subTest(missing=missing):
+                green = dict(GREEN)
+                del green[missing]
+                self.write({"at": "2026-10-09T13:55:00Z", "green": green})
+                self.assertIsNone(self.found())
+        self.write({"at": "2026-10-09T13:55:00Z"})
+        self.assertIsNone(self.found())
+
+    def test_the_lookup(self):
+        written = datetime.datetime.now(datetime.timezone.utc)
+        self.write({"at": written.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "green": GREEN})
+        rules.configure(self.project, merger)
+        self.addCleanup(rules.configure, PROJECT, merger)
+        old = rules.ENVIRON
+        rules.ENVIRON = self.env
+        self.addCleanup(setattr, rules, "ENVIRON", old)
+        waiting, other = waiting_issue(green=None), issue(61)
+        rules.attach_green_nightly(None, "example/widget", [],
+                                   [waiting, other])
+        self.assertEqual(waiting["greenNightly"], GREEN)
+        self.assertNotIn("greenNightly", other)
 
 
 if __name__ == "__main__":

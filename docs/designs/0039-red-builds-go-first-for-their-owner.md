@@ -1,7 +1,7 @@
 # 0039: Red builds go first for their owner, and pass on if untouched
 
-* Status: proposed
-* Implemented: next release, off until configured.
+* Status: approved (Alex Bligh, 2026-10-31, https://github.com/abligh/agent-forge/issues/178#issuecomment-6543694746)
+* Implemented: v0.4.138, off until configured.
 * Author: XMPPEngineer
 * Date: 2026-10-31
 

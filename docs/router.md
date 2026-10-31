@@ -352,7 +352,10 @@ lookup reads, rather than GitHub, the state forge-nightly and
 forge-pr-check keep on the same host, to know which open issues say a
 build is red; rule 20 reads `prs` for whether a pull request
 references one, and rule 21, run in `sweep` beside the idle offer,
-reads `directory` too. `previous` is the
+reads `directory` too. With `router.nightly_wake` (rule 22), the
+`green nightly` lookup reads the last green run from forge-nightly's
+state on the same host the same way, for the issues carrying its
+label. `previous` is the
 last sending run's decisions (`previous.json`, above), read only for a
 module whose `wants_previous` is true after `configure`; it is None on
 the first run, or when the file can't be read, which a module must read
