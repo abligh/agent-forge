@@ -321,6 +321,34 @@ class KeysTest(unittest.TestCase):
                                      {"issue": {"number": 4}})[0],
                          [("item", 4), ("tool", ("widget-triage",))])
 
+    def test_actions_narrow_which_deliveries_tick(self):
+        configure(ticks={"issues": ["widget-triage"],
+                         "pull_request": [list(BUILD)]},
+                  actions={"issues": ["opened", "labeled"],
+                           "pull_request": ["opened", "labeled"],
+                           "_comment": "x"})
+        tick = ("tool", ("widget-triage",))
+        for action, keys in (("opened", [("item", 4), tick]),
+                             ("labeled", [("item", 4), tick]),
+                             ("edited", [("item", 4)]),
+                             (None, [("item", 4)])):
+            payload = {"issue": {"number": 4}}
+            if action:
+                payload["action"] = action
+            self.assertEqual(rc.keys_for("issues", payload)[0], keys, action)
+        # Still on top of the event's own rule: labeled leaves no new head.
+        self.assertEqual(rc.keys_for("pull_request", {
+            "action": "labeled", "pull_request": {"number": 7}})[0],
+            [("item", 7)])
+        self.assertEqual(rc.keys_for("pull_request", {
+            "action": "opened", "pull_request": {"number": 7}})[0],
+            [("item", 7), ("tool", BUILD)])
+        configure(ticks={"issues": ["widget-triage"]},
+                  actions={"issues": ["opened"]}, route=None)
+        self.assertEqual(rc.keys_for("issues", {
+            "action": "edited", "issue": {"number": 4}}),
+            ([], "nothing to route or tick"))
+
     def test_the_order_is_the_table_s_first_mention(self):
         configure(ticks={"push": ["forge-merger", "b"],
                          "status": ["a", "forge-merger"]})

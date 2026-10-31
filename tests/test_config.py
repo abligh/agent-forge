@@ -788,6 +788,23 @@ class Check(unittest.TestCase):
             "receiver.ticks.issues[%d] must be a tool's name or a non-empty "
             "list of strings starting with one" % i for i in range(6)])
 
+    def test_receiver_actions(self):
+        self.assertEqual(self.problems(receiver={"actions": {
+            "issues": ["opened", "labeled"], "_comment": "x"}}), [])
+        self.assertEqual(self.problems(receiver={"actions": {
+            "push": ["created"],
+            "issues": [],
+            "issue_comment": "created",
+            "pull_request": ["opened", ""],
+            "pull_request_review": [1]}}), [
+            "receiver.actions.push: not an event with actions (issues, "
+            "issue_comment, pull_request, pull_request_review)"] + [
+            "receiver.actions.%s must be a non-empty list of action names"
+            % e for e in ("issues", "issue_comment", "pull_request",
+                          "pull_request_review")])
+        self.assertEqual(self.problems(receiver={"actions": []}),
+                         ["receiver.actions must be an object"])
+
     def test_receiver_route(self):
         for route in (["widget-router"], [], ["tools/r", "{items}"], [1]):
             self.assertEqual(self.problems(receiver={"route": route}), [

@@ -215,12 +215,16 @@ RED_FIRST = ("fallback_hours",)
 # designs/0040: the label marking an issue as waiting for a nightly check.
 NIGHTLY_WAKE = {"label": str}
 RECEIVER = {"address": str, "port": int, "path": str, "secret_file": str,
-            "max_body": int, "ticks": dict, "route": list,
-            "run_timeout": int}
+            "max_body": int, "ticks": dict, "actions": dict,
+            "route": list, "run_timeout": int}
 # The webhook events forge-receiver reads; `receiver.ticks` keys are
 # these. bin/forge-receiver says when each one gives a tool work.
 RECEIVER_EVENTS = ("issues", "issue_comment", "pull_request",
                    "pull_request_review", "status", "check_suite", "push")
+# The events that name an item and carry an action; `receiver.actions`
+# keys are these.
+RECEIVER_ACTION_EVENTS = ("issues", "issue_comment", "pull_request",
+                          "pull_request_review")
 # The receiver reads at most eight digits of Content-Length.
 RECEIVER_MAX_BODY = 99999999
 CLOSING_KEYWORDS = {"enforced_by": str, "rerun": str}
@@ -1331,6 +1335,21 @@ def _check_receiver(receiver, problems):
                 problems.append("%s[%d] must be a tool's name or a non-empty "
                                 "list of strings starting with one"
                                 % (where, i))
+    actions_by_event = receiver.get("actions", {})
+    if not isinstance(actions_by_event, dict):
+        actions_by_event = {}
+    for event, actions in actions_by_event.items():
+        where = "receiver.actions.%s" % event
+        if event.startswith("_"):
+            continue
+        if event not in RECEIVER_ACTION_EVENTS:
+            problems.append("%s: not an event with actions (%s)"
+                            % (where, ", ".join(RECEIVER_ACTION_EVENTS)))
+            continue
+        if not (isinstance(actions, list) and actions and all(
+                isinstance(a, str) and a for a in actions)):
+            problems.append("%s must be a non-empty list of action names"
+                            % where)
     route = receiver.get("route")
     if isinstance(route, list) and not (
             _argv(route) and any("{items}" in a for a in route)):

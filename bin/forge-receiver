@@ -55,6 +55,12 @@ tools work only when:
   behind it and needs updating;
 * `issues`, `issue_comment`: any delivery naming an item.
 
+`actions` narrows that, by event: with `"issues": ["opened",
+"labeled"]`, only those `issues` actions give its tools work. It is
+checked on top of the rules above (a `pull_request` action must still
+leave a new head), and never changes what is routed. Without it, the
+rules above alone decide.
+
 **Routing.** With `route` set (an argument list with `{items}` in it),
 the item each `issues`, `issue_comment`, `pull_request` and
 `pull_request_review` event names, an `int`, is routed too, and so is
@@ -158,6 +164,9 @@ SECRET_FILE = ""
 # table first names it: the order a run ticks them.
 TICKS = {}
 TOOL_ORDER = []
+# {event: frozenset of actions}: the only actions that give the event's
+# tools work. An event not in it is decided by gives_work alone.
+ACTIONS = {}
 # The router's argument list, with "{items}" to fill; None to route
 # nothing.
 ROUTE = None
@@ -171,7 +180,7 @@ def configure(project):
     repository and its default branch."""
     global REPO_SLUG, MAIN_REF, STATUS_CONTEXT, ACT_AS, ADDRESS, PORT
     global PATH, MAX_BODY, SECRET_FILE, TICKS, TOOL_ORDER, ROUTE
-    global RUN_TIMEOUT
+    global RUN_TIMEOUT, ACTIONS
     receiver = project.section("receiver")
     REPO_SLUG = project.repo
     MAIN_REF = "refs/heads/" + project.default_branch
@@ -192,6 +201,9 @@ def configure(project):
         TICKS[event] = [(t,) if isinstance(t, str) else tuple(t)
                         for t in tools]
         TOOL_ORDER += [t for t in TICKS[event] if t not in TOOL_ORDER]
+    ACTIONS = {event: frozenset(actions) for event, actions
+               in receiver.get("actions", {}).items()
+               if not event.startswith("_")}
     ROUTE = tuple(receiver["route"]) if receiver.get("route") else None
     RUN_TIMEOUT = receiver.get("run_timeout", 600)
 
@@ -244,6 +256,8 @@ def ticks(event):
 def gives_work(event, payload):
     """Whether an item event gives its tools work: see the module doc."""
     action = payload.get("action")
+    if event in ACTIONS and action not in ACTIONS[event]:
+        return False
     if event == "pull_request":
         return action in NEW_HEAD_ACTIONS
     if event == "pull_request_review":
