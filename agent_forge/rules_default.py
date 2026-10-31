@@ -144,16 +144,18 @@ key):
     item owner), not parked (as rule 20 reads it, but for that label
     itself), whose label was last put on (its newest `LabeledEvent`
     among the last 30 label events fetched; none found wakes nobody)
-    before the last green nightly run started: the owner's, "check it
-    on that build now", naming the run, its commit and when it went
-    green. A label that old means the fixes were in the build. It
+    before the newest nightly run that published its builds started,
+    red or green: the owner's, "check it on that build now", naming the
+    run, its commit and when it ended. A label that old means the fixes
+    were in the build. It
     applies whatever the issue's `Defer-until:` says: no rule above
     reads one on an issue (only rule 15's offer does). The event is the
-    run's end, so it is said once for each green run, never reminded;
-    while the label stays on, a later green run wakes her again. The
-    green run is `green` in forge-nightly's nightly.json, while the
-    file is fresh; one without `started` wakes nobody. The `green
-    nightly` lookup reads it. An issue carrying the label is also not
+    run's end, so it is said once for each such run, never reminded;
+    while the label stays on, a later one wakes her again. The run is
+    `published` in forge-nightly's nightly.json (a run whose
+    `nightly.release_jobs` succeeded; without that key, a green run),
+    else `green`, while the file is fresh; one without `started` wakes
+    nobody. The `published nightly` lookup reads it. An issue carrying the label is also not
     actionable for rules 15-17 or rule 16's unstarted count: it waits,
     as a waiting label makes it wait, and rule 22 wakes it.
 
@@ -1488,42 +1490,46 @@ def red_fallbacks(ctx):
     return decisions, taken
 
 
-# --- a green nightly wakes what waits for it (rule 22) -------------------------
+# --- a published nightly wakes what waits for it (rule 22) ---------------------
 
 
-def green_nightly(project, environ=None, now=None):
-    """The last green nightly run, {"run", "sha", "started", "ended"}, as
-    forge-nightly keeps it in nightly.json while the file is fresh (as
-    `nightly.current` reads it), its times as GitHub writes them; None
-    when there is none, or it lacks any of them (a record from before
-    forge-nightly kept `started` wakes nobody)."""
-    green = nightly.current(project, environ, now).get("green")
-    if not isinstance(green, dict):
+def published_nightly(project, environ=None, now=None):
+    """The newest nightly run that published its builds, red or green,
+    {"run", "sha", "started", "ended"}: `published` in forge-nightly's
+    nightly.json, else `green` (a file from before it kept
+    `published`), while the file is fresh (as `nightly.current` reads
+    it), its times as GitHub writes them; None when there is none, or it
+    lacks any of them (a record without `started` wakes nobody)."""
+    data = nightly.current(project, environ, now)
+    built = data.get("published")
+    if built is None:
+        built = data.get("green")
+    if not isinstance(built, dict):
         return None
-    run, sha = green.get("run"), green.get("sha")
-    started, ended = as_stamp(green.get("started")), as_stamp(
-        green.get("ended"))
+    run, sha = built.get("run"), built.get("sha")
+    started, ended = as_stamp(built.get("started")), as_stamp(
+        built.get("ended"))
     if not (isinstance(run, int) and not isinstance(run, bool)
             and isinstance(sha, str) and sha and started and ended):
         return None
     return {"run": run, "sha": sha, "started": started, "ended": ended}
 
 
-def attach_green_nightly(github, repo, prs, issues):
+def attach_published_nightly(github, repo, prs, issues):
     """Rule 22's lookup, with `router.nightly_wake`: give each open issue
-    carrying its label `greenNightly`, the last green nightly run as
-    `green_nightly` reads it. It reads forge-nightly's state on this
-    host, not GitHub."""
+    carrying its label `publishedNightly`, the newest nightly run that
+    published its builds, as `published_nightly` reads it. It reads
+    forge-nightly's state on this host, not GitHub."""
     if NIGHTLY_WAKE is None or PROJECT is None:
         return
-    green = None
+    built = None
     for issue in issues:
         if not awaits_nightly(issue):
             continue
-        if green is None:
-            green = green_nightly(PROJECT, ENVIRON) or {}
-        if green:
-            issue["greenNightly"] = dict(green)
+        if built is None:
+            built = published_nightly(PROJECT, ENVIRON) or {}
+        if built:
+            issue["publishedNightly"] = dict(built)
 
 
 def awaits_nightly(issue):
@@ -1546,28 +1552,30 @@ def labelled_at(issue, label):
 
 def nightly_turn(issue, roster, ctx):
     """Rule 22: an open issue carrying `router.nightly_wake`'s label,
-    with an owner, not parked, labelled before the last green nightly
-    run started (so its fixes are in that build), is its owner's turn,
+    with an owner, not parked, labelled before the newest nightly run
+    that published its builds started (so its fixes are in those
+    builds), red or green, is its owner's turn,
     once for that run: the event is the run's end. A `Defer-until:` on
     the issue doesn't hold it. None otherwise."""
     if NIGHTLY_WAKE is None or ctx is None or not awaits_nightly(issue):
         return None
-    green = issue.get("greenNightly")
-    if not isinstance(green, dict) or not green.get("started") \
-            or not green.get("ended"):
+    built = issue.get("publishedNightly")
+    if not isinstance(built, dict) or not built.get("started") \
+            or not built.get("ended"):
         return None
     owner = issue_owner(issue, roster)
     if not owner or parked(issue):
         return None
     labelled = labelled_at(issue, NIGHTLY_WAKE["label"])
-    if labelled is None or labelled >= green["started"]:
+    if labelled is None or labelled >= built["started"]:
         return None
     n = issue["number"]
-    return turn(n, owner, 22, green["ended"],
-                "waits for a nightly check, and nightly run %s (%s, green "
-                "at %s) includes its fixes: check it on that build now." % (
-                    green["run"], green["sha"][:7],
-                    since_text(green["ended"], ctx.when)),
+    return turn(n, owner, 22, built["ended"],
+                "waits for a nightly check, and nightly run %s (%s, builds "
+                "published at %s) includes its fixes: check it on that "
+                "build now." % (
+                    built["run"], built["sha"][:7],
+                    since_text(built["ended"], ctx.when)),
                 reminder=ONCE)
 
 
@@ -1960,4 +1968,4 @@ def attach_bases(github, repo, prs, issues):
 lookups = (Lookup("blockers", attach_blockers),
            Lookup("bases", attach_bases),
            Lookup("red builds", attach_red_builds),
-           Lookup("green nightly", attach_green_nightly))
+           Lookup("published nightly", attach_published_nightly))

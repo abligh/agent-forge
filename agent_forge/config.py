@@ -95,7 +95,7 @@ STATS_WATCH_FIGURES = {
 # forge-nightly (designs/0028): a red nightly is a red main.
 NIGHTLY = {"workflow": str, "job": str, "owners": dict, "labels": list,
            "retry_hours": int, "escalate_hours": list, "as": str,
-           "tell_owner": str}
+           "tell_owner": str, "release_jobs": list}
 # A workflow is named by its file, which is read for its inputs.
 WORKFLOW_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
@@ -460,6 +460,11 @@ def _check_nightly(nightly, data, problems):
     if isinstance(labels, list) and not all(
             isinstance(l, str) and l.strip() for l in labels):
         problems.append("%s.labels must be a list of label names" % where)
+    jobs = nightly.get("release_jobs")
+    if isinstance(jobs, list) and not (jobs and all(
+            isinstance(j, str) and j.strip() for j in jobs)):
+        problems.append("%s.release_jobs must be a non-empty list of job "
+                        "names" % where)
     if _is(nightly.get("retry_hours"), int) and nightly["retry_hours"] < 1:
         problems.append("%s.retry_hours must be at least 1" % where)
     hours = nightly.get("escalate_hours")

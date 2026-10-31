@@ -1,7 +1,7 @@
 """Tests for agent_forge.rules_default as the engine sees it: the
 interface. Most rules are tested through bin/forge-router, in
 tests/test_forge_router.py; red builds first (`router.red_first`,
-rules 20 and 21, designs/0039) and a green nightly's wake
+rules 20 and 21, designs/0039) and a published nightly's wake
 (`router.nightly_wake`, rule 22, designs/0040) are tested here."""
 import datetime
 import json
@@ -83,7 +83,7 @@ class Interface(unittest.TestCase):
         self.assertEqual(sorted(rules.graphql), ["Issue", "PullRequest"])
         self.assertEqual([l.name for l in rules.lookups],
                          ["blockers", "bases", "red builds",
-                          "green nightly"])
+                          "published nightly"])
 
 
 # --- red builds first (designs/0039) ----------------------------------------
@@ -479,14 +479,14 @@ class RedBuilds(unittest.TestCase):
         self.assertNotIn("redBuild", other)
 
 
-# --- a green nightly wakes what waits for it (designs/0040) -----------------
+# --- a published nightly wakes what waits for it (designs/0040) -------------
 
 WAITS = "awaiting-nightly"
 GREEN = {"run": 77, "sha": "c0ffee1" + "0" * 33,
          "started": "2026-10-09T12:00:00Z", "ended": "2026-10-09T13:30:00Z"}
 GREEN_LINE = ("#60 waits for a nightly check, and nightly run 77 (c0ffee1, "
-              "green at 13:30Z) includes its fixes: check it on that build "
-              "now.")
+              "builds published at 13:30Z) includes its fixes: check it on "
+              "that build now.")
 
 
 def waiting_issue(number=60, owner="LeadDev", labels=(),
@@ -501,7 +501,7 @@ def waiting_issue(number=60, owner="LeadDev", labels=(),
         nodes.append({"createdAt": labelled, "label": {"name": WAITS}})
     item["ownerLabels"] = {"nodes": nodes}
     if green is not None:
-        item["greenNightly"] = dict(green)
+        item["publishedNightly"] = dict(green)
     return item
 
 
@@ -565,8 +565,8 @@ class Rule22(RedFirstCase):
         self.assertEqual(self.wakes(waiting_issue()), [])
         # Nor does the lookup read anything.
         item = waiting_issue(green=None)
-        rules.attach_green_nightly(None, "example/widget", [], [item])
-        self.assertNotIn("greenNightly", item)
+        rules.attach_published_nightly(None, "example/widget", [], [item])
+        self.assertNotIn("publishedNightly", item)
 
     def test_labelled_before_the_run_started(self):
         self.assertEqual(self.wakes(waiting_issue()), [router.Decision(
@@ -639,7 +639,7 @@ class Rule22(RedFirstCase):
         self.assertEqual(self.wakes(waiting_issue(
             green=dict(GREEN, started=None))), [])
 
-    def test_a_new_green_run_is_a_new_event(self):
+    def test_a_new_published_run_is_a_new_event(self):
         later = dict(GREEN, run=78, started="2026-10-10T03:17:00Z",
                      ended="2026-10-10T04:20:00Z")
         [got] = self.wakes(waiting_issue(green=later),
@@ -649,8 +649,8 @@ class Rule22(RedFirstCase):
         self.assertEqual((got.event, got.line), (
             "2026-10-10T04:20:00Z",
             "#60 waits for a nightly check, and nightly run 78 (c0ffee1, "
-            "green at 04:20Z) includes its fixes: check it on that build "
-            "now."))
+            "builds published at 04:20Z) includes its fixes: check it on "
+            "that build now."))
 
     def test_without_the_runs_context_it_never_applies(self):
         self.assertIsNone(rules.nightly_turn(waiting_issue(), self.roster,
@@ -687,7 +687,7 @@ class NightlyWaitIsNotActionable(RedFirstCase):
 
 
 class GreenNightly(unittest.TestCase):
-    """Which run is the last green one: forge-nightly's state."""
+    """Which run last published its builds: forge-nightly's state."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -703,13 +703,28 @@ class GreenNightly(unittest.TestCase):
             json.dump(data, handle)
 
     def found(self):
-        return rules.green_nightly(self.project, self.env, self.now)
+        return rules.published_nightly(self.project, self.env, self.now)
 
     def test_the_green_run_while_fresh(self):
         self.write({"at": "2026-10-09T13:55:00Z", "green": dict(
             GREEN, started="2026-10-09T12:00:00+00:00")})
         self.assertEqual(self.found(), GREEN)
         self.now = NOW + datetime.timedelta(hours=1)
+        self.assertIsNone(self.found())
+
+    def test_a_red_run_that_published_wins_over_green(self):
+        # A red run still publishes its builds (designs/0040's amendment).
+        red = dict(GREEN, run=80, sha="beef123" + "0" * 33,
+                   started="2026-10-09T09:48:00Z",
+                   ended="2026-10-09T11:10:00Z")
+        older = dict(GREEN, run=79, started="2026-10-09T03:17:00Z",
+                     ended="2026-10-09T04:30:00Z")
+        self.write({"at": "2026-10-09T13:55:00Z", "green": older,
+                    "published": red})
+        self.assertEqual(self.found(), red)
+        # A malformed `published` is no fallback to `green`.
+        self.write({"at": "2026-10-09T13:55:00Z", "green": older,
+                    "published": dict(red, started=None)})
         self.assertIsNone(self.found())
 
     def test_nothing_without_the_file_or_a_whole_record(self):
@@ -733,10 +748,36 @@ class GreenNightly(unittest.TestCase):
         rules.ENVIRON = self.env
         self.addCleanup(setattr, rules, "ENVIRON", old)
         waiting, other = waiting_issue(green=None), issue(61)
-        rules.attach_green_nightly(None, "example/widget", [],
+        rules.attach_published_nightly(None, "example/widget", [],
                                    [waiting, other])
-        self.assertEqual(waiting["greenNightly"], GREEN)
-        self.assertNotIn("greenNightly", other)
+        self.assertEqual(waiting["publishedNightly"], GREEN)
+        self.assertNotIn("publishedNightly", other)
+
+    def test_rule_22_from_a_red_run_that_published(self):
+        # The nightly is red (the issue open), and its run published
+        # builds: the issue labelled before that run started is woken.
+        written = datetime.datetime.now(datetime.timezone.utc)
+        red = {"run": 80, "sha": "beef123" + "0" * 33,
+               "started": "2026-10-09T09:48:00Z",
+               "ended": "2026-10-09T11:10:00Z"}
+        self.write({"at": written.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "issue": 40, "issue_open": True, "newest": "red",
+                    "red": dict(red, steps=["test-slow"]),
+                    "published": red})
+        rules.configure(self.project, merger)
+        self.addCleanup(rules.configure, PROJECT, merger)
+        old = rules.ENVIRON
+        rules.ENVIRON = self.env
+        self.addCleanup(setattr, rules, "ENVIRON", old)
+        waiting = waiting_issue(green=None, labelled="2026-10-09T01:38:00Z")
+        rules.attach_published_nightly(None, "example/widget", [], [waiting])
+        got = [d for d in rules.decide(waiting, context(waiting))
+               if d.rule == 22]
+        self.assertEqual(got, [router.Decision(
+            60, "LeadDev", 22, red["ended"],
+            "#60 waits for a nightly check, and nightly run 80 (beef123, "
+            "builds published at 11:10Z) includes its fixes: check it on "
+            "that build now.", reminder=router.ONCE)])
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
 # 0040: A green nightly wakes the issues waiting for it
 
-* Status: proposed
-* Implemented: next release, off until configured.
+* Status: approved (Alex Bligh, 2026-10-31, https://github.com/abligh/agent-forge/issues/180#issuecomment-6543862165)
+* Implemented: v0.4.139, off until configured; the amendment below,
+  next release.
 * Author: XMPPEngineer
 * Date: 2026-10-31
 
@@ -14,12 +15,14 @@ and sets `Defer-until:` to after the next scheduled nightly, so the
 router doesn't wake her before there is a build to check.
 
 The scheduled run isn't the only nightly. designs/0028 runs a red
-nightly again every few hours, and a run that ends green makes the same
-builds. An issue deferred to tomorrow's scheduled run waits all day
-for a build that already exists.
+nightly again every few hours, and a run publishes its builds whether
+it ends green or red (see the amendment). An issue deferred to
+tomorrow's scheduled run waits all day for a build that already
+exists.
 
-With `router.nightly_wake`, the first green nightly that contains an
-issue's fixes wakes its owner, whatever its `Defer-until:` says.
+With `router.nightly_wake`, the first nightly run that published its
+builds with an issue's fixes in them wakes its owner, whatever its
+`Defer-until:` says.
 
 ## What happened
 
@@ -70,8 +73,8 @@ hand-over count (designs/0038) pass over it. Rule 22 is what wakes it.
 is still to come (no rule that decides an issue's turn reads
 `Defer-until:`; only the idle offer does):
 
-> #N waits for a nightly check, and nightly run R (abc1234, green at
-> 14:05Z) includes its fixes: check it on that build now.
+> #N waits for a nightly check, and nightly run R (abc1234, builds
+> published at 14:05Z) includes its fixes: check it on that build now.
 
 The issue's own decision (rules 9-20) still stands: rule 22 is a
 second decision beside it, not a rule in its order. In that order it
@@ -90,9 +93,40 @@ before that doesn't wake her.
   that was dispatched from an older head would be woken early. The
   router can't see that cheaply; the owner sees it on the build and
   waits.
+- An issue left labelled while a further fix merges keeps its old
+  label time, so it can be woken for a build without that fix. The
+  owner takes the label off while a fix is in flight, or labels it
+  again once the fix has merged.
 
 ## Rollout
 
 Off by default. A project sets `router.nightly_wake` after a release
 with this is installed. Measured after a week: hours from a green
 nightly to the issues waiting for it being closed or relabelled.
+
+## Amendment, 2026-10-31: red runs publish builds too
+
+The design assumed only a green nightly makes builds to check. It
+doesn't: the nightly's release jobs depend on the builds, not on the
+tests, so a run that fails its tests still publishes. On the day this
+shipped, run 41190157895, which started at 09:48Z, failed its
+`build-and-test` and `test-mac` jobs, but its `release` and
+`release-mac` jobs succeeded, and the published nightly release
+pointed at its commit. An issue labelled at 01:38Z could have been
+checked on the 03:17Z and 09:48Z builds; rule 22 waited for a green
+run.
+
+So rule 22 reads the newest run that published its builds, red or
+green:
+
+- A new key, `nightly.release_jobs`, lists the jobs that publish (by
+  name, or a matrix's `name (...)`). A judged run in which each of
+  them ran and succeeded published its builds, whatever the deciding
+  job says, and forge-nightly keeps it in `nightly.json` as
+  `published` (`run`, `sha`, `started`, `ended`). `green` is kept as
+  before.
+- Without `release_jobs`, only a green run counts as published, so
+  nothing changes for a project that doesn't set it.
+- The router reads `published`, else `green` (a file written before
+  forge-nightly kept `published`), and its message names the run's
+  end as when its builds were published, not when it went green.
