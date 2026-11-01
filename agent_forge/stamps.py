@@ -10,10 +10,16 @@ to its author, until someone approved after the bad stamp had passed.
 
 Ids don't lie: a pull request's reviews are numbered in the order they
 were started, and its comments in the order they were posted. So within
-each sequence, no record can be later than the next one by id, nor later
-than the moment it was read. `correct` caps `createdAt` at both. It moves
-a review's `submittedAt` back by the same amount, but never below the
-corrected `createdAt`.
+each sequence, no record can be later than the next one by id. `correct`
+caps `createdAt` at that. It moves a review's `submittedAt` back by the
+same amount, but never below the corrected `createdAt`.
+
+It is not capped at the read time. A cap that moves every tick would
+change every key built from a stamp (the Merger's hand-back and
+held-comment keys use the approval's `submittedAt`), and the Merger
+would post the same comment again on each tick. The id cap only moves
+when a new record arrives. A future-stamped newest record stays as it
+is until one does, or until GitHub's clock passes it.
 
 Why `createdAt` and not ids alone: a review gets its id when it is
 started, so a pending review's `submittedAt` can rightly come after a
@@ -49,22 +55,21 @@ def _usable(record):
     return True
 
 
-def correct_sequence(records, now):
+def correct_sequence(records):
     """Correct `records` (one id sequence: a pull request's reviews, or
-    its comments) in place, against the read time `now` (a datetime).
-    Returns how many records were moved."""
+    its comments) in place. Returns how many records were moved."""
     moved = 0
-    cap = now.replace(microsecond=0)
     # Records sharing an id (only fixtures do) don't cap each other: each
-    # is capped by the newest id above them, and caps those below.
-    group_id, group_cap, next_cap = None, cap, cap
+    # is capped by the newest id above them, and caps those below. The
+    # newest id has no cap.
+    group_id, group_cap, next_cap = None, None, None
     for record in sorted((r for r in records if _usable(r)),
                          key=lambda r: r["databaseId"], reverse=True):
         if record["databaseId"] != group_id:
             group_id, group_cap = record["databaseId"], next_cap
         cap = group_cap
         created = _parse(record["createdAt"])
-        if created > cap:
+        if cap is not None and created > cap:
             delta = created - cap
             record["createdAt"] = _iso(cap)
             submitted = record.get("submittedAt")
@@ -76,17 +81,17 @@ def correct_sequence(records, now):
                     pass
             created = cap
             moved += 1
-        next_cap = min(next_cap, created)
+        next_cap = created if next_cap is None else min(next_cap, created)
     return moved
 
 
-def correct(node, now=None):
-    """Correct `node`'s `reviews` and `comments` lists in place (a pull
-    request or issue, with its connections already flattened to lists)
-    and return `node`."""
-    now = now or datetime.datetime.now(datetime.timezone.utc)
+def correct(node):
+    """Correct `node`'s `reviews` and `comments` in place (a pull request
+    or issue, as lists or as GraphQL connections) and return `node`."""
     for field in ("reviews", "comments"):
         records = node.get(field)
+        if isinstance(records, dict):
+            records = records.get("nodes")
         if isinstance(records, list):
-            correct_sequence(records, now)
+            correct_sequence(records)
     return node
