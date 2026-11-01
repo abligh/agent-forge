@@ -175,7 +175,7 @@ import urllib.request
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(BIN))
-from agent_forge import config, locks, nightly, router  # noqa: E402
+from agent_forge import config, locks, nightly, router, stamps  # noqa: E402
 
 
 def _load(name, path):
@@ -276,9 +276,11 @@ def flattened(node):
 
 
 def prepare(node, typename):
-    """`node` as the rules see it: the `flatten` connections as lists and
-    `__typename` set."""
-    flattened(node)
+    """`node` as the rules see it: the `flatten` connections as lists,
+    `__typename` set, and the stamps of its `reviews` and `comments`
+    corrected as forge-merger corrects them (agent_forge/stamps.py), so
+    that what the rules predict is what the Merger does."""
+    stamps.correct(flattened(node))
     node["__typename"] = typename
     return node
 

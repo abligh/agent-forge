@@ -67,6 +67,9 @@ def review(who, state, at, rid=900, oid=HEAD):
             "comments": {"totalCount": 0}}
 
 
+# GitHub numbers comments in posting order, and the stamps are corrected
+# to match (agent_forge/stamps.py), so give a fixture's comments ids that
+# rise with their times (or share one).
 def comment(who, at, body="text", cid=700):
     return {"databaseId": cid, "author": {"login": who}, "createdAt": at,
             "body": body}
@@ -541,7 +544,7 @@ class IssueRules(unittest.TestCase):
     def test_10_the_newest_answer_is_the_event(self):
         d = decide_issue(issue_node(
             labels=["Status:waiting-owner"],
-            comments=[comment(LEADDEV, T0), comment(OWNER, T1, cid=1),
+            comments=[comment(LEADDEV, T0, cid=0), comment(OWNER, T1, cid=1),
                       comment(OWNER, T3, cid=3)]))
         self.assertTurn(d, "LeadDev", 10, T3)
 
@@ -569,7 +572,8 @@ class IssueRules(unittest.TestCase):
     def test_12_someone_elses_newer_comment_is_the_owners(self):
         d = decide_issue(issue_node(
             labels=["Owner:LeadDev"],
-            comments=[comment(LEADDEV, T1), comment(REVIEWER, T2, cid=8)]))
+            comments=[comment(LEADDEV, T1, cid=7),
+                      comment(REVIEWER, T2, cid=8)]))
         self.assertTurn(d, "LeadDev", 12, T2)
         self.assertEqual(d["line"],
                          "#22 has a comment by Reviewer (comment 8)")

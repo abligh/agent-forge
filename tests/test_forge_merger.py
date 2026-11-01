@@ -984,6 +984,19 @@ class FetchPrs(unittest.TestCase):
         self.assertIn("owner=example", github.calls[0])
         self.assertIn("name=widget", github.calls[0])
 
+    def test_a_future_stamped_older_review_is_not_said_since(self):
+        # #183: a request for changes posted before the approval but
+        # stamped after it held the pull request as a remark since.
+        old = dict(review("otherwidgetagent", "CHANGES_REQUESTED",
+                          at="2026-11-01T09:58:54Z", body="One phrase."),
+                   databaseId=100, createdAt="2026-11-01T09:58:54Z")
+        new = dict(review(REVIEWER, at="2026-11-01T09:07:28Z"),
+                   databaseId=200, createdAt="2026-11-01T09:07:28Z")
+        page = graphql_page([pr(7, reviews=[old, new])])
+        got = m.fetch_prs(FakeGitHub({"graphql": lambda: page}))[0]
+        self.assertEqual(m.approval_of(got)["databaseId"], 200)
+        self.assertEqual(m.said_since(got, m.approval_of(got)), [])
+
     def test_open_issues(self):
         self.assertEqual(m.fetch_open_issues(FakeGitHub({"--paginate":
                                                          [4, 9]})), {4, 9})

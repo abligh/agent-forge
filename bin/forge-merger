@@ -533,7 +533,7 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from agent_forge import config, github as forge_github, locks, \
-    nightly  # noqa: E402
+    nightly, stamps  # noqa: E402
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 
@@ -937,11 +937,13 @@ query($owner:String!, $name:String!, $cursor:String) {
         author { login }
         labels(first:50) { nodes { name } }
         reviews(last:100) {
-          nodes { author { login } authorCanPushToRepository
-                  state submittedAt body commit { oid }
+          nodes { databaseId author { login } authorCanPushToRepository
+                  state createdAt submittedAt body commit { oid }
                   comments { totalCount } }
         }
-        comments(last:100) { nodes { author { login } createdAt body } }
+        comments(last:100) {
+          nodes { databaseId author { login } createdAt body }
+        }
       }
     }
   }
@@ -1996,7 +1998,8 @@ class GitHub:
 
 def fetch_prs(github):
     """Every open pull request as a plain dictionary: GraphQL's node,
-    with `reviews` and `comments` flattened to lists."""
+    with `reviews` and `comments` flattened to lists and their stamps
+    corrected (agent_forge/stamps.py)."""
     owner, name = REPO_SLUG.split("/")
     prs, cursor = [], None
     while True:
@@ -2008,7 +2011,7 @@ def fetch_prs(github):
         for node in page["nodes"]:
             node["reviews"] = node["reviews"]["nodes"]
             node["comments"] = node["comments"]["nodes"]
-            prs.append(node)
+            prs.append(stamps.correct(node))
         if not page["pageInfo"]["hasNextPage"]:
             return prs
         cursor = page["pageInfo"]["endCursor"]
