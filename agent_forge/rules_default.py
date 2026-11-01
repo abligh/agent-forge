@@ -359,8 +359,8 @@ graphql = {
         labels(first:30) { nodes { name } }
         files(first:100) { nodes { path additions deletions } }
         reviews(last:100) {
-          nodes { databaseId author { login } state submittedAt body
-                  commit { oid } comments { totalCount } }
+          nodes { databaseId author { login } state createdAt submittedAt
+                  body commit { oid } comments { totalCount } }
         }
         comments(last:100) {
           nodes { databaseId author { login } createdAt body }

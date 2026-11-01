@@ -96,7 +96,7 @@ class Rules(unittest.TestCase):
         configure(self, {"triage": "Reviewer"})
 
     def test_12_a_comment_on_an_agents_unlabelled_issue_wakes_it(self):
-        d = decide(issue_node(comments=[comment(LEADDEV, T1),
+        d = decide(issue_node(comments=[comment(LEADDEV, T1, cid=7),
                                         comment(REVIEWER, T2, cid=8)]))
         self.assertEqual((d["who"], d["rule"], d["event"]),
                          ("LeadDev", 12, T2))
