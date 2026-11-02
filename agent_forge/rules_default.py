@@ -114,6 +114,13 @@ Issues:
     wake, and a number that names nothing is left out. Pull requests
     don't need it: the Merger holds a blocked one and takes it up
     itself. What the named items are now is the `blockers` lookup.
+    With `router.issue_blocked_by: "agents"`, an issue's lines may also
+    be in a comment by the project's owner or by any agent in the
+    configuration: the newest such text with a `Blocked-by:` line
+    decides, replacing earlier numbers, and `Blocked-by: none` clears
+    them. "Written" is then that text's time. Anyone on the project can
+    so correct a line another wrote, whoever owns the issue now. Pull
+    requests still read their body only (the Merger's `merge.blocked_by`).
 
 With `router.red_first` (designs/0039), a red-build issue is one a
 build tool on this host keeps open while a build is red: forge-nightly's
@@ -344,6 +351,12 @@ RED_FIRST = None
 DEFAULT_FALLBACK_HOURS = 2
 # `router.nightly_wake` (designs/0040), {"label"}, or None: off.
 NIGHTLY_WAKE = None
+# `router.issue_blocked_by`: "body" (the default), or "agents": an
+# issue's `Blocked-by:` lines may be in a comment by the owner or an
+# agent (`issue_blocker_state`).
+ISSUE_BLOCKED_BY = "body"
+# With "agents": the logins whose comments may carry them.
+BLOCKER_WRITERS = frozenset()
 # The project, from `configure`: whose tools' state the red-build and
 # green-nightly lookups read.
 PROJECT = None
@@ -403,7 +416,7 @@ def configure(project, merger_tool):
     global MERGE_NOTICE, merged_window
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
     global UNREVIEWED, QUIET_LABELS, IN_PROGRESS, RED_FIRST, PROJECT
-    global NIGHTLY_WAKE
+    global NIGHTLY_WAKE, ISSUE_BLOCKED_BY, BLOCKER_WRITERS
     merger = merger_tool
     PROJECT = project
     labels = project.section("labels")
@@ -452,6 +465,10 @@ def configure(project, merger_tool):
         "fallback_hours": red.get("fallback_hours", DEFAULT_FALLBACK_HOURS)}
     wake = project.section("router").get("nightly_wake")
     NIGHTLY_WAKE = None if wake is None else {"label": wake.get("label")}
+    ISSUE_BLOCKED_BY = project.section("router").get("issue_blocked_by",
+                                                     "body")
+    BLOCKER_WRITERS = frozenset(
+        {OWNER} | {project.slug(n).lower() for n in project.agents})
     graphql["Issue"] = ISSUE_FIELDS + (
         OWNER_LABEL_EVENTS if OWNERS or NIGHTLY_WAKE else "")
 
@@ -982,7 +999,7 @@ def unblocked_by(issue, owner, comments, roster):
     """Rule 14: the item owner's turn when the last open item its
     `Blocked-by:` lines name has closed since the body was written and
     since the item owner last spoke, else None."""
-    named = merger.blockers_of(issue)
+    named, said = issue_blocker_state(issue)
     known = {b: info for b, info in (issue.get("blockedBy") or {}).items()
              if b in named and info}
     if not known or any(i.get("state") == "OPEN" for i in known.values()):
@@ -991,7 +1008,7 @@ def unblocked_by(issue, owner, comments, roster):
                 default="")
     who = owner or roster.who(author_of(issue))
     written = max(issue.get("lastEditedAt") or "",
-                  issue.get("createdAt") or "",
+                  issue.get("createdAt") or "", said,
                   last_by(comments, {roster.login_of(who)}))
     if not event or event <= written:
         return None
@@ -1173,11 +1190,49 @@ def referenced_by(pr):
     return numbers
 
 
+def is_issue(item):
+    return "headRefOid" not in item and \
+        item.get("__typename") != "PullRequest"
+
+
+def issue_blocker_state(issue):
+    """(numbers, written) for an issue's `Blocked-by:` lines: what they
+    name, and when the text that decides was written ("" for the body,
+    whose own times rule 14 reads). With `router.issue_blocked_by:
+    "agents"`, the newest of the body and the comments by
+    `BLOCKER_WRITERS` that has a `Blocked-by:` line decides: its strict
+    lines replace earlier numbers, and `Blocked-by: none` clears them.
+    Otherwise, and for a pull request, it is the Merger's reading."""
+    if ISSUE_BLOCKED_BY != "agents" or not is_issue(issue):
+        return merger.blockers_of(issue), ""
+    texts = [("", issue.get("body"))] + sorted(
+        ((c.get("createdAt") or "", c.get("body"))
+         for c in issue.get("comments") or ()
+         if author_of(c) in BLOCKER_WRITERS),
+        key=lambda t: t[0])
+    named, written = set(), ""
+    for when, text in texts:
+        text = merger.markers_of(text)
+        if not any(merger.BLOCKED_LINE_RE.match(l)
+                   for l in text.splitlines()):
+            continue
+        found = {int(m.group(1)) for m in merger.BLOCKED_RE.finditer(text)}
+        if found or merger.UNBLOCK_RE.search(text):
+            named, written = found, when
+    return named, written
+
+
+def blockers_of(item):
+    """The numbers an item's `Blocked-by:` lines name, as
+    `issue_blocker_state` reads them."""
+    return issue_blocker_state(item)[0]
+
+
 def blocked(issue):
     """Whether an item an issue's `Blocked-by:` lines name is still open,
     or what they name is unknown. A number naming nothing is left out,
     as rule 14 leaves it out."""
-    named = merger.blockers_of(issue)
+    named = blockers_of(issue)
     if not named:
         return False
     known = issue.get("blockedBy")
@@ -1587,7 +1642,7 @@ def unblocked_by_merge(number, ctx):
     `number` and whose every named item is now closed or merged."""
     out = []
     for issue in sorted(ctx.issues, key=lambda i: i["number"]):
-        if number in merger.blockers_of(issue) and not blocked(issue):
+        if number in blockers_of(issue) and not blocked(issue):
             out.append("#%d (%s)" % (issue["number"],
                                      issue_owner(issue, ctx.roster)
                                      or ctx.roster.who(author_of(issue))))
@@ -1891,7 +1946,7 @@ def attach_blockers(github, repo, prs, issues):
     owner, name = repo.split("/")
     open_now = {i["number"] for i in prs + issues}
     covered = issues + [p for p in prs if DRAFT_HOURS and p.get("isDraft")]
-    named = {i["number"]: merger.blockers_of(i) for i in covered}
+    named = {i["number"]: blockers_of(i) for i in covered}
     ask = sorted(set().union(*named.values()) - open_now) if named else []
     def look_up(numbers):
         query = BLOCKER_QUERY % "\n".join(BLOCKER_FIELD % (b, b)
