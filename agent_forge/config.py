@@ -201,7 +201,9 @@ RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
           "stuck": dict, "owners": dict, "unreviewed": dict,
           "forget_minutes": int, "quiet_labels": list, "red_first": dict,
-          "nightly_wake": dict}
+          "nightly_wake": dict, "issue_blocked_by": str}
+# Where an issue's `Blocked-by:` lines may be (agent_forge/rules_default.py).
+ISSUE_BLOCKED_BY = ("body", "agents")
 IDLE_OFFER = {"idle_minutes": int, "shell_minutes": int, "report_to": str,
               "hand_over_above": int}
 MERGE_NOTICE = {"window_minutes": int, "skip_label": str, "to": str}
@@ -532,6 +534,10 @@ def check(data):
         if isinstance(router.get("nightly_wake"), dict):
             _check_nightly_wake(router["nightly_wake"], "nightly" in data,
                                 problems)
+        if isinstance(router.get("issue_blocked_by"), str) and \
+                router["issue_blocked_by"] not in ISSUE_BLOCKED_BY:
+            problems.append("router.issue_blocked_by must be one of %s"
+                            % ", ".join(ISSUE_BLOCKED_BY))
         if _is(router.get("forget_minutes"), int) and \
                 router["forget_minutes"] < 0:
             problems.append("router.forget_minutes must be at least 0")
