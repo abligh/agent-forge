@@ -30,6 +30,22 @@ state is read from the configuration's repository, with the read token
 forge-config's other tools use; without a configuration, every
 worktree is judged by --idle-hours.
 
+Designs/0041 adds, each off unless given:
+
+  --high-water / --low-water PCT: when a root's filesystem is at least
+     --high-water percent used after the normal pass, more is cleared:
+     any cache that passes rules 1 and 2, whatever its idle time, least
+     recently used first, until the filesystem is under --low-water. A
+     cache used in the last --pressure-floor-hours (default 1) is kept.
+  --every-minutes N: a run that finds every root under --high-water,
+     with the last full scan less than N minutes ago, exits at once,
+     so cron can run this every few minutes cheaply.
+  --shared DIR: DIR's direct subdirectories that carry a valid
+     CACHEDIR.TAG are caches shared between worktrees (a Cargo
+     CARGO_TARGET_DIR). They are judged by --idle-hours alone, and are
+     in use also while a process's environment names them as
+     CARGO_TARGET_DIR.
+
 Exit status:
 
     0   the scan finished (whatever it cleared or kept)
@@ -39,6 +55,7 @@ Exit status:
 import argparse
 import errno
 import fcntl
+import hashlib
 import os
 import shutil
 import subprocess
@@ -151,6 +168,57 @@ def busy_paths(proc="/proc"):
     return paths
 
 
+def target_dirs(proc="/proc"):
+    """Every CARGO_TARGET_DIR named in a process's environment, resolved
+    (only processes this user may read: the agents' own)."""
+    dirs = set()
+    try:
+        pids = [p for p in os.listdir(proc) if p.isdigit()]
+    except OSError:
+        return dirs
+    for pid in pids:
+        try:
+            with open(os.path.join(proc, pid, "environ"), "rb") as handle:
+                env = handle.read()
+        except OSError:
+            continue
+        for item in env.split(b"\0"):
+            if item.startswith(b"CARGO_TARGET_DIR="):
+                value = os.fsdecode(item[len(b"CARGO_TARGET_DIR="):])
+                if value:
+                    dirs.add(os.path.realpath(value))
+    return dirs
+
+
+def shared_caches(root):
+    """The tagged cache directories directly under `root` that aren't
+    worktrees, and leftovers of an interrupted run there."""
+    caches, leftovers = [], []
+    try:
+        entries = sorted(os.scandir(root), key=lambda e: e.name)
+    except OSError:
+        return caches, leftovers
+    for entry in entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        if entry.name.endswith(PRUNING):
+            leftovers.append(entry.path)
+        elif not os.path.exists(os.path.join(entry.path, ".git")) and \
+                is_cache_dir(entry.path):
+            caches.append(entry.path)
+    return caches, leftovers
+
+
+def used_percent(path):
+    """The used percentage of `path`'s filesystem, as df shows it:
+    used / (used + available to unprivileged users)."""
+    st = os.statvfs(path)
+    used = (st.f_blocks - st.f_bfree) * st.f_frsize
+    avail = st.f_bavail * st.f_frsize
+    total = used + avail
+    return 100.0 * used / total if total else 0.0
+
+
 def is_busy(worktree, paths):
     real = os.path.realpath(worktree)
     prefix = real.rstrip("/") + "/"
@@ -221,12 +289,15 @@ def hours(seconds):
     return seconds / 3600.0
 
 
-def judge(cache, worktree, *, now, busy, merged_hours, idle_hours, finished):
+def judge(cache, worktree, *, now, busy, merged_hours, idle_hours, finished,
+          newest=None):
     """(clear, reason) for one cache directory. `finished()` is asked
     only when the answer depends on it."""
     if busy:
         return False, "busy (a process is using the worktree)"
-    idle = hours(now - newest_file_time(cache))
+    if newest is None:
+        newest = newest_file_time(cache)
+    idle = hours(now - newest)
     if idle < merged_hours:
         return False, "used %.0fh ago" % idle
     if idle >= idle_hours:
@@ -260,21 +331,52 @@ def worktrees(root):
             yield entry.path
 
 
+def clear(cache, reason, *, dry_run, out):
+    """Clear one cache under its Cargo locks; its size in KiB, or None
+    when a build holds a lock."""
+    locks = Locks(cache)
+    if not locks.acquired:
+        out("kept %s: locked (a build is running)" % cache)
+        return None
+    try:
+        kib = size_kib(cache)
+        if dry_run:
+            out("would clear %s (%.1f GB): %s" % (cache, kib / 1048576, reason))
+        else:
+            doomed = cache + PRUNING
+            os.rename(cache, doomed)
+            locks.release()
+            delete(doomed)
+            out("cleared %s (%.1f GB): %s" % (cache, kib / 1048576, reason))
+        return kib
+    finally:
+        locks.release()
+
+
+def drop_leftovers(leftovers, *, dry_run, out):
+    for left in leftovers:
+        out("%s %s: leftover of an interrupted run" % (
+            "would delete" if dry_run else "deleted", left))
+        if not dry_run:
+            delete(left)
+
+
 def prune(roots, *, dry_run, merged_hours, idle_hours, repo, token,
           now=None, busy=None, branch_of=current_branch, finished_of=pr_finished,
-          out=print):
-    """Scan `roots`, clear what the rules allow; (cleared, kept, KiB)."""
+          out=print, shared=(), high_water=None, low_water=None,
+          floor_hours=1.0, targets=None, usage=used_percent):
+    """Scan `roots` (and `shared`), clear what the rules allow, then,
+    with `high_water`, clear more under pressure; (cleared, kept, KiB)."""
     now = time.time() if now is None else now
     busy = busy_paths() if busy is None else busy
     cleared = kept = freed = 0
+    # Kept caches nothing is using, for the pressure pass:
+    # (newest file time, cache, the root it was found under).
+    spare = []
     for root in roots:
         for wt in worktrees(root):
             caches, leftovers = find_caches(wt)
-            for left in leftovers:
-                out("%s %s: leftover of an interrupted run" % (
-                    "would delete" if dry_run else "deleted", left))
-                if not dry_run:
-                    delete(left)
+            drop_leftovers(leftovers, dry_run=dry_run, out=out)
             in_use = is_busy(wt, busy)
             branch = []
 
@@ -284,33 +386,120 @@ def prune(roots, *, dry_run, merged_hours, idle_hours, repo, token,
                 return finished_of(repo, token, branch[0])
 
             for cache in caches:
-                clear, reason = judge(
+                newest = None if in_use else newest_file_time(cache)
+                ok, reason = judge(
                     cache, wt, now=now, busy=in_use, merged_hours=merged_hours,
-                    idle_hours=idle_hours, finished=finished)
-                if not clear:
-                    out("kept %s: %s" % (cache, reason))
+                    idle_hours=idle_hours, finished=finished, newest=newest)
+                kib = clear(cache, reason, dry_run=dry_run, out=out) if ok else None
+                if kib is None:
+                    if not ok:
+                        out("kept %s: %s" % (cache, reason))
                     kept += 1
+                    if not in_use:
+                        spare.append((newest, cache, root))
                     continue
-                locks = Locks(cache)
-                if not locks.acquired:
-                    out("kept %s: locked (a build is running)" % cache)
-                    kept += 1
-                    continue
-                try:
-                    kib = size_kib(cache)
-                    if dry_run:
-                        out("would clear %s (%.1f GB): %s" % (cache, kib / 1048576, reason))
-                    else:
-                        doomed = cache + PRUNING
-                        os.rename(cache, doomed)
-                        locks.release()
-                        delete(doomed)
-                        out("cleared %s (%.1f GB): %s" % (cache, kib / 1048576, reason))
-                finally:
-                    locks.release()
                 cleared += 1
                 freed += kib
+    if shared:
+        targets = target_dirs() if targets is None else targets
+    for root in shared:
+        caches, leftovers = shared_caches(root)
+        drop_leftovers(leftovers, dry_run=dry_run, out=out)
+        for cache in caches:
+            real = os.path.realpath(cache)
+            in_use = is_busy(cache, busy) or any(
+                t == real or t.startswith(real.rstrip("/") + "/")
+                for t in targets)
+            if in_use:
+                out("kept %s: busy (a process is using it)" % cache)
+                kept += 1
+                continue
+            newest = newest_file_time(cache)
+            idle = hours(now - newest)
+            ok = idle >= idle_hours
+            reason = "shared, idle %.0fh" % idle
+            kib = clear(cache, reason, dry_run=dry_run, out=out) if ok else None
+            if kib is None:
+                if not ok:
+                    out("kept %s: shared, used %.0fh ago (< %gh)" % (
+                        cache, idle, idle_hours))
+                kept += 1
+                spare.append((newest, cache, root))
+                continue
+            cleared += 1
+            freed += kib
+    if high_water is not None:
+        n, kib = relieve(spare, sorted(set(roots) | set(shared)),
+                         dry_run=dry_run, now=now, high_water=high_water,
+                         low_water=low_water, floor_hours=floor_hours,
+                         usage=usage, out=out)
+        cleared += n
+        kept -= n
+        freed += kib
     return cleared, kept, freed
+
+
+def relieve(spare, roots, *, dry_run, now, high_water, low_water,
+            floor_hours, usage, out):
+    """The pressure pass: for each root whose filesystem is at least
+    `high_water` percent used, clear its spare caches, least recently
+    used first, until it is under `low_water`; (cleared, KiB)."""
+    cleared = freed = 0
+    for root in roots:
+        before = usage(root)
+        if before < high_water:
+            continue
+        out("pressure: %s is %.0f%% used (high-water %g%%)" % (
+            root, before, high_water))
+        # A dry run deletes nothing, so it estimates from sizes.
+        st = os.statvfs(root)
+        total_kib = ((st.f_blocks - st.f_bfree) + st.f_bavail) * st.f_frsize / 1024
+        pretend = 0
+        now_used = before
+        for newest, cache, where in sorted(c for c in spare if c[2] == root):
+            if now_used < low_water:
+                break
+            idle = hours(now - newest)
+            if idle < floor_hours:
+                continue
+            kib = clear(cache, "pressure: used %.0fh ago" % idle,
+                        dry_run=dry_run, out=out)
+            if kib is None:
+                continue
+            cleared += 1
+            freed += kib
+            if dry_run:
+                pretend += kib
+                now_used = before - (100.0 * pretend / total_kib if total_kib else 0)
+            else:
+                now_used = usage(root)
+        out("pressure: %s %s %.0f%% used (low-water %g%%)" % (
+            root, "would be" if dry_run else "now", now_used, low_water))
+    return cleared, freed
+
+
+def stamp_path(roots, environ):
+    """Where the time of the last full scan of these roots is kept."""
+    home = environ.get("HOME") or os.path.expanduser("~")
+    base = environ.get("FORGE_STATE_DIR") or os.path.join(
+        environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"),
+        "agent-forge")
+    key = hashlib.sha256("\0".join(sorted(roots)).encode()).hexdigest()[:16]
+    return os.path.join(base, PROG, "last-scan-" + key)
+
+
+def last_scan(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def mark_scan(path, now):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as handle:
+        handle.write("%d\n" % now)
+    os.utime(path, (now, now))
 
 
 def main(argv=None, out=print, err=None, environ=None, **hooks):
@@ -325,15 +514,53 @@ def main(argv=None, out=print, err=None, environ=None, **hooks):
                         help="idle hours before clearing otherwise (default 48)")
     parser.add_argument("--dry-run", action="store_true",
                         help="report what would be cleared, delete nothing")
+    parser.add_argument("--shared", action="append", default=[],
+                        help="a directory whose tagged subdirectories are "
+                             "caches shared between worktrees (repeatable)")
+    parser.add_argument("--high-water", type=float,
+                        help="used percent of a root's filesystem at which "
+                             "to clear more, least recently used first")
+    parser.add_argument("--low-water", type=float,
+                        help="used percent to clear down to under pressure")
+    parser.add_argument("--pressure-floor-hours", type=float, default=1,
+                        help="under pressure, keep caches used this recently "
+                             "(default 1)")
+    parser.add_argument("--every-minutes", type=float,
+                        help="skip the scan if every root is under "
+                             "--high-water and the last was this recent")
     args = parser.parse_args(argv)
     if args.merged_hours < 0 or args.idle_hours < args.merged_hours:
         err("%s: need 0 <= --merged-hours <= --idle-hours" % PROG)
         return 2
+    if (args.high_water is None) != (args.low_water is None):
+        err("%s: --high-water and --low-water go together" % PROG)
+        return 2
+    if args.high_water is not None and not (
+            0 < args.low_water <= args.high_water <= 100):
+        err("%s: need 0 < --low-water <= --high-water <= 100" % PROG)
+        return 2
+    if args.pressure_floor_hours < 0 or (
+            args.every_minutes is not None and args.every_minutes <= 0):
+        err("%s: --pressure-floor-hours must be >= 0, --every-minutes > 0" % PROG)
+        return 2
     roots = [os.path.expanduser(r) for r in args.root]
-    for root in roots:
+    shared = [os.path.expanduser(r) for r in args.shared]
+    for root in roots + shared:
         if not os.path.isdir(root):
             err("%s: %s is not a directory" % (PROG, root))
             return 2
+    now = hooks.get("now")
+    now = time.time() if now is None else now
+    usage = hooks.get("usage", used_percent)
+    stamp = stamp_path(roots + shared, environ)
+    if args.every_minutes is not None:
+        last = last_scan(stamp)
+        calm = args.high_water is None or all(
+            usage(r) < args.high_water for r in roots + shared)
+        if calm and last is not None and now - last < args.every_minutes * 60:
+            out("%s: skipped, last full scan %.0f min ago and no root over "
+                "its high-water mark" % (PROG, (now - last) / 60))
+            return 0
     repo = token = None
     if "finished_of" not in hooks:
         try:
@@ -343,9 +570,14 @@ def main(argv=None, out=print, err=None, environ=None, **hooks):
         except config.ConfigError as e:
             err("%s: no configuration (%s); judging every worktree by --idle-hours"
                 % (PROG, e))
+    hooks = dict(hooks, now=now)
     cleared, kept, kib = prune(
         roots, dry_run=args.dry_run, merged_hours=args.merged_hours,
-        idle_hours=args.idle_hours, repo=repo, token=token, out=out, **hooks)
+        idle_hours=args.idle_hours, repo=repo, token=token, out=out,
+        shared=shared, high_water=args.high_water, low_water=args.low_water,
+        floor_hours=args.pressure_floor_hours, **hooks)
+    if args.every_minutes is not None and not args.dry_run:
+        mark_scan(stamp, now)
     out("%s: %s %d, kept %d, %.1f GB" % (
         PROG, "would clear" if args.dry_run else "cleared", cleared, kept, kib / 1048576))
     return 0

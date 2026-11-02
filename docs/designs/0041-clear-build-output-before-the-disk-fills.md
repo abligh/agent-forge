@@ -1,6 +1,7 @@
 # 0041: Clear build output before the disk fills
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-02, https://github.com/abligh/agent-forge/issues/188#issuecomment-6577187240)
+* Implemented: v0.4.145, off until a host's cron line gives the options.
 * Author: XMPPEngineer
 * Date: 2026-11-02
 

@@ -246,3 +246,188 @@ class PullRequestState(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def run_pressure(fx, *, usage, high=85, low=70, floor=1.0, busy=(),
+                 finished=False, shared=(), targets=(), dry_run=False):
+    lines = []
+    result = prune.prune(
+        [fx.root], dry_run=dry_run, merged_hours=6, idle_hours=48,
+        repo="o/r", token=None, now=NOW, busy=set(busy),
+        branch_of=lambda wt: "b", finished_of=lambda *a: finished,
+        out=lines.append, shared=list(shared), high_water=high,
+        low_water=low, floor_hours=floor, targets=set(targets), usage=usage)
+    return result, lines
+
+
+class Pressure(unittest.TestCase):
+    """designs/0041: over the high-water mark, the least recently used
+    spare caches go, whatever their age, until under the low-water mark."""
+
+    def setUp(self):
+        self.fx = Fixture(self)
+        self.caches = {}
+        for name, age in (("a", 20), ("b", 5), ("c", 10), ("d", 0.5)):
+            wt = self.fx.worktree(name)
+            self.caches[name] = self.fx.cache(wt, age_hours=age)
+
+    def left(self):
+        return sorted(n for n, c in self.caches.items() if os.path.exists(c))
+
+    def usage(self, per_cache=10, base=50):
+        # Each cache still there is 10 points of the disk.
+        return lambda root: base + per_cache * len(self.left())
+
+    def test_under_high_water_nothing_more_goes(self):
+        (cleared, kept, _), _ = run_pressure(self.fx, usage=lambda r: 84)
+        self.assertEqual((cleared, kept), (0, 4))
+        self.assertEqual(self.left(), ["a", "b", "c", "d"])
+
+    def test_oldest_first_until_under_low_water(self):
+        # 90% used; under 71 means two must go, the two oldest.
+        (cleared, _, _), lines = run_pressure(self.fx, usage=self.usage(), low=71)
+        self.assertEqual(cleared, 2)
+        self.assertEqual(self.left(), ["b", "d"])
+        self.assertTrue(any(l.startswith("cleared") and "pressure: used 20h ago" in l
+                            for l in lines))
+        self.assertIn("now 70% used", lines[-1])
+
+    def test_the_floor_keeps_what_was_just_used(self):
+        # Needs all four gone to reach 50; d (used 0.5h ago) stays.
+        run_pressure(self.fx, usage=self.usage(), low=45)
+        self.assertEqual(self.left(), ["d"])
+
+    def test_a_busy_worktree_is_kept_under_pressure(self):
+        wt = os.path.dirname(self.caches["a"])
+        run_pressure(self.fx, usage=self.usage(), busy=[os.path.realpath(wt)],
+                     low=71)
+        self.assertEqual(self.left(), ["a", "d"])
+
+    def test_a_held_lock_keeps_it_under_pressure(self):
+        lock = os.path.join(self.caches["a"], "debug", ".cargo-lock")
+        with open(lock, "rb") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            run_pressure(self.fx, usage=self.usage(), low=71)
+        self.assertEqual(self.left(), ["a", "d"])
+
+    def test_dry_run_estimates_and_deletes_nothing(self):
+        (cleared, _, kib), lines = run_pressure(
+            self.fx, usage=lambda r: 99.9, dry_run=True)
+        self.assertEqual(self.left(), ["a", "b", "c", "d"])
+        self.assertEqual(cleared, 3)
+        self.assertTrue(lines[-1].startswith("pressure: %s would be" % self.fx.root))
+
+
+class Shared(unittest.TestCase):
+    """designs/0041: tagged directories directly under --shared are caches
+    shared between worktrees."""
+
+    def setUp(self):
+        self.fx = Fixture(self)
+        self.shared = os.path.join(self.fx.root, "shared")
+        os.makedirs(self.shared)
+
+    def tgt(self, name, age, tag=TAG):
+        return self.fx.cache(self.shared, rel=name, age_hours=age, tag=tag)
+
+    def go(self, **kw):
+        lines = []
+        result = prune.prune(
+            [], dry_run=False, merged_hours=6, idle_hours=48, repo="o/r",
+            token=None, now=NOW, busy=set(kw.get("busy", ())),
+            out=lines.append, shared=[self.shared],
+            targets=set(kw.get("targets", ())), high_water=kw.get("high"),
+            low_water=kw.get("low"), usage=kw.get("usage", lambda r: 0))
+        return result, lines
+
+    def test_idle_shared_cache_is_cleared(self):
+        old = self.tgt(".tgt-old", 100)
+        new = self.tgt(".tgt-new", 10)
+        (cleared, kept, _), lines = self.go()
+        self.assertEqual((cleared, kept), (1, 1))
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(new))
+
+    def test_untagged_is_never_touched(self):
+        plain = self.tgt(".tgt-plain", 100, tag=None)
+        self.go()
+        self.assertTrue(os.path.exists(plain))
+
+    def test_a_worktree_is_not_a_shared_cache(self):
+        wt = os.path.join(self.shared, "wt")
+        os.makedirs(wt)
+        with open(os.path.join(wt, ".git"), "w") as f:
+            f.write("gitdir: /nowhere\n")
+        with open(os.path.join(wt, "CACHEDIR.TAG"), "wb") as f:
+            f.write(TAG)
+        self.go()
+        self.assertTrue(os.path.exists(os.path.join(wt, ".git")))
+
+    def test_named_as_cargo_target_dir_is_busy(self):
+        old = self.tgt(".tgt-old", 100)
+        (_, _, _), lines = self.go(targets=[os.path.realpath(old)])
+        self.assertTrue(os.path.exists(old))
+        self.assertIn("busy", lines[0])
+
+    def test_open_file_inside_is_busy(self):
+        old = self.tgt(".tgt-old", 100)
+        self.go(busy=[os.path.realpath(os.path.join(old, "debug", "x"))])
+        self.assertTrue(os.path.exists(old))
+
+    def test_shared_caches_go_under_pressure_too(self):
+        old = self.tgt(".tgt-a", 30)
+        new = self.tgt(".tgt-b", 20)
+        left = lambda: [p for p in (old, new) if os.path.exists(p)]
+        self.go(high=85, low=71, usage=lambda r: 55 + 15 * len(left()))
+        self.assertEqual(left(), [new])
+
+    def test_target_dirs_reads_environments(self):
+        proc = os.path.join(self.fx.root, "proc")
+        for pid, env in (("1", b"A=1\0CARGO_TARGET_DIR=/x/t\0"), ("2", b"B=2\0")):
+            os.makedirs(os.path.join(proc, pid))
+            with open(os.path.join(proc, pid, "environ"), "wb") as f:
+                f.write(env)
+        self.assertEqual(prune.target_dirs(proc), {os.path.realpath("/x/t")})
+
+
+class Often(unittest.TestCase):
+    """designs/0041: --every-minutes skips a scan while all is calm."""
+
+    def setUp(self):
+        self.fx = Fixture(self)
+        self.state = tempfile.TemporaryDirectory()
+        self.addCleanup(self.state.cleanup)
+        self.env = {"FORGE_STATE_DIR": self.state.name, "HOME": self.state.name}
+
+    def main(self, *extra, now=NOW, usage=lambda r: 50):
+        lines = []
+        rc = prune.main(["--root", self.fx.root, "--every-minutes", "60",
+                         "--high-water", "85", "--low-water", "70", *extra],
+                        out=lines.append, err=lines.append, environ=self.env,
+                        finished_of=lambda *a: None, busy=set(),
+                        branch_of=lambda wt: "b", now=now, usage=usage)
+        return rc, lines
+
+    def test_first_run_scans_then_a_recent_one_skips(self):
+        _, first = self.main()
+        self.assertIn("cleared 0", first[-1])
+        _, second = self.main(now=NOW + 10 * 60)
+        self.assertIn("skipped", second[-1])
+
+    def test_after_the_interval_it_scans_again(self):
+        self.main()
+        _, later = self.main(now=NOW + 61 * 60)
+        self.assertIn("cleared 0", later[-1])
+
+    def test_over_high_water_it_never_skips(self):
+        self.main()
+        _, hot = self.main(now=NOW + 60, usage=lambda r: 90)
+        self.assertNotIn("skipped", hot[-1])
+
+    def test_flags_are_checked(self):
+        for bad in (["--high-water", "85"], ["--low-water", "90", "--high-water", "80"],
+                    ["--every-minutes", "0"], ["--pressure-floor-hours", "-1"]):
+            rc = prune.main(["--root", self.fx.root, *bad], out=lambda m: None,
+                            err=lambda m: None, environ=self.env,
+                            finished_of=lambda *a: None, busy=set())
+            self.assertEqual(rc, 2, bad)
