@@ -488,6 +488,19 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"stacks": True}),
                          ["merge.stacks must be an object"])
 
+    def test_merge_stacks_predict_restacked(self):
+        # designs/0042: it changes only the predictions.
+        self.assertEqual(self.problems(merge={"stacks": {
+            "predict_restacked": True}, "test_ahead": {}}), [])
+        self.assertEqual(self.problems(merge={"stacks": {
+            "predict_restacked": False}}), [])
+        self.assertEqual(self.problems(merge={"stacks": {
+            "predict_restacked": True}}),
+            ["merge.stacks.predict_restacked needs merge.test_ahead"])
+        self.assertEqual(self.problems(merge={"stacks": {
+            "predict_restacked": "yes"}, "test_ahead": {}}),
+            ["merge.stacks.predict_restacked must be true or false"])
+
     def test_merge_stacks_wait_hours(self):
         for hours in (1, 72, 168):
             self.assertEqual(self.problems(merge={"stacks": {

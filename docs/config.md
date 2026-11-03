@@ -535,8 +535,9 @@ default.
 
 ### `merge.stacks`
 
-`{"max_run": N, "wait_hours": H}` (`max_run` default 0, no limit;
-designs/0025; `wait_hours` default none, designs/0033). A pull request
+`{"max_run": N, "wait_hours": H, "predict_restacked": B}` (`max_run`
+default 0, no limit; designs/0025; `wait_hours` default none,
+designs/0033; `predict_restacked` default false, designs/0042). A pull request
 whose base branch is another open pull request's head branch is
 stacked on it, and held as `stacked on #Q` rather than as based on
 another branch, so it can be reviewed and approved while it waits.
@@ -587,6 +588,20 @@ merges unless it is handed back. With `max_run`, after N layers
 merged in a row the next one keeps its usual place in the queue. The
 tick's record says which stack is in progress under `stack`. Off by
 default.
+
+With `predict_restacked: true` (designs/0042; needs
+`merge.test_ahead`, and the configuration check refuses it without),
+a layer waiting to be restacked whose plain merge onto what is
+predicted ahead of it conflicts is predicted as the Merger will make
+it: the final head of the layer below merged into its head (unless it
+holds it), then that merged onto the prediction against that head,
+with the same safety conditions as `STACK-UPDATE`. Its entry in
+`ahead.json` says `"restacked": true`. When the layer's head reaches
+that tree, the build check's verdict on the prediction is its own.
+With `merge.early_conflicts`, such a layer whose restack would conflict
+with the default branch itself is handed back early, with the reason
+`RESTACK` or `STACK-UPDATE` would give; without this option every layer
+waits to be told until it is reached.
 
 ### `merge.resolve`
 
