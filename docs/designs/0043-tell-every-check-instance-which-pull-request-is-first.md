@@ -1,6 +1,6 @@
 # 0043: Tell every check instance which pull request is first
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-03, in the terminal: "agent-forge designs/0043 (issue af#196, PR #195) approved"; https://github.com/abligh/agent-forge/issues/196)
 * Author: XMPPEngineer
 * Date: 2026-11-03
 
