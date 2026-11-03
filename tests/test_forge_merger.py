@@ -2708,6 +2708,184 @@ class PredictAhead(unittest.TestCase):
                          [".git", "a.txt", "b.txt", "base.txt", "shared.txt"])
 
 
+class PredictRestacked(unittest.TestCase):
+    """merge.stacks.predict_restacked (designs/0042): a layer whose lower
+    layer merged is predicted, and checked early, as the Merger will
+    restack it (`decide`'s RESTACK, then STACK-UPDATE), not as its head
+    merges plainly."""
+
+    LINES = ["1", "X", "3", "4", "5", "6", "7", "8", "9"]
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Repo(tmp.name)
+        self.base = self.repo.main_tip()
+
+    def lines(self, **at):
+        return "".join(at.get("l%d" % n, line) + "\n"
+                       for n, line in enumerate(self.LINES, 1))
+
+    def stack(self, later, new=False):
+        """main has l.txt (unless `new`); #5 changes it (or adds it), #6
+        on it sets line 8 to U, then #5 makes it `later`, and main
+        squashes #5's final head. Returns #6's pull request."""
+        if not new:
+            self.repo.branch("main", "main")
+            self.repo.commit("l.txt", self.lines(l2="2"), "main l.txt")
+            self.repo.push("main")
+        self.repo.branch("lower", "main")
+        first = self.repo.commit("l.txt", self.lines(), "lower l.txt")
+        self.repo.branch("upper", first)
+        self.upper = self.repo.commit("l.txt", self.lines(l8="U"),
+                                      "upper l.txt")
+        self.repo.publish_pr(6, self.upper)
+        self.repo.branch("lower", "lower")
+        self.lower = self.repo.commit("l.txt", later, "lower again")
+        main = self.repo.main_tip()
+        squash = run_git(self.repo.path, "commit-tree",
+                         self.lower + "^{tree}", "-p", main, "-m", "#5")
+        run_git(self.repo.path, "push", "-q", "origin", squash + ":main")
+        run_git(self.repo.path, "fetch", "-q", "origin")
+        self.restacks = {6: (5, self.lower)}
+        return pr(6, T1, head=self.upper)
+
+    def other(self, number, name):
+        self.repo.branch("o%d" % number, self.repo.main_tip())
+        sha = self.repo.commit(name, "x\n", "#%d" % number)
+        self.repo.publish_pr(number, sha)
+        return pr(number, T1, head=sha)
+
+    def restacked_by_hand(self):
+        """#6 with #5's final head merged in, as RESTACK makes it."""
+        self.repo.branch("restacked", self.upper)
+        return self.repo.merge(self.lower)
+
+    def predict(self, queue, restacks=None, **kw):
+        return m.predict_ahead(self.repo.path, self.repo.main_tip(), queue,
+                               restacks=restacks, **kw)
+
+    def test_the_configuration(self):
+        self.addCleanup(m.configure, project())
+        m.configure(project(stacks={"predict_restacked": True},
+                            test_ahead={}))
+        self.assertIs(m.PREDICT_RESTACKED, True)
+        m.configure(project(stacks={"predict_restacked": True}))
+        self.assertIs(m.PREDICT_RESTACKED, False)
+        m.configure(project(stacks={}, test_ahead={}))
+        self.assertIs(m.PREDICT_RESTACKED, False)
+
+    def test_a_layer_is_predicted_as_the_merger_restacks_it(self):
+        layer = self.stack(self.lines(l3="Y"))
+        seven, eight = self.other(7, "g.txt"), self.other(8, "h.txt")
+        # Plainly, it conflicts with main.
+        self.assertEqual(m.git(self.repo.path, "merge-tree", "--write-tree",
+                               self.repo.main_tip(),
+                               self.upper).returncode, 1)
+        got = self.predict([seven, layer, eight], self.restacks)
+        self.assertEqual([e["pr"] for e in got], [7, 6, 8])
+        self.assertIs(got[1].get("restacked"), True)
+        self.assertNotIn("same_as_head", got[1])
+        self.assertNotIn("restacked", got[0])
+        self.assertNotIn("restacked", got[2])
+        # What STACK-UPDATE would push once #7 has merged: main merged
+        # into the restacked head against #5's final head.
+        expected = m.based_merge(self.repo.path, got[0]["sha"],
+                                 self.restacked_by_hand(), self.lower)
+        self.assertIsNotNone(expected)
+        self.assertEqual(got[1]["tree"], expected)
+        self.assertEqual(run_git(self.repo.path, "rev-parse",
+                                 got[1]["sha"] + "^"), got[0]["sha"])
+        # The same inputs give the same commits.
+        self.assertEqual(self.predict([seven, layer, eight], self.restacks),
+                         got)
+
+    def test_without_the_option_the_layer_is_left_out(self):
+        layer = self.stack(self.lines(l3="Y"))
+        seven, eight = self.other(7, "g.txt"), self.other(8, "h.txt")
+        self.assertEqual([e["pr"] for e in self.predict([seven, layer,
+                                                         eight])], [7, 8])
+        self.assertEqual([e["pr"] for e in self.predict(
+            [seven, layer, eight], {})], [7, 8])
+
+    def test_a_restack_that_conflicts_is_a_conflict(self):
+        # #5 later changes the line #6 changed.
+        layer = self.stack(self.lines(l8="V"))
+        seven, eight = self.other(7, "g.txt"), self.other(8, "h.txt")
+        q = [seven, layer, eight]
+        self.assertEqual([e["pr"] for e in self.predict(q, self.restacks)],
+                         [7, 8])
+        self.assertEqual([e["pr"] for e in self.predict(
+            q, self.restacks, overdue={6: 95})], [7])
+        # First in the queue, it ends the list, as a plain conflict does.
+        self.assertEqual(self.predict([layer, seven], self.restacks), [])
+
+    def test_a_layer_that_holds_the_head_below_is_not_merged_with_it(self):
+        # l.txt is new in #5, so main and #6 each add it, and a plain
+        # merge conflicts even once #6 holds #5's final head.
+        self.stack(self.lines(l3="Y"), new=True)
+        head = self.restacked_by_hand()
+        self.repo.publish_pr(6, head)
+        calls = []
+
+        def run(args, cwd=None, env=None):
+            calls.append(args)
+            return m.sh(args, cwd=cwd, env=env)
+
+        got = m.predict_ahead(self.repo.path, self.repo.main_tip(),
+                              [pr(6, T1, head=head)], run,
+                              restacks=self.restacks)
+        self.assertEqual([(e["pr"], e.get("restacked")) for e in got],
+                         [(6, True)])
+        self.assertEqual(got[0]["tree"], m.based_merge(
+            self.repo.path, self.repo.main_tip(), head, self.lower))
+        self.assertNotIn(["merge-tree", "--write-tree", "--no-messages",
+                          head, self.lower],
+                         [a[3:] for a in calls])
+
+    def early(self, layer, said, restacks):
+        github = FakeGitHub({})
+        got = m.early_conflicts(self.repo.path, self.repo.main_tip(),
+                                [layer], {6: m.approval_of(layer)}, github,
+                                said, True, tools_run(), {6}, restacks)
+        return got, github.writes
+
+    def test_a_layer_whose_restack_conflicts_is_handed_back_early(self):
+        layer = self.stack(self.lines(l8="V"))
+        said = {}
+        self.assertEqual(self.early(layer, said, None), ([], []))
+        got, writes = self.early(layer, said, self.restacks)
+        self.assertEqual([(d["pr"], d["reason"], d["detail"], d["early"])
+                          for d in got], [(
+                              6, m.RESTACK_REASON % (
+                                  m.CONFLICT_REASON, 5, self.lower[:10]),
+                              m.RESTACK_DETAIL % (5, self.lower[:10],
+                                                  "main"), True)])
+        self.assertEqual([w[1] for w in writes],
+                         [SLUG + "/issues/6/comments"])
+        # Said once per approval and head.
+        self.assertEqual(self.early(layer, said, self.restacks), ([], []))
+
+    def test_a_layer_whose_restack_is_clean_is_left_alone(self):
+        layer = self.stack(self.lines(l3="Y"))
+        self.assertEqual(self.early(layer, {}, self.restacks), ([], []))
+
+    def test_a_layer_main_conflicts_with_after_the_restack(self):
+        # STACK-UPDATE's merge conflicts: main changed #6's line 8 too.
+        layer = self.stack(self.lines(l3="Y"))
+        self.repo.branch("main", "origin/main")
+        self.repo.commit("l.txt", self.lines(l3="Y", l8="M"), "main l8")
+        self.repo.push("main")
+        got, _ = self.early(layer, {}, self.restacks)
+        self.assertEqual([(d["pr"], d["reason"]) for d in got],
+                         [(6, m.CONFLICT_REASON)])
+
+    def test_a_layer_without_a_restack_entry_is_still_left_out(self):
+        layer = self.stack(self.lines(l8="V"))
+        self.assertEqual(self.early(layer, {}, {7: (5, self.lower)}),
+                         ([], []))
+
+
 class Batches(unittest.TestCase):
     """designs/0032: which predictions are the batch, and what is said
     of it."""

@@ -112,7 +112,7 @@ SAID_SINCE = {"author": bool, "approvals": bool, "quiet": list}
 BLOCKED_BY = ("body", "everywhere")
 RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int}
 AGE_FIRST = {"after_minutes": int}
-STACKS = {"max_run": int, "wait_hours": int}
+STACKS = {"max_run": int, "wait_hours": int, "predict_restacked": bool}
 TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "batch": int, "stacks": bool, "batches": int}
 STALL_ALERT = {"tell": list, "retell_minutes": int,
@@ -594,6 +594,11 @@ def check(data):
             if _is(stacks.get("wait_hours"), int) and \
                     not 1 <= stacks["wait_hours"] <= 168:
                 problems.append("merge.stacks.wait_hours must be 1 to 168")
+            if stacks.get("predict_restacked") is True and \
+                    "test_ahead" not in merge:
+                # designs/0042: it changes only the predictions.
+                problems.append("merge.stacks.predict_restacked needs "
+                                "merge.test_ahead")
         _check_merge_0026(merge, data, problems)
     for name, allowed in (("labels", LABELS), ("relay", RELAY)):
         section = data.get(name, {})

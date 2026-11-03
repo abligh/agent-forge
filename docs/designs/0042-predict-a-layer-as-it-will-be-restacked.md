@@ -1,6 +1,6 @@
 # 0042: Predict a layer as it will be restacked
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-03, in the terminal: "agent-forge #191 and #193 approved"; https://github.com/abligh/agent-forge/issues/191)
 * Author: XMPPEngineer
 * Date: 2026-11-02
 

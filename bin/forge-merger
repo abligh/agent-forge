@@ -328,7 +328,9 @@ with a fixed author, committer and date and no signature, so the same
 inputs give the same SHA and a prediction is never tested twice. Their
 list is `ahead.json` in the state directory (`at`, `base`, `repo`,
 `entries` of `pr`, `head`, `sha`, `tree`, and `same_as_head` when the
-tree is the head's own, which the head's own check already tests).
+tree is the head's own, which the head's own check already tests, or
+`restacked` when it is a stack's layer predicted as the Merger will
+restack it: merge.stacks.predict_restacked, designs/0042).
 Every live tick rewrites both and empties them when it waits on
 nothing; a dry run writes neither. `forge-pr-check` tests the entries
 in its free slots and posts green on a head whose tree one of them, or
@@ -702,6 +704,10 @@ AHEAD_BATCHES = 1
 # pull request a layer pushed out of the batch is `owed` in ahead.json,
 # and no layer may push an owed one out again.
 AHEAD_STACKS = False
+# merge.stacks.predict_restacked (designs/0042): a layer waiting to be
+# restacked is predicted, and checked early, as the Merger will restack
+# it, not as its head merges plainly.
+PREDICT_RESTACKED = False
 # What the build check's status says of a head its batch covered.
 COVERED_TEXT = "covered by batch"
 # designs/0035, second amendment: a red batch's members, kept until the
@@ -842,7 +848,7 @@ def configure(project):
     global STACKS, STACK_MAX_RUN, STACK_WAIT, RESOLVE, HOLD_LABELS, BLOCKED_BY
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
-    global AGE_FIRST
+    global AGE_FIRST, PREDICT_RESTACKED
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -896,6 +902,8 @@ def configure(project):
     STACK_WAIT = datetime.timedelta(hours=wait) if wait else None
     AHEAD_STACKS = (STACKS and AHEAD_BATCH > 1
                     and (ahead or {}).get("stacks") is True)
+    PREDICT_RESTACKED = (STACKS and TEST_AHEAD
+                         and stacks.get("predict_restacked") is True)
     RESOLVE = tuple({"paths": frozenset(rule["paths"]),
                      "command": tuple(rule["command"]),
                      "check": tuple(rule["check"])}
@@ -2778,7 +2786,7 @@ def ci_rerun(decision, github, state_dir, when, live, out):
 
 
 def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
-                    run=sh, layers=()):
+                    run=sh, layers=(), restacks=None):
     """merge.early_conflicts: the hand-backs for the candidates the tick
     didn't reach (`rest`, behind the one it stopped at) whose heads
     conflict with main. Without it, such a pull request is told only
@@ -2790,13 +2798,21 @@ def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
     (`layers`): the Merger restacks it when it is reached, and its own
     hand-back says which merge conflicted. Told the plain conflict here,
     a layer's two hand-backs replaced each other in `said` and each was
-    posted again, every tick."""
+    posted again, every tick.
+
+    `restacks` (merge.stacks.predict_restacked, designs/0042) is {pr:
+    (after, lower)} for the layers waiting to be restacked: such a layer
+    whose restack (`restacked_tree`) conflicts with main is handed back
+    now, with the reason `decide` would give it when reached."""
+    restacks = restacks or {}
     decisions = []
     for pr in rest:
         approval = approvals[pr["number"]]
         before = said.get(str(pr["number"])) or {}
         key = hand_back_key(approval, pr["headRefOid"], CONFLICT_REASON)
-        if (pr["number"] in layers
+        # A restack's reason starts with CONFLICT_REASON too, so a layer
+        # told it is skipped here like any other.
+        if ((pr["number"] in layers and pr["number"] not in restacks)
                 or ({k: before.get(k) for k in ("approved", "head")}
                     == {k: key[k] for k in ("approved", "head")}
                     and (before.get("reason") or "").startswith(
@@ -2809,7 +2825,20 @@ def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
                "--no-messages", main_tip, pr["headRefOid"],
                run=run).returncode != 1:
             continue
-        decision = conflict_hand_back(pr, approval, github, said, live)
+        reason, detail = CONFLICT_REASON, None
+        if pr["number"] in restacks:
+            after, lower = restacks[pr["number"]]
+            _, failed = restacked_tree(repo, main_tip, pr["headRefOid"],
+                                       lower, run)
+            if failed == "restack":
+                reason = RESTACK_REASON % (CONFLICT_REASON, after, lower[:10])
+                detail = RESTACK_DETAIL % (after, lower[:10], MAIN)
+            elif failed != "update":
+                # Clean: the Merger restacks it when it is reached. Or
+                # git failed: it is decided when it is reached.
+                continue
+        decision = conflict_hand_back(pr, approval, github, said, live,
+                                      reason, detail)
         decision["early"] = True
         decisions.append(decision)
     return decisions
@@ -3305,8 +3334,45 @@ def tell_spoken(state_dir, github, prs, spoken, live):
     return told
 
 
+def ahead_env():
+    """The environment for a prediction's commits: AHEAD_IDENTITY and
+    AHEAD_DATE, so that the same inputs give the same commit."""
+    name, email = AHEAD_IDENTITY
+    return dict(os.environ, GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
+                GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email,
+                GIT_AUTHOR_DATE=AHEAD_DATE, GIT_COMMITTER_DATE=AHEAD_DATE)
+
+
+def restacked_tree(repo, base, head, lower, run=sh):
+    """designs/0042: (tree, failed) for the layer at `head` merged onto
+    `base` as the Merger will restack it once it is reached, `lower`
+    being the final head of the merged layer below. These are `decide`'s
+    steps: when `head` lacks `lower`, RESTACK merges it in first (here
+    committed with the predictions' identity and date: only its tree
+    matters to what follows), then STACK-UPDATE's `based_merge` onto
+    `base`. `failed` is None with a tree; "restack" when RESTACK's merge
+    conflicts, "update" when `based_merge` gives None, and "git" when
+    git failed otherwise; tree is None then."""
+    layer = head
+    if not is_ancestor(repo, lower, head, run):
+        merged = git(repo, "merge-tree", "--write-tree", "--no-messages",
+                     head, lower, run=run)
+        if merged.returncode == 1:
+            return None, "restack"
+        if merged.returncode != 0 or not merged.stdout.split():
+            return None, "git"
+        made = run(["git", "-C", repo, "commit-tree", "--no-gpg-sign",
+                    merged.stdout.split()[0], "-p", head, "-p", lower, "-m",
+                    "forge-merger: restack ahead"], env=ahead_env())
+        layer = (made.stdout or "").strip()
+        if made.returncode != 0 or len(layer) != 40:
+            return None, "git"
+    tree = based_merge(repo, base, layer, lower, run)
+    return (tree, None) if tree is not None else (None, "update")
+
+
 def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
-                  overdue=()):
+                  overdue=(), restacks=None):
     """The commits the first `depth` + 1 pull requests in `queue`
     (default AHEAD_DEPTH) will have once those ahead of each have
     merged, as [{pr, head, sha, tree}], each also written as
@@ -3324,12 +3390,15 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
     entry whose tree is its head's own says `same_as_head`, since the
     head's own check tests it. The commits carry a fixed identity and
     date and no signature, so the same prediction is the same commit on
-    every tick."""
+    every tick.
+
+    `restacks` (merge.stacks.predict_restacked, designs/0042) is {pr:
+    (after, lower)} for a stack's layers waiting to be restacked. One
+    whose plain merge conflicts is predicted as `restacked_tree` makes
+    it, as `decide` will once it is reached, and says `restacked`;
+    only if that fails too is it a conflict."""
     depth = AHEAD_DEPTH if depth is None else depth
-    name, email = AHEAD_IDENTITY
-    env = dict(os.environ, GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
-               GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email,
-               GIT_AUTHOR_DATE=AHEAD_DATE, GIT_COMMITTER_DATE=AHEAD_DATE)
+    env = ahead_env()
     entries, parent = [], main_tip
     for pr in queue:
         if len(entries) > depth:
@@ -3338,14 +3407,22 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
         have_head(repo, pr, run)
         merged = git(repo, "merge-tree", "--write-tree", "--no-messages",
                      parent, head, run=run)
-        if merged.returncode == 1 and entries \
-                and pr["number"] not in overdue:
-            # It conflicts with one predicted ahead of it: skip it, so
-            # that those behind it are still tested ahead.
-            continue
-        if merged.returncode != 0 or not merged.stdout.split():
-            break
-        tree = merged.stdout.split()[0]
+        restacked = None
+        if merged.returncode == 1 and pr["number"] in (restacks or {}):
+            # A layer still holds the lower layer's own commits, which
+            # main has as one squash: plainly it conflicts, but the
+            # Merger will restack it (designs/0042).
+            restacked, _ = restacked_tree(repo, parent, head,
+                                          restacks[pr["number"]][1], run)
+        if restacked is None:
+            if merged.returncode == 1 and entries \
+                    and pr["number"] not in overdue:
+                # It conflicts with one predicted ahead of it: skip it,
+                # so that those behind it are still tested ahead.
+                continue
+            if merged.returncode != 0 or not merged.stdout.split():
+                break
+        tree = restacked or merged.stdout.split()[0]
         made = run(["git", "-C", repo, "commit-tree", "--no-gpg-sign", tree,
                     "-p", parent, "-m", "forge-merger: #%d ahead"
                     % pr["number"]], env=env)
@@ -3353,9 +3430,14 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
         if made.returncode != 0 or len(sha) != 40:
             break
         entry = {"pr": pr["number"], "head": head, "sha": sha, "tree": tree}
-        own = git(repo, "rev-parse", head + "^{tree}", run=run)
-        if own.returncode == 0 and own.stdout.strip() == tree:
-            entry["same_as_head"] = True
+        if restacked:
+            # designs/0042: the tree the restack will give, which the
+            # head's own check doesn't test.
+            entry["restacked"] = True
+        else:
+            own = git(repo, "rev-parse", head + "^{tree}", run=run)
+            if own.returncode == 0 and own.stdout.strip() == tree:
+                entry["same_as_head"] = True
         entries.append(entry)
         parent = sha
     listed = git(repo, "for-each-ref", "--format=%(refname)", AHEAD_REF,
@@ -4499,7 +4581,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     if EARLY_CONFLICTS:
         record["decisions"] += early_conflicts(
             repo, main_tip, queue[stopped:], approvals, github, said, live,
-            run, layers)
+            run, layers, restacks if PREDICT_RESTACKED else None)
     if live:
         minutes = stalled_for(state_dir, waiting, when, check_state)
         if minutes is not None and "stalled" not in record:
@@ -4579,8 +4661,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     ahead_queue, lambda pr: ready_layers(
                         repo, pr, prs, open_numbers, when, said, run,
                         regenerated, rules), last, AHEAD_BATCH)
-            entries = predict_ahead(repo, main_tip, ahead_queue, run,
-                                    overdue=overdue)
+            entries = predict_ahead(
+                repo, main_tip, ahead_queue, run, overdue=overdue,
+                restacks=restacks if PREDICT_RESTACKED else None)
             record["ahead"] = [e["pr"] for e in entries]
             said_ahead = {"at": record["at"], "base": main_tip,
                           "repo": repo, "entries": entries}
