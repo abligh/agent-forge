@@ -485,3 +485,44 @@ instead of one per merge attempt. No new key: it applies wherever
 
 **Order of work.** `forge-merger`: the checks before `predict_ahead`,
 `checked.json`, tests; `docs/config.md`; a release.
+
+## Amendment (2026-11-03, fifth): a batch of one still runs the later tops
+
+* Status: approved (Alex Bligh, 2026-11-03, in the terminal: "agent-forge #191 and #193 approved"; https://github.com/abligh/agent-forge/issues/193)
+
+**Why.** A batch shrinks to one member while it merges: the members
+merge one by one, and once one is left, `batch.size` in `ahead.json`
+is 1. `forge-pr-check` counts a batch only from two members (a red
+batch's suspects excepted). It then falls back to walking every
+prediction in order, and leaves out the later tops (part 2), since
+`merger_later` needs a batch too. So spare slots run the next batch's
+members, one after another, instead of its top. The top starts only
+once the last member has merged.
+
+Over the 24 hours to 06:38Z on 3 November, one project's
+check host ran 91 predictions. 38 green ones were never used, at about
+10 of 26.9 slot-hours. 25 of those 38 (5.9 slot-hours) started during a
+batch of one:
+
+* 11 had the right tree, but the next top went green first and
+  covered them;
+* 5 had the right tree but finished after their pull request had
+  merged;
+* 8 had the wrong tree, because a pull request went in front of them;
+* 1 had a pull request that left the queue.
+
+For example, at 07:09Z on 2 November the batch was one pull request.
+The free slots ran the next batch's first two members, and that
+batch's top started only at 07:10:32Z, after the one had merged.
+
+**Change.** When `ahead.json` lists `later` batches, `forge-pr-check`
+counts a batch of one as a batch. Its top is the one member, so it's
+the front pull request's own tree, which its own check already covers.
+Spare slots go to the later tops in order, as part 2 says. Without
+`later` batches (`merge.test_ahead.batches` 1), nothing changes. No
+new key: it applies where `batches` is above 1.
+
+**Cost.** None. Fewer runs, and the next top starts sooner.
+
+**Order of work.** `forge-pr-check`: `merger_batch` takes a batch of
+one when `later` is listed. Tests for both cases, then a release.

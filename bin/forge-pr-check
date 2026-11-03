@@ -2028,15 +2028,19 @@ def merger_batch(merger_dir, when, repo=None):
     its top last, or [] when there is none of two or more, or ahead.json
     can't be read as merger_ahead reads it, or its `batch` doesn't name
     the trees of its first entries. A batch of a red batch's suspects
-    (designs/0035, second amendment) may be one."""
+    (designs/0035, second amendment) may be one, and so may a batch
+    with `later` batches after it (the fifth amendment): its one member
+    is merging, and the spare slots go to the later tops."""
     entries = merger_ahead(merger_dir, when, repo)
     if not entries:
         return []
     try:
         with open(os.path.join(merger_dir, "ahead.json")) as handle:
-            batch = json.load(handle)["batch"]
+            said = json.load(handle)
+        batch = said["batch"]
         size, trees = batch["size"], batch["trees"]
-        least = 1 if batch.get("suspects") is True else 2
+        least = 1 if batch.get("suspects") is True \
+            or said.get("later") else 2
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return []
     if not isinstance(size, int) or isinstance(size, bool) or size < least \
