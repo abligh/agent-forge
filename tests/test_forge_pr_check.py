@@ -2144,6 +2144,30 @@ class Batch(unittest.TestCase):
                                "suspects": True})
         self.assertEqual(pc.merger_batch(self.dir, T0), self.entries[:1])
 
+    def test_a_batch_of_one_with_later_batches_is_a_batch(self):
+        # designs/0035, fifth amendment: the last member of a merging
+        # batch, with the next batch after it.
+        write_ahead(self.dir, self.entries, batch=1, later=(2,))
+        self.assertEqual(pc.merger_batch(self.dir, T0), self.entries[:1])
+        self.assertEqual(pc.merger_later(self.dir, T0), [self.entries[2]])
+
+    def test_a_batch_of_one_runs_the_later_top_not_the_members(self):
+        # The front's own tree is its head's check; a spare slot goes
+        # to the next batch's top, not to that batch's first member.
+        write_ahead(self.dir, self.entries, batch=1, later=(2,))
+        batch = pc.merger_batch(self.dir, T0)
+        later = pc.merger_later(self.dir, T0)
+        state = empty()
+        state["results"][SHA_P] = verdict(pr=7, tree=TREE_1)
+        self.assertEqual(pc.next_ahead(state, self.entries, when=T0,
+                                       batch=batch, later=later),
+                         (SHA_C, 9))
+
+    def test_a_batch_of_one_without_later_batches_is_none(self):
+        write_ahead(self.dir, self.entries, batch=1)
+        self.assertEqual(pc.merger_batch(self.dir, T0), [])
+        self.assertEqual(pc.merger_later(self.dir, T0), [])
+
     def test_the_runs_to_stop_are_read(self):
         write_ahead(self.dir, self.entries, batch=2)
         self.assertEqual(pc.merger_stop(self.dir, T0), set())

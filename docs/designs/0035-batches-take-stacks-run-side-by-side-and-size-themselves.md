@@ -488,7 +488,7 @@ instead of one per merge attempt. No new key: it applies wherever
 
 ## Amendment (2026-11-03, fifth): a batch of one still runs the later tops
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-03, in the terminal: "agent-forge #191 and #193 approved"; https://github.com/abligh/agent-forge/issues/193)
 
 **Why.** A batch shrinks to one member while it merges: the members
 merge one by one, and once one is left, `batch.size` in `ahead.json`
