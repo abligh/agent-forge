@@ -545,6 +545,38 @@ class Check(unittest.TestCase):
             "batches": True}}),
             ["merge.test_ahead.batches must be an integer"])
 
+    def test_merge_designs_0044(self):
+        # Rules 1 to 4 are switches, on unless set to false.
+        self.assertEqual(self.problems(merge={
+            "hand_back_once_per_head": False,
+            "right_of_way": {"while_eligible": False},
+            "test_ahead": {"fixed_order": False,
+                           "hand_back_red_suspect": False}}), [])
+        self.assertEqual(self.problems(merge={
+            "hand_back_once_per_head": 1,
+            "right_of_way": {"while_eligible": "no"},
+            "test_ahead": {"fixed_order": 0}}), [
+            "merge.hand_back_once_per_head must be true or false",
+            "merge.test_ahead.fixed_order must be true or false",
+            "merge.right_of_way.while_eligible must be true or false"])
+
+    def test_merge_test_ahead_unstable(self):
+        # designs/0044, rule 5.
+        ahead = {"depth": 7, "batch": 4, "batches": 2}
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, unstable_after_recuts=6)}), [])
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, unstable_after_recuts=6, batches_when_unstable=2)}), [])
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, unstable_after_recuts=0, batches_when_unstable=3)}), [
+            "merge.test_ahead.unstable_after_recuts must be at least 1",
+            "merge.test_ahead.batches_when_unstable must be at least 1 and "
+            "at most batches (2)"])
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, batches_when_unstable=1)}), [
+            "merge.test_ahead.batches_when_unstable needs "
+            "unstable_after_recuts"])
+
     def test_merge_test_ahead_batch(self):
         self.assertEqual(self.problems(merge={"test_ahead": {"batch": 4}}),
                          [])

@@ -48,8 +48,9 @@ was already said:
   a review again;
 * `MERGE` squash-merges, pinned the same way, with GitHub's default
   message;
-* `HAND-BACK` comments once per approval, head and reason, signed
-  `— Merger`. To the author it is a plain comment, and for a conflict
+* `HAND-BACK` comments once per approval and head, whatever the
+  reason (`merge.hand_back_once_per_head`, designs/0044; without it,
+  once per approval, head and reason), signed `— Merger`. To the author it is a plain comment, and for a conflict
   it says what to do (CONFLICT_ADVICE) and lists the author's other
   open pull requests with where each stands; to the approving
   Reviewer it starts `Not-a-review`, since it asks for a review rather
@@ -380,6 +381,20 @@ up to `batch`. When the batch before has merged, a fixed one is the
 batch at its own size, so its top's green covers it at once. Nothing
 follows a red first batch, or a later one whose top is red.
 
+**A batch whose top's run has started keeps its order**
+(`merge.test_ahead.fixed_order`, default on; designs/0044, rule 3).
+Every batch up to the last whose top's run has started (`fixed_order`)
+keeps its members' order: an overdue candidate, right of way's holder,
+one newly approved and a returning stack layer go behind them, and
+right of way holds none of them. Only urgent ones, behind the batch
+being merged, and a red default branch's fixes go in front, as before.
+A member that drops out ends it from its batch on. The record lists
+them under `fixed`. With `unstable_after_recuts: N` (off by default;
+rule 5), a tick that re-cuts such a batch says `"recut": true`, and
+while more than N ticks in the last hour did, only
+`batches_when_unstable` (default 1) batches are predicted (`unstable`
+in the record; `UNSTABLE` and `SETTLED` lines).
+
 **A member is checked before its batch** (designs/0035, fourth
 amendment). Before predicting, the Merger runs, for each pull request
 it would predict on the default branch, the checks that don't depend
@@ -405,8 +420,12 @@ batch's slot and the rest as `later` batches, `batches` - 1 of them
 set, already red, isn't run again. A prediction for a prefix longer
 than a red one is listed as `stop` in `ahead.json`, and the build
 check stops its run. A red prefix one longer than a green one names
-its last member: `SUSPECTS #a..#b: #n is red on its own; the search
-ends`, and it is checked and handed back as without batches. When no
+its last member, and once it leads, `SUSPECTS #a..#b: #n is red on its
+own; the search ends`. With `merge.test_ahead.hand_back_red_suspect`
+(default on; designs/0044, rule 4) it is handed back as soon as it is
+named, `SUSPECT-RED #n: ...`, and kept in `red-suspects.json`: until
+it has a new head it is neither predicted, updated nor merged.
+Without it, it is checked and handed back as without batches. When no
 suspects are left and every one merged, the first red was flaky:
 `BATCH-FLAKE #a..#b: every suspect merged green; the red top's tree
 <tree> was a flake`.
@@ -479,6 +498,9 @@ when). Meanwhile every other candidate whose head conflicts with H is
 held, `held` saying `conflicts with #P, which has right of way`, told
 once like a hold above; once P is a candidate it goes first, after
 only the one a `test_ahead` run is in flight for, and never yields.
+With `while_eligible` (default on; designs/0044, rule 2), P holds
+nobody while it isn't a candidate at H or was handed back at H, and
+the record's `right_of_way` says why under `idle`.
 The record's `right_of_way` says who has it, `{pr, head, since}`, or
 null. Of several that earned it, the first in the order above has it.
 
@@ -699,6 +721,18 @@ AHEAD_BATCH = 1
 # and the build check runs their tops in spare slots. One whose top's
 # run has started is `fixed`; the first that isn't grows at its end.
 AHEAD_BATCHES = 1
+# merge.test_ahead.fixed_order (designs/0044, rule 3): the batches up to
+# the last whose top's run has started keep their order; nothing but an
+# urgent one or a red default branch's fix goes in front of them.
+FIXED_ORDER = True
+# merge.test_ahead.unstable_after_recuts and batches_when_unstable
+# (designs/0044, rule 5): when more than UNSTABLE_AFTER ticks in the
+# last UNSTABLE_WINDOW re-cut a batch whose top's run had started, only
+# UNSTABLE_BATCHES batches are predicted until there are fewer. None:
+# off.
+UNSTABLE_AFTER = None
+UNSTABLE_BATCHES = 1
+UNSTABLE_WINDOW = datetime.timedelta(hours=1)
 # merge.test_ahead.stacks (designs/0035): a stack's ready layers are
 # predicted straight after their base, so they join its batch. A queued
 # pull request a layer pushed out of the batch is `owed` in ahead.json,
@@ -714,6 +748,17 @@ COVERED_TEXT = "covered by batch"
 # red one among them is found.
 SUSPECTS_FILE = "suspects.json"
 CHECKED_FILE = "checked.json"
+# merge.test_ahead.hand_back_red_suspect (designs/0044, rule 4): a
+# suspect the search finds red on its own is handed back at once, and
+# kept out of batches, and not updated or merged, until it has a new
+# head: {pr: {head, reason}} in RED_SUSPECT_FILE.
+RED_SUSPECT_OUT = True
+RED_SUSPECT_FILE = "red-suspects.json"
+RED_SUSPECT_REASON = ("a red batch's search found it red on its own: %s is "
+                      "failure on it merged with %s")
+RED_SUSPECT_DETAIL = ("The build check's run of %s, this head merged onto "
+                      "%s%s, was red. It stays out of the Merger's batches "
+                      "until this pull request has a new head.")
 # designs/0011, amendment: a head red only where the tip it was merged
 # with is red itself waits for the tip to be fixed, not handed back.
 BASE_RED_REASON = ("%s is red only in %s, as %s is at %s; waits for it to "
@@ -780,6 +825,10 @@ ROW_AFTER = 2
 ROW_FOR = datetime.timedelta(minutes=60)
 ROW_REASON = "conflicts with #%d, which has right of way"
 ROW_FILE = "right-of-way.json"
+# merge.right_of_way.while_eligible (designs/0044, rule 2): right of
+# way holds others only while its holder is a candidate at its head and
+# not handed back there.
+ROW_WHILE_ELIGIBLE = True
 # merge.age_first (designs/0037): a candidate that has waited AGE_FIRST
 # since a tick first saw it as one is overdue, and goes first. AGE_FILE
 # remembers when; an entry no candidate for AGE_FORGET is dropped.
@@ -808,6 +857,10 @@ SAID_APPROVALS = False
 # merge.update_once: no second UPDATE or RESOLVE after any hand-back
 # under the same approval.
 UPDATE_ONCE = False
+# merge.hand_back_once_per_head (designs/0044, rule 1): a pull request
+# is told of a hand-back once per approval and head, whatever the
+# reason; False tells it again for each new reason.
+ONCE_PER_HEAD = True
 # merge.ci_never_started: how long after the head's commit a CI run
 # that never started is handed back, or None to wait (and stall).
 CI_NEVER_STARTED = None
@@ -848,7 +901,8 @@ def configure(project):
     global STACKS, STACK_MAX_RUN, STACK_WAIT, RESOLVE, HOLD_LABELS, BLOCKED_BY
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
-    global AGE_FIRST, PREDICT_RESTACKED
+    global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
+    global FIXED_ORDER, RED_SUSPECT_OUT, UNSTABLE_AFTER, UNSTABLE_BATCHES
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -881,6 +935,11 @@ def configure(project):
     AHEAD_DEPTH = (ahead or {}).get("depth", DEFAULT_AHEAD_DEPTH)
     AHEAD_BATCH = (ahead or {}).get("batch", 1)
     AHEAD_BATCHES = (ahead or {}).get("batches", 1)
+    FIXED_ORDER = (ahead or {}).get("fixed_order", True) is not False
+    RED_SUSPECT_OUT = (ahead or {}).get("hand_back_red_suspect",
+                                        True) is not False
+    UNSTABLE_AFTER = (ahead or {}).get("unstable_after_recuts")
+    UNSTABLE_BATCHES = (ahead or {}).get("batches_when_unstable", 1)
     HOLD_CONFLICTING = merge.get("hold_conflicting", False) is True
     YIELD_PLACES = merge.get("yield_after_hand_back", 0)
     YIELD_CAP = merge.get("yield_cap", 3)
@@ -892,6 +951,7 @@ def configure(project):
     RIGHT_OF_WAY = row is not None
     ROW_AFTER = (row or {}).get("after_conflicts", 2)
     ROW_FOR = datetime.timedelta(minutes=(row or {}).get("minutes", 60))
+    ROW_WHILE_ELIGIBLE = (row or {}).get("while_eligible", True) is not False
     age = merge.get("age_first")
     AGE_FIRST = (None if age is None else datetime.timedelta(
         minutes=age.get("after_minutes", 90)))
@@ -916,6 +976,7 @@ def configure(project):
     QUIET_LOGINS = QUIET_LOGINS | {project.slug(n)
                                    for n in said.get("quiet", ())}
     UPDATE_ONCE = merge.get("update_once", False) is True
+    ONCE_PER_HEAD = merge.get("hand_back_once_per_head", True) is not False
     never = merge.get("ci_never_started")
     CI_NEVER_STARTED = (datetime.timedelta(minutes=never)
                         if never is not None else None)
@@ -2248,6 +2309,32 @@ def hand_back_key(approval, head, reason, text=None):
     return key
 
 
+def told(before, key):
+    """Whether `before`, a hand-back from `handed-back.json`, already
+    said what the hand-back `key` (`hand_back_key`) would say. The same
+    approval, head and reason always has. With ONCE_PER_HEAD (designs/
+    0044, rule 1) so has any other hand-back under the same approval
+    and head: the author already has it, and a second reason for the
+    same head is only noise. On one project on 2026-11-04, 32 of 84
+    hand-backs in a morning repeated one already told for the same head;
+    one head was told 8 times in an hour, alternating between a conflict
+    with main and a merge after the approval that wasn't clean, since
+    each replaced the other in `said`. Two hand-backs still count as
+    new: one after a gate's refusal of a description (`text`), unless
+    it is the same refusal of the same description, since the author
+    may fix the description alone; and one after a gate's refusal for
+    now (`retry`) for another reason, since that refusal wasn't the
+    author's to fix."""
+    if {k: v for k, v in before.items() if k != "at"} == key:
+        return True
+    if not ONCE_PER_HEAD or before.get("approved") != key["approved"] \
+            or before.get("head") != key["head"]:
+        return False
+    if before.get("text") and before["text"] != key.get("text"):
+        return False
+    return not (before.get("retry") and before.get("reason") != key["reason"])
+
+
 def description(pr):
     """A short hash of `pr`'s title and body: what a `merge.gate` tool
     that reads the description was given."""
@@ -2313,9 +2400,8 @@ def carry_out(decision, approval, github, said):
             key["retry"] = True
             asked = dict(key, at=decision.get("at") or iso(now_utc()))
         before = said.get(str(number))
-        if isinstance(before, dict) and \
-                {k: v for k, v in before.items() if k != "at"} == key:
-            if decision.get("retry"):
+        if isinstance(before, dict) and told(before, key):
+            if decision.get("retry") and before.get("reason") == key["reason"]:
                 said[str(number)] = asked
             return "already said"
         ok, why = github.write(
@@ -2793,7 +2879,8 @@ def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
     when it reaches the front, which in a busy queue can be hours after
     the merge that made the conflict, hours its author could have spent
     on the fix. One already told of a conflict for this approval and
-    head is skipped, whatever the words, and so is one git can't compare
+    head is skipped, whatever the words, and with ONCE_PER_HEAD one
+    told anything for them (`told`), and so is one git can't compare
     (it is decided when it is reached, as before). So is a stack's layer
     (`layers`): the Merger restacks it when it is reached, and its own
     hand-back says which merge conflicted. Told the plain conflict here,
@@ -2816,7 +2903,8 @@ def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
                 or ({k: before.get(k) for k in ("approved", "head")}
                     == {k: key[k] for k in ("approved", "head")}
                     and (before.get("reason") or "").startswith(
-                        CONFLICT_REASON))):
+                        CONFLICT_REASON))
+                or told(before, key)):
             continue
         have_head(repo, pr, run)
         if is_ancestor(repo, main_tip, pr["headRefOid"], run):
@@ -3049,15 +3137,17 @@ def waiting_since(path, candidates, prs, when, save=True):
             for pr in candidates}
 
 
-def overdue_first(queue, since, when, keep=None, members=()):
+def overdue_first(queue, since, when, keep=None, members=(), fixed=()):
     """(`queue` with its overdue candidates first, {pr: minutes waited}
     for those): each that has waited AGE_FIRST since `since` says, the
     longest waiting first. Only `keep`, the one in flight, the members
-    of a batch being merged and urgent ones stay ahead of them; the rest
-    keep their order. The members keep theirs too, overdue or not: the
-    batch's green covers its trees in that order only, and on 2026-10-31
-    an overdue member moved up inside a green batch of seven, which
-    then merged two and waited out a new top's run."""
+    of a batch being merged and urgent ones stay ahead of them, and then
+    the members of `fixed`, batches whose top's run has started
+    (`fixed_order`, designs/0044, rule 3); the rest keep their order.
+    The members keep theirs too, overdue or not: the batch's green
+    covers its trees in that order only, and on 2026-10-31 an overdue
+    member moved up inside a green batch of seven, which then merged two
+    and waited out a new top's run."""
     waited = {pr["number"]: when - since[pr["number"]] for pr in queue
               if pr["number"] in since}
     late = {n: w for n, w in waited.items() if w >= AGE_FIRST}
@@ -3066,9 +3156,10 @@ def overdue_first(queue, since, when, keep=None, members=()):
     zero = datetime.timedelta(0)
     queue = sorted(queue, key=lambda pr: (
         pr["number"] != keep, pr["number"] not in members) + (
-        (False, False, zero) if pr["number"] in members else (
-            not urgent(pr), pr["number"] not in late,
-            -late.get(pr["number"], zero))))
+        (0, False, zero) if pr["number"] in members
+        else (1, False, zero) if pr["number"] in fixed
+        else (0 if urgent(pr) else 2, pr["number"] not in late,
+              -late.get(pr["number"], zero))))
     return queue, {n: int(w.total_seconds() // 60) for n, w in late.items()}
 
 
@@ -3083,7 +3174,8 @@ def right_of_way(repo, prs, records, path, when, main_ref, run=sh,
     amendment), and less than ROW_FOR has passed since a tick
     first saw H with it earned. `path` remembers that moment per pull
     request ({pr: {head, since}}), written when `save`. Of several, the
-    first in the Merger's order has it."""
+    first in the Merger's order has it. Whether it holds anyone this
+    tick is `row_idle`'s question (designs/0044, rule 2)."""
     counts = conflict_hand_backs(records)
     other = {(pr, head) for pr, head, reason in author_hand_backs(records)
              if reason != CONFLICT_REASON}
@@ -3114,6 +3206,23 @@ def right_of_way(repo, prs, records, path, when, main_ref, run=sh,
     if save:
         save_json(path, seen)
     return found
+
+
+def row_idle(row, candidates, approvals, said, when):
+    """Why `row`, right of way as `right_of_way` found it, holds nobody
+    this tick, or None when it holds (designs/0044, rule 2): its holder
+    must be a candidate (approved, covered, not drafted, nothing open
+    blocking it) at the head it has right of way for, and not handed
+    back at that head under its approval. One project, 2026-11-04:
+    right of way was active in 70 to 90% of the Merger's ticks, holding
+    3 to 6 pull requests, even while its holder was back with its
+    author."""
+    holder = [pr for pr in candidates if pr["number"] == row["pr"]]
+    if not holder or holder[0]["headRefOid"] != row["head"]:
+        return "not a candidate at %s" % row["head"][:10]
+    if handed_back(said, holder[0], approvals[row["pr"]], when):
+        return "handed back at %s" % row["head"][:10]
+    return None
 
 
 def codeowners_rules(repo, ref, run=sh):
@@ -3472,6 +3581,117 @@ def locked_order(state_dir, queue):
     return places
 
 
+def fixed_order(state_dir, repo, queue, open_numbers, approvals, said,
+                check_state, when=None, run=sh):
+    """{number: place} for the pull requests of the batches the last
+    live tick predicted (AHEAD_FILE) up to and including the last whose
+    top's run has started, in their order (designs/0044, rule 3). Their
+    order is fixed: an overdue candidate (designs/0037), one with right
+    of way, or one newly approved goes behind them, and right of way
+    holds none of them. Only the batch being merged gives way to an
+    urgent one less, as before, and a red default branch's fixes still
+    go first. A batch's top's run has started when ahead.json says it
+    is `fixed`, or the build check has started it (`ahead_started`).
+    Without `batch` each prediction is a batch of its own.
+
+    A member that drops out ends it, from its batch on, since every tree
+    from there on changes anyway: one still open (`open_numbers`) but no
+    longer in `queue`, handed back at its head (`said`, under its
+    approval in `approvals`), or at another head whose tree is not the
+    one predicted (GitHub's update of the one in flight gives the
+    predicted tree, so that one stays). One that merged or closed has
+    left the front, and the rest keep their places. One project,
+    2026-11-04: overdue candidates, right of way and three batches in
+    flight re-cut the batches about 13 times an hour, and 46% of green
+    batch-top runs merged nothing."""
+    heads = {pr["number"]: pr for pr in queue}
+    places = {}
+    for group in started_batches(load_json(os.path.join(
+            state_dir, AHEAD_FILE), {}), check_state):
+        kept = []
+        for e in group:
+            pr = heads.get(e.get("pr"))
+            if pr is None:
+                if e.get("pr") in open_numbers:
+                    return places
+                continue
+            if pr["headRefOid"] != e.get("head"):
+                have_head(repo, pr, run)
+                tree = git(repo, "rev-parse", pr["headRefOid"] + "^{tree}",
+                           run=run)
+                if tree.returncode != 0 or \
+                        tree.stdout.strip() != e.get("tree"):
+                    return places
+            if handed_back(said, pr, approvals.get(pr["number"]) or {},
+                           when):
+                return places
+            kept.append(pr["number"])
+        for number in kept:
+            places.setdefault(number, len(places))
+    return places
+
+
+def started_batches(last, check_state):
+    """The batches of `last`, an ahead.json, as lists of its entries,
+    up to and including the last whose top's run has started: ahead.json
+    says it is `fixed`, or the build check has started it
+    (`ahead_started`). Without `batch` each prediction is a batch of its
+    own. Every tree of a later batch holds the batches before it, so a
+    run started there counts for them too."""
+    entries = last.get("entries") if isinstance(last, dict) else None
+    if not isinstance(entries, list) or not all(
+            isinstance(e, dict) for e in entries):
+        return []
+    batch, sizes = last.get("batch"), []
+    if isinstance(batch, dict):
+        for b in [batch] + list(last.get("later") or ()):
+            if not isinstance(b, dict) or not isinstance(b.get("size"), int) \
+                    or isinstance(b.get("size"), bool) or b["size"] < 1:
+                break
+            sizes.append((b["size"], b is not batch and b.get("fixed")))
+    else:
+        sizes = [(1, False)] * len(entries)
+    groups, at, end = [], 0, 0
+    for size, fixed in sizes:
+        group = entries[at:at + size]
+        if len(group) < size:
+            break
+        groups.append(group)
+        top = group[-1]
+        if fixed or (isinstance(top.get("sha"), str)
+                     and isinstance(top.get("tree"), str)
+                     and ahead_started(check_state, top["sha"], top["tree"])):
+            end = len(groups)
+        at += size
+    return groups[:end]
+
+
+def recut(last, entries, open_numbers, merged, check_state):
+    """Whether the predictions `entries` re-cut a batch of `last`, the
+    ahead.json before them, whose top's run had started
+    (`started_batches`; designs/0044, rule 5): what is left of those
+    batches, without the pull requests that merged or closed since
+    (`merged`, or not in `open_numbers`), is no longer a run of the
+    same pull requests with the same trees. That run is then spent."""
+    left = [(e.get("pr"), e.get("tree")) for group in started_batches(
+        last, check_state) for e in group
+        if e.get("pr") in open_numbers and e.get("pr") not in merged]
+    now = [(e["pr"], e["tree"]) for e in entries]
+    return bool(left) and not any(now[k:k + len(left)] == left
+                                  for k in range(len(now) - len(left) + 1))
+
+
+def unstable(records, recut_now):
+    """How many ticks in `records` (the last UNSTABLE_WINDOW), and this
+    one when `recut_now`, re-cut a batch whose top's run had started,
+    when that is more than merge.test_ahead.unstable_after_recuts
+    (designs/0044, rule 5); else None."""
+    if UNSTABLE_AFTER is None:
+        return None
+    count = sum(1 for r in records if r.get("recut") is True) + bool(recut_now)
+    return count if count > UNSTABLE_AFTER else None
+
+
 def current_batch(state_dir, queue):
     """(trees, members) of the batch the last tick (AHEAD_FILE) was
     merging: its batch while a member is still in `queue` at the head
@@ -3663,10 +3883,10 @@ def batch_size(entries, last, verdict, later=(), urgents=frozenset()):
 
 
 def later_batches(entries, size, last, verdict, started,
-                  urgents=frozenset()):
+                  urgents=frozenset(), batches=None):
     """designs/0035 part 2: the batches after the first `size` of the
     predictions `entries`, end to end, as [{size, trees, fixed?}], at
-    most AHEAD_BATCHES - 1 of them. A batch of the last tick's (`last`,
+    most `batches` - 1 of them (default AHEAD_BATCHES). A batch of the last tick's (`last`,
     ahead.json's `later`) that was `fixed` keeps its size while its
     trees still come next; the first that isn't takes up to
     AHEAD_BATCH, so it grows at its end until its top's run starts
@@ -3674,13 +3894,14 @@ def later_batches(entries, size, last, verdict, started,
     a red first batch, nor a later one whose top is red: each later
     tree contains it."""
     trees = [e["tree"] for e in entries]
+    batches = AHEAD_BATCHES if batches is None else batches
     if size < 1 or verdict(trees[size - 1]) is False:
         return []
     fixed = [b["trees"] for b in (last or ())
              if isinstance(b, dict) and b.get("fixed")
              and isinstance(b.get("trees"), list) and b["trees"]]
     out, at = [], size
-    while len(out) < AHEAD_BATCHES - 1 and at < len(trees):
+    while len(out) < batches - 1 and at < len(trees):
         # Matched by its trees, not its place: the first of them moves
         # up once the batch before it has merged.
         kept = [t for t in fixed if trees[at:at + len(t)] == t]
@@ -3839,13 +4060,16 @@ def suspects_left(saved, queue, record, approvals, said):
 
 
 def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
-                  record, out):
+                  record, out, found=None):
     """One tick of the search (designs/0035, second amendment): the
     batch and `later` batches written into `said_ahead` for the
     suspects at the front of the predictions `entries`, the runs to
     stop as `stop`, and the search saved. Whether it goes on: False
     once a suspect is red on its own at the front, which is then
-    checked as without batches, or when no suspect is predicted."""
+    checked as without batches, or when no suspect is predicted. A
+    suspect red on its own, on top of every suspect before it, is
+    appended to the list `found` with the number of green ones before
+    it, as (entry, green) (designs/0044, rule 4)."""
     path = os.path.join(state_dir, SUSPECTS_FILE)
     numbers = {e["pr"] for e in saved["suspects"]}
     n = 0
@@ -3853,6 +4077,8 @@ def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
         n += 1
     trees = [e["tree"] for e in entries[:n]]
     green, red, cuts = suspect_cuts(trees, verdict, AHEAD_BATCHES)
+    if found is not None and red is not None and red == green + 1:
+        found.append((entries[red - 1], green))
     if not n or (red == 1 and not green):
         if n:
             out("SUSPECTS #%d..#%d: #%d is red on its own; the search ends"
@@ -3893,6 +4119,51 @@ def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
         saved["said"] = line
     save_json(path, saved)
     return True
+
+
+def red_suspects(state_dir, prs):
+    """RED_SUSPECT_FILE's entries for the pull requests in `prs` still
+    at the head they were found red at (designs/0044, rule 4): {number,
+    as a string: {head, reason}}. A new head is new evidence, so its
+    entry is dropped, and so is a closed one's."""
+    heads = {str(pr["number"]): pr["headRefOid"] for pr in prs}
+    saved = load_json(os.path.join(state_dir, RED_SUSPECT_FILE), {})
+    return {k: v for k, v in (saved.items() if isinstance(saved, dict)
+                              else ())
+            if isinstance(v, dict) and isinstance(v.get("reason"), str)
+            and heads.get(k) is not None and heads[k] == v.get("head")}
+
+
+def hand_back_red_suspect(state_dir, entry, green, queue, approvals, reds,
+                          github, said, live, record, out):
+    """designs/0044, rule 4: hand back the suspect a red batch's search
+    found red on its own (`entry`, its prediction, on top of `green`
+    suspects found green), once, and keep it in RED_SUSPECT_FILE, so
+    that it stays out of every batch until its author pushes a new head.
+    Without it, the search ended, the suspect went back into the queue
+    as any other, and was put into new batches, whose tops were red
+    again: on one project on 2026-11-04 a suspect found red on its own
+    was put back into a batch three more times before it was handed
+    back."""
+    pr = [p for p in queue if p["number"] == entry["pr"]]
+    if not pr or pr[0]["headRefOid"] != entry["head"]:
+        return
+    reason = RED_SUSPECT_REASON % (STATUS_CONTEXT, MAIN)
+    decision = conflict_hand_back(
+        pr[0], approvals[entry["pr"]], github, said, live, reason,
+        RED_SUSPECT_DETAIL % (entry["sha"][:10], MAIN, (
+            " and the %d pull requests ahead of it in the batch" % green
+            if green > 1 else " and the one ahead of it in the batch"
+            if green else "")))
+    decision["suspect"] = True
+    record["decisions"].append(decision)
+    if str(entry["pr"]) not in reds:
+        out("SUSPECT-RED #%d: red on its own at %s; %shanded back, and out "
+            "of batches until a new head" % (
+                entry["pr"], entry["head"][:10], "" if live else "would be "))
+    reds[str(entry["pr"])] = {"head": entry["head"], "reason": reason}
+    if live:
+        save_json(os.path.join(state_dir, RED_SUSPECT_FILE), reds)
 
 
 def merged_one(record):
@@ -4229,20 +4500,36 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # already having, and every prediction behind it.
         queue.sort(key=lambda pr: pr["number"] != in_flight)
     os.makedirs(state_dir, exist_ok=True)
+    said_path = os.path.join(state_dir, "handed-back.json")
+    said = load_json(said_path, {})
+    reds = red_suspects(state_dir, prs) if TEST_AHEAD and RED_SUSPECT_OUT \
+        else {}
     since, overdue = {}, {}
     if AGE_FIRST is not None:
         since = waiting_since(os.path.join(
             state_dir, AGE_FILE if live else "dry-run-" + AGE_FILE),
             candidates, prs, when)
     row_held = {}
+    fixed = fixed_order(state_dir, repo, queue, {pr["number"] for pr in prs},
+                        approvals, said, check_state, when, run) \
+        if TEST_AHEAD and FIXED_ORDER else {}
     if RIGHT_OF_WAY:
         row = right_of_way(repo, prs, records, os.path.join(
             state_dir, ROW_FILE if live else "dry-run-" + ROW_FILE),
             when, main_tip, run)
-    if row:
+    idle = row and ROW_WHILE_ELIGIBLE and row_idle(
+        row, candidates, approvals, said, when)
+    if idle:
+        # designs/0044, rule 2: it holds nobody while it is back with its
+        # author, drafted, or not approved at the head it has it for.
+        row = dict(row, idle=idle)
+    if row and not idle:
         # Nothing that conflicts with it merges first; it goes first
         # once it is a candidate, after only the one in flight.
-        others = [pr for pr in queue if pr["number"] != row["pr"]]
+        # Nor does a member of a batch whose top's run has started
+        # (designs/0044, rule 3): it keeps its place.
+        others = [pr for pr in queue if pr["number"] != row["pr"]
+                  and pr["number"] not in fixed]
         if since:
             # One that has waited longer and is overdue isn't held for
             # it (designs/0037): it goes first, and the holder waits.
@@ -4290,13 +4577,17 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # An urgent pull request goes ahead of a layer that comes back,
         # though not ahead of the batch being merged (Alex, 2026-10-26:
         # a pin waited behind four layers in turn, an hour and a half).
+        # A batch whose top's run has started keeps its order too, behind
+        # only those and urgent ones (designs/0044, rule 3).
         queue.sort(key=lambda pr: (
             pr["number"] != in_flight,
             0 if pr["number"] in members
             else 1 if urgent(pr) and pr["number"] not in first
-            else 2 if pr["number"] in first and pr["number"] not in late
-            else 3 if pr["number"] in places
-            else 4 if pr["number"] in late else 5))
+            and pr["number"] not in fixed
+            else 2 if pr["number"] in fixed
+            else 3 if pr["number"] in first and pr["number"] not in late
+            else 4 if pr["number"] in places
+            else 5 if pr["number"] in late else 6))
     if since:
         # Overdue ones go first (designs/0037), behind only the one in
         # flight, urgent ones and a batch being merged, whose runs are
@@ -4305,7 +4596,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             state_dir, queue, check_state))
         queue, overdue = overdue_first(
             queue, since, when, in_flight,
-            batch_members(state_dir, queue) if merging else set())
+            batch_members(state_dir, queue) if merging else set(), fixed)
         for number in overdue:
             yielded.pop(number, None)
     if MAIN_RED_FIXES & {pr["number"] for pr in queue}:
@@ -4339,6 +4630,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         record["right_of_way"] = row
     if AGE_FIRST is not None:
         record["overdue"] = {str(n): w for n, w in sorted(overdue.items())}
+    if fixed:
+        record["fixed"] = sorted(fixed, key=fixed.get)
     if stack:
         record["stack"] = [dict({"pr": e["pr"], "after": e["after"]},
                                 **({"waiting": True} if e.get("since")
@@ -4346,8 +4639,6 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                            for e in stack["pending"]]
     if expired:
         record["stack_waited"] = tell_waited(github, expired, live)
-    said_path = os.path.join(state_dir, "handed-back.json")
-    said = load_json(said_path, {})
     if spoken or os.path.exists(os.path.join(state_dir, HELD_FILE)):
         record["spoken"] = tell_spoken(state_dir, github, prs, spoken, live)
     if HOLD_CONFLICTING or RIGHT_OF_WAY:
@@ -4382,6 +4673,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                                  any_base=True)[0] is not None]
     for at, pr in enumerate([] if retarget is not None else queue):
         approval = approvals[pr["number"]]
+        found_red = reds.get(str(pr["number"]))
+        if found_red:
+            # Found red on its own by a red batch's search, and handed
+            # back: not updated, merged or predicted until a new head
+            # (designs/0044, rule 4).
+            record["decisions"].append(conflict_hand_back(
+                pr, approval, github, said, live, found_red["reason"]))
+            continue
         decision = decide(pr, approval, repo, main_tip, github, github.env,
                           run, below if pr["number"] in layers else (),
                           regenerated, when, restacks.get(pr["number"]))
@@ -4639,6 +4938,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     % (pr["number"], failed[1].splitlines()[0],
                        "" if live else "would be "))
             rest = [pr for pr in queue if pr["number"] != waiting_on
+                    and str(pr["number"]) not in reds
                     and not handed_back(said, pr, approvals[pr["number"]],
                                         when)]
             ahead_queue = acting + rest if acting else []
@@ -4671,6 +4971,25 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                           "repo": repo, "entries": entries}
             if owed:
                 said_ahead["owed"] = record["owed"] = owed
+            merged_now = {d["pr"] for d in record["decisions"]
+                          if d.get("action") == "MERGE"
+                          and d.get("result") == "done"}
+            if entries and recut(last, entries, {pr["number"] for pr in prs},
+                                 merged_now, check_state):
+                record["recut"] = True
+            shaky = unstable(recent_records(
+                os.path.join(state_dir, name), when - UNSTABLE_WINDOW),
+                record.get("recut")) if UNSTABLE_AFTER is not None else None
+            if shaky is not None:
+                said_ahead["unstable"] = record["unstable"] = shaky
+            if bool(shaky) != bool((last or {}).get("unstable")) \
+                    and AHEAD_BATCHES > UNSTABLE_BATCHES:
+                out("UNSTABLE: %d re-cuts of a started batch in the last "
+                    "hour, over %d; predicting %d batch%s until fewer" % (
+                        shaky, UNSTABLE_AFTER, UNSTABLE_BATCHES,
+                        "" if UNSTABLE_BATCHES == 1 else "es")
+                    if shaky else "SETTLED: %d batches in flight again"
+                    % AHEAD_BATCHES)
             # A red that is only the base's own judges nothing
             # (designs/0011, amendment): it waits for the base to change.
             verdict = lambda tree: None if tree_base_red(
@@ -4702,9 +5021,27 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 said_ahead["entries"] = entries
                 record["ahead"] = [e["pr"] for e in entries]
             if searching and entries:
+                found = []
                 searching = suspect_round(
                     state_dir, saved, entries, verdict, last, said_ahead,
-                    record, out)
+                    record, out, found if RED_SUSPECT_OUT else None)
+                for entry, green in found:
+                    hand_back_red_suspect(
+                        state_dir, entry, green, ahead_queue, approvals,
+                        reds, github, said, live, record, out)
+                if found:
+                    save_json(said_path, said)
+                if found and not searching:
+                    # The search ended on it, at the front: it leaves
+                    # the predictions now, not from its next batch.
+                    gone = {e["pr"] for e, _ in found}
+                    ahead_queue = [pr for pr in ahead_queue
+                                   if pr["number"] not in gone]
+                    entries = predict_ahead(
+                        repo, main_tip, ahead_queue, run, overdue=overdue,
+                        restacks=restacks if PREDICT_RESTACKED else None)
+                    said_ahead["entries"] = entries
+                    record["ahead"] = [e["pr"] for e in entries]
             if AHEAD_BATCH > 1 and entries and not searching:
                 size, red = batch_size(entries, (last or {}).get("batch"),
                                        verdict, (last or {}).get("later")
@@ -4726,7 +5063,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         entries, 0 if red else size,
                         (last or {}).get("later"), verdict,
                         lambda sha, tree: ahead_started(check_state, sha,
-                                                        tree), urgents)
+                                                        tree), urgents,
+                        UNSTABLE_BATCHES if shaky else AHEAD_BATCHES)
                     if later:
                         said_ahead["later"] = later
                         at, record["later"] = size, []

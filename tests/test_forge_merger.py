@@ -1243,7 +1243,17 @@ class Tick(Decide):
         self.assertEqual(self.github.writes, [])
         self.assertEqual(record["decisions"][0]["result"], "already said")
 
-    def test_a_new_reason_on_the_same_head_is_said_again(self):
+    def test_a_new_reason_on_the_same_head_is_not_said_again(self):
+        # designs/0044, rule 1: once per approval and head.
+        self.tick([self.item()], conclusions=("failure",), live=True)
+        record, _ = self.tick([self.item()], conclusions=("error",),
+                              live=True)
+        self.assertEqual(self.github.writes, [])
+        self.assertEqual(record["decisions"][0]["result"], "already said")
+
+    def test_without_once_per_head_a_new_reason_is_said_again(self):
+        m.configure(project(hand_back_once_per_head=False))
+        self.addCleanup(m.configure, project())
         self.tick([self.item()], conclusions=("failure",), live=True)
         self.tick([self.item()], conclusions=("error",), live=True)
         self.assertEqual(len(self.github.writes), 1)
@@ -1264,6 +1274,49 @@ class Tick(Decide):
         self.assertEqual(record["decisions"][0]["result"], "done")
         record, _ = self.tick([again], live=True)
         self.assertEqual(record["decisions"][0]["result"], "already said")
+
+    def told(self, before, **decision):
+        """carry_out's answer for a hand-back of #5 at head h, approved
+        at T1, after `before` in `said`, and the writes it made."""
+        github = FakeGitHub({})
+        decision = dict({"action": "HAND-BACK", "to": "author", "pr": 5,
+                         "head": "h" * 40, "reason": "red"}, **decision)
+        result = m.carry_out(decision, review(REVIEWER), github,
+                             {"5": before})
+        return result, len(github.writes)
+
+    def test_once_per_head_whatever_the_reason(self):
+        # designs/0044, rule 1. One project, 2026-11-04: one head was
+        # told 8 times in an hour, a conflict with main and a merge that
+        # wasn't clean in turn, each replacing the other in `said`.
+        conflict = m.hand_back_key(review(REVIEWER), "h" * 40,
+                                   m.CONFLICT_REASON)
+        self.assertEqual(self.told(dict(conflict), to="reviewer", reason=(
+            "abc's tree is not the clean merge of its parents")),
+            ("already said", 0))
+        self.assertEqual(self.told(dict(conflict, head="g" * 40)),
+                         ("done", 1))
+        self.assertEqual(self.told(dict(conflict, approved=T0)), ("done", 1))
+
+    def test_a_gate_s_refusal_of_a_description_still_counts_alone(self):
+        gate = m.hand_back_key(review(REVIEWER), "h" * 40, "gate", "d1")
+        # The same refusal of the same description, in other words: said.
+        self.assertEqual(self.told(dict(gate), reason="gate, again",
+                                   text="d1"), ("already said", 0))
+        # Another description, or anything after it: the author may have
+        # fixed the description alone.
+        self.assertEqual(self.told(dict(gate), reason="gate", text="d2"),
+                         ("done", 1))
+        self.assertEqual(self.told(dict(gate), reason=m.CONFLICT_REASON),
+                         ("done", 1))
+
+    def test_a_refusal_for_now_does_not_stand_for_another_reason(self):
+        now = dict(m.hand_back_key(review(REVIEWER), "h" * 40, "gate", "d1"),
+                   retry=True, at=T1)
+        self.assertEqual(self.told(dict(now), reason="gate", text="d1",
+                                   retry=True, at=T2), ("already said", 0))
+        self.assertEqual(self.told(dict(now), reason="other gate",
+                                   text="d1"), ("done", 1))
 
     def test_a_skip_writes_nothing(self):
         self.assertIsNone(m.carry_out(
@@ -3307,6 +3360,55 @@ class TickAhead(RepoCase):
         self.assertEqual(self.ahead_json()["later"], [
             {"size": 1, "trees": [top["tree"]], "fixed": True}])
 
+    def test_fewer_batches_while_re_cuts_are_frequent(self):
+        # designs/0044, rule 5: more than 2 re-cuts of a started batch in
+        # the last hour, so one batch until fewer.
+        m.configure(project(test_ahead={"batch": 2, "batches": 2,
+                                        "depth": 3,
+                                        "unstable_after_recuts": 2}))
+        self.repo.branch("third", "origin/main")
+        sha = self.repo.commit("t.txt", "third\n", "third")
+        self.repo.publish_pr(7, sha)
+        self.repo.branch("feature", "feature")
+        third = pr(7, T1, head=sha, reviews=[review(REVIEWER, oid=sha)])
+        prs = [self.item(), self.other_pr(), third]
+        state = os.path.join(self.tmp.name, "state")
+        os.makedirs(state, exist_ok=True)
+        with open(os.path.join(state, "merger.jsonl"), "w") as handle:
+            for at in ("10:59", "11:10", "11:20", "11:30"):
+                handle.write(json.dumps({"at": "2026-10-07T%s:00Z" % at,
+                                         "recut": True}) + "\n")
+        record, lines = self.tick(prs, conclusions=(None,), live=True)
+        self.assertEqual(record["unstable"], 3)
+        self.assertEqual(record["batch"], [5, 6])
+        self.assertNotIn("later", record)
+        self.assertIn("UNSTABLE: 3 re-cuts of a started batch in the last "
+                      "hour, over 2; predicting 1 batch until fewer", lines)
+        # Said once.
+        _, lines = self.tick(prs, conclusions=(None,), live=True, minutes=1)
+        self.assertFalse([l for l in lines if l.startswith("UNSTABLE")])
+        # An hour on, the re-cuts are older than the window.
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=31)
+        self.assertNotIn("unstable", record)
+        self.assertEqual(record["later"], [[7]])
+        self.assertIn("SETTLED: 2 batches in flight again", lines)
+
+    def test_a_re_cut_is_recorded(self):
+        m.configure(project(test_ahead={"batch": 2}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        started = {"ahead_started": {top["sha"]: "x"}, "results": {}}
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              minutes=1, check_state=started)
+        self.assertNotIn("recut", record)
+        # #6 is pushed to: the started batch is re-cut.
+        six = dict(prs[1], headRefOid=self.head)
+        record, _ = self.tick([prs[0], six], conclusions=(None,), live=True,
+                              minutes=2, check_state=started)
+        self.assertIs(record["recut"], True)
+
     def test_a_red_top_splits_the_batch(self):
         m.configure(project(test_ahead={"batch": 2}))
         self.tick([self.item(), self.other_pr()], conclusions=(None,),
@@ -3356,6 +3458,99 @@ class TickAhead(RepoCase):
                   minutes=2, check_state=red)
         self.assertEqual([e["pr"] for e in m.load_suspects(
             self.state)["suspects"]], [5])
+
+    def red_alone(self):
+        """#5 and #6 a batch whose top is red, then #5 red on its own:
+        the ticks' records and lines, and the red check state."""
+        m.configure(project(test_ahead={"batch": 2}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        red = {"results": {top["sha"]: {"tree": top["tree"], "ok": False}}}
+        self.tick(prs, conclusions=(None,), live=True, check_state=red)
+        alone = self.ahead_json()["entries"][0]
+        red["results"][alone["sha"]] = {"tree": alone["tree"], "ok": False}
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=1, check_state=red)
+        return prs, record, lines, red
+
+    def test_a_suspect_red_on_its_own_is_handed_back_and_kept_out(self):
+        # designs/0044, rule 4. One project, 2026-11-04: such a suspect
+        # was put back into a batch three more times before it was
+        # handed back.
+        prs, record, lines, red = self.red_alone()
+        self.assertIn("SUSPECTS #5..#6: #5 is red on its own; the search "
+                      "ends", lines)
+        self.assertIn("SUSPECT-RED #5: red on its own at %s; handed back, "
+                      "and out of batches until a new head"
+                      % self.head[:10], lines)
+        back = [d for d in record["decisions"] if d.get("suspect")]
+        self.assertEqual([(d["pr"], d["to"], d["result"]) for d in back],
+                         [(5, "author", "done")])
+        self.assertEqual(back[0]["reason"], m.RED_SUSPECT_REASON % (
+            m.STATUS_CONTEXT, "main"))
+        body = self.github.writes[-1][2]["body"]
+        self.assertIn("It stays out of the Merger's batches", body)
+        self.assertEqual(record["ahead"], [6])
+        # Later ticks: handed back once, never updated, merged or
+        # predicted at that head.
+        for minutes in (2, 3):
+            record, lines = self.tick(prs, conclusions=("success",),
+                                      live=True, minutes=minutes,
+                                      check_state=red)
+            for d in record["decisions"]:
+                if d["pr"] == 5:
+                    self.assertEqual(d, {
+                        "action": "HAND-BACK", "to": "author", "pr": 5,
+                        "head": self.head, "reason": back[0]["reason"],
+                        "result": "already said"})
+            self.assertNotIn(5, record["ahead"])
+            self.assertFalse([l for l in lines if "SUSPECT-RED" in l])
+            self.assertFalse([w for w in self.github.writes
+                              if "/issues/5/" in w[1] or "/pulls/5/" in w[1]])
+        # A new head is new evidence.
+        head = self.repo.commit("f4.txt", "fixed\n", "fixed")
+        self.repo.publish_pr(5, head)
+        fixed = pr(5, head=head, reviews=[review(REVIEWER, oid=head)])
+        record, _ = self.tick([fixed, prs[1]], conclusions=(None,),
+                              live=True, minutes=4)
+        self.assertIn(5, record["ahead"])
+        self.assertEqual(m.red_suspects(self.state, [fixed]), {})
+
+    def test_without_the_key_a_red_suspect_waits_to_be_reached(self):
+        m.configure(project(test_ahead={"batch": 2,
+                                        "hand_back_red_suspect": False}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        red = {"results": {top["sha"]: {"tree": top["tree"], "ok": False}}}
+        self.tick(prs, conclusions=(None,), live=True, check_state=red)
+        alone = self.ahead_json()["entries"][0]
+        red["results"][alone["sha"]] = {"tree": alone["tree"], "ok": False}
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=1, check_state=red)
+        self.assertFalse([d for d in record["decisions"] if d.get("suspect")])
+        self.assertIn(5, record["ahead"])
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state, m.RED_SUSPECT_FILE)))
+
+    def test_a_suspect_named_red_behind_a_green_prefix_goes_at_once(self):
+        # Red one longer than a green prefix: named, and handed back
+        # while the green prefix merges.
+        m.configure(project(test_ahead={"batch": 4}))
+        saved = {"suspects": [{"pr": n, "head": "h%d" % n}
+                              for n in (10, 11, 12)],
+                 "tree": "t", "merged": [], "left": []}
+        entries = [{"pr": 10 + k, "sha": "%d" % k * 40, "tree": t,
+                    "head": "h%d" % (10 + k)} for k, t in enumerate("abc")]
+        found = []
+        with tempfile.TemporaryDirectory() as state_dir:
+            going = m.suspect_round(
+                state_dir, saved, entries,
+                lambda t: True if t == "a" else False, None, {}, {},
+                lambda line: None, found)
+        self.assertTrue(going)
+        self.assertEqual(found, [(entries[1], 1)])
 
     def test_a_suspect_that_merges_keeps_the_search(self):
         # Seen on 2026-10-26: the first suspect merged on its green, and
@@ -4273,7 +4468,12 @@ class EarlyConflicts(RepoCase):
             m.approval_of(six), six["headRefOid"],
             m.RESTACK_REASON % (m.CONFLICT_REASON, 5, "0" * 10))}
         self.assertEqual(self.early(six, said), ([], []))
+        # Told anything else for this approval and head, it isn't told
+        # again either (designs/0044, rule 1), unless that is off.
         said["6"]["reason"] = "the Merger's gate failed"
+        self.assertEqual(self.early(six, said), ([], []))
+        m.configure(project(early_conflicts=True,
+                            hand_back_once_per_head=False))
         got, _ = self.early(six, said)
         self.assertEqual([d["pr"] for d in got], [6])
 
@@ -4418,13 +4618,46 @@ class RightOfWay(RepoCase):
         self.assertIsNone(record["right_of_way"])
         self.assertEqual((record["queue"], record["held"]), ([6, 5], {}))
 
-    def test_it_holds_while_not_yet_approved_again(self):
+    def test_it_holds_nobody_while_not_yet_approved_again(self):
+        # designs/0044, rule 2: only while it is a candidate at its head.
+        unapproved = pr(5, head=self.head, reviews=[])
+        rival = self.rival(created=self.OLDER)
+        record, _ = self.tick([unapproved, rival], live=True)
+        self.assertEqual(record["right_of_way"], dict(
+            self.row(), idle="not a candidate at %s" % self.head[:10]))
+        self.assertEqual((record["queue"], record["held"]), ([6], {}))
+        # Approved again, it holds, on the clock it started.
+        record, _ = self.tick([self.item(), rival], conclusions=(None,),
+                              live=True, minutes=1)
+        self.assertEqual(record["right_of_way"], self.row())
+        self.assertEqual(list(record["held"]), ["6"])
+
+    def test_without_while_eligible_it_holds_while_not_yet_approved(self):
+        m.configure(project(right_of_way={"while_eligible": False}))
         unapproved = pr(5, head=self.head, reviews=[])
         record, _ = self.tick([unapproved, self.rival(created=self.OLDER)],
                               live=True)
         self.assertEqual(record["right_of_way"], self.row())
         self.assertEqual(record["queue"], [])
         self.assertEqual(list(record["held"]), ["6"])
+
+    def test_it_holds_nobody_once_handed_back_at_its_head(self):
+        # Here to its reviewer, since a commit after the approval isn't
+        # a merge: a hand-back to the author for anything else already
+        # ended it (designs/0002).
+        head = self.repo.commit("f3.txt", "after\n", "after the approval")
+        self.repo.publish_pr(5, head)
+        five = pr(5, head=head, reviews=[review(REVIEWER, oid=self.head)])
+        rival = self.rival(created=self.OLDER)
+        record, _ = self.tick([five, rival], conclusions=(None,), live=True)
+        self.assertEqual(record["decisions"][0]["action"], "HAND-BACK")
+        self.assertEqual(list(record["held"]), ["6"])
+        record, _ = self.tick([five, rival], conclusions=(None,), live=True,
+                              minutes=1)
+        self.assertEqual(record["right_of_way"]["idle"],
+                         "handed back at %s" % head[:10])
+        self.assertNotIn("6", record["held"])
+        self.assertIn(6, record["queue"])
 
     def test_it_ends_after_the_minutes_and_the_clock_survives(self):
         rival = self.rival(created=self.OLDER)
@@ -4446,7 +4679,8 @@ class RightOfWay(RepoCase):
         record, _ = self.tick([moved, rival], live=True, minutes=61)
         self.assertEqual(record["right_of_way"],
                          {"pr": 5, "head": head,
-                          "since": "2026-10-07T13:01:00Z"})
+                          "since": "2026-10-07T13:01:00Z",
+                          "idle": "not a candidate at %s" % head[:10]})
 
     def test_not_while_its_head_conflicts_with_main(self):
         self.advance_main("f.txt", "main moved f\n")
@@ -4683,7 +4917,8 @@ class AgeFirst(RepoCase):
         rival = self.rival()
         record, _ = self.tick([self.unapproved(), rival],
                               conclusions=(None,))
-        self.assertEqual(list(record["held"]), ["6"])
+        # Unapproved, #5 holds nobody yet (designs/0044, rule 2).
+        self.assertEqual(list(record["held"]), [])
         record, _ = self.tick([self.item(), rival], conclusions=(None,),
                               minutes=29)
         self.assertEqual((record["queue"], list(record["held"])),
@@ -4693,6 +4928,245 @@ class AgeFirst(RepoCase):
         self.assertEqual(record["right_of_way"]["pr"], 5)
         self.assertNotIn("6", record["held"])
         self.assertEqual(record["queue"], [6, 5])
+
+
+class FixedOrder(unittest.TestCase):
+    """designs/0044, rule 3: the batches up to the last whose top's run
+    has started keep their order."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        m.configure(project(test_ahead={"batch": 2, "batches": 2,
+                                        "depth": 3}))
+        self.addCleanup(m.configure, project())
+
+    def ahead(self, numbers, batch=2, later=(), fixed=False):
+        entries = [{"pr": n, "head": "h%d" % n, "sha": "s%d" % n,
+                    "tree": "t%d" % n} for n in numbers]
+        value = {"entries": entries}
+        if batch:
+            value["batch"] = {"size": batch, "trees": [
+                e["tree"] for e in entries[:batch]]}
+            at = batch
+            value["later"] = []
+            for size in later:
+                value["later"].append(dict({"size": size, "trees": [
+                    e["tree"] for e in entries[at:at + size]]},
+                    **({"fixed": True} if fixed else {})))
+                at += size
+        m.save_json(os.path.join(self.tmp.name, m.AHEAD_FILE), value)
+
+    def fixed(self, queue, started=(), said=None, open_numbers=None,
+              trees=None):
+        prs = [{"number": n, "headRefOid": h} for n, h in queue]
+        approvals = {p["number"]: review(REVIEWER) for p in prs}
+        check = {"ahead_started": {s: "x" for s in started}, "results": {}}
+        trees = trees or {}
+
+        def run(args, cwd=None, env=None):
+            if "rev-parse" in args:
+                sha = args[-1].split("^")[0]
+                return subprocess.CompletedProcess(
+                    args, 0 if sha in trees else 1, trees.get(sha, "") + "\n",
+                    "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return m.fixed_order(
+            self.tmp.name, "repo", prs,
+            {p["number"] for p in prs} if open_numbers is None
+            else open_numbers, approvals, said or {}, check, None, run)
+
+    def queue(self, *numbers):
+        return [(n, "h%d" % n) for n in numbers]
+
+    def test_nothing_started_fixes_nothing(self):
+        self.ahead([5, 6, 7, 8], later=[2])
+        self.assertEqual(self.fixed(self.queue(5, 6, 7, 8)), {})
+
+    def test_up_to_the_last_started_top(self):
+        self.ahead([5, 6, 7, 8], later=[2])
+        self.assertEqual(self.fixed(self.queue(5, 6, 7, 8), ["s6"]),
+                         {5: 0, 6: 1})
+        # A later top started fixes the batches before it too: its
+        # tree has them all.
+        self.assertEqual(self.fixed(self.queue(5, 6, 7, 8), ["s8"]),
+                         {5: 0, 6: 1, 7: 2, 8: 3})
+
+    def test_a_later_batch_said_fixed_is_started(self):
+        self.ahead([5, 6, 7], later=[1], fixed=True)
+        self.assertEqual(self.fixed(self.queue(5, 6, 7)),
+                         {5: 0, 6: 1, 7: 2})
+
+    def test_without_batches_each_prediction_is_one(self):
+        self.ahead([5, 6, 7], batch=0)
+        self.assertEqual(self.fixed(self.queue(5, 6, 7), ["s6"]),
+                         {5: 0, 6: 1})
+
+    def test_one_that_merged_leaves_the_rest_in_place(self):
+        self.ahead([5, 6, 7, 8], later=[2])
+        self.assertEqual(self.fixed(self.queue(6, 7, 8), ["s8"],
+                                    open_numbers={6, 7, 8}),
+                         {6: 0, 7: 1, 8: 2})
+
+    def test_one_that_drops_out_ends_it_from_its_batch(self):
+        self.ahead([5, 6, 7, 8], later=[2])
+        everyone = {5, 6, 7, 8}
+        # #7 lost its approval, or is held: the first batch keeps its
+        # order, and the second, whose trees all change, doesn't.
+        self.assertEqual(self.fixed(self.queue(5, 6, 8), ["s8"],
+                                    open_numbers=everyone), {5: 0, 6: 1})
+        # Pushed to.
+        self.assertEqual(self.fixed([(5, "h5"), (6, "h6"), (7, "new"),
+                                     (8, "h8")], ["s8"]), {5: 0, 6: 1})
+        # Handed back at its head.
+        said = {"7": m.hand_back_key(review(REVIEWER), "h7", "red")}
+        self.assertEqual(self.fixed(self.queue(5, 6, 7, 8), ["s8"],
+                                    said=said), {5: 0, 6: 1})
+
+    def test_the_one_updated_keeps_its_place_by_its_tree(self):
+        # GitHub's update of the one in flight gives the tree predicted.
+        self.ahead([5, 6])
+        self.assertEqual(self.fixed([(5, "u5"), (6, "h6")], ["s6"],
+                                    trees={"u5": "t5"}), {5: 0, 6: 1})
+        self.assertEqual(self.fixed([(5, "u5"), (6, "h6")], ["s6"],
+                                    trees={"u5": "other"}), {})
+
+    def test_it_reads_what_it_can(self):
+        for junk in (None, [], {"entries": "x"}, {"entries": [1]},
+                     {"entries": [{"pr": 5}], "batch": {"size": "2"}}):
+            with self.subTest(junk=junk):
+                m.save_json(os.path.join(self.tmp.name, m.AHEAD_FILE), junk)
+                self.assertEqual(self.fixed(self.queue(5), ["s5"]), {})
+
+    def test_overdue_and_urgent_ones_around_a_fixed_batch(self):
+        when = datetime.datetime(2026, 11, 4, 9, 0)
+        long_ago = when - datetime.timedelta(minutes=200)
+        queue = [pr(n) for n in (6, 7, 8, 5)]
+        labelled(queue[2], "Priority:urgent")
+        m.configure(urgent_project(age_first={}, test_ahead={"batch": 2}))
+        out, overdue = m.overdue_first(queue, {5: long_ago}, when, None,
+                                       set(), {6: 0, 7: 1})
+        # The urgent one first, as before, then the fixed batch, then
+        # the overdue one.
+        self.assertEqual([p["number"] for p in out], [8, 6, 7, 5])
+        self.assertEqual(overdue, {5: 200})
+
+
+class Recut(unittest.TestCase):
+    """designs/0044, rule 5: what counts as re-cutting a batch whose
+    top's run has started."""
+
+    def last(self, sizes=(2,), started=True):
+        entries = [{"pr": n, "head": "h%d" % n, "sha": "s%d" % n,
+                    "tree": "t%d" % n} for n in (5, 6, 7, 8)]
+        sizes = list(sizes)
+        value = {"entries": entries, "batch": {"size": sizes[0]},
+                 "later": [{"size": k} for k in sizes[1:]]}
+        check = {"ahead_started": {"s%d" % (4 + sum(sizes)): "x"}
+                 if started else {}, "results": {}}
+        return value, check
+
+    def entries(self, *pairs):
+        return [{"pr": n, "tree": t} for n, t in pairs]
+
+    def test_growing_and_merging_are_no_re_cut(self):
+        last, check = self.last()
+        everyone = {5, 6, 7, 8}
+        self.assertFalse(m.recut(last, self.entries(
+            (5, "t5"), (6, "t6"), (9, "t9")), everyone, set(), check))
+        self.assertFalse(m.recut(last, self.entries((6, "t6"), (7, "x")),
+                                 everyone, {5}, check))
+        self.assertFalse(m.recut(last, self.entries((7, "x")), {7, 8},
+                                 set(), check))
+
+    def test_one_in_front_or_one_dropping_out_is(self):
+        last, check = self.last()
+        everyone = {4, 5, 6, 7, 8}
+        self.assertTrue(m.recut(last, self.entries(
+            (4, "t4"), (5, "u5"), (6, "u6")), everyone, set(), check))
+        self.assertTrue(m.recut(last, self.entries((6, "u6"), (7, "u7")),
+                                everyone, set(), check))
+
+    def test_a_batch_not_started_is_not(self):
+        last, check = self.last(started=False)
+        self.assertFalse(m.recut(last, self.entries((4, "t4")), {4, 5, 6},
+                                 set(), check))
+
+    def test_counting(self):
+        m.configure(project(test_ahead={"batch": 2, "batches": 2,
+                                        "unstable_after_recuts": 2}))
+        self.addCleanup(m.configure, project())
+        records = [{"recut": True}, {}, {"recut": True}]
+        self.assertIsNone(m.unstable(records, False))
+        self.assertEqual(m.unstable(records, True), 3)
+        m.configure(project(test_ahead={"batch": 2, "batches": 2}))
+        self.assertIsNone(m.unstable(records * 9, True))
+
+
+class FixedOrderTick(RepoCase):
+    """Rule 3 in a tick: an overdue candidate and right of way go behind
+    a batch whose top's run has started."""
+
+    item = Decide.item
+    tick = Tick.tick
+    other_pr = Tick.other_pr
+    rival = HoldConflicting.rival
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        self.addCleanup(m.configure, project())
+        self.state = os.path.join(self.tmp.name, "state")
+        os.makedirs(self.state)
+
+    def predicted(self, *prs):
+        m.save_json(os.path.join(self.state, m.AHEAD_FILE), {
+            "at": "2026-10-07T12:00:00Z", "entries": [
+                {"pr": p["number"], "head": p["headRefOid"],
+                 "sha": "s%d" % p["number"], "tree": "t%d" % p["number"]}
+                for p in prs],
+            "batch": {"size": len(prs), "trees": [
+                "t%d" % p["number"] for p in prs]}})
+
+    def test_an_overdue_one_goes_behind_a_started_batch(self):
+        m.configure(project(age_first={}, test_ahead={"batch": 2}))
+        six, seven = self.other_pr(), self.other_pr(7)
+        self.tick([self.item()], conclusions=(None,))
+        self.tick([pr(5, head=self.head, reviews=[]), six, seven],
+                  conclusions=(None,), minutes=1)
+        started = {"ahead_started": {"s7": "x"}, "results": {}}
+        for check, queue in ((None, [5, 6, 7]), (started, [6, 7, 5])):
+            with self.subTest(started=bool(check)):
+                self.predicted(six, seven)
+                record, _ = self.tick([self.item(), six, seven],
+                                      conclusions=(None,), minutes=95,
+                                      check_state=check)
+                self.assertEqual(record["queue"], queue)
+                self.assertEqual(record.get("fixed"),
+                                 [6, 7] if check else None)
+        # Off, the overdue one goes first as before.
+        m.configure(project(age_first={}, test_ahead={
+            "batch": 2, "fixed_order": False}))
+        self.predicted(six, seven)
+        record, _ = self.tick([self.item(), six, seven], conclusions=(None,),
+                              minutes=96, check_state=started)
+        self.assertEqual(record["queue"], [5, 6, 7])
+
+    def test_right_of_way_holds_no_member_of_a_started_batch(self):
+        m.configure(project(right_of_way={}, test_ahead={"batch": 2}))
+        RightOfWay.overtaken(self, name="dry-run.jsonl")
+        rival = self.rival(created=RightOfWay.OLDER)
+        self.predicted(rival)
+        record, _ = self.tick([self.item(), rival], conclusions=(None,))
+        self.assertEqual(record["held"],
+                         {"6": "conflicts with #5, which has right of way"})
+        record, _ = self.tick([self.item(), rival], conclusions=(None,),
+                              check_state={"ahead_started": {"s6": "x"},
+                                           "results": {}})
+        self.assertEqual(record["right_of_way"]["pr"], 5)
+        self.assertEqual((record["held"], record["queue"]), ({}, [6, 5]))
 
 
 class CodeownersMatch(unittest.TestCase):
@@ -5275,6 +5749,11 @@ class Stacks(RepoCase):
                                                     "ok": ok}}})
             return record["queue"]
         self.assertEqual(queue(True), [3, 4, 6])
+        # Its top's run has started, so its order is fixed, green or not
+        # (designs/0044, rule 3); before that rule the layer went first.
+        self.assertEqual(queue(None), [3, 4, 6])
+        m.configure(project(stacks={}, test_ahead={
+            "batch": 2, "batches": 2, "fixed_order": False}))
         self.assertEqual(queue(None)[0], 6)
 
     def test_an_urgent_one_goes_ahead_of_a_layer_that_comes_back(self):
