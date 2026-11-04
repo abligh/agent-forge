@@ -146,12 +146,21 @@ class MatchedMain(unittest.TestCase):
 
 class Writer:
     """GitHub, as report_main sees it: each write recorded, answered by
-    `answers` (status by method) or success."""
+    `answers` (status by method) or success. A read (GET) is kept apart,
+    in `reads`, and finds an issue whose state is `issue_state`."""
 
-    def __init__(self, answers=None):
+    def __init__(self, answers=None, issue_state="open"):
         self.writes, self.answers, self.next = [], answers or {}, 41
+        self.reads, self.issue_state = [], issue_state
 
     def __call__(self, method, path, body=None):
+        if method == "GET":
+            self.reads.append(path)
+            status = self.answers.get("GET")
+            if status is not None:
+                return status, {"message": "nope"}
+            return 200, {"number": int(path.rsplit("/", 1)[-1]),
+                         "state": self.issue_state}
         self.writes.append((method, path, body))
         status = self.answers.get(method)
         if status is not None:
@@ -280,6 +289,67 @@ class RedIssue(unittest.TestCase):
         self.report(self.commit("more"), True, write)
         self.assertEqual(write.writes[-1][0], "PATCH")
         self.assertNotIn("main_red", pc.load(self.state_dir))
+
+    def test_a_closed_issue_is_reopened_while_still_red(self):
+        # Seen on 2026-11-04: a pull request saying it fixed the issue
+        # merged and closed it, the default branch stayed red, and the
+        # check went on commenting "Still red" on the closed issue, where
+        # no fix could be put first.
+        self.report(self.red, False, Writer())
+        later = self.commit("three")
+        write = Writer(issue_state="closed")
+        self.report(later, False, write)
+        self.assertEqual(write.reads, ["/repos/%s/issues/42" % pc.REPO_SLUG])
+        (reopen, comment) = write.writes
+        self.assertEqual(reopen, ("PATCH", "/repos/%s/issues/42"
+                                  % pc.REPO_SLUG, {"state": "open"}))
+        self.assertTrue(comment[1].endswith("/issues/42/comments"))
+        self.assertIn("Reopened: this was closed while `main` is still "
+                      "red", comment[2]["body"])
+        self.assertIn(later[:10], comment[2]["body"])
+        self.assertTrue(comment[2]["body"].endswith("— %s" % pc.POSTER))
+        self.assertIn("MAIN-RED-REOPENED #42", self.lines[-1])
+        red = pc.load(self.state_dir)["main_red"]
+        self.assertEqual(red["issue"], 42)
+        self.assertIn(later, red["told"])
+        # Open again, the same head is not told twice.
+        write = Writer()
+        self.report(later, False, write)
+        self.assertEqual(write.writes, [])
+
+    def test_a_closed_issue_is_reopened_for_a_head_already_told(self):
+        self.report(self.red, False, Writer())
+        write = Writer(issue_state="closed")
+        self.report(self.red, False, write)
+        self.assertEqual([w[0] for w in write.writes], ["PATCH", "POST"])
+        self.assertIn("MAIN-RED-REOPENED #42", self.lines[-1])
+
+    def test_an_open_issue_is_commented_on_as_before(self):
+        self.report(self.red, False, Writer())
+        later = self.commit("three")
+        write = Writer()
+        self.report(later, False, write)
+        (comment,) = write.writes
+        self.assertIn("Still red at %s" % later[:10], comment[2]["body"])
+        self.assertFalse([l for l in self.lines if "REOPENED" in l])
+
+    def test_a_refused_reopen_still_comments(self):
+        self.report(self.red, False, Writer())
+        later = self.commit("three")
+        write = Writer({"PATCH": 403}, issue_state="closed")
+        self.report(later, False, write)
+        self.assertEqual([w[0] for w in write.writes], ["PATCH", "POST"])
+        self.assertIn("Still red at %s" % later[:10],
+                      write.writes[1][2]["body"])
+        self.assertTrue(any("REPORT-FAILED" in l and "reopening #42" in l
+                            for l in self.lines))
+
+    def test_an_unreadable_issue_is_commented_on_as_before(self):
+        self.report(self.red, False, Writer())
+        later = self.commit("three")
+        write = Writer({"GET": 502}, issue_state="closed")
+        self.report(later, False, write)
+        self.assertEqual([w[0] for w in write.writes], ["POST"])
 
 
 if __name__ == "__main__":
