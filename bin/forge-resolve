@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Merge the default branch in as the Merger would, keeping both sides' additions.
+
+    forge-resolve [--onto REF] [--dry-run]
+
+Run on a pull request's branch when it conflicts with the default
+branch. It makes the merge the Merger makes under
+`merge.resolve.union` (designs/0046): git's own merge of `REF`
+(default `origin/<default_branch>`; fetch it first) into `HEAD`, with
+each conflicting hunk resolved as this branch's lines then `REF`'s,
+but only in a file one of the globs names and only where the hunk's
+base is empty, so that both sides only added lines. Any other conflict
+anywhere and it makes nothing: merge by hand (`git merge`), and the
+resolution needs a reviewer's approval as before.
+
+The globs are read from the configuration at `REF`, the one the
+Merger judges by, not from this branch's. The approval of the head
+before covers the merge, as it covers a clean merge, because the
+Merger recomputes the same resolution from the merge's two parents
+and finds the same tree.
+
+The merge commit is yours (git's usual identity), with `HEAD` as its
+first parent and `REF` as its second, and the branch is moved to it
+with `git merge --ff-only`, so the worktree must have no uncommitted
+changes to tracked files. With `--dry-run` it only says what it would
+keep. A merge with no conflict at all is made too.
+
+Exit 0 when the merge was made (or would be, or `HEAD` already holds
+`REF`); 1 when a conflict is not one it resolves (the reason is
+printed); 2 when the checkout, the ref or the configuration could not
+be read, or the worktree has changes.
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, proc, union  # noqa: E402
+
+MESSAGE = "Merge %s into %s; additions kept from both sides in %s"
+CLEAN_MESSAGE = "Merge %s into %s"
+
+
+def git(repo, *args, run=proc.sh):
+    return run(["git", "-C", repo] + list(args))
+
+
+def project_at(repo, ref, run=proc.sh):
+    """The checked configuration as `ref` has it, or raises ConfigError."""
+    shown = git(repo, "show", "%s:%s" % (ref, config.CONFIG_NAME), run=run)
+    if shown.returncode != 0:
+        raise config.ConfigError(["not at %s: %s" % (
+            ref, shown.stderr.strip())], config.CONFIG_NAME)
+    try:
+        data = json.loads(shown.stdout)
+    except ValueError as err:
+        raise config.ConfigError(["unreadable: %s" % err],
+                                 config.CONFIG_NAME) from None
+    problems = config.check(data)
+    if problems:
+        raise config.ConfigError(problems, config.CONFIG_NAME)
+    return config.Project(data, None)
+
+
+def main(argv=None, run=proc.sh, out=print, cwd=None):
+    parser = argparse.ArgumentParser(
+        prog="forge-resolve", description=__doc__.splitlines()[0])
+    parser.add_argument("--onto", default=None,
+                        help="the ref to merge in (default "
+                        "origin/<default_branch>)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="say what it would keep, and change nothing")
+    args = parser.parse_args(argv)
+    got = git(cwd or ".", "rev-parse", "--show-toplevel", run=run)
+    repo = got.stdout.strip()
+    if got.returncode != 0 or not repo:
+        out("NO-REPO: not inside a git checkout")
+        return 2
+    onto = args.onto
+    if onto is None:
+        # The default branch's name is in the configuration, which is
+        # read at that branch: this checkout's copy names it.
+        try:
+            onto = "origin/" + config.load(
+                os.path.join(repo, config.CONFIG_NAME)).default_branch
+        except config.ConfigError as err:
+            out("NO-CONFIG: %s" % err)
+            return 2
+    try:
+        globs = union.globs(project_at(repo, onto, run).section("merge"))
+    except config.ConfigError as err:
+        out("NO-CONFIG: %s" % err)
+        return 2
+    head = git(repo, "rev-parse", "--verify", "HEAD^{commit}", run=run)
+    main_ = git(repo, "rev-parse", "--verify", onto + "^{commit}", run=run)
+    if head.returncode != 0 or main_.returncode != 0:
+        out("NO-REF: %s" % (head.stderr + main_.stderr).strip())
+        return 2
+    head, main_ = head.stdout.strip(), main_.stdout.strip()
+    if git(repo, "merge-base", "--is-ancestor", main_, head,
+           run=run).returncode == 0:
+        out("UP-TO-DATE: HEAD already holds %s" % onto)
+        return 0
+    if not globs:
+        out("OFF: merge.resolve.union names no files at %s" % onto)
+    got = union.resolve(repo, head, main_, globs, run)
+    if not got:
+        out("CONFLICT: %s; merge it by hand (git merge %s)"
+            % (got.reason, onto))
+        return 1
+    branch = git(repo, "symbolic-ref", "-q", "--short", "HEAD",
+                 run=run).stdout.strip() or "HEAD"
+    paths = [path for path, _ in got.files]
+    for line in union.summary(got.files, "HEAD", onto).splitlines():
+        out(line)
+    if args.dry_run:
+        out("WOULD-MERGE: %s into %s%s" % (
+            onto, branch, "" if got.clean else
+            ", keeping both sides in " + ", ".join(paths)))
+        return 0
+    if git(repo, "status", "--porcelain", "--untracked-files=no",
+           run=run).stdout.strip():
+        out("DIRTY: commit or stash the changes to tracked files first")
+        return 2
+    message = (CLEAN_MESSAGE % (onto, branch) if got.clean
+               else MESSAGE % (onto, branch, ", ".join(paths)))
+    made = git(repo, "commit-tree", got.tree, "-p", head, "-p", main_,
+               "-m", message, run=run)
+    if made.returncode != 0:
+        out("FAILED: git commit-tree: %s" % made.stderr.strip())
+        return 2
+    moved = git(repo, "merge", "-q", "--ff-only", made.stdout.strip(),
+                run=run)
+    if moved.returncode != 0:
+        out("FAILED: git merge --ff-only: %s" % moved.stderr.strip())
+        return 2
+    out("MERGED: %s into %s as %s" % (onto, branch,
+                                      made.stdout.strip()[:10]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

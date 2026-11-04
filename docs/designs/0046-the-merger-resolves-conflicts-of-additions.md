@@ -1,6 +1,6 @@
 # 0046: The Merger resolves conflicts of additions itself
 
-* Status: proposed
+* Status: accepted
 * Author: XMPPEngineer
 * Date: 2026-11-04
 

@@ -3905,8 +3905,8 @@ class TickAhead(RepoCase):
 
     def test_one_with_a_run_in_flight_keeps_its_place(self):
         # #5 is older, so it would go first; #6 is mid-run.
-        self.assertEqual(m.IN_FLIGHT, ("UPDATE", "RESOLVE", "RESTACK",
-                                       "STACK-UPDATE", "WAIT"))
+        self.assertEqual(m.IN_FLIGHT, ("UPDATE", "RESOLVE", "UNION",
+                                       "RESTACK", "STACK-UPDATE", "WAIT"))
         for action in m.IN_FLIGHT:
             with self.subTest(action=action):
                 self.assertEqual(self.keeps_place(action), 6)
@@ -6622,6 +6622,254 @@ class Resolve(unittest.TestCase):
         self.assertEqual(github.writes, [])
 
 
+UNION_LIST = "# Changes\n\n* base\n\n## Older\n"
+
+
+class Union(unittest.TestCase):
+    """merge.resolve.union (designs/0046): CHANGES.md lists changes, and
+    the feature and main each add a line at the same place."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Repo(self.tmp.name)
+        self.state = os.path.join(self.tmp.name, "state")
+        os.mkdir(self.state)
+        self.write("CHANGES.md", UNION_LIST)
+        self.write("code.txt", "a\nb\nc\n")
+        self.commit("list")
+        self.repo.push("main")
+        self.repo.branch("feature")
+        self.write("CHANGES.md", UNION_LIST.replace(
+            "* base\n", "* base\n* feature\n"))
+        self.head = self.commit("feature")
+        self.publish(self.head)
+        self.repo.branch("main", "main")
+        self.write("CHANGES.md", UNION_LIST.replace(
+            "* base\n", "* base\n* main\n"))
+        self.commit("main")
+        self.repo.push("main")
+        self.repo.branch("feature", "feature")
+        self.configure()
+        self.addCleanup(m.configure, project())
+        m.RESOLVE_IDENTITY = IDENTITY
+        self.addCleanup(setattr, m, "RESOLVE_IDENTITY", None)
+
+    def configure(self, globs=("*.md",), **merge):
+        m.configure(project(resolve={"union": list(globs)}, **merge))
+
+    write = Resolve.write
+    commit = Resolve.commit
+    git_run = Resolve.git_run
+
+    def publish(self, head):
+        self.repo.publish_pr(5, head)
+        run_git(self.repo.path, "push", "-q", "-f", "origin",
+                head + ":refs/heads/b5")
+
+    def item(self, head=None):
+        return pr(5, head=head or self.head,
+                  reviews=[review(REVIEWER, oid=self.head)])
+
+    def decide(self):
+        item = self.item()
+        return m.decide(item, m.approval_of(item), self.repo.path,
+                        self.repo.main_tip(), FakeGitHub(answers()), {},
+                        self.git_run())
+
+    def push(self, github=None):
+        decision = self.decide()
+        decision.update(pr=5, head=self.head)
+        return m.union_push(self.repo.path, decision, self.repo.main_tip(),
+                            github or FakeGitHub({}), self.git_run())
+
+    def hand_merge(self, text):
+        """The author's own merge of main, resolved as `text`."""
+        got = subprocess.run(["git", "-C", self.repo.path, "merge", "-q",
+                              "origin/main"], env=git_env(),
+                             capture_output=True, text=True)
+        self.assertIn("CONFLICT", got.stdout + got.stderr)
+        self.write("CHANGES.md", text)
+        return self.commit("merge main")
+
+    def covers(self, head):
+        return m.covers_head(self.repo.path, self.head, head,
+                             "refs/remotes/origin/main")
+
+    def test_the_configuration(self):
+        self.assertEqual(m.UNION, ("*.md",))
+        self.assertEqual(m.RESOLVE, ())
+        m.configure(project(resolve={"union": ["a"], "regenerate": [RULE]}))
+        self.assertEqual((m.UNION, len(m.RESOLVE)), (("a",), 1))
+        m.configure(project(resolve=[RULE]))
+        self.assertEqual((m.UNION, len(m.RESOLVE)), ((), 1))
+
+    def test_a_pure_addition_conflict_is_resolved(self):
+        got = self.decide()
+        self.assertEqual(got["action"], "UNION")
+        self.assertEqual(got["branch"], "b5")
+        self.assertEqual(got["files"],
+                         [("CHANGES.md", [(["* feature"], ["* main"])])])
+
+    def test_the_resolution_is_committed_pushed_and_said(self):
+        github = FakeGitHub({})
+        self.assertEqual(self.push(github), "done")
+        new = run_git(self.repo.origin, "rev-parse", "b5")
+        self.assertEqual(run_git(self.repo.origin, "rev-list", "--parents",
+                                 "-n1", new).split()[1:],
+                         [self.head, self.repo.main_tip()])
+        self.assertEqual(run_git(self.repo.origin, "show",
+                                 new + ":CHANGES.md"),
+                         "# Changes\n\n* base\n* feature\n* main\n\n## Older")
+        self.assertEqual(run_git(self.repo.origin, "log", "-1",
+                                 "--format=%an <%ae>", new),
+                         "%s <%s>" % IDENTITY)
+        self.assertEqual(self.pushed_env["GIT_CONFIG_KEY_0"],
+                         "http.https://github.com/.extraheader")
+        (method, where, fields), = github.writes
+        self.assertEqual((method, where), ("POST",
+                                           SLUG + "/issues/5/comments"))
+        body = fields["body"]
+        self.assertIn("`CHANGES.md`: 1 line from this branch, then 1 line "
+                      "from `main`", body)
+        self.assertIn("+ * feature\n+ * main\n", body)
+        self.assertTrue(body.endswith("— Merger"))
+        # Its tree is the resolution, so the approval covers it.
+        self.repo.push("main")
+        self.assertEqual(self.covers(run_git(self.repo.path, "rev-parse",
+                                             "origin/b5")), (True, None))
+
+    def test_a_moved_head_refuses_the_push(self):
+        run_git(self.repo.path, "commit", "-q", "--allow-empty", "-m", "x")
+        run_git(self.repo.path, "push", "-q", "-f", "origin", "HEAD:b5")
+        self.assertTrue(self.push().startswith("refused: "))
+        self.assertNotEqual(run_git(self.repo.origin, "rev-parse", "b5"),
+                            self.head)
+
+    def test_without_an_identity_it_fails(self):
+        m.RESOLVE_IDENTITY = None
+        self.assertTrue(self.push().startswith("failed: identity"))
+
+    def test_a_mixed_conflict_is_handed_back(self):
+        self.write("code.txt", "a\nfeature\nc\n")
+        self.head = self.commit("feature code")
+        self.repo.branch("main", "main")
+        self.write("code.txt", "a\nmain\nc\n")
+        self.commit("main code")
+        self.repo.push("main")
+        self.repo.branch("feature", "feature")
+        self.publish(self.head)
+        got = self.decide()
+        self.assertEqual((got["action"], got["reason"]),
+                         ("HAND-BACK", m.CONFLICT_REASON))
+        self.assertIn("code.txt conflicts, and no glob names it",
+                      got["detail"])
+
+    def test_a_matching_file_with_a_changed_line_is_handed_back(self):
+        self.write("CHANGES.md", UNION_LIST.replace(
+            "* base\n", "* BASE\n* feature\n"))
+        self.head = self.commit("feature edits")
+        self.publish(self.head)
+        got = self.decide()
+        self.assertEqual((got["action"], got["reason"]),
+                         ("HAND-BACK", m.CONFLICT_REASON))
+        self.assertIn("changed or removed", got["detail"])
+
+    def test_without_the_setting_it_is_handed_back(self):
+        m.configure(project())
+        got = self.decide()
+        self.assertEqual(got["action"], "HAND-BACK")
+        self.assertNotIn("detail", got)
+
+    def test_an_author_merge_of_the_same_tree_is_covered(self):
+        head = self.hand_merge(UNION_LIST.replace(
+            "* base\n", "* base\n* feature\n* main\n"))
+        self.assertEqual(self.covers(head), (True, None))
+        # Without the setting it is a hand-resolved conflict, as before.
+        m.configure(project())
+        ok, why = self.covers(head)
+        self.assertFalse(ok)
+        self.assertIn("not the clean merge", why)
+
+    def test_an_author_merge_of_another_tree_is_refused(self):
+        head = self.hand_merge(UNION_LIST.replace(
+            "* base\n", "* base\n* main\n* feature\n"))
+        ok, why = self.covers(head)
+        self.assertFalse(ok)
+        self.assertIn("not the clean merge", why)
+        # So is the resolution with anything more in it.
+        run_git(self.repo.path, "reset", "-q", "--hard", self.head)
+        head = self.hand_merge(UNION_LIST.replace(
+            "* base\n", "* base\n* feature\n* main\n* slipped in\n"))
+        self.assertFalse(self.covers(head)[0])
+
+    def tick(self, item=None, minutes=0, conclusions=("success",)):
+        item = item or self.item()
+        github = FakeGitHub(answers(conclusions, prs=[item]))
+        start = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                                  tzinfo=datetime.timezone.utc)
+        lines = []
+        record = m.tick(self.repo.path, self.state, github, self.git_run(),
+                        lines.append, now=lambda: start + datetime.timedelta(
+                            minutes=minutes), live=True)
+        return record, github, lines
+
+    def test_a_tick_resolves_it_then_waits_for_the_build_check(self):
+        record, github, lines = self.tick()
+        (decision,) = record["decisions"]
+        self.assertEqual((decision["action"], decision["result"]),
+                         ("UNION", "done"))
+        self.assertEqual(decision["files"], {"CHANGES.md": [[1, 1]]})
+        self.assertIn("UNION #5: merged main into it, keeping both sides' "
+                      "added lines in CHANGES.md", lines)
+        self.assertEqual([w[1] for w in github.writes],
+                         [SLUG + "/issues/5/comments"])
+        self.assertEqual(m.load_json(os.path.join(self.state, "next.json"),
+                                     {}).get("pr"), 5)
+        new = run_git(self.repo.origin, "rev-parse", "b5")
+        self.assertNotEqual(new, self.head)
+        self.repo.publish_pr(5, new)
+        record, github, _ = self.tick(self.item(new), minutes=1,
+                                      conclusions=(None,))
+        self.assertEqual([d["action"] for d in record["decisions"]],
+                         ["WAIT"])
+        self.assertEqual(github.writes, [])
+
+    def test_a_tick_that_cannot_push_hands_it_back_once(self):
+        m.RESOLVE_IDENTITY = None
+        record, github, _ = self.tick()
+        self.assertEqual([(d["action"], d.get("result"))
+                          for d in record["decisions"]],
+                         [("UNION", "failed: identity: the Merger's commit "
+                                    "identity is unknown"),
+                          ("HAND-BACK", "done")])
+        self.assertIn("could not resolve it (identity)",
+                      record["decisions"][1]["reason"])
+        record, github, _ = self.tick(minutes=1)
+        self.assertEqual([(d["action"], d.get("result"))
+                          for d in record["decisions"]],
+                         [("UNION", "failed: identity: the Merger's commit "
+                                    "identity is unknown"),
+                          ("HAND-BACK", "already said")])
+        self.assertEqual(github.writes, [])
+
+    def test_early_conflicts_leave_a_resolvable_one_to_the_merger(self):
+        self.configure(early_conflicts=True)
+        item = self.item()
+        github = FakeGitHub({})
+        got = m.early_conflicts(self.repo.path, self.repo.main_tip(), [item],
+                                {5: m.approval_of(item)}, github, {}, True,
+                                self.git_run())
+        self.assertEqual((got, github.writes), ([], []))
+        self.configure(globs=("docs/*",), early_conflicts=True)
+        got = m.early_conflicts(self.repo.path, self.repo.main_tip(), [item],
+                                {5: m.approval_of(item)}, github, {}, True,
+                                self.git_run())
+        self.assertEqual([(d["pr"], d["action"]) for d in got],
+                         [(5, "HAND-BACK")])
+        self.assertIn("no glob names it", got[0]["detail"])
+
+
 class UpdateOnce(Tick):
 
     def test_no_update_after_a_hand_back_under_the_same_approval(self):
@@ -6708,6 +6956,11 @@ class Main0026(unittest.TestCase):
         m.RESOLVE_IDENTITY = None
         self.run_main({"resolve": [RULE]}, ["--dry-run"])
         self.assertEqual(self.identities, [])
+
+    def test_union_gives_a_live_run_the_mergers_identity(self):
+        self.run_main({"resolve": {"union": ["*.md"]}}, [])
+        self.assertEqual(self.identities, ["Merger"])
+        self.assertEqual(self.ticks[0]["identity"], IDENTITY)
 
     def test_the_check_state_is_read_for_queued_stalls(self):
         check = os.path.join(self.tmp, "check")

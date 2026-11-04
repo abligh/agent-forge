@@ -27,6 +27,9 @@ still covers, nobody has spoken since, and nothing it names in a
 For the first candidate, it decides one action:
 
 * `UPDATE`: behind `main`, and merging `main` into it is clean;
+* `UNION`: behind `main`, and merging `main` into it conflicts only
+  where both sides added lines, in files `merge.resolve.union` names
+  (designs/0046, below);
 * `WAIT`: the build check (`checks.context`) has not reported on the
   head, or a run of the CI workflow on it has not finished;
 * `MERGE`: every gate check passed;
@@ -174,12 +177,36 @@ head H. Either H is A, or every commit reachable from H but not from A
 or from `main` is a merge with these properties:
 
 * one of its parents is on `main`;
-* its tree equals `git merge-tree --write-tree` of its two parents.
+* its tree equals `git merge-tree --write-tree` of its two parents,
+  or, with `merge.resolve.union`, the resolution `UNION` makes of
+  them (below), recomputed from the two parents in their order.
 
 GitHub carries an approval forward across any push, so this check is
 what stops an unreviewed commit being merged under it. An author's own
 clean merge of `main` passes; a hand-resolved conflict does not, and
-needs a new approval.
+needs a new approval, unless it is exactly the resolution the Merger
+would have made (`forge-resolve` makes it).
+
+**With `merge.resolve.union`, a conflict of additions is resolved, not
+handed back** (designs/0046; default off). It is a list of path globs
+(`agent_forge/union.py`). When merging `main` into the head conflicts,
+the Merger takes `git merge-tree --write-tree` of the head and `main`'s
+tip, with each conflicting hunk shown with its base (`zdiff3`). Only
+if every conflict is in a file's lines (no modify/delete, rename,
+binary or mode conflict), in a file a glob matches, and every
+conflicting hunk's base is empty, so both sides only added lines, is it
+resolved: each hunk becomes the head's lines, then `main`'s. Anything
+else anywhere and it is handed back as before, the comment saying why
+the Merger didn't resolve it. A resolved merge is committed as the
+Merger (parents: the head, then `main`'s tip), pushed to the branch
+with a lease on the head it judged, at most once per approval and head
+(`unioned.json` in the state directory), and announced in a comment,
+signed `— Merger`, listing each file and the lines it kept from each
+side. Then it waits for the build check on the new head, as after
+`UPDATE`. A push GitHub refuses is judged afresh next tick; any other
+failure hands the pull request back for the conflict. With
+`merge.early_conflicts`, a candidate behind the front whose conflict
+this resolves is not handed back early.
 
 **Where that re-review starts.** The hand-back to the approver lists
 the paths whose content in H a reviewer has not seen together with
@@ -557,7 +584,7 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from agent_forge import config, github as forge_github, locks, \
-    nightly, stamps  # noqa: E402
+    nightly, stamps, union  # noqa: E402
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 
@@ -596,6 +623,22 @@ STACK_UPDATE_NOTE = ("Merged `%s` into this on top of %s, against #%d's final "
                      "made every line of it: the approval of that head still "
                      "covers the new one, so no review is needed again. The "
                      "Merger checks it and merges it.\n\n%s")
+# What it says once it has merged `main` in with conflicts of additions
+# resolved (designs/0046, UNION).
+UNION_NOTE = ("Merged `%s` into this on top of %s. git found conflicts, but "
+              "in each one both sides only added lines, in files "
+              "`merge.resolve.union` names, so the Merger kept both: this "
+              "branch's lines, then `%s`'s.\n\n%s\n\nNothing else is "
+              "changed, so the approval of that head still covers the new one "
+              "and no review is needed again (`forge-resolve` makes the same "
+              "merge). The Merger checks it and merges it.\n\n%s")
+# What a conflict's hand-back adds when union resolution is on but
+# couldn't resolve it.
+UNION_DETAIL = ("The Merger resolves a conflict itself only when, in every "
+                "conflicting hunk, both sides only added lines, in files "
+                "`merge.resolve.union` names. Not here: %s.")
+UNION_MESSAGE = "Merge %s into %s; additions kept from both sides in %s"
+UNIONED_FILE = "unioned.json"
 RESTACK_REASON = ("%s, and merging #%d's final head %s into it conflicts "
                   "too")
 RESTACK_DETAIL = ("Merge #%d's final head, %s, into the branch first, then "
@@ -772,7 +815,8 @@ BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
 TICKS_PER_RUN = 10
 # The actions that leave a run in progress or about to start on the
 # pull request: with test_ahead, it keeps its place in the queue.
-IN_FLIGHT = ("UPDATE", "RESOLVE", "RESTACK", "STACK-UPDATE", "WAIT")
+IN_FLIGHT = ("UPDATE", "RESOLVE", "UNION", "RESTACK", "STACK-UPDATE",
+             "WAIT")
 # merge.hold_conflicting: hold one that conflicts with one ahead of it.
 HOLD_CONFLICTING = False
 HOLD_REASON = "conflicts with #%d, ahead of it in the queue"
@@ -849,6 +893,9 @@ RESOLVED_FILE = "resolved.json"
 # by `main` when RESOLVE is.
 RESOLVE_IDENTITY = None
 RESOLVE_MESSAGE = "Merge %s into %s; %s regenerated"
+# merge.resolve.union (designs/0046): globs of the files whose conflicts
+# of additions the Merger resolves by keeping both sides; () is off.
+UNION = ()
 # merge.hold_labels: labels that hold a pull request.
 HOLD_LABELS = ()
 # merge.blocked_by: "body", or "everywhere" as `blocker_state` reads it.
@@ -857,7 +904,7 @@ BLOCKED_BY = "body"
 # others hold too.
 SAID_AUTHOR = False
 SAID_APPROVALS = False
-# merge.update_once: no second UPDATE or RESOLVE after any hand-back
+# merge.update_once: no second UPDATE, RESOLVE or UNION after any hand-back
 # under the same approval.
 UPDATE_ONCE = False
 # merge.hand_back_once_per_head (designs/0044, rule 1): a pull request
@@ -888,7 +935,9 @@ def configure(project):
     `minutes`, default 60) and `code_owners` (default false) and
     `stacks` (default none: a stacked pull request is held; `max_run`,
     default 0, no limit; `wait_hours`, default none: a layer that isn't
-    ready when the layer below merges leaves the stack), and design 0026's `resolve`, `hold_labels`,
+    ready when the layer below merges leaves the stack), and design 0026's
+    `resolve` (a list of rules, or an object with them as `regenerate`
+    and design 0046's `union` globs), `hold_labels`,
     `blocked_by`, `said_since`, `update_once`, `ci_never_started`,
     `queued_stall_minutes` and `read_as` (each off unless set). The
     `checks` section: `context` and `poster` (default the merger).
@@ -902,6 +951,7 @@ def configure(project):
     global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
     global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS, URGENT_LABEL
     global STACKS, STACK_MAX_RUN, STACK_WAIT, RESOLVE, HOLD_LABELS, BLOCKED_BY
+    global UNION
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
@@ -967,10 +1017,14 @@ def configure(project):
                     and (ahead or {}).get("stacks") is True)
     PREDICT_RESTACKED = (STACKS and TEST_AHEAD
                          and stacks.get("predict_restacked") is True)
+    UNION = union.globs(merge)
+    rules = merge.get("resolve", ())
+    if isinstance(rules, dict):
+        rules = rules.get("regenerate", ())
     RESOLVE = tuple({"paths": frozenset(rule["paths"]),
                      "command": tuple(rule["command"]),
                      "check": tuple(rule["check"])}
-                    for rule in merge.get("resolve", ()))
+                    for rule in rules)
     HOLD_LABELS = tuple(merge.get("hold_labels", ()))
     BLOCKED_BY = merge.get("blocked_by", "body")
     said = merge.get("said_since") or {}
@@ -1542,7 +1596,9 @@ def covers_head(repo, approved, head, main_ref, run=sh, below=(),
     (STACKS): a clean merge of one of them, as of `main`, covers the
     head too. With `merge.resolve`, a merge whose only conflict was in a
     rule's paths covers it too, once `regenerated(sha, rule)` says its
-    files are what the rule's `check` makes of them."""
+    files are what the rule's `check` makes of them. With
+    `merge.resolve.union` (designs/0046), so does a merge whose tree is
+    `union.resolve` of its parents, in their order, whoever made it."""
     if not is_ancestor(repo, approved, head, run):
         return False, "the approved commit %s is not in the head's history" % (
             approved[:10])
@@ -1578,6 +1634,10 @@ def covers_head(repo, approved, head, main_ref, run=sh, below=(),
                               "trying again next tick" % sha[:10])
             if verdict:
                 continue
+        if UNION and tree.returncode == 0 and union.resolve(
+                repo, parents[0], parents[1], UNION, run).tree \
+                == tree.stdout.split()[0]:
+            continue
         return False, ("%s's tree is not the clean merge of its parents"
                        % sha[:10])
     return True, None
@@ -1763,6 +1823,40 @@ def stack_update(repo, decision, main_tip, github, run=sh):
                      MAIN, head[:10], decision["after"],
                      decision["below"][:10], MAIN, MAIN, decision["after"],
                      SIGNATURE))
+    return "done"
+
+
+def union_push(repo, decision, main_tip, github, run=sh):
+    """Commit `decision`'s tree (`union.resolve` of the head and
+    `main_tip`) as a merge of `main_tip` into the head, as the Merger,
+    push it to the branch with a lease on the head it judged, and say
+    on the pull request what it kept from each side (designs/0046).
+    "done", "refused: why" or "failed: why", as `resolve`."""
+    if RESOLVE_IDENTITY is None:
+        return "failed: identity: the Merger's commit identity is unknown"
+    head, branch = decision["head"], decision["branch"]
+    paths = [path for path, _ in decision["files"]]
+    name, email = RESOLVE_IDENTITY
+    made = run(["git", "-C", repo, "commit-tree", decision["tree"],
+                "-p", head, "-p", main_tip, "-m", UNION_MESSAGE % (
+                    MAIN, branch, ", ".join(paths))],
+               env=dict(os.environ, GIT_AUTHOR_NAME=name,
+                        GIT_AUTHOR_EMAIL=email, GIT_COMMITTER_NAME=name,
+                        GIT_COMMITTER_EMAIL=email))
+    if made.returncode != 0:
+        return "failed: git commit-tree: " + made.stderr.strip()
+    pushed = run(["git", "-C", repo, "push", "-q",
+                  "--force-with-lease=refs/heads/%s:%s" % (branch, head),
+                  "https://github.com/%s.git" % REPO_SLUG,
+                  "%s:refs/heads/%s" % (made.stdout.strip(), branch)],
+                 env=push_env(github))
+    if pushed.returncode != 0:
+        return "refused: " + tail(pushed.stderr + "\n" + pushed.stdout, 2)
+    github.write("POST", "repos/%s/issues/%d/comments"
+                 % (REPO_SLUG, decision["pr"]), body=UNION_NOTE % (
+                     MAIN, head[:10], MAIN,
+                     union.summary(decision["files"], "this branch",
+                                   "`%s`" % MAIN), SIGNATURE))
     return "done"
 
 
@@ -2160,6 +2254,13 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
             rule = resolve_rule(conflicted_paths(merged.stdout))
             if RESOLVE and rule is not None:
                 return {"action": "RESOLVE", "rule": rule}
+            if UNION:
+                got = union.resolve(repo, head, main_tip, UNION, run)
+                if got.tree:
+                    return {"action": "UNION", "tree": got.tree,
+                            "files": got.files, "branch": pr["headRefName"]}
+                return dict(back("author", CONFLICT_REASON),
+                            detail=UNION_DETAIL % got.reason)
             return back("author", CONFLICT_REASON)
         return {"action": "UPDATE"}
     state, said = status_state(github.api(
@@ -2925,6 +3026,12 @@ def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
                run=run).returncode != 1:
             continue
         reason, detail = CONFLICT_REASON, None
+        if UNION and pr["number"] not in restacks:
+            got = union.resolve(repo, pr["headRefOid"], main_tip, UNION, run)
+            if got.tree:
+                # The Merger resolves it itself when it is reached.
+                continue
+            detail = UNION_DETAIL % got.reason
         if pr["number"] in restacks:
             after, lower = restacks[pr["number"]]
             _, failed = restacked_tree(repo, main_tip, pr["headRefOid"],
@@ -4743,8 +4850,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             continue
         before = said.get(str(pr["number"])) or {}
         if (UPDATE_ONCE
-                and decision["action"] in ("UPDATE", "RESOLVE", "RESTACK",
-                                           "STACK-UPDATE")
+                and decision["action"] in ("UPDATE", "RESOLVE", "UNION",
+                                           "RESTACK", "STACK-UPDATE")
                 and before.get("approved")
                 and before["approved"] == approval.get("submittedAt")
                 and not description_moved(before, pr)
@@ -4793,10 +4900,19 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         elif live and decision["action"] == "RESTACK":
             decision["result"] = restack_once(state_dir, decision, approval,
                                               github, said)
+        elif live and decision["action"] == "UNION":
+            decision["result"] = once(
+                os.path.join(state_dir, UNIONED_FILE), decision, approval,
+                lambda: union_push(repo, decision, main_tip, github, run))
         elif live:
             result = carry_out(decision, approval, github, said)
             if result is not None:
                 decision["result"] = result
+        if decision["action"] == "UNION":
+            # The record keeps how many lines each side gave, not the
+            # lines: the comment on the pull request has those.
+            decision["files"] = {path: [[len(h), len(m)] for h, m in hunks]
+                                 for path, hunks in decision["files"]}
         record["decisions"].append(decision)
         if decision["action"] == "RESTACK":
             if decision.get("result", "done") == "done":
@@ -4823,6 +4939,19 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     "%s, and the Merger could not merge it in against "
                     "#%d's final head" % (CONFLICT_REASON,
                                           decision["after"])))
+                continue
+        if decision["action"] == "UNION":
+            if decision.get("result", "done") == "done":
+                out("UNION #%d: %smerged %s into it, keeping both sides' "
+                    "added lines in %s" % (
+                        pr["number"], "" if live else "would have ", MAIN,
+                        ", ".join(sorted(decision["files"]))))
+            elif not decision["result"].startswith("refused"):
+                step = decision["result"][len("failed: "):].split(": ")[0]
+                record["decisions"].append(conflict_hand_back(
+                    pr, approval, github, said, live,
+                    "%s, and the Merger could not resolve it (%s)"
+                    % (CONFLICT_REASON, step)))
                 continue
         if (decision["action"] == "RESOLVE"
                 and decision.get("result", "").startswith("failed")):
@@ -5194,7 +5323,7 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
         if token is None:
             out("NO-TOKEN: could not mint %s's token" % reader)
             return 2
-        if (RESOLVE or STACKS) and not args.dry_run:
+        if (RESOLVE or UNION or STACKS) and not args.dry_run:
             RESOLVE_IDENTITY = identity(project, ACT_AS)
         check_state = None
         if QUEUED_STALL_AFTER is not None or AHEAD_BATCH > 1:
