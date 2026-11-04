@@ -109,15 +109,18 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "early_conflicts": bool, "stacks": dict, "resolve": list,
          "hold_labels": list, "blocked_by": str, "said_since": dict,
          "update_once": bool, "ci_never_started": int,
-         "queued_stall_minutes": int, "read_as": str, "age_first": dict}
+         "queued_stall_minutes": int, "read_as": str, "age_first": dict,
+         "hand_back_once_per_head": bool}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
 SAID_SINCE = {"author": bool, "approvals": bool, "quiet": list}
 BLOCKED_BY = ("body", "everywhere")
-RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int}
+RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int, "while_eligible": bool}
 AGE_FIRST = {"after_minutes": int}
 STACKS = {"max_run": int, "wait_hours": int, "predict_restacked": bool}
 TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
-              "batch": int, "stacks": bool, "batches": int}
+              "batch": int, "stacks": bool, "batches": int,
+              "fixed_order": bool, "hand_back_red_suspect": bool,
+              "unstable_after_recuts": int, "batches_when_unstable": int}
 STALL_ALERT = {"tell": list, "retell_minutes": int,
                "owner_after_minutes": int, "title": str, "labels": list}
 # checks is shared with tools not here yet, so only these keys are
@@ -1151,6 +1154,19 @@ def _check_test_ahead(ahead, checks, problems):
         elif ahead["batches"] * batch > depth + 1:
             problems.append("%s.batches x batch must be at most depth + 1 "
                             "(%d)" % (where, depth + 1))
+    if _is(ahead.get("unstable_after_recuts"), int) and \
+            ahead["unstable_after_recuts"] < 1:
+        problems.append("%s.unstable_after_recuts must be at least 1" % where)
+    if "batches_when_unstable" in ahead:
+        # designs/0044, rule 5: fewer batches while re-cuts are frequent.
+        batches = ahead["batches"] if _is(ahead.get("batches"), int) else 1
+        if "unstable_after_recuts" not in ahead:
+            problems.append("%s.batches_when_unstable needs "
+                            "unstable_after_recuts" % where)
+        elif _is(ahead["batches_when_unstable"], int) and \
+                not 1 <= ahead["batches_when_unstable"] <= batches:
+            problems.append("%s.batches_when_unstable must be at least 1 "
+                            "and at most batches (%d)" % (where, batches))
     if isinstance(checks, dict) and checks.get("merger_first") is False:
         problems.append("%s puts the Merger's pull request first, so "
                         "checks.merger_first must not be false" % where)
