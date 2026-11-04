@@ -522,7 +522,8 @@ Off by default.
 designs/0002). A pull request P handed back to its author for a
 conflict with `main` at N heads in the last 24 hours has earned right
 of way. It has it for its head H while H is clean against `main`, H
-wasn't handed back for anything else, and less than M minutes have
+wasn't handed back for anything else, no request for changes stands
+on P (designs/0002, amendment), and less than M minutes have
 passed since a tick first saw H with it earned (`right-of-way.json` in
 the Merger's state directory, `dry-run-right-of-way.json` for a dry
 run). Meanwhile every other candidate whose head conflicts with H is
