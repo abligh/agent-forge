@@ -106,6 +106,15 @@ is what makes it safe.
    locally.
 3. docs/config.md.
 
+## Not yet
+
+`merge.hold_conflicting`, right of way and test-ahead's predictions
+still judge a conflict with plain `git merge-tree`, so a pull request
+that `UNION` would resolve is held or predicted as conflicting there.
+That costs a tick or a prediction, not a wrong merge. Teaching them
+`union.resolve` is a follow-up once the Merger's own use has been
+measured.
+
 ## What it costs
 
 * **On the build host:** one `merge-tree` and one push per resolved
