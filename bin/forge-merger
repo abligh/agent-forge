@@ -4306,6 +4306,51 @@ def rerun_green(entry, head, check_state, repo, run=sh):
     return r
 
 
+def red_hand_back(reason):
+    """Whether a hand-back's `reason` is the build check's red on the
+    head itself."""
+    return isinstance(reason, str) and \
+        reason.startswith(STATUS_CONTEXT + " is failure")
+
+
+def clear_green_reruns(said, prs, check_state, out):
+    """Forget each hand-back in `said` that was for the build check's
+    red on a head (`red_hand_back`) that the build check has since run
+    green: a run of the same head, not a batch's cover, finished after
+    the hand-back was said (`at`). Without this, with `update_once`, a
+    red that a rerun showed was not the pull request's (a poisoned
+    cache, a timing test under load) kept it out of the queue until it
+    was approved again: seen on 2026-11-04, ten hours. Returns the
+    numbers released, after logging `HAND-BACK-CLEARED` for each. A
+    hand-back kept without `at`, said before this, is left alone."""
+    heads = {str(pr["number"]): pr["headRefOid"] for pr in prs}
+    results = (check_state or {}).get("results") or {}
+    cleared = []
+    for key in sorted(said, key=lambda k: int(k) if k.isdigit() else 0):
+        before = said[key]
+        if not isinstance(before, dict) or key not in heads \
+                or before.get("head") != heads[key] \
+                or not red_hand_back(before.get("reason")) \
+                or not before.get("at"):
+            continue
+        r = results.get(heads[key])
+        if not isinstance(r, dict) or r.get("ok") is not True \
+                or r.get("covered"):
+            continue
+        try:
+            if parse_time(r.get("finished")) <= parse_time(before["at"]):
+                continue
+        except (TypeError, ValueError):
+            continue
+        out("HAND-BACK-CLEARED #%s: green %sat %s since its red; back in "
+            "the queue under its approval" % (
+                key, "rerun " if r.get("rerun_of") is not None else "run ",
+                heads[key][:10]))
+        del said[key]
+        cleared.append(int(key))
+    return cleared
+
+
 def clear_red_suspects(state_dir, reds, prs, check_state, repo, github,
                        said, live, out, run=sh):
     """Release each red suspect in `reds` whose head the build check has
@@ -4728,6 +4773,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     cleared = clear_red_suspects(
         state_dir, reds, prs, check_state, repo, github, said, live, out,
         run) if reds else []
+    clear_green_reruns(said, prs, check_state, out)
     since, overdue = {}, {}
     if AGE_FIRST is not None:
         since = waiting_since(os.path.join(
@@ -5016,6 +5062,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             result = carry_out(decision, approval, github, said)
             if result is not None:
                 decision["result"] = result
+            if result == "done" and decision["action"] == "HAND-BACK" \
+                    and red_hand_back(decision.get("reason")):
+                # When it was said, so that a green rerun of the same
+                # head after it releases it (clear_green_reruns).
+                said[str(pr["number"])]["at"] = iso(when)
         if decision["action"] == "UNION":
             # The record keeps how many lines each side gave, not the
             # lines: the comment on the pull request has those.

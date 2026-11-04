@@ -6984,6 +6984,70 @@ class UpdateOnce(Tick):
         record, _ = self.tick([again], live=True, minutes=2)
         self.assertEqual(record["decisions"][0]["action"], "UPDATE")
 
+    def red_then_rerun(self, finished, ok=True, covered=False):
+        """#5 handed back for the build check's red under update_once,
+        main moved on, and the build check's verdict on the same head
+        finished at `finished`; the next tick's record and log."""
+        m.configure(project(update_once=True))
+        self.addCleanup(m.configure, project())
+        record, _ = self.tick([self.item()], conclusions=("failure",),
+                              live=True)
+        self.assertEqual(record["decisions"][0]["action"], "HAND-BACK")
+        saved = m.load_json(os.path.join(self.state, "handed-back.json"), {})
+        self.assertEqual(saved["5"]["at"], "2026-10-07T12:00:00Z")
+        self.advance_main("m3.txt")
+        verdict = {"pr": 5, "ok": ok, "finished": finished,
+                   "base": self.repo.main_tip(), "rerun_of": ["test"]}
+        if covered:
+            verdict["covered"] = True
+        return self.tick([self.item()], live=True, minutes=5,
+                         check_state={"results": {self.head: verdict}})
+
+    def test_a_green_rerun_after_the_red_releases_it(self):
+        # Seen on 2026-11-04: a poisoned cache's red, re-run green within
+        # the hour, kept a pull request out for ten hours, until its
+        # reviewer approved the same head again.
+        record, lines = self.red_then_rerun("2026-10-07T12:03:00Z")
+        self.assertIn("HAND-BACK-CLEARED #5: green rerun at %s since its "
+                      "red; back in the queue under its approval"
+                      % self.head[:10], lines)
+        self.assertEqual(record["decisions"][0]["action"], "UPDATE")
+        self.assertNotIn("5", m.load_json(os.path.join(
+            self.state, "handed-back.json"), {}))
+
+    def assert_still_skipped(self, record, lines):
+        self.assertFalse([l for l in lines if "HAND-BACK-CLEARED" in l])
+        self.assertEqual(record["decisions"][0]["action"], "SKIP")
+
+    def test_a_green_from_before_the_red_does_not_release_it(self):
+        self.assert_still_skipped(*self.red_then_rerun("2026-10-07T11:59:00Z"))
+
+    def test_a_red_rerun_does_not_release_it(self):
+        self.assert_still_skipped(*self.red_then_rerun("2026-10-07T12:03:00Z",
+                                                       ok=False))
+
+    def test_a_batch_cover_does_not_release_it(self):
+        self.assert_still_skipped(*self.red_then_rerun("2026-10-07T12:03:00Z",
+                                                       covered=True))
+
+    def test_a_hand_back_kept_without_a_time_is_left_alone(self):
+        said = {"5": {"approved": T1, "head": "a" * 40,
+                      "reason": "vm/build-and-test is failure: red"}}
+        got = m.clear_green_reruns(
+            said, [pr(5, head="a" * 40)],
+            {"results": {"a" * 40: {"ok": True, "finished": T3}}},
+            lambda line: None)
+        self.assertEqual((got, list(said)), ([], ["5"]))
+
+    def test_other_hand_backs_are_left_alone(self):
+        said = {"5": {"approved": T1, "head": "a" * 40, "at": T1,
+                      "reason": m.CONFLICT_REASON}}
+        got = m.clear_green_reruns(
+            said, [pr(5, head="a" * 40)],
+            {"results": {"a" * 40: {"ok": True, "finished": T3}}},
+            lambda line: None)
+        self.assertEqual((got, list(said)), ([], ["5"]))
+
     def test_without_it_the_update_goes_ahead(self):
         self.tick([self.item()], conclusions=("failure",), live=True)
         self.advance_main("m3.txt")

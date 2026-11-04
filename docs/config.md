@@ -695,7 +695,14 @@ With `update_once: true`, after any hand-back under an approval (not
 only one for a conflict) the Merger neither updates nor resolves the
 pull request again until it is approved again: it is skipped,
 `handed back under this approval (...); not updated until it is
-approved again`. Off by default.
+approved again`. One way out needs no approval: a hand-back for the
+build check's own red on the head (`<status> is failure`) is
+forgotten once the build check runs the same head green, a run of its
+own rather than a batch's cover, finished after the hand-back was
+said (as `labels.rerun` gives one). The tick logs
+`HAND-BACK-CLEARED #n`, and the pull request is updated and merged
+again under its approval. A hand-back said before this was added
+carries no time, and still waits for a new approval. Off by default.
 
 ### `merge.hand_back_once_per_head`
 
