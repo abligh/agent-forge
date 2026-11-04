@@ -641,6 +641,9 @@ CI_WORKFLOW = "ci"
 # The reason a conflicting head is handed back for. It names no files,
 # so it stays the same while main moves and is said once per head.
 CONFLICT_REASON = "it conflicts with main, so it can't be updated"
+# What the reviewer is told when an author's merge after the approval
+# isn't git's own (`covered`).
+NOT_CLEAN_MARK = "is not the clean merge of its parents"
 # A write pinned to a head (`update-branch`'s expected_head_sha, a
 # merge's sha) that GitHub refused because the head it holds is not the
 # one named. GitHub sometimes moves a branch without moving the pull
@@ -2319,8 +2322,9 @@ def told(before, key):
     hand-backs in a morning repeated one already told for the same head;
     one head was told 8 times in an hour, alternating between a conflict
     with main and a merge after the approval that wasn't clean, since
-    each replaced the other in `said`. Two hand-backs still count as
-    new: one after a gate's refusal of a description (`text`), unless
+    each replaced the other in `said`. Three hand-backs still count as
+    new: a conflict with main after the reviewer was told the merge
+    wasn't clean, since the conflict is the author's to act on; one after a gate's refusal of a description (`text`), unless
     it is the same refusal of the same description, since the author
     may fix the description alone; and one after a gate's refusal for
     now (`retry`) for another reason, since that refusal wasn't the
@@ -2331,6 +2335,13 @@ def told(before, key):
             or before.get("head") != key["head"]:
         return False
     if before.get("text") and before["text"] != key.get("text"):
+        return False
+    # A conflict with main is the author's to fix: telling the reviewer
+    # that the author's merge wasn't clean doesn't tell the author that
+    # main has moved again. Once the conflict is said, the other reason is not
+    # said after it: the author's next merge makes a new head anyway.
+    if CONFLICT_REASON in key["reason"] and NOT_CLEAN_MARK in str(
+            before.get("reason") or ""):
         return False
     return not (before.get("retry") and before.get("reason") != key["reason"])
 

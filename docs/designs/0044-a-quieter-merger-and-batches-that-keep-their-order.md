@@ -60,8 +60,13 @@ every time.
 an approval at a head, nothing more is posted on it for that approval
 and head, whatever the reason or the recipient. A new head or a new
 approval is a new question, as before. The record still lists the
-decision, with `already said`. Two hand-backs still count as new:
+decision, with `already said`. Three hand-backs still count as new:
 
+* a conflict with `main` after the reviewer was told that the author's
+  merge after the approval wasn't clean: the conflict is the author's
+  to act on, and the reviewer's message didn't tell her. Once the
+  conflict is said, the reviewer's message isn't said after it, since
+  the author's next merge makes a new head anyway;
 * one after a `merge.gate` tool's refusal, unless it is the same
   refusal of the same title and body: the author may fix the
   description alone, and a gate's hand-back is keyed by it already;
@@ -69,7 +74,8 @@ decision, with `already said`. Two hand-backs still count as new:
   since that refusal wasn't the author's to fix.
 
 `merge.early_conflicts` skips a pull request already told anything for
-its approval and head, so it does no git work for it either.
+its approval and head, by the same rule, so it does no git work for it
+either.
 
 **Switch:** `merge.hand_back_once_per_head`, default `true`. With
 `false`, each new reason for the same head is said again.

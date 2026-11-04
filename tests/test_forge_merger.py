@@ -1298,6 +1298,15 @@ class Tick(Decide):
                          ("done", 1))
         self.assertEqual(self.told(dict(conflict, approved=T0)), ("done", 1))
 
+    def test_a_conflict_after_another_reason_still_reaches_the_author(self):
+        # The reviewer was told the author's merge wasn't clean; then main
+        # moved and the head conflicts: the author must hear it.
+        unclean = m.hand_back_key(
+            review(REVIEWER), "h" * 40,
+            "abc's tree is not the clean merge of its parents")
+        self.assertEqual(self.told(dict(unclean), reason=m.CONFLICT_REASON),
+                         ("done", 1))
+
     def test_a_gate_s_refusal_of_a_description_still_counts_alone(self):
         gate = m.hand_back_key(review(REVIEWER), "h" * 40, "gate", "d1")
         # The same refusal of the same description, in other words: said.
