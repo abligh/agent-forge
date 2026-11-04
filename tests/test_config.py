@@ -313,11 +313,26 @@ class Check(unittest.TestCase):
             "stats_watch.figures.main_red must be an object",
             "stats_watch.figures.speed: unknown figure (one of check_run, "
             "check_wait, pr_turnaround, merge_time, merge_rate, "
-            "slots_busy, main_red, nightly_red_hours, main_cpu)"])
+            "slots_busy, main_red, nightly_red_hours, main_cpu, "
+            "hand_backs_per_merge, prs_per_slot, reviewer_busy)"])
         self.assertEqual(self.problems(stats_watch={}),
                          ["stats_watch: missing 'owner'"])
         self.assertEqual(self.problems(stats_watch=[]),
                          ["'stats_watch' must be an object"])
+
+    def test_stats_watch_takes_forge_flows_figures(self):
+        self.assertEqual(self.problems(stats_watch={
+            "owner": "LeadDev", "figures": {
+                "hand_backs_per_merge": {"limit": 1, "ratio": 2},
+                "prs_per_slot": {"limit": 2, "ratio": 1.5},
+                "reviewer_busy": {"limit": 90}}}), [])
+        self.assertEqual(self.problems(stats_watch={
+            "owner": "LeadDev", "figures": {
+                "reviewer_busy": {"ratio": 2},
+                "prs_per_slot": {"limit": 0}}}), [
+            "stats_watch.figures.reviewer_busy: unknown key 'ratio'",
+            "stats_watch.figures.prs_per_slot.limit must be a number "
+            "above 0"])
 
     def test_stats_watch_main_cpu_takes_a_step(self):
         def problems(rules):
