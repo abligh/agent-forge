@@ -148,6 +148,19 @@ open `checks.main_red_issue` issue runs it again instead, once, the
 same way, and the label comes off the issue.
 Only a posting tick, and not an instance's (designs/0021), acts on it.
 
+**With `checks.approved_first`, approved pull requests go first**: a
+waiting head of a pull request one of the reviewer agents has approved,
+at any commit, is started before every other pull request's but an
+urgent one's, overdue ones included, the Merger's own first among them,
+then the oldest; the `STARTED` line ends `, first: it is approved`.
+The reviews are read by `approved_prs`, each pull request at most every
+APPROVED_FRESH, at most APPROVED_MAX_CALLS a tick, and kept in
+approved.json. Allowed in an instance block too: an instance can't see
+the Merger's queue, and with `max_wait_minutes` every head there is
+soon overdue and run oldest first, unreviewed ones included. It only
+orders; approved pull requests merge and leave, so it can't starve the
+rest for long.
+
 **With `checks.max_wait_minutes`, no head waits on priority for ever**:
 a pull request's head that has waited that long goes before every
 other pull request's, the oldest first, the first_authors' and the
@@ -789,6 +802,17 @@ NIGHTLY_FIXES = frozenset()
 # (designs/0011, amendment), put first as if urgent; found each tick by
 # `tick` and kept as state.json's main_red.fixes.
 MAIN_RED_FIXES = frozenset()
+# checks.approved_first: whether a head of a pull request a reviewer
+# agent has approved goes first, and those reviewers' bot logins, lower
+# case. APPROVED_PRS is this tick's answer, from `approved_prs`.
+APPROVED_FIRST = False
+REVIEWER_LOGINS = frozenset()
+APPROVED_PRS = frozenset()
+# How long a pull request's approval answer is kept in approved.json
+# before it is asked again, and the most pull requests asked in a tick.
+APPROVED_FRESH = datetime.timedelta(minutes=5)
+APPROVED_MAX_CALLS = 30
+APPROVED_FILE = "approved.json"
 # labels.rerun: the label that runs a red head once more (designs/0022),
 # or None.
 RERUN_LABEL = None
@@ -938,7 +962,7 @@ def configure(project, instance=None):
     global RED_COMMENT, RERUN_LABEL, HOST_FAULT_EXTRA, STEP_ALERT
     global CACHE_FAULT_TEXT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
-    global PULL_REQUESTS, HOST_LOCK
+    global PULL_REQUESTS, HOST_LOCK, APPROVED_FIRST, REVIEWER_LOGINS
     INSTANCE = instance
     if instance is None:
         checks, HOST = project.section("checks"), project.host
@@ -998,6 +1022,9 @@ def configure(project, instance=None):
                               for name in checks.get("first_authors", []))
     MAX_WAIT = datetime.timedelta(minutes=checks["max_wait_minutes"]) \
         if "max_wait_minutes" in checks else None
+    APPROVED_FIRST = checks.get("approved_first", False) is True
+    REVIEWER_LOGINS = frozenset(project.bot_login(name).lower()
+                                for name in project.reviewers())
     URGENT_LABEL = project.section("labels").get("urgent")
     # One instance taking the label off would hide it from the others,
     # so only the check checks itself describes acts on it.
@@ -1409,6 +1436,61 @@ def red_fixes(token, number, run=sh, keywords=None):
     return sorted(fixes)
 
 
+def approved_prs(state_dir, state, heads, token, when, run=sh):
+    """checks.approved_first: the open pull requests, among those with a
+    head to run (open, not a draft, no verdict yet), that one of the
+    reviewer agents has approved, at any commit: an approval of an
+    earlier head still means the pull request is near merging.
+
+    Each answer is kept in approved.json and asked again once older
+    than APPROVED_FRESH; at most APPROVED_MAX_CALLS pull requests are
+    asked in a tick, the longest unasked first, and one that can't be
+    read keeps its last answer. It only orders, so a stale or missing
+    answer costs a place, never a run."""
+    path = os.path.join(state_dir, APPROVED_FILE)
+    try:
+        with open(path) as handle:
+            known = json.load(handle)
+    except (OSError, ValueError):
+        known = {}
+    if not isinstance(known, dict):
+        known = {}
+    results = state.get("results", {})
+    wanted = sorted({head[0] for head in heads
+                     if not head[3] and head[1] not in results})
+
+    def asked(pr):
+        try:
+            return parse(known[str(pr)]["at"])
+        except (KeyError, TypeError, ValueError):
+            return None
+    due = [pr for pr in wanted
+           if asked(pr) is None or when - asked(pr) >= APPROVED_FRESH]
+    due.sort(key=lambda pr: (asked(pr) is not None,
+                             asked(pr) or when, pr))
+    for pr in due[:APPROVED_MAX_CALLS]:
+        got = gh(["--paginate", "repos/%s/pulls/%d/reviews?per_page=100"
+                  % (REPO_SLUG, pr), "--jq",
+                  '.[] | select(.state == "APPROVED") | .user.login'],
+                 token, run)
+        if got.returncode != 0:
+            continue
+        logins = {l.strip().lower() for l in got.stdout.splitlines()}
+        known[str(pr)] = {"at": iso(when),
+                          "approved": bool(logins & REVIEWER_LOGINS)}
+    known = {k: v for k, v in known.items()
+             if k.isdigit() and int(k) in wanted}
+    try:
+        fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".approved.")
+        with os.fdopen(fd, "w") as handle:
+            json.dump(known, handle, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return frozenset(int(k) for k, v in known.items()
+                     if isinstance(v, dict) and v.get("approved"))
+
+
 def open_heads(token, run=sh, why=None):
     """[(pr, sha, head repository, draft, author, labels)] for every open
     pull request, or None if GitHub could not be read, with the reason
@@ -1588,6 +1670,10 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
             state["waiting"][sha]["urgent"] = True
         else:
             state["waiting"][sha].pop("urgent", None)
+        if APPROVED_FIRST and pr in APPROVED_PRS:
+            state["waiting"][sha]["approved"] = True
+        else:
+            state["waiting"][sha].pop("approved", None)
     replaced = {}
     for sha in list(state["waiting"]):
         entry = state["waiting"][sha]
@@ -2064,6 +2150,14 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
            if waiting[s].get("urgent") and not waiting[s].get("errors")]
     if hot:
         sha = min(hot, key=lambda s: order(waiting, s))
+        return sha, waiting[sha]["pr"]
+    # checks.approved_first: a reviewer has approved its pull request,
+    # so it is near merging. The Merger's own goes first among them.
+    ready = [s for s in heads
+             if waiting[s].get("approved") and not waiting[s].get("errors")]
+    if ready:
+        sha = min(ready, key=lambda s: (waiting[s]["pr"] != first_pr,
+                                        order(waiting, s)))
         return sha, waiting[sha]["pr"]
     # checks.max_wait_minutes: a head that has waited that long goes
     # before every other pull request's, the oldest first, so priority
@@ -3168,6 +3262,11 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     issue = (seen.get("main_red") or {}).get("issue") \
         if MAIN_RED_ISSUE is not None else None
     fixes = red_fixes(token, issue, run) if issue else []
+    # checks.approved_first: which waiting heads' pull requests a
+    # reviewer has approved, read outside the lock.
+    global APPROVED_PRS
+    APPROVED_PRS = approved_prs(state_dir, seen, heads, token, when, run) \
+        if APPROVED_FIRST else frozenset()
     todo = []
     with state_lock(state_dir):
         state = load(state_dir)
@@ -3441,6 +3540,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
            len(queued - taken) - 1,
            ", first: the Merger waits on it" if pr == first_pr else
+           ", first: it is approved"
+           if state["waiting"].get(sha, {}).get("approved") else
            ", first: it has waited %d minutes"
            % (MAX_WAIT.total_seconds() // 60)
            if overdue(state["waiting"].get(sha, {}), when) else ""))

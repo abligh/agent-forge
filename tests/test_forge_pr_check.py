@@ -3391,3 +3391,146 @@ class RedMainFixes(unittest.TestCase):
                       T0, tempfile.mkdtemp(), out=lambda *a: None)
         self.assertTrue(state["waiting"][SHA_B].get("urgent"))
         self.assertFalse(state["waiting"][SHA_A].get("urgent"))
+
+
+def is_reviews(args):
+    return args[:2] == ["gh", "api"] and any("/reviews" in a for a in args)
+
+
+class ApprovedFirst(StateCase):
+    """checks.approved_first: a head of a pull request a reviewer agent
+    has approved goes first, since the next merges wait on it."""
+
+    REVIEWER = "reviewerwidgetagent[bot]"
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (("APPROVED_FIRST", True),
+                            ("REVIEWER_LOGINS", frozenset({self.REVIEWER})),
+                            ("APPROVED_PRS", frozenset())):
+            patcher = mock.patch.object(pc, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def waiting(self, **minutes_by_pr):
+        return {"waiting": {sha: {"pr": pr, "since": pc.iso(
+            T0 - datetime.timedelta(minutes=m))}
+            for sha, (pr, m) in minutes_by_pr.items()}}
+
+    def test_an_approved_head_goes_before_older_and_overdue_ones(self):
+        state = self.waiting(**{SHA_A: (1, 120), SHA_B: (2, 10)})
+        state["waiting"][SHA_B]["approved"] = True
+        with mock.patch.object(pc, "MAX_WAIT",
+                               datetime.timedelta(minutes=30)):
+            self.assertEqual(pc.next_head(state, when=T0), (SHA_B, 2))
+
+    def test_the_mergers_own_goes_first_among_approved_ones(self):
+        state = self.waiting(**{SHA_A: (1, 120), SHA_B: (2, 10)})
+        for sha in (SHA_A, SHA_B):
+            state["waiting"][sha]["approved"] = True
+        self.assertEqual(pc.next_head(state, first_pr=2, when=T0),
+                         (SHA_B, 2))
+        self.assertEqual(pc.next_head(state, when=T0), (SHA_A, 1))
+
+    def test_urgent_still_goes_before_approved(self):
+        state = self.waiting(**{SHA_A: (1, 10), SHA_B: (2, 120)})
+        state["waiting"][SHA_A]["urgent"] = True
+        state["waiting"][SHA_B]["approved"] = True
+        self.assertEqual(pc.next_head(state, when=T0), (SHA_A, 1))
+
+    def test_a_failed_approved_head_goes_behind(self):
+        state = self.waiting(**{SHA_A: (1, 10), SHA_B: (2, 120)})
+        state["waiting"][SHA_B].update(approved=True, errors=1)
+        self.assertEqual(pc.next_head(state, when=T0), (SHA_A, 1))
+
+    def test_off_it_orders_as_before(self):
+        state = self.waiting(**{SHA_A: (1, 120), SHA_B: (2, 10)})
+        state["waiting"][SHA_B]["approved"] = True
+        with mock.patch.object(pc, "APPROVED_FIRST", False):
+            state["results"], state["refused"] = {}, {}
+            pc.note_heads(state, [(1, SHA_A, pc.REPO_SLUG, False),
+                                  (2, SHA_B, pc.REPO_SLUG, False)],
+                          T0, self.state_dir, out=lambda *a: None)
+        self.assertNotIn("approved", state["waiting"][SHA_B])
+        self.assertEqual(pc.next_head(state, when=T0), (SHA_A, 1))
+
+    def test_note_heads_marks_and_unmarks(self):
+        state = self.waiting(**{SHA_A: (1, 120)})
+        state["results"], state["refused"] = {}, {}
+        heads = [(1, SHA_A, pc.REPO_SLUG, False)]
+        with mock.patch.object(pc, "APPROVED_PRS", frozenset({1})):
+            pc.note_heads(state, heads, T0, self.state_dir,
+                          out=lambda *a: None)
+        self.assertTrue(state["waiting"][SHA_A]["approved"])
+        pc.note_heads(state, heads, T0, self.state_dir, out=lambda *a: None)
+        self.assertNotIn("approved", state["waiting"][SHA_A])
+
+    def reviews(self, by_pr):
+        def answer(args):
+            pr = int(next(a for a in args if "/reviews" in a)
+                     .split("/pulls/")[1].split("/")[0])
+            if by_pr.get(pr) is None:
+                return done(args, 1, "", "boom")
+            return done(args, 0, "".join(l + "\n" for l in by_pr[pr]))
+        return FakeRun((is_reviews, answer))
+
+    def test_only_a_reviewer_agents_approval_counts(self):
+        run = self.reviews({1: [self.REVIEWER], 2: ["someone"], 3: []})
+        heads = [(1, SHA_A, REPO, False), (2, SHA_B, REPO, False),
+                 (3, SHA_C, REPO, False)]
+        got = pc.approved_prs(self.state_dir, {"results": {}}, heads, "tok",
+                              T0, run)
+        self.assertEqual(got, frozenset({1}))
+
+    def test_answers_are_kept_and_asked_again_when_stale(self):
+        run = self.reviews({1: [self.REVIEWER]})
+        heads = [(1, SHA_A, REPO, False)]
+        pc.approved_prs(self.state_dir, {"results": {}}, heads, "tok", T0,
+                        run)
+        pc.approved_prs(self.state_dir, {"results": {}}, heads, "tok",
+                        T0 + datetime.timedelta(minutes=1), run)
+        self.assertEqual(len(run.calls), 1)
+        got = pc.approved_prs(self.state_dir, {"results": {}}, heads, "tok",
+                              T0 + pc.APPROVED_FRESH, run)
+        self.assertEqual(len(run.calls), 2)
+        self.assertEqual(got, frozenset({1}))
+
+    def test_an_unreadable_answer_keeps_the_last_one(self):
+        heads = [(1, SHA_A, REPO, False)]
+        pc.approved_prs(self.state_dir, {"results": {}}, heads, "tok", T0,
+                        self.reviews({1: [self.REVIEWER]}))
+        got = pc.approved_prs(self.state_dir, {"results": {}}, heads, "tok",
+                              T0 + pc.APPROVED_FRESH, self.reviews({}))
+        self.assertEqual(got, frozenset({1}))
+
+    def test_drafts_and_heads_with_a_verdict_are_not_asked(self):
+        run = self.reviews({1: [self.REVIEWER], 2: [self.REVIEWER]})
+        heads = [(1, SHA_A, REPO, True), (2, SHA_B, REPO, False)]
+        got = pc.approved_prs(self.state_dir, {"results": {SHA_B: {}}},
+                              heads, "tok", T0, run)
+        self.assertEqual((got, run.calls), (frozenset(), []))
+
+    def test_at_most_so_many_are_asked_in_a_tick(self):
+        heads = [(n, "%040x" % n, REPO, False) for n in range(1, 41)]
+        run = self.reviews({n: [] for n in range(1, 41)})
+        pc.approved_prs(self.state_dir, {"results": {}}, heads, "tok", T0,
+                        run)
+        self.assertEqual(len(run.calls), pc.APPROVED_MAX_CALLS)
+        pc.approved_prs(self.state_dir, {"results": {}}, heads, "tok",
+                        T0 + datetime.timedelta(minutes=1), run)
+        self.assertEqual(len(run.calls), 40)
+
+    def test_a_tick_starts_the_approved_head_and_says_why(self):
+        self.write_state(self.waiting(**{SHA_A: (7, 120), SHA_B: (8, 10)}))
+        run = FakeRun((is_pulls, done([], 0, heads_tsv(
+            (7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")))),
+            (is_reviews, lambda args: done(args, 0, self.REVIEWER + "\n"
+                                           if "/pulls/8/" in " ".join(args)
+                                           else "")))
+        self.spawned = []
+        pc.tick(self.state_dir, "tok", run,
+                lambda *a: self.spawned.append(a), self.lines.append,
+                when=T0, slots=1)
+        self.assertEqual(self.spawned[0][1], SHA_B)
+        self.assertTrue(self.lines[-1].endswith(", first: it is approved"),
+                        self.lines[-1])
