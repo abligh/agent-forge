@@ -450,8 +450,16 @@ check stops its run. A red prefix one longer than a green one names
 its last member, and once it leads, `SUSPECTS #a..#b: #n is red on its
 own; the search ends`. With `merge.test_ahead.hand_back_red_suspect`
 (default on; designs/0044, rule 4) it is handed back as soon as it is
-named, `SUSPECT-RED #n: ...`, and kept in `red-suspects.json`: until
-it has a new head it is neither predicted, updated nor merged.
+named, `SUSPECT-RED #n: ...`, and kept in `red-suspects.json`, with
+when it was found red and the tip it was found red on: until it has a
+new head it is neither predicted, updated nor merged. A green run of
+the same head also releases it (amendment, 2026-11-04), as
+`labels.rerun` gives one: the build check's verdict on the head, from
+its state, finished after the suspect was found red, merged with that
+tip or a later one. The tick logs `SUSPECT-CLEARED #n: green rerun at
+<head>`, says so once on the pull request, and the hand-back is
+forgotten, so it is predicted again under its approval. A suspect
+kept before the amendment, with no time, waits for a new head.
 Without it, it is checked and handed back as without batches. When no
 suspects are left and every one merged, the first red was flaky:
 `BATCH-FLAKE #a..#b: every suspect merged green; the red top's tree
@@ -739,6 +747,9 @@ STALL_LABELS = ()
 WAITING_OWNER = DEFAULT_WAITING_OWNER
 # labels.urgent: the label that puts a pull request first, or None.
 URGENT_LABEL = None
+# labels.rerun: the label that has the build check run a red head
+# again (designs/0022), or None; named in RED_SUSPECT_DETAIL.
+RERUN_LABEL = None
 # The pull requests that fix a red nightly (designs/0028), taken as if
 # urgent; read from forge-nightly's state by `main` (and the router's).
 NIGHTLY_FIXES = frozenset()
@@ -797,14 +808,26 @@ CHECKED_FILE = "checked.json"
 # merge.test_ahead.hand_back_red_suspect (designs/0044, rule 4): a
 # suspect the search finds red on its own is handed back at once, and
 # kept out of batches, and not updated or merged, until it has a new
-# head: {pr: {head, reason}} in RED_SUSPECT_FILE.
+# head, or until the build check's run of the head is green again
+# (amendment, 2026-11-04): {pr: {head, reason, at, main}} in
+# RED_SUSPECT_FILE, `at` when it was found red and `main` the tip it
+# was found red on.
 RED_SUSPECT_OUT = True
 RED_SUSPECT_FILE = "red-suspects.json"
 RED_SUSPECT_REASON = ("a red batch's search found it red on its own: %s is "
                       "failure on it merged with %s")
 RED_SUSPECT_DETAIL = ("The build check's run of %s, this head merged onto "
                       "%s%s, was red. It stays out of the Merger's batches "
-                      "until this pull request has a new head.")
+                      "until this pull request has a new head, or until "
+                      "the build check's own run of this head, merged onto "
+                      "%s as it is now or later, is green.%s")
+RED_SUSPECT_RERUN = (" If you believe the red was a flake, put the `%s` "
+                     "label on this pull request to have it run again.")
+SUSPECT_CLEARED_NOTE = ("The build check's run of %s, merged onto %s%s, "
+                        "finished green at %s, after a red batch's search "
+                        "found it red on its own: that red looks like a "
+                        "flake. This is back in the Merger's queue under "
+                        "its approval.\n\n%s")
 # designs/0011, amendment: a head red only where the tip it was merged
 # with is red itself waits for the tip to be fixed, not handed back.
 BASE_RED_REASON = ("%s is red only in %s, as %s is at %s; waits for it to "
@@ -956,6 +979,7 @@ def configure(project):
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
     global FIXED_ORDER, RED_SUSPECT_OUT, UNSTABLE_AFTER, UNSTABLE_BATCHES
+    global RERUN_LABEL
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -983,6 +1007,7 @@ def configure(project):
     WAITING_OWNER = project.section("labels").get("waiting_on_owner",
                                                   DEFAULT_WAITING_OWNER)
     URGENT_LABEL = project.section("labels").get("urgent")
+    RERUN_LABEL = project.section("labels").get("rerun")
     ahead = merge.get("test_ahead")
     TEST_AHEAD = ahead is not None
     AHEAD_DEPTH = (ahead or {}).get("depth", DEFAULT_AHEAD_DEPTH)
@@ -4242,8 +4267,9 @@ def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
 def red_suspects(state_dir, prs):
     """RED_SUSPECT_FILE's entries for the pull requests in `prs` still
     at the head they were found red at (designs/0044, rule 4): {number,
-    as a string: {head, reason}}. A new head is new evidence, so its
-    entry is dropped, and so is a closed one's."""
+    as a string: {head, reason, at, main}}. A new head is new evidence,
+    so its entry is dropped, and so is a closed one's. A green run of
+    the same head is too, but that is `rerun_green`'s to say."""
     heads = {str(pr["number"]): pr["headRefOid"] for pr in prs}
     saved = load_json(os.path.join(state_dir, RED_SUSPECT_FILE), {})
     return {k: v for k, v in (saved.items() if isinstance(saved, dict)
@@ -4252,8 +4278,81 @@ def red_suspects(state_dir, prs):
             and heads.get(k) is not None and heads[k] == v.get("head")}
 
 
+def rerun_green(entry, head, check_state, repo, run=sh):
+    """The build check's green verdict on `head`, from its state
+    (`check_state`'s results), that releases the red suspect `entry`
+    (designs/0044, rule 4, amendment), or None. It must have finished
+    after the suspect was found red (`at`), so it is a run since, not
+    the head's own green from before; with the tip it was merged with
+    (`base`) known, that tip must be the one it was found red on
+    (`main`) or a descendant of it, which `git merge-base --is-ancestor`
+    in `repo` says. A batch's cover is not a run. An entry without `at`,
+    written before the amendment, is released only by a new head."""
+    r = ((check_state or {}).get("results") or {}).get(head)
+    if not isinstance(r, dict) or r.get("ok") is not True \
+            or r.get("covered") or not entry.get("at"):
+        return None
+    try:
+        if parse_time(r.get("finished")) <= parse_time(entry["at"]):
+            return None
+    except (TypeError, ValueError):
+        return None
+    base, red_main = r.get("base"), entry.get("main")
+    if isinstance(base, str) and base and isinstance(red_main, str) \
+            and red_main and base != red_main and git(
+                repo, "merge-base", "--is-ancestor", red_main, base,
+                run=run).returncode != 0:
+        return None
+    return r
+
+
+def clear_red_suspects(state_dir, reds, prs, check_state, repo, github,
+                       said, live, out, run=sh):
+    """Release each red suspect in `reds` whose head the build check has
+    since run green (`rerun_green`; designs/0044, rule 4, amendment):
+    drop it from `reds`, from RED_SUSPECT_FILE and from `said`, so that
+    it is predicted, updated and merged again under its approval, log
+    `SUSPECT-CLEARED`, and say so once on the pull request
+    (SUSPECT_CLEARED_NOTE). Returns the numbers released. Seen on
+    2026-11-04: a wall-clock timing test failed under load in a
+    suspect's own prefix, and the only way back was a new head, a
+    rebuild and, for a merge that wasn't clean, a re-review."""
+    heads = {str(pr["number"]): pr["headRefOid"] for pr in prs}
+    cleared = []
+    for key in sorted(reds, key=int):
+        entry = reds[key]
+        r = rerun_green(entry, heads[key], check_state, repo, run)
+        if r is None:
+            continue
+        head = heads[key]
+        out("SUSPECT-CLEARED #%s: green %sat %s; %sback in the queue" % (
+            key, "rerun " if r.get("rerun_of") is not None else "run ",
+            head[:10], "" if live else "would be "))
+        del reds[key]
+        cleared.append(int(key))
+        before = said.get(key)
+        if isinstance(before, dict) and before.get("head") == head \
+                and before.get("reason") == entry.get("reason"):
+            del said[key]
+        if not live:
+            continue
+        base = r.get("base")
+        ok, why = github.write(
+            "POST", "repos/%s/issues/%s/comments" % (REPO_SLUG, key),
+            body=SUSPECT_CLEARED_NOTE % (
+                head[:10], MAIN, " at %s" % base[:10]
+                if isinstance(base, str) and base else "",
+                r.get("finished"), SIGNATURE))
+        if not ok:
+            out("SUSPECT-CLEARED #%s: commenting refused: %s" % (key, why))
+    if cleared and live:
+        save_json(os.path.join(state_dir, RED_SUSPECT_FILE), reds)
+        save_json(os.path.join(state_dir, "handed-back.json"), said)
+    return cleared
+
+
 def hand_back_red_suspect(state_dir, entry, green, queue, approvals, reds,
-                          github, said, live, record, out):
+                          github, said, live, record, out, main_tip=None):
     """designs/0044, rule 4: hand back the suspect a red batch's search
     found red on its own (`entry`, its prediction, on top of `green`
     suspects found green), once, and keep it in RED_SUSPECT_FILE, so
@@ -4272,14 +4371,18 @@ def hand_back_red_suspect(state_dir, entry, green, queue, approvals, reds,
         RED_SUSPECT_DETAIL % (entry["sha"][:10], MAIN, (
             " and the %d pull requests ahead of it in the batch" % green
             if green > 1 else " and the one ahead of it in the batch"
-            if green else "")))
+            if green else ""), MAIN,
+            RED_SUSPECT_RERUN % RERUN_LABEL if RERUN_LABEL else ""))
     decision["suspect"] = True
     record["decisions"].append(decision)
     if str(entry["pr"]) not in reds:
         out("SUSPECT-RED #%d: red on its own at %s; %shanded back, and out "
             "of batches until a new head" % (
                 entry["pr"], entry["head"][:10], "" if live else "would be "))
-    reds[str(entry["pr"])] = {"head": entry["head"], "reason": reason}
+    kept = {"head": entry["head"], "reason": reason, "at": record["at"]}
+    if main_tip:
+        kept["main"] = main_tip
+    reds[str(entry["pr"])] = kept
     if live:
         save_json(os.path.join(state_dir, RED_SUSPECT_FILE), reds)
 
@@ -4622,6 +4725,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     said = load_json(said_path, {})
     reds = red_suspects(state_dir, prs) if TEST_AHEAD and RED_SUSPECT_OUT \
         else {}
+    cleared = clear_red_suspects(
+        state_dir, reds, prs, check_state, repo, github, said, live, out,
+        run) if reds else []
     since, overdue = {}, {}
     if AGE_FIRST is not None:
         since = waiting_since(os.path.join(
@@ -4740,6 +4846,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     queue = [pr for pr in queue if pr["number"] not in held_by]
     record = {"at": iso(when), "main": main_tip, "held": held,
               "queue": [pr["number"] for pr in queue], "decisions": []}
+    if cleared:
+        record["suspects_cleared"] = cleared
     QUEUE_VIEW.clear()
     QUEUE_VIEW.update(queue=record["queue"], held=held, prs=prs)
     if YIELD_PLACES:
@@ -5168,7 +5276,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 for entry, green in found:
                     hand_back_red_suspect(
                         state_dir, entry, green, ahead_queue, approvals,
-                        reds, github, said, live, record, out)
+                        reds, github, said, live, record, out, main_tip)
                 if found:
                     save_json(said_path, said)
                 if found and not searching:

@@ -129,8 +129,14 @@ the label on, read from the pull request's events, and when), queues
 the head as if new, takes the label off, logs `RERUN` and posts the
 status back to pending. The second verdict's description says `(run
 again after red(<steps>))` and stands. A head already run again keeps
-its verdict, and the label comes off with a comment; on a green, pending
-or unrun head the label just comes off. On a head given up on (failures
+its verdict, and the label comes off with a comment; on a pending or
+unrun head the label just comes off. A pull request's green head is run
+again too, once, the same way (designs/0044, amendment): a Merger's
+batch can find a head red that was green on its own, and a flake there
+is lifted by a green run since. That run is forced: it is neither
+matched nor covered and reuses no step (`reruns.<sha>.force`), since
+its tree and steps are green here already and would only be posted
+green again; it says `(run again after green)`. On a head given up on (failures
 to prepare it, or host faults: neither its own) the label clears those
 counts, so the head is tried again in its old place; the tick logs
 `RERUN ... given up after ...`, posts pending and takes the label off.
@@ -1601,9 +1607,12 @@ def rerun_kind(state, sha, draft=False, repo=None):
     """What labels.rerun does to head sha (designs/0022): "stuck" for a
     waiting head given up on, which is tried again (its failures were
     not its own, so this is not its one run again), "again" for a head
-    already run again once, "red" for one to run again, else
-    "nothing", for a green, pending or unrun head, or a draft's or
-    another repository's, which aren't run."""
+    already run again once, "red" for one to run again, "green" for a
+    pull request's green head to run again as a forced run (designs/
+    0044, amendment: a Merger's red suspect whose own check was green),
+    else "nothing", for a pending or unrun head, the default branch's
+    green head, or a draft's or another repository's, which aren't
+    run."""
     if draft or (repo is not None and repo != REPO_SLUG):
         return "nothing"
     if given_up(state["waiting"].get(sha, {})):
@@ -1611,7 +1620,11 @@ def rerun_kind(state, sha, draft=False, repo=None):
     if sha in state.get("reruns", {}):
         return "again"
     r = state["results"].get(sha)
-    return "red" if r is not None and not r.get("ok") else "nothing"
+    if r is None:
+        return "nothing"
+    if not r.get("ok"):
+        return "red"
+    return "nothing" if r.get("main") else "green"
 
 
 def rerun_labelled(heads):
@@ -1644,8 +1657,9 @@ def take_reruns(state, labelled, labellers, when, state_dir, out=print):
     """labels.rerun, under the state lock, before the heads are queued:
     move each labelled red head's verdict into `reruns`, so note_heads
     queues it as if new, and say what is still to do on GitHub, as
-    [(pr, sha, what, detail)]: "rerun" (detail: who and the red's
-    steps) to post pending and take the label off, "stuck" (who) the
+    [(pr, sha, what, detail)]: "rerun" (detail: who) to post pending
+    and take the label off, "green" (who) the same for a green head,
+    whose run again is forced (`forced`), "stuck" (who) the
     same for a head given up on, whose counts are cleared and which
     keeps its place, "again" (who) to comment and take it off, "drop"
     to take it off. A head whose
@@ -1693,6 +1707,10 @@ def take_reruns(state, labelled, labellers, when, state_dir, out=print):
         verdict = state["results"].pop(sha)
         reruns[sha] = {"pr": pr, "verdict": verdict, "by": login,
                        "labelled": at, "queued": iso(when), "answered": at}
+        if kind == "green":
+            # Its tree is green here, and its steps' verdicts are too:
+            # a match or a reuse would only post that green again.
+            reruns[sha]["force"] = True
         # A fresh place at the back: queued as if new.
         state["waiting"].pop(sha, None)
         if verdict.get("main"):
@@ -1702,7 +1720,7 @@ def take_reruns(state, labelled, labellers, when, state_dir, out=print):
                                      "main": True, "rerun": True}
         log(state_dir, "RERUN #%d %s: was %s; queued by %s"
             % (pr, sha[:10], verdict_word(verdict), login), when, out)
-        todo.append((pr, sha, "rerun", login))
+        todo.append((pr, sha, "rerun" if kind == "red" else "green", login))
     if not reruns:
         del state["reruns"]
     return todo
@@ -1719,8 +1737,9 @@ def finish_reruns(todo, token, run=sh, post=None, out=print):
     taking the label off. A write GitHub refuses is printed
     RERUN-FAILED; a label left on is taken off by a later tick."""
     for pr, sha, what, login in todo:
-        if what == "rerun" and post is not None:
-            post(sha, "pending", "queued again after a red, by %s" % login)
+        if what in ("rerun", "green") and post is not None:
+            post(sha, "pending", "queued again after a %s, by %s"
+                 % ("red" if what == "rerun" else "green", login))
         if what == "stuck" and post is not None:
             post(sha, "pending", "queued again after it was given up on, "
                  "by %s" % login)
@@ -1742,9 +1761,17 @@ def finish_reruns(todo, token, run=sh, post=None, out=print):
                    (got.stderr or "").strip()[:200]))
 
 
+def forced(state, sha):
+    """Whether head sha waits for a forced run: labels.rerun on a green
+    head (designs/0044, amendment). It is neither matched, covered nor
+    reuses a step, so the run builds and runs each chosen step."""
+    return sha not in state["results"] and (
+        state.get("reruns", {}).get(sha) or {}).get("force") is True
+
+
 def mark_rerun(state, sha, record):
     """A verdict on a head run again (labels.rerun) names the red it
-    replaces, for its description."""
+    replaces, for its description, or none (`[]`) for a green."""
     moved = state.get("reruns", {}).get(sha)
     if moved is not None:
         record["rerun_of"] = list(moved["verdict"].get("failed", []))
@@ -2757,7 +2784,8 @@ def final_status(r):
     # labels.rerun (designs/0022): a second verdict says the head was
     # red once, early, since GitHub cuts the end.
     again = " (run again after red(%s))" % ",".join(r["rerun_of"]) \
-        if r.get("rerun_of") is not None else ""
+        if r.get("rerun_of") else " (run again after green)" \
+        if r.get("rerun_of") == [] else ""
     if r.get("conflicts") is not None:
         paths = r["conflicts"]
         return "failure", "red%s%s: conflicts with %s at %s%s" % (
@@ -4676,7 +4704,7 @@ def settled_heads(state, checkout, busy=(), when=None, run=sh,
     found = []
     for sha, entry in sorted(state["waiting"].items()):
         if entry.get("main") or sha in busy or just_started(entry, when) \
-                or not older(tip, sha):
+                or not older(tip, sha) or forced(state, sha):
             continue
         tree = tree_of(checkout, sha, run)
         same = tested(state, tree, when, ok=True, accept=every) \
@@ -5400,7 +5428,14 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                    if selection["stale"] else ""))
         phases.mark("choose")
         tree = tree_of(wt, checked, run) if TEST_AHEAD or main else None
-        if tree and not ahead and not main:
+        force = False
+        if RERUN_LABEL and not (ahead or main):
+            with state_lock(state_dir):
+                force = forced(load(state_dir), sha)
+        if force:
+            out("  forced: labels.rerun on a green head; nothing matched "
+                "or reused")
+        if tree and not ahead and not main and not force:
             with state_lock(state_dir):
                 same = tested(load(state_dir), tree, started, ok=True,
                               accept=covers(selection, lambda a, b: run(
@@ -5463,7 +5498,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                        CHECK_DEPENDS=depends)
             steps = [s for s in applicable(wt) if s[0] in selection["ran"]]
         digests, reused = {}, {}
-        if REUSE_AGE is not None and steps is not None:
+        if REUSE_AGE is not None and steps is not None and not force:
             # designs/0009: a step whose inputs a green run here
             # already tested isn't run again.
             try:

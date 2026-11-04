@@ -2743,10 +2743,12 @@ class SettledHeads(StateCase):
             (lambda a: "--is-ancestor" in a,
              done([], 0 if contains else 1)))
 
-    def settle(self, result, contains=True, busy=True, **estimate):
-        self.write_state({"waiting": {SHA_A: dict({"pr": 7, "since": pc.iso(
-            T0 - datetime.timedelta(minutes=5))}, **estimate)},
-            "results": {SHA_P: result}})
+    def settle(self, result, contains=True, busy=True, reruns=None,
+               **estimate):
+        self.write_state(dict({"waiting": {SHA_A: dict({
+            "pr": 7, "since": pc.iso(T0 - datetime.timedelta(minutes=5))},
+            **estimate)}, "results": {SHA_P: result}},
+            **({"reruns": reruns} if reruns else {})))
         if busy:
             self.hold(1, "#8 %s %s" % (SHA_B, pc.iso(T0)))
             self.hold(2, "#9 %s %s" % (SHA_C, pc.iso(T0)))
@@ -2767,6 +2769,14 @@ class SettledHeads(StateCase):
         self.assertEqual(self.spawned, [])
         self.assertTrue(any("MATCHED #7 %s" % SHA_A[:10] in line
                             for line in self.lines))
+
+    def test_a_forced_rerun_is_not_matched(self):
+        # labels.rerun on a green head (designs/0044, amendment).
+        self.settle(verdict(pr=7, ahead=True), reruns={SHA_A: {
+            "pr": 7, "verdict": verdict(pr=7), "queued": pc.iso(T0),
+            "force": True}})
+        self.assertIn(SHA_A, self.state()["waiting"])
+        self.assertNotIn(SHA_A, self.state()["results"])
 
     def batched(self, results, contains=None):
         """A tick with #7's head on the tree of the first member of the
@@ -3085,6 +3095,29 @@ class WorkerAhead(Worker):
                           r["tree"]), (True, SHA_P, 0, True, TREE_1))
         self.assertEqual(state["waiting"], {})
         self.assertIn("MATCHED #7 aaaaaaaaaa", self.logged())
+
+    def test_a_forced_rerun_of_a_green_head_is_run(self):
+        # labels.rerun on a green head (designs/0044, amendment): a
+        # match would only post the green it already has.
+        self.write_state(dict(empty(), results={
+            SHA_P: verdict(pr=2, ahead=True)}))
+        self.queue()
+        state = self.state()
+        state["reruns"] = {SHA_A: {"pr": 7, "verdict": verdict(pr=7),
+                                   "queued": pc.iso(T0), "force": True}}
+        self.write_state(state)
+        posts = []
+        run = self.run_for()
+        with mock.patch.object(pc, "RERUN_LABEL", "rerun"):
+            self.assertEqual(self.work(run, post=lambda *a: posts.append(a)
+                                       or True), 0)
+        self.assertTrue(self.ran(run))
+        r = self.state()["results"][SHA_A]
+        self.assertNotIn("matched", r)
+        self.assertEqual(r["rerun_of"], [])
+        self.assertIn("(run again after green)", posts[-1][2])
+        self.assertIn("  forced: labels.rerun on a green head; nothing "
+                      "matched or reused", self.lines)
 
     def test_another_heads_green_is_named_as_that_head(self):
         self.write_state(dict(empty(), results={SHA_B: verdict(pr=4)}))

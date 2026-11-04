@@ -218,8 +218,38 @@ class RerunTick(base.StateCase):
         self.assertFalse(any(p[1] == "pending" and "again" in p[2]
                              for p in self.posts))
 
-    def test_a_green_head_just_loses_the_label(self):
-        self.check_nothing_to_run({"results": {SHA_A: green()}})
+    def test_a_green_head_is_run_again_forced(self):
+        # designs/0044, amendment: a Merger's red suspect whose own check
+        # was green, red only in its batch's run onto main.
+        first = green()
+        self.write_state({"results": {SHA_A: first}})
+        self.assertEqual(self.tick(), 0)
+        state = self.state()
+        self.assertNotIn(SHA_A, state["results"])
+        self.assertEqual(state["reruns"][SHA_A], {
+            "pr": 7, "verdict": first, "by": LABELLER, "labelled": AT_2,
+            "queued": pc.iso(T0), "answered": AT_2, "force": True})
+        self.assertTrue(pc.forced(state, SHA_A))
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_A, 7, True, 1)])
+        self.assertEqual(len(self.calls(is_unlabel)), 1)
+        self.assertEqual(self.calls(is_comment), [])
+        self.assertIn((SHA_A, "pending", "queued again after a green, by %s"
+                       % LABELLER), self.posts)
+        logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertIn("RERUN #7 aaaaaaaaaa: was green; queued by %s"
+                      % LABELLER, logged)
+
+    def test_a_green_head_run_again_once_is_refused_like_a_red(self):
+        self.write_state({"results": {SHA_A: green()}, "reruns": {SHA_A: {
+            "pr": 7, "verdict": green(), "by": AUTHOR, "labelled": AT,
+            "queued": pc.iso(T0), "answered": AT, "force": True}}})
+        self.tick()
+        self.assertEqual(len(self.calls(is_comment)), 1)
+        self.assertFalse(pc.forced(self.state(), SHA_A))
+
+    def test_the_default_branch_s_green_head_is_not_run_again(self):
+        self.assertEqual(pc.rerun_kind({"results": {SHA_A: dict(
+            green(0), main=True)}, "waiting": {}}, SHA_A), "nothing")
 
     def test_a_pending_head_just_loses_the_label(self):
         self.check_nothing_to_run({"waiting": {SHA_A: {
@@ -336,6 +366,10 @@ class RerunVerdict(base.StateCase):
         self.assertEqual(pc.final_status(r), (
             "failure", "red on build.example.org (run again after "
             "red(test)): test failed"))
+
+    def test_a_forced_rerun_of_a_green_says_so(self):
+        self.assertIn("(run again after green)", pc.final_status(
+            dict(green(), rerun_of=[]))[1])
 
     def test_a_first_verdict_says_nothing_of_it(self):
         self.assertNotIn("run again", pc.final_status(red())[1])

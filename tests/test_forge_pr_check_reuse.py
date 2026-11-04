@@ -635,6 +635,21 @@ class Worker(DigestCase):
         self.assertIn("  steps: a reused (a as #7 at %s); b skipped; "
                       "c skipped" % one[:7], self.lines)
 
+    def test_a_forced_rerun_reuses_nothing(self):
+        # labels.rerun on a green head (designs/0044, amendment): its
+        # steps' verdicts are green here already, so a reuse would only
+        # post that green again.
+        one = self.pr_head(7, {"A": "a2\n"})
+        self.work_pr(one, 7)
+        two = self.pr_head(8, {"A": "a2\n", "Z": "z\n"})
+        self.write_state(dict(self.state(), reruns={two: {
+            "pr": 8, "verdict": {"ok": True}, "queued": pc.iso(T0),
+            "force": True}}))
+        with mock.patch.object(pc, "RERUN_LABEL", "rerun"):
+            self.assertEqual(self.work_pr(two, 8, at=T0 + DAY), 0)
+        self.assertEqual(self.ran(), ["a", "a"])
+        self.assertNotIn("reused", self.state()["results"][two])
+
     def test_a_red_step_runs_again(self):
         broken = [("a", ["sh", "-c", "echo a >> %s; false" % self.log],
                    None)] + self.steps[1:]
