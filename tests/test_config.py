@@ -786,6 +786,19 @@ class Check(unittest.TestCase):
             {"name": "c", "after": ["b"]})), [
             "checks.steps: `after` makes a cycle: a -> c -> b -> a"])
 
+    def test_warm(self):
+        self.assertEqual(self.problems(checks={
+            "warm": {"paths": ["Cargo.lock"], "minutes": 30}}), [])
+        self.assertEqual(self.problems(checks={
+            "warm": {"paths": ["Cargo.lock"]}}), [])
+        self.assertEqual(self.problems(checks={
+            "warm": {"paths": [], "minutes": 0, "slots": 1}}), [
+            "checks.warm: unknown key 'slots'",
+            "checks.warm.paths must be a non-empty list of globs",
+            "checks.warm.minutes must be at least 1"])
+        self.assertEqual(self.problems(checks={"warm": ["Cargo.lock"]}), [
+            "checks.warm must be an object"])
+
     def test_fast_lane(self):
         # designs/0006.
         self.assertEqual(self.problems(checks={

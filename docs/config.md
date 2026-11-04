@@ -183,6 +183,33 @@ hollowed out Cargo's incremental sessions, and rustc crashed. A missing
 directory only makes it build that part afresh, so pruning costs time,
 never a wrong verdict.
 
+### Warming a slot's caches
+
+Each slot keeps its own caches, and they are only as new as the last
+run in that slot built them. When the default branch changes something
+most of the tree depends on (a lock file, a core library), every later
+run in a slot whose caches were last built at an older head builds that
+change again, whatever its pull request touches. With `warm`, an idle
+tick builds the default branch's head again in such a slot, so the next
+pull request in it starts from caches at the head:
+
+- only when no head is waiting to start, and never in the last free
+  slot, which stays for a pull request that turns up meanwhile;
+- only once the head has a green verdict of its own;
+- in a slot whose last green default-branch run was at another head,
+  when the paths changed between the two match a glob in `warm.paths`
+  (`fnmatch`, whose `*` also matches `/`), or when that head can't be
+  known (a slot never built, or a head git doesn't have);
+- at most once per head in a slot, and once every `warm.minutes` (60).
+
+The run is the default branch's full run, never matched or reused,
+untraced, and posted nowhere. Its outcome is kept in `state.json`'s
+`warm` by slot, not as the head's verdict, so a red one changes nothing
+but the log. The tick logs `SLOT-WARM slot <n> <head>: cache at
+<head>, main changed <paths>`, the run `WARM-GREEN` or `WARM-RED`.
+Every run's verdict names its slot (`slot`), and a green default-branch
+run records the head it built the slot's caches at (`cache_main_sha`).
+
 Links are never followed, so nothing outside the caches is touched.
 What went is logged in `verdicts.log` as `CACHE-PRUNED`, with the bytes
 freed and left.
@@ -976,6 +1003,7 @@ unaffected: their lines stay body-only, as the Merger reads them
 | `steps` | one step, `make test` | What runs on each head, in order: `{"name": ..., "run": [argv], "only_if": path, "always": bool, "version": [argv], "reads_base": bool, "outputs": [path], "after": [name], "alone": bool, "light": bool, "caches": {...}}`, `only_if` a file the head must have; `outputs`, paths inside the worktree the step leaves behind that the tracer may not see it write (`reuse.chain_writes_only`); with `depends`, `always` runs the step whatever changed, for a cheap step or one that depends on more than files (a statically linked tool the tracer can't see). `after`, `alone`, `light` and `caches` say how the step runs beside others, and mean nothing without `side_by_side`. They are left out of the step's input digest. |
 | `caches` | none | `{variable: directory name}`: each slot's own build cache, kept in the state directory, such as `{"CARGO_TARGET_DIR": "cargo-target"}`. |
 | `cache_limit` | none | The most a slot's `caches` may hold after a run, as a size such as `40G` (`K`, `M`, `G` or `T`); with it each run prunes its slot's caches (see below). Without it nothing is pruned. |
+| `warm` | none: off | `{"paths": [glob, ...], "minutes": 60}`: an idle slot whose caches were built at an older default-branch head, before changes to these paths, builds the head again (see "Warming a slot's caches"). `paths` is required. |
 | `slots` | `2` | Checks run at once (`$FORGE_PR_CHECK_SLOTS` overrides). |
 | `memory_max` | `16G` | Each step's memory limit, in systemd's syntax, or `off`; `null` starts no scope and says nothing (`$FORGE_PR_CHECK_MEMORY_MAX` overrides). |
 | `cpu_share` | `"run"` | When each step's `CHECK_CPUS` is worked out: `"run"`, once as the run starts, from the slots busy then; `"step"`, as each step starts, from the slots busy then, so a long step that starts after short ones gets the CPUs runs that have since finished let go. A `CHECK_CPUS` the host sets wins either way. designs/0029. |
@@ -1027,7 +1055,7 @@ platform. Without an instance, `forge-pr-check` runs as before.
 | Keys | Where they come from |
 | --- | --- |
 | `host`, `context`, `steps`, `poster` | The block. `context` and `steps` are required. `host` falls back to the top-level `host`, and `poster` to `checks.poster`. |
-| `slots`, `memory_max`, `cpu_weight`, `step_timeout_minutes`, `caches`, `cache_limit`, `keep_ignored`, `drop_env`, `merge_default`, `red_comment`, `max_wait_minutes`, `host_fault_text`, `cache_fault_text`, `step_alert`, `cpu_share`, `side_by_side` | The block, else `checks`, else the default. |
+| `slots`, `memory_max`, `cpu_weight`, `step_timeout_minutes`, `caches`, `cache_limit`, `keep_ignored`, `drop_env`, `merge_default`, `red_comment`, `max_wait_minutes`, `host_fault_text`, `cache_fault_text`, `step_alert`, `cpu_share`, `side_by_side`, `warm` | The block, else `checks`, else the default. |
 | `depends`, `tracer`, `depends_minutes`, `fast_lane`, `reuse`, `fresh`, `main` | The block only, else the default: they describe the first host's tracer. |
 | `main_red_issue` | The block only, never inherited: the instance's own issue while its newest default-branch verdict is red (designs/0034), titled by default `The default branch is red for <context> at <sha>`. Its `poster`'s App then needs `issues: write`. |
 | `first_authors`, `merger_first`, `merger_cpu_weight`, `docker_slices` | `checks` only, and refused in a block: they belong to the context the Merger requires. `merge.test_ahead` doesn't apply to an instance either. |

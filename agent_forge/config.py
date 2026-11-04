@@ -139,7 +139,7 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "host_fault_text": list, "cache_fault_text": list,
           "step_alert": dict, "cpu_share": str,
           "side_by_side": dict, "merger_cpu_weight": int,
-          "docker_slices": dict, "pull_requests": dict}
+          "docker_slices": dict, "pull_requests": dict, "warm": dict}
 # checks.docker_slices (designs/0031): the slices each step's
 # containers go in, the next merge's run's and every other's.
 DOCKER_SLICES = {"front": str, "other": str}
@@ -165,7 +165,7 @@ INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight",
                       "keep_ignored", "drop_env", "merge_default",
                       "red_comment", "max_wait_minutes", "host_fault_text",
                       "cache_fault_text", "step_alert", "cpu_share",
-                      "side_by_side")
+                      "side_by_side", "warm")
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main", "main_red_issue")
 INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
@@ -190,6 +190,9 @@ MAIN_RED_ISSUE = {"label": str, "labels": list, "title": str}
 SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 # checks.fast_lane: a slot for heads whose chosen steps are cheap.
 FAST_LANE = {"max_seconds": int}
+# checks.warm: an idle slot builds the default branch's head again when
+# its caches were built at a head older by changes to these paths.
+WARM = {"paths": list, "minutes": int}
 # checks.reuse: a step's green verdict reused for unchanged inputs.
 REUSE = {"max_age_days": int, "trace_matched_main": bool,
          "chain_writes_only": bool, "dirs_by_names": bool,
@@ -890,6 +893,8 @@ def _check_checks(checks, data, problems, where="checks"):
                                 "(\"<name>.slice\")" % (where, key))
     if isinstance(checks.get("fast_lane"), dict):
         _check_fast_lane(checks, problems, where)
+    if isinstance(checks.get("warm"), dict):
+        _check_warm(checks, problems, where)
     if isinstance(checks.get("reuse"), dict):
         _check_reuse(checks, problems, where)
     if isinstance(checks.get("fresh"), dict):
@@ -1198,6 +1203,20 @@ def _check_fast_lane(checks, problems, section="checks"):
     if checks.get("depends") is not True:
         problems.append("%s needs %s.depends: without it every head "
                         "runs every step, and none is cheap" % (where, section))
+
+
+def _check_warm(checks, problems, section="checks"):
+    """checks.warm: which paths changed on the default branch make an
+    idle slot build its head again, and how often a slot may."""
+    where = section + ".warm"
+    warm = checks["warm"]
+    _fields(where, warm, WARM, problems)
+    paths = warm.get("paths")
+    if not (isinstance(paths, list) and paths and all(
+            isinstance(p, str) and p.strip() for p in paths)):
+        problems.append("%s.paths must be a non-empty list of globs" % where)
+    if _is(warm.get("minutes"), int) and warm["minutes"] < 1:
+        problems.append("%s.minutes must be at least 1" % where)
 
 
 def _check_fresh(checks, problems, section="checks"):

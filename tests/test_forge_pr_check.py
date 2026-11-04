@@ -2725,6 +2725,135 @@ class TwinHeads(unittest.TestCase):
 TIP = "9" * 40
 
 
+class WarmSlot(StateCase):
+    """checks.warm: an idle slot builds the default branch's head again
+    when its caches were built at a head older by changes that matter."""
+
+    OLD = "0" * 40
+
+    def setUp(self):
+        super().setUp()
+        data = example()
+        data["checks"]["warm"] = {"paths": ["Cargo.lock", "crates/core/*"],
+                                  "minutes": 60}
+        pc.configure(config.Project(data, None))
+        self.addCleanup(pc.configure, config.Project(example(), None))
+
+    def run_with(self, diff="Cargo.lock\nREADME.md\n", diff_rc=0,
+                 before=None, heads=()):
+        return FakeRun(
+            (is_pulls, done([], 0, heads_tsv(*heads))),
+            (lambda a: "refs/remotes/origin/" + pc.MAIN in a
+             and "rev-list" not in a,
+             done([], 0, "%s\n%s\n" % (TIP, TREE_2))),
+            (lambda a: "rev-list" in a, done([], 0, (before or "") + "\n")),
+            (lambda a: "diff" in a and "--name-only" in a,
+             done([], diff_rc, diff)))
+
+    def state_with(self, **more):
+        return dict({"waiting": {}, "results": {TIP: verdict(pr=0, main=True)},
+                     "cache_main_sha": {"1": self.OLD, "2": self.OLD,
+                                        "3": self.OLD}}, **more)
+
+    def warm(self, state, free=(1, 2), run=None, when=T0):
+        return pc.warm_slot(state, list(free), (TIP, TREE_2), "/repo", when,
+                            run or self.run_with())
+
+    def test_off_by_default(self):
+        pc.configure(config.Project(example(), None))
+        self.assertIsNone(pc.WARM_PATHS)
+        self.assertIsNone(self.warm(self.state_with()))
+
+    def test_the_configuration(self):
+        self.assertEqual(pc.WARM_PATHS, ("Cargo.lock", "crates/core/*"))
+        self.assertEqual(pc.WARM_EVERY, datetime.timedelta(minutes=60))
+
+    def test_a_stale_slot_whose_change_matters_is_warmed(self):
+        self.assertEqual(self.warm(self.state_with()),
+                         (1, self.OLD, ["Cargo.lock"]))
+
+    def test_changes_no_glob_names_dont_warm(self):
+        run = self.run_with(diff="README.md\ndocs/x.md\n")
+        self.assertIsNone(self.warm(self.state_with(), run=run))
+
+    def test_a_slot_built_at_the_head_isnt_warmed(self):
+        state = self.state_with(cache_main_sha={"1": TIP, "2": self.OLD})
+        self.assertIsNone(self.warm(state))
+        self.assertEqual(self.warm(state, free=(1, 2, 3)),
+                         (2, self.OLD, ["Cargo.lock"]))
+
+    def test_never_the_last_free_slot(self):
+        self.assertIsNone(self.warm(self.state_with(), free=(1,)))
+
+    def test_only_once_the_head_is_green(self):
+        self.assertIsNone(self.warm(self.state_with(results={})))
+        self.assertIsNone(self.warm(self.state_with(
+            results={TIP: verdict(pr=0, ok=False)})))
+
+    def test_once_per_slot_per_interval_and_once_per_head(self):
+        recent = {"1": {"sha": SHA_B, "at": pc.iso(
+            T0 - datetime.timedelta(minutes=30))}}
+        self.assertIsNone(self.warm(self.state_with(warm=recent)))
+        self.assertEqual(self.warm(self.state_with(warm=recent),
+                                   free=(1, 2, 3))[0], 2)
+        later = T0 + datetime.timedelta(minutes=31)
+        self.assertEqual(self.warm(self.state_with(warm=recent),
+                                   when=later)[0], 1)
+        # Tried at this head already, green or red: not again.
+        tried = {"1": {"sha": TIP, "at": pc.iso(
+            T0 - datetime.timedelta(hours=5)), "ok": False}}
+        self.assertIsNone(self.warm(self.state_with(warm=tried)))
+
+    def test_a_cache_from_before_its_head_was_kept(self):
+        state = self.state_with(cache_main_sha={}, cache_main={"1": 1e9})
+        run = self.run_with(before=self.OLD)
+        self.assertEqual(self.warm(state, run=run),
+                         (1, self.OLD, ["Cargo.lock"]))
+        listed = [c["args"] for c in run.calls if "rev-list" in c["args"]]
+        self.assertIn("--before=@1000000000", listed[0])
+
+    def test_a_slot_never_built_or_unknown_is_warmed(self):
+        self.assertEqual(self.warm(self.state_with(cache_main_sha={})),
+                         (1, None, None))
+        self.assertEqual(self.warm(self.state_with(), run=self.run_with(
+            diff_rc=128)), (1, self.OLD, None))
+
+    def tick(self, heads=()):
+        self.spawned = []
+        pc.tick(self.state_dir, "tok", self.run_with(heads=heads),
+                lambda *a, **k: self.spawned.append((a, k)),
+                self.lines.append, when=T0, slots=2, checkout="/repo")
+
+    def test_an_idle_tick_warms_a_slot(self):
+        self.write_state(self.state_with())
+        self.tick()
+        (args, kw), = self.spawned
+        self.assertEqual(args[1:5], (TIP, 0, False, 1))
+        self.assertEqual(kw, {"main": True, "warm": True})
+        self.assertEqual(self.state()["warm"]["1"]["sha"], TIP)
+        self.assertIn("SLOT-WARM slot 1 %s: cache at %s, main changed "
+                      "Cargo.lock" % (TIP[:10], self.OLD[:10]),
+                      pathlib.Path(self.state_dir, "verdicts.log")
+                      .read_text())
+        # The next tick doesn't warm it again.
+        self.tick()
+        self.assertEqual(self.spawned, [])
+
+    def test_a_waiting_head_goes_first(self):
+        self.write_state(self.state_with())
+        self.tick(heads=[(7, SHA_A, REPO, "false")])
+        (args, kw), = self.spawned
+        self.assertEqual(args[1:3], (SHA_A, 7))
+        self.assertNotIn("warm", kw)
+        self.assertNotIn("warm", self.state())
+
+    def test_off_an_idle_tick_starts_nothing(self):
+        pc.configure(config.Project(example(), None))
+        self.write_state(self.state_with())
+        self.tick()
+        self.assertEqual(self.spawned, [])
+
+
 class SettledHeads(StateCase):
     """A head that a worker would only match is matched by the tick, with
     no slot: one waited 38 minutes behind six runs for a slot to match

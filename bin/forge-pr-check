@@ -444,6 +444,15 @@ hold at most the limit. Links are never followed. What went is logged
 as `CACHE-PRUNED`; a failure to prune is logged and changes nothing
 else. Without it, nothing is pruned.
 
+**With `checks.warm`, an idle slot catches up with the default
+branch.** When no head waits to start, and more than one slot is free,
+a slot whose caches were last built at an older default-branch head,
+by a change to a path `warm.paths` names, builds the default branch's
+green head again (`warm_slot`): untraced, posted nowhere, its outcome
+kept in state.json's `warm` and never as a verdict. Logged `SLOT-WARM`,
+then `WARM-GREEN` or `WARM-RED`; at most once per head per slot, and
+once every `warm.minutes`.
+
 **Each step gets `CHECK_RESULTS`, an empty directory of its own** to
 leave results in, such as a test runner's per-shard times. It is
 `results/<head>/<step>` in the state directory, kept as long as the
@@ -666,6 +675,13 @@ VERSION_TIMEOUT_S = 60
 # checks.cache_limit: the most a slot's caches may hold, in bytes, after
 # a run prunes them (`prune_caches`); None: never pruned.
 CACHE_LIMIT = None
+# checks.warm: globs of paths whose change on the default branch, since
+# the head a slot's caches were last built at, makes that slot build the
+# default branch's head again when it is idle (`warm_slot`); None: off.
+WARM_PATHS = None
+# How long a slot waits after one warming before the next.
+DEFAULT_WARM_MINUTES = 60
+WARM_EVERY = datetime.timedelta(minutes=DEFAULT_WARM_MINUTES)
 # What pruning takes first: executables under a `deps` directory older
 # than this that the default branch's last green run in the slot didn't
 # write (and their split debug info), and `incremental` directories
@@ -895,7 +911,8 @@ def configure(project, instance=None):
     `step_timeout_minutes`, `merger_first`, `depends`,
     `depends_minutes`, `tracer`, `fast_lane`, `merge_default`,
     `cache_limit`, `reuse`, `fresh`, `first_authors`, `max_wait_minutes`,
-    `keep_ignored`, `cpu_share`, `side_by_side`, each step's `always`,
+    `keep_ignored`, `cpu_share`, `side_by_side`, `warm`, each step's
+    `always`,
     `version`, `outputs`, `after`, `alone`, `light` and `caches`),
     each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
@@ -910,7 +927,7 @@ def configure(project, instance=None):
     global MERGER_CPU_WEIGHT, DOCKER_SLICES
     global STEP_CACHES
     global TEST_AHEAD, SPARE_ONLY, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
-    global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT
+    global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT, WARM_PATHS, WARM_EVERY
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     global TRACE_MATCHED_MAIN, CHAIN_WRITES_ONLY, DIRS_BY_NAMES, OUTPUTS
     global MATCH_MAIN_UNRECORDED
@@ -1014,6 +1031,9 @@ def configure(project, instance=None):
     DROP_PREFIXES = tuple(d[:-1] for d in drop if d.endswith("*"))
     CACHE_LIMIT = size_bytes(checks["cache_limit"]) \
         if "cache_limit" in checks else None
+    WARM_PATHS = tuple(checks["warm"]["paths"]) if "warm" in checks else None
+    WARM_EVERY = datetime.timedelta(minutes=(checks.get("warm") or {}).get(
+        "minutes", DEFAULT_WARM_MINUTES))
     SLOTS = checks.get("slots", DEFAULT_SLOTS)
     MEMORY_MAX = checks.get("memory_max", DEFAULT_MEMORY_MAX)
     CPU_WEIGHT = checks.get("cpu_weight", DEFAULT_CPU_WEIGHT)
@@ -1848,6 +1868,60 @@ def main_rerun_labelled(state, head, token, run=sh):
     if got.returncode != 0 or RERUN_LABEL not in got.stdout.splitlines():
         return []
     return [(issue, head[0], False, None)]
+
+
+def warm_slot(state, free, head, checkout, when, run=sh):
+    """checks.warm: (slot, cached, changed) for the first of the `free`
+    slots whose caches want building at the default branch's head
+    `head` (sha, tree), or None. Only when the head already has a green
+    verdict of its own (a red or unrun head has its own run coming), and
+    never in the last free slot, which stays for a pull request that
+    turns up meanwhile. A slot is skipped when it was warmed, or tried,
+    at this head or less than WARM_EVERY ago; else it wants it when the
+    head its caches were last built at (`cached`, from its last green
+    default-branch run) isn't `head` and the paths changed between them
+    (`changed`) match a WARM_PATHS glob, or when that head can't be
+    known (`changed` is then None)."""
+    if WARM_PATHS is None or head is None or not checkout or len(free) < 2:
+        return None
+    sha = head[0]
+    if (state["results"].get(sha) or {}).get("ok") is not True:
+        return None
+    for slot in free[:-1]:
+        last = state.get("warm", {}).get(str(slot)) or {}
+        if last.get("sha") == sha:
+            continue
+        try:
+            if when - parse(last["at"]) < WARM_EVERY:
+                continue
+        except (KeyError, TypeError, ValueError):
+            pass
+        cached = state.get("cache_main_sha", {}).get(str(slot))
+        if cached == sha:
+            continue
+        if cached is None:
+            # Kept before cache_main_sha: the default branch's head when
+            # the slot's last green run of it began.
+            began = state.get("cache_main", {}).get(str(slot))
+            if began is not None:
+                got = run(["git", "-C", checkout, "rev-list", "-1",
+                           "--before=@%d" % int(began),
+                           "refs/remotes/origin/" + MAIN])
+                cached = (got.stdout or "").strip() or None \
+                    if got.returncode == 0 else None
+        if cached is None:
+            return slot, None, None
+        if cached == sha:
+            continue
+        got = run(["git", "-C", checkout, "diff", "--name-only", cached, sha])
+        if got.returncode != 0:
+            return slot, cached, None
+        changed = [path for path in (got.stdout or "").splitlines()
+                   if any(fnmatch.fnmatchcase(path, glob)
+                          for glob in WARM_PATHS)]
+        if changed:
+            return slot, cached, changed
+    return None
 
 
 def main_due(entry, when):
@@ -2971,16 +3045,17 @@ def repost(state, heads, post, out=print):
 
 
 def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
-                 ahead=False, main=False):
+                 ahead=False, main=False, warm=False):
     """Start the check detached; see the module docstring on the cron
     lock. Its output goes to worker.log. A prediction (`ahead`) posts
     nothing, but a posting one still chains the next tick. `main` is a
-    default-branch head's traced full run (checks.depends)."""
+    default-branch head's traced full run (checks.depends); `warm`, one
+    run again only to warm `slot`'s caches (checks.warm)."""
     wlog = open(os.path.join(state_dir, "worker.log"), "a")
     wlog.write("=== %s worker %s %s %s%s ===\n"
                % (iso(now_utc()), who(pr, main), sha,
                   "fast lane" if slot == LANE else "slot %d" % slot,
-                  " ahead" if ahead else ""))
+                  " ahead" if ahead else " warm" if warm else ""))
     wlog.flush()
     # The installation lock forge-cron-run handed this tick goes on to
     # the worker, which outlives it: the release can't move under a run.
@@ -2991,7 +3066,8 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
         + (["--checkout", checkout] if checkout else [])
         + (["--post"] if posting else [])
         + (["--ahead"] if ahead else [])
-        + (["--main"] if main else [])
+        + (["--main"] if main or warm else [])
+        + (["--warm"] if warm else [])
         + (["--merger-dir", MERGER_DIR_ARG] if MERGER_DIR_ARG else [])
         + (["--instance", INSTANCE] if INSTANCE is not None else []),
         cwd=state_dir, stdin=subprocess.DEVNULL, stdout=wlog,
@@ -3025,7 +3101,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     fields = {slot: holder_fields(h) for slot, h in holders.items()}
     busy = {f[1] for f in fields.values() if f}
     head_of_main = main_head(checkout, run) \
-        if (DEPENDS or MAIN_EVERY) and checkout else None
+        if (DEPENDS or MAIN_EVERY or WARM_PATHS) and checkout else None
     fresh = FRESH_WAIT is not None and DEPENDS and head_of_main is not None \
         and not MAIN_EVERY
     # With checks.fresh, what the default branch's head needs traced,
@@ -3066,8 +3142,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         # that would otherwise never end.
         unrun = [(pr, sha) for pr, sha in dropped if sha in state["waiting"]]
         note_heads(state, heads, when, state_dir, out, post)
-        if head_of_main and queue_main(state, head_of_main, when, state_dir,
-                                       busy, needs):
+        if head_of_main and (DEPENDS or MAIN_EVERY) and queue_main(
+                state, head_of_main, when, state_dir, busy, needs):
             out("QUEUED %s %s: a %srun of every step%s"
                 % (MAIN, head_of_main[0][:10], "traced " if DEPENDS else "",
                    "" if not needs else "; stale: " + ", ".join(needs)))
@@ -3275,6 +3351,26 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                len(queued - taken)))
         return 0
     if pick is None:
+        warming = warm_slot(state, free, head_of_main, checkout, when, run) \
+            if fast is None and not starting and not live_heads(
+                state, taken, when) else None
+        if warming is not None:
+            slot, cached, changed = warming
+            with state_lock(state_dir):
+                state = load(state_dir)
+                state.setdefault("warm", {})[str(slot)] = {
+                    "sha": head_of_main[0], "at": iso(when), "started": True}
+                save(state_dir, state)
+            spawn(state_dir, head_of_main[0], 0, post is not None, slot,
+                  checkout, main=True, warm=True)
+            log(state_dir, "SLOT-WARM %s %s: cache at %s, %s changed %s"
+                % (slot_label(slot), head_of_main[0][:10],
+                   cached[:10] if cached else "an unknown head", MAIN,
+                   ", ".join(changed[:5]) + (" and %d more"
+                                             % (len(changed) - 5)
+                                             if len(changed) > 5 else "")
+                   if changed else "(unknown)"), when, out)
+            return 0
         # A start in the lane has said what this tick did.
         if fast is None and starting:
             out("STARTING: %d just started, not yet running; %d waiting"
@@ -5307,7 +5403,7 @@ class Phases:
 
 def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
            post=None, chain=None, slot=1, memory_max=None, ahead=False,
-           main=False, report=None, front=None):
+           main=False, report=None, front=None, warm=False):
     """Check sha, pull request pr's head, now, in this process, in
     `slot`, each step limited to memory_max (None: no limit). With
     `ahead`, sha is the Merger's prediction for pr: checked out without
@@ -5330,7 +5426,15 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
 
     `front(when)` says whether the next merge waits on this run
     (designs/0031: checks.merger_cpu_weight, checks.docker_slices),
-    asked as each step starts. The fast lane's run never is."""
+    asked as each step starts. The fast lane's run never is.
+
+    With `warm` (checks.warm), sha is the default branch's head, run
+    again only so that `slot`'s caches are built at it: never matched,
+    untraced, posted nowhere, its outcome kept in state.json's `warm`
+    by slot rather than as sha's verdict, so a flaky red here can't make
+    the default branch red. Logged WARM-GREEN or WARM-RED."""
+    if warm:
+        main, post, report = True, None, None
     os.makedirs(state_dir, exist_ok=True)
     phases = Phases()
     started = clock()
@@ -5340,6 +5444,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                     "#%d %s %s pid=%d%s" % (pr, sha, iso(started),
                                             os.getpid(),
                                             " ahead" if ahead else
+                                            " main warm" if warm else
                                             " main" if main else ""))
     if held is None:
         out("BUSY: another check holds the worker lock"
@@ -5445,7 +5550,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 settled = True
                 return matched(state_dir, sha, pr, same, tree, started,
                                post, out)
-        if main and MAIN_EVERY and tree and (
+        if main and MAIN_EVERY and tree and not warm and (
                 not DEPENDS or MATCH_MAIN_UNRECORDED or os.path.exists(
                     os.path.join(trace.records_dir(state_dir),
                                  tree + ".json"))):
@@ -5519,7 +5624,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                            if name in reused else "ran" if name in
                            selection["ran"] else "skipped")
                 for name, _, _ in applicable(wt)))
-        if main and DEPENDS:
+        if main and DEPENDS and not warm:
             tracer = tracer_for(state_dir, run)
             if tracer is None:
                 log(state_dir, "NO-TRACE %s %s: the %s tracer can't be used "
@@ -5536,8 +5641,10 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                     "is recorded" % TRACER)
             else:
                 wrap = trace_wrapper(state_dir, slot, tracer, files)
-        kept = os.path.join(state_dir, RESULTS_DIR, sha)
-        logs = os.path.join(state_dir, LOGS_DIR, sha)
+        # A warming keeps its own, beside the verdict's.
+        mark = "%s-warm%d" % (sha, slot) if warm else sha
+        kept = os.path.join(state_dir, RESULTS_DIR, mark)
+        logs = os.path.join(state_dir, LOGS_DIR, mark)
         share, step_caches = cpu_share(state_dir, env), None
         if SIDE_BY_SIDE is not None:
             step_caches = {
@@ -5639,9 +5746,11 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             return 2
         with state_lock(state_dir):
             state = load(state_dir)
-            seen = state["waiting"].pop(sha, {}).get("since", iso(started))
+            seen = state["waiting"].get(sha, {}).get("since", iso(started)) \
+                if warm else \
+                state["waiting"].pop(sha, {}).get("since", iso(started))
             record = {
-                "pr": pr, "seen": seen, "started": iso(started),
+                "pr": pr, "slot": slot, "seen": seen, "started": iso(started),
                 "finished": iso(finished), "ok": ok,
                 "failed": [r["name"] for r in results if r["rc"] != 0],
                 # Side by side, the steps' own walls overlap: the run's
@@ -5662,12 +5771,12 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             if any(r.get("results_bytes") for r in results):
                 # What the steps left in CHECK_RESULTS, by step.
                 record["results"] = {
-                    "dir": os.path.join(RESULTS_DIR, sha),
+                    "dir": os.path.join(RESULTS_DIR, mark),
                     "steps": {r["name"]: results_name(r["name"])
                               for r in results if r.get("results_bytes")}}
             if os.path.isdir(logs):
                 # Each step's whole output, a time on every line.
-                record["logs"] = os.path.join(LOGS_DIR, sha)
+                record["logs"] = os.path.join(LOGS_DIR, mark)
             if TEST_AHEAD:
                 # What a later head with the same tree is matched by.
                 record.update(tree=tree, host=socket.gethostname(),
@@ -5694,6 +5803,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                     state.setdefault("cache_main", {})[str(slot)] = begun
                     state.setdefault("cache_main_end", {})[str(slot)] = \
                         time.time()
+                    # And the head they were built at (checks.warm).
+                    state.setdefault("cache_main_sha", {})[str(slot)] = sha
             if selection is not None:
                 record["selection"] = selection
             if merge:
@@ -5705,12 +5816,22 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                     record["base_red"] = True
             if not ahead and not main:
                 mark_rerun(state, sha, record)
-            flaked = flakes_of(state, sha, record)
-            state["results"][sha] = record
+            if warm:
+                flaked = []
+                state.setdefault("warm", {})[str(slot)] = dict(
+                    record, sha=sha, at=iso(started))
+            else:
+                flaked = flakes_of(state, sha, record)
+                state["results"][sha] = record
             save(state_dir, state)
         settled = True
         phases.mark("verdict")
-        if main:
+        if warm:
+            log(state_dir, "%s %s %s in %s: %s ran=%ds"
+                % ("WARM-GREEN" if ok else "WARM-RED", MAIN, sha[:10],
+                   slot_label(slot), verdict_word(record),
+                   record["seconds"]), finished, out)
+        elif main:
             log(state_dir, "%s %s %s: %s waited=%ds ran=%ds"
                 % ("MAIN-GREEN" if ok else "MAIN-RED", MAIN, sha[:10],
                    verdict_word(record),
@@ -5782,7 +5903,10 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         out("  overhead: %s" % phases.text())
         with state_lock(state_dir):
             state = load(state_dir)
-            if sha in state["results"]:
+            if warm and str(slot) in state.get("warm", {}):
+                state["warm"][str(slot)]["overhead"] = spent
+                save(state_dir, state)
+            elif sha in state["results"] and not warm:
                 if posted is not None:
                     state["results"][sha]["posted"] = posted
                 state["results"][sha]["overhead"] = spent
@@ -5841,6 +5965,11 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
                         help="with --worker: SHA is the default branch's "
                         "head, run in full under the tracer and its "
                         "dependency record written (checks.depends)")
+    parser.add_argument("--warm", action="store_true",
+                        help="with --worker and --main: build SHA again in "
+                        "--slot only to bring the slot's caches up to it "
+                        "(checks.warm): untraced, posted nowhere, and kept "
+                        "apart from its verdict")
     parser.add_argument("--state-dir", default=None,
                         help="where the queue, the verdicts and the logs "
                         "live (default ~/.local/state/agent-forge/"
@@ -5860,6 +5989,8 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
         "FORGE_CRON_CHECKOUT"), help="the checkout kept at the default "
         "branch (default $FORGE_CRON_CHECKOUT)")
     args = parser.parse_args(argv)
+    if args.warm:
+        args.main = True
     if args.worker and args.main and args.pr is None:
         args.pr = 0
     if args.worker and args.pr is None:
@@ -5892,13 +6023,15 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
         project.name, "pr-check" if args.instance is None
         else "pr-check-" + args.instance, environ)
     os.makedirs(state_dir, exist_ok=True)
-    post = make_poster(run, out, project) if args.post else None
+    post = make_poster(run, out, project) if args.post and not args.warm \
+        else None
     if args.worker:
         chain = (lambda: start_next_tick(
             checkout=repo, state_dir=args.state_dir,
             merger_dir=args.merger_dir)) if args.post else None
         report = None
-        if args.main and args.post and MAIN_RED_ISSUE is not None:
+        if args.main and args.post and MAIN_RED_ISSUE is not None \
+                and not args.warm:
             write = make_writer(project, out)
             report = lambda sha, ok, failed, same: report_main(
                 state_dir, repo, sha, ok, failed, same, write, out, run)
@@ -5917,7 +6050,7 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
                       post=post, chain=chain, slot=args.slot,
                       memory_max=memory_max_from_env(environ),
                       ahead=args.ahead, main=args.main, report=report,
-                      front=front)
+                      front=front, warm=args.warm)
     token = mint(run)
     if token is None:
         out("NO-TOKEN: could not mint %s's token" % POSTER)
