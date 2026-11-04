@@ -120,7 +120,9 @@ The numbers are read from forge-nightly's state
 default branch** (designs/0011, amendment): while the
 `checks.main_red_issue` issue is open, each open pull request whose
 title or body (outside code) closes it, read each tick and kept as
-`main_red.fixes` in state.json, where the Merger reads it too.
+`main_red.fixes` in state.json, where the Merger reads it too. An issue closed while the default branch is still red is
+reopened by its next red verdict (`MAIN-RED-REOPENED`), so its fixes go
+first again.
 
 **With `labels.rerun`, a red head can be run once more** (designs/0022).
 A tick that finds the label on an open pull request whose head is red
@@ -2418,6 +2420,10 @@ def make_writer(project, out=print, call=None):
     return write
 
 
+REOPENED_TEXT = ("Reopened: this was closed while `%s` is still red for "
+                 "`%s`, at %s: %s. It closes when a later tip is green.\n\n%s")
+
+
 def signature():
     """How an issue or comment forge-pr-check writes ends: a line saying
     the machinery wrote it, then `— <poster>`, the App it writes as, the
@@ -2492,8 +2498,9 @@ def report_main(state_dir, repo, sha, ok, failed, same, write, out=print,
     """checks.main_red_issue (designs/0011): keep one issue open while
     the default branch is red. The first red head opens it (labelled,
     with the failed steps and the commits since the last green head),
-    each further red head comments once, and the first green head closes
-    it, naming the run whose tree it matched (`same`) if it wasn't run.
+    each further red head comments once (or, finding the issue closed
+    while the default branch is still red, reopens it: `reopened`), and
+    the first green head closes it, naming the run whose tree it matched (`same`) if it wasn't run.
     A write GitHub refuses is logged REPORT-FAILED and tried again on the
     next verdict, never dropped."""
     with state_lock(state_dir):
@@ -2528,7 +2535,10 @@ def report_main(state_dir, repo, sha, ok, failed, same, write, out=print,
             state.pop("main_red", None) if not red else None
             save(state_dir, state)
         return
-    if red.get("issue"):
+    if red.get("issue") and reopened(state_dir, red, sha, failed, write,
+                                     when, out):
+        pass
+    elif red.get("issue"):
         if sha in red.get("told", []):
             return
         number = red["issue"]
@@ -2572,6 +2582,39 @@ def report_main(state_dir, repo, sha, ok, failed, same, write, out=print,
         state = load(state_dir)
         state["main_red"] = red
         save(state_dir, state)
+
+
+def reopened(state_dir, red, sha, failed, write, when, out=print):
+    """Whether the default branch's red issue `red` was found closed and
+    reopened, red at `sha` (designs/0011, amendment). An issue closed
+    while the default branch is still red (a pull request saying it
+    fixes it merged, and the next head is red too) holds no fix: only an
+    open issue's closing pull requests go first (`main_red.fixes`), so
+    no fix could jump the queue for as long as it stayed closed. It is
+    reopened with a comment saying where the default branch is red, and
+    `sha` counts as told. Logged MAIN-RED-REOPENED. An issue that is
+    open, or whose state can't be read, is False: commented on as
+    before. A reopen GitHub refuses is logged REPORT-FAILED, and False,
+    so the comment still goes."""
+    number = red["issue"]
+    path = "/repos/%s/issues/%d" % (REPO_SLUG, number)
+    got, issue = write("GET", path)
+    if got != 200 or not isinstance(issue, dict) \
+            or issue.get("state") != "closed":
+        return False
+    opened, _ = write("PATCH", path, {"state": "open"})
+    if opened != 200:
+        log(state_dir, "REPORT-FAILED %s %s: reopening #%d: HTTP %s"
+            % (MAIN, sha[:10], number, opened), when, out)
+        return False
+    steps = ", ".join(n for n, _ in failed) or "a step failed"
+    write("POST", path + "/comments", {"body": REOPENED_TEXT % (
+        MAIN, STATUS_CONTEXT, sha[:10], steps, signature())})
+    if sha not in red.get("told", []):
+        red["told"] = red.get("told", []) + [sha]
+    log(state_dir, "MAIN-RED-REOPENED #%d: closed while %s is still red at "
+        "%s (%s)" % (number, MAIN, sha[:10], steps), when, out)
+    return True
 
 
 def step_runs(state, since, until=None, weighted=None):
