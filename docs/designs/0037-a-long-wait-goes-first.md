@@ -98,3 +98,15 @@ Off by default. A project turns it on with `merge.age_first` in its
 configuration, once the release with it is pinned. Measured after a
 day: p90 and maximum queue-to-merge time, merges per hour, and how
 many predictions an overdue candidate spent.
+
+## Amendment (2026-11-04): behind a batch whose run has started
+
+* Status: approved (Alex, 2026-11-04, in XMPPEngineer's session)
+
+An overdue candidate goes first behind every batch whose top's run has
+started, not only behind the batch being merged
+([designs/0044](0044-a-quieter-merger-and-batches-that-keep-their-order.md),
+rule 3). On one project, going in front of such batches, with right of
+way and three batches in flight, re-cut the batches about 13 times an
+hour, and 46% of green batch-top runs merged nothing.
+`merge.test_ahead.fixed_order: false` turns it off.

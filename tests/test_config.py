@@ -313,11 +313,26 @@ class Check(unittest.TestCase):
             "stats_watch.figures.main_red must be an object",
             "stats_watch.figures.speed: unknown figure (one of check_run, "
             "check_wait, pr_turnaround, merge_time, merge_rate, "
-            "slots_busy, main_red, nightly_red_hours, main_cpu)"])
+            "slots_busy, main_red, nightly_red_hours, main_cpu, "
+            "hand_backs_per_merge, prs_per_slot, reviewer_busy)"])
         self.assertEqual(self.problems(stats_watch={}),
                          ["stats_watch: missing 'owner'"])
         self.assertEqual(self.problems(stats_watch=[]),
                          ["'stats_watch' must be an object"])
+
+    def test_stats_watch_takes_forge_flows_figures(self):
+        self.assertEqual(self.problems(stats_watch={
+            "owner": "LeadDev", "figures": {
+                "hand_backs_per_merge": {"limit": 1, "ratio": 2},
+                "prs_per_slot": {"limit": 2, "ratio": 1.5},
+                "reviewer_busy": {"limit": 90}}}), [])
+        self.assertEqual(self.problems(stats_watch={
+            "owner": "LeadDev", "figures": {
+                "reviewer_busy": {"ratio": 2},
+                "prs_per_slot": {"limit": 0}}}), [
+            "stats_watch.figures.reviewer_busy: unknown key 'ratio'",
+            "stats_watch.figures.prs_per_slot.limit must be a number "
+            "above 0"])
 
     def test_stats_watch_main_cpu_takes_a_step(self):
         def problems(rules):
@@ -544,6 +559,38 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"test_ahead": {
             "batches": True}}),
             ["merge.test_ahead.batches must be an integer"])
+
+    def test_merge_designs_0044(self):
+        # Rules 1 to 4 are switches, on unless set to false.
+        self.assertEqual(self.problems(merge={
+            "hand_back_once_per_head": False,
+            "right_of_way": {"while_eligible": False},
+            "test_ahead": {"fixed_order": False,
+                           "hand_back_red_suspect": False}}), [])
+        self.assertEqual(self.problems(merge={
+            "hand_back_once_per_head": 1,
+            "right_of_way": {"while_eligible": "no"},
+            "test_ahead": {"fixed_order": 0}}), [
+            "merge.hand_back_once_per_head must be true or false",
+            "merge.test_ahead.fixed_order must be true or false",
+            "merge.right_of_way.while_eligible must be true or false"])
+
+    def test_merge_test_ahead_unstable(self):
+        # designs/0044, rule 5.
+        ahead = {"depth": 7, "batch": 4, "batches": 2}
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, unstable_after_recuts=6)}), [])
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, unstable_after_recuts=6, batches_when_unstable=2)}), [])
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, unstable_after_recuts=0, batches_when_unstable=3)}), [
+            "merge.test_ahead.unstable_after_recuts must be at least 1",
+            "merge.test_ahead.batches_when_unstable must be at least 1 and "
+            "at most batches (2)"])
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, batches_when_unstable=1)}), [
+            "merge.test_ahead.batches_when_unstable needs "
+            "unstable_after_recuts"])
 
     def test_merge_test_ahead_batch(self):
         self.assertEqual(self.problems(merge={"test_ahead": {"batch": 4}}),

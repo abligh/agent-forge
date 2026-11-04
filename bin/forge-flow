@@ -1,0 +1,1295 @@
+#!/usr/bin/env python3
+"""Write a web page that says why merging is slow, from local records.
+
+    forge-flow [--state-dir DIR] --out DIR [--now TIME] [--github]
+               [--checkout DIR]
+
+designs/0045. Reads what forge-pr-check, forge-merger and forge-router
+already write in a project's state directory (`--state-dir`, default
+~/.local/state/agent-forge/<project>/ from the configuration) and
+writes three files into `--out`:
+
+* `index.html`, one static page: no scripts, inline SVG and CSS bars,
+  light and dark, readable on a phone;
+* `flow.json`, every number on the page;
+* `flow-history.jsonl`, one line for each whole hour, appended once.
+
+It changes nothing else. The files it reads:
+
+* `pr-check/worker.log`: the `=== <time> worker ...` line that starts
+  each run (its slot, and `ahead` for a Merger prediction);
+* `pr-check/verdicts.log`: how each run ended (VERDICT, MAIN-GREEN,
+  MAIN-RED, STOPPED) and what was posted without a run (MATCHED,
+  COVERED);
+* `merger/merger.jsonl`: one record a Merger tick;
+* `merger/ahead.json` and `merger/handed-back.json`: the batch and the
+  hand-backs now;
+* `router/presence.jsonl`, if there is one: who was busy and idle.
+
+**The panels**, each over the last 1 h, 6 h and 24 h, with the 7 days
+up to now (or as much of them as the records hold) as a baseline:
+
+1. Why so few merges: each Merger tick is put in one state, and the
+   time to the next tick counts to it (at most GAP; the rest is "Merger
+   not ticking"). In order of precedence: `merging` (the tick merged),
+   `culprit search` (the queue's first pull request is a member of a
+   batch whose top went red since), `waiting on a batch top` (it waits
+   on a pull request in a batch of two or more), `waiting on a head
+   check` (it waits on, or updated, a head outside such a batch),
+   `handed back` (every eligible pull request is back with its author),
+   `eligible but held` (approved pull requests, all held) and `nothing
+   eligible`. Minutes in each state, each hour.
+2. Flow: merges and arrivals (pull requests the build check first ran)
+   an hour; the pull requests waiting now, by where they wait.
+3. Efficiency: (a) build-check runs per merged pull request, from its
+   first push to its merge: its head runs and the batch runs it was a
+   member of; (b) all runs started in the window per merge; pull
+   requests per merge slot (merges over the green runs they rested
+   on), sized 1, 2-3 and 4+; green batch tops on which all, part or
+   none of the batch merged.
+4. Rework: hand-backs told per merge, by cause, with those repeating one
+   already told for the same head apart; red head checks that were
+   `red(merge)` (a conflict) against the other reds.
+5. Latency: first approval to merge, median and p90. Locally, the first
+   approval is when the Merger first listed the pull request as queued
+   or held. `--github` asks GitHub for the first approving review of
+   each merged pull request instead, kept in `approvals.json` in
+   `--out` so each is asked once.
+6. Capacity: slot-hours by what they went on, against the slots times
+   the window; the median wait for a slot and run time; how busy each
+   agent was, reviewers first.
+7. Policy: who holds right of way and since when, the share of the
+   window it was held, the overdue count, and batch re-cuts an hour (a
+   tick whose batch is not the last one less what merged).
+
+Run it every 5 minutes from the build-check host's crontab, through
+forge-cron-run:
+
+    */5 * * * * FORGE_CRON_CHECKOUT=$HOME/widget-cron \\
+        $HOME/.local/bin/forge-cron-run forge-flow --out $HOME/flow/widget
+
+Serving the page is the host's business: point a static file server
+at `--out`, behind authentication.
+
+Exit status: 0 the page was written; 2 no configuration (without
+`--state-dir`) or no records.
+"""
+
+import argparse
+import bisect
+import collections
+import datetime
+import html
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(BIN))
+from agent_forge import config, github, locks  # noqa: E402
+
+PROG = "forge-flow"
+
+
+def _load_tool(name):
+    loader = importlib.machinery.SourceFileLoader(
+        name.replace("-", "_"), os.path.join(BIN, name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+# forge-stats' parsing and statistics, shared rather than copied.
+stats = _load_tool("forge-stats")
+parse_time = stats.parse_time
+percentile = stats.percentile
+
+HOUR = datetime.timedelta(hours=1)
+DAY = datetime.timedelta(days=1)
+# A tick's state lasts to the next tick, but no longer than this.
+GAP = datetime.timedelta(minutes=10)
+# A run's end is looked for this long after its start.
+MATCH_WINDOW = datetime.timedelta(hours=3)
+# A run with no end logged held its slot until the next run, at most this.
+OPEN_RUN = datetime.timedelta(hours=1)
+WINDOWS = (("1h", HOUR), ("6h", 6 * HOUR), ("24h", DAY))
+BASELINE = ("7d", 7 * DAY)
+LANE = "fast"
+HISTORY_DAYS = 7
+
+MERGING = "merging"
+SEARCH = "culprit search"
+BATCH_WAIT = "waiting on a batch top"
+HEAD_WAIT = "waiting on a head check"
+HANDED = "handed back"
+HELD = "eligible but held"
+NOTHING = "nothing eligible"
+NO_TICKS = "Merger not ticking"
+STATES = (MERGING, SEARCH, BATCH_WAIT, HEAD_WAIT, HANDED, HELD, NOTHING,
+          NO_TICKS)
+UPDATES = ("UPDATE", "STACK-UPDATE", "RESTACK", "RETARGET")
+
+HEADER_RE = re.compile(r"^=== (\S+) worker (?:#(\d+)|main) ([0-9a-f]+) "
+                       r"(?:slot (\d+)|fast lane)( ahead)? ===")
+STOPPED_RE = re.compile(r"^(\S+) STOPPED (?:#(\d+)|main) ([0-9a-f]+) "
+                        r"after (\d+)s")
+MATCHED_AHEAD_RE = re.compile(
+    r"^(\S+) MATCHED #(\d+) ([0-9a-f]+): its tree tested green as the "
+    r"Merger's prediction for #(\d+) ([0-9a-f]+)")
+MATCHED_HEAD_RE = re.compile(
+    r"^(\S+) MATCHED #(\d+) ([0-9a-f]+): its tree tested green as "
+    r"#(\d+)'s head ([0-9a-f]+)")
+MAIN_MATCHED_RE = re.compile(r"^(\S+) MAIN-GREEN main ([0-9a-f]+): matched")
+COVERED_RE = re.compile(
+    r"^(\S+) COVERED #(\d+) ([0-9a-f]+): the top of the Merger's batch "
+    r"#(\d+)\.\.#(\d+) tested green as ([0-9a-f]+)")
+# What a hold says, as the page groups them.
+HOLDS = (("stacked", ("stacked on",)),
+         ("right of way", ("right of way",)),
+         ("conflicts with one ahead", ("ahead of it in the queue",)),
+         ("review after the approval", ("after the approval",)))
+
+
+def iso(when):
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def stamp(when):
+    return when.strftime("%Y-%m-%dT%H:%MZ")
+
+
+def ratio(a, b, digits=2):
+    return round(a / b, digits) if b else None
+
+
+def spread(values):
+    """{n, median, p90} of a list of numbers."""
+    return {"n": len(values), "median": percentile(values, 50),
+            "p90": percentile(values, 90)}
+
+
+def read_lines(path):
+    return stats.read_lines(path)
+
+
+def load_json(path, default):
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------- runs
+
+def read_starts(lines, until):
+    """The build check's runs, from worker.log's header lines, in order:
+    {t, pr, sha, slot, kind}, kind one of head, fast, ahead and main."""
+    runs = []
+    for line in lines:
+        if not line.startswith("=== "):
+            continue
+        got = HEADER_RE.match(line)
+        if got is None:
+            continue
+        try:
+            at = parse_time(got.group(1))
+        except ValueError:
+            continue
+        if at >= until:
+            continue
+        pr = int(got.group(2)) if got.group(2) else None
+        kind = ("main" if pr is None else "ahead" if got.group(5)
+                else "fast" if got.group(4) is None else "head")
+        runs.append({"t": at, "pr": pr, "sha": got.group(3),
+                     "slot": got.group(4) or LANE, "kind": kind})
+    runs.sort(key=lambda r: r["t"])
+    return runs
+
+
+def read_verdicts(lines, until):
+    """(ends, events) from verdicts.log. `ends` is {(kind, pr, sha10):
+    [end]}, how runs ended, kind head, ahead or main; `events` is {(pr,
+    sha10): [(time, basis)]}, each green a head could merge on, basis
+    the run that made it green: ("head", pr, sha10) or ("ahead", top's
+    pr, top's sha10)."""
+    ends = collections.defaultdict(list)
+    events = collections.defaultdict(list)
+    for line in lines:
+        got = stats.VERDICT_RE.match(line)
+        if got:
+            at = parse_time(got.group(1))
+            if at >= until:
+                continue
+            who = got.group(3)
+            pr = None if who == "main" else int(who[1:])
+            sha = got.group(4)[:10]
+            kind = ("main" if pr is None else "ahead" if got.group(2)
+                    else "head")
+            ends[(kind, pr, sha)].append({
+                "t": at, "res": got.group(5),
+                "steps": (got.group(6) or "").strip("()"),
+                "waited": int(got.group(7)) if got.group(7) else None,
+                "ran": int(got.group(8)) if got.group(8) else 0})
+            if kind == "head" and got.group(5) == "green":
+                events[(pr, sha)].append((at, ("head", pr, sha)))
+            continue
+        got = stats.MAIN_RE.match(line)
+        if got:
+            at = parse_time(got.group(1))
+            if at < until:
+                ends[("main", None, got.group(3)[:10])].append({
+                    "t": at, "res": got.group(2).lower(), "steps": "",
+                    "waited": int(got.group(4)), "ran": int(got.group(5))})
+            continue
+        got = MAIN_MATCHED_RE.match(line)
+        if got:
+            at = parse_time(got.group(1))
+            if at < until:
+                ends[("main", None, got.group(2)[:10])].append(matched_end(at))
+            continue
+        got = STOPPED_RE.match(line)
+        if got:
+            at = parse_time(got.group(1))
+            if at >= until:
+                continue
+            pr = int(got.group(2)) if got.group(2) else None
+            end = {"t": at, "res": "stopped", "steps": "", "waited": None,
+                   "ran": int(got.group(4))}
+            for kind in (("head", "ahead") if pr else ("main",)):
+                ends[(kind, pr, got.group(3)[:10])].append(end)
+            continue
+        for regex, basis in ((MATCHED_AHEAD_RE, "ahead"),
+                             (MATCHED_HEAD_RE, "head")):
+            got = regex.match(line)
+            if got:
+                at = parse_time(got.group(1))
+                if at < until:
+                    key = (int(got.group(2)), got.group(3)[:10])
+                    events[key].append(
+                        (at, (basis, int(got.group(4)), got.group(5)[:10])))
+                    ends[("head",) + key].append(matched_end(at))
+                break
+        else:
+            got = COVERED_RE.match(line)
+            if got:
+                at = parse_time(got.group(1))
+                if at < until:
+                    key = (int(got.group(2)), got.group(3)[:10])
+                    events[key].append((at, ("ahead", int(got.group(5)),
+                                             got.group(6)[:10])))
+                    ends[("head",) + key].append(matched_end(at))
+    for key in ends:
+        ends[key].sort(key=lambda e: e["t"])
+    for key in events:
+        events[key].sort(key=lambda e: e[0])
+    return ends, events
+
+
+def matched_end(at):
+    """The end of a run that found its tree already green and posted
+    without building (MATCHED, COVERED): it is not counted as a run."""
+    return {"t": at, "res": "matched", "steps": "", "waited": None,
+            "ran": 0}
+
+
+def match_runs(runs, ends, now):
+    """Give each run its end (or None), its slot time `dur` in seconds,
+    and `nth`, how many runs of the same kind, pull request and commit
+    came before it (0 for a first run)."""
+    pointer = {}
+    seen = collections.Counter()
+    for run in runs:
+        kind = "head" if run["kind"] == "fast" else run["kind"]
+        key = (kind, run["pr"], run["sha"][:10])
+        found = ends.get(key, [])
+        i = pointer.get(key, 0)
+        while i < len(found) and found[i]["t"] < run["t"]:
+            i += 1
+        if i < len(found) and found[i]["t"] - run["t"] <= MATCH_WINDOW:
+            run["end"] = found[i]
+            i += 1
+        else:
+            run["end"] = None
+        pointer[key] = i
+        same = (run["kind"], run["pr"], run["sha"])
+        run["nth"] = seen[same]
+        seen[same] += 1
+    by_slot = collections.defaultdict(list)
+    for run in runs:
+        by_slot[run["slot"]].append(run)
+    for slot_runs in by_slot.values():
+        for i, run in enumerate(slot_runs):
+            if run["end"] is not None:
+                run["dur"] = (run["end"]["t"] - run["t"]).total_seconds()
+                continue
+            later = slot_runs[i + 1]["t"] if i + 1 < len(slot_runs) else now
+            run["dur"] = max(0.0, min(later - run["t"], OPEN_RUN)
+                             .total_seconds())
+            run["open"] = i + 1 == len(slot_runs)
+
+
+def category(run):
+    """What a run's slot time went on."""
+    res = run["end"]["res"] if run["end"] else None
+    if res == "stopped":
+        return "stopped or superseded"
+    if run["nth"]:
+        return "rerun"
+    if run["kind"] == "main":
+        return "main"
+    if run["kind"] == LANE:
+        return "fast lane"
+    what = "batch" if run["kind"] == "ahead" else "head"
+    if res is None:
+        return "running" if run.get("open") else "no end logged"
+    return "%s %s" % (what, res)
+
+
+# ------------------------------------------------------------- records
+
+def read_records(path, since, until):
+    """merger.jsonl's records from `since` to before `until`, in order,
+    each with its time as `_t`."""
+    low, high = iso(since), iso(until)
+    records = []
+    for line in read_lines(path):
+        i = line.find('"at": "')
+        if i >= 0 and not low <= line[i + 7:i + 27] < high:
+            continue
+        try:
+            record = json.loads(line)
+            record["_t"] = parse_time(record["at"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+        if since <= record["_t"] < until:
+            records.append(record)
+    records.sort(key=lambda r: r["_t"])
+    return records
+
+
+def merged(record):
+    return [d.get("pr") for d in record.get("decisions") or []
+            if d.get("action") == "MERGE"
+            and d.get("result", "done") == "done"]
+
+
+def tick_state(record, searching):
+    """The state one Merger tick was in; see the module docstring."""
+    if merged(record):
+        return MERGING
+    if searching:
+        return SEARCH
+    batch = record.get("batch") or []
+    for decision in record.get("decisions") or []:
+        action = decision.get("action")
+        if action == "WAIT":
+            if len(batch) > 1 and decision.get("pr") in batch:
+                return BATCH_WAIT
+            return HEAD_WAIT
+        if action in UPDATES:
+            return HEAD_WAIT
+    if record.get("queue"):
+        return HANDED
+    if record.get("held"):
+        return HELD
+    return NOTHING
+
+
+def segment(record, pr):
+    """The members of the batch whose top is `pr`, from the tick a run
+    started under: the batch or later batch holding it, up to it."""
+    if record is None:
+        return [pr]
+    for part in [record.get("batch") or []] + list(record.get("later")
+                                                   or []):
+        if pr in part:
+            return list(part[:part.index(pr) + 1])
+    return [pr]
+
+
+def hold_kind(reason):
+    for kind, needles in HOLDS:
+        if any(n in reason for n in needles):
+            return kind
+    return "other"
+
+
+class Flow:
+    """Every record, parsed once and indexed by time."""
+
+    def __init__(self, state_dir, now, slots=None, reviewers=(),
+                 approvals=None):
+        self.now = now
+        self.start = now - BASELINE[1] - DAY
+        pr_dir = os.path.join(state_dir, "pr-check")
+        merger_dir = os.path.join(state_dir, "merger")
+        self.runs = read_starts(read_lines(os.path.join(
+            pr_dir, "worker.log")), now)
+        ends, self.events = read_verdicts(read_lines(os.path.join(
+            pr_dir, "verdicts.log")), now)
+        match_runs(self.runs, ends, now)
+        self.arrived = {}
+        for run in self.runs:
+            if run["kind"] in ("head", LANE):
+                self.arrived.setdefault(run["pr"], run["t"])
+        # A worker that posted without building ran nothing.
+        self.runs = [r for r in self.runs
+                     if not (r["end"] and r["end"]["res"] == "matched")]
+        self.records = read_records(os.path.join(
+            merger_dir, "merger.jsonl"), self.start, now)
+        self.ahead = load_json(os.path.join(merger_dir, "ahead.json"), {})
+        self.handed_back = load_json(os.path.join(
+            merger_dir, "handed-back.json"), {})
+        self.presence = read_lines(os.path.join(
+            state_dir, "router", "presence.jsonl"))
+        self.reviewers = set(reviewers)
+        self.approvals = {} if approvals is None else approvals
+        self.run_times = [r["t"] for r in self.runs]
+        self.tick_times = [r["_t"] for r in self.records]
+        self.slots = slots or self._slots_seen()
+        self._index()
+
+    def _slots_seen(self):
+        recent = [r["slot"] for r in self.runs[bisect.bisect_left(
+            self.run_times, self.now - BASELINE[1]):] if r["slot"] != LANE]
+        return max((int(s) for s in recent), default=1)
+
+    def tick_at(self, when):
+        i = bisect.bisect_right(self.tick_times, when) - 1
+        return self.records[i] if i >= 0 else None
+
+    def _index(self):
+        heads, batches = collections.defaultdict(list), \
+            collections.defaultdict(list)
+        searches = []
+        for run in self.runs:
+            if run["kind"] in ("head", LANE):
+                heads[run["pr"]].append(run["t"])
+            elif run["kind"] == "ahead":
+                run["members"] = segment(self.tick_at(run["t"]), run["pr"])
+                for pr in run["members"]:
+                    batches[pr].append(run["t"])
+                end = run["end"]
+                if end and end["res"] == "red" and len(run["members"]) > 1:
+                    searches.append((end["t"], set(run["members"])))
+        self.head_runs, self.batch_runs = heads, batches
+        searches.sort(key=lambda s: s[0])
+        # The Merger's ticks: merges, hand-backs, states.
+        self.merges, self.hand_backs, self.first_approved = [], [], {}
+        told = set()
+        suspects, k = None, 0
+        spans, previous = [], None
+        self.recut_times = []
+        for i, record in enumerate(self.records):
+            at = record["_t"]
+            for pr in list(record.get("queue") or []) + [
+                    int(n) for n in (record.get("held") or {})]:
+                self.first_approved.setdefault(pr, at)
+            done = merged(record)
+            for d in record.get("decisions") or []:
+                if d.get("action") == "MERGE" and d.get("pr") in done:
+                    self.merges.append({"t": at, "pr": d.get("pr"),
+                                        "head": d.get("head") or ""})
+                elif d.get("action") == "HAND-BACK" and \
+                        d.get("result") == "done":
+                    key = (d.get("pr"), d.get("head"))
+                    self.hand_backs.append({
+                        "t": at, "pr": d.get("pr"),
+                        "cause": stats.cause_of(d.get("reason") or ""),
+                        "repeat": key in told})
+                    told.add(key)
+            while k < len(searches) and searches[k][0] <= at:
+                suspects = searches[k][1]
+                k += 1
+            queue = record.get("queue") or []
+            if suspects and not (queue and queue[0] in suspects):
+                suspects = None
+            searching = bool(suspects)
+            if i == len(self.records) - 1 and (
+                    self.ahead.get("batch") or {}).get("suspects"):
+                searching = True
+            state = tick_state(record, searching)
+            record["_state"] = state
+            later = (self.records[i + 1]["_t"] if i + 1 < len(self.records)
+                     else self.now)
+            spans.append((at, min(later, at + GAP), state))
+            if later - at > GAP:
+                spans.append((at + GAP, later, NO_TICKS))
+            batch = record.get("batch") or []
+            if previous and batch:
+                gone = set(done) | set(merged(self.records[i - 1]))
+                if batch != [p for p in previous if p not in gone]:
+                    self.recut_times.append(at)
+            previous = batch
+        if self.records and self.records[0]["_t"] > self.start:
+            spans.insert(0, (self.start, self.records[0]["_t"], NO_TICKS))
+        self.spans = spans
+        self.span_starts = [s[0] for s in spans]
+        self.merge_times = [m["t"] for m in self.merges]
+        # What each merge rested on, and what merged on each green run.
+        self.merged_on = collections.defaultdict(list)
+        for m in self.merges:
+            m["basis"] = self.basis(m)
+            self.merged_on[m["basis"]].append(m["pr"])
+        self.presence_spans = self._presence()
+
+    def basis(self, merge):
+        """The green run a merge rested on: ("head", pr, sha10),
+        ("ahead", top, sha10), or ("unknown", pr, head10)."""
+        def last(key):
+            found = [b for t, b in self.events.get(key, ())
+                     if t <= merge["t"]]
+            return found[-1] if found else None
+        head = merge["head"][:10]
+        got = last((merge["pr"], head))
+        if got and got[0] == "head" and got[1] != merge["pr"]:
+            got = last(got[1:]) or got
+        return got or ("unknown", merge["pr"], head)
+
+    def _presence(self):
+        """{name: [(start, end, status)]} from presence.jsonl."""
+        spans, open_ = collections.defaultdict(list), {}
+        for line in self.presence:
+            try:
+                rec = json.loads(line)
+                name, at = rec["name"], parse_time(rec["at"])
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+            if at >= self.now:
+                continue
+            if name in open_:
+                start, status = open_.pop(name)
+                spans[name].append((start, at, status))
+            open_[name] = (at, rec.get("status") or "unknown")
+        for name, (start, status) in open_.items():
+            spans[name].append((start, self.now, status))
+        return spans
+
+    # ------------------------------------------------------ figures
+
+    def state_minutes(self, since, until):
+        totals = dict.fromkeys(STATES, 0.0)
+        i = max(0, bisect.bisect_right(self.span_starts, since) - 1)
+        while i < len(self.spans) and self.spans[i][0] < until:
+            a, b, state = self.spans[i]
+            lo, hi = max(a, since), min(b, until)
+            if hi > lo:
+                totals[state] += (hi - lo).total_seconds() / 60
+            i += 1
+        covered = (min(until, self.now) - since).total_seconds() / 60
+        totals[NO_TICKS] += max(0.0, covered - sum(totals.values()))
+        return {k: round(v, 1) for k, v in totals.items()}
+
+    def figures(self, since, until):
+        """Every figure for [since, until)."""
+        hours = (until - since).total_seconds() / 3600
+        lo = bisect.bisect_left(self.merge_times, since)
+        hi = bisect.bisect_left(self.merge_times, until)
+        merges = self.merges[lo:hi]
+        n = len(merges)
+        runs = self.runs[bisect.bisect_left(self.run_times, since):
+                         bisect.bisect_left(self.run_times, until)]
+        ticks = self.records[bisect.bisect_left(self.tick_times, since):
+                             bisect.bisect_left(self.tick_times, until)]
+        out = {"since": stamp(since), "until": stamp(until),
+               "hours": round(hours, 2), "merges": n,
+               "merges_per_hour": ratio(n, hours, 1),
+               "states": self.state_minutes(since, until)}
+        out["arrivals"] = sum(1 for t in self.arrived.values()
+                              if since <= t < until)
+        out["eligible_mean"] = ratio(sum(len(r.get("queue") or [])
+                                         for r in ticks), len(ticks), 1)
+        out["held_mean"] = ratio(sum(len(r.get("held") or {})
+                                     for r in ticks), len(ticks), 1)
+        out.update(self._efficiency(merges, runs, since, until))
+        out.update(self._rework(merges, runs, since, until))
+        out["approval_to_merge"] = self._latency(merges)
+        out.update(self._capacity(runs, hours))
+        out["busy"] = self._busy(since, until)
+        out.update(self._policy(ticks, hours))
+        return out
+
+    def _efficiency(self, merges, runs, since, until):
+        per_pr, heads, batches = [], [], []
+        for m in merges:
+            h = bisect.bisect_right(self.head_runs.get(m["pr"], []), m["t"])
+            b = bisect.bisect_right(self.batch_runs.get(m["pr"], []),
+                                    m["t"])
+            per_pr.append(h + b)
+            heads.append(h)
+            batches.append(b)
+        n = len(merges)
+        kinds = collections.Counter(r["kind"] for r in runs)
+        slots = collections.Counter(m["basis"] for m in merges)
+        sizes = list(slots.values())
+        tops = {"green": 0, "all": 0, "part": 0, "none": 0}
+        for run in runs:
+            if run["kind"] != "ahead" or not run["end"] or \
+                    run["end"]["res"] != "green":
+                continue
+            got = set(self.merged_on.get(("ahead", run["pr"],
+                                          run["sha"][:10]), ()))
+            members = run["members"]
+            tops["green"] += 1
+            on = len(got & set(members))
+            tops["all" if on == len(members) else "part" if on
+                 else "none"] += 1
+        return {
+            "runs_per_merged_pr": dict(spread(per_pr), mean=ratio(
+                sum(per_pr), n), heads_mean=ratio(sum(heads), n),
+                batches_mean=ratio(sum(batches), n)),
+            "runs": dict(kinds), "runs_total": len(runs),
+            "runs_per_merge": ratio(len(runs), n),
+            "merge_slots": {
+                "slots": len(sizes), "prs_per_slot": ratio(n, len(sizes)),
+                "sizes": {"1": sum(1 for s in sizes if s == 1),
+                          "2-3": sum(1 for s in sizes if 2 <= s <= 3),
+                          "4+": sum(1 for s in sizes if s >= 4)},
+                "unknown": sum(1 for b in slots if b[0] == "unknown")},
+            "green_batch_tops": tops}
+
+    def _rework(self, merges, runs, since, until):
+        n = len(merges)
+        told = [h for h in self.hand_backs if since <= h["t"] < until]
+        first = collections.Counter(h["cause"] for h in told
+                                    if not h["repeat"])
+        again = collections.Counter(h["cause"] for h in told if h["repeat"])
+        reds = collections.Counter()
+        for run in runs:
+            end = run["end"]
+            if run["kind"] in ("head", LANE) and end and \
+                    end["res"] in ("green", "red"):
+                reds["green" if end["res"] == "green" else
+                     "red(merge)" if end["steps"] == "merge" else "red"] += 1
+        return {"hand_backs": {
+            "told": len(told), "per_merge": ratio(len(told), n),
+            "new": dict(first), "repeats": dict(again),
+            "repeats_total": sum(again.values()),
+            "per_merge_by_cause": {c: ratio(v, n) for c, v in (
+                first + again).most_common()}},
+            "head_checks": dict(reds)}
+
+    def _latency(self, merges):
+        local, remote = [], []
+        for m in merges:
+            seen = self.first_approved.get(m["pr"])
+            if seen is not None:
+                local.append((m["t"] - seen).total_seconds() / 60)
+            got = self.approvals.get(str(m["pr"]))
+            if got:
+                remote.append((m["t"] - parse_time(got)).total_seconds()
+                              / 60)
+        out = {"local_minutes": {k: (round(v) if isinstance(v, float)
+                                     else v)
+                                 for k, v in spread(local).items()}}
+        if self.approvals:
+            out["github_minutes"] = {k: (round(v) if isinstance(v, float)
+                                         else v)
+                                     for k, v in spread(remote).items()}
+        return out
+
+    def _capacity(self, runs, hours):
+        by = collections.Counter()
+        for run in runs:
+            by[category(run)] += run["dur"] / 3600
+        waited = [r["end"]["waited"] for r in runs
+                  if r["kind"] in ("head", LANE) and r["end"]
+                  and r["end"]["waited"] is not None]
+        ran = [r["end"]["ran"] for r in runs if r["end"]
+               and r["end"]["res"] in ("green", "red") and r["end"]["ran"]]
+        return {"slot_hours": {k: round(v, 1) for k, v in by.most_common()},
+                "slot_hours_used": round(sum(by.values()), 1),
+                "slot_hours_available": round(self.slots * hours, 1),
+                "slots": self.slots,
+                "head_wait_seconds": spread(waited),
+                "run_seconds": spread(ran)}
+
+    def _busy(self, since, until):
+        """{name: {busy, listed hours, reviewer}}: the share of the time
+        an agent was listed (not gone) that she was `busy`: `idle`,
+        `shell` (her turn over, a background task running; designs/0017)
+        and anything else count as not busy."""
+        out = {}
+        for name, spans in self.presence_spans.items():
+            busy = listed = 0.0
+            for a, b, status in spans:
+                lo, hi = max(a, since), min(b, until)
+                if hi <= lo or status == "gone":
+                    continue
+                seconds = (hi - lo).total_seconds()
+                listed += seconds
+                if status == "busy":
+                    busy += seconds
+            if listed:
+                out[name] = {"busy": round(busy / listed, 3),
+                             "listed_hours": round(listed / 3600, 1),
+                             "reviewer": name in self.reviewers}
+        return dict(sorted(out.items(), key=lambda kv: (
+            not kv[1]["reviewer"], -kv[1]["busy"], kv[0])))
+
+    def _policy(self, ticks, hours):
+        held = sum(1 for r in ticks if r.get("right_of_way"))
+        recuts = sum(1 for t in self.recut_times
+                     if ticks and ticks[0]["_t"] <= t <= ticks[-1]["_t"])
+        return {"right_of_way_share": ratio(held, len(ticks), 3),
+                "overdue_mean": ratio(sum(len(r.get("overdue") or {})
+                                          for r in ticks), len(ticks), 1),
+                "recuts": recuts, "recuts_per_hour": ratio(recuts, hours, 1)}
+
+    # ------------------------------------------------------ now
+
+    def snapshot(self):
+        """Where the pull requests wait at the last tick, and who holds
+        right of way."""
+        if not self.records:
+            return {}
+        last = self.records[-1]
+        batch = list(last.get("batch") or [])
+        later = [pr for part in last.get("later") or [] for pr in part]
+        back = sorted({d.get("pr") for d in last.get("decisions") or []
+                       if d.get("action") in ("HAND-BACK", "SKIP")})
+        queued = [pr for pr in last.get("queue") or []
+                  if pr not in batch and pr not in later and pr not in back]
+        held = collections.defaultdict(list)
+        for pr, reason in sorted((last.get("held") or {}).items(),
+                                 key=lambda kv: int(kv[0])):
+            held[hold_kind(reason)].append(int(pr))
+        row = last.get("right_of_way") or {}
+        since = None
+        if row.get("pr") is not None:
+            for record in reversed(self.records):
+                if (record.get("right_of_way") or {}).get("pr") != row["pr"]:
+                    break
+                since = record["_t"]
+        reasons = {}
+        for pr in back:
+            said = self.handed_back.get(str(pr))
+            if isinstance(said, dict):
+                reasons[pr] = stats.cause_of(said.get("reason") or "")
+        return {"at": stamp(last["_t"]), "state": last["_state"],
+                "batch": batch, "later": later, "queued": queued,
+                "handed_back": back, "handed_back_causes": reasons,
+                "held": dict(held),
+                "right_of_way": {"pr": row.get("pr"),
+                                 "since": stamp(since) if since else None},
+                "overdue": len(last.get("overdue") or {}),
+                "searching": last["_state"] == SEARCH}
+
+    def hourly(self, hours=24):
+        """The last `hours` clock hours, oldest first: each hour's
+        states, merges and arrivals."""
+        top = self.now.replace(minute=0, second=0, microsecond=0)
+        rows = []
+        for k in range(hours - 1, -1, -1):
+            a = top - k * HOUR
+            b = min(a + HOUR, self.now)
+            lo = bisect.bisect_left(self.merge_times, a)
+            rows.append({"hour": stamp(a), "states": self.state_minutes(a, b),
+                         "merges": bisect.bisect_left(self.merge_times, b)
+                         - lo,
+                         "arrivals": sum(1 for t in self.arrived.values()
+                                         if a <= t < b)})
+        return rows
+
+    def watch_figures(self, since, until):
+        """forge-stats-watch's figures (designs/0045): {name: (value,
+        samples)}."""
+        got = self.figures(since, until)
+        hours = (until - since).total_seconds() / 3600
+        busy = [v["busy"] for v in got["busy"].values()
+                if v["reviewer"] and v["listed_hours"] >= 0.9 * hours]
+        slots = got["merge_slots"]
+        return {"hand_backs_per_merge": (got["hand_backs"]["per_merge"],
+                                         got["merges"]),
+                "prs_per_slot": (slots["prs_per_slot"], slots["slots"]),
+                "reviewer_busy": (100 * max(busy) if busy else None,
+                                  len(busy))}
+
+
+# ------------------------------------------------------------- history
+
+HISTORY_KEYS = ("merges", "arrivals", "states", "runs_total",
+                "runs_per_merge", "merge_slots", "hand_backs",
+                "head_checks", "slot_hours", "recuts", "right_of_way_share",
+                "overdue_mean")
+
+
+def append_history(flow, path):
+    """Append one line for each whole hour not yet in `path`, from at
+    most HISTORY_DAYS ago. Returns how many were added."""
+    last = None
+    for line in read_lines(path):
+        try:
+            last = parse_time(json.loads(line)["hour"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    top = flow.now.replace(minute=0, second=0, microsecond=0)
+    first = top - HISTORY_DAYS * DAY
+    if flow.records:
+        # The first whole hour the records cover.
+        start = flow.records[0]["_t"]
+        hour = start.replace(minute=0, second=0, microsecond=0)
+        first = max(first, hour if hour == start else hour + HOUR)
+    if last is not None:
+        first = max(first, last + HOUR)
+    lines = []
+    hour = first
+    while hour + HOUR <= top:
+        got = flow.figures(hour, hour + HOUR)
+        lines.append(json.dumps(dict({"hour": stamp(hour)}, **{
+            k: got[k] for k in HISTORY_KEYS}), sort_keys=True))
+        hour += HOUR
+    if lines:
+        with open(path, "a") as handle:
+            handle.write("\n".join(lines) + "\n")
+    return len(lines)
+
+
+# -------------------------------------------------------------- GitHub
+
+APPROVAL_FIELDS = ("number reviews(states: APPROVED, first: 1) "
+                   "{ nodes { submittedAt } }")
+
+
+def first_approvals(token, repo, numbers, cache, call=github.api_call):
+    """`cache` ({str(number): time or None}) with the first approving
+    review of each of `numbers` not in it yet, from GitHub."""
+    owner, name = repo.split("/", 1)
+    wanted = sorted({n for n in numbers if str(n) not in cache})
+    for start in range(0, len(wanted), stats.BATCH):
+        part = wanted[start:start + stats.BATCH]
+        body = " ".join("p%d: pullRequest(number: %d) { %s }"
+                        % (n, n, APPROVAL_FIELDS) for n in part)
+        status, got = github.graphql(token, stats.QUERY % body,
+                                     {"owner": owner, "name": name},
+                                     call=call)
+        found = ((got or {}).get("data") or {}).get("repository") or {}
+        if status != 200 or not found:
+            raise RuntimeError("GitHub answered %s: %s"
+                               % (status, json.dumps(got)[:200]))
+        for n in part:
+            nodes = (((found.get("p%d" % n) or {}).get("reviews") or {})
+                     .get("nodes") or [])
+            cache[str(n)] = nodes[0].get("submittedAt") if nodes else None
+    return cache
+
+
+# ---------------------------------------------------------------- page
+
+# The categorical slots, in their fixed order, one for each state.
+COLOURS = {
+    MERGING: ("#008300", "#008300"),
+    SEARCH: ("#e34948", "#e66767"),
+    BATCH_WAIT: ("#2a78d6", "#3987e5"),
+    HEAD_WAIT: ("#1baf7a", "#199e70"),
+    HANDED: ("#eb6834", "#d95926"),
+    HELD: ("#6250d6", "#9085e9"),
+    NOTHING: ("#e87ba4", "#d55181"),
+    NO_TICKS: ("#898781", "#5d5c58"),
+}
+WHAT = {
+    MERGING: "the tick merged",
+    SEARCH: "a batch top went red; its members are being sorted out",
+    BATCH_WAIT: "waiting for the run of a batch's top",
+    HEAD_WAIT: "waiting for a head's own check, or its update",
+    HANDED: "every eligible pull request is back with its author",
+    HELD: "approved pull requests, but every one held",
+    NOTHING: "no approved pull request",
+    NO_TICKS: "no Merger record for over %d minutes" % (
+        GAP.total_seconds() // 60),
+}
+
+CSS = """
+:root{color-scheme:light;--bg:#f9f9f7;--card:#fcfcfb;--ink:#0b0b0b;
+--ink2:#52514e;--muted:#898781;--grid:#e1e0d9;--ring:rgba(11,11,11,.10);
+%s}
+@media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#0d0d0d;
+--card:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--grid:#2c2c2a;
+--ring:rgba(255,255,255,.10);%s}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:980px;margin:0 auto;padding:12px}
+h1{font-size:20px;margin:8px 0 2px}h2{font-size:16px;margin:0 0 8px}
+.sub{color:var(--ink2);margin:0 0 12px}
+section{background:var(--card);border:1px solid var(--ring);
+border-radius:8px;padding:12px;margin:0 0 12px;overflow-x:auto}
+table{border-collapse:collapse;width:100%%;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:3px 6px;border-bottom:1px solid var(--grid);
+white-space:nowrap}th:first-child,td:first-child{text-align:left;
+white-space:normal}th{color:var(--ink2);font-weight:600}
+.note{color:var(--muted);font-size:13px;margin:6px 0 0}
+.key{display:flex;flex-wrap:wrap;gap:4px 14px;margin:8px 0 0;font-size:13px}
+.key span{display:inline-flex;align-items:center;gap:5px}
+.sw{width:11px;height:11px;border-radius:3px;display:inline-block}
+.bar{display:flex;height:16px;gap:2px;min-width:120px}
+.bar i{display:block;height:100%%;border-radius:2px}
+.hbar{background:var(--grid);border-radius:3px;height:10px;min-width:80px}
+.hbar i{display:block;height:100%%;border-radius:3px;background:var(--s2)}
+svg text{fill:var(--muted);font-size:10px}
+.now{font-size:14px}.now b{font-variant-numeric:tabular-nums}
+"""
+
+
+def esc(value):
+    return html.escape("-" if value is None else str(value))
+
+
+def num(value, digits=1):
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return "%.*f" % (digits, value)
+    return str(value)
+
+
+def minutes_text(m):
+    if m is None:
+        return "-"
+    return "%d min" % m if m < 120 else "%.1f h" % (m / 60)
+
+
+def css_vars():
+    light = "".join("--s%d:%s;" % (i, COLOURS[s][0])
+                    for i, s in enumerate(STATES))
+    dark = "".join("--s%d:%s;" % (i, COLOURS[s][1])
+                   for i, s in enumerate(STATES))
+    return CSS % (light, dark)
+
+
+def state_var(state):
+    return "var(--s%d)" % STATES.index(state)
+
+
+def key_html():
+    return '<div class="key">%s</div>' % "".join(
+        '<span><i class="sw" style="background:%s"></i>%s</span>'
+        % (state_var(s), esc(s)) for s in STATES)
+
+
+def hourly_svg(rows):
+    """Minutes in each state, one stacked column an hour."""
+    width, height, left, bottom = 720, 190, 28, 18
+    col = (width - left) / max(1, len(rows))
+    scale = (height - bottom - 6) / 60.0
+    parts = ['<svg viewBox="0 0 %d %d" width="100%%" role="img" '
+             'aria-label="Minutes in each Merger state, each hour">'
+             % (width, height)]
+    for m in (0, 30, 60):
+        y = height - bottom - m * scale
+        parts.append('<line x1="%d" x2="%d" y1="%.1f" y2="%.1f" '
+                     'style="stroke:var(--grid)"/><text x="0" y="%.1f">%d'
+                     '</text>' % (left, width, y, y, y + 3, m))
+    for i, row in enumerate(rows):
+        x = left + i * col + 1
+        y = height - bottom
+        for state in STATES:
+            m = row["states"].get(state, 0)
+            if m <= 0:
+                continue
+            h = m * scale
+            y -= h
+            parts.append(
+                '<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" '
+                'rx="1.5" style="fill:%s"><title>%s %s: %.0f min</title></rect>'
+                % (x, y, col - 2, max(0.5, h - 1), state_var(state),
+                   esc(row["hour"][11:16]), esc(state), m))
+        if i % 3 == 0:
+            parts.append('<text x="%.1f" y="%d">%s</text>'
+                         % (x, height - 4, esc(row["hour"][11:13])))
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def share_bar(states):
+    total = sum(states.values()) or 1
+    return '<div class="bar">%s</div>' % "".join(
+        '<i style="width:%.2f%%;background:%s" title="%s: %.0f min"></i>'
+        % (100 * states[s] / total, state_var(s), esc(s), states[s])
+        for s in STATES if states.get(s))
+
+
+def table(head, rows):
+    return "<table><tr>%s</tr>%s</table>" % (
+        "".join("<th>%s</th>" % esc(h) for h in head),
+        "".join("<tr>%s</tr>" % "".join("<td>%s</td>" % c for c in row)
+                for row in rows))
+
+
+def per_hour(fig, minutes):
+    """Minutes an hour, so windows of every length compare."""
+    return minutes / fig["hours"] if fig["hours"] else 0
+
+
+def page(data):
+    w = data["windows"]
+    names = [k for k, _ in WINDOWS] + [BASELINE[0]]
+    head = [""] + ["last %s" % k for k in names[:-1]] + ["7 days"]
+    snap = data["now"]
+    out = ['<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+           '<meta name="viewport" content="width=device-width,'
+           'initial-scale=1"><title>Merge flow: %s</title><style>%s</style>'
+           '</head><body><main>' % (esc(data["project"]), css_vars())]
+    out.append("<h1>Merge flow: %s</h1><p class=\"sub\">Written %s from "
+               "the records to %s. The 7-day column covers %s h.</p>"
+               % (esc(data["project"]), esc(data["generated"]),
+                  esc(snap.get("at")), num(w[BASELINE[0]]["hours"], 0)))
+    # 1. States.
+    rows = []
+    for state in STATES:
+        rows.append(['<i class="sw" style="background:%s"></i> %s'
+                     % (state_var(state), esc(state))] + [
+            "%.0f min" % w[k]["states"][state] for k in names[:-1]] + [
+            "%.0f min/h" % per_hour(w[names[-1]], w[names[-1]]["states"]
+                                    [state])])
+    rows.append(["share"] + [share_bar(w[k]["states"]) for k in names])
+    out.append("<section><h2>1. Why so few merges</h2>%s%s%s"
+               '<p class="note">Minutes in each state, each hour (UTC). '
+               "Each Merger tick is put in one state; the time to the next "
+               "tick counts to it. %s</p></section>"
+               % (hourly_svg(data["hours"]), key_html(), table(head, rows),
+                  " ".join("<b>%s</b>: %s." % (esc(s), esc(WHAT[s]))
+                           for s in STATES)))
+    # 2. Flow.
+    rows = [["merges"] + [esc(w[k]["merges"]) for k in names[:-1]]
+            + ["%s/h" % num(ratio(w[names[-1]]["merges"],
+                                  w[names[-1]]["hours"]))],
+            ["arrivals (first run of a pull request)"]
+            + [esc(w[k]["arrivals"]) for k in names[:-1]]
+            + ["%s/h" % num(ratio(w[names[-1]]["arrivals"],
+                                  w[names[-1]]["hours"]))],
+            ["eligible, mean"] + [num(w[k]["eligible_mean"]) for k in names],
+            ["held, mean"] + [num(w[k]["held_mean"]) for k in names]]
+    where = [["in the batch", ", ".join("#%d" % p for p in snap.get(
+        "batch", [])) or "-"],
+        ["in later batches", ", ".join("#%d" % p for p in snap.get(
+            "later", [])) or "-"],
+        ["queued, not yet in a batch", ", ".join("#%d" % p for p in snap.get(
+            "queued", [])) or "-"],
+        ["back with the author", ", ".join(
+            "#%d%s" % (p, " (%s)" % snap["handed_back_causes"][p]
+                       if p in snap.get("handed_back_causes", {}) else "")
+            for p in snap.get("handed_back", [])) or "-"]]
+    for kind, prs in sorted(snap.get("held", {}).items()):
+        where.append(["held: %s" % kind, ", ".join("#%d" % p for p in prs)])
+    out.append("<section><h2>2. Flow</h2>%s<h2 style=\"margin-top:12px\">"
+               "Waiting now (%s, %s)</h2>%s</section>"
+               % (table(head, rows), esc(snap.get("at")),
+                  esc(snap.get("state")),
+                  table(["where", "pull requests"],
+                        [[esc(a), esc(b)] for a, b in where])))
+    # 3. Efficiency.
+
+    def slots(f):
+        s = f["merge_slots"]["sizes"]
+        return "%s / %s / %s" % (s["1"], s["2-3"], s["4+"])
+
+    def tops(f):
+        t = f["green_batch_tops"]
+        return "%d: %d all, %d part, %d none" % (
+            t["green"], t["all"], t["part"], t["none"])
+    rows = [["(a) runs per merged pull request, mean"]
+            + [num(w[k]["runs_per_merged_pr"]["mean"], 2) for k in names],
+            ["(a) of them head runs / batch runs"]
+            + ["%s / %s" % (num(w[k]["runs_per_merged_pr"]["heads_mean"], 2),
+                            num(w[k]["runs_per_merged_pr"]["batches_mean"],
+                                2)) for k in names],
+            ["(a) median / p90"]
+            + ["%s / %s" % (num(w[k]["runs_per_merged_pr"]["median"]),
+                            num(w[k]["runs_per_merged_pr"]["p90"]))
+               for k in names],
+            ["(b) runs per merge"]
+            + [num(w[k]["runs_per_merge"], 2) for k in names],
+            ["pull requests per merge slot"]
+            + [num(w[k]["merge_slots"]["prs_per_slot"], 2) for k in names],
+            ["slots of 1 / 2-3 / 4+"] + [slots(w[k]) for k in names],
+            ["green batch tops"] + [tops(w[k]) for k in names]]
+    out.append("<section><h2>3. Efficiency</h2>%s<p class=\"note\">(a) counts"
+               " a pull request's head runs and the batch runs it was a "
+               "member of, from its first push to its merge. (b) counts every"
+               " run started in the window: heads, predictions and main. A "
+               "merge slot is the green run a merge rested on.</p></section>"
+               % table(head, rows))
+    # 4. Rework.
+    causes = sorted({c for k in names for c in
+                     w[k]["hand_backs"]["per_merge_by_cause"]})
+    rows = [["hand-backs told per merge"]
+            + [num(w[k]["hand_backs"]["per_merge"], 2) for k in names]]
+    for cause in causes:
+        rows.append(["&nbsp;&nbsp;%s" % esc(cause)] + [num(
+            w[k]["hand_backs"]["per_merge_by_cause"].get(cause), 2)
+            for k in names])
+    rows.append(["repeats for the same head"] + [
+        "%d of %d" % (w[k]["hand_backs"]["repeats_total"],
+                      w[k]["hand_backs"]["told"]) for k in names])
+    rows.append(["head checks: green / red(merge) / other red"] + [
+        "%d / %d / %d" % (w[k]["head_checks"].get("green", 0),
+                          w[k]["head_checks"].get("red(merge)", 0),
+                          w[k]["head_checks"].get("red", 0))
+        for k in names])
+    out.append("<section><h2>4. Rework</h2>%s<p class=\"note\">A repeat is a "
+               "hand-back told again for a head already handed back. "
+               "red(merge) is a head that conflicts with the default "
+               "branch.</p></section>" % table(head, rows))
+    # 5. Latency.
+
+    def lat(f, key):
+        got = f["approval_to_merge"].get(key)
+        if not got or not got["n"]:
+            return "-"
+        return "%s / %s (%d)" % (minutes_text(got["median"]),
+                                 minutes_text(got["p90"]), got["n"])
+    rows = [["first approval to merge, median / p90 (local)"]
+            + [lat(w[k], "local_minutes") for k in names]]
+    if "github_minutes" in w["24h"]["approval_to_merge"]:
+        rows.append(["the same, from GitHub's first approval"]
+                    + [lat(w[k], "github_minutes") for k in names])
+    out.append("<section><h2>5. Latency</h2>%s<p class=\"note\">Locally, "
+               "the first approval is the first Merger tick that listed the "
+               "pull request as queued or held.</p></section>"
+               % table(head, rows))
+    # 6. Capacity.
+    cats = sorted({c for k in names for c in w[k]["slot_hours"]},
+                  key=lambda c: -w[BASELINE[0]]["slot_hours"].get(c, 0))
+    rows = []
+    for cat in cats:
+        rows.append([esc(cat)] + ["%.1f" % w[k]["slot_hours"].get(cat, 0)
+                                  for k in names])
+    rows.append(["used of available"] + [
+        "%.1f of %.1f" % (w[k]["slot_hours_used"],
+                          w[k]["slot_hours_available"]) for k in names])
+    rows.append(["head wait for a slot, median"] + [
+        num(w[k]["head_wait_seconds"]["median"], 0) + " s" for k in names])
+    rows.append(["run time, median"] + [
+        num(w[k]["run_seconds"]["median"], 0) + " s" for k in names])
+    busy = []
+    for name, got in w["6h"]["busy"].items():
+        week = w[BASELINE[0]]["busy"].get(name, {}).get("busy")
+        busy.append(["%s%s" % (esc(name), " (reviewer)" if got["reviewer"]
+                               else ""),
+                     '<div class="hbar"><i style="width:%.0f%%"></i></div>'
+                     % (100 * got["busy"]),
+                     "%.0f%%" % (100 * got["busy"]),
+                     "-" if week is None else "%.0f%%" % (100 * week)])
+    out.append("<section><h2>6. Capacity</h2>%s<p class=\"note\">Slot-hours"
+               " of the runs started in the window; %d slots.</p>"
+               "<h2 style=\"margin-top:12px\">Busy, last 6 h</h2>%s"
+               "<p class=\"note\">Busy is the share of the time an agent was "
+               "listed that she was busy, not idle or in a shell.</p></section>"
+               % (table(head[:1] + head[1:], rows), w["24h"]["slots"],
+                  table(["agent", "", "6 h", "7 d"], busy) if busy
+                  else "<p>No presence records.</p>"))
+    # 7. Policy.
+    row = snap.get("right_of_way") or {}
+    rows = [["right of way held, share of ticks"] + [
+        "-" if w[k]["right_of_way_share"] is None else
+        "%.0f%%" % (100 * w[k]["right_of_way_share"]) for k in names],
+        ["overdue, mean"] + [num(w[k]["overdue_mean"]) for k in names],
+        ["batch re-cuts an hour"] + [num(w[k]["recuts_per_hour"])
+                                     for k in names]]
+    out.append("<section><h2>7. Policy</h2><p class=\"now\">Right of way "
+               "now: <b>%s</b>%s. Overdue now: <b>%d</b>.</p>%s</section>"
+               % ("#%d" % row["pr"] if row.get("pr") else "nobody",
+                  " since %s" % esc(row["since"]) if row.get("since") else "",
+                  snap.get("overdue", 0), table(head, rows)))
+    out.append('<p class="note">forge-flow, agent-forge (designs/0045). '
+               "Every number is in flow.json.</p></main></body></html>")
+    return "".join(out)
+
+
+# ---------------------------------------------------------------- main
+
+def write(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
+def compute(flow, project_name):
+    windows = {k: flow.figures(flow.now - span, flow.now)
+               for k, span in WINDOWS}
+    start = flow.now - BASELINE[1]
+    if flow.records:
+        start = max(start, flow.records[0]["_t"])
+    windows[BASELINE[0]] = flow.figures(start, flow.now)
+    return {"project": project_name, "generated": stamp(flow.now),
+            "windows": windows, "hours": flow.hourly(), "now":
+            flow.snapshot()}
+
+
+def main(argv=None, out=print, err=None, environ=None, now=None,
+         call=github.api_call, token=None):
+    err = err or (lambda line: print(line, file=sys.stderr))
+    environ = os.environ if environ is None else environ
+    parser = argparse.ArgumentParser(prog=PROG,
+                                     description=__doc__.splitlines()[0])
+    parser.add_argument("--state-dir", help="the project's state directory "
+                        "(default from the configuration)")
+    parser.add_argument("--out", required=True,
+                        help="where index.html, flow.json and "
+                        "flow-history.jsonl go")
+    parser.add_argument("--now", help="read the records as at this time "
+                        "(UTC; default now)")
+    parser.add_argument("--github", action="store_true",
+                        help="also ask GitHub for each merged pull "
+                        "request's first approval")
+    parser.add_argument("--checkout", default=environ.get(
+        "FORGE_CRON_CHECKOUT"), help="where the configuration is found "
+        "(default $FORGE_CRON_CHECKOUT, else the current directory)")
+    args = parser.parse_args(argv)
+    project = None
+    try:
+        project = config.load(None, environ, cwd=os.path.expanduser(
+            args.checkout) if args.checkout else None)
+    except config.ConfigError as error:
+        if not args.state_dir or args.github:
+            err("NO-CONFIG: %s" % error)
+            return 2
+    state_dir = args.state_dir or os.path.dirname(locks.state_dir(
+        project.name, "merger", environ, create=False))
+    now = parse_time(args.now) if args.now else (
+        now or datetime.datetime.now(datetime.timezone.utc))
+    slots, reviewers, name = None, set(), os.path.basename(
+        os.path.normpath(state_dir))
+    if project is not None:
+        name = project.name
+        slots = project.section("checks").get("slots")
+        agents = set(project.reviewers())
+        reviewers = {s for s, a in project.by_session().items()
+                     if a in agents} | agents
+    os.makedirs(args.out, exist_ok=True)
+    cache_path = os.path.join(args.out, "approvals.json")
+    approvals = load_json(cache_path, {}) if args.github else {}
+    flow = Flow(state_dir, now, slots, reviewers, approvals)
+    if not flow.records and not flow.runs:
+        err("NO-RECORDS: nothing in %s" % state_dir)
+        return 2
+    if args.github:
+        wanted = [m["pr"] for m in flow.merges
+                  if m["t"] >= now - BASELINE[1]]
+        try:
+            token = token or github.read_token(project, environ)
+            first_approvals(token, project.repo, wanted, approvals, call)
+            write(cache_path, json.dumps(approvals, sort_keys=True))
+        except (RuntimeError, github.MintError, OSError) as error:
+            err("%s: GitHub's approvals left out: %s" % (PROG, error))
+    data = compute(flow, name)
+    write(os.path.join(args.out, "flow.json"),
+          json.dumps(data, indent=1, sort_keys=True))
+    write(os.path.join(args.out, "index.html"), page(data))
+    added = append_history(flow, os.path.join(args.out,
+                                              "flow-history.jsonl"))
+    out("%s: wrote %s (%s; %d merges in the last hour; %d history lines)"
+        % (PROG, args.out, data["now"].get("state"),
+           data["windows"]["1h"]["merges"], added))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

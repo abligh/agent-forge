@@ -30,6 +30,20 @@ configuration's `stats_watch.figures`:
                    (designs/0024, third amendment); CPU time, unlike run
                    time, is little moved by how busy the host is
 
+From `forge-flow`'s figures (designs/0045), read in this process from
+the same state directory:
+
+    hand_backs_per_merge  hand-backs told per merge: over `limit`, or
+                   over `ratio` x the baseline's; its samples are the
+                   merges
+    prs_per_slot   pull requests merged per green run they rested on:
+                   under `limit`, or under the baseline's over `ratio`;
+                   its samples are those runs
+    reviewer_busy  the busiest reviewer's share of the window spent
+                   busy, in percent: over `limit`. Only reviewers the
+                   router listed for nearly the whole window count, and
+                   `min_samples` doesn't apply
+
 A figure from fewer than `min_samples` (default 5) samples is not
 judged, nor a `ratio` against a baseline that thin. merge_rate's
 samples are the approved pull requests that waited in the queue during
@@ -103,7 +117,14 @@ WHAT = {
     "main_red": ("red build checks of the default branch", "red"),
     "nightly_red_hours": ("the hours since the last green nightly", "h"),
     "main_cpu": ("a default-branch run's CPU time, median", "CPU-s"),
+    "hand_backs_per_merge": ("hand-backs told per merge", "per merge"),
+    "prs_per_slot": ("pull requests merged per green run", "per run"),
+    "reviewer_busy": ("the busiest reviewer's time busy", "%"),
 }
+# The figures forge-flow computes (designs/0045), and those judged as
+# floors: out of line when too low.
+FLOW = ("hand_backs_per_merge", "prs_per_slot", "reviewer_busy")
+FLOORS = ("merge_rate", "prs_per_slot")
 FIGURE_RE = re.compile(r"^Figure: ([a-z_]+)\s*$", re.MULTILINE)
 OUT, IN, UNJUDGED = "out", "in", "unjudged"
 
@@ -146,6 +167,29 @@ def forge_stats(environ):
             raise RuntimeError("forge-stats: %s" % " ".join(lines))
         return json.loads(lines[0])
     return stats
+
+
+def forge_flow(environ):
+    """A function (since, until) -> {figure: (value, samples)} for the
+    FLOW figures, from forge-flow run in this process over the
+    project's state directory."""
+    tool = _load_tool("forge-flow")
+    checkout = environ.get("FORGE_CRON_CHECKOUT")
+    project = config.load(None, environ, cwd=os.path.expanduser(
+        checkout) if checkout else None)
+    state_dir = os.path.dirname(locks.state_dir(project.name, "merger",
+                                                environ, create=False))
+    agents = set(project.reviewers())
+    reviewers = agents | {s for s, a in project.by_session().items()
+                          if a in agents}
+    cache = {}
+
+    def flow(since, until):
+        if until not in cache:
+            cache[until] = tool.Flow(state_dir, until, project.section(
+                "checks").get("slots"), reviewers)
+        return cache[until].watch_figures(since, until)
+    return flow
 
 
 MIN_HELD_HOURS = 1
@@ -210,6 +254,8 @@ def show(figure, value):
         return "%.1f an hour" % value
     if figure == "main_cpu":
         return "%.0f CPU-s" % value
+    if figure in ("hand_backs_per_merge", "prs_per_slot"):
+        return "%.2f %s" % (value, unit)
     if unit == "%":
         return "%.0f%%" % value
     return "%.1f min" % value
@@ -234,6 +280,14 @@ def judge(figure, rules, window, baseline, min_samples):
                 if limit else "")
         return IN, ("green" if not value else
                     "red for %s" % show(figure, value))
+    if figure == "reviewer_busy":
+        if value is None:
+            return UNJUDGED, "no reviewer listed by the router for the window"
+        limit = rules.get("limit")
+        if limit is not None and value > limit:
+            return OUT, "%s, over the limit of %s" % (
+                show(figure, value), show(figure, limit))
+        return IN, show(figure, value)
     if figure == "merge_rate" and not n:
         return UNJUDGED, "no approved pull request waited"
     if figure == "merge_rate" and value is None:
@@ -244,7 +298,7 @@ def judge(figure, rules, window, baseline, min_samples):
     ratio = rules.get("ratio")
     have_base = (ratio is not None and base is not None
                  and base_n >= min_samples and base > 0)
-    if figure == "merge_rate":
+    if figure in FLOORS:
         floor = rules.get("limit")
         if floor is not None and value < floor:
             return OUT, "%s, under the limit of %s" % (
@@ -356,7 +410,7 @@ def find_issues(token, project, label, call):
 
 def main(argv=None, out=print, err=None, environ=None, now=None,
          call=github.api_call, sign=github.openssl_sign, stats=None,
-         mint=None):
+         mint=None, flow=None):
     err = err or (lambda line: print(line, file=sys.stderr))
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(prog=PROG,
@@ -384,7 +438,12 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
         window = figures(stats(start, now), cfg["window_hours"], watched)
         baseline = figures(stats(start - watch.baseline, start),
                            cfg["baseline_days"] * 24, watched)
-    except (RuntimeError, OSError, ValueError) as error:
+        if any(f in watched for f in FLOW):
+            flow = flow or forge_flow(environ)
+            window.update(flow(start, now))
+            baseline.update(flow(start - watch.baseline, start))
+    except (RuntimeError, OSError, ValueError,
+            config.ConfigError) as error:
         err("%s: skipping this hour: %s" % (PROG, error))
         return 2
     verdicts = {}
