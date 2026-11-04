@@ -196,3 +196,14 @@ morning, against a 7-day baseline of 9.9.
 
 Approved by Alex Bligh, 2026-11-04, in XMPPEngineer's terminal ("(1)
 yes").
+
+## Amendment (2026-11-04, second): only while it is a candidate
+
+P holds others only while it is a candidate at H and was not handed
+back at H under its approval
+([designs/0044](0044-a-quieter-merger-and-batches-that-keep-their-order.md),
+rule 2), and it never holds a member of a batch whose top's run has
+started (rule 3). `merge.right_of_way.while_eligible: false` turns the
+first back off.
+
+Approved (Alex, 2026-11-04, in XMPPEngineer's session).

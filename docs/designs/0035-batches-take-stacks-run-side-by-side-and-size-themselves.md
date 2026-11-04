@@ -526,3 +526,22 @@ new key: it applies where `batches` is above 1.
 
 **Order of work.** `forge-pr-check`: `merger_batch` takes a batch of
 one when `later` is listed. Tests for both cases, then a release.
+
+## Amendment (2026-11-04, sixth): fixed means fixed, and a red suspect leaves
+
+* Status: approved (Alex, 2026-11-04, in XMPPEngineer's session)
+
+Two changes, written up in
+[designs/0044](0044-a-quieter-merger-and-batches-that-keep-their-order.md):
+
+* **Rule 3.** The first amendment's "a batch whose top's run has
+  started is fixed" now holds against every other ordering rule:
+  overdue candidates, right of way, newly approved pull requests and
+  returning stack layers go behind such batches
+  (`merge.test_ahead.fixed_order`, default `true`).
+* **Rule 4.** The second amendment's search ends with the red suspect
+  handed back at once, and kept out of batches until it has a new head
+  (`merge.test_ahead.hand_back_red_suspect`, default `true`).
+
+Rule 5 caps the batches in flight while started batches are re-cut
+often (`merge.test_ahead.unstable_after_recuts`, off by default).
