@@ -134,6 +134,41 @@ class Judge(unittest.TestCase):
         self.assertEqual(got, (tool.UNJUDGED, "the queue held approved "
                                "work for under 1 h"))
 
+    def test_hand_backs_per_merge_trips_over_its_limit_or_ratio(self):
+        rules = {"limit": 1, "ratio": 2}
+        got = self.judge("hand_backs_per_merge", (1.4, 10), (0.5, 100),
+                         rules)
+        self.assertEqual(got, (tool.OUT, "1.40 per merge, over the limit "
+                               "of 1.00 per merge"))
+        got = self.judge("hand_backs_per_merge", (0.9, 10), (0.4, 100),
+                         rules)
+        self.assertEqual(got[0], tool.OUT)
+        self.assertIn("over 2 x the baseline's 0.40 per merge", got[1])
+        self.assertEqual(self.judge("hand_backs_per_merge", (0.5, 10),
+                                    (0.4, 100), rules)[0], tool.IN)
+        self.assertEqual(self.judge("hand_backs_per_merge", (3, 2),
+                                    None, rules)[0], tool.UNJUDGED)
+
+    def test_prs_per_slot_is_a_floor(self):
+        rules = {"limit": 2}
+        got = self.judge("prs_per_slot", (1.4, 10), None, rules)
+        self.assertEqual(got, (tool.OUT, "1.40 per run, under the limit of "
+                               "2.00 per run"))
+        self.assertEqual(self.judge("prs_per_slot", (2.5, 10), None,
+                                    rules)[0], tool.IN)
+        got = self.judge("prs_per_slot", (1.4, 10), (3.1, 100),
+                         {"ratio": 2})
+        self.assertEqual(got[0], tool.OUT)
+
+    def test_reviewer_busy_trips_over_its_limit(self):
+        rules = {"limit": 90}
+        self.assertEqual(self.judge("reviewer_busy", (97, 1), None, rules),
+                         (tool.OUT, "97%, over the limit of 90%"))
+        self.assertEqual(self.judge("reviewer_busy", (60, 2), None,
+                                    rules)[0], tool.IN)
+        self.assertEqual(self.judge("reviewer_busy", (None, 0), None,
+                                    rules)[0], tool.UNJUDGED)
+
     def test_main_red_trips_on_any(self):
         self.assertEqual(self.judge("main_red", (1, 1))[0], tool.OUT)
         self.assertEqual(self.judge("main_red", (0, 0))[0], tool.IN)
@@ -454,6 +489,52 @@ class Main(unittest.TestCase):
         self.assertEqual(self.main(), 0)
         self.assertEqual(self.minted, [])
         self.assertIn("no stats_watch section", self.out[0])
+
+
+class ForgeFlow(unittest.TestCase):
+    """forge-flow's figures (designs/0045), from the state directory."""
+
+    setUp, stats, mint, main = Main.setUp, Main.stats, Main.mint, Main.main
+
+    def watch(self, figures):
+        with open(self.config) as handle:
+            data = json.load(handle)
+        data["stats_watch"]["figures"] = figures
+        with open(self.config, "w") as handle:
+            json.dump(data, handle)
+
+    def test_flow_figures_come_from_forge_flow(self):
+        from tests.test_forge_flow import NOW as FLOW_NOW, write_state
+        write_state(os.path.join(self.dir.name, "widget"))
+        self.watch({"hand_backs_per_merge": {"limit": 0.5},
+                    "prs_per_slot": {"limit": 1}})
+        self.assertEqual(self.main(now=FLOW_NOW), 0)
+        self.assertEqual(self.out[:2], [
+            "UNJUDGED hand_backs_per_merge: 2 samples, fewer than 5",
+            "UNJUDGED prs_per_slot: 1 samples, fewer than 5"])
+
+    def test_an_injected_flow_is_judged(self):
+        self.watch({"reviewer_busy": {"limit": 90}})
+        got = []
+
+        def flow(since, until):
+            got.append(until - since)
+            return {"reviewer_busy": (95.0, 1)}
+        self.assertEqual(tool.main([], self.out.append, self.err.append,
+                                   self.env, NOW, call=self.gh,
+                                   stats=self.stats, mint=self.mint,
+                                   flow=flow), 0)
+        self.assertEqual(got, [6 * HOUR, 7 * 24 * HOUR])
+        self.assertEqual(self.gh.writes[0][2]["title"], "forge-stats-watch: "
+                         "reviewer_busy 95%, over the limit of 90%")
+
+    def test_figures_not_watched_never_run_forge_flow(self):
+        def flow(since, until):
+            raise AssertionError("forge-flow ran")
+        self.assertEqual(tool.main([], self.out.append, self.err.append,
+                                   self.env, NOW, call=self.gh,
+                                   stats=self.stats, mint=self.mint,
+                                   flow=flow), 0)
 
 
 class ForgeStats(unittest.TestCase):

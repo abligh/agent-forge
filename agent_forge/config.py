@@ -91,7 +91,10 @@ STATS_WATCH_FIGURES = {
     "merge_rate": ("limit", "ratio"), "slots_busy": ("limit",),
     "main_red": (),
     "nightly_red_hours": ("limit",),
-    "main_cpu": ("limit", "ratio", "step")}
+    "main_cpu": ("limit", "ratio", "step"),
+    # From forge-flow (designs/0045).
+    "hand_backs_per_merge": ("limit", "ratio"),
+    "prs_per_slot": ("limit", "ratio"), "reviewer_busy": ("limit",)}
 # forge-nightly (designs/0028): a red nightly is a red main.
 NIGHTLY = {"workflow": str, "job": str, "owners": dict, "labels": list,
            "retry_hours": int, "escalate_hours": list, "as": str,
