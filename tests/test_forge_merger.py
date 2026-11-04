@@ -3449,20 +3449,23 @@ class TickAhead(RepoCase):
         self.repo.publish_pr(4, sha)
         self.repo.branch("feature", "feature")
         early = pr(4, T0, head=sha, reviews=[review(REVIEWER, oid=sha)])
-        self.tick([self.item(), self.other_pr()], conclusions=(None,),
-                  live=True)
+        # Made once: each other_pr() commits again, and a commit made in
+        # the next second is a new head, so #6 would leave the suspects
+        # by chance (the test failed now and then).
+        other = self.other_pr()
+        self.tick([self.item(), other], conclusions=(None,), live=True)
         top = self.ahead_json()["entries"][1]
         red = {"results": {top["sha"]: {"tree": top["tree"], "ok": False}}}
-        self.tick([self.item(), self.other_pr()], conclusions=(None,),
-                  live=True, check_state=red)
+        self.tick([self.item(), other], conclusions=(None,), live=True,
+                  check_state=red)
         # #4, older, would go first: it waits behind the suspects.
-        record, _ = self.tick([early, self.item(), self.other_pr()],
+        record, _ = self.tick([early, self.item(), other],
                               conclusions=(None,), live=True, minutes=1,
                               check_state=red)
         self.assertEqual(record["ahead"][:2], [5, 6])
         self.assertEqual(record["batch"], [5])
         # #6 is pushed to: it leaves, and the search has #5 alone.
-        six = dict(self.other_pr(), headRefOid=self.head)
+        six = dict(other, headRefOid=self.head)
         self.tick([self.item(), six], conclusions=(None,), live=True,
                   minutes=2, check_state=red)
         self.assertEqual([e["pr"] for e in m.load_suspects(
@@ -7228,3 +7231,4 @@ class RedMain(unittest.TestCase):
         got = m.later_batches(entries, 2, None, lambda t: None,
                               lambda sha, tree: False, {6})
         self.assertEqual([b["size"] for b in got], [1, 1])
+
