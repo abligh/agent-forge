@@ -227,14 +227,23 @@ suspect is also released by the build check's green verdict on the
 same head, read from the build check's state as the Merger already
 reads its verdicts, that finished after `at`, merged with that tip or
 one after it (`git merge-base --is-ancestor`). A batch's cover doesn't
-count. `labels.rerun` gives such a run of a red head. The tick logs
+count. `labels.rerun` gives such a run (below). The tick logs
 `SUSPECT-CLEARED #N: green rerun at <head>`, says so once on the pull
 request, and forgets the hand-back, so the suspect is predicted,
 updated and merged again under its approval. The hand-back's comment
 names both ways out, and the label when the project has one. A suspect
 kept before this, with no `at`, still waits for a new head.
 
+**A green head runs again too.** A flaky suspect's own check is
+usually green already: only its batch's run onto `main` went red. So
+`forge-pr-check` now honours `labels.rerun` on a pull request's green
+head as well, once per head as for a red one. The run is forced: the
+head's tree and steps are green here already, so a match, a batch's
+cover or a step's reuse would only post that green again without
+building. A forced run is none of those, and each step it chooses
+runs. It posts pending as `queued again after a green`, and its
+verdict says `(run again after green)`.
+
 **What it costs.** Nothing more from GitHub: the verdict and its time
-come from the build check's state. A head whose own check was green
-before the batch went red isn't run again by `labels.rerun`, so for it
-a new head is still the way out.
+come from the build check's state. A forced run is a full run of the
+head's chosen steps, once per head, when someone asks for it.
