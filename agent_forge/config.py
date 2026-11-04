@@ -106,12 +106,15 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "hold_conflicting": bool, "yield_after_hand_back": int,
          "yield_cap": int, "yield_ignores_conflicts": bool,
          "right_of_way": dict, "code_owners": bool,
-         "early_conflicts": bool, "stacks": dict, "resolve": list,
+         "early_conflicts": bool, "stacks": dict, "resolve": (list, dict),
          "hold_labels": list, "blocked_by": str, "said_since": dict,
          "update_once": bool, "ci_never_started": int,
          "queued_stall_minutes": int, "read_as": str, "age_first": dict,
          "hand_back_once_per_head": bool}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
+# merge.resolve as an object: designs/0026's rules as `regenerate`, and
+# designs/0046's `union` globs.
+RESOLVE = {"regenerate": list, "union": list}
 SAID_SINCE = {"author": bool, "approvals": bool, "quiet": list}
 BLOCKED_BY = ("body", "everywhere")
 RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int, "while_eligible": bool}
@@ -766,9 +769,20 @@ def _check_merge_0026(merge, data, problems):
     """The `merge` settings of designs/0026."""
     names = set(data.get("agents") or {}) | set(data.get("machinery") or {})
     rules = merge.get("resolve")
+    if isinstance(rules, dict):
+        _fields("merge.resolve", rules, RESOLVE, problems)
+        globs = rules.get("union")
+        if isinstance(globs, list) and not all(
+                isinstance(g, str) and g.strip() for g in globs):
+            problems.append("merge.resolve.union must be a list of path "
+                            "globs")
+        rules = rules.get("regenerate")
+        where_rules = "merge.resolve.regenerate"
+    else:
+        where_rules = "merge.resolve"
     if isinstance(rules, list):
         for i, rule in enumerate(rules):
-            where = "merge.resolve[%d]" % i
+            where = "%s[%d]" % (where_rules, i)
             if not _fields(where, rule, RESOLVE_RULE, problems):
                 continue
             for key in RESOLVE_RULE:

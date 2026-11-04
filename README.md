@@ -55,6 +55,7 @@ Identity, signing and decisions, which agents run:
 | `forge-decision` | Says whether the owner decided something, on this item, after it was asked. |
 | `forge-approval-scope` | Says whether a branch adds text to an approved design without saying so. |
 | `forge-closing-keywords` | Reports every issue a squash merge will close, refusing a negated one. |
+| `forge-resolve` | Merges the default branch in as the Merger would, keeping both sides of a conflict of additions. |
 
 Documentation and hosts:
 

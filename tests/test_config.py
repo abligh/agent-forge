@@ -491,6 +491,25 @@ class Check(unittest.TestCase):
             "merge.queued_stall_minutes must be at least 1",
             "merge.read_as 'Nobody' is not an agent or machinery"])
 
+    def test_merge_resolve_union_of_design_0046(self):
+        self.assertEqual(self.problems(merge={"resolve": {
+            "union": ["CHANGELOG.md", "docs/*.md"],
+            "regenerate": [{"paths": ["data/table.tsv"],
+                            "command": ["tools/gen-table"],
+                            "check": ["tools/gen-table", "--check"]}]}}), [])
+        self.assertEqual(self.problems(merge={"resolve": {"union": []}}), [])
+        self.assertEqual(self.problems(merge={"resolve": {
+            "union": ["ok", ""], "regenerate": [{"paths": ["a"]}],
+            "other": 1}}), [
+            "merge.resolve: unknown key 'other'",
+            "merge.resolve.union must be a list of path globs",
+            "merge.resolve.regenerate[0]: missing 'command'",
+            "merge.resolve.regenerate[0]: missing 'check'"])
+        self.assertEqual(self.problems(merge={"resolve": {"union": "x"}}),
+                         ["merge.resolve.union must be a list"])
+        self.assertEqual(self.problems(merge={"resolve": "x"}),
+                         ["merge.resolve must be a list or an object"])
+
     def test_merge_stacks(self):
         self.assertEqual(self.problems(merge={"stacks": {}}), [])
         self.assertEqual(self.problems(merge={"stacks": {"max_run": 3}}), [])
