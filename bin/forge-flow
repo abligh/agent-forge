@@ -10,7 +10,8 @@ already write in a project's state directory (`--state-dir`, default
 writes three files into `--out`:
 
 * `index.html`, one static page: no scripts, inline SVG and CSS bars,
-  light and dark, readable on a phone;
+  light and dark, readable on a phone. Its hourly graphs cover the
+  last 24 whole hours, and an hour with no Merger record is a gap;
 * `flow.json`, every number on the page;
 * `flow-history.jsonl`, one line for each whole hour, appended once.
 
@@ -27,7 +28,10 @@ It changes nothing else. The files it reads:
 * `router/presence.jsonl`, if there is one: who was busy and idle.
 
 **The panels**, each over the last 1 h, 6 h and 24 h, with the 7 days
-up to now (or as much of them as the records hold) as a baseline:
+up to now (or as much of them as the records hold) as a baseline. At a
+glance, first: merges an hour against the bar of 10, builds per merge
+((b) below, target about 1.1) and builds per merged pull request ((a),
+target about 2).
 
 1. Why so few merges: each Merger tick is put in one state, and the
    time to the next tick counts to it (at most GAP; the rest is "Merger
@@ -39,14 +43,16 @@ up to now (or as much of them as the records hold) as a baseline:
    `handed back` (every eligible pull request is back with its author),
    `eligible but held` (approved pull requests, all held) and `nothing
    eligible`. Minutes in each state, each hour.
-2. Flow: merges and arrivals (pull requests the build check first ran)
-   an hour; the pull requests waiting now, by where they wait.
+2. Flow: merges, arrivals (pull requests the build check first ran),
+   runs, hand-backs and re-cuts, each per hour; the pull requests
+   waiting now, by where they wait. A graph of merges each hour.
 3. Efficiency: (a) build-check runs per merged pull request, from its
    first push to its merge: its head runs and the batch runs it was a
    member of; (b) all runs started in the window per merge; pull
    requests per merge slot (merges over the green runs they rested
    on), sized 1, 2-3 and 4+; green batch tops on which all, part or
-   none of the batch merged.
+   none of the batch merged. Graphs of (a), (b) and pull requests per
+   merge slot each hour.
 4. Rework: hand-backs told per merge, by cause, with those repeating one
    already told for the same head apart; red head checks that were
    `red(merge)` (a conflict) against the other reds.
@@ -54,10 +60,11 @@ up to now (or as much of them as the records hold) as a baseline:
    approval is when the Merger first listed the pull request as queued
    or held. `--github` asks GitHub for the first approving review of
    each merged pull request instead, kept in `approvals.json` in
-   `--out` so each is asked once.
+   `--out` so each is asked once. A graph of both each hour.
 6. Capacity: slot-hours by what they went on, against the slots times
    the window; the median wait for a slot and run time; how busy each
-   agent was, reviewers first.
+   agent was, reviewers first. Graphs of the run time of heads and of
+   batch runs, mean and median, in 6-hour buckets over 7 days.
 7. Policy: who holds right of way and since when, the share of the
    window it was held, the overdue count, and batch re-cuts an hour (a
    tick whose batch is not the last one less what merged).
@@ -83,6 +90,7 @@ import html
 import importlib.machinery
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
@@ -120,6 +128,8 @@ WINDOWS = (("1h", HOUR), ("6h", 6 * HOUR), ("24h", DAY))
 BASELINE = ("7d", 7 * DAY)
 LANE = "fast"
 HISTORY_DAYS = 7
+# The build-time graph's buckets, in hours.
+BUCKET_HOURS = 6
 
 MERGING = "merging"
 SEARCH = "culprit search"
@@ -348,6 +358,37 @@ def category(run):
     if res is None:
         return "running" if run.get("open") else "no end logged"
     return "%s %s" % (what, res)
+
+
+def built(run):
+    """Whether a run built and tested to a verdict, so its run time
+    counts."""
+    end = run["end"]
+    return bool(end and end["res"] in ("green", "red") and end["ran"])
+
+
+def mean(values, digits=0):
+    if not values:
+        return None
+    got = round(sum(values) / len(values), digits)
+    return int(got) if digits == 0 else got
+
+
+# What a run is, for its run time: a head (the fast lane's too), a
+# batch (the Merger's prediction) or the default branch.
+RUN_KINDS = (("head", ("head", LANE)), ("batch", ("ahead",)),
+             ("main", ("main",)))
+
+
+def run_times(runs):
+    """{head, batch, main: {n, mean, median, p90}}: the run time in
+    seconds of the runs that built to a verdict, by kind."""
+    out = {}
+    for name, kinds in RUN_KINDS:
+        ran = [r["end"]["ran"] for r in runs
+               if r["kind"] in kinds and built(r)]
+        out[name] = dict(spread(ran), mean=mean(ran))
+    return out
 
 
 # ------------------------------------------------------------- records
@@ -602,6 +643,8 @@ class Flow:
                "states": self.state_minutes(since, until)}
         out["arrivals"] = sum(1 for t in self.arrived.values()
                               if since <= t < until)
+        out["arrivals_per_hour"] = ratio(out["arrivals"], hours, 1)
+        out["runs_per_hour"] = ratio(len(runs), hours, 1)
         out["eligible_mean"] = ratio(sum(len(r.get("queue") or [])
                                          for r in ticks), len(ticks), 1)
         out["held_mean"] = ratio(sum(len(r.get("held") or {})
@@ -612,6 +655,8 @@ class Flow:
         out.update(self._capacity(runs, hours))
         out["busy"] = self._busy(since, until)
         out.update(self._policy(ticks, hours))
+        out["hand_backs_per_hour"] = ratio(out["hand_backs"]["told"], hours,
+                                           1)
         return out
 
     def _efficiency(self, merges, runs, since, until):
@@ -700,14 +745,14 @@ class Flow:
         waited = [r["end"]["waited"] for r in runs
                   if r["kind"] in ("head", LANE) and r["end"]
                   and r["end"]["waited"] is not None]
-        ran = [r["end"]["ran"] for r in runs if r["end"]
-               and r["end"]["res"] in ("green", "red") and r["end"]["ran"]]
+        ran = [r["end"]["ran"] for r in runs if built(r)]
         return {"slot_hours": {k: round(v, 1) for k, v in by.most_common()},
                 "slot_hours_used": round(sum(by.values()), 1),
                 "slot_hours_available": round(self.slots * hours, 1),
                 "slots": self.slots,
                 "head_wait_seconds": spread(waited),
-                "run_seconds": spread(ran)}
+                "run_seconds": dict(spread(ran), mean=mean(ran)),
+                "run_seconds_by_kind": run_times(runs)}
 
     def _busy(self, since, until):
         """{name: {busy, listed hours, reviewer}}: the share of the time
@@ -796,6 +841,39 @@ class Flow:
                                          if a <= t < b)})
         return rows
 
+    def graph_hours(self, hours=24):
+        """The last `hours` whole clock hours, oldest first, with what
+        the page graphs (graph_row). An hour with no Merger record is a
+        gap: it has only its `hour`, and `records` false."""
+        top = self.now.replace(minute=0, second=0, microsecond=0)
+        rows = []
+        for k in range(hours, 0, -1):
+            a = top - k * HOUR
+            ticks = (bisect.bisect_left(self.tick_times, a + HOUR)
+                     - bisect.bisect_left(self.tick_times, a))
+            row = {"hour": stamp(a), "records": bool(ticks)}
+            if ticks:
+                row.update(graph_row(self.figures(a, a + HOUR)))
+            rows.append(row)
+        return rows
+
+    def build_times(self, days=HISTORY_DAYS, size=BUCKET_HOURS):
+        """The build check's run times over the last `days`, in buckets
+        of `size` hours from midnight UTC, oldest first: each bucket's
+        run_times(). The last bucket runs to now and is `partial`."""
+        step = size * HOUR
+        top = self.now.replace(hour=self.now.hour - self.now.hour % size,
+                               minute=0, second=0, microsecond=0)
+        rows = []
+        for k in range(days * 24 // size - 1, -1, -1):
+            a = top - k * step
+            b = min(a + step, self.now)
+            runs = self.runs[bisect.bisect_left(self.run_times, a):
+                             bisect.bisect_left(self.run_times, b)]
+            rows.append(dict({"since": stamp(a), "until": stamp(b),
+                              "partial": b < a + step}, **run_times(runs)))
+        return rows
+
     def watch_figures(self, since, until):
         """forge-stats-watch's figures (designs/0045): {name: (value,
         samples)}."""
@@ -816,7 +894,100 @@ class Flow:
 HISTORY_KEYS = ("merges", "arrivals", "states", "runs_total",
                 "runs_per_merge", "merge_slots", "hand_backs",
                 "head_checks", "slot_hours", "recuts", "right_of_way_share",
-                "overdue_mean")
+                "overdue_mean", "runs_per_merged_pr", "approval_to_merge",
+                "run_seconds", "run_seconds_by_kind")
+
+
+def graph_row(fig):
+    """What the page graphs of one hour, from its figures or its
+    history line (whose older lines lack some: those are None)."""
+    lat = fig.get("approval_to_merge") or {}
+    lat = lat.get("github_minutes") or lat.get("local_minutes") or {}
+    return {"merges": fig.get("merges"),
+            "runs_per_merge": fig.get("runs_per_merge"),
+            "runs_per_merged_pr": (fig.get("runs_per_merged_pr")
+                                   or {}).get("mean"),
+            "prs_per_slot": (fig.get("merge_slots")
+                             or {}).get("prs_per_slot"),
+            "approval_median": lat.get("median"),
+            "approval_p90": lat.get("p90"),
+            "approval_n": lat.get("n")}
+
+
+def had_records(line):
+    """Whether a history line's hour had the Merger ticking at all."""
+    states = line.get("states") or {}
+    return any(v for k, v in states.items() if k != NO_TICKS)
+
+
+def history_lines(lines):
+    """{hour: line} of flow-history.jsonl's lines."""
+    out = {}
+    for line in lines:
+        try:
+            got = json.loads(line)
+            out[got["hour"]] = got
+        except (ValueError, KeyError, TypeError):
+            continue
+    return out
+
+
+def graph_hours_from_history(history, until, hours=24):
+    """Flow.graph_hours() from flow-history.jsonl's lines, for a saved
+    flow.json written before the page had graphs. An hour with no line,
+    or no Merger record, is a gap."""
+    by = history_lines(history)
+    top = until.replace(minute=0, second=0, microsecond=0)
+    rows = []
+    for k in range(hours, 0, -1):
+        hour = stamp(top - k * HOUR)
+        line = by.get(hour)
+        row = {"hour": hour, "records": bool(line and had_records(line))}
+        if row["records"]:
+            row.update(graph_row(line))
+        rows.append(row)
+    return rows
+
+
+def build_times_from_history(history, until, days=HISTORY_DAYS,
+                             size=BUCKET_HOURS):
+    """Flow.build_times() from flow-history.jsonl's lines: each
+    bucket's mean is its hours' means weighted by their runs. A median
+    can't be put together from hours', so it is None."""
+    by = history_lines(history)
+    step = size * HOUR
+    top = until.replace(hour=until.hour - until.hour % size, minute=0,
+                        second=0, microsecond=0)
+    rows = []
+    for k in range(days * 24 // size - 1, -1, -1):
+        a = top - k * step
+        b = min(a + step, until)
+        row = {"since": stamp(a), "until": stamp(b),
+               "partial": b < a + step}
+        for name, _ in RUN_KINDS:
+            n = total = 0
+            for h in range(size):
+                got = ((by.get(stamp(a + h * HOUR)) or {})
+                       .get("run_seconds_by_kind") or {}).get(name) or {}
+                if got.get("n") and got.get("mean") is not None:
+                    n += got["n"]
+                    total += got["n"] * got["mean"]
+            row[name] = {"n": n, "mean": round(total / n) if n else None,
+                         "median": None, "p90": None}
+        rows.append(row)
+    return rows
+
+
+def with_graphs(data, history):
+    """`data` (a flow.json), with the graphs' figures from
+    flow-history.jsonl's lines where it has none of its own."""
+    data = dict(data)
+    until = parse_time(data["generated"])
+    if "graph_hours" not in data:
+        data["graph_hours"] = graph_hours_from_history(history, until)
+    if "build_times" not in data:
+        data["build_times"] = build_times_from_history(history, until)
+    return data
 
 
 def append_history(flow, path):
@@ -906,11 +1077,11 @@ WHAT = {
 
 CSS = """
 :root{color-scheme:light;--bg:#f9f9f7;--card:#fcfcfb;--ink:#0b0b0b;
---ink2:#52514e;--muted:#898781;--grid:#e1e0d9;--ring:rgba(11,11,11,.10);
-%s}
+--ink2:#52514e;--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;
+--ring:rgba(11,11,11,.10);--c1:#2a78d6;--c2:#eb6834;%s}
 @media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#0d0d0d;
---card:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--grid:#2c2c2a;
---ring:rgba(255,255,255,.10);%s}}
+--card:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--grid:#2c2c2a;--axis:#383835;
+--ring:rgba(255,255,255,.10);--c1:#3987e5;--c2:#d95926;%s}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
 font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -932,6 +1103,28 @@ white-space:normal}th{color:var(--ink2);font-weight:600}
 .hbar{background:var(--grid);border-radius:3px;height:10px;min-width:80px}
 .hbar i{display:block;height:100%%;border-radius:3px;background:var(--s2)}
 svg text{fill:var(--muted);font-size:10px}
+svg .grid{stroke:var(--grid);stroke-width:1}
+svg .axis{stroke:var(--axis);stroke-width:1}
+svg .ref{stroke:var(--ink2);stroke-width:1;stroke-dasharray:4 3}
+svg text.reft,svg text.lab{fill:var(--ink2)}
+svg .line{fill:none;stroke-width:2;stroke-linejoin:round;
+stroke-linecap:round}
+svg .dot{stroke:var(--card);stroke-width:2}
+svg .zero{fill:var(--axis)}
+svg .hit{fill:transparent}svg .hit:hover{fill:var(--ring)}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,
+minmax(280px,1fr));gap:12px;margin:10px 0}
+figure.chart{margin:0;min-width:0}
+figcaption b{display:block;font-size:14px}
+figcaption .note{display:block;margin:2px 0 4px}
+.ln{width:14px;height:2px;border-radius:1px;display:inline-block}
+details{font-size:13px;margin:4px 0 0}summary{color:var(--ink2);
+cursor:pointer}
+.tile{display:grid;grid-template-columns:repeat(auto-fit,
+minmax(200px,1fr));gap:10px;margin:0 0 10px}
+.tile div{border:1px solid var(--ring);border-radius:8px;padding:8px 10px}
+.tile .v{font-size:28px;font-weight:600}
+.tile .l{color:var(--ink2);font-size:13px}
 .now{font-size:14px}.now b{font-variant-numeric:tabular-nums}
 """
 
@@ -1006,6 +1199,275 @@ def hourly_svg(rows):
     return "".join(parts)
 
 
+# The graphs' two series colours: the categorical slots 1 and 2.
+SERIES = ("var(--c1)", "var(--c2)")
+# Targets: the owner's bar for merges, and where builds per pull request
+# would be with full batching.
+MERGE_BAR = 10
+RUNS_PER_MERGE_TARGET = 1.1
+RUNS_PER_PR_TARGET = 2
+
+
+def nice_ticks(top):
+    """Clean y ticks from 0 to at least `top`: 0 and up to 4 more."""
+    top = top if top and top > 0 else 1
+    base = 10 ** math.floor(math.log10(top / 4))
+    for m in (1, 2, 2.5, 5, 10):
+        step = base * m
+        if top / step <= 4:
+            break
+    count = math.ceil(top / step - 1e-9)
+    return [round(step * i, 6) for i in range(count + 1)]
+
+
+def tick_text(value):
+    return ("%d" % value if value == int(value)
+            else ("%.2f" % value).rstrip("0"))
+
+
+def chart(cid, title, desc, unit, slots, series, ticks_x, ref=None,
+          bars=False, x_label="hour (UTC)", gap="no value"):
+    """One small graph, as inline SVG: `slots` names each x position
+    (for its tooltip), `series` is [(name, values)] with None for a
+    gap, `ticks_x` is [(index, text)], `ref` an optional (value, text)
+    reference line. Bars for one series, else lines. A gap draws
+    nothing, and `gap` says why under a run of three or more; a zero
+    bar is a stub on the baseline."""
+    width, height = 360, 200
+    left, right, top, bottom = 30, 10, 18, 30
+    multi = len(series) > 1
+    if multi:
+        right = 44
+    values = [v for _, vs in series for v in vs if v is not None]
+    ticks = nice_ticks(max(values + ([ref[0] * 1.15] if ref else []),
+                           default=0))
+    y_top = ticks[-1]
+    plot_w, plot_h = width - left - right, height - top - bottom
+    col = plot_w / max(1, len(slots))
+
+    def x(i):
+        return left + (i + 0.5) * col
+
+    def y(v):
+        return top + plot_h * (1 - v / y_top)
+    parts = ['<svg viewBox="0 0 %d %d" width="100%%" role="img" '
+             'aria-labelledby="%s-t %s-d"><title id="%s-t">%s</title>'
+             '<desc id="%s-d">%s</desc>'
+             % (width, height, cid, cid, cid, esc(title), cid, esc(desc))]
+    for t in ticks:
+        parts.append('<line x1="%d" x2="%d" y1="%.1f" y2="%.1f" class="%s"/>'
+                     '<text x="%d" y="%.1f" text-anchor="end">%s</text>'
+                     % (left, width - right, y(t), y(t),
+                        "axis" if t == 0 else "grid", left - 4, y(t) + 3.5,
+                        tick_text(t)))
+    parts.append('<text x="0" y="9">%s</text>' % esc(unit))
+    parts.append('<text x="%d" y="%d" text-anchor="end">%s</text>'
+                 % (width - right, height - 2, esc(x_label)))
+    for i, text in ticks_x:
+        parts.append('<text x="%.1f" y="%d" text-anchor="middle">%s</text>'
+                     % (x(i), top + plot_h + 13, esc(text)))
+    if ref:
+        # The line across the plot, keyed above it, clear of the marks.
+        key_x = width - right - 6 * len(ref[1]) - 22
+        parts.append('<line x1="%d" x2="%d" y1="%.1f" y2="%.1f" '
+                     'class="ref"/><line x1="%d" x2="%d" y1="6" y2="6" '
+                     'class="ref"/><text x="%d" y="9" class="reft">%s</text>'
+                     % (left, width - right, y(ref[0]), y(ref[0]), key_x,
+                        key_x + 16, key_x + 20, esc(ref[1])))
+    if not values:
+        parts.append('<text x="%.1f" y="%.1f" text-anchor="middle" '
+                     'class="reft">no data yet</text>'
+                     % (left + plot_w / 2, top + plot_h / 2))
+    ends = []
+    for k, (name, vs) in enumerate(series):
+        colour = SERIES[k]
+        if bars:
+            w = min(24.0, col - 2)
+            r = min(4.0, w / 2)
+            for i, v in enumerate(vs):
+                if v is None:
+                    continue
+                if v == 0:
+                    parts.append('<rect x="%.1f" y="%.1f" width="%.1f" '
+                                 'height="1.5" class="zero"/>'
+                                 % (x(i) - w / 2, y(0) - 1.5, w))
+                    continue
+                x0, y0, h = x(i) - w / 2, y(v), y(0) - y(v)
+                rr = min(r, h)
+                parts.append(
+                    '<path d="M%.1f %.1fV%.1fQ%.1f %.1f %.1f %.1fH%.1fQ%.1f '
+                    '%.1f %.1f %.1fV%.1fZ" style="fill:%s"/>'
+                    % (x0, y(0), y0 + rr, x0, y0, x0 + rr, y0, x0 + w - rr,
+                       x0 + w, y0, x0 + w, y0 + rr, y(0), colour))
+            continue
+        runs, run = [], []
+        for i, v in enumerate(vs):
+            if v is None:
+                if run:
+                    runs.append(run)
+                run = []
+            else:
+                run.append((x(i), y(v)))
+        if run:
+            runs.append(run)
+        for run in runs:
+            if len(run) > 1:
+                parts.append('<path d="M%s" class="line" style="stroke:%s"/>'
+                             % ("L".join("%.1f %.1f" % p for p in run),
+                                colour))
+        dots = [run[0] for run in runs if len(run) == 1]
+        if runs:
+            dots.append(runs[-1][-1])
+            ends.append((runs[-1][-1], name))
+        for px, py in dots:
+            parts.append('<circle cx="%.1f" cy="%.1f" r="4" class="dot" '
+                         'style="fill:%s"/>' % (px, py, colour))
+    # Direct labels at the lines' ends, unless they would collide.
+    if multi and len(ends) == len(series) and all(
+            abs(a[0][1] - b[0][1]) >= 11 for a in ends for b in ends
+            if a is not b):
+        for (px, py), name in ends:
+            parts.append('<text x="%.1f" y="%.1f" class="lab">%s</text>'
+                         % (px + 7, py + 3.5, esc(name)))
+    # Say so under a run of 3 or more slots with no value at all.
+    empty = [all(vs[i] is None for _, vs in series)
+             for i in range(len(slots))]
+    i = 0
+    while values and i < len(slots):
+        j = i
+        while j < len(slots) and empty[j]:
+            j += 1
+        if j - i >= 3:
+            parts.append('<text x="%.1f" y="%.1f" text-anchor="middle">'
+                         "%s</text>" % ((x(i) + x(j - 1)) / 2, y(0) - 5,
+                                        esc(gap)))
+        i = j + 1
+    # A hit target a slot, the whole plot high, carrying its values.
+    for i, slot in enumerate(slots):
+        said = ["%s: %s" % (name, num(vs[i], 2) if isinstance(vs[i], float)
+                            else vs[i]) for name, vs in series
+                if vs[i] is not None]
+        parts.append('<rect x="%.1f" y="%d" width="%.1f" height="%.1f" '
+                     'class="hit"><title>%s: %s</title></rect>'
+                     % (left + i * col, top, col, plot_h, esc(slot),
+                        esc("; ".join(said) or gap)))
+    parts.append("</svg>")
+    key = ""
+    if multi:
+        key = '<div class="key">%s</div>' % "".join(
+            '<span><i class="ln" style="background:%s"></i>%s</span>'
+            % (SERIES[k], esc(name)) for k, (name, _) in enumerate(series))
+    rows = [[esc(slot)] + [esc(num(vs[i], 2) if isinstance(vs[i], float)
+                               else vs[i]) for _, vs in series]
+            for i, slot in enumerate(slots)]
+    return ('<figure class="chart"><figcaption><b>%s</b><span class="note">'
+            '%s</span></figcaption>%s%s<details><summary>Values</summary>%s'
+            "</details></figure>"
+            % (esc(title), esc(desc), "".join(parts), key,
+               table([""] + [name for name, _ in series], rows)))
+
+
+def hour_ticks(rows):
+    """Every 6th hour's label, as HH."""
+    return [(i, row["hour"][11:13]) for i, row in enumerate(rows)
+            if int(row["hour"][11:13]) % 6 == 0]
+
+
+def graph_values(rows, key, scale=1.0):
+    return [None if not row.get("records") or row.get(key) is None
+            else row[key] / scale for row in rows]
+
+
+def latency_scale(rows):
+    """Minutes, or hours when the p90 runs past 3 hours."""
+    worst = max([v for v in graph_values(rows, "approval_p90")
+                 if v is not None], default=0)
+    return (60.0, "hours") if worst > 180 else (1.0, "minutes")
+
+
+def flow_graphs(rows):
+    """Section 2's graph: merges each hour, against the bar."""
+    slots = [r["hour"][11:16] for r in rows]
+    return '<div class="charts">%s</div>' % chart(
+        "merges", "Merges per hour, last 24 h",
+        "Pull requests merged in each whole hour (UTC), against the bar "
+        "of %d an hour. A gap is an hour with no Merger record; a stub on "
+        "the baseline is an hour with none merged." % MERGE_BAR,
+        "merges/h", slots, [("merges", graph_values(rows, "merges"))],
+        hour_ticks(rows), ref=(MERGE_BAR, "bar %d/h" % MERGE_BAR),
+        bars=True, gap="no records")
+
+
+def efficiency_graphs(rows):
+    slots = [r["hour"][11:16] for r in rows]
+    ticks = hour_ticks(rows)
+    return '<div class="charts">%s%s%s</div>' % (
+        chart("rpm", "Builds per merge, each hour",
+              "All build-check runs started in the hour, divided by the "
+              "pull requests merged in it. Full batching brings it towards "
+              "about %s. A gap is an hour with no merge."
+              % RUNS_PER_MERGE_TARGET, "builds per merge", slots,
+              [("builds per merge", graph_values(rows, "runs_per_merge"))],
+              ticks, ref=(RUNS_PER_MERGE_TARGET, "target %s"
+                          % RUNS_PER_MERGE_TARGET)),
+        chart("rppr", "Builds per merged PR, each hour",
+              "For the pull requests merged in the hour, the mean of each "
+              "one's own runs from its first push to its merge: its head "
+              "runs and the batch runs it was in. The optimum is about %d. A "
+              "gap is an hour with no merge." % RUNS_PER_PR_TARGET,
+              "builds per PR", slots,
+              [("builds per merged PR",
+                graph_values(rows, "runs_per_merged_pr"))],
+              ticks, ref=(RUNS_PER_PR_TARGET, "optimum %d"
+                          % RUNS_PER_PR_TARGET)),
+        chart("pps", "Pull requests per merge slot, each hour",
+              "Pull requests merged in the hour, over the green runs they "
+              "rested on. Higher means more merged on each green run. A gap "
+              "is an hour with no merge.",
+              "PRs per slot", slots,
+              [("PRs per slot", graph_values(rows, "prs_per_slot"))],
+              ticks))
+
+
+def latency_graphs(rows):
+    scale, unit = latency_scale(rows)
+    slots = [r["hour"][11:16] for r in rows]
+    return '<div class="charts">%s</div>' % chart(
+        "lat", "First approval to merge, each hour",
+        "For the pull requests merged in the hour, the time from their "
+        "first approval to their merge: median and p90, in %s. A gap "
+        "is an hour with no merge." % unit,
+        unit, slots,
+        [("median", graph_values(rows, "approval_median", scale)),
+         ("p90", graph_values(rows, "approval_p90", scale))],
+        hour_ticks(rows))
+
+
+def build_graphs(rows):
+    """Run time of the build check, mean and median, 6-hour buckets."""
+    slots = ["%s %s-%s%s" % (r["since"][5:10], r["since"][11:13],
+                             r["until"][11:13] if r["until"][11:13] != "00"
+                             else "24", " so far" if r["partial"] else "")
+             for r in rows]
+    ticks = [(i, r["since"][5:10]) for i, r in enumerate(rows)
+             if r["since"][11:13] == "00"]
+    ticks = ticks[1::2] if len(ticks) > 4 else ticks
+
+    def values(kind, key):
+        return [None if (r.get(kind) or {}).get(key) is None
+                else round(r[kind][key] / 60, 1) for r in rows]
+    out = []
+    for kind, what in (("head", "Head runs"), ("batch", "Batch runs")):
+        out.append(chart(
+            "bt-" + kind, "%s: build time, last 7 days" % what,
+            "The build check's run time, in minutes, of the %s that built "
+            "to a verdict, in 6-hour buckets (UTC): mean and median. A gap "
+            "is a bucket with none." % what.lower(), "minutes", slots,
+            [("mean", values(kind, "mean")),
+             ("median", values(kind, "median"))], ticks, x_label="day (UTC)"))
+    return '<div class="charts">%s</div>' % "".join(out)
+
+
 def share_bar(states):
     total = sum(states.values()) or 1
     return '<div class="bar">%s</div>' % "".join(
@@ -1026,6 +1488,41 @@ def per_hour(fig, minutes):
     return minutes / fig["hours"] if fig["hours"] else 0
 
 
+def glance(w, names, head):
+    """The figures the owner reads first: merges an hour and the two
+    builds-per-pull-request figures, each beside its target."""
+    day = w["24h"]
+    tiles = [("%s /h" % num(day["merges_per_hour"]),
+              "merges an hour, last 24 h (bar %d)" % MERGE_BAR),
+             (num(day["runs_per_merge"], 2),
+              "builds per merge, last 24 h (target about %s)"
+              % RUNS_PER_MERGE_TARGET),
+             (num(day["runs_per_merged_pr"]["mean"], 2),
+              "builds per merged PR, last 24 h (optimum about %d)"
+              % RUNS_PER_PR_TARGET)]
+    rows = [["merges per hour"]
+            + [num(ratio(w[k]["merges"], w[k]["hours"], 1)) for k in names]
+            + ["%d" % MERGE_BAR],
+            ["Builds per merge (all build runs &divide; PRs merged)"]
+            + [num(w[k]["runs_per_merge"], 2) for k in names]
+            + ["&asymp; %s" % RUNS_PER_MERGE_TARGET],
+            ["Builds per merged PR along its own path"]
+            + [num(w[k]["runs_per_merged_pr"]["mean"], 2) for k in names]
+            + ["&asymp; %d" % RUNS_PER_PR_TARGET]]
+    return ('<section><h2>At a glance</h2><div class="tile">%s</div>%s'
+            '<p class="note">Builds per merge counts every build-check run '
+            "started in the window (heads, batch predictions, the default "
+            "branch, stopped runs and reruns) over the pull requests merged "
+            "in it; full batching brings it towards one build a merge. "
+            "Builds per merged PR follows each pull request merged in the "
+            "window from its first push to its merge, and counts its own "
+            "head runs and the batch runs it was in; at best that is one "
+            "of each.</p></section>"
+            % ("".join('<div><div class="v">%s</div><div class="l">%s</div>'
+                       "</div>" % (esc(v), esc(l)) for v, l in tiles),
+               table(head + ["target"], rows)))
+
+
 def page(data):
     w = data["windows"]
     names = [k for k, _ in WINDOWS] + [BASELINE[0]]
@@ -1039,6 +1536,8 @@ def page(data):
                "the records to %s. The 7-day column covers %s h.</p>"
                % (esc(data["project"]), esc(data["generated"]),
                   esc(snap.get("at")), num(w[BASELINE[0]]["hours"], 0)))
+    graphs = data.get("graph_hours") or []
+    out.append(glance(w, names, head))
     # 1. States.
     rows = []
     for state in STATES:
@@ -1056,13 +1555,22 @@ def page(data):
                   " ".join("<b>%s</b>: %s." % (esc(s), esc(WHAT[s]))
                            for s in STATES)))
     # 2. Flow.
-    rows = [["merges"] + [esc(w[k]["merges"]) for k in names[:-1]]
-            + ["%s/h" % num(ratio(w[names[-1]]["merges"],
-                                  w[names[-1]]["hours"]))],
-            ["arrivals (first run of a pull request)"]
-            + [esc(w[k]["arrivals"]) for k in names[:-1]]
-            + ["%s/h" % num(ratio(w[names[-1]]["arrivals"],
-                                  w[names[-1]]["hours"]))],
+    def hourly_rate(label, count):
+        """A row of a count per hour, the count itself in a tooltip."""
+        cells = []
+        for k in names:
+            n = count(w[k])
+            cells.append('<span title="%s in %s h">%s /h</span>' % (
+                esc(n), num(w[k]["hours"], 1),
+                num(ratio(n, w[k]["hours"], 1))))
+        return [label] + cells
+    rows = [hourly_rate("merges", lambda f: f["merges"]),
+            hourly_rate("arrivals (first run of a pull request)",
+                        lambda f: f["arrivals"]),
+            hourly_rate("build-check runs started",
+                        lambda f: f["runs_total"]),
+            hourly_rate("hand-backs told", lambda f: f["hand_backs"]["told"]),
+            hourly_rate("batch re-cuts", lambda f: f["recuts"]),
             ["eligible, mean"] + [num(w[k]["eligible_mean"]) for k in names],
             ["held, mean"] + [num(w[k]["held_mean"]) for k in names]]
     where = [["in the batch", ", ".join("#%d" % p for p in snap.get(
@@ -1077,9 +1585,13 @@ def page(data):
             for p in snap.get("handed_back", [])) or "-"]]
     for kind, prs in sorted(snap.get("held", {}).items()):
         where.append(["held: %s" % kind, ", ".join("#%d" % p for p in prs)])
-    out.append("<section><h2>2. Flow</h2>%s<h2 style=\"margin-top:12px\">"
+    out.append("<section><h2>2. Flow</h2>%s<p class=\"note\">Counts are "
+               "per hour in every window; hover one for the count itself. "
+               "Means are means over the Merger's ticks.</p>%s"
+               "<h2 style=\"margin-top:12px\">"
                "Waiting now (%s, %s)</h2>%s</section>"
-               % (table(head, rows), esc(snap.get("at")),
+               % (table(head, rows), flow_graphs(graphs),
+                  esc(snap.get("at")),
                   esc(snap.get("state")),
                   table(["where", "pull requests"],
                         [[esc(a), esc(b)] for a, b in where])))
@@ -1113,8 +1625,8 @@ def page(data):
                " a pull request's head runs and the batch runs it was a "
                "member of, from its first push to its merge. (b) counts every"
                " run started in the window: heads, predictions and main. A "
-               "merge slot is the green run a merge rested on.</p></section>"
-               % table(head, rows))
+               "merge slot is the green run a merge rested on.</p>%s"
+               "</section>" % (table(head, rows), efficiency_graphs(graphs)))
     # 4. Rework.
     causes = sorted({c for k in names for c in
                      w[k]["hand_backs"]["per_merge_by_cause"]})
@@ -1151,8 +1663,9 @@ def page(data):
                     + [lat(w[k], "github_minutes") for k in names])
     out.append("<section><h2>5. Latency</h2>%s<p class=\"note\">Locally, "
                "the first approval is the first Merger tick that listed the "
-               "pull request as queued or held.</p></section>"
-               % table(head, rows))
+               "pull request as queued or held. The graph uses GitHub's "
+               "first approval where it has it.</p>%s</section>"
+               % (table(head, rows), latency_graphs(graphs)))
     # 6. Capacity.
     cats = sorted({c for k in names for c in w[k]["slot_hours"]},
                   key=lambda c: -w[BASELINE[0]]["slot_hours"].get(c, 0))
@@ -1167,6 +1680,11 @@ def page(data):
         num(w[k]["head_wait_seconds"]["median"], 0) + " s" for k in names])
     rows.append(["run time, median"] + [
         num(w[k]["run_seconds"]["median"], 0) + " s" for k in names])
+    for kind, what in (("head", "head runs"), ("batch", "batch runs")):
+        rows.append(["run time of %s, mean / median" % what] + [
+            "%s / %s s" % (num(got.get("mean"), 0), num(got.get("median"), 0))
+            for got in ((w[k].get("run_seconds_by_kind") or {}).get(kind, {})
+                        for k in names)])
     busy = []
     for name, got in w["6h"]["busy"].items():
         week = w[BASELINE[0]]["busy"].get(name, {}).get("busy")
@@ -1180,10 +1698,13 @@ def page(data):
                " of the runs started in the window; %d slots.</p>"
                "<h2 style=\"margin-top:12px\">Busy, last 6 h</h2>%s"
                "<p class=\"note\">Busy is the share of the time an agent was "
-               "listed that she was busy, not idle or in a shell.</p></section>"
+               "listed that she was busy, not idle or in a shell.</p>"
+               "<h2 style=\"margin-top:12px\">Build time, last 7 days</h2>%s"
+               "</section>"
                % (table(head[:1] + head[1:], rows), w["24h"]["slots"],
                   table(["agent", "", "6 h", "7 d"], busy) if busy
-                  else "<p>No presence records.</p>"))
+                  else "<p>No presence records.</p>",
+                  build_graphs(data.get("build_times") or [])))
     # 7. Policy.
     row = snap.get("right_of_way") or {}
     rows = [["right of way held, share of ticks"] + [
@@ -1220,7 +1741,8 @@ def compute(flow, project_name):
     windows[BASELINE[0]] = flow.figures(start, flow.now)
     return {"project": project_name, "generated": stamp(flow.now),
             "windows": windows, "hours": flow.hourly(), "now":
-            flow.snapshot()}
+            flow.snapshot(), "graph_hours": flow.graph_hours(),
+            "build_times": flow.build_times()}
 
 
 def main(argv=None, out=print, err=None, environ=None, now=None,

@@ -236,3 +236,54 @@ tests cover the three new figures and the call into `forge-flow`.
    build-check host. The host's owner points a web server at `--out`.
 3. Later, if wanted, the project names the new figures in
    `stats_watch`.
+
+## Amendment (2026-11-04): per hour, and graphs
+
+The owner asked for the page to do the arithmetic: every count in the
+flow panel per hour, graphs of the last 24 hours, the two
+builds-per-pull-request figures named plainly beside their targets,
+and the build check's run time over a longer period.
+
+* **At a glance.** A panel above the first says, for the last 1 h,
+  6 h, 24 h and the 7 days, merges per hour against the bar of 10, and
+  the two builds-per-pull-request figures with their targets:
+  * "Builds per merge (all build runs ÷ PRs merged)", target about
+    1.1: every run started in the window, whatever it was for, over
+    the merges in it. This is (b).
+  * "Builds per merged PR along its own path", target about 2: for
+    each pull request merged in the window, its own head runs from its
+    first push and the batch runs it was in, up to its merge. This is
+    (a).
+
+  Both were already computed as these names say, so neither changed.
+* **The flow panel is per hour.** Merges, arrivals, runs started,
+  hand-backs told and batch re-cuts show per hour in every window, the
+  count itself in a tooltip. The means stay means. `flow.json` adds
+  `arrivals_per_hour`, `runs_per_hour` and `hand_backs_per_hour`
+  beside the counts, which are kept.
+* **Graphs of the last 24 whole hours.** Merges each hour, as columns
+  against a line at 10; builds per merge, builds per merged pull
+  request and pull requests per merge slot, each its own graph with
+  its target, since their scales differ; and first approval to merge,
+  median and p90. An hour with no Merger record is a gap, never a
+  zero; a ratio's hour with no merge is a gap too. `flow.json` adds
+  `graph_hours`.
+* **Build time over 7 days.** The run time of runs that built to a
+  verdict, mean and median, in 6-hour buckets, heads and batch runs
+  apart. Hour by hour it would be too few runs a point. `flow.json`
+  adds `build_times`, and each window adds `run_seconds.mean` and
+  `run_seconds_by_kind` (head, batch and the default branch).
+* **The history keeps more.** Each new line of `flow-history.jsonl`
+  also has `runs_per_merged_pr`, `approval_to_merge`, `run_seconds`
+  and `run_seconds_by_kind`. Lines already written are left as they
+  are.
+
+The graphs are inline SVG drawn in Python, as the page allows no
+script: each has a title and a description for screen readers, a
+tooltip on every hour and a table of its values beside it. They are
+360 units wide, in a grid that puts one a row on a phone.
+
+A page rendered from a saved `flow.json` written before this change
+takes the graphs from `flow-history.jsonl` instead (`with_graphs`),
+where an hour with no line is a gap and figures older lines lack are
+left out.
