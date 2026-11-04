@@ -221,14 +221,20 @@ tested.
 
 * **Its update still gives the predicted tree.** This is the case when
   the author merged `main` cleanly. Nothing changes, as today.
-* **Otherwise the member leaves the train.** The new commits aren't
-  covered by its approval anyway, so it couldn't merge until reviewed
-  again. The train is not abandoned. It keeps its other members and
-  their order. Since their files are disjoint from the leaver's, their
-  trees are unchanged; only the top's tree changes. That tree needs
-  its own run, which goes first. The trains behind are rebuilt on the
-  new top and keep their members where those still merge cleanly. The
-  log says `TRAIN-LEFT #n: pushed <sha> mid-train`.
+* **Otherwise the member leaves the train, and only it.** The new
+  commits aren't covered by its approval anyway, so it couldn't merge
+  until reviewed again. The train is not abandoned. It keeps its other
+  members and their order. Since their files are disjoint from the
+  leaver's, they still merge cleanly without it and their trees are
+  unchanged; only the top's tree changes. That tree needs its own run,
+  which goes first. The trains behind are rebuilt on the new top and
+  keep their members where those still merge cleanly. The log says
+  `TRAIN-LEFT #n: pushed <sha> mid-train`.
+* **In a stack carriage, the layers above the leaver leave with it.**
+  They are built on its old head, so they can't merge without it.
+  The layers below it stay: they don't depend on it. The layers that
+  left go into the first train not yet cut, as one carriage again
+  once the pushed layer is approved at its new head.
 
 Merging the remaining members on the old run without a new one would
 save that run, but would put an untested tree on `main`. The members
@@ -242,15 +248,23 @@ requests itself, so an author need not merge `main` into one.
 
 ### 6. No hand-back for a conflict with the putative main
 
-A carriage that won't merge cleanly onto a train's base waits for a
-later train. It isn't handed back for that. Today's
+A carriage that won't merge cleanly onto a train's base, but does onto
+the real `main`, waits for a later train. It isn't handed back for
+that: the conflict is only predicted, and goes away if the train ahead
+crashes or loses the member it conflicts with. Today's
 `merge.hold_conflicting` and the predictions already leave such a pull
-request out; trains make that the rule. It is handed back only at the
-front, when it conflicts with the real `main` that it would land on.
-Then `merge.resolve.union` (designs/0046) is tried first, as today.
+request out; trains make that the rule.
 
-`merge.early_conflicts` is unchanged, since it judges against the real
-`main`.
+It is handed back as soon as it conflicts with the real `main`, on the
+tick the conflicting pull request merges, wherever it is in the queue.
+That is `merge.early_conflicts` (designs/0012), unchanged, which tries
+`merge.resolve.union` (designs/0046) first and hands back only what
+that can't resolve. A conflict with the real `main` doesn't get better
+by waiting, so waiting would only delay the author's fix. So the
+longest a pull request goes unhanded-back is one train: the time from
+the prediction to the merge that makes it real. Without
+`early_conflicts`, it is handed back when it reaches the front, as
+today; trains mode recommends turning `early_conflicts` on.
 
 ### 7. A red train
 
