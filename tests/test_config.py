@@ -611,6 +611,30 @@ class Check(unittest.TestCase):
             "merge.test_ahead.batches_when_unstable needs "
             "unstable_after_recuts"])
 
+    def test_merge_test_ahead_trains(self):
+        # designs/0047.
+        ahead = {"depth": 7, "batch": 4, "batches": 2}
+        for mode in ("dry-run", "live"):
+            self.assertEqual(self.problems(merge={"test_ahead": dict(
+                ahead, trains=mode)}), [])
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, trains="live", trains_within="clean")}), [])
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, trains="on", trains_within="any")}), [
+            "merge.test_ahead.trains must be one of dry-run, live",
+            "merge.test_ahead.trains_within must be one of files, clean"])
+        self.assertEqual(self.problems(merge={"test_ahead": {
+            "trains": "live", "fixed_order": False}}), [
+            "merge.test_ahead.trains needs batch above 1",
+            "merge.test_ahead.trains keeps a train's order, so fixed_order "
+            "must not be false"])
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, trains_within="files")}), [
+            "merge.test_ahead.trains_within needs trains"])
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, trains=1)}), [
+            "merge.test_ahead.trains must be a string"])
+
     def test_merge_test_ahead_batch(self):
         self.assertEqual(self.problems(merge={"test_ahead": {"batch": 4}}),
                          [])

@@ -67,7 +67,14 @@ target about 2).
    batch runs, mean and median, in 6-hour buckets over 7 days.
 7. Policy: who holds right of way and since when, the share of the
    window it was held, the overdue count, and batch re-cuts an hour (a
-   tick whose batch is not the last one less what merged).
+   tick whose batch is not the last one less what merged); re-cuts of a
+   started batch or train by cause (designs/0047: the Merger's
+   `train_events`, "other" when it names none), and, while
+   `merge.test_ahead.trains` is a dry run, the batch re-cuts a train
+   would not have made and the trains' own changes.
+
+Also for designs/0047: approvals an hour (the first tick that listed
+each pull request), and pull requests per green batch top or train.
 
 Run it every 5 minutes from the build-check host's crontab, through
 forge-cron-run:
@@ -644,6 +651,11 @@ class Flow:
         out["arrivals"] = sum(1 for t in self.arrived.values()
                               if since <= t < until)
         out["arrivals_per_hour"] = ratio(out["arrivals"], hours, 1)
+        # designs/0047: approvals an hour, the supply of work, by the
+        # first tick that listed each pull request.
+        out["approvals"] = sum(1 for t in self.first_approved.values()
+                               if since <= t < until)
+        out["approvals_per_hour"] = ratio(out["approvals"], hours, 1)
         out["runs_per_hour"] = ratio(len(runs), hours, 1)
         out["eligible_mean"] = ratio(sum(len(r.get("queue") or [])
                                          for r in ticks), len(ticks), 1)
@@ -673,6 +685,7 @@ class Flow:
         slots = collections.Counter(m["basis"] for m in merges)
         sizes = list(slots.values())
         tops = {"green": 0, "all": 0, "part": 0, "none": 0}
+        members_total = 0
         for run in runs:
             if run["kind"] != "ahead" or not run["end"] or \
                     run["end"]["res"] != "green":
@@ -681,6 +694,7 @@ class Flow:
                                           run["sha"][:10]), ()))
             members = run["members"]
             tops["green"] += 1
+            members_total += len(members)
             on = len(got & set(members))
             tops["all" if on == len(members) else "part" if on
                  else "none"] += 1
@@ -696,7 +710,9 @@ class Flow:
                           "2-3": sum(1 for s in sizes if 2 <= s <= 3),
                           "4+": sum(1 for s in sizes if s >= 4)},
                 "unknown": sum(1 for b in slots if b[0] == "unknown")},
-            "green_batch_tops": tops}
+            "green_batch_tops": tops,
+            # designs/0047: pull requests per green batch top or train.
+            "prs_per_green_top": ratio(members_total, tops["green"])}
 
     def _rework(self, merges, runs, since, until):
         n = len(merges)
@@ -781,7 +797,23 @@ class Flow:
         held = sum(1 for r in ticks if r.get("right_of_way"))
         recuts = sum(1 for t in self.recut_times
                      if ticks and ticks[0]["_t"] <= t <= ticks[-1]["_t"])
-        return {"right_of_way_share": ratio(held, len(ticks), 3),
+        # designs/0047: what cut a started batch or a train again, by
+        # the Merger's train events ("other" when it names none), and,
+        # in a dry run, the trains' own changes and the batch re-cuts
+        # trains would not have made.
+        causes, dry = collections.Counter(), collections.Counter()
+        for r in ticks:
+            said = [c for c in r.get("train_events") or () if c != "cut"]
+            if r.get("trains_dry"):
+                dry.update(said)
+                said = []
+            if r.get("recut"):
+                causes.update(said or ["other"])
+        return {"recuts_by_cause": dict(causes.most_common()),
+                "dry_train_changes": dict(dry.most_common()),
+                "recuts_avoided": sum(1 for r in ticks
+                                      if r.get("recut_avoided")),
+                "right_of_way_share": ratio(held, len(ticks), 3),
                 "overdue_mean": ratio(sum(len(r.get("overdue") or {})
                                           for r in ticks), len(ticks), 1),
                 "recuts": recuts, "recuts_per_hour": ratio(recuts, hours, 1)}
@@ -1567,6 +1599,8 @@ def page(data):
     rows = [hourly_rate("merges", lambda f: f["merges"]),
             hourly_rate("arrivals (first run of a pull request)",
                         lambda f: f["arrivals"]),
+            hourly_rate("approvals (first listed by the Merger)",
+                        lambda f: f["approvals"]),
             hourly_rate("build-check runs started",
                         lambda f: f["runs_total"]),
             hourly_rate("hand-backs told", lambda f: f["hand_backs"]["told"]),
@@ -1620,7 +1654,9 @@ def page(data):
             ["pull requests per merge slot"]
             + [num(w[k]["merge_slots"]["prs_per_slot"], 2) for k in names],
             ["slots of 1 / 2-3 / 4+"] + [slots(w[k]) for k in names],
-            ["green batch tops"] + [tops(w[k]) for k in names]]
+            ["green batch tops"] + [tops(w[k]) for k in names],
+            ["pull requests per green batch top or train"]
+            + [num(w[k]["prs_per_green_top"], 2) for k in names]]
     out.append("<section><h2>3. Efficiency</h2>%s<p class=\"note\">(a) counts"
                " a pull request's head runs and the batch runs it was a "
                "member of, from its first push to its merge. (b) counts every"
@@ -1712,7 +1748,17 @@ def page(data):
         "%.0f%%" % (100 * w[k]["right_of_way_share"]) for k in names],
         ["overdue, mean"] + [num(w[k]["overdue_mean"]) for k in names],
         ["batch re-cuts an hour"] + [num(w[k]["recuts_per_hour"])
-                                     for k in names]]
+                                     for k in names],
+        ["re-cuts of a started batch or train, by cause"] + [esc(", ".join(
+            "%s %d" % kv for kv in w[k]["recuts_by_cause"].items()) or "-")
+            for k in names]]
+    if any(w[k]["recuts_avoided"] or w[k]["dry_train_changes"]
+           for k in names):
+        rows += [["trains dry run: batch re-cuts a train would not have "
+                  "made"] + [num(w[k]["recuts_avoided"]) for k in names],
+                 ["trains dry run: train changes"] + [esc(", ".join(
+                     "%s %d" % kv for kv in w[k]["dry_train_changes"]
+                     .items()) or "-") for k in names]]
     out.append("<section><h2>7. Policy</h2><p class=\"now\">Right of way "
                "now: <b>%s</b>%s. Overdue now: <b>%d</b>.</p>%s</section>"
                % ("#%d" % row["pr"] if row.get("pr") else "nobody",
