@@ -1,6 +1,6 @@
 # 0047: Fixed trains of pull requests that touch different files
 
-* Status: proposed
+* Status: accepted
 * Author: XMPPEngineer
 * Date: 2026-11-04
 
