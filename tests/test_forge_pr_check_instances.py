@@ -56,6 +56,14 @@ class Validation(unittest.TestCase):
             "belongs to the context the Merger requires" % key
             for key in ("merger_first", "first_authors")))
 
+    def test_approved_first_is_allowed_in_a_block_and_in_checks(self):
+        data = with_mac(approved_first=True)
+        data["checks"]["approved_first"] = False
+        self.assertEqual(config.check(data), [])
+        data["checks"]["instances"]["mac"]["approved_first"] = "yes"
+        self.assertTrue(any("approved_first" in p
+                            for p in config.check(data)))
+
     def test_an_unknown_key_is_refused(self):
         self.assertEqual(config.check(with_mac(slot=2)), [
             "checks.instances.mac: unknown key 'slot'"])
@@ -171,6 +179,16 @@ class Configure(StateCase):
         self.assertIsNone(pc.FAST_LANE_S)
         self.assertFalse(pc.MERGER_FIRST)
         self.assertFalse(pc.TEST_AHEAD)
+
+    def test_approved_first_and_the_reviewers_are_read(self):
+        data = with_mac(approved_first=True)
+        pc.configure(config.Project(data, None), "mac")
+        self.assertTrue(pc.APPROVED_FIRST)
+        project = config.Project(data, None)
+        self.assertEqual(pc.REVIEWER_LOGINS, frozenset(
+            project.bot_login(n).lower() for n in project.reviewers()))
+        pc.configure(config.Project(with_mac(), None), "mac")
+        self.assertFalse(pc.APPROVED_FIRST)
 
     def test_memory_max_null_starts_no_scope_and_says_nothing(self):
         pc.configure(config.Project(with_mac(memory_max=None), None), "mac")

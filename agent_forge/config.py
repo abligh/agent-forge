@@ -142,7 +142,8 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "host_fault_text": list, "cache_fault_text": list,
           "step_alert": dict, "cpu_share": str,
           "side_by_side": dict, "merger_cpu_weight": int,
-          "docker_slices": dict, "pull_requests": dict, "warm": dict}
+          "docker_slices": dict, "pull_requests": dict, "warm": dict,
+          "approved_first": bool}
 # checks.docker_slices (designs/0031): the slices each step's
 # containers go in, the next merge's run's and every other's.
 DOCKER_SLICES = {"front": str, "other": str}
@@ -168,7 +169,7 @@ INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight",
                       "keep_ignored", "drop_env", "merge_default",
                       "red_comment", "max_wait_minutes", "host_fault_text",
                       "cache_fault_text", "step_alert", "cpu_share",
-                      "side_by_side", "warm")
+                      "side_by_side", "warm", "approved_first")
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main", "main_red_issue")
 INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
