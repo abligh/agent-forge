@@ -212,3 +212,29 @@ On a project with `merge.test_ahead`, over a day before and after:
 repeated hand-backs per head, ticks with right of way holding someone
 whose holder was not a candidate, ticks with `recut`, green batch tops
 that merged nothing, and merges per hour.
+
+## Amendment, 2026-11-04: a green rerun releases a red suspect
+
+**Why.** Rule 4 kept a suspect out until it had a new head. On one
+project, the day it shipped, a wall-clock timing test failed under
+load in #8104's own run, and the suspect was handed back for a flake.
+A new head was the only way out: a rebuild, the author's work, and for
+a merge that wasn't clean a re-review.
+
+**The change.** `red-suspects.json` keeps, with each suspect, when it
+was found red (`at`) and the tip it was found red on (`main`). A
+suspect is also released by the build check's green verdict on the
+same head, read from the build check's state as the Merger already
+reads its verdicts, that finished after `at`, merged with that tip or
+one after it (`git merge-base --is-ancestor`). A batch's cover doesn't
+count. `labels.rerun` gives such a run of a red head. The tick logs
+`SUSPECT-CLEARED #N: green rerun at <head>`, says so once on the pull
+request, and forgets the hand-back, so the suspect is predicted,
+updated and merged again under its approval. The hand-back's comment
+names both ways out, and the label when the project has one. A suspect
+kept before this, with no `at`, still waits for a new head.
+
+**What it costs.** Nothing more from GitHub: the verdict and its time
+come from the build check's state. A head whose own check was green
+before the batch went red isn't run again by `labels.rerun`, so for it
+a new head is still the way out.

@@ -3468,10 +3468,14 @@ class TickAhead(RepoCase):
         self.assertEqual([e["pr"] for e in m.load_suspects(
             self.state)["suspects"]], [5])
 
-    def red_alone(self):
+    def red_alone(self, rerun_label=None):
         """#5 and #6 a batch whose top is red, then #5 red on its own:
-        the ticks' records and lines, and the red check state."""
-        m.configure(project(test_ahead={"batch": 2}))
+        the ticks' records and lines, and the red check state. With
+        `rerun_label`, as labels.rerun."""
+        configured = project(test_ahead={"batch": 2})
+        if rerun_label:
+            configured.data.setdefault("labels", {})["rerun"] = rerun_label
+        m.configure(configured)
         prs = [self.item(), self.other_pr()]
         self.tick(prs, conclusions=(None,), live=True)
         top = self.ahead_json()["entries"][1]
@@ -3525,6 +3529,97 @@ class TickAhead(RepoCase):
                               live=True, minutes=4)
         self.assertIn(5, record["ahead"])
         self.assertEqual(m.red_suspects(self.state, [fixed]), {})
+
+    def rerun(self, red, finished, ok=True):
+        """`red` with a verdict on #5's own head that finished at
+        `finished`, merged with main's tip."""
+        red["results"][self.head] = {"pr": 5, "ok": ok, "finished": finished,
+                                     "base": self.repo.main_tip(),
+                                     "rerun_of": ["test"]}
+        return red
+
+    def test_a_red_suspect_records_when_and_on_what_it_was_found(self):
+        _, record, _, _ = self.red_alone()
+        saved = m.load_json(os.path.join(self.state, m.RED_SUSPECT_FILE), {})
+        self.assertEqual(saved["5"]["at"], record["at"])
+        self.assertEqual(saved["5"]["main"], self.repo.main_tip())
+
+    def test_the_hand_back_names_both_ways_out(self):
+        self.red_alone()
+        self.assertIsNone(m.RERUN_LABEL)
+        body = self.github.writes[-1][2]["body"]
+        self.assertIn("until this pull request has a new head, or until the "
+                      "build check's own run of this head", body)
+        self.assertNotIn("label", body)
+
+    def test_a_green_rerun_after_the_red_releases_it(self):
+        # designs/0044, rule 4, amendment: on 2026-11-04 a timing test
+        # failed under load, and only a new head brought it back.
+        prs, record, lines, red = self.red_alone()
+        self.rerun(red, "2026-10-07T12:01:30Z")
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=2, check_state=red)
+        self.assertIn("SUSPECT-CLEARED #5: green rerun at %s; back in the "
+                      "queue" % self.head[:10], lines)
+        self.assertEqual(record["suspects_cleared"], [5])
+        self.assertFalse([d for d in record["decisions"]
+                          if d["pr"] == 5 and d["action"] == "HAND-BACK"])
+        self.assertIn(5, record["ahead"])
+        notes = [w for w in self.github.writes
+                 if w[1] == SLUG + "/issues/5/comments"]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("finished green at 2026-10-07T12:01:30Z", notes[0][2][
+            "body"])
+        self.assertTrue(notes[0][2]["body"].endswith(m.SIGNATURE))
+        self.assertEqual(m.load_json(os.path.join(
+            self.state, m.RED_SUSPECT_FILE), {}), {})
+        self.assertNotIn("5", m.load_json(os.path.join(
+            self.state, "handed-back.json"), {}))
+        # Said once.
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=3, check_state=red)
+        self.assertNotIn("suspects_cleared", record)
+        self.assertFalse([w for w in self.github.writes
+                          if w[1] == SLUG + "/issues/5/comments"])
+
+    def assert_still_out(self, prs, red):
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=2, check_state=red)
+        self.assertFalse([l for l in lines if "SUSPECT-CLEARED" in l])
+        self.assertNotIn("suspects_cleared", record)
+        self.assertEqual([d["result"] for d in record["decisions"]
+                          if d["pr"] == 5], ["already said"])
+        self.assertNotIn(5, record["ahead"])
+
+    def test_a_green_from_before_the_red_does_not_release_it(self):
+        prs, _, _, red = self.red_alone()
+        self.assert_still_out(prs, self.rerun(red, "2026-10-07T12:00:30Z"))
+
+    def test_a_red_rerun_does_not_release_it(self):
+        prs, _, _, red = self.red_alone()
+        self.assert_still_out(prs, self.rerun(red, "2026-10-07T12:01:30Z",
+                                              ok=False))
+
+    def test_a_green_on_an_older_main_does_not_release_it(self):
+        prs, _, _, red = self.red_alone()
+        self.rerun(red, "2026-10-07T12:01:30Z")
+        red["results"][self.head]["base"] = run_git(
+            self.repo.path, "rev-parse", "origin/main~1")
+        self.assert_still_out(prs, red)
+
+    def test_a_red_suspect_kept_without_a_time_waits_for_a_new_head(self):
+        prs, _, _, red = self.red_alone()
+        path = os.path.join(self.state, m.RED_SUSPECT_FILE)
+        saved = m.load_json(path, {})
+        del saved["5"]["at"], saved["5"]["main"]
+        m.save_json(path, saved)
+        self.assert_still_out(prs, self.rerun(red, "2026-10-07T12:01:30Z"))
+
+    def test_the_hand_back_names_the_rerun_label(self):
+        self.red_alone(rerun_label="Rerun")
+        body = self.github.writes[-1][2]["body"]
+        self.assertIn("If you believe the red was a flake, put the `Rerun` "
+                      "label on this pull request", body)
 
     def test_without_the_key_a_red_suspect_waits_to_be_reached(self):
         m.configure(project(test_ahead={"batch": 2,
