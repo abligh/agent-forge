@@ -245,6 +245,35 @@ class Figures(Base):
         self.assertEqual(self.got["recuts"], 1)
 
 
+class TrainFigures(Base):
+    """designs/0047's figures: approvals an hour, pull requests per green
+    top, and re-cuts by cause."""
+
+    def test_approvals_and_pull_requests_per_green_top(self):
+        got = self.flow().figures(T("2026-11-04T10:00:00Z"), NOW)
+        # #1, #3, #4 queued and #5 held, each first listed in the hour.
+        self.assertEqual((got["approvals"], got["approvals_per_hour"]),
+                         (4, 4.0))
+        # The one green top had #1 and #3.
+        self.assertEqual(got["prs_per_green_top"], 2.0)
+
+    def test_re_cuts_by_cause(self):
+        records = RECORDS + [
+            rec("10:45:00", [6, 7], recut=True, trains=[[6, 7]],
+                train_events=["left", "cut"]),
+            rec("10:46:00", [6, 7], recut=True),
+            rec("10:47:00", [6, 7], recut=True, trains=[[6], [7]],
+                trains_dry=True, recut_avoided=True,
+                train_events=["cut"]),
+            rec("10:48:00", [6, 7], trains=[[7]], trains_dry=True,
+                train_events=["left"])]
+        got = self.flow(records=records).figures(
+            T("2026-11-04T10:00:00Z"), NOW)
+        self.assertEqual(got["recuts_by_cause"], {"other": 2, "left": 1})
+        self.assertEqual(got["recuts_avoided"], 1)
+        self.assertEqual(got["dry_train_changes"], {"left": 1})
+
+
 class PerHour(Base):
     """Section 2's counts, per hour in every window (designs/0045,
     amendment of 2026-11-04)."""

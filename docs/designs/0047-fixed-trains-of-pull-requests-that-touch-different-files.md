@@ -339,6 +339,33 @@ have made.
 `forge-pr-check` needs nothing new: a train is a batch to it, with a
 top to run and members to cover.
 
+## How it was built
+
+Built as above, in `bin/forge-merger` (`cut_trains`), `bin/forge-flow`
+and `agent_forge/config.py`. Where it differs, and why:
+
+* **No pending description on a member.** A member's head carries its
+  own green status, which the Merger's merge rests on; a pending status
+  posted there would replace it. The Merger logs `TRAIN-CUT`,
+  `TRAIN-LEFT` and `TRAIN-RECUT` instead. Telling authors stays under
+  "Not yet", with when their train will land.
+* **An urgent pull request cuts once.** One that can't board (its train
+  ahead conflicts, say) would otherwise cut the trains after the first
+  again on every tick. ahead.json keeps `urgent_cut`, the urgent ones
+  that have had their cut. One the queue puts in front of the first
+  train, which the Merger then acts on first, cuts every train.
+* **The dry run doesn't treat a moved default branch as a force merge.**
+  In a dry run the batches merge, so the default branch moves to trees
+  no dry train predicted on every merge. Its trains are predicted again
+  on the new tip instead; a member that then conflicts leaves.
+* **A red train is searched as a red batch is** (designs/0035, second
+  amendment, and designs/0044 rule 4), and the trains are cut afresh
+  once the search ends.
+* **`unstable_after_recuts` doesn't shrink trains.** Trains are cut
+  again only for the causes above, each logged.
+* **`trains` needs `batch` above 1,** since a train of one is a
+  prediction, not a batch.
+
 ## Not yet
 
 * **Merging what's left of a train after a push, without a new run.**

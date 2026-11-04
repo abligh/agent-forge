@@ -7232,3 +7232,356 @@ class RedMain(unittest.TestCase):
                               lambda sha, tree: False, {6})
         self.assertEqual([b["size"] for b in got], [1, 1])
 
+
+SHARED = "".join("line %d\n" % k for k in range(1, 21))
+
+
+class Trains(RepoCase):
+    """designs/0047: trains of carriages that touch different files, cut
+    once and kept."""
+
+    item = Decide.item
+    tick = Tick.tick
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main("shared.txt", SHARED)
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        self.configure()
+        self.addCleanup(m.configure, project())
+
+    def configure(self, **ahead):
+        m.configure(urgent_project(test_ahead=dict(
+            {"batch": 3, "batches": 2, "depth": 5, "trains": "live"},
+            **ahead)))
+
+    def change(self, number, name, text, created=T1, start="origin/main"):
+        """An approved pull request on a branch of its own from `start`
+        that writes `text` to `name`."""
+        self.repo.branch("b%d" % number, start)
+        sha = self.repo.commit(name, text, "#%d" % number)
+        self.repo.publish_pr(number, sha)
+        self.repo.branch("feature", "feature")
+        got = pr(number, created, head=sha,
+                 reviews=[review(REVIEWER, oid=sha)])
+        got["headRefName"] = "b%d" % number
+        return got
+
+    def line(self, number, k, created=T1):
+        """One that changes line `k` of shared.txt only."""
+        text = SHARED.replace("line %d\n" % k, "line %d by #%d\n"
+                              % (k, number))
+        return self.change(number, "shared.txt", text, created)
+
+    def cut(self, carriages, last=None, open_numbers=None, check=None):
+        heads = {p["number"]: p["headRefOid"]
+                 for c in carriages for p in c}
+        return m.cut_trains(self.repo.path, self.repo.main_tip(), carriages,
+                            last, heads, open_numbers or set(heads),
+                            red=check or frozenset())
+
+    def said(self, entries, sizes):
+        """ahead.json as a tick writes it for these trains."""
+        _, _, later = m.train_batches(entries, sizes, lambda t: None)
+        return {"base": self.repo.main_tip(), "trains": True,
+                "entries": entries, "batch": {"size": sizes[0], "trees": [
+                    e["tree"] for e in entries[:sizes[0]]]}, "later": later}
+
+    def numbers(self, entries, sizes):
+        return m.train_lists(entries, sizes)
+
+    def test_carriages_share_no_file_and_an_overlap_waits_its_turn(self):
+        six, seven = self.line(6, 1), self.line(7, 20)
+        eight = self.change(8, "x.txt", "x\n")
+        entries, sizes, events = self.cut(
+            [[self.item()], [six], [seven], [eight]])
+        # #7 shares shared.txt with #6: it waits, and is first in the
+        # next train.
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6, 8], [7]])
+        self.assertEqual([e["carriage"] for e in entries], [5, 6, 8, 7])
+        self.assertEqual([e["train"] for e in entries], [0, 0, 0, 1])
+        self.assertIn(("cut", "CUT 2: #7"), events)
+        # Each prediction stands on the one before, as GitHub would
+        # merge them.
+        self.assertEqual(m.git(self.repo.path, "rev-parse",
+                               entries[3]["sha"] + "^").stdout.strip(),
+                         entries[2]["sha"])
+
+    def test_within_clean_takes_an_overlap_that_merges_cleanly(self):
+        self.configure(trains_within="clean")
+        six, seven = self.line(6, 1), self.line(7, 20)
+        eight = self.change(8, "x.txt", "x\n")
+        entries, sizes, _ = self.cut([[self.item()], [six], [seven],
+                                      [eight]])
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6, 7], [8]])
+
+    def test_one_that_conflicts_with_the_train_ahead_waits(self):
+        # designs/0047 §6: not handed back for a conflict with the
+        # putative main.
+        self.configure(batch=1, batches=2, depth=3)
+        six = self.line(6, 1)
+        clash = SHARED.replace("line 1\n", "line 1 by #7\n")
+        seven = self.change(7, "shared.txt", clash)
+        eight = self.change(8, "x.txt", "x\n")
+        entries, sizes, _ = self.cut([[six], [seven], [eight]])
+        self.assertEqual(self.numbers(entries, sizes), [[6], [8]])
+
+    def test_a_stack_is_one_carriage_and_never_split(self):
+        six = self.change(6, "s.txt", "one\n")
+        layer = self.change(9, "s2.txt", "two\n", start=six["headRefOid"])
+        seven = self.change(7, "y.txt", "y\n")
+        eight = self.change(8, "z.txt", "z\n")
+        self.configure(batch=2, batches=2, depth=3)
+        # [#6, #9] doesn't fit beside #7: it goes next, whole.
+        entries, sizes, _ = self.cut([[seven], [six, layer], [eight]])
+        self.assertEqual(self.numbers(entries, sizes), [[7, 8], [6, 9]])
+        self.assertEqual([e["carriage"] for e in entries], [7, 8, 6, 6])
+
+    def test_a_stack_longer_than_batch_is_a_train_of_its_own(self):
+        six = self.change(6, "s.txt", "one\n")
+        layer = self.change(9, "s2.txt", "two\n", start=six["headRefOid"])
+        top = self.change(10, "s3.txt", "three\n",
+                          start=layer["headRefOid"])
+        seven = self.change(7, "y.txt", "y\n")
+        self.configure(batch=2, batches=2, depth=3)
+        entries, sizes, _ = self.cut([[six, layer, top], [seven]])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 9, 10], [7]])
+
+    def test_a_cut_train_is_fixed_and_a_newcomer_waits(self):
+        six = self.change(6, "y.txt", "y\n")
+        entries, sizes, _ = self.cut([[self.item()], [six]])
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6]])
+        # #4, older and disjoint, comes in front in the queue: it goes
+        # into the next train, not into the cut one.
+        four = self.change(4, "w.txt", "w\n", created=T0)
+        got, sizes, events = self.cut([[four], [self.item()], [six]],
+                                      self.said(entries, sizes))
+        self.assertEqual(self.numbers(got, sizes), [[5, 6], [4]])
+        self.assertEqual([c for c, _ in events], ["cut"])
+        self.assertEqual(got[:2], entries)
+
+    def test_a_push_takes_out_only_that_member(self):
+        six, seven = self.change(6, "y.txt", "y\n"), self.change(
+            7, "z.txt", "z\n")
+        entries, sizes, _ = self.cut([[self.item()], [six], [seven]])
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6, 7]])
+        # #6 is pushed to: its new head is no longer approved, so it has
+        # left the queue. The train keeps #5 and #7.
+        last = self.said(entries, sizes)
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), [[self.item()], [seven]],
+            last, {5: self.head, 6: "c" * 40, 7: seven["headRefOid"]},
+            {5, 6, 7})
+        self.assertEqual(self.numbers(got, sizes), [[5, 7]])
+        self.assertEqual(events, [("left", "LEFT #6: pushed cccccccccc "
+                                   "mid-train")])
+        # #5's tree is unchanged; only the top's tree is new.
+        self.assertEqual(got[0], entries[0])
+        self.assertNotEqual(got[1]["tree"], entries[2]["tree"])
+
+    def test_a_layer_above_a_leaver_leaves_with_it(self):
+        six = self.change(6, "s.txt", "one\n")
+        layer = self.change(9, "s2.txt", "two\n", start=six["headRefOid"])
+        seven = self.change(7, "y.txt", "y\n")
+        self.configure(batch=4, batches=1)
+        entries, sizes, _ = self.cut([[self.item()], [six, layer],
+                                      [seven]])
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6, 9, 7]])
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            [[self.item()], [seven]], self.said(entries, sizes),
+            {5: self.head, 6: six["headRefOid"], 9: layer["headRefOid"],
+             7: seven["headRefOid"]}, {5, 6, 7, 9})
+        self.assertEqual(self.numbers(got, sizes), [[5, 7]])
+        self.assertEqual(events, [("left", "LEFT #6: left the queue; its "
+                                   "stack's layers #9 leave with it")])
+
+    def test_a_merged_member_just_goes(self):
+        six = self.change(6, "y.txt", "y\n")
+        entries, sizes, _ = self.cut([[self.item()], [six]])
+        # #5 merged as predicted: main's tree is its prediction's.
+        self.repo.branch("main")
+        run_git(self.repo.path, "merge", "-q", "--ff-only", self.head)
+        self.repo.push("main")
+        self.repo.branch("feature", "feature")
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), [[six]],
+            self.said(entries, sizes), {6: six["headRefOid"]}, {6})
+        self.assertEqual(self.numbers(got, sizes), [[6]])
+        self.assertEqual(events, [])
+        self.assertEqual(got[0]["tree"], entries[1]["tree"])
+
+    def test_a_force_merge_cuts_every_train_again(self):
+        six, seven = self.change(6, "y.txt", "y\n"), self.change(
+            7, "z.txt", "z\n")
+        self.configure(batch=1, batches=3)
+        entries, sizes, _ = self.cut([[self.item()], [six], [seven]])
+        last = self.said(entries, sizes)
+        self.advance_main("forced.txt", "by hand\n")
+        got, sizes, events = self.cut([[seven], [self.item()], [six]],
+                                      last)
+        self.assertEqual(events[0][0], "main moved")
+        self.assertEqual(self.numbers(got, sizes), [[7], [5], [6]])
+
+    def test_an_urgent_one_cuts_the_trains_behind_the_first(self):
+        six, seven = self.change(6, "y.txt", "y\n"), self.change(
+            7, "z.txt", "z\n")
+        self.configure(batch=1, batches=3)
+        entries, sizes, _ = self.cut([[self.item()], [six], [seven]])
+        hot = labelled(self.change(8, "u.txt", "u\n"), "Priority:urgent")
+        got, sizes, events = self.cut(
+            [[self.item()], [six], [seven], [hot]],
+            self.said(entries, sizes))
+        self.assertEqual(events[0], ("urgent", "RECUT: #8 goes first; the "
+                                     "trains after the first are cut "
+                                     "again"))
+        self.assertEqual(self.numbers(got, sizes), [[5], [8], [6]])
+
+    def test_urgent_ones_board_apart(self):
+        hot = labelled(self.change(8, "u.txt", "u\n"), "Priority:urgent")
+        six = self.change(6, "y.txt", "y\n")
+        entries, sizes, _ = self.cut([[six], [hot]])
+        self.assertEqual(self.numbers(entries, sizes), [[8], [6]])
+
+    def test_a_red_head_cannot_board(self):
+        six, seven = self.change(6, "y.txt", "y\n"), self.change(
+            7, "z.txt", "z\n")
+        state = {"results": {six["headRefOid"]: {"ok": False,
+                                                 "tree": "t"}}}
+        self.assertIs(m.head_red(state, six), True)
+        self.assertIs(m.head_red(dict(state, main_red={"issue": 3}), six),
+                      False)
+        self.assertIs(m.head_red({"results": {six["headRefOid"]: {
+            "ok": False, "covered": "batch"}}}, six), False)
+        entries, sizes, _ = self.cut([[self.item()], [six], [seven]],
+                                     check={6})
+        self.assertEqual(self.numbers(entries, sizes), [[5, 7]])
+
+    def test_a_red_train_ends_what_follows_it(self):
+        entries = [{"pr": n, "tree": "t%d" % n} for n in (1, 2, 3, 4, 5)]
+        red = lambda bad: (lambda tree: False if tree in bad else None)
+        self.assertEqual(m.train_batches(entries, [2, 2, 1], red(())), (
+            2, None, [{"size": 2, "trees": ["t3", "t4"], "fixed": True},
+                      {"size": 1, "trees": ["t5"], "fixed": True}]))
+        # A red second train: nothing after it.
+        self.assertEqual(m.train_batches(entries, [2, 2, 1],
+                                         red({"t4"}))[2],
+                         [{"size": 2, "trees": ["t3", "t4"],
+                           "fixed": True}])
+        # A red first train: its members are the suspects, nothing
+        # follows.
+        self.assertEqual(m.train_batches(entries, [2, 2, 1], red({"t2"})),
+                         (2, 2, []))
+
+    def ahead_json(self):
+        return m.load_json(os.path.join(self.state, m.AHEAD_FILE), None)
+
+    def test_a_live_tick_writes_trains_and_keeps_them(self):
+        six, seven = self.line(6, 1), self.line(7, 20)
+        prs = [self.item(), six, seven]
+        record, lines = self.tick(prs, conclusions=(None,), live=True)
+        self.assertEqual(record["trains"], [[5, 6], [7]])
+        self.assertEqual((record["batch"], record["later"]), ([5, 6], [[7]]))
+        ahead = self.ahead_json()
+        self.assertIs(ahead["trains"], True)
+        self.assertEqual(ahead["later"][0]["fixed"], True)
+        self.assertIn("TRAIN-CUT 1: #5 #6", lines)
+        self.assertIn("TRAIN-CUT 2: #7", lines)
+        # The next tick changes nothing, and says nothing.
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=1)
+        self.assertEqual(record["trains"], [[5, 6], [7]])
+        self.assertFalse([l for l in lines if l.startswith("TRAIN-")])
+        self.assertNotIn("recut", record)
+
+    def test_a_dry_run_keeps_the_batches_and_logs_the_trains(self):
+        self.configure(trains="dry-run")
+        six, seven = self.line(6, 1), self.line(7, 20)
+        prs = [self.item(), six, seven]
+        record, lines = self.tick(prs, conclusions=(None,), live=True)
+        # The batch is the queue's first three, as without trains.
+        self.assertEqual(record["batch"], [5, 6, 7])
+        self.assertEqual(record["trains"], [[5, 6], [7]])
+        self.assertIn("TRAIN-DRY 1: #5 #6 | 2: #7", lines)
+        self.assertNotIn("trains", self.ahead_json())
+        dry = m.load_json(os.path.join(self.state, m.TRAINS_DRY_FILE), {})
+        self.assertEqual([e["pr"] for e in dry["entries"]], [5, 6, 7])
+        _, lines = self.tick(prs, conclusions=(None,), live=True, minutes=1)
+        self.assertNotIn("TRAIN-DRY 1: #5 #6 | 2: #7", lines)
+
+    def test_off_by_default(self):
+        m.configure(project(test_ahead={"batch": 3}))
+        self.assertIsNone(m.TRAINS)
+        six = self.line(6, 1)
+        record, lines = self.tick([self.item(), six], conclusions=(None,),
+                                  live=True)
+        self.assertNotIn("trains", record)
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state, m.TRAINS_DRY_FILE)))
+
+    def test_a_push_mid_train_in_a_live_tick(self):
+        self.configure(batch=3, batches=1)
+        six, eight = self.change(6, "y.txt", "y\n"), self.change(
+            8, "x.txt", "x\n")
+        self.tick([self.item(), six, eight], conclusions=(None,), live=True)
+        # #6 is pushed to; its approval is of the old head.
+        self.repo.branch("b6", six["headRefOid"])
+        pushed = self.repo.commit("y.txt", "y again\n", "#6 again")
+        self.repo.publish_pr(6, pushed)
+        self.repo.branch("feature", "feature")
+        record, lines = self.tick(
+            [self.item(), dict(six, headRefOid=pushed), eight],
+            conclusions=(None,), live=True, minutes=1)
+        self.assertEqual(record["trains"], [[5, 8]])
+        self.assertIn("TRAIN-LEFT #6: pushed %s mid-train" % pushed[:10],
+                      lines)
+        self.assertEqual(record["train_events"], ["left"])
+        self.assertIs(record["recut"], True)
+
+    def test_an_urgent_one_that_cannot_board_cuts_only_once(self):
+        six, seven = self.change(6, "y.txt", "y\n"), self.change(
+            7, "z.txt", "z\n")
+        self.configure(batch=1, batches=3)
+        entries, sizes, _ = self.cut([[self.item()], [six], [seven]])
+        hot = labelled(self.change(8, "u.txt", "u\n"), "Priority:urgent")
+        note = {}
+        heads = {5: self.head, 6: six["headRefOid"], 7: seven["headRefOid"],
+                 8: hot["headRefOid"]}
+        # #8's head is red: it can't board, so it gets one cut only.
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            [[self.item()], [six], [seven], [hot]],
+            self.said(entries, sizes), heads, set(heads), red={8},
+            note=note)
+        self.assertEqual([c for c, _ in events][:1], ["urgent"])
+        self.assertEqual(note, {"urgent_cut": [8]})
+        last = dict(self.said(got, sizes), urgent_cut=[8])
+        again, sizes2, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            [[self.item()], [six], [seven], [hot]], last, heads, set(heads),
+            red={8})
+        self.assertEqual(events, [])
+        self.assertEqual(again, got)
+
+    def test_a_dry_run_keeps_its_trains_when_main_moves(self):
+        six = self.change(6, "y.txt", "y\n")
+        entries, sizes, _ = self.cut([[self.item()], [six]])
+        last = self.said(entries, sizes)
+        self.advance_main("other.txt", "merged by a batch\n")
+        heads = {5: self.head, 6: six["headRefOid"]}
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), [[six], [self.item()]],
+            last, heads, set(heads), force_merges=False)
+        self.assertEqual(self.numbers(got, sizes), [[5, 6]])
+        self.assertEqual(events, [])
+
+    def test_an_urgent_one_the_queue_puts_first_cuts_every_train(self):
+        six = self.change(6, "y.txt", "y\n")
+        self.configure(batch=2, batches=2)
+        entries, sizes, _ = self.cut([[self.item()], [six]])
+        hot = labelled(self.change(8, "u.txt", "u\n"), "Priority:urgent")
+        got, sizes, events = self.cut([[hot], [self.item()], [six]],
+                                      self.said(entries, sizes))
+        self.assertEqual(events[0][0], "urgent")
+        self.assertEqual(self.numbers(got, sizes), [[8], [5, 6]])

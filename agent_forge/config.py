@@ -123,7 +123,10 @@ STACKS = {"max_run": int, "wait_hours": int, "predict_restacked": bool}
 TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "batch": int, "stacks": bool, "batches": int,
               "fixed_order": bool, "hand_back_red_suspect": bool,
-              "unstable_after_recuts": int, "batches_when_unstable": int}
+              "unstable_after_recuts": int, "batches_when_unstable": int,
+              "trains": str, "trains_within": str}
+TRAINS = ("dry-run", "live")
+TRAINS_WITHIN = ("files", "clean")
 STALL_ALERT = {"tell": list, "retell_minutes": int,
                "owner_after_minutes": int, "title": str, "labels": list}
 # checks is shared with tools not here yet, so only these keys are
@@ -1186,6 +1189,23 @@ def _check_test_ahead(ahead, checks, problems):
                 not 1 <= ahead["batches_when_unstable"] <= batches:
             problems.append("%s.batches_when_unstable must be at least 1 "
                             "and at most batches (%d)" % (where, batches))
+    if _is(ahead.get("trains"), str):
+        # designs/0047: trains are batches cut once, so they need batches
+        # and keep their order.
+        if ahead["trains"] not in TRAINS:
+            problems.append("%s.trains must be one of %s"
+                            % (where, ", ".join(TRAINS)))
+        if not _is(ahead.get("batch"), int) or ahead["batch"] < 2:
+            problems.append("%s.trains needs batch above 1" % where)
+        if ahead.get("fixed_order") is False:
+            problems.append("%s.trains keeps a train's order, so "
+                            "fixed_order must not be false" % where)
+    if _is(ahead.get("trains_within"), str):
+        if ahead["trains_within"] not in TRAINS_WITHIN:
+            problems.append("%s.trains_within must be one of %s"
+                            % (where, ", ".join(TRAINS_WITHIN)))
+        if "trains" not in ahead:
+            problems.append("%s.trains_within needs trains" % where)
     if isinstance(checks, dict) and checks.get("merger_first") is False:
         problems.append("%s puts the Merger's pull request first, so "
                         "checks.merger_first must not be false" % where)
