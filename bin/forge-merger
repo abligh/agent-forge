@@ -3078,7 +3078,9 @@ def right_of_way(repo, prs, records, path, when, main_ref, run=sh,
     None. One handed back to its author for a conflict with main at
     ROW_AFTER heads in `records` has earned it; it has it for its head
     H while H is clean against `main_ref`, it wasn't handed back at H
-    for anything else, and less than ROW_FOR has passed since a tick
+    for anything else, no request for changes stands on it (GitHub
+    refuses its merge until that reviewer's next verdict; designs/0002,
+    amendment), and less than ROW_FOR has passed since a tick
     first saw H with it earned. `path` remembers that moment per pull
     request ({pr: {head, since}}), written when `save`. Of several, the
     first in the Merger's order has it."""
@@ -3096,7 +3098,7 @@ def right_of_way(repo, prs, records, path, when, main_ref, run=sh,
         head, key = pr["headRefOid"], str(pr["number"])
         if (seen.get(key) or {}).get("head") != head:
             seen[key] = {"head": head, "since": iso(when)}
-        if found or (pr["number"], head) in other:
+        if found or (pr["number"], head) in other or changes_requested(pr):
             continue
         try:
             since = parse_time(seen[key]["since"])

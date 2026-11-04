@@ -169,3 +169,30 @@ dropped.
   it is in a race it is losing.
 * **M.** Default suggestion: 60 minutes. That covers a re-review and a
   build at the times observed, with room to spare.
+
+## Amendment (2026-11-04): a request for changes ends it
+
+A pull request whose request for changes still stands does not hold
+right of way. GitHub refuses to merge it until that reviewer's next
+verdict, which takes at least a new head, a build and a re-review, so
+holding others for it only delays them.
+
+On one day a pull request held right of way for an hour from 05:46Z.
+A reviewer requested changes at 05:59Z (tests for a new branch of its
+code), and twelve approved pull requests stayed held behind it while
+its author wrote them. The Merger merged about four an hour that
+morning, against a 7-day baseline of 9.9.
+
+* **The rule.** In the list of what must hold for P to have right of
+  way for H, add: no request for changes stands on P, as
+  `changes_requested` judges it (each reviewer's newest verdict).
+* **The clock keeps running.** The moment the Merger first saw H with
+  right of way earned is not reset, so a request for changes lifted
+  within M minutes gives P back what is left of them. A new head is a
+  new H, as before.
+* **Anything else said after the approval** (a comment, a review that
+  only comments) leaves right of way alone: it may need no more than a
+  reply.
+
+Approved by Alex Bligh, 2026-11-04, in XMPPEngineer's terminal ("(1)
+yes").

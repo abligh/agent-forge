@@ -4463,6 +4463,25 @@ class RightOfWay(RepoCase):
                               conclusions=(None,), live=True)
         self.assertIsNone(record["right_of_way"])
 
+    def test_not_while_a_request_for_changes_stands(self):
+        # designs/0002, amendment: GitHub refuses its merge until that
+        # reviewer's next verdict, so it holds nobody meanwhile, and the
+        # clock it started keeps running.
+        rival = self.rival(created=self.OLDER)
+        approved = review(REVIEWER, oid=self.head)
+        asked = review("example-owner", "CHANGES_REQUESTED", T1)
+        record, _ = self.tick([pr(5, head=self.head,
+                                  reviews=[approved, asked]), rival],
+                              live=True)
+        self.assertIsNone(record["right_of_way"])
+        self.assertNotIn("6", record["held"])
+        lifted = review("example-owner", "APPROVED", T2, oid=self.head)
+        record, _ = self.tick([pr(5, head=self.head,
+                                  reviews=[approved, asked, lifted]), rival],
+                              conclusions=(None,), live=True, minutes=10)
+        self.assertEqual(record["right_of_way"], self.row())
+        self.assertEqual(list(record["held"]), ["6"])
+
     def test_it_never_yields(self):
         m.configure(project(right_of_way={}, yield_after_hand_back=2))
         record, _ = self.tick([self.item(), self.other_pr()],
