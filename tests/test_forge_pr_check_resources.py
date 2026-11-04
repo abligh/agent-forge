@@ -513,6 +513,47 @@ class CachesInTheWorker(RepoCase):
         self.assertGreaterEqual(self.state()["cache_main_end"]["1"],
                                 self.state()["cache_main"]["1"])
 
+        # And the head they were built at, for checks.warm, and the slot
+        # every run names.
+        self.assertEqual(self.state()["cache_main_sha"]["1"], tip)
+        self.assertEqual(self.state()["results"][tip]["slot"], 1)
+
+    def warm(self, tip, slot=2):
+        """A warming of `tip` in `slot`, whose own verdict is already
+        green."""
+        self.write_state({"waiting": {}, "results": {tip: {
+            "pr": 0, "main": True, "ok": True, "failed": [],
+            "finished": pc.iso(T0), "slot": 1}}})
+        clock = iter([T0, T0 + datetime.timedelta(minutes=1)])
+        return pc.worker(self.repo, self.state_dir, tip, 0, pc.sh,
+                         self.lines.append, lambda: next(clock),
+                         lambda *a: self.posts.append(a) or True,
+                         slot=slot, main=True, warm=True)
+
+    def test_a_warming_builds_the_slot_and_leaves_the_verdict_alone(self):
+        tip = self.move_main({"B": "b2\n"})
+        self.assertEqual(self.warm(tip), 0)
+        state = self.state()
+        self.assertEqual(state["results"][tip]["slot"], 1)
+        self.assertNotIn("overhead", state["results"][tip])
+        self.assertEqual((state["warm"]["2"]["sha"], state["warm"]["2"]["ok"],
+                          state["warm"]["2"]["slot"]), (tip, True, 2))
+        self.assertEqual(state["cache_main_sha"]["2"], tip)
+        self.assertEqual(self.posts, [])
+        self.assertIn("WARM-GREEN main %s in slot 2: green" % tip[:10],
+                      self.logged())
+
+    def test_a_red_warming_changes_no_verdict(self):
+        tip = self.move_main({"B": "b2\n"})
+        with mock.patch.object(pc, "STEPS", [("fail", ["false"], None)]):
+            self.assertEqual(self.warm(tip), 1)
+        state = self.state()
+        self.assertIs(state["results"][tip]["ok"], True)
+        self.assertIs(state["warm"]["2"]["ok"], False)
+        self.assertNotIn("2", state.get("cache_main_sha", {}))
+        self.assertEqual(self.posts, [])
+        self.assertIn("WARM-RED main %s in slot 2" % tip[:10], self.logged())
+
 
 if __name__ == "__main__":
     unittest.main()
