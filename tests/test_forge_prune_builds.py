@@ -431,3 +431,84 @@ class Often(unittest.TestCase):
                             err=lambda m: None, environ=self.env,
                             finished_of=lambda *a: None, busy=set())
             self.assertEqual(rc, 2, bad)
+
+
+class AgedCache(unittest.TestCase):
+    """--aged-cache: an untagged cache trimmed file by file by age."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.top = tmp.name
+        self.cache = os.path.join(self.top, "gocache")
+        self.outside = os.path.join(self.top, "outside")
+        os.makedirs(os.path.join(self.cache, "0a"))
+        os.makedirs(self.outside)
+
+    def file(self, path, age_days):
+        with open(path, "wb") as f:
+            f.write(b"x" * 4096)
+        t = NOW - age_days * 24 * HOUR
+        os.utime(path, (t, t))
+        return path
+
+    def main(self, *extra):
+        lines, errs = [], []
+        rc = prune.main(["--root", self.top, "--aged-cache", self.cache]
+                        + list(extra), out=lines.append, err=errs.append,
+                        finished_of=lambda *a: None, busy=set(), now=NOW)
+        return rc, lines, errs
+
+    def test_old_files_go_recent_files_and_directories_stay(self):
+        old = self.file(os.path.join(self.cache, "0a", "old-d"), 9)
+        new = self.file(os.path.join(self.cache, "0a", "new-d"), 1)
+        rc, lines, _ = self.main()
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(new))
+        self.assertTrue(os.path.isdir(os.path.join(self.cache, "0a")))
+        self.assertTrue(any("trimmed 1 file" in l for l in lines), lines)
+
+    def test_a_recent_atime_keeps_an_old_mtime(self):
+        path = self.file(os.path.join(self.cache, "0a", "read"), 9)
+        os.utime(path, (NOW - HOUR, NOW - 9 * 24 * HOUR))
+        self.main()
+        self.assertTrue(os.path.exists(path))
+
+    def test_aged_days_sets_the_age(self):
+        path = self.file(os.path.join(self.cache, "0a", "x"), 3)
+        self.main()
+        self.assertTrue(os.path.exists(path))
+        self.main("--aged-days", "2")
+        self.assertFalse(os.path.exists(path))
+
+    def test_a_dry_run_deletes_nothing(self):
+        path = self.file(os.path.join(self.cache, "0a", "x"), 9)
+        rc, lines, _ = self.main("--dry-run")
+        self.assertTrue(os.path.exists(path))
+        self.assertTrue(any("would trim 1 file" in l for l in lines), lines)
+
+    def test_a_link_is_never_followed_out_of_the_cache(self):
+        precious = self.file(os.path.join(self.outside, "precious"), 30)
+        os.symlink(self.outside, os.path.join(self.cache, "0a", "dirlink"))
+        os.symlink(precious, os.path.join(self.cache, "0a", "filelink"))
+        self.main("--aged-days", "0.0001")
+        self.assertTrue(os.path.exists(precious))
+
+    def test_a_link_as_the_cache_or_home_is_refused(self):
+        link = os.path.join(self.top, "link")
+        os.symlink(self.outside, link)
+        errs = []
+        rc = prune.main(["--root", self.top, "--aged-cache", link],
+                        out=lambda m: None, err=errs.append,
+                        finished_of=lambda *a: None, busy=set(), now=NOW)
+        self.assertEqual(rc, 2)
+        rc = prune.main(["--root", self.top, "--aged-cache", "/"],
+                        out=lambda m: None, err=errs.append,
+                        finished_of=lambda *a: None, busy=set(), now=NOW)
+        self.assertEqual(rc, 2)
+        rc = prune.main(["--root", self.top, "--aged-cache", self.cache,
+                         "--aged-days", "0"], out=lambda m: None,
+                        err=errs.append, finished_of=lambda *a: None,
+                        busy=set(), now=NOW)
+        self.assertEqual(rc, 2)
