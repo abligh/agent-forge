@@ -998,6 +998,14 @@ HOLD_LABELS = ()
 # checks.context, on the pull requests each instance applies to, as
 # (context, creator login, path globs or None, label or None).
 GATED = ()
+# merge.own_head_green (default true): a pull request is a candidate,
+# to merge or to join a batch, a train or a prediction, only once
+# checks.context is green on the commit its approval names or on its
+# head. A head the Merger's own merge of the default branch made is
+# judged by the approved commit, as `covers_head` judges the approval.
+OWN_HEAD_GREEN = True
+GREEN_WAIT_REASON = ("%s is %s on %s, and no approved commit is green; "
+                     "waits for the build check to pass")
 # How far back through merges of the default branch an instance's
 # verdict on an earlier head of the pull request still counts.
 GATE_DEPTH = 20
@@ -1059,7 +1067,7 @@ def configure(project):
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
     global FIXED_ORDER, RED_SUSPECT_OUT, UNSTABLE_AFTER, UNSTABLE_BATCHES
-    global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED
+    global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -1078,6 +1086,7 @@ def configure(project):
         in config.gated_instances(project.data))
     BUILD_HOST = project.host
     GATE = tuple(tuple(argv) for argv in merge.get("gate", DEFAULT_GATE))
+    OWN_HEAD_GREEN = merge.get("own_head_green", True)
     CI_WORKFLOW = merge.get("ci_workflow", "ci")
     STALL_AFTER = datetime.timedelta(minutes=merge.get("stall_minutes", 30))
     alert = merge.get("stall_alert")
@@ -3237,7 +3246,7 @@ def retry_due(before, when):
 
 
 def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
-                 regenerated=None, rules=None):
+                 regenerated=None, rules=None, green=None):
     """designs/0035: the layers stacked on `base`, climbing the stack,
     that would be eligible but for their base, each with an approval
     that covers its head, as [(pull request, approval)]. The first that
@@ -3264,6 +3273,8 @@ def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
         if rules and code_owner_wait(repo, layer, rules,
                                      "refs/remotes/origin/" + MAIN, run,
                                      regenerated):
+            return layers
+        if green is not None and green(layer, approval):
             return layers
         layers.append((layer, approval))
         below = layer
@@ -3553,6 +3564,29 @@ def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
             break
         commit = parents[1]
     return first or (None, "", pr["headRefOid"])
+
+
+def own_green_wait(pr, approval, github, cache):
+    """Why `pr` isn't a candidate yet under merge.own_head_green, or
+    None: checks.context isn't green (success) on the commit its
+    approval names, nor on its head. Statuses are read once a tick per
+    commit, through `cache`. A pending, red or absent context holds the
+    pull request: nothing merges, boards a batch or a train, or is
+    predicted until the build check has passed on it."""
+    approved = ((approval or {}).get("commit") or {}).get("oid")
+    seen = []
+    for sha in dict.fromkeys(s for s in (approved, pr.get("headRefOid"))
+                             if s):
+        if sha not in cache:
+            cache[sha] = status_state(github.api(
+                "repos/%s/commits/%s/statuses?per_page=100"
+                % (REPO_SLUG, sha)) or [])[0]
+        if cache[sha] == "success":
+            return None
+        seen.append((sha, cache[sha]))
+    sha, state = seen[-1] if seen else ("", None)
+    return GREEN_WAIT_REASON % (STATUS_CONTEXT, state or "absent",
+                                sha[:10] or "its head")
 
 
 def instance_wait(repo, pr, main_tip, github, cache, run=sh):
@@ -5367,6 +5401,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
+    greens = {}
+    if OWN_HEAD_GREEN:
+        for pr in list(candidates):
+            why = own_green_wait(pr, approvals[pr["number"]], github, greens)
+            if why:
+                held[str(pr["number"])] = why
+                candidates.remove(pr)
     if GATED:
         files = {}
         for pr in list(candidates):
@@ -5893,7 +5934,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             sizes, events = None, []
             layers_of = (lambda pr: ready_layers(
                 repo, pr, prs, open_numbers, when, said, run, regenerated,
-                rules)) if AHEAD_STACKS else None
+                rules, (lambda layer, approval: own_green_wait(
+                    layer, approval, github, greens))
+                if OWN_HEAD_GREEN else None)) if AHEAD_STACKS else None
             cut = lambda before: cut_trains(
                 repo, main_tip, train_carriages(ahead_queue, layers_of),
                 before, {pr["number"]: pr["headRefOid"] for pr in prs},

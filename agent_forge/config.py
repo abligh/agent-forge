@@ -111,7 +111,7 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "hold_labels": list, "blocked_by": str, "said_since": dict,
          "update_once": bool, "ci_never_started": int,
          "queued_stall_minutes": int, "read_as": str, "age_first": dict,
-         "hand_back_once_per_head": bool}
+         "hand_back_once_per_head": bool, "own_head_green": bool}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
 # merge.resolve as an object: designs/0026's rules as `regenerate`, and
 # designs/0046's `union` globs.
