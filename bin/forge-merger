@@ -1273,9 +1273,9 @@ def said_since(pr, approval):
     less those marked `Not-a-review`, those by QUIET_LOGINS, those by
     the pull request's author and approvals. Empty means nothing has
     been said since. With `merge.said_since.author` the author's remarks
-    count too, and with `approvals` so does a later approval: another
-    reviewer's assent after the one that counts is still a remark the
-    approver hasn't seen."""
+    count too, and with `approvals` so does a later approval with text:
+    another reviewer's assent after the one that counts is still a
+    remark the approver hasn't seen. A bare approval never counts."""
     at = approval["submittedAt"]
     author = login(pr)
     said = []
@@ -1292,9 +1292,13 @@ def said_since(pr, approval):
             if NOT_A_REVIEW_RE.search(markers_of(item.get("body"))):
                 continue
             if (kind == "review" and item.get("state") == "APPROVED"
-                    and not SAID_APPROVALS):
+                    and (not SAID_APPROVALS
+                         or not markers_of(item.get("body")).strip())):
                 # Assent, whatever its text: a reviewer with second
-                # thoughts requests changes instead.
+                # thoughts requests changes instead. Even with
+                # `approvals`, an approval with no text says nothing the
+                # approver hasn't seen (a code owner's bare approval
+                # held pull requests it should have released).
                 continue
             said.append((who or "ghost", when, kind))
     return sorted(said, key=lambda s: s[1])

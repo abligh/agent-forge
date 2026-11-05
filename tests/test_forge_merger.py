@@ -6375,8 +6375,15 @@ class SaidSince0026(unittest.TestCase):
 
     def test_a_later_approval_holds_with_approvals(self):
         m.configure(project(said_since={"approvals": True}))
-        self.assertEqual(self.said(reviews=[review(PEER, at=T2)]),
+        self.assertEqual(self.said(reviews=[review(PEER, at=T2,
+                                                   body="one thing")]),
                          [(PEER, T2, "review")])
+
+    def test_a_bare_later_approval_never_holds(self):
+        m.configure(project(said_since={"author": True, "approvals": True}))
+        self.assertEqual(self.said(reviews=[review(PEER, at=T2)]), [])
+        self.assertEqual(self.said(reviews=[review(PEER, at=T2,
+                                                   body="  \n")]), [])
 
     def test_quiet_logins_never_hold(self):
         p = project(said_since={"quiet": ["Helper"]})
