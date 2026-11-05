@@ -225,7 +225,10 @@ ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
 # Where an issue's `Blocked-by:` lines may be (agent_forge/rules_default.py).
 ISSUE_BLOCKED_BY = ("body", "agents")
 IDLE_OFFER = {"idle_minutes": int, "shell_minutes": int, "report_to": str,
-              "hand_over_above": int}
+              "hand_over_above": int, "retell_minutes": int}
+# The shortest `router.idle_offer.retell_minutes`: a re-told offer is a
+# nudge, and one every few minutes is noise the agent learns to ignore.
+MIN_RETELL_MINUTES = 30
 MERGE_NOTICE = {"window_minutes": int, "skip_label": str, "to": str}
 # Whom `router.merge_notice.to` tells of a merge.
 MERGE_NOTICE_TO = ("author", "owner_label")
@@ -1343,6 +1346,10 @@ def _check_idle_offer(offer, agents, problems):
     for key in ("idle_minutes", "shell_minutes"):
         if _is(offer.get(key), int) and offer[key] < 1:
             problems.append("%s.%s must be at least 1" % (where, key))
+    if _is(offer.get("retell_minutes"), int) and \
+            offer["retell_minutes"] < MIN_RETELL_MINUTES:
+        problems.append("%s.retell_minutes must be at least %d"
+                        % (where, MIN_RETELL_MINUTES))
     if _is(offer.get("hand_over_above"), int) and \
             offer["hand_over_above"] < 0:
         problems.append("%s.hand_over_above must be at least 0" % where)

@@ -116,6 +116,13 @@ class Config(unittest.TestCase):
                           "least 0"])
         self.assertEqual(len(self.problems({"hand_over_above": "3"})), 1)
 
+    def test_retell_minutes_an_integer_of_at_least_thirty(self):
+        self.assertEqual(self.problems({"retell_minutes": 30}), [])
+        self.assertEqual(self.problems({"retell_minutes": 29}),
+                         ["router.idle_offer.retell_minutes must be at "
+                          "least 30"])
+        self.assertEqual(len(self.problems({"retell_minutes": "60"})), 1)
+
     def test_report_to_is_an_agent(self):
         self.assertEqual(self.problems({"report_to": "Merger"}),
                          ["router.idle_offer.report_to: 'Merger' is not an "
@@ -136,7 +143,8 @@ class Configure(unittest.TestCase):
         configure(self, {})
         self.assertEqual(rules.IDLE_OFFER,
                          {"idle_minutes": 10, "shell_minutes": None,
-                          "report_to": None, "hand_over_above": None})
+                          "report_to": None, "hand_over_above": None,
+                          "retell_minutes": None})
         self.assertTrue(rules.wants_directory)
 
     def test_the_rules_load_with_it(self):
@@ -425,6 +433,39 @@ class Offer(unittest.TestCase):
         ctx = context(issues=[owned(30)], only=frozenset({30}),
                       listing=directory(entry("WidgetLeadDev")))
         self.assertEqual(rules.sweep(ctx), [])
+
+
+class Retell(unittest.TestCase):
+    """`idle_offer.retell_minutes`: the offer, not the report, is told
+    again while the same idle period lasts."""
+
+    def setUp(self):
+        configure(self, {"report_to": "LeadDev", "retell_minutes": 120})
+
+    def test_the_offer_is_reminded_every_retell_minutes(self):
+        got = rules.sweep(context(issues=[owned(30)],
+                                  listing=directory(entry("WidgetLeadDev"))))
+        self.assertEqual([(d.rule, d.event) for d in got], [(15, IDLE)])
+        reminder = got[0].reminder
+        self.assertEqual((reminder.first_s, reminder.ceiling_s),
+                         (7200.0, 7200.0))
+        # Never sooner than the interval, and it doesn't grow.
+        for sent in (0, 1, 5):
+            wait = reminder.wait("k", sent)
+            self.assertGreaterEqual(wait, 7200.0)
+            self.assertLessEqual(wait, 7200.0 * 1.5)
+
+    def test_the_report_is_still_said_once(self):
+        got = rules.sweep(context(issues=[],
+                                  listing=directory(entry("WidgetUIDev"))))
+        self.assertEqual([(d.rule, d.reminder) for d in got],
+                         [(16, router.ONCE)])
+
+    def test_without_it_the_offer_is_said_once(self):
+        configure(self, {"report_to": "LeadDev"})
+        got = rules.sweep(context(issues=[owned(30)],
+                                  listing=directory(entry("WidgetLeadDev"))))
+        self.assertEqual(got[0].reminder, router.ONCE)
 
 
 class NotOffered(unittest.TestCase):
