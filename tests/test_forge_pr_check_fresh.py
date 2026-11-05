@@ -433,6 +433,22 @@ class Tick(StateCase):
         # Pull requests first, as without fresh.
         self.assertEqual([a[1:3] for a, _ in self.spawned], [(SHA_A, 7)])
 
+    def test_a_spare_slot_takes_the_next_after_the_tip(self):
+        prediction = {"pr": 2, "sha": "d" * 40, "tree": "e" * 40}
+        with mock.patch.object(pc, "TEST_AHEAD", True), \
+                mock.patch.object(pc, "merger_first", lambda *a: None), \
+                mock.patch.object(pc, "merger_ahead",
+                                  lambda *a: [prediction]):
+            self.tick([(7, SHA_A, REPO, "false")], merger_dir="/merger")
+        self.assertEqual([(a[1], a[2], a[4]) for a, _ in self.spawned],
+                         [(SHA_C, 0, 1), ("d" * 40, 2, 2)])
+
+    def test_the_tip_runs_beside_a_head_in_the_same_tick(self):
+        self.estimates[SHA_A]["stale_steps"] = []
+        self.tick([(7, SHA_A, REPO, "false")])
+        self.assertEqual([(a[1], a[2], a[4]) for a, _ in self.spawned],
+                         [(SHA_A, 7, 1), (SHA_C, 0, 2)])
+
     def test_after_wait_minutes_it_runs_as_now(self):
         self.tick([(7, SHA_A, REPO, "false")])
         # The tip's traced run is in slot 1.
