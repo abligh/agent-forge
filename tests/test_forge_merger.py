@@ -7915,3 +7915,44 @@ class OwnGreenWait(unittest.TestCase):
         m.configure(project(own_head_green=False))
         self.addCleanup(m.configure, project())
         self.assertIs(m.OWN_HEAD_GREEN, False)
+
+
+class OwnGreenWaitAfterUpdates(RepoCase):
+    """merge.own_head_green follows merges of the default branch back:
+    a batch member the Merger has just updated again, whose build check
+    hasn't posted yet, stays a candidate (and in its batch) when an
+    earlier update of it was green, though its approval names a commit
+    that never was."""
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main("m1.txt")
+        self.first = self.repo.merge("origin/main")
+        self.advance_main("m2.txt")
+        self.head = self.repo.merge("origin/main")
+
+    def wait(self, statuses):
+        github = FakeGitHub({SLUG + "/commits/" + sha: value
+                             for sha, value in statuses.items()})
+        item = pr(5, head=self.head,
+                  reviews=[review(REVIEWER, oid=self.approved)])
+        return m.own_green_wait(item, m.approval_of(item), github, {},
+                                self.repo.path, self.repo.main_tip())
+
+    def test_green_before_the_latest_update_counts(self):
+        self.assertIsNone(self.wait({self.approved: [], self.head: [],
+                                     self.first: [status()]}))
+
+    def test_nothing_green_on_the_way_back_still_holds_it(self):
+        self.assertEqual(
+            self.wait({self.approved: [], self.head: [],
+                       self.first: [status("failure")]}),
+            m.GREEN_WAIT_REASON % ("vm/build-and-test", "absent",
+                                   self.head[:10]))
+
+    def test_a_commit_of_its_own_stops_the_walk(self):
+        # A change after the green update is new work: its green is
+        # needed, not the one before it.
+        self.head = self.repo.commit("f.txt", "more\n", "more")
+        self.assertIsNotNone(self.wait({self.approved: [], self.head: [],
+                                        self.first: [status()]}))
