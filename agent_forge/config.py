@@ -57,6 +57,7 @@ TOP = {
     "queue": (dict, False),
     "stats_watch": (dict, False),
     "nightly": (dict, False),
+    "session_start": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
@@ -68,6 +69,7 @@ AREAS = {"paths": list, "labels": list}
 IDENTITY = {"unattributed_domain": (str, list), "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list, "crontabs": dict}
 # forge-memory-sync, -check and -trim (agent_forge/memory.py).
+SESSION_START = {"skip_labels": list}
 MEMORY = {"dir": str, "remote": str, "git_dir": str, "seed_dir": str,
           "ssh_key": str, "branch": str, "labels": list, "limit": int,
           "long_line": int}
@@ -348,6 +350,18 @@ def _fields(where, entry, allowed, problems):
             problems.append("%s.%s must be %s"
                             % (where, key, _type_name(allowed[key])))
     return True
+
+
+def _check_session_start(section, problems):
+    """session_start.skip_labels: labels whose items the restart brief
+    leaves out, each a non-empty string."""
+    if not _fields("session_start", section, SESSION_START, problems):
+        return
+    skip = section.get("skip_labels")
+    if isinstance(skip, list) and not all(
+            isinstance(l, str) and l for l in skip):
+        problems.append("session_start.skip_labels must be a list of "
+                        "non-empty strings")
 
 
 def _check_identity(ident, problems):
@@ -687,6 +701,8 @@ def check(data):
             problems.append("host_settings.host_keys must be a list of "
                             "strings")
     _check_memory(data.get("memory", {}), "memory" in data, problems)
+    if "session_start" in data:
+        _check_session_start(data["session_start"], problems)
     _check_quiet(data.get("quiet", {}), "quiet" in data, problems)
     _check_queue(data.get("queue", {}), problems)
     if "stats_watch" in data:

@@ -255,6 +255,50 @@ class Brief(Checkout):
         self.assertIn("SessionStart", out.getvalue())
 
 
+class SkipLabels(Checkout):
+    """session_start.skip_labels leaves machinery items out, and says so."""
+
+    MARKED = ISSUES + [
+        {"number": 30, "title": "nightly job heartbeat",
+         "labels": [{"name": "Owner:LeadDev"}, {"name": "Heartbeat"}]},
+        {"number": 31, "title": "review job heartbeat",
+         "labels": [{"name": "Heartbeat"}]},
+    ]
+
+    def test_every_item_is_listed_without_the_key(self):
+        ctx = self.context(call=fake_call(self.MARKED))[1]["additionalContext"]
+        self.assertIn("#30 issue", ctx)
+        self.assertNotIn("not listed", ctx)
+
+    def test_a_skip_label_leaves_its_items_out_and_counts_them(self):
+        self.data["session_start"] = {"skip_labels": ["Heartbeat"]}
+        self.write_config()
+        ctx = self.context(call=fake_call(self.MARKED))[1]["additionalContext"]
+        self.assertIn("#18 issue", ctx)
+        self.assertNotIn("#30", ctx)
+        self.assertNotIn("#31", ctx)
+        self.assertIn("2 more not listed", ctx)
+
+    def test_only_skipped_items_reads_as_none_listed_and_says_why(self):
+        self.data["session_start"] = {"skip_labels": ["Heartbeat"]}
+        self.write_config()
+        only = self.MARKED[3:]
+        ctx = self.context(call=fake_call(only))[1]["additionalContext"]
+        self.assertIn("You own no open items", ctx)
+        self.assertIn("2 more not listed", ctx)
+
+    def test_the_config_check_refuses_a_bad_list(self):
+        from agent_forge import config
+        for bad in ({"skip_labels": "Heartbeat"}, {"skip_labels": [""]},
+                    {"skip_labels": [3]}, {"other": []}):
+            data = example()
+            data["session_start"] = bad
+            self.assertTrue(config.check(data), bad)
+        data = example()
+        data["session_start"] = {"skip_labels": ["Heartbeat"]}
+        self.assertEqual(config.check(data), [])
+
+
 class EndToEnd(unittest.TestCase):
     """The real script, on a real stamped repository, with nothing to
     reach GitHub through: what the hook runs is the thing tested, and a
