@@ -810,7 +810,7 @@ reference, or `#N`, its URL or "issue N" in the body). With
 its turn has ended and only a background task it started still runs,
 such as a wait loop that will never finish (designs/0017). Its offer
 says since when the task has been running. One offer per idle period,
-never reminded. An idle developer with nothing to act on is
+never reminded, unless `retell_minutes` is set. An idle developer with nothing to act on is
 reported to `report_to`, once per idle period. A directory that can't
 be read, or isn't complete, makes nobody idle. Off without the key;
 `{}` turns it on with the defaults. `agent_forge/rules_default.py`
@@ -822,6 +822,7 @@ be read, or isn't complete, makes nobody idle. Off without the key;
 | `shell_minutes` | none (off) | How long an agent's entry must have been `shell` (its turn ended, a background task still running) before it counts as idle. Longer than `idle_minutes`, because the agent often acts on a background build when it finishes; 20 is a reasonable start. Needs agents and relay on an xmpp-mcp that reports `shell`. |
 | `report_to` | none | The agent told about a developer (not a reviewer or a collaborator) that is idle with nothing it can act on, such as whoever plans the work. Not told about itself. Without it, nobody is told. |
 | `hand_over_above` | none (off) | With `report_to`: when an agent owns more than this many issues it could act on but hasn't started (no `in-progress` label after `labels.status_prefix`), the report about an idle developer also names the agent owning the most, lists them (oldest first, at most ten), and asks for one to be handed over (designs/0038). An owner may keep this many for context; 3 is a reasonable start. Nothing is reassigned automatically. |
+| `retell_minutes` | none (off) | Tell an agent the offer again, every this many minutes (at least 30; up to half as long again, so agents idle together aren't told together), while the same idle period lasts and she still has work to offer. A long idle period otherwise hears about her work once. The report to `report_to` is never repeated. |
 
 ### `router.merge_notice`
 

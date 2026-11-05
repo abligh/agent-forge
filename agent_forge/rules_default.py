@@ -191,7 +191,10 @@ agents with nothing to do (off without it):
     among themselves), and the offer says "Red builds go first".
     The event is when the idle period began, and it is about no item,
     so it is offered once per idle period, never reminded, and the
-    next idle period offers again. An agent idle through `shell` is
+    next idle period offers again. With `idle_offer.retell_minutes`
+    (at least 30), an agent still idle in the same period, with work
+    still there to offer, is told again every `retell_minutes` (plus a
+    little jitter); rule 16's report is never repeated. An agent idle through `shell` is
     also told since when its background task has been running;
 16. an idle developer (not a reviewer or a collaborator) with no such
     turn and nothing actionable: `idle_offer.report_to`'s, so whoever
@@ -308,7 +311,7 @@ import os
 import re
 
 from agent_forge import locks, nightly, state
-from agent_forge.router import ONCE, Action, Decision, Lookup
+from agent_forge.router import ONCE, Action, Decision, Lookup, Reminder
 
 # The Merger's hand-back names the head it judged, in both its forms.
 HAND_BACK_RE = re.compile(r"^Not merging ([0-9a-f]{7,40}):", re.MULTILINE)
@@ -439,7 +442,8 @@ def configure(project, merger_tool):
         "idle_minutes": offer.get("idle_minutes", DEFAULT_IDLE_MINUTES),
         "shell_minutes": offer.get("shell_minutes"),
         "report_to": offer.get("report_to"),
-        "hand_over_above": offer.get("hand_over_above")}
+        "hand_over_above": offer.get("hand_over_above"),
+        "retell_minutes": offer.get("retell_minutes")}
     IN_PROGRESS = labels.get("status_prefix", "Status:") + "in-progress"
     wants_directory = IDLE_OFFER is not None
     notice = project.section("router").get("merge_notice")
@@ -1312,6 +1316,14 @@ def counted(n, one, many):
 NOT_REPORTED = ("reviewer", "collaborator")
 
 
+def retell():
+    """Rule 15's reminder: never, or every `idle_offer.retell_minutes`."""
+    minutes = IDLE_OFFER.get("retell_minutes")
+    if not minutes:
+        return ONCE
+    return Reminder(minutes * 60.0, minutes * 60.0)
+
+
 def idle_offers(ctx, skip=()):
     """Rules 15 and 16: an offer to each idle agent with an actionable
     issue and no turn, and a report to `report_to` of each idle
@@ -1340,7 +1352,7 @@ def idle_offers(ctx, skip=()):
                     " A background task of yours has been running since "
                     "%s. Stop it if it is stale." % since_text(
                         stamp, ctx.when) if shell else ""),
-                reminder=ONCE))
+                reminder=retell()))
             continue
         if not report_to or agent == ctx.roster.stand_in(report_to) or \
                 ctx.roster.project.kind(agent) in NOT_REPORTED:
