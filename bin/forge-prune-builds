@@ -46,6 +46,18 @@ Designs/0041 adds, each off unless given:
      in use also while a process's environment names them as
      CARGO_TARGET_DIR.
 
+Trimming by age (off unless given):
+
+  --aged-cache DIR: DIR is a cache that keeps entries rather than a
+     build per directory, and carries no CACHEDIR.TAG (a Go build cache,
+     GOCACHE, is one). Every FILE under it neither read nor written for
+     --aged-days days (default 5: the age Go's own trim uses) is
+     deleted, whatever the disk use; directories are kept, since the
+     cache's owner creates its layout once and expects it. The walk
+     never follows a symbolic link, and a link is judged as a file by
+     its own times, so nothing outside DIR is ever touched. A cache
+     loses only entries old enough to be rebuilt cheaply.
+
 Exit status:
 
     0   the scan finished (whatever it cleared or kept)
@@ -502,6 +514,34 @@ def mark_scan(path, now):
     os.utime(path, (now, now))
 
 
+def trim_aged(path, max_age_s, *, now, dry_run, out):
+    """Delete every file under `path` not read or written for `max_age_s`
+    seconds (newest of atime and mtime, by lstat: a link is judged by
+    itself and never followed). Directories stay. Returns (files, KiB)."""
+    cutoff = now - max_age_s
+    files = kib = 0
+    for dirpath, _dirs, names in os.walk(path, followlinks=False):
+        for name in names:
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            if max(st.st_atime, st.st_mtime) >= cutoff:
+                continue
+            if not dry_run:
+                try:
+                    os.unlink(full)
+                except OSError:
+                    continue
+            files += 1
+            kib += st.st_blocks // 2
+    out("%s: %s %d file(s), %.1f MB older than %.1f days in %s" % (
+        PROG, "would trim" if dry_run else "trimmed", files, kib / 1024,
+        max_age_s / 86400, path))
+    return files, kib
+
+
 def main(argv=None, out=print, err=None, environ=None, **hooks):
     err = err or (lambda m: print(m, file=sys.stderr))
     environ = os.environ if environ is None else environ
@@ -525,6 +565,13 @@ def main(argv=None, out=print, err=None, environ=None, **hooks):
     parser.add_argument("--pressure-floor-hours", type=float, default=1,
                         help="under pressure, keep caches used this recently "
                              "(default 1)")
+    parser.add_argument("--aged-cache", action="append", default=[],
+                        help="an untagged cache (such as GOCACHE) whose "
+                             "files are deleted once --aged-days old "
+                             "(repeatable)")
+    parser.add_argument("--aged-days", type=float, default=5,
+                        help="days unused before an --aged-cache file is "
+                             "deleted (default 5)")
     parser.add_argument("--every-minutes", type=float,
                         help="skip the scan if every root is under "
                              "--high-water and the last was this recent")
@@ -539,12 +586,24 @@ def main(argv=None, out=print, err=None, environ=None, **hooks):
             0 < args.low_water <= args.high_water <= 100):
         err("%s: need 0 < --low-water <= --high-water <= 100" % PROG)
         return 2
+    if args.aged_days <= 0:
+        err("%s: --aged-days must be > 0" % PROG)
+        return 2
     if args.pressure_floor_hours < 0 or (
             args.every_minutes is not None and args.every_minutes <= 0):
         err("%s: --pressure-floor-hours must be >= 0, --every-minutes > 0" % PROG)
         return 2
     roots = [os.path.expanduser(r) for r in args.root]
     shared = [os.path.expanduser(r) for r in args.shared]
+    aged = [os.path.expanduser(r) for r in args.aged_cache]
+    for top in aged:
+        # A link as the cache itself would send the walk elsewhere, and
+        # "/" or the home directory is never a cache.
+        if os.path.islink(top) or not os.path.isdir(top) or \
+                os.path.realpath(top) in ("/", os.path.realpath(
+                    os.path.expanduser("~"))):
+            err("%s: --aged-cache %s is not a cache directory" % (PROG, top))
+            return 2
     for root in roots + shared:
         if not os.path.isdir(root):
             err("%s: %s is not a directory" % (PROG, root))
@@ -576,6 +635,9 @@ def main(argv=None, out=print, err=None, environ=None, **hooks):
         idle_hours=args.idle_hours, repo=repo, token=token, out=out,
         shared=shared, high_water=args.high_water, low_water=args.low_water,
         floor_hours=args.pressure_floor_hours, **hooks)
+    for top in aged:
+        trim_aged(top, args.aged_days * 86400, now=now,
+                  dry_run=args.dry_run, out=out)
     if args.every_minutes is not None and not args.dry_run:
         mark_scan(stamp, now)
     out("%s: %s %d, kept %d, %.1f GB" % (
