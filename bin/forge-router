@@ -285,10 +285,11 @@ def prepare(node, typename):
     return node
 
 
-def fetch(github):
+def fetch(github, only=None):
     """(pull requests, issues): every open one, as GraphQL's nodes with
     the rules' `flatten` connections as lists and `__typename` set, then
-    what the rules' lookups attach."""
+    what the rules' lookups attach. With `only`, a `per_item` lookup is
+    run over those numbers' items alone."""
     owner, name = REPO_SLUG.split("/")
     query = QUERY % {"PullRequest": RULES.graphql.get("PullRequest", ""),
                      "Issue": RULES.graphql.get("Issue", "")}
@@ -315,7 +316,12 @@ def fetch(github):
             more[kind] = page["pageInfo"]["hasNextPage"]
             cursors[cursor] = page["pageInfo"]["endCursor"]
     for lookup in RULES.lookups:
-        lookup.run(github, REPO_SLUG, prs, issues)
+        if only and getattr(lookup, "per_item", False):
+            lookup.run(github, REPO_SLUG,
+                       [p for p in prs if p["number"] in only],
+                       [i for i in issues if i["number"] in only])
+        else:
+            lookup.run(github, REPO_SLUG, prs, issues)
     return prs, issues
 
 
@@ -936,7 +942,7 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
             out("SEED REFUSED: %s already records turns; a seed is only "
                 "for a router's first run" % state_path)
             return 2
-    prs, issues = fetch(github)
+    prs, issues = fetch(github, only)
     listing = None
     if RULES.wants_directory and directory is not None:
         listing, why = directory()

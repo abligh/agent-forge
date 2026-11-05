@@ -557,6 +557,39 @@ class Recheck(EngineCase):
         self.assertEqual(seen, [(2, 0), (0, 1)])
 
 
+
+class PerItemLookups(EngineCase):
+    """A `per_item` lookup is run over an `--only` run's items alone
+    (a lookup reading each long thread over REST spent every delivery's
+    run on every open item)."""
+
+    def watch(self, per_item):
+        seen = []
+        self.rules.lookups = (router.Lookup(
+            "x", lambda g, repo, prs, issues: seen.append(
+                sorted(i["number"] for i in prs + issues)),
+            per_item=per_item),)
+        return seen
+
+    def test_an_only_run_hands_a_per_item_lookup_just_its_items(self):
+        seen = self.watch(True)
+        self.run_router((41, 43, 45), only=(43,))
+        self.assertEqual(seen, [[43]])
+
+    def test_a_full_run_hands_it_every_open_item(self):
+        seen = self.watch(True)
+        self.run_router((41, 43, 45))
+        self.assertEqual(seen, [[41, 43, 45]])
+
+    def test_a_lookup_that_is_not_per_item_still_sees_everything(self):
+        seen = self.watch(False)
+        self.run_router((41, 43, 45), only=(43,))
+        self.assertEqual(seen, [[41, 43, 45]])
+
+    def test_per_item_is_off_by_default(self):
+        self.assertFalse(router.Lookup("x", print).per_item)
+
+
 class ExitStatus(EngineCase):
 
     def test_nothing_due_is_zero(self):
