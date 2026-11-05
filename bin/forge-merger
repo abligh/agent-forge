@@ -1181,7 +1181,8 @@ query($owner:String!, $name:String!, $cursor:String) {
     pullRequests(states:OPEN, first:50, after:$cursor) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        number title createdAt isDraft baseRefName headRefName headRefOid body
+        number title createdAt lastEditedAt isDraft baseRefName headRefName
+        headRefOid body
         author { login }
         labels(first:50) { nodes { name } }
         reviews(last:100) {
@@ -1310,9 +1311,12 @@ def label_names(pr):
 
 def texts_of(pr):
     """The body, comments and submitted reviews of `pr`, oldest first, as
-    (time, text) pairs; the body sorts first. A pending review has no
-    time and is not read."""
-    texts = [("", pr.get("body"))]
+    (time, text) pairs. The body is dated by its last edit (`lastEditedAt`,
+    else `createdAt`), so a body edited after a comment is the newer
+    text; the sort is stable, so on a tie the body stays first. A pending
+    review has no time and is not read."""
+    texts = [(pr.get("lastEditedAt") or pr.get("createdAt") or "",
+              pr.get("body"))]
     texts += [(c.get("createdAt") or "", c.get("body"))
               for c in pr.get("comments") or ()]
     texts += [(r.get("submittedAt") or "", r.get("body"))

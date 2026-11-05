@@ -6293,6 +6293,30 @@ class BlockedByEverywhere(unittest.TestCase):
                   comments=[comment(PEER, at=TA, body="Blocked-by: #3")])
         self.assertEqual(self.held(item), "Blocked-by: #3")
 
+    def test_a_body_edited_after_a_comment_hold_decides(self):
+        """The body is dated by its last edit: an edit that clears the
+        hold, made after a comment set it, is the newer text."""
+        item = pr(body="Blocked-by: none",
+                  comments=[comment(PEER, at=TA, body="Blocked-by: #2")])
+        item["lastEditedAt"] = TB
+        self.assertIsNone(self.held(item))
+        item["body"] = "Blocked-by: #3"
+        self.assertEqual(self.held(item), "Blocked-by: #3")
+
+    def test_an_unedited_body_is_dated_by_its_creation(self):
+        item = pr(created=TB, body="Blocked-by: #3",
+                  comments=[comment(PEER, at=TA, body="Blocked-by: #2")])
+        self.assertEqual(self.held(item), "Blocked-by: #3")
+        # Created before the comment: the comment is newer.
+        item["createdAt"] = T0
+        self.assertEqual(self.held(item), "Blocked-by: #2")
+
+    def test_a_body_edit_older_than_the_comment_does_not_win(self):
+        item = pr(body="Blocked-by: none",
+                  comments=[comment(PEER, at=TB, body="Blocked-by: #2")])
+        item["lastEditedAt"] = TA
+        self.assertEqual(self.held(item), "Blocked-by: #2")
+
     def test_none_clears_it(self):
         item = pr(body="Blocked-by: #2",
                   comments=[comment(PEER, at=TA, body="Blocked-by: none")])
