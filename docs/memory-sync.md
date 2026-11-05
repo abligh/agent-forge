@@ -9,7 +9,9 @@ host's sync until a person or agent resolves it. Nothing is ever
 resolved by guessing.
 
 Two tools look after the index itself: `forge-memory-check` asserts it
-still loads in full, and `forge-memory-trim` shortens its lines without
+still loads in full and that every topic file is reachable from it
+(directly, through an index page it links, or through `[[name]]` links
+between memories), and `forge-memory-trim` shortens its lines without
 losing anything.
 
 The configuration's `memory` section ([config.md](config.md)) says

@@ -96,6 +96,45 @@ class MemoryCheckTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("in no index entry", out)
 
+    def test_a_file_reached_through_an_index_page_is_indexed(self):
+        """A layered index: MEMORY.md links an index page, which links the
+        topic file. The file is loaded, so it must not be reported."""
+        m = self.mem(["people-index"], extra_files=["alice"])
+        (m.root / "people-index.md").write_text("- [alice](alice.md)\n")
+        code, out = m.run()
+        self.assertEqual(code, 0, out)
+        self.assertIn("clean", out)
+
+    def test_a_file_reached_by_a_wiki_link_name_is_indexed(self):
+        """[[name]] matches the front matter's name:, not just the file."""
+        m = self.mem(["alpha"], extra_files=["topic-b"])
+        (m.root / "alpha.md").write_text("see [[the-b-memory]]\n")
+        (m.root / "topic-b.md").write_text(
+            "---\nname: the-b-memory\n---\n\nbody, links [[topic-c]]\n")
+        (m.root / "topic-c.md").write_text("# c\n")
+        code, out = m.run()
+        self.assertEqual(code, 0, out)
+
+    def test_a_wiki_link_matches_a_basename_too(self):
+        m = self.mem(["alpha"], extra_files=["beta"])
+        (m.root / "alpha.md").write_text("[[beta]]\n")
+        self.assertEqual(m.run()[0], 0)
+
+    def test_a_wiki_link_to_nothing_is_not_an_error(self):
+        """An unmatched [[name]] marks a memory worth writing later."""
+        m = self.mem(["alpha"])
+        (m.root / "alpha.md").write_text("[[not-written-yet]]\n")
+        self.assertEqual(m.run()[0], 0)
+
+    def test_a_cycle_of_links_with_no_way_in_is_still_unindexed(self):
+        """Files that only link each other are never loaded."""
+        m = self.mem(["alpha"], extra_files=["x", "y"])
+        (m.root / "x.md").write_text("[[y]]\n")
+        (m.root / "y.md").write_text("(x.md)\n")
+        code, out = m.run()
+        self.assertEqual(code, 1)
+        self.assertIn("in no index entry", out)
+
     def test_a_missing_directory_is_reported_not_passed_quietly(self):
         """A check that cannot see its subject must not report on it —
         and must not do so silently, which is how an inert check survives."""
