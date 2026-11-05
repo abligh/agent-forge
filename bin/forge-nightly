@@ -35,7 +35,12 @@ so one an earlier tick opened is found even without this tool's state.
 **Fixes go first.** While the issue is open, each tick writes the
 numbers of the open pull requests that close it (a closing keyword in
 the title, the body or a commit message, by forge-closing-keywords'
-rule, or the issue in `closingIssuesReferences`) to its state.
+rule, or the issue in `closingIssuesReferences`) to its state. With
+`nightly.fixes_named` (designs/0048 §4), a pull request also fixes it
+when it names the issue (`#N` or its URL, any keyword or none, in its
+title, body outside code, or commits), or closes an issue linked with
+it: one named by `#N` in a comment on it not written by this tool's
+App, or one whose own text names it (a cross-reference).
 forge-pr-check, forge-merger and forge-router read them there
 (agent_forge/nightly.py) and treat them as if they carried
 `labels.urgent`. Only the 100 oldest open pull requests are read.
@@ -46,7 +51,12 @@ queued or in progress and either a pull request that closes the issue
 merged after the newest run started, or `retry_hours` (default 3) have
 passed since it ended. One it dispatched counts as running until a run
 created after the dispatch is seen, or DISPATCH_WAIT has passed. Each
-dispatch is a comment on the issue, with the commit and why.
+dispatch is a comment on the issue, with the commit and why. With
+`nightly.defer_until` (designs/0048 §5), it ends with a `Defer-until:`
+line at the run's expected end: now plus the median length of the last
+five completed runs, rounded up to the quarter hour, kept in the state
+as `dispatched.until`; forge-router's rules 20 and 21 hold the issue
+until then, or until a red run ends.
 
 **A retry fails fast.** When the workflow's file on the default
 branch declares a `workflow_dispatch` input named `first`, a dispatch
@@ -91,7 +101,9 @@ import fnmatch
 import importlib.machinery
 import importlib.util
 import os
+import math
 import re
+import statistics
 import sys
 import urllib.error
 import urllib.parse
@@ -103,7 +115,8 @@ from agent_forge import config, github, locks, nightly, state  # noqa: E402
 
 PROG = "forge-nightly"
 DEFAULTS = {"owners": {}, "labels": [], "retry_hours": 3,
-            "escalate_hours": [24, 48]}
+            "escalate_hours": [24, 48], "fixes_named": False,
+            "defer_until": False}
 # The events a nightly run starts from.
 EVENTS = ("schedule", "workflow_dispatch")
 ACTIVE = ("queued", "in_progress", "waiting", "requested", "pending")
@@ -124,11 +137,22 @@ LOG_STAMP_RE = re.compile(
 MARKER = "Nightly: %s"
 TITLE = "The nightly is red at %s"
 REQUEST_TIMEOUT_S = 60
+# `nightly.defer_until` (designs/0048 §5): the expected end of a run is
+# its start plus the median length of this many recent runs, rounded up.
+DURATION_RUNS = 5
+DEFER_ROUND = datetime.timedelta(minutes=15)
 
 OPEN_PRS_QUERY = """
 query($o: String!, $r: String!, $n: Int!) {
   repository(owner: $o, name: $r) {
-    issue(number: $n) { state }
+    issue(number: $n) {
+      state
+      comments(last: 100) { nodes { author { login } body } }
+      timelineItems(last: 100, itemTypes: [CROSS_REFERENCED_EVENT]) {
+        nodes { ... on CrossReferencedEvent {
+          source { ... on Issue { number } } } }
+      }
+    }
     open: pullRequests(states: OPEN, first: 100,
                        orderBy: {field: CREATED_AT, direction: ASC}) {
       nodes { ...closes }
@@ -592,38 +616,126 @@ class Tick:
         saved["newest"] = "red"
         return True
 
+    def closed_by(self, pr):
+        """The issue numbers pull request `pr` (GraphQL) closes: its
+        `closingIssuesReferences`, and the closing keywords in its title,
+        body (outside code) and commit messages."""
+        found = {(n or {}).get("number") for n in (
+            (pr.get("closingIssuesReferences") or {}).get("nodes") or ())}
+        refs = self.closing.refs
+        found |= set(refs(self.closing.blank_code(pr.get("body") or "")))
+        found |= set(refs(pr.get("title") or ""))
+        for c in (pr.get("commits") or {}).get("nodes") or ():
+            found |= set(refs(((c or {}).get("commit") or {}).get(
+                "message") or ""))
+        found.discard(None)
+        return found
+
     def closes(self, pr, number):
         """Whether pull request `pr` (GraphQL) closes issue `number`."""
-        declared = {(n or {}).get("number") for n in (
-            (pr.get("closingIssuesReferences") or {}).get("nodes") or ())}
-        if number in declared:
-            return True
-        refs = self.closing.refs
-        if number in refs(self.closing.blank_code(pr.get("body") or "")) \
-                or number in refs(pr.get("title") or ""):
-            return True
-        return any(number in refs(((c or {}).get("commit") or {}).get(
-            "message") or "") for c in (
-                (pr.get("commits") or {}).get("nodes") or ()))
+        return number in self.closed_by(pr)
+
+    def names(self, pr, number):
+        """Whether pull request `pr` names issue `number` by `#N` or its
+        URL, with or without a keyword, in its title, body (outside
+        code) or commit messages."""
+        pattern = re.compile(r"(?:#|/issues/)%d(?![0-9])" % number)
+        texts = [pr.get("title") or "",
+                 self.closing.blank_code(pr.get("body") or "")]
+        texts += [((c or {}).get("commit") or {}).get("message") or ""
+                  for c in (pr.get("commits") or {}).get("nodes") or ()]
+        return any(pattern.search(t) for t in texts)
+
+    def linked(self, issue, number):
+        """With `fixes_named`, the issues linked with the nightly's issue
+        `number` (GraphQL `issue`): those named by `#N` in comments not
+        written by this tool's App (its own list the commits since green,
+        whose messages name unrelated numbers), and those whose text
+        names it (cross-references from issues)."""
+        bot = self.project.bot_login(self.name)
+        mine = {bot, bot[:-len("[bot]")] if bot.endswith("[bot]") else bot}
+        found = set()
+        for c in ((issue.get("comments") or {}).get("nodes") or ()):
+            if ((c or {}).get("author") or {}).get("login") in mine:
+                continue
+            found |= {int(m) for m in re.findall(
+                r"#([0-9]+)\b", self.closing.blank_code(
+                    (c or {}).get("body") or ""))}
+        for item in ((issue.get("timelineItems") or {}).get("nodes") or ()):
+            source = (item or {}).get("source") or {}
+            if isinstance(source.get("number"), int):
+                found.add(source["number"])
+        found.discard(number)
+        return found
+
+    def fixes_how(self, pr, number, linked):
+        """How pull request `pr` fixes the nightly's issue `number`, for
+        the dispatch comment, or None. Without `fixes_named` only
+        closing it counts (designs/0028 §3); with it, naming it or
+        closing an issue linked with it does too (designs/0048 §4)."""
+        closed = self.closed_by(pr)
+        if number in closed:
+            return "closes #%d" % number
+        if not self.cfg["fixes_named"]:
+            return None
+        if self.names(pr, number):
+            return "names #%d" % number
+        both = sorted(closed & linked)
+        if both:
+            return "closes #%d, linked with #%d" % (both[0], number)
+        return None
 
     def fixes(self, number):
-        """(whether the issue is open, the open pull requests that close
-        it, [(number, mergedAt)] of those merged that close it)."""
+        """(whether the issue is open, the open pull requests that fix
+        it, [(number, mergedAt, how)] of those merged that fix it)."""
         owner, _, name = self.repo.partition("/")
         status, doc = github.graphql(self.token, OPEN_PRS_QUERY, {
             "o": owner, "r": name, "n": number}, call=self.call)
         try:
             repo = doc["data"]["repository"]
-            is_open = (repo["issue"] or {}).get("state") == "OPEN"
+            issue = repo["issue"] or {}
+            is_open = issue.get("state") == "OPEN"
             open_prs = repo["open"]["nodes"]
             merged = repo["merged"]["nodes"]
         except (KeyError, TypeError):
             raise RuntimeError("GitHub answered %s for the pull requests "
                                "that close #%d" % (status, number)) from None
+        linked = self.linked(issue, number) if self.cfg["fixes_named"] \
+            else set()
+        done = []
+        for p in merged:
+            how = self.fixes_how(p, number, linked) if p.get("mergedAt") \
+                else None
+            if how:
+                done.append((p["number"], p["mergedAt"], how))
         return (is_open,
-                [p["number"] for p in open_prs if self.closes(p, number)],
-                [(p["number"], p.get("mergedAt")) for p in merged
-                 if p.get("mergedAt") and self.closes(p, number)])
+                [p["number"] for p in open_prs
+                 if self.fixes_how(p, number, linked)], done)
+
+    def expected_end(self, runs):
+        """With `defer_until`, when a run started now should end: now
+        plus the median length of the last DURATION_RUNS completed runs,
+        rounded up to DEFER_ROUND; None without any."""
+        lengths = []
+        for r in runs:
+            if r.get("status") != "completed":
+                continue
+            try:
+                start = parse_time(r.get("run_started_at")
+                                   or r["created_at"])
+                end = parse_time(r["updated_at"])
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+            if end > start:
+                lengths.append((end - start).total_seconds())
+            if len(lengths) == DURATION_RUNS:
+                break
+        if not lengths:
+            return None
+        until = self.now.timestamp() + statistics.median(lengths)
+        step = DEFER_ROUND.total_seconds()
+        return datetime.datetime.fromtimestamp(
+            math.ceil(until / step) * step, datetime.timezone.utc)
 
     def dispatch(self, saved, runs, newest, merged):
         """Dispatch the workflow again when nothing of it runs and a fix
@@ -648,10 +760,10 @@ class Tick:
         why = None
         started = parse_time(newest.get("run_started_at")
                              or newest["created_at"])
-        for pr, when in sorted(merged, key=lambda m: m[1]):
+        for pr, when, how in sorted(merged, key=lambda m: m[1]):
             if parse_time(when) > started:
-                why = "#%d, which closes #%d, merged at %s, after run %s " \
-                    "started" % (pr, number, stamp(parse_time(when)),
+                why = "#%d, which %s, merged at %s, after run %s " \
+                    "started" % (pr, how, stamp(parse_time(when)),
                                  newest["id"])
                 break
         retry = datetime.timedelta(hours=self.cfg["retry_hours"])
@@ -679,10 +791,16 @@ class Tick:
             self.would, self.workflow, self.main, head[:10], why,
             "; first: %s" % first if first else ""))
         saved["dispatched"] = {"at": iso(self.now), "sha": head, "why": why}
-        self.comment(number, "Ran the nightly again on `%s` at %s: %s.%s"
+        until = self.expected_end(runs) if self.cfg["defer_until"] else None
+        defer = ""
+        if until is not None:
+            # The router holds the issue until then (designs/0048 §5).
+            saved["dispatched"]["until"] = iso(until)
+            defer = "\n\nDefer-until: %s" % stamp(until)
+        self.comment(number, "Ran the nightly again on `%s` at %s: %s.%s%s"
                      % (self.main, head[:10], why,
                         " The steps that failed last go first: `%s`."
-                        % first if first else ""))
+                        % first if first else "", defer))
 
     def takes_first(self):
         """Whether the workflow's file declares the `first` input."""

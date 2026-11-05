@@ -98,7 +98,8 @@ STATS_WATCH_FIGURES = {
 # forge-nightly (designs/0028): a red nightly is a red main.
 NIGHTLY = {"workflow": str, "job": str, "owners": dict, "labels": list,
            "retry_hours": int, "escalate_hours": list, "as": str,
-           "tell_owner": str, "release_jobs": list}
+           "tell_owner": str, "release_jobs": list, "fixes_named": bool,
+           "defer_until": bool}
 # A workflow is named by its file, which is read for its inputs.
 WORKFLOW_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
