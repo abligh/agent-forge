@@ -3572,17 +3572,39 @@ def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
     return first or (None, "", pr["headRefOid"])
 
 
-def own_green_wait(pr, approval, github, cache):
+def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
+                   run=sh):
     """Why `pr` isn't a candidate yet under merge.own_head_green, or
     None: checks.context isn't green (success) on the commit its
-    approval names, nor on its head. Statuses are read once a tick per
-    commit, through `cache`. A pending, red or absent context holds the
-    pull request: nothing merges, boards a batch or a train, or is
-    predicted until the build check has passed on it."""
+    approval names, nor on its head, nor (given `repo` and `main_tip`)
+    on the commit before each merge of the default branch into the
+    head, back to the first commit that isn't one, as for an instance
+    (`instance_verdict`). A merge of the default branch changes nothing
+    of the pull request's own: without that, a head the Merger has just
+    updated, whose build check hasn't yet posted (a batch member's
+    `covered by batch` green comes a minute later), would be held for
+    that minute, leave its batch, and the batch would be recut, every
+    member updated and built again. The merge itself still waits for
+    the context on the head it merges (`decide`). Statuses are read
+    once a tick per commit, through `cache`. A pending, red or absent
+    context holds the pull request: nothing merges, boards a batch or a
+    train, or is predicted until the build check has passed on it."""
     approved = ((approval or {}).get("commit") or {}).get("oid")
+    head = pr.get("headRefOid")
+    shas = [approved, head]
+    if repo is not None and main_tip and head:
+        commit, depth = head, 0
+        while depth < GATE_DEPTH:
+            depth += 1
+            parents = git(repo, "rev-list", "--parents", "-n", "1", commit,
+                          run=run).stdout.split()
+            if len(parents) != 3 or not is_ancestor(repo, parents[2],
+                                                    main_tip, run):
+                break
+            commit = parents[1]
+            shas.append(commit)
     seen = []
-    for sha in dict.fromkeys(s for s in (approved, pr.get("headRefOid"))
-                             if s):
+    for sha in dict.fromkeys(s for s in shas if s):
         if sha not in cache:
             cache[sha] = status_state(github.api(
                 "repos/%s/commits/%s/statuses?per_page=100"
@@ -3590,6 +3612,9 @@ def own_green_wait(pr, approval, github, cache):
         if cache[sha] == "success":
             return None
         seen.append((sha, cache[sha]))
+    if len(seen) > 2:
+        # The reason names the head (or the approved commit), as before.
+        seen = seen[:2]
     sha, state = seen[-1] if seen else ("", None)
     return GREEN_WAIT_REASON % (STATUS_CONTEXT, state or "absent",
                                 sha[:10] or "its head")
@@ -5410,7 +5435,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     greens = {}
     if OWN_HEAD_GREEN:
         for pr in list(candidates):
-            why = own_green_wait(pr, approvals[pr["number"]], github, greens)
+            why = own_green_wait(pr, approvals[pr["number"]], github, greens,
+                                 repo, main_tip, run)
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
@@ -5941,7 +5967,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             layers_of = (lambda pr: ready_layers(
                 repo, pr, prs, open_numbers, when, said, run, regenerated,
                 rules, (lambda layer, approval: own_green_wait(
-                    layer, approval, github, greens))
+                    layer, approval, github, greens, repo, main_tip, run))
                 if OWN_HEAD_GREEN else None)) if AHEAD_STACKS else None
             cut = lambda before: cut_trains(
                 repo, main_tip, train_carriages(ahead_queue, layers_of),

@@ -760,8 +760,12 @@ only once `checks.context` is green on the commit its approval names
 or on its head. While it is pending, red or absent on both, the pull
 request is held, with the reason, and the queue moves past it. A head
 the Merger made by merging the default branch into an approved one is
-judged by the approved commit, so an update doesn't hold it; the
-merge itself still waits for the context on the head it merges. This
+judged by the approved commit, and by the commit before each merge of
+the default branch into it, back to the first that isn't one, so an
+update doesn't hold it: a batch member updated again, whose
+`covered by batch` green the build check posts a minute later, stays
+in its batch rather than recutting it. The merge itself still waits
+for the context on the head it merges. This
 makes the build check the gate even for a reviewer who approves
 before it has run, so agents can push without running the whole
 check locally. On by default; `false` judges eligibility by the
