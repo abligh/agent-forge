@@ -65,7 +65,7 @@ AGENT = dict(APP, session_name=str, twins=list, kind=str, reviews=list,
              away=str, areas=dict, offer=bool)
 # An agent's areas (designs/0030): what is hers, for a rules module.
 AREAS = {"paths": list, "labels": list}
-IDENTITY = {"unattributed_domain": str, "unattributed_name": str}
+IDENTITY = {"unattributed_domain": (str, list), "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list, "crontabs": dict}
 # forge-memory-sync, -check and -trim (agent_forge/memory.py).
 MEMORY = {"dir": str, "remote": str, "git_dir": str, "seed_dir": str,
@@ -350,6 +350,22 @@ def _fields(where, entry, allowed, problems):
     return True
 
 
+def _check_identity(ident, problems):
+    """identity.unattributed_domain: one "@domain", or a list of them."""
+    if not isinstance(ident, dict):
+        return
+    domains = ident.get("unattributed_domain")
+    if isinstance(domains, str):
+        domains = [domains]
+    if isinstance(domains, list):
+        for d in domains:
+            if not (isinstance(d, str) and d.startswith("@") and len(d) > 1
+                    and not any(c.isspace() for c in d)):
+                problems.append("identity.unattributed_domain: %r is not an "
+                                "email domain such as \"@host.example.org\""
+                                % (d,))
+
+
 def _check_memory(memory, present, problems):
     """The `memory` section: where the agents' memories are shared."""
     if not _fields("memory", memory, MEMORY, problems) or not present:
@@ -539,6 +555,7 @@ def check(data):
         problems.append("repo %r must be owner/name" % data["repo"])
     _fields("naming", data.get("naming", {}), NAMING, problems)
     _fields("identity", data.get("identity", {}), IDENTITY, problems)
+    _check_identity(data.get("identity", {}), problems)
     router = data.get("router", {})
     if _fields("router", router, ROUTER, problems):
         if isinstance(router.get("idle_offer"), dict):

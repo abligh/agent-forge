@@ -53,6 +53,16 @@ class Check(unittest.TestCase):
         data["merge"]["test_ahead"] = {"spare_slots_only": "yes"}
         self.assertEqual(len(config.check(data)), 1)
 
+    def test_unattributed_domain_is_one_domain_or_a_list(self):
+        data = example()
+        data["identity"]["unattributed_domain"] = ["@a.example", "@b"]
+        self.assertEqual(config.check(data), [])
+        data["identity"]["unattributed_domain"] = "@a.example"
+        self.assertEqual(config.check(data), [])
+        for bad in (["a.example"], ["@"], ["@a b"], [3], "nope"):
+            data["identity"]["unattributed_domain"] = bad
+            self.assertEqual(len(config.check(data)), 1, bad)
+
     def test_twins_are_session_names(self):
         data = example()
         data["agents"]["LeadDev"]["twins"] = ["WidgetLeadDev2"]
