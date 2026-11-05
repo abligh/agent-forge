@@ -96,6 +96,7 @@ class FakeGitHub:
         self.jobs = {}
         self.issues = []
         self.open_prs, self.merged_prs = [], []
+        self.comments, self.referenced_by = [], []
         self.workflow = WORKFLOW
         self.fail = None
         self.writes = []
@@ -112,7 +113,11 @@ class FakeGitHub:
             issue = next((i for i in self.issues if i["number"] == 101),
                          {"state": "open"})
             return 200, {"data": {"repository": {
-                "issue": {"state": issue["state"].upper()},
+                "issue": {"state": issue["state"].upper(),
+                          "comments": {"nodes": self.comments},
+                          "timelineItems": {"nodes": [
+                              {"source": {"number": n}}
+                              for n in self.referenced_by]}},
                 "open": {"nodes": self.open_prs},
                 "merged": {"nodes": self.merged_prs}}}}
         assert path.startswith(repo), path
@@ -445,6 +450,107 @@ class Main(unittest.TestCase):
         comment = self.writes("POST", "/comments")[-1][2]["body"]
         self.assertIn("#6, which closes #101, merged at 2026-10-23T11:30Z, "
                       "after run 2 started", comment)
+
+    def test_fixes_named_a_fix_that_names_it_or_closes_a_linked_issue(self):
+        self.data["nightly"]["fixes_named"] = True
+        self.save_config()
+        self.red_night()
+        self.main()
+        # #77 is named by an agent; #55 by the tool's own commit list,
+        # which doesn't link it; #88 names the nightly's issue itself.
+        self.gh.comments = [
+            {"author": {"login": "uidevwidgetagent"},
+             "body": "The cause is #77."},
+            {"author": {"login": "mergerwidgetagent"},
+             "body": "- `1111111111` Something (#55)"}]
+        self.gh.referenced_by = [88]
+        self.gh.open_prs = [
+            pr(5, body="For #101: wait longer"), pr(6, body="Fixes #77"),
+            pr(7, body="Fixes #88"), pr(8, body="Fixes #55"),
+            pr(9, body="See #1010"), pr(10, body="`#101` in code")]
+        self.gh.merged_prs = [
+            pr(6, body="Fixes #77", merged=stamp(NOW - HOUR / 2))]
+        self.main(now=NOW + datetime.timedelta(minutes=5))
+        self.assertEqual(self.saved()["fixes"], [5, 6, 7])
+        comment = self.writes("POST", "/comments")[-1][2]["body"]
+        self.assertIn("#6, which closes #77, linked with #101, merged at "
+                      "2026-10-23T11:30Z", comment)
+
+    def test_without_fixes_named_only_closing_it_counts(self):
+        self.red_night()
+        self.main()
+        self.gh.comments = [{"author": {"login": "uidevwidgetagent"},
+                             "body": "The cause is #77."}]
+        self.gh.open_prs = [pr(5, body="For #101"), pr(6, body="Fixes #77")]
+        self.gh.merged_prs = [
+            pr(6, body="Fixes #77", merged=stamp(NOW - HOUR / 2))]
+        self.main(now=NOW + datetime.timedelta(minutes=5))
+        self.assertEqual(self.saved()["fixes"], [])
+        self.assertEqual(self.writes("POST", "/dispatches"), [])
+
+    def test_defer_until_at_the_runs_expected_end(self):
+        self.data["nightly"]["defer_until"] = True
+        self.save_config()
+        self.red_night()
+        # Run lengths 1 h (run 2), 1 h (run 1) and 3 h 10 min: median 1 h.
+        self.gh.runs.append(run(0, GREEN_SHA, "success",
+                                ended=NOW - 30 * HOUR,
+                                started=NOW - 33 * HOUR - HOUR / 6))
+        self.main(now=NOW)
+        later = NOW + HOUR + datetime.timedelta(minutes=7)
+        self.main(now=later)
+        comment = self.writes("POST", "/comments")[-1][2]["body"]
+        # 13:07 + 1 h = 14:07, rounded up to 14:15; the router reads it
+        # as markers.parse_time does.
+        line = "\n\nDefer-until: 2026-10-23T14:15Z\n\n"
+        self.assertIn(line, comment)
+        from agent_forge import markers
+        self.assertEqual(markers.parse_time(markers.latest_deferral(
+            [("", comment)])), datetime.datetime(
+                2026, 10, 23, 14, 15, tzinfo=datetime.timezone.utc))
+        self.assertEqual(self.saved()["dispatched"]["until"],
+                         "2026-10-23T14:15:00Z")
+
+    def test_an_early_red_supersedes_the_deferral(self):
+        self.data["nightly"]["defer_until"] = True
+        self.save_config()
+        self.red_night()
+        self.main(now=NOW)
+        later = NOW + HOUR + datetime.timedelta(minutes=7)
+        self.main(now=later)
+        self.assertEqual(self.saved()["dispatched"]["until"],
+                         "2026-10-23T14:15:00Z")
+        # Its run ends red at 13:40, before 14:15.
+        ended = NOW + HOUR + datetime.timedelta(minutes=40)
+        self.gh.runs.insert(0, run(3, NEXT_SHA, event="workflow_dispatch",
+                                   ended=ended, started=later))
+        self.gh.jobs[3] = red_jobs()
+        self.main(now=ended + datetime.timedelta(minutes=2))
+        comments = [w[2]["body"] for w in self.writes("POST", "/comments")]
+        dispatch, red = comments[-2], comments[-1]
+        self.assertTrue(red.startswith("Red again."), red)
+        self.assertIn("\n\nDefer-until: 2026-10-23T13:42Z\n\n", red)
+        # The issue's newest line is now, so rule 15 holds it no more.
+        from agent_forge import markers
+        self.assertIsNone(markers.deferred(
+            [("1", dispatch), ("2", red)],
+            ended + datetime.timedelta(minutes=3)))
+        # A red after the expected end adds nothing.
+        self.gh.runs.insert(0, run(4, NEXT_SHA, event="workflow_dispatch",
+                                   ended=NOW + 3 * HOUR,
+                                   started=NOW + 2 * HOUR))
+        self.gh.jobs[4] = red_jobs()
+        self.main(now=NOW + 3 * HOUR + datetime.timedelta(minutes=2))
+        red = self.writes("POST", "/comments")[-1][2]["body"]
+        self.assertTrue(red.startswith("Red again."), red)
+        self.assertNotIn("Defer-until", red)
+
+    def test_without_defer_until_no_line(self):
+        self.red_night()
+        self.main(now=NOW + HOUR)
+        comment = self.writes("POST", "/comments")[-1][2]["body"]
+        self.assertNotIn("Defer-until", comment)
+        self.assertNotIn("until", self.saved()["dispatched"])
 
     def test_without_the_first_input_it_is_dispatched_plain(self):
         self.gh.workflow = WORKFLOW.replace("      first:", "      other:")

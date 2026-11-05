@@ -359,7 +359,8 @@ class Check(unittest.TestCase):
             "owners": {"test-slow": "UIDev", "vet-*": "Helper"},
             "labels": ["bug"], "retry_hours": 3, "escalate_hours": [24, 48],
             "tell_owner": "owner@example.org", "as": "Merger",
-            "release_jobs": ["release"]}
+            "release_jobs": ["release"], "fixes_named": True,
+            "defer_until": False}
         self.assertEqual(config.check(data), [])
         data["nightly"]["stats_figure"] = {}
         data["nightly"].update(
@@ -384,6 +385,11 @@ class Check(unittest.TestCase):
             with self.subTest(jobs=jobs):
                 data["nightly"] = {"workflow": "ci.yaml", "job": "j",
                                    "release_jobs": jobs}
+                self.assertEqual(len(config.check(data)), 1)
+        for key in ("fixes_named", "defer_until"):
+            with self.subTest(key=key):
+                data["nightly"] = {"workflow": "ci.yaml", "job": "j",
+                                   key: "yes"}
                 self.assertEqual(len(config.check(data)), 1)
         for hours in ([], [1, 2, 3], [0], [24, 24], [True]):
             with self.subTest(hours=hours):

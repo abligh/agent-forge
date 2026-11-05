@@ -226,6 +226,13 @@ class Rule20(RedFirstCase):
                          router.Decision(40, "LeadDev", 20, RED,
                                          NIGHTLY_LINE))
 
+    def test_not_while_a_rerun_is_expected_to_run(self):
+        item = red_issue()
+        item["redBuild"]["rerun_until"] = "2026-10-09T15:00:00Z"
+        self.assertNotEqual(self.decided(item).rule, 20)
+        item["redBuild"]["rerun_until"] = "2026-10-09T13:45:00Z"
+        self.assertEqual(self.decided(item).rule, 20)
+
     def test_the_default_branch(self):
         got = self.decided(red_issue(what="the default branch"))
         self.assertTrue(got.line.startswith(
@@ -339,6 +346,14 @@ class Rule21(RedFirstCase):
         # Nothing else is offered to her that run.
         self.assertEqual([(d.agent, d.rule) for d in got], [("UIDev", 21)])
 
+    def test_not_while_a_rerun_is_expected_to_run(self):
+        item = red_issue()
+        item["redBuild"]["rerun_until"] = "2026-10-09T15:00:00Z"
+        self.assertEqual(self.fallbacks(issues=[item]), [])
+        item["redBuild"]["rerun_until"] = "2026-10-09T13:45:00Z"
+        self.assertEqual([d.agent for d in self.fallbacks(issues=[item])],
+                         ["UIDev"])
+
     def test_the_name_breaks_a_tie(self):
         got = self.fallbacks(directory=listing(
             entry("WidgetUIDev"), entry("Helper")))
@@ -448,6 +463,27 @@ class RedBuilds(unittest.TestCase):
         self.assertEqual(self.found(), {41: ("the default branch", None)})
         self.write("pr-check", "state.json", {"main_red": {"issue": True}})
         self.assertEqual(self.found(), {})
+
+    def rerun(self):
+        return rules.nightly_rerun(self.project, self.env, self.now)
+
+    def test_a_rerun_holds_until_its_expected_end(self):
+        data = {"at": "2026-10-09T13:55:00Z", "issue": 40,
+                "issue_open": True, "opened": "2026-10-09T05:00:00Z",
+                "red": {"ended": "2026-10-09T05:40:00Z"},
+                "dispatched": {"at": "2026-10-09T09:40:00Z",
+                               "until": "2026-10-09T15:00:00Z"}}
+        self.write("nightly", "nightly.json", data)
+        self.assertEqual(self.rerun(), (40, "2026-10-09T15:00:00Z"))
+        # A red run that ended since the dispatch ends the hold.
+        data["red"]["ended"] = "2026-10-09T13:00:00Z"
+        self.write("nightly", "nightly.json", data)
+        self.assertIsNone(self.rerun())
+        # So does a dispatch without `until` (defer_until off).
+        data["red"]["ended"] = "2026-10-09T05:40:00Z"
+        del data["dispatched"]["until"]
+        self.write("nightly", "nightly.json", data)
+        self.assertIsNone(self.rerun())
 
     def test_the_lookup(self):
         # The lookup reads the file as of now.
