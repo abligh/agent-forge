@@ -81,6 +81,8 @@ class CronRun(unittest.TestCase):
         self.assertEqual(self.run_tool("report", "x", "y"), 0)
         log = self.log()
         self.assertIn("at %s\n" % head, log)
+        self.assertRegex(log, r"\nwaited=\d+s\n")
+        self.assertRegex(log, r"\nended \S+ ran=\d+s\nexit=0\n$")
         self.assertIn("cwd=%s\n" % self.cron, log)
         self.assertIn("args=x y\n", log)
         self.assertIn("token=none\n", log)

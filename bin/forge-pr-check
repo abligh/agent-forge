@@ -39,8 +39,10 @@ its one line names the pull request, head, start and process (`#7
 own worktree (`wt`, `wt-N`) and its own build caches (`checks.caches`,
 below), so two checks never share a checkout or wait on each other's
 cache lock. A tick starts the oldest waiting head that no slot is
-running, in the first free slot, and starts nothing when every slot is
-held. The kernel drops a lock however its holder dies, so a killed
+running, in the first free slot, and goes on until no slot is free or
+no head can start, so the start rate isn't the tick rate: at one start
+a tick, a queue of 66 heads waited over two hours with slots idle. It
+starts nothing when every slot is held. The kernel drops a lock however its holder dies, so a killed
 worker is never reported as running.
 
 **Oldest-waiting first.** A head waits from when a tick first sees it.
@@ -3587,168 +3589,184 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     first_pr = merger_first(merger_dir, when)
     ahead = (merger_ahead(merger_dir, when, checkout)
              if TEST_AHEAD and merger_dir else [])
-    predicted = pick = fast = None
-    held = {}
-    with state_lock(state_dir):
-        state = load(state_dir)
-        cheap = cheap_heads(state) if lane else {}
-        # A head whose own prediction, the same tree, is running waits
-        # for its verdict rather than checking the tree a second time.
-        twins = twin_heads(state, fields.values(), checkout, run) \
-            if TEST_AHEAD else {}
-        # And one in the Merger's batch waits for its top (designs/0032).
-        twins.update(batch_heads(state, batch, checkout, busy, when, run))
-        if fresh:
-            held = held_heads(state, head_of_main[0], busy, when, first_pr,
-                              cheap)
-            # Why each held head waits, kept with it; dropped once it
-            # doesn't.
-            for sha, entry in state["waiting"].items():
-                if sha in held:
-                    entry["held"] = held[sha]
-                else:
-                    entry.pop("held", None)
-            save(state_dir, state)
-        # The default branch goes first while a head runs a step only
-        # because its record is stale.
-        urgent = fresh and any(w.get("stale_steps")
-                               and w.get("lane_base") == head_of_main[0]
-                               for w in state["waiting"].values()
-                               if not w.get("main"))
-        if lane_free:
-            fast = lane_head(state, cheap, set(busy) | set(twins), when)
-            if fast is not None:
-                state["waiting"][fast[0]]["started"] = iso(when)
+    # Fill every free slot, not one per tick: a tick's start rate was the
+    # queue's ceiling (see the module docstring). What a pass starts is
+    # as good as running to the next pass; the listing above isn't redone.
+    first_pass = True
+    while free or lane_free:
+        predicted = pick = fast = None
+        held = {}
+        with state_lock(state_dir):
+            state = load(state_dir)
+            cheap = cheap_heads(state) if lane else {}
+            # A head whose own prediction, the same tree, is running waits
+            # for its verdict rather than checking the tree a second time.
+            twins = twin_heads(state, fields.values(), checkout, run) \
+                if TEST_AHEAD else {}
+            # And one in the Merger's batch waits for its top (designs/0032).
+            twins.update(batch_heads(state, batch, checkout, busy, when, run))
+            if fresh:
+                held = held_heads(state, head_of_main[0], busy, when, first_pr,
+                                  cheap)
+                # Why each held head waits, kept with it; dropped once it
+                # doesn't.
+                for sha, entry in state["waiting"].items():
+                    if sha in held:
+                        entry["held"] = held[sha]
+                    else:
+                        entry.pop("held", None)
                 save(state_dir, state)
-        # What the lane just took is as good as running.
-        taken = set(busy) | set(twins) | ({fast[0]} if fast else set())
-        # A head of the Merger's own pull request held for its batch's
-        # top: the top's run is the one the next merge waits on, so it
-        # goes first, as the head itself would (2026-10-29: #5586 waited
-        # 32 minutes while overdue heads took every free slot).
-        front_held = first_pr is not None and any(
-            state["waiting"].get(s, {}).get("pr") == first_pr
-            and not state["waiting"].get(s, {}).get("main")
-            for s in twins)
-        if free:
-            pick = next_head(state, taken | set(held), first_pr, when,
-                             cheap, urgent) if fresh else \
-                next_head(state, taken, first_pr, when, cheap)
-            if TEST_AHEAD:
-                forget_ahead(state, ahead)
-                # The Merger's predictions go before an ordinary pick,
-                # but not before a head that has waited max_wait, nor
-                # before the default branch's run once it has waited
-                # depends_minutes or while heads wait on its record
-                # (urgent, or held). Nor before a head put first on
-                # purpose (labels.urgent, checks.first_authors), nor at
-                # all while a head of the Merger's own pull request waits
-                # unstarted: every prediction assumes it merges first,
-                # so none of them can merge anything before it has its
-                # own verdict, and a pick put before it would otherwise
-                # let predictions starve both. With spare_slots_only
-                # (designs/0014), never before an ordinary pick.
-                if front_held or not merger_head_waits(
-                        state, first_pr, taken, when) and (
-                        pick is None or not SPARE_ONLY and not (
-                        pick[1] == first_pr
-                        or overdue(state["waiting"][pick[0]], when)
-                        or put_first(state["waiting"][pick[0]])
-                        or (pick[1] == 0 and (urgent or held or main_due(
-                            state["waiting"][pick[0]], when))))):
-                    # A later batch's top only in a slot no head
-                    # wants (designs/0035 part 2). A held head's tree
-                    # isn't being checked: it waits for the prediction,
-                    # so counting it would leave both waiting.
-                    predicted = next_ahead(
-                        state, ahead, taken, when,
-                        busy_trees(taken - set(twins), checkout, run), batch,
-                        merger_later(merger_dir, when, checkout)
-                        if pick is None else ())
-            if predicted is not None:
-                state.setdefault("ahead_started", {})[predicted[0]] = \
-                    iso(when)
-                save(state_dir, state)
-            elif pick is not None:
-                state["waiting"][pick[0]]["started"] = iso(when)
-                save(state_dir, state)
-            elif TEST_AHEAD:
-                save(state_dir, state)
-        starting = sum(1 for s, w in state["waiting"].items()
-                       if s not in taken and just_started(w, when))
-    for sha in sorted(held, key=lambda s: order(state["waiting"], s)):
-        out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
-                                 held[sha]))
-    for sha in sorted(twins, key=lambda s: order(state["waiting"], s)):
-        out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
-                                 twins[sha]))
-    if fast is not None:
-        sha, pr = fast
-        spawn(state_dir, sha, pr, post is not None, LANE, checkout)
-        out("STARTED #%d %s in the fast lane, its steps ~%ds here; "
-            "%d waiting" % (pr, sha[:10], cheap[sha], len(queued - taken)))
-    if not free:
-        return 0
-    if predicted is not None:
-        sha, pr = predicted
-        spawn(state_dir, sha, pr, post is not None, free[0], checkout, True)
-        out("STARTED-AHEAD #%d %s%s, the Merger's prediction; %d waiting"
-            % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
-               len(queued - taken)))
-        return 0
-    if pick is None:
-        warming = warm_slot(state, free, head_of_main, checkout, when, run) \
-            if fast is None and not starting and not live_heads(
-                state, taken, when) else None
-        if warming is not None:
-            slot, cached, changed = warming
-            with state_lock(state_dir):
-                state = load(state_dir)
-                state.setdefault("warm", {})[str(slot)] = {
-                    "sha": head_of_main[0], "at": iso(when), "started": True}
-                save(state_dir, state)
-            spawn(state_dir, head_of_main[0], 0, post is not None, slot,
-                  checkout, main=True, warm=True)
-            log(state_dir, "SLOT-WARM %s %s: cache at %s, %s changed %s"
-                % (slot_label(slot), head_of_main[0][:10],
-                   cached[:10] if cached else "an unknown head", MAIN,
-                   ", ".join(changed[:5]) + (" and %d more"
-                                             % (len(changed) - 5)
-                                             if len(changed) > 5 else "")
-                   if changed else "(unknown)"), when, out)
+            # The default branch goes first while a head runs a step only
+            # because its record is stale.
+            urgent = fresh and any(w.get("stale_steps")
+                                   and w.get("lane_base") == head_of_main[0]
+                                   for w in state["waiting"].values()
+                                   if not w.get("main"))
+            if lane_free:
+                fast = lane_head(state, cheap, set(busy) | set(twins), when)
+                if fast is not None:
+                    state["waiting"][fast[0]]["started"] = iso(when)
+                    save(state_dir, state)
+            # What the lane just took is as good as running.
+            taken = set(busy) | set(twins) | ({fast[0]} if fast else set())
+            # A head of the Merger's own pull request held for its batch's
+            # top: the top's run is the one the next merge waits on, so it
+            # goes first, as the head itself would (2026-10-29: #5586 waited
+            # 32 minutes while overdue heads took every free slot).
+            front_held = first_pr is not None and any(
+                state["waiting"].get(s, {}).get("pr") == first_pr
+                and not state["waiting"].get(s, {}).get("main")
+                for s in twins)
+            if free:
+                pick = next_head(state, taken | set(held), first_pr, when,
+                                 cheap, urgent) if fresh else \
+                    next_head(state, taken, first_pr, when, cheap)
+                if TEST_AHEAD:
+                    forget_ahead(state, ahead)
+                    # The Merger's predictions go before an ordinary pick,
+                    # but not before a head that has waited max_wait, nor
+                    # before the default branch's run once it has waited
+                    # depends_minutes or while heads wait on its record
+                    # (urgent, or held). Nor before a head put first on
+                    # purpose (labels.urgent, checks.first_authors), nor at
+                    # all while a head of the Merger's own pull request waits
+                    # unstarted: every prediction assumes it merges first,
+                    # so none of them can merge anything before it has its
+                    # own verdict, and a pick put before it would otherwise
+                    # let predictions starve both. With spare_slots_only
+                    # (designs/0014), never before an ordinary pick.
+                    if front_held or not merger_head_waits(
+                            state, first_pr, taken, when) and (
+                            pick is None or not SPARE_ONLY and not (
+                            pick[1] == first_pr
+                            or overdue(state["waiting"][pick[0]], when)
+                            or put_first(state["waiting"][pick[0]])
+                            or (pick[1] == 0 and (urgent or held or main_due(
+                                state["waiting"][pick[0]], when))))):
+                        # A later batch's top only in a slot no head
+                        # wants (designs/0035 part 2). A held head's tree
+                        # isn't being checked: it waits for the prediction,
+                        # so counting it would leave both waiting.
+                        predicted = next_ahead(
+                            state, ahead, taken, when,
+                            busy_trees(taken - set(twins), checkout, run), batch,
+                            merger_later(merger_dir, when, checkout)
+                            if pick is None else ())
+                if predicted is not None:
+                    state.setdefault("ahead_started", {})[predicted[0]] = \
+                        iso(when)
+                    save(state_dir, state)
+                elif pick is not None:
+                    state["waiting"][pick[0]]["started"] = iso(when)
+                    save(state_dir, state)
+                elif TEST_AHEAD:
+                    save(state_dir, state)
+            starting = sum(1 for s, w in state["waiting"].items()
+                           if s not in taken and just_started(w, when))
+        if first_pass:
+            for sha in sorted(held, key=lambda s: order(state["waiting"], s)):
+                out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
+                                         held[sha]))
+            for sha in sorted(twins, key=lambda s: order(state["waiting"], s)):
+                out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
+                                         twins[sha]))
+        first_pass = False
+        if fast is not None:
+            sha, pr = fast
+            spawn(state_dir, sha, pr, post is not None, LANE, checkout)
+            out("STARTED #%d %s in the fast lane, its steps ~%ds here; "
+                "%d waiting" % (pr, sha[:10], cheap[sha], len(queued - taken)))
+            busy.add(sha)
+            lane_free = False
+        if not free:
             return 0
-        # A start in the lane has said what this tick did.
-        if fast is None and starting:
-            out("STARTING: %d just started, not yet running; %d waiting"
-                % (starting, len(queued - taken) - starting))
-        elif fast is None and len(free) == slots and (lane_free or not lane) \
-                and not held:
-            out("IDLE: no open head is waiting" if not queued else
-                "IDLE: %d waiting, each given up on after %d failures"
-                % (len(queued), MAX_ERRORS))
-        return 0
-    sha, pr = pick
-    if pr == 0:
-        spawn(state_dir, sha, pr, post is not None, free[0], checkout,
-              main=True)
-        out("STARTED %s %s%s, every step%s; %d waiting"
-            % (MAIN, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
-               " traced" if DEPENDS else "",
-               len(queued - taken) - 1))
-        return 0
-    if checkout:
-        spawn(state_dir, sha, pr, post is not None, free[0], checkout)
-    else:
-        spawn(state_dir, sha, pr, post is not None, free[0])
-    out("STARTED #%d %s%s; %d waiting%s"
-        % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
-           len(queued - taken) - 1,
-           ", first: the Merger waits on it" if pr == first_pr else
-           ", first: it is approved"
-           if state["waiting"].get(sha, {}).get("approved") else
-           ", first: it has waited %d minutes"
-           % (MAX_WAIT.total_seconds() // 60)
-           if overdue(state["waiting"].get(sha, {}), when) else ""))
+        if predicted is not None:
+            sha, pr = predicted
+            spawn(state_dir, sha, pr, post is not None, free[0], checkout, True)
+            out("STARTED-AHEAD #%d %s%s, the Merger's prediction; %d waiting"
+                % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
+                   len(queued - taken)))
+            busy.add(sha)
+            # So the next pass holds a head of the same tree for it.
+            fields[free.pop(0)] = (pr, sha, iso(when), None, True)
+            continue
+        if pick is None:
+            warming = warm_slot(state, free, head_of_main, checkout, when, run) \
+                if fast is None and not starting and not live_heads(
+                    state, taken, when) else None
+            if warming is not None:
+                slot, cached, changed = warming
+                with state_lock(state_dir):
+                    state = load(state_dir)
+                    state.setdefault("warm", {})[str(slot)] = {
+                        "sha": head_of_main[0], "at": iso(when), "started": True}
+                    save(state_dir, state)
+                spawn(state_dir, head_of_main[0], 0, post is not None, slot,
+                      checkout, main=True, warm=True)
+                log(state_dir, "SLOT-WARM %s %s: cache at %s, %s changed %s"
+                    % (slot_label(slot), head_of_main[0][:10],
+                       cached[:10] if cached else "an unknown head", MAIN,
+                       ", ".join(changed[:5]) + (" and %d more"
+                                                 % (len(changed) - 5)
+                                                 if len(changed) > 5 else "")
+                       if changed else "(unknown)"), when, out)
+                return 0
+            # A start in the lane has said what this tick did.
+            if fast is None and starting:
+                out("STARTING: %d just started, not yet running; %d waiting"
+                    % (starting, len(queued - taken) - starting))
+            elif fast is None and len(free) == slots and (lane_free or not lane) \
+                    and not held:
+                out("IDLE: no open head is waiting" if not queued else
+                    "IDLE: %d waiting, each given up on after %d failures"
+                    % (len(queued), MAX_ERRORS))
+            return 0
+        sha, pr = pick
+        if pr == 0:
+            spawn(state_dir, sha, pr, post is not None, free[0], checkout,
+                  main=True)
+            out("STARTED %s %s%s, every step%s; %d waiting"
+                % (MAIN, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
+                   " traced" if DEPENDS else "",
+                   len(queued - taken) - 1))
+            busy.add(sha)
+            free.pop(0)
+            continue
+        if checkout:
+            spawn(state_dir, sha, pr, post is not None, free[0], checkout)
+        else:
+            spawn(state_dir, sha, pr, post is not None, free[0])
+        out("STARTED #%d %s%s; %d waiting%s"
+            % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
+               len(queued - taken) - 1,
+               ", first: the Merger waits on it" if pr == first_pr else
+               ", first: it is approved"
+               if state["waiting"].get(sha, {}).get("approved") else
+               ", first: it has waited %d minutes"
+               % (MAX_WAIT.total_seconds() // 60)
+               if overdue(state["waiting"].get(sha, {}), when) else ""))
+        busy.add(sha)
+        free.pop(0)
     return 0
 
 

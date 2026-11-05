@@ -57,6 +57,11 @@ file, in the same modes, instead of its own. An old wrapper that holds
 the file exclusively for each whole job is simply waited for, and
 waits in turn.
 
+The header's time is when the job was launched, before any lock. Each
+run also logs `waited=<s>` for the locks and sync, when it starts the
+tool, and `ended <time> ran=<s>` before its `exit=` line, so how long a
+job held the checkout can be read from the log.
+
 The wait is bounded (`$FORGE_CRON_LOCK_WAIT_S`, default 300, one budget
 for every lock), shorter than any job's period, so a waiter gives up
 before its successor is launched rather than piling up behind a hung
@@ -245,7 +250,8 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
     log_path = os.path.join(logdir, name + ".log")
     key = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.realpath(repo).strip("/"))
     wanted = os.path.join(logdir, ".forge-cron.%s.sync-wanted" % key)
-    deadline = clock() + wait
+    begun = clock()
+    deadline = begun + wait
     header = "=== %s %s ===" % (now(), " ".join([tool] + args))
 
     log = open(log_path, "a")
@@ -328,11 +334,14 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
         # (a worker outlives its tick), so no part of the job runs on a
         # release other than the one it was started on.
         env[locks.INSTALL_LOCK_FD] = str(install_lock.fileno())
+        ready = clock()
+        write("waited=%ds" % (ready - begun))
         rc = subprocess.call([path] + args, cwd=repo, env=env, stdout=log,
                              stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                              close_fds=True, pass_fds=(install_lock.fileno(),))
         if rc < 0:
             rc = 128 - rc   # killed by a signal, as a shell reports it
+        write("ended %s ran=%ds" % (now(), clock() - ready))
         write("exit=%d" % rc)
         return rc
     finally:
