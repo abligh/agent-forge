@@ -132,11 +132,17 @@ opened; for the default branch, the issue's newest comment by the
 build check's poster, else its creation. It is **in hand** when an
 open pull request, by anyone, references it (as rule 15 reads a
 reference). It is **parked** when it has a quiet label or a label
-starting `Status:waiting-` (the labels' `status_prefix`). The
-`red builds` lookup reads the tools' state. Off without the key:
+starting `Status:waiting-` (the labels' `status_prefix`). It is
+**rerunning** while forge-nightly has dispatched a rerun with
+`nightly.defer_until` (designs/0048 §5), its expected end
+(`dispatched.until`) is still to come, and no red run has ended since
+the dispatch: nobody is woken to say there is nothing to do while it
+runs. The `red builds` lookup reads the tools' state. Off without the
+key:
 
 20. after rules 9-11 and 18, and before rule 12: an open red-build
-    issue with an owner (the item owner), not parked, not in hand, on
+    issue with an owner (the item owner), not parked, not in hand, not
+    rerunning, on
     which the owner hasn't commented since its red event: the owner's,
     "red builds go first", reminded as any turn. The event is the red
     event, so a new red run wakes her again; her comment ends it, and
@@ -206,7 +212,8 @@ rule 15 nor reported by rule 16.
 
 With `router.red_first` as well (designs/0039; off without either):
 
-21. an open red-build issue, not parked and not in hand, whose red
+21. an open red-build issue, not parked, not in hand and not
+    rerunning, whose red
     event is at least `red_first.fallback_hours` old and whose owner
     hasn't commented on it for as long: the idle developer (as rule 16
     reads one) idle longest, the name breaking a tie, other than its
@@ -1430,6 +1437,26 @@ def red_builds(project, environ=None, now=None):
     return found
 
 
+def nightly_rerun(project, environ=None, now=None):
+    """(the nightly's issue, when its rerun should end, as STAMP) while
+    forge-nightly has dispatched a rerun with `nightly.defer_until`
+    (designs/0048 §5) and no red run has ended since the dispatch;
+    None otherwise. Rules 20 and 21 hold the issue until then: nobody
+    is woken to say there is nothing to do while it runs."""
+    data = nightly.current(project, environ, now)
+    number = data.get("issue")
+    sent = data.get("dispatched")
+    if not data.get("issue_open") or not isinstance(number, int) \
+            or isinstance(number, bool) or not isinstance(sent, dict):
+        return None
+    at, until = as_stamp(sent.get("at")), as_stamp(sent.get("until"))
+    red = data.get("red") if isinstance(data.get("red"), dict) else {}
+    ended = as_stamp(red.get("ended"))
+    if not at or not until or (ended and ended >= at):
+        return None
+    return number, until
+
+
 def red_event(issue, event):
     """The red event of the default branch's issue: its newest comment
     by the build check's poster (each red head after the first says so
@@ -1450,6 +1477,7 @@ def attach_red_builds(github, repo, prs, issues):
     if RED_FIRST is None or PROJECT is None:
         return
     found = red_builds(PROJECT, ENVIRON)
+    rerun = nightly_rerun(PROJECT, ENVIRON)
     for issue in issues:
         if issue["number"] not in found:
             continue
@@ -1457,12 +1485,21 @@ def attach_red_builds(github, repo, prs, issues):
         event = red_event(issue, event)
         if event:
             issue["redBuild"] = {"what": what, "event": event}
+            if rerun and rerun[0] == issue["number"]:
+                issue["redBuild"]["rerun_until"] = rerun[1]
 
 
 def red_build(issue):
     """The issue's `redBuild`, with `router.red_first`, or None."""
     red = issue.get("redBuild") if RED_FIRST is not None else None
     return red if isinstance(red, dict) and red.get("event") else None
+
+
+def rerunning(red, ctx):
+    """Whether a red build's rerun is still expected to be running
+    (`rerun_until`, designs/0048 §5)."""
+    until = red.get("rerun_until")
+    return bool(until) and until > ctx.when.strftime(STAMP)
 
 
 def in_hand(number, ctx):
@@ -1486,7 +1523,8 @@ def red_turn(issue, owner, comments, roster, ctx):
     since its red event, and that no open pull request references, is
     the owner's turn, reminded as any turn is. None otherwise."""
     red = red_build(issue)
-    if red is None or ctx is None or not owner or parked(issue):
+    if red is None or ctx is None or not owner or parked(issue) \
+            or rerunning(red, ctx):
         return None
     n = issue["number"]
     if in_hand(n, ctx) or \
@@ -1519,7 +1557,7 @@ def red_fallbacks(ctx):
         red = red_build(issue)
         n = issue["number"]
         if red is None or parked(issue) or in_hand(n, ctx) \
-                or red["event"] > cutoff:
+                or red["event"] > cutoff or rerunning(red, ctx):
             continue
         owner = issue_owner(issue, ctx.roster)
         if owner and last_by(issue.get("comments") or [],
