@@ -31,8 +31,11 @@ GATE = [["tools/closing-keywords", "--pr", "{pr}", "--include-subject"],
 
 
 def project(**merge):
+    # own_head_green is off here, so the older tests' answers needn't
+    # carry statuses for every approved commit; OwnGreenWait and the
+    # Tick tests that name it turn it on.
     data = example()
-    data["merge"] = dict({"gate": GATE}, **merge)
+    data["merge"] = dict({"gate": GATE, "own_head_green": False}, **merge)
     return config.Project(data, None)
 
 
@@ -68,7 +71,7 @@ def pr(number=1, created=T0, reviews=None, comments=None, body="",
 
 def urgent_project(**merge):
     data = example()
-    data["merge"] = dict({"gate": GATE}, **merge)
+    data["merge"] = dict({"gate": GATE, "own_head_green": False}, **merge)
     data.setdefault("labels", {})["urgent"] = "Priority:urgent"
     return config.Project(data, None)
 
@@ -1076,6 +1079,37 @@ class Tick(Decide):
         # #6 changes no path the instance runs: it is decided as before.
         self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
                          [(6, "MERGE")])
+
+    def test_a_pull_request_not_yet_green_is_held_and_passed(self):
+        # merge.own_head_green: the build check is the gate, even for an
+        # approval given before it ran. #5 is pending on its head and
+        # its approved commit, so it is no candidate: not merged, and
+        # in no batch, train or prediction. #6 is decided as before.
+        m.configure(project(own_head_green=True))
+        self.addCleanup(m.configure, project())
+        pending = [status("pending")]
+        record, _ = self.tick([self.item(), self.other_pr()], extra={
+            SLUG + "/commits/" + self.head: pending,
+            SLUG + "/commits/" + self.approved: pending})
+        self.assertEqual(
+            record["held"]["5"],
+            "vm/build-and-test is pending on %s, and no approved commit "
+            "is green; waits for the build check to pass" % self.head[:10])
+        self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
+                         [(6, "MERGE")])
+
+    def test_green_on_the_approved_commit_is_enough(self):
+        # The Merger's own merge of main made a new head, still pending:
+        # the approved commit passed, so the pull request is a candidate
+        # and waits at the front for its head, as before.
+        m.configure(project(own_head_green=True))
+        self.addCleanup(m.configure, project())
+        record, _ = self.tick([self.item()], extra={
+            SLUG + "/commits/" + self.head: [status("pending")],
+            SLUG + "/commits/" + self.approved: [status("success")]})
+        self.assertNotIn("5", record["held"])
+        self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
+                         [(5, "WAIT")])
 
     def other_pr(self, number=6):
         """An approved pull request on its own branch, clean against
@@ -2119,8 +2153,9 @@ class StallAlert(Decide):
 
     def test_the_owners_label_is_the_configured_one(self):
         data = example()
-        data["merge"] = {"gate": GATE, "stall_alert": dict(
-            self.ALERT, owner_after_minutes=30)}
+        data["merge"] = {"gate": GATE, "own_head_green": False,
+                         "stall_alert": dict(
+                             self.ALERT, owner_after_minutes=30)}
         data["labels"]["waiting_on_owner"] = "Blocked on owner"
         m.configure(config.Project(data, None))
         self.waits(0)
@@ -2596,6 +2631,7 @@ class Configure(unittest.TestCase):
         self.assertEqual(m.STALL_TELL, ("LeadDev", "Reviewer"))
         self.assertEqual(m.STALL_LABELS, ("bug", "Owner:LeadDev"))
         self.assertEqual(m.STALL_RETELL, datetime.timedelta(minutes=60))
+        self.assertIs(m.OWN_HEAD_GREEN, True)
 
     def test_a_status_poster_other_than_the_merger(self):
         data = example()
@@ -7717,7 +7753,7 @@ class CloseMergedIssues(unittest.TestCase):
 def gated_project(scope=None):
     """The example project with a `mac` instance the Merger waits for."""
     data = example()
-    data["merge"] = {"gate": GATE}
+    data["merge"] = {"gate": GATE, "own_head_green": False}
     block = {"context": "vm/mac", "steps": [{"name": "t", "run": ["true"]}],
              "poster": "Merger", "gate": True}
     if scope is not None:
@@ -7796,3 +7832,47 @@ class InstanceGate(RepoCase):
             "success", context="vm/mac", creator="mallory")],
             self.approved: []}), "waiting for vm/mac (absent)")
 
+
+class OwnGreenWait(unittest.TestCase):
+    """merge.own_head_green: `own_green_wait` on its own."""
+
+    APPROVED, HEAD = "a" * 40, "h" * 40
+
+    def wait(self, statuses, cache=None):
+        github = FakeGitHub({SLUG + "/commits/" + sha: value
+                             for sha, value in statuses.items()})
+        item = pr(5, head=self.HEAD,
+                  reviews=[review(REVIEWER, oid=self.APPROVED)])
+        got = m.own_green_wait(item, m.approval_of(item), github,
+                               {} if cache is None else cache)
+        return got, github
+
+    def test_green_on_either_commit_passes(self):
+        self.assertIsNone(self.wait({self.APPROVED: [status()]})[0])
+        self.assertIsNone(self.wait({self.APPROVED: [status("pending")],
+                                     self.HEAD: [status()]})[0])
+
+    def test_pending_red_and_absent_hold_it(self):
+        for state, said in (("pending", "pending"), ("failure", "failure"),
+                            (None, "absent")):
+            got, _ = self.wait({self.APPROVED: [], self.HEAD:
+                                [status(state)] if state else []})
+            self.assertEqual(got, m.GREEN_WAIT_REASON % (
+                "vm/build-and-test", said, self.HEAD[:10]))
+
+    def test_someone_elses_green_does_not_count(self):
+        got, _ = self.wait({self.APPROVED: [], self.HEAD: [
+            status(creator="mallory")]})
+        self.assertIsNotNone(got)
+
+    def test_each_commit_is_read_once_a_tick(self):
+        cache = {}
+        _, github = self.wait({self.APPROVED: [], self.HEAD: []}, cache)
+        _, again = self.wait({self.APPROVED: [], self.HEAD: []}, cache)
+        self.assertEqual(len(github.calls), 2)
+        self.assertEqual(again.calls, [])
+
+    def test_off_by_configuration(self):
+        m.configure(project(own_head_green=False))
+        self.addCleanup(m.configure, project())
+        self.assertIs(m.OWN_HEAD_GREEN, False)
