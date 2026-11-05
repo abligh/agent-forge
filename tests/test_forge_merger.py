@@ -7585,3 +7585,43 @@ class Trains(RepoCase):
                                       self.said(entries, sizes))
         self.assertEqual(events[0][0], "urgent")
         self.assertEqual(self.numbers(got, sizes), [[8], [5, 6]])
+
+
+class ReturnedHead(unittest.TestCase):
+    """A hand-back for another head is forgotten once the head is back
+    at the approved commit itself (agent-forge-next-bundle item 3)."""
+
+    def setUp(self):
+        m.configure(project())
+        self.addCleanup(m.configure, project())
+
+    def said(self, head):
+        return {"5": {"approved": T1, "head": head,
+                      "reason": "the approved commit is not in the head's "
+                                "history"}}
+
+    def test_back_at_the_approved_commit_clears_it(self):
+        said, lines = self.said("b" * 40), []
+        item = pr(5, head="a" * 40, reviews=[review(REVIEWER, oid="a" * 40)])
+        self.assertEqual(m.clear_returned_heads(said, [item], lines.append),
+                         [5])
+        self.assertEqual(said, {})
+        self.assertIn("HAND-BACK-CLEARED #5: the head is back at the "
+                      "approved commit aaaaaaaaaa, not bbbbbbbbbb", lines[0])
+
+    def test_a_hand_back_of_this_very_head_stands(self):
+        said = self.said("a" * 40)
+        item = pr(5, head="a" * 40, reviews=[review(REVIEWER, oid="a" * 40)])
+        self.assertEqual(m.clear_returned_heads(said, [item], print), [])
+        self.assertIn("5", said)
+
+    def test_a_head_that_is_not_the_approved_commit_stands(self):
+        said = self.said("b" * 40)
+        item = pr(5, head="c" * 40, reviews=[review(REVIEWER, oid="a" * 40)])
+        self.assertEqual(m.clear_returned_heads(said, [item], print), [])
+
+    def test_one_said_under_another_approval_is_left_alone(self):
+        said = self.said("b" * 40)
+        item = pr(5, head="a" * 40,
+                  reviews=[review(REVIEWER, at=T3, oid="a" * 40)])
+        self.assertEqual(m.clear_returned_heads(said, [item], print), [])

@@ -4746,6 +4746,38 @@ def clear_green_reruns(said, prs, check_state, out):
     return cleared
 
 
+def clear_returned_heads(said, prs, out):
+    """Forget each hand-back in `said` said under the approval a pull
+    request has now, for another head than it has now, when its head is
+    now the approved commit itself: whatever was wrong with the other
+    head, the approval covers this one exactly. Without this, with
+    `update_once`, the pull request stayed out of the queue until it was
+    approved again: seen on 2026-11-04, a head the Merger's own update
+    left without the approved commit in its history went back to the
+    approved commit, and waited 2.5 hours for a second approval of the
+    commit already approved. Returns the numbers released, after
+    logging `HAND-BACK-CLEARED` for each."""
+    cleared = []
+    for pr in prs:
+        key = str(pr["number"])
+        before = said.get(key)
+        approval = approval_of(pr)
+        if not isinstance(before, dict) or approval is None:
+            continue
+        approved = (approval.get("commit") or {}).get("oid")
+        head = pr.get("headRefOid")
+        if not approved or head != approved or before.get("head") == head \
+                or before.get("approved") != approval.get("submittedAt"):
+            continue
+        out("HAND-BACK-CLEARED #%s: the head is back at the approved "
+            "commit %s, not %s it was handed back at; back in the queue "
+            "under its approval" % (key, head[:10],
+                                    str(before.get("head") or "")[:10]))
+        del said[key]
+        cleared.append(pr["number"])
+    return cleared
+
+
 def clear_red_suspects(state_dir, reds, prs, check_state, repo, github,
                        said, live, out, run=sh):
     """Release each red suspect in `reds` whose head the build check has
@@ -5169,6 +5201,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         state_dir, reds, prs, check_state, repo, github, said, live, out,
         run) if reds else []
     clear_green_reruns(said, prs, check_state, out)
+    clear_returned_heads(said, prs, out)
     since, overdue = {}, {}
     if AGE_FIRST is not None:
         since = waiting_since(os.path.join(

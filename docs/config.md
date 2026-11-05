@@ -731,7 +731,11 @@ own rather than a batch's cover, finished after the hand-back was
 said (as `labels.rerun` gives one). The tick logs
 `HAND-BACK-CLEARED #n`, and the pull request is updated and merged
 again under its approval. A hand-back said before this was added
-carries no time, and still waits for a new approval. Off by default.
+carries no time, and still waits for a new approval. Another needs
+none either: a pull request whose head is back at the approved commit
+itself, after a hand-back for another head, has that hand-back
+forgotten (`HAND-BACK-CLEARED #n: the head is back at the approved
+commit ...`), since the approval covers it exactly. Off by default.
 
 ### `merge.hand_back_once_per_head`
 
