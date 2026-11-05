@@ -23,7 +23,10 @@ defaults to the last `--hours` (24) up to now.
   check's `state.json`, which records each step's CPU seconds): each
   run's total over its steps, and each step's, for the runs that
   finished in the window. The default branch's runs are the steady
-  series: a pull request's run may test only what it changed.
+  series: a pull request's run may test only what it changed;
+- the scoped steps' time (`scoped_seconds`, designs/0048): on how many
+  runs that finished in the window they ran, and how long they took
+  there, together on each run and in all. Shown only when some did.
 
 **The merge queue** (`merger.jsonl`):
 - merges in the window, and per hour;
@@ -586,6 +589,38 @@ def main_cpu_stats(results, since, until):
             "steps": {k: summary(v) for k, v in sorted(steps.items())}}
 
 
+def scoped_stats(results, since, until):
+    """{"runs": summary, "seconds": total} of the scoped steps' time
+    (designs/0048: each verdict's `scoped_seconds`) over the runs that
+    finished in the window and ran one."""
+    took = []
+    for result in (results or {}).values():
+        if not isinstance(result, dict):
+            continue
+        seconds = result.get("scoped_seconds")
+        if not isinstance(seconds, (int, float)) or isinstance(
+                seconds, bool) or seconds <= 0:
+            continue
+        try:
+            when = parse_time(result["finished"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if since <= when < until:
+            took.append(seconds)
+    return {"runs": summary(took), "seconds": sum(took)}
+
+
+def scoped_text(scoped):
+    """The report's line for the scoped steps, or None when none ran."""
+    runs = scoped["runs"]
+    if not runs["n"]:
+        return None
+    return ("  scoped steps: ran on %d runs, %.1f slot-hours; per run "
+            "median %.0f s, p90 %.0f s" % (
+                runs["n"], scoped["seconds"] / 3600, runs["median"],
+                runs["p90"]))
+
+
 def read_results(pr_dir):
     """The build check's `results` from its state.json, or {}."""
     try:
@@ -670,6 +705,8 @@ def report(name, since, until, check, queue, approval, authors,
                         check["busy_seconds"] / 3600))
     if check.get("main_cpu") is not None:
         lines.append(cpu_text(check["main_cpu"]))
+    if check.get("scoped") is not None and scoped_text(check["scoped"]):
+        lines.append(scoped_text(check["scoped"]))
     lines += ["", "Merge queue"]
     held = queue["held_seconds"] / 3600
     lines.append("  merges: %d (%.1f an hour; %s)"
@@ -769,7 +806,9 @@ def main(argv=None, out=print, environ=None, now=None,
         out("NO-RECORDS: nothing in %s or %s" % (pr_dir, merger_dir))
         return 2
     check = check_stats(verdicts, since, until, slots)
-    check["main_cpu"] = main_cpu_stats(read_results(pr_dir), since, until)
+    results = read_results(pr_dir)
+    check["main_cpu"] = main_cpu_stats(results, since, until)
+    check["scoped"] = scoped_stats(results, since, until)
     queue = queue_stats(records, since, until)
     approval, authors = None, {}
     presence = read_lines(os.path.join(

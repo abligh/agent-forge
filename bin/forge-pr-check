@@ -395,6 +395,32 @@ slot's lock, and removed when the run ends, stopped or not. A step
 stopped by SIGTERM (a superseded head) or killed outright leaves its
 `go-build*` and test directories there, not in /tmp.
 
+**A step with `pull_requests` runs only where it can be broken**
+(designs/0048 §1-§3): `{"paths": [glob, ...], "label": name}`, either
+left out but not both, as on an instance (designs/0034). Such a scoped
+step, often one of the nightly's slow ones, runs on a pull request's
+head only when the head changes a path a glob matches (`fnmatchcase`
+from the repository's top, since its merge base with the default
+branch) or the pull request carries the label; otherwise it is left
+out, and the verdict's `scoped` says `skipped: out of scope`. The scope
+decides, not `checks.depends`' tracer; `checks.reuse` still applies to a
+scoped step that runs. Scoped steps run after every other step, and
+only once those are green (else `skipped: an earlier step failed`);
+side by side, they run side by side with each other. Together they
+have `checks.scoped_minutes` (default 60): a step still running when
+that is used up is stopped, and one not yet started isn't run; either
+is red, `over the scoped budget`. A Merger's prediction runs a scoped
+step when its changes since its merge base match, or any open pull
+request whose head it contains carries the label. A default-branch head
+runs one, with `checks.main` `every` or `newest`, when its changes
+since the last default-branch head checked here match (each, if none
+was); with `needed`, and when warming, never. The fast lane never
+takes a head whose estimate has a scoped step in its run, and a head is
+matched to another verdict on its tree, or covered by a batch, only
+when that verdict ran every scoped step the head would. Each scoped
+step that ran is in the verdict's `scoped` as `ran: <why>`, and their
+time together as `scoped_seconds`.
+
 **Each step runs under a memory limit**, in its own `systemd-run
 --user --scope` with `MemoryMax` (`checks.memory_max`, default `16G`;
 `$FORGE_PR_CHECK_MEMORY_MAX` overrides it; `off` for none) and no swap.
@@ -654,7 +680,16 @@ STEP_CACHES = {}
 # Step keys that say how a step is run beside others, not what it
 # tests: left out of its input digest, so setting them reuses nothing
 # less.
-SCHEDULING_KEYS = ("after", "alone", "light", "caches")
+SCHEDULING_KEYS = ("after", "alone", "light", "caches", "pull_requests")
+# designs/0048: the scoped steps, {name: (globs, label)}, from each
+# step's `pull_requests`, and the time they have together on a head.
+SCOPED = {}
+DEFAULT_SCOPED_MINUTES = 60
+SCOPED_S = 60 * DEFAULT_SCOPED_MINUTES
+# What a scoped step's entry in a verdict's `scoped` says.
+OUT_OF_SCOPE = "skipped: out of scope"
+SCOPED_UNRUN = "skipped: an earlier step failed"
+OVER_BUDGET = "red: over the scoped budget"
 # checks.keep_ignored: paths, relative to the worktree, that the clean
 # before each head leaves alone although they are ignored, so a build
 # can find its own last output there (`git clean -e`).
@@ -937,8 +972,8 @@ def configure(project, instance=None):
     `step_timeout_minutes`, `merger_first`, `depends`,
     `depends_minutes`, `tracer`, `fast_lane`, `merge_default`,
     `cache_limit`, `reuse`, `fresh`, `first_authors`, `max_wait_minutes`,
-    `keep_ignored`, `cpu_share`, `side_by_side`, `warm`, each step's
-    `always`,
+    `keep_ignored`, `cpu_share`, `side_by_side`, `warm`,
+    `scoped_minutes`, each step's `always`, `pull_requests`,
     `version`, `outputs`, `after`, `alone`, `light` and `caches`),
     each with the
     default above, and `merge.test_ahead` (`max_age_hours`), which
@@ -963,6 +998,7 @@ def configure(project, instance=None):
     global CACHE_FAULT_TEXT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
     global PULL_REQUESTS, HOST_LOCK, APPROVED_FIRST, REVIEWER_LOGINS
+    global SCOPED, SCOPED_S
     INSTANCE = instance
     if instance is None:
         checks, HOST = project.section("checks"), project.host
@@ -996,6 +1032,12 @@ def configure(project, instance=None):
                       if s.get("alone"))
     LIGHT = frozenset(s["name"] for s in checks.get("steps", [])
                       if s.get("light"))
+    # designs/0048; the configuration refuses it in an instance's steps.
+    SCOPED = {s["name"]: (tuple(s["pull_requests"].get("paths", ())),
+                          s["pull_requests"].get("label"))
+              for s in checks.get("steps", []) if s.get("pull_requests")} \
+        if instance is None else {}
+    SCOPED_S = 60 * checks.get("scoped_minutes", DEFAULT_SCOPED_MINUTES)
     STEP_CACHES = {s["name"]: dict(s["caches"])
                    for s in checks.get("steps", []) if s.get("caches")}
     # The configuration refuses reuse without depends.
@@ -1559,6 +1601,102 @@ def touches(paths, globs):
                for path in paths for glob in globs)
 
 
+def scope_of(wt, sha, run=sh, labels=(), since=None, names=None):
+    """designs/0048 §1: {step: why} of the scoped steps (SCOPED) a run of
+    commit sha takes in, in a checkout wt that has it: each whose label
+    is in `labels`, or one of whose globs (`touches`) matches a path
+    changed since `since`, by default sha's merge base with the default
+    branch's remote ref. A rename counts as both its names. When what
+    changed can't be listed, every scoped step is in, so a step is never
+    left out for want of an answer. With `names`, only those steps (the
+    ones that apply to the head) are considered."""
+    if not SCOPED:
+        return {}
+    scoped = {name: scope for name, scope in SCOPED.items()
+              if names is None or name in names}
+    paths = None
+    if since is None:
+        got = run(["git", "-C", wt, "merge-base", sha,
+                   "refs/remotes/origin/" + MAIN])
+        base = (got.stdout or "").strip()
+        since = base if got.returncode == 0 and len(base) == 40 else None
+    if since:
+        got = run(["git", "-C", wt, "diff", "--name-only", "--no-renames",
+                   since, sha])
+        if got.returncode == 0:
+            paths = [line for line in got.stdout.splitlines() if line]
+    chosen = {}
+    for name, (globs, label) in scoped.items():
+        hit = next((path for path in paths or () if touches([path], globs)),
+                   None)
+        if label and label in labels:
+            chosen[name] = "label %s" % label
+        elif paths is None:
+            chosen[name] = "could not list what changed"
+        elif hit is not None:
+            chosen[name] = "changes %s" % hit
+    return chosen
+
+
+def scope_labels(heads):
+    """{sha: [label]}: of each open, non-draft head, the scoped steps'
+    labels its pull request carries (designs/0048), for a worker to read
+    from state.json's `scope_labels`; only heads with one."""
+    wanted = {label for _, label in SCOPED.values() if label}
+    found = {}
+    for head in heads:
+        labels = head[5] if len(head) > 5 else []
+        got = sorted(wanted.intersection(labels))
+        if got and not head[3]:
+            found[head[1]] = got
+    return found
+
+
+def labels_within(wt, sha, state, run=sh):
+    """The scoped steps' labels on every open pull request whose head
+    commit sha, a Merger's prediction, contains: a batch's or a train's
+    members (designs/0048 §3)."""
+    labels = set()
+    for head, names in sorted((state.get("scope_labels") or {}).items()):
+        if not set(names) <= labels and run(
+                ["git", "-C", wt, "merge-base", "--is-ancestor", head,
+                 sha]).returncode == 0:
+            labels.update(names)
+    return sorted(labels)
+
+
+def last_main(state, sha):
+    """The default-branch head other than sha whose verdict here finished
+    last, or None: what a default-branch head's scoped steps are chosen
+    against (designs/0048 §3)."""
+    best = None
+    for other, r in state["results"].items():
+        if other != sha and r.get("main") and isinstance(
+                r.get("finished"), str) and (
+                best is None or r["finished"] > best[1]):
+            best = (other, r["finished"])
+    return best[0] if best else None
+
+
+def scoped_ran(record):
+    """The scoped steps a verdict ran or reused (its `scoped`)."""
+    return {name for name, said in (record.get("scoped") or {}).items()
+            if isinstance(said, str) and said.startswith(("ran", "reused"))}
+
+
+def scoped_too(accept, need):
+    """`accept` for `tested`, also requiring that a verdict ran every
+    scoped step in `need`: the steps the head would run (designs/0048).
+    `accept` None takes any verdict."""
+    if not need:
+        return accept
+
+    def both(record):
+        return set(need) <= scoped_ran(record) and (
+            accept is None or accept(record))
+    return both
+
+
 def in_scope(heads, state_dir, token, run=sh, out=print, when=None):
     """`heads`, less the pull requests' heads this instance doesn't run
     (PULL_REQUESTS, designs/0034): one is run when its pull request
@@ -1641,6 +1779,9 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
     request was waiting all along, and a push, by its author or the
     Merger's update, must not send it to the back of the queue."""
     current, new = set(), []
+    if SCOPED:
+        state["scope_labels"] = scope_labels(
+            [h for h in heads if h[2] == REPO_SLUG])
     for pr, sha, repo, draft, *extra in heads:
         author = extra[0] if extra else ""
         labels = extra[1] if len(extra) > 1 else []
@@ -4095,7 +4236,7 @@ def children_cpu():
 
 def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
           cpu=children_cpu, logs=None, stream=None, share=None,
-          caches=None, side_by_side=None, front=None):
+          caches=None, side_by_side=None, front=None, deadline=None):
     """Every step that applies to the head, each run even if an earlier
     one failed, and none retried, each after `prefix` (memory_cap).
     `wrap(name, prefix, argv, env)` gives a traced step's (argv, env).
@@ -4115,7 +4256,11 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
     run now (designs/0031), asked as each step starts: if so, the
     step's scope has MERGER_CPU_WEIGHT and its result `merger_weight`;
     with DOCKER_SLICES, its CHECK_DOCKER_SLICE is the front's or the
-    other's. Returns (ok, results), the results in the steps' order."""
+    other's. With `deadline`, a time.monotonic() value (designs/0048's
+    checks.scoped_minutes), no step runs past it: one is stopped there,
+    and one that would start after it isn't run, either red with
+    `over_budget` and a tail saying so. Returns (ok, results), the
+    results in the steps' order."""
     chosen = applicable(wt, steps)
     weights = {}
 
@@ -4144,21 +4289,34 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
     def execute(name, step_args, step_env_, folder, usage=None,
                 on_start=None):
         started = time.monotonic()
+        timeout, budget = STEP_TIMEOUT_S, False
+        if deadline is not None:
+            left = deadline - started
+            if left <= 0:
+                return {"name": name, "rc": 124, "seconds": 0, "wall": 0.0,
+                        "tail": "not started: over the scoped budget of "
+                        "%d minutes" % (SCOPED_S // 60),
+                        "over_budget": True}
+            if left < timeout:
+                timeout, budget = max(1, int(left)), True
         used = cpu() if usage is None else None
         if logs is not None and stream is not None:
             os.makedirs(logs, exist_ok=True)
             more = {} if usage is None else {"usage": usage,
                                              "on_start": on_start}
             got = stream(step_args, cwd=wt, env=step_env_,
-                         timeout=STEP_TIMEOUT_S, log=os.path.join(
+                         timeout=timeout, log=os.path.join(
                              logs, results_name(name) + ".log.gz"), **more)
         else:
-            got = run(step_args, cwd=wt, env=step_env_,
-                      timeout=STEP_TIMEOUT_S)
+            got = run(step_args, cwd=wt, env=step_env_, timeout=timeout)
         wall = time.monotonic() - started
         result = {"name": name, "rc": got.returncode,
                   "seconds": int(wall), "wall": round(wall, 2),
                   "tail": tail((got.stdout or "") + (got.stderr or ""))}
+        if budget and got.returncode == 124:
+            result["over_budget"] = True
+            result["tail"] = "stopped: over the scoped budget of %d " \
+                "minutes\n%s" % (SCOPED_S // 60, result["tail"])
         if usage is None:
             result["cpu"] = round(max(0.0, cpu() - used), 2)
         elif usage.get("cpu") is not None:
@@ -4936,8 +5094,9 @@ def settled_heads(state, checkout, busy=(), when=None, run=sh,
     def older(a, b):
         return run(["git", "-C", checkout, "merge-base", "--is-ancestor",
                     a, b]).returncode == 0
-    every = covers({"ran": [name for name, _, _ in STEPS], "base": tip},
-                   older)
+    # The scoped steps are judged by what each head needs (designs/0048).
+    every = covers({"ran": [name for name, _, _ in STEPS
+                            if name not in SCOPED], "base": tip}, older)
     key = records_key(state_dir, tip) \
         if FRESH_WAIT is not None and state_dir else None
     members = {e["tree"] for e in batch[:-1]}
@@ -4947,22 +5106,28 @@ def settled_heads(state, checkout, busy=(), when=None, run=sh,
                 or not older(tip, sha) or forced(state, sha):
             continue
         tree = tree_of(checkout, sha, run)
-        same = tested(state, tree, when, ok=True, accept=every) \
-            if tree else None
+        # designs/0048: and every scoped step the head would run.
+        need = scope_of(checkout, sha, run, (state.get("scope_labels")
+                                             or {}).get(sha, []), names=[
+            n for n, _, _ in applicable_at(checkout, sha, run)]) \
+            if SCOPED and tree else None
+        same = tested(state, tree, when, ok=True,
+                      accept=scoped_too(every, need)) if tree else None
         steps = estimated(entry, tip, key)
         if same is None and tree and steps is not None:
-            same = tested(state, tree, when, ok=True, accept=covers(
-                {"ran": steps, "base": tip}, older))
+            same = tested(state, tree, when, ok=True, accept=scoped_too(
+                covers({"ran": steps, "base": tip}, older), need))
         covered = None
         if same is None and tree in members:
             top = batch[-1]["tree"]
-            same = tested(state, top, when, ok=True, accept=every)
+            same = tested(state, top, when, ok=True,
+                          accept=scoped_too(every, need))
             if same is None and steps is not None:
-                same = tested(state, top, when, ok=True, accept=covers(
-                    {"ran": steps, "base": tip}, older))
+                same = tested(state, top, when, ok=True, accept=scoped_too(
+                    covers({"ran": steps, "base": tip}, older), need))
             if same is None:
-                same = tested(state, top, when, ok=True,
-                              accept=based_below(sha, older))
+                same = tested(state, top, when, ok=True, accept=scoped_too(
+                    based_below(sha, older), need))
             covered = batch_span(batch) if same is not None else None
         if same is not None and same != sha:
             found.append((sha, entry["pr"], same, tree, covered))
@@ -5079,10 +5244,15 @@ def estimate(state_dir, checkout, busy=(), run=sh, tip=None):
     estimated again whenever it or the records change (`records_key`);
     the steps that would run only because their record is stale are
     kept as `stale_steps`, and the base they were chosen against as
-    `lane_base`."""
+    `lane_base`.
+
+    With scoped steps (designs/0048), the scope decides theirs, as in a
+    run, and a head that would run one is kept with `lane_scoped`: the
+    fast lane never takes it."""
     key = records_key(state_dir, tip) if FRESH_WAIT is not None else None
     with state_lock(state_dir):
-        waiting = load(state_dir)["waiting"]
+        seen = load(state_dir)
+        waiting = seen["waiting"]
         todo = sorted((w["since"], sha, w["pr"]) for sha, w in waiting.items()
                       if ("lane_steps" not in w if key is None
                           else w.get("lane_key") != key)
@@ -5094,8 +5264,19 @@ def estimate(state_dir, checkout, busy=(), run=sh, tip=None):
         selection = lane_steps(checkout, sha, pr, state_dir, run, tip) \
             if key is not None else \
             lane_steps(checkout, sha, pr, state_dir, run)
+        if "ran" in selection and SCOPED:
+            names = [n for n, _, _ in applicable_at(checkout, sha, run)
+                     if n in SCOPED]
+            scoped = scope_of(checkout, sha, run, (seen.get(
+                "scope_labels") or {}).get(sha, []), names=names)
+            selection["ran"] = {n: why for n, why in selection["ran"].items()
+                                if n not in SCOPED}
+            selection["ran"].update(scoped)
         if "ran" in selection:
             found[sha] = {"lane_steps": sorted(selection["ran"])}
+            if SCOPED:
+                found[sha]["lane_scoped"] = sorted(
+                    n for n in selection["ran"] if n in SCOPED)
             if key is not None:
                 found[sha].update(stale_steps=selection["stale"],
                                   lane_base=selection["base"], lane_key=key)
@@ -5113,6 +5294,7 @@ def lane_cost(entry, costs):
     costs, or None when it has no estimate or a step has no cost."""
     steps = entry.get("lane_steps")
     if not isinstance(steps, list) or entry.get("main") \
+            or entry.get("lane_scoped") \
             or any(name not in costs for name in steps):
         return None
     return sum(costs[name] for name in steps)
@@ -5675,6 +5857,39 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                    selection["record"][:10],
                    "; stale: " + ", ".join(selection["stale"])
                    if selection["stale"] else ""))
+        # designs/0048: which scoped steps this run takes in, and why.
+        scoped = scoped_names = None
+        if SCOPED:
+            scoped_names = [n for n, _, _ in applicable(wt) if n in SCOPED]
+            if warm or (main and not MAIN_EVERY):
+                scoped = {}
+            elif main:
+                with state_lock(state_dir):
+                    before = last_main(load(state_dir), sha)
+                scoped = scope_of(wt, sha, run, since=before,
+                                  names=scoped_names) if before else {
+                    n: "no earlier %s head checked here" % MAIN
+                    for n in scoped_names}
+            else:
+                with state_lock(state_dir):
+                    known = load(state_dir)
+                labels = labels_within(wt, sha, known, run) if ahead else \
+                    (known.get("scope_labels") or {}).get(sha, [])
+                scoped = scope_of(wt, sha, run, labels, names=scoped_names)
+            out("  scoped: %s" % ("; ".join(
+                "%s in (%s)" % (n, scoped[n]) if n in scoped else
+                "%s out of scope" % n for n in scoped_names) or "none apply"))
+            if selection is not None and "ran" in selection:
+                # The scope decides, not the tracer.
+                for n in scoped_names:
+                    if n in scoped:
+                        selection["ran"][n] = "in scope: %s" % scoped[n]
+                        if n in selection["skipped"]:
+                            selection["skipped"].remove(n)
+                    else:
+                        selection["ran"].pop(n, None)
+                        if n not in selection["skipped"]:
+                            selection["skipped"].append(n)
         phases.mark("choose")
         tree = tree_of(wt, checked, run) if TEST_AHEAD or main else None
         force = False
@@ -5687,9 +5902,11 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         if tree and not ahead and not main and not force:
             with state_lock(state_dir):
                 same = tested(load(state_dir), tree, started, ok=True,
-                              accept=covers(selection, lambda a, b: run(
-                                  ["git", "-C", wt, "merge-base",
-                                   "--is-ancestor", a, b]).returncode == 0))
+                              accept=scoped_too(covers(
+                                  selection, lambda a, b: run(
+                                      ["git", "-C", wt, "merge-base",
+                                       "--is-ancestor", a, b]).returncode
+                                  == 0), scoped))
             if same is not None and same != sha:
                 settled = True
                 return matched(state_dir, sha, pr, same, tree, started,
@@ -5705,7 +5922,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             # MATCH_MAIN_UNRECORDED (designs/0036), trace_matched
             # decides instead whether the records need it.
             with state_lock(state_dir):
-                same = tested(load(state_dir), tree, started, ok=True)
+                same = tested(load(state_dir), tree, started, ok=True,
+                              accept=scoped_too(None, scoped))
             if same is not None and same != sha and not trace_matched(
                     state_dir, wt, sha, tree, slot, started, run, out):
                 settled = True
@@ -5785,6 +6003,12 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                     "is recorded" % TRACER)
             else:
                 wrap = trace_wrapper(state_dir, slot, tracer, files)
+        # designs/0048: the scoped steps run last, on their own budget.
+        scoped_steps = None
+        if scoped is not None:
+            every = steps if steps is not None else applicable(wt)
+            steps = [s for s in every if s[0] not in SCOPED]
+            scoped_steps = [s for s in every if s[0] in scoped]
         # A warming keeps its own, beside the verdict's.
         mark = "%s-warm%d" % (sha, slot) if warm else sha
         kept = os.path.join(state_dir, RESULTS_DIR, mark)
@@ -5814,14 +6038,18 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             shutil.rmtree(logs, ignore_errors=True)
             steps_began = time.monotonic()
             # A test's own `run` stands in for every program, steps too.
-            ok, results = check(wt, env, run, steps=steps,
-                                prefix=memory_cap(memory_max, env, run, out),
-                                wrap=wrap, kept=kept, logs=logs,
-                                stream=sh_logged if run is sh else None,
-                                share=share, caches=step_caches,
-                                side_by_side=SIDE_BY_SIDE,
-                                front=None if front is None or slot == LANE
-                                or main else lambda: front(clock()))
+            how = dict(prefix=memory_cap(memory_max, env, run, out),
+                       wrap=wrap, kept=kept, logs=logs,
+                       stream=sh_logged if run is sh else None,
+                       share=share, caches=step_caches,
+                       side_by_side=SIDE_BY_SIDE,
+                       front=None if front is None or slot == LANE
+                       or main else lambda: front(clock()))
+            ok, results = check(wt, env, run, steps=steps, **how)
+            if scoped_steps and ok:
+                ok, more = check(wt, env, run, steps=scoped_steps,
+                                 deadline=time.monotonic() + SCOPED_S, **how)
+                results = results + more
             steps_took = time.monotonic() - steps_began
             phases.mark("steps")
             for r in results:
@@ -5931,6 +6159,25 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                               steps=steps_digest())
             if reused:
                 record["reused"] = reused
+            if scoped is not None:
+                ran = {r["name"]: r for r in results}
+                said = {}
+                for n in scoped_names:
+                    if n not in scoped:
+                        said[n] = OUT_OF_SCOPE
+                    elif n in reused:
+                        said[n] = "reused: %s" % scoped[n]
+                    elif ran.get(n, {}).get("over_budget"):
+                        said[n] = OVER_BUDGET
+                    elif n in ran:
+                        said[n] = "ran: %s" % scoped[n]
+                    else:
+                        said[n] = SCOPED_UNRUN
+                record["scoped"] = said
+                # What forge-stats shows the scoped steps cost.
+                record["scoped_seconds"] = int(sum(
+                    r.get("wall", r["seconds"]) for r in results
+                    if r["name"] in SCOPED))
             if SIDE_BY_SIDE is not None:
                 # What step_alert compares a step's runs by (designs/0029).
                 record["side_by_side"] = True

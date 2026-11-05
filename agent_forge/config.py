@@ -143,7 +143,7 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "step_alert": dict, "cpu_share": str,
           "side_by_side": dict, "merger_cpu_weight": int,
           "docker_slices": dict, "pull_requests": dict, "warm": dict,
-          "approved_first": bool}
+          "approved_first": bool, "scoped_minutes": int}
 # checks.docker_slices (designs/0031): the slices each step's
 # containers go in, the next merge's run's and every other's.
 DOCKER_SLICES = {"front": str, "other": str}
@@ -205,7 +205,8 @@ REUSE = {"max_age_days": int, "trace_matched_main": bool,
 FRESH = {"wait_minutes": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool,
         "version": list, "reads_base": bool, "outputs": list,
-        "after": list, "alone": bool, "light": bool, "caches": dict}
+        "after": list, "alone": bool, "light": bool, "caches": dict,
+        "pull_requests": dict}
 # checks.tracer's values (docs/designs/0005).
 TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.
@@ -874,7 +875,7 @@ def _check_checks(checks, data, problems, where="checks"):
         if key in checks and not _is(checks[key], kinds):
             problems.append("%s.%s must be %s" % (where, key, _type_name(kinds)))
     for key in ("slots", "step_timeout_minutes", "depends_minutes",
-                "max_wait_minutes"):
+                "max_wait_minutes", "scoped_minutes"):
         if _is(checks.get(key), int) and checks[key] < 1:
             problems.append("%s.%s must be at least 1" % (where, key))
     if _is(checks.get("cpu_weight"), int) \
@@ -990,12 +991,23 @@ def _check_checks(checks, data, problems, where="checks"):
                         and not any(c in path for c in "*?[!\\")):
                     problems.append("%s.outputs: %r is not a path inside "
                                     "the worktree" % (at, path))
+            if isinstance(step.get("pull_requests"), dict):
+                # designs/0048: a scoped step.
+                if where != "checks":
+                    problems.append("%s.pull_requests: only checks' own "
+                                    "steps may set it; the instance's "
+                                    "pull_requests scopes all of its steps"
+                                    % at)
+                else:
+                    _check_pull_requests(step["pull_requests"], problems,
+                                         at + ".pull_requests")
             if isinstance(step.get("caches"), dict) and not all(
                     isinstance(v, str) and v and "/" not in v
                     for v in step["caches"].values()):
                 problems.append("%s.caches must map variables to directory "
                                 "names" % at)
         _check_after(checks["steps"], problems, where)
+        _check_scoped_after(checks["steps"], problems, where)
     if isinstance(checks.get("caches"), dict) and not all(
             isinstance(v, str) and v and "/" not in v
             for v in checks["caches"].values()):
@@ -1067,6 +1079,23 @@ def _check_after(steps, problems, where):
         state[name] = "done"
     for name in names:
         visit(name, [])
+
+
+def _check_scoped_after(steps, problems, where):
+    """designs/0048: a step that isn't scoped can't wait (`after`) for one
+    that is, since scoped steps run after all the others."""
+    scoped = {s["name"] for s in steps if isinstance(s, dict)
+              and isinstance(s.get("name"), str)
+              and isinstance(s.get("pull_requests"), dict)}
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict) or step.get("name") in scoped \
+                or not isinstance(step.get("after"), list):
+            continue
+        for other in step["after"]:
+            if other in scoped:
+                problems.append("%s.steps[%d].after: %r is scoped, so it "
+                                "runs after every step that isn't"
+                                % (where, i, other))
 
 
 def _check_pull_requests(scope, problems, where):

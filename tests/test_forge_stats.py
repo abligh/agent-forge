@@ -125,6 +125,33 @@ class MainCpu(unittest.TestCase):
                          "test 200 s, vet 10 s")
 
 
+class Scoped(unittest.TestCase):
+    # designs/0048: the scoped steps' time, from each verdict's
+    # scoped_seconds.
+
+    RESULTS = {
+        "a": {"finished": "2026-10-12T01:00:00Z", "scoped_seconds": 600},
+        "b": {"finished": "2026-10-12T01:30:00Z", "scoped_seconds": 1200},
+        # None ran, outside the window, or no time.
+        "c": {"finished": "2026-10-12T01:30:00Z", "scoped_seconds": 0},
+        "d": {"finished": "2026-10-11T23:00:00Z", "scoped_seconds": 900},
+        "e": {"finished": "2026-10-12T01:30:00Z"},
+    }
+
+    def test_the_runs_that_ran_one(self):
+        got = tool.scoped_stats(self.RESULTS, SINCE, UNTIL)
+        self.assertEqual((got["runs"]["n"], got["seconds"]), (2, 1800))
+
+    def test_the_report_line(self):
+        got = tool.scoped_text(tool.scoped_stats(self.RESULTS, SINCE, UNTIL))
+        self.assertEqual(got, "  scoped steps: ran on 2 runs, 0.5 "
+                         "slot-hours; per run median 600 s, p90 1200 s")
+
+    def test_no_line_when_none_ran(self):
+        self.assertIsNone(tool.scoped_text(tool.scoped_stats({}, SINCE,
+                                                             UNTIL)))
+
+
 class Queue(unittest.TestCase):
 
     def setUp(self):
