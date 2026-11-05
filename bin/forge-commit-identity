@@ -16,12 +16,16 @@ precisely because it resolves to nobody, so either identity there is
 unattributed whatever its local part says; and
 `identity.unattributed_name` is refused whatever email accompanies it.
 
-**The domain defaults to the host's own.** Git's default email is
-`<user>@<the host's fully qualified name>`, so with no
-`unattributed_domain` configured the rule takes the host's name
-(`$FORGE_UNATTRIBUTED_DOMAIN` overrides it, as `@host.example.org`).
-A project's configuration then never has to name its hosts. A host
-whose name has no dot gives no domain, and only the name rule applies.
+**The domains default to the host's own.** Git's default email is
+`<user>@<a name for the host>`, and which name depends on how the host
+resolves itself: the fully qualified one, the short one, or something
+between (`claude@build.example`). So with no `unattributed_domain`
+configured the rule reserves the host's fully qualified name, its
+`hostname`, and every leading run of their labels (`@build`,
+`@build.example`, `@build.example.org`). `$FORGE_UNATTRIBUTED_DOMAIN`
+overrides them, comma-separated. A project's configuration then never
+has to name its hosts; when it does, `unattributed_domain` is one
+domain or a list, and replaces the defaults.
 
 **Only GitHub's synthetic merge is skipped, not merges in general.**
 The merge commit GitHub makes for a pull_request checkout (`Merge <sha>
@@ -76,25 +80,47 @@ def commits(rng, run=proc.sh):
     return rows
 
 
-def unattributed_domain(project, environ=None, fqdn=socket.getfqdn):
-    """The reserved domain, "@host.example.org": the configuration's,
-    else $FORGE_UNATTRIBUTED_DOMAIN, else this host's own; "" for none."""
+def _host_domains(*names):
+    """Every "@domain" git may give this host's default email: each name
+    and each of its leading label runs, so "build.example.org" gives
+    "@build", "@build.example" and "@build.example.org"."""
+    out = []
+    for name in names:
+        labels = (name or "").strip().rstrip(".").lower().split(".")
+        if not labels[0]:
+            continue
+        for n in range(1, len(labels) + 1):
+            domain = "@" + ".".join(labels[:n])
+            if domain not in out:
+                out.append(domain)
+    return out
+
+
+def unattributed_domains(project, environ=None, fqdn=socket.getfqdn,
+                         hostname=socket.gethostname):
+    """The reserved domains, lower case: the configuration's (a string or
+    a list), else $FORGE_UNATTRIBUTED_DOMAIN (comma-separated), else this
+    host's own names and their short forms."""
     environ = os.environ if environ is None else environ
-    domain = (project.section("identity").get("unattributed_domain")
-              or environ.get("FORGE_UNATTRIBUTED_DOMAIN"))
-    if not domain:
-        host = (fqdn() or "").strip().rstrip(".")
-        domain = "@" + host if "." in host else ""
-    return domain.lower()
+    domains = project.section("identity").get("unattributed_domain")
+    if isinstance(domains, str):
+        domains = [domains]
+    if not domains and environ.get("FORGE_UNATTRIBUTED_DOMAIN"):
+        domains = environ["FORGE_UNATTRIBUTED_DOMAIN"].split(",")
+    if not domains:
+        return _host_domains(fqdn(), hostname())
+    return [d.strip().lower() for d in domains if d.strip()]
 
 
-def host_identity(project, name, email, environ=None, fqdn=socket.getfqdn):
-    """Whether name/email is the host's unconfigured identity, or on its
-    domain. Case-insensitive, as emails are."""
+def host_identity(project, name, email, environ=None, fqdn=socket.getfqdn,
+                  hostname=socket.gethostname):
+    """Whether name/email is the host's unconfigured identity, or on one
+    of its domains. Case-insensitive, as emails are."""
     ident = project.section("identity")
-    domain = unattributed_domain(project, environ, fqdn)
+    domains = unattributed_domains(project, environ, fqdn, hostname)
     plain = ident.get("unattributed_name", "").lower()
-    return bool((domain and email.strip().lower().endswith(domain))
+    email = email.strip().lower()
+    return bool(any(email.endswith(d) for d in domains)
                 or (plain and name.strip().lower() == plain))
 
 

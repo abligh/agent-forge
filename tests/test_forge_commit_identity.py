@@ -48,32 +48,62 @@ class HostIdentity(unittest.TestCase):
         del data["identity"]
         p = config.Project(data)
         self.assertFalse(tool.host_identity(p, *HOST, environ={},
-                                            fqdn=lambda: "localhost"))
+                                            fqdn=lambda: "localhost",
+                                            hostname=lambda: "localhost"))
 
-    def test_the_domain_defaults_to_the_hosts_own(self):
+    def test_the_domains_default_to_the_hosts_own_names(self):
         data = example()
         del data["identity"]
         p = config.Project(data)
         fqdn = lambda: "build.example.org"
-        self.assertEqual(tool.unattributed_domain(p, {}, fqdn),
-                         "@build.example.org")
-        self.assertTrue(tool.host_identity(p, *HOST, environ={}, fqdn=fqdn))
-        self.assertFalse(tool.host_identity(p, *BOT, environ={}, fqdn=fqdn))
-        self.assertEqual(tool.unattributed_domain(
-            p, {}, lambda: "build.example.org."), "@build.example.org")
+        short = lambda: "build"
+        self.assertEqual(tool.unattributed_domains(p, {}, fqdn, short),
+                         ["@build", "@build.example", "@build.example.org"])
+        for email in ("agent@build.example.org", "claude@build",
+                      "claude@build.example", "x@BUILD.EXAMPLE.ORG"):
+            self.assertTrue(tool.host_identity(
+                p, "X", email, environ={}, fqdn=fqdn, hostname=short), email)
+        self.assertFalse(tool.host_identity(p, *BOT, environ={}, fqdn=fqdn,
+                                            hostname=short))
+        self.assertFalse(tool.host_identity(
+            p, "X", "x@build.example.org.evil", environ={}, fqdn=fqdn,
+            hostname=short))
+        self.assertEqual(tool.unattributed_domains(
+            p, {}, lambda: "build.example.org.", short)[-1],
+            "@build.example.org")
+
+    def test_a_hostname_unlike_the_fqdn_is_reserved_too(self):
+        data = example()
+        del data["identity"]
+        p = config.Project(data)
+        self.assertIn("@box", tool.unattributed_domains(
+            p, {}, lambda: "build.example.org", lambda: "box"))
+        self.assertEqual(tool.unattributed_domains(
+            p, {}, lambda: "", lambda: ""), [])
 
     def test_the_environment_overrides_the_host(self):
         data = example()
         del data["identity"]
         p = config.Project(data)
-        self.assertEqual(tool.unattributed_domain(
-            p, {"FORGE_UNATTRIBUTED_DOMAIN": "@Other.Example"},
-            lambda: "build.example.org"), "@other.example")
+        self.assertEqual(tool.unattributed_domains(
+            p, {"FORGE_UNATTRIBUTED_DOMAIN": "@Other.Example, @b.example"},
+            lambda: "build.example.org", lambda: "build"),
+            ["@other.example", "@b.example"])
 
     def test_the_configuration_wins(self):
-        self.assertEqual(tool.unattributed_domain(
+        self.assertEqual(tool.unattributed_domains(
             project(), {"FORGE_UNATTRIBUTED_DOMAIN": "@other.example"},
-            lambda: "elsewhere.example"), "@build.example.org")
+            lambda: "elsewhere.example", lambda: "x"),
+            ["@build.example.org"])
+
+    def test_the_configuration_may_list_several(self):
+        data = example()
+        data["identity"]["unattributed_domain"] = ["@a.example", "@b"]
+        p = config.Project(data)
+        self.assertTrue(tool.host_identity(p, "X", "q@b", environ={}))
+        self.assertTrue(tool.host_identity(p, "X", "q@a.example", environ={}))
+        self.assertFalse(tool.host_identity(p, "X", "q@build.example.org",
+                                            environ={}))
 
 
 class Borrowed(unittest.TestCase):
