@@ -60,6 +60,8 @@ someone else's.
 
 `reminders` counts delivered reminders only (`reminders_sent`), so
 (a) means the agent was told N more times and the turn is still hers.
+A reminder taken by any of her sessions counts, her twins' included:
+a twin shares her App and may be the session holding the item.
 A turn whose decision has no reminder (`router.ONCE`) never reaches
 (a). The count is the engine's, so (a) works the same under any rules
 module.
@@ -92,9 +94,11 @@ when a run delivers any wake.
   for (b) and `forge-router: <agent> hasn't taken up <item>` for (a);
   the first trigger decides the title. It is opened as the Merger's
   App, which the router already reads GitHub as, labelled `label` (by
-  default `labels.waiting_on_owner`) and `<labels.owner_prefix><agent>`,
-  and its body mentions `to` (by default the repository's owner). It
-  says what triggered it: the item and its reminders for (a), or since
+  default `labels.waiting_on_owner`) and `<labels.owner_prefix><agent>`.
+  That label is the owner's list, so by default the issue mentions and
+  assigns nobody: a mention would add an email on top. With `to` set,
+  the body mentions that login, and still assigns nobody. It says what
+  triggered it: the item and its reminders for (a), or since
   when and the relay's answer for (b), and what a person might do
   (look at her session, restart it, or give the item to someone else).
 * **Later triggers comment** on the open issue: another turn reaching
@@ -125,8 +129,7 @@ nothing. `--seed` never escalates.
   "escalate": {
     "after_reminders": 4,
     "undelivered_minutes": 120,
-    "label": "Status:waiting-owner",
-    "to": "a-person"
+    "label": "Status:waiting-owner"
   }
 }
 ```
@@ -136,7 +139,7 @@ nothing. `--seed` never escalates.
 | `after_reminders` | none: (a) is off | Delivered reminders of one turn after which it escalates. At least 1. |
 | `undelivered_minutes` | none: (b) and §3 are off | How long an agent's wakes may all go undelivered before she escalates. At least 30; 60 or more is advised, since a session restart leaves an agent out of the room for some minutes. |
 | `label` | `labels.waiting_on_owner` | The label the issue is opened with. |
-| `to` | the repository owner | Who the issue's body mentions. |
+| `to` | none: nobody is mentioned | A GitHub login the issue's body mentions. Never assigned. |
 
 At least one of `after_reminders` and `undelivered_minutes` must be
 set. `forge-config check` validates the section: whole numbers in
@@ -169,8 +172,11 @@ Unit tests with a faked relay and GitHub:
   `away`;
 * an unreachable relay sets `relay_down_since`, not per-agent times,
   and opens one relay issue;
+* a reminder taken by a twin session counts toward (a);
 * a second trigger comments, not opens; the issue closes on a
   delivered wake, and on the triggering turn ceasing to be decided;
+* without `to` the body mentions nobody and no one is assigned; with
+  it, the body mentions that login and no one is assigned;
 * a dry run and `--seed` write nothing; config validation.
 
 ## Implementation plan
@@ -180,10 +186,11 @@ Unit tests with a faked relay and GitHub:
    with the tests above; README and docs/router.md.
 3. A release. A project turns it on with one config change.
 
-## Open questions
+## Settled questions
 
-1. Should (a) also count reminders that went to a twin session, or
-   only to the agent's own? Today a delivery to any of her sessions
-   counts, and this design keeps that.
-2. Should the issue be assigned as well as mentioned? Assigning needs
-   `to` to be a GitHub login with access; mentioning does not.
+1. **Twins count.** A reminder delivered to any of the agent's
+   sessions, twins included, counts toward (a): a twin shares the App
+   and holds the item.
+2. **No default `to`, and no assignment.** The `labels.waiting_on_owner`
+   label is the owner's list; a mention on top would only add email.
+   `to`, when set, is a login mentioned in the body, never assigned.
