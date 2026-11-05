@@ -555,9 +555,23 @@ def run_job(sd, job, status, cancelled, run, clock, sleep, spawn_job):
 
 # Recovery: what a restart left behind, deliveries due, pruning.
 
-def start_unit(sd, job, run):
+def bus_env(environ=None, uid=None, isdir=os.path.isdir):
+    """`env XDG_RUNTIME_DIR=/run/user/<uid>` to put before systemd-run when
+    the variable is missing and that directory exists, else nothing. Cron
+    gives a job no XDG_RUNTIME_DIR, and without it `systemd-run --user`
+    can't find the user's bus ("Failed to connect to bus: No medium
+    found"), so no job submitted from cron was ever queued."""
+    environ = os.environ if environ is None else environ
+    if environ.get("XDG_RUNTIME_DIR"):
+        return []
+    path = "/run/user/%d" % (os.getuid() if uid is None else uid)
+    return ["env", "XDG_RUNTIME_DIR=" + path] if isdir(path) else []
+
+
+def start_unit(sd, job, run, prefix=None):
     """systemd-run the ticket's runner; None, or why it didn't start."""
-    argv = ["systemd-run", "--user", "--unit", "forge-queue-" + job["ticket"],
+    argv = (bus_env() if prefix is None else prefix) + [
+        "systemd-run", "--user", "--unit", "forge-queue-" + job["ticket"],
             "--collect", "--quiet", "--description",
             "forge-queue %s: %s" % (job["ticket"], job["name"]),
             sys.executable, os.path.join(BIN, "forge-queue"),

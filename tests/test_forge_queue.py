@@ -45,6 +45,11 @@ class QueueTest(unittest.TestCase):
         self.env = dict(self.r.env, FORGE_CONFIG=self.config,
                         FORGE_AGENT="LeadDev")
         self.units = []
+        # The host's own XDG_RUNTIME_DIR must not decide what the tests
+        # see; BusEnv tests bus_env itself.
+        saved = fq.bus_env
+        fq.bus_env = lambda: []
+        self.addCleanup(setattr, fq, "bus_env", saved)
         self.sent = []
         self.refuse = []
         self.lines = []
@@ -675,3 +680,26 @@ class Message(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BusEnv(unittest.TestCase):
+    def test_cron_without_the_variable_gets_the_users_runtime_dir(self):
+        self.assertEqual(fq.bus_env({}, 1001, lambda p: True),
+                         ["env", "XDG_RUNTIME_DIR=/run/user/1001"])
+
+    def test_a_set_variable_is_left_alone(self):
+        self.assertEqual(fq.bus_env({"XDG_RUNTIME_DIR": "/x"}, 1001,
+                                      lambda p: True), [])
+
+    def test_no_runtime_dir_no_prefix(self):
+        self.assertEqual(fq.bus_env({}, 1001, lambda p: False), [])
+
+    def test_start_unit_puts_the_prefix_first(self):
+        seen = []
+        def run(argv):
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        job = {"ticket": "q-1", "name": "n"}
+        self.assertIsNone(fq.start_unit("/sd", job, run,
+                                          prefix=["env", "X=1"]))
+        self.assertEqual(seen[0][:3], ["env", "X=1", "systemd-run"])
