@@ -168,9 +168,15 @@ class Decision:
 class Lookup:
     """Something fetched besides the query: `run(github, repo, prs,
     issues)` attaches what it finds to the items it covers, so a rule
-    reads it with the item. `repo` is "owner/name"."""
+    reads it with the item. `repo` is "owner/name". With `per_item`,
+    what it fetches for one item serves only that item's own decisions,
+    so a run that `--only` narrows hands it just those items: a lookup
+    that makes a call or two per item then costs a delivery's run what
+    the delivery named, not what is open. Leave it off for one whose
+    rules read across items (a blocker's state, say)."""
     name: str
     run: Callable[..., None]
+    per_item: bool = False
 
 
 @dataclasses.dataclass

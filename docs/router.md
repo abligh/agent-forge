@@ -213,7 +213,13 @@ it always did. A dry run never rechecks.
 and state as cron's runs. A `sweep` is told which items it may decide
 about (`ctx.only`, the numbers, None on a full run), and the engine
 drops every decision about another item, or about none: those are
-cron's runs' to make.
+cron's runs' to make. A lookup made with `per_item=True` is run over
+the named items alone, since what it fetches for another item would
+only feed decisions the engine drops: a module whose lookup reads each
+long thread over REST spends a delivery's run on that delivery. The
+listing itself still covers every open item, so a rule can read
+another item's fields; only a `per_item` lookup's additions are
+missing from the others.
 
 **Exit status.** 0 when nothing was due or everything was delivered; 1
 when some was delivered and the rest stays due; 2 when the queue
