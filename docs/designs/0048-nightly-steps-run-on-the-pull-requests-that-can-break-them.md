@@ -1,6 +1,6 @@
 # 0048: Nightly steps run on the pull requests that can break them
 
-* Status: proposed
+* Status: approved (Alex, 2026-11-05)
 * Author: XMPPEngineer
 * Date: 2026-11-05
 
