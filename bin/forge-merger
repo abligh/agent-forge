@@ -260,6 +260,11 @@ or a value that is not a time, holds it.
   created count, so nobody else can post a green one;
 * every run of the Actions workflow `merge.ci_workflow` (default `ci`)
   on it succeeded. `""` means the project has no such workflow;
+* with `checks.instances.<name>.gate`, that instance's context is
+  `success` on the head, or before the merges of `main` into it, for
+  each pull request the instance applies to; until then the pull
+  request is held, not waited on, so the queue moves past it
+  (`instance_wait`);
 * every gate tool in `merge.gate` exits 0. Each is an argument list
   with `{pr}`, `{base}` (main's tip) and `{head}` filled in, and an
   argument that is exactly `{below}` replaced by the number of a
@@ -613,6 +618,7 @@ token, GitHub or git failed) or the head it waits on is `STALLED`.
 import argparse
 import base64
 import datetime
+import fnmatch
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -988,6 +994,13 @@ RESOLVE_MESSAGE = "Merge %s into %s; %s regenerated"
 UNION = ()
 # merge.hold_labels: labels that hold a pull request.
 HOLD_LABELS = ()
+# checks.instances.<name>.gate: the contexts the Merger requires besides
+# checks.context, on the pull requests each instance applies to, as
+# (context, creator login, path globs or None, label or None).
+GATED = ()
+# How far back through merges of the default branch an instance's
+# verdict on an earlier head of the pull request still counts.
+GATE_DEPTH = 20
 # merge.blocked_by: "body", or "everywhere" as `blocker_state` reads it.
 BLOCKED_BY = "body"
 # merge.said_since: whether the author's remarks and later approvals by
@@ -1046,7 +1059,7 @@ def configure(project):
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
     global FIXED_ORDER, RED_SUSPECT_OUT, UNSTABLE_AFTER, UNSTABLE_BATCHES
-    global RERUN_LABEL, TRAINS, TRAINS_WITHIN
+    global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -1057,6 +1070,12 @@ def configure(project):
     CHANGERS = frozenset(APPROVERS) | {project.owner}
     STATUS_CONTEXT = checks.get("context", DEFAULT_CONTEXT)
     STATUS_CREATOR = project.bot_login(checks.get("poster", ACT_AS))
+    GATED = tuple(
+        (context, project.bot_login(poster or ACT_AS),
+         tuple((scope or {}).get("paths", ())) if scope else None,
+         (scope or {}).get("label") if scope else None)
+        for _name, context, poster, scope
+        in config.gated_instances(project.data))
     BUILD_HOST = project.host
     GATE = tuple(tuple(argv) for argv in merge.get("gate", DEFAULT_GATE))
     CI_WORKFLOW = merge.get("ci_workflow", "ci")
@@ -3495,6 +3514,84 @@ def owners_of(path, rules):
     return owners
 
 
+def newest_status(statuses, context, creator):
+    """(state, description) of the newest status named `context` that
+    `creator` created in `statuses` (REST's list, newest first), or
+    (None, "")."""
+    for status in statuses or []:
+        if (status.get("context") == context
+                and (status.get("creator") or {}).get("login") == creator):
+            return (status.get("state") or "unknown",
+                    status.get("description") or "")
+    return None, ""
+
+
+def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
+    """(state, description, sha) of `context` for `pr`: on its head,
+    or, while the head has none final, on the commit before each merge
+    of the default branch into it (the Merger's own `update-branch`, or
+    the author's), back to the first commit that isn't one. A merge of
+    the default branch changes nothing of the pull request's own, and
+    an instance whose verdicts take an hour would otherwise never
+    catch up with a head the Merger updates whenever the default
+    branch moves. A head's own pending verdict is the answer when no
+    earlier one is final."""
+    commit, first, depth = pr["headRefOid"], None, 0
+    while commit and depth < GATE_DEPTH:
+        depth += 1
+        state, said = newest_status(github.api(
+            "repos/%s/commits/%s/statuses?per_page=100"
+            % (REPO_SLUG, commit)), context, creator)
+        if state not in (None, "pending"):
+            return state, said, commit
+        if first is None:
+            first = (state, said, commit)
+        parents = git(repo, "rev-list", "--parents", "-n", "1", commit,
+                      run=run).stdout.split()
+        if len(parents) != 3 or not is_ancestor(repo, parents[2],
+                                                main_tip, run):
+            break
+        commit = parents[1]
+    return first or (None, "", pr["headRefOid"])
+
+
+def instance_wait(repo, pr, main_tip, github, cache, run=sh):
+    """Why `pr` waits for an instance's context (checks.instances.<name>.
+    gate), or None. An instance applies to a pull request when its
+    block has no `pull_requests`, or the pull request carries its
+    `label`, or changes a path its `paths` match (since it left the
+    default branch; one whose paths git can't list applies). The
+    pull request waits, held, while an instance that applies has no
+    final verdict (`instance_verdict`), and stays held while it is red:
+    the author's push, or the instance's rerun, moves it on. It is held
+    rather than waited on at the front so the queue moves past it: an
+    instance's run can take an hour. Seen on 2026-11-05: a pull request
+    merged with a second platform's run still pending, and broke that
+    platform's default branch for nearly three hours."""
+    labels = None
+    for context, creator, globs, label in GATED:
+        applies = globs is None and label is None
+        if not applies and label:
+            labels = label_names(pr) if labels is None else labels
+            applies = label in labels
+        if not applies and globs:
+            paths = changed_files(repo, main_tip, pr, cache, run)
+            applies = paths is None or any(
+                fnmatch.fnmatchcase(path, glob)
+                for path in paths for glob in globs)
+        if not applies:
+            continue
+        state, said, sha = instance_verdict(repo, pr, main_tip, github,
+                                            context, creator, run)
+        if state == "success":
+            continue
+        if state in (None, "pending"):
+            return "waiting for %s (%s)" % (context, state or "absent")
+        return "%s is %s at %s%s" % (context, state, sha[:10],
+                                     ": " + said if said else "")
+    return None
+
+
 def code_owner_wait(repo, pr, rules, main_ref, run=sh, regenerated=None):
     """Why `pr` waits for a code owner, or None. Each path it changes
     since `main_ref` that `rules` gives owners needs one of them: its
@@ -5267,6 +5364,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         for pr in list(candidates):
             why = rules and code_owner_wait(repo, pr, rules, main_tip, run,
                                             regenerated)
+            if why:
+                held[str(pr["number"])] = why
+                candidates.remove(pr)
+    if GATED:
+        files = {}
+        for pr in list(candidates):
+            have_head(repo, pr, run)
+            why = instance_wait(repo, pr, main_tip, github, files, run)
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)

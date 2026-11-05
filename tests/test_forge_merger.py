@@ -1067,6 +1067,16 @@ class Tick(Decide):
             self.assertEqual(github.writes, [])
         return record, lines
 
+    def test_a_pull_request_waiting_for_an_instance_is_held_and_passed(self):
+        # checks.instances.<name>.gate (agent-forge-next-bundle item 5).
+        m.configure(gated_project({"paths": ["f.*"]}))
+        self.addCleanup(m.configure, project())
+        record, _ = self.tick([self.item(), self.other_pr()])
+        self.assertEqual(record["held"]["5"], "waiting for vm/mac (absent)")
+        # #6 changes no path the instance runs: it is decided as before.
+        self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
+                         [(6, "MERGE")])
+
     def other_pr(self, number=6):
         """An approved pull request on its own branch, clean against
         main, opened after #5."""
@@ -7702,3 +7712,87 @@ class CloseMergedIssues(unittest.TestCase):
         self.close(github, minutes=25 * 60)
         self.assertEqual(m.load_json(
             os.path.join(self.state, m.CLOSING_FILE), {}), {})
+
+
+def gated_project(scope=None):
+    """The example project with a `mac` instance the Merger waits for."""
+    data = example()
+    data["merge"] = {"gate": GATE}
+    block = {"context": "vm/mac", "steps": [{"name": "t", "run": ["true"]}],
+             "poster": "Merger", "gate": True}
+    if scope is not None:
+        block["pull_requests"] = scope
+    data.setdefault("checks", {}).setdefault("instances", {})["mac"] = block
+    return config.Project(data, None)
+
+
+class InstanceGate(RepoCase):
+    """The Merger waits for a gated instance's context on the pull
+    requests it applies to (agent-forge-next-bundle item 5)."""
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        self.addCleanup(m.configure, project())
+
+    def wait(self, statuses, scope=None, labels=()):
+        m.configure(gated_project(scope))
+        item = pr(5, head=self.head,
+                  reviews=[review(REVIEWER, oid=self.approved)])
+        item["labels"] = {"nodes": [{"name": n} for n in labels]}
+        self.github = FakeGitHub({SLUG + "/commits/" + sha: value
+                                  for sha, value in statuses.items()})
+        return m.instance_wait(self.repo.path, item, self.repo.main_tip(),
+                               self.github, {})
+
+    def mac(self, state, description=""):
+        return [status(state, context="vm/mac", description=description)]
+
+    def test_the_configuration_reads_gated_instances(self):
+        m.configure(gated_project({"paths": ["mac/*"], "label": "Check:mac"}))
+        self.assertEqual(m.GATED, (("vm/mac", "mergerwidgetagent[bot]",
+                                    ("mac/*",), "Check:mac"),))
+        m.configure(project())
+        self.assertEqual(m.GATED, ())
+
+    def test_green_on_the_head_passes(self):
+        self.assertIsNone(self.wait({self.head: self.mac("success")}))
+
+    def test_absent_and_pending_wait(self):
+        self.assertEqual(self.wait({self.head: [], self.approved: []}),
+                         "waiting for vm/mac (absent)")
+        self.assertEqual(self.wait({self.head: self.mac("pending"),
+                                    self.approved: []}),
+                         "waiting for vm/mac (pending)")
+
+    def test_red_holds_it(self):
+        self.assertEqual(
+            self.wait({self.head: self.mac("failure", "red(test)")}),
+            "vm/mac is failure at %s: red(test)" % self.head[:10])
+
+    def test_a_verdict_before_a_merge_of_main_counts(self):
+        # The head is a merge of main into the approved commit: the
+        # instance's green on the approved commit is the pull request's.
+        self.assertIsNone(self.wait({self.head: self.mac("pending"),
+                                     self.approved: self.mac("success")}))
+
+    def test_a_pull_request_out_of_scope_does_not_wait(self):
+        self.assertIsNone(self.wait({}, scope={"paths": ["mac/*"]}))
+        self.assertEqual(self.github.calls, [])
+
+    def test_a_path_or_the_label_puts_it_in_scope(self):
+        self.assertEqual(self.wait({self.head: [], self.approved: []},
+                                   scope={"paths": ["f.*"]}),
+                         "waiting for vm/mac (absent)")
+        self.assertEqual(self.wait({self.head: [], self.approved: []},
+                                   scope={"label": "Check:mac"},
+                                   labels=("Check:mac",)),
+                         "waiting for vm/mac (absent)")
+
+    def test_someone_elses_green_does_not_count(self):
+        self.assertEqual(self.wait({self.head: [status(
+            "success", context="vm/mac", creator="mallory")],
+            self.approved: []}), "waiting for vm/mac (absent)")
+

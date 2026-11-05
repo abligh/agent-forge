@@ -143,7 +143,7 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "step_alert": dict, "cpu_share": str,
           "side_by_side": dict, "merger_cpu_weight": int,
           "docker_slices": dict, "pull_requests": dict, "warm": dict,
-          "approved_first": bool}
+          "approved_first": bool, "gate": bool}
 # checks.docker_slices (designs/0031): the slices each step's
 # containers go in, the next merge's run's and every other's.
 DOCKER_SLICES = {"front": str, "other": str}
@@ -175,8 +175,9 @@ INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
 INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
                         "merger_cpu_weight", "docker_slices")
 # And from the block alone, never `checks`: a context the Merger requires
-# can't leave heads unrun (designs/0034).
-INSTANCE_ONLY = ("pull_requests",)
+# can't leave heads unrun (designs/0034). `gate`: the Merger also waits
+# for the instance's context on the pull requests it applies to.
+INSTANCE_ONLY = ("pull_requests", "gate")
 # An instance's host's own exclusive lock, which agents sharing the
 # machine take with `mkdir` (agent-forge issue 54): {dir, wait_minutes}.
 # Instance-only, and checked here rather than as a `checks` key.
@@ -924,6 +925,9 @@ def _check_checks(checks, data, problems, where="checks"):
         else:
             _check_pull_requests(checks["pull_requests"], problems,
                                  where + ".pull_requests")
+    if "gate" in checks and where == "checks":
+        problems.append("checks.gate: only an instance may set it; the "
+                        "Merger always requires checks.context")
     if isinstance(checks.get("step_alert"), dict):
         _check_step_alert(checks["step_alert"], data, problems,
                           where + ".step_alert")
@@ -1125,6 +1129,24 @@ def _check_instances(instances, data, problems):
                if k in INSTANCE_OWN + INSTANCE_INHERITED + INSTANCE_BLOCK_ONLY
                + INSTANCE_ONLY and k != "host"}
         _check_checks(own, data, problems, where)
+
+
+def gated_instances(data):
+    """[(name, context, poster, pull_requests)] of the instances whose
+    block sets `gate: true`, by name: the contexts the Merger requires
+    besides checks.context, on the pull requests each applies to.
+    `poster` is the agent or App name whose statuses count (the block's,
+    else checks.poster, else None for the Merger's own); `pull_requests`
+    the block's scope, or None for every pull request."""
+    checks = data.get("checks", {})
+    got = []
+    for name, block in sorted((checks.get("instances") or {}).items()):
+        if not isinstance(block, dict) or block.get("gate") is not True:
+            continue
+        got.append((name, block.get("context"),
+                    block.get("poster", checks.get("poster")),
+                    block.get("pull_requests")))
+    return got
 
 
 def instance_checks(data, name):

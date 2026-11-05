@@ -461,3 +461,27 @@ class MainNewest(StateCase):
         self.assertTrue(text.startswith("`main` is red for `ci/mac` at "
                                         "cccccccccc on mac-1: test-ios."))
         self.assertIn("closed when a later tip is green for `ci/mac`", text)
+
+
+class GateValidation(unittest.TestCase):
+    """checks.instances.<name>.gate: the Merger waits for the context."""
+
+    def test_a_block_may_set_it(self):
+        self.assertEqual(config.check(with_mac(gate=True,
+                                               pull_requests=SCOPE)), [])
+        self.assertEqual(config.gated_instances(with_mac(
+            gate=True, pull_requests=SCOPE)),
+            [("mac", "ci/mac", "MacChecker", SCOPE)])
+        self.assertEqual(config.gated_instances(with_mac()), [])
+
+    def test_it_is_a_boolean(self):
+        self.assertEqual(config.check(with_mac(gate="yes")), [
+            "checks.instances.mac.gate must be true or false"])
+
+    def test_checks_itself_may_not(self):
+        data = example()
+        data["checks"]["gate"] = True
+        self.assertEqual(config.check(data), [
+            "checks.gate: only an instance may set it; the Merger always "
+            "requires checks.context"])
+

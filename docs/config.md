@@ -1067,14 +1067,30 @@ platform. Without an instance, `forge-pr-check` runs as before.
 | `main_red_issue` | The block only, never inherited: the instance's own issue while its newest default-branch verdict is red (designs/0034), titled by default `The default branch is red for <context> at <sha>`. Its `poster`'s App then needs `issues: write`. |
 | `first_authors`, `merger_first`, `merger_cpu_weight`, `docker_slices` | `checks` only, and refused in a block: they belong to the context the Merger requires. `merge.test_ahead` doesn't apply to an instance either. |
 | `pull_requests` | The block only, and refused in `checks`, whose context the Merger requires on every head: `{"paths": [glob, ...], "label": name}`, either left out but not both. See below. |
+| `gate` | The block only, and refused in `checks`: `true` makes the Merger wait for this instance's context too, on each pull request the instance applies to (default `false`; see below). |
 | `lock` | The block only: the host's own exclusive lock, a directory that agents sharing the machine take with `mkdir`, as `{"dir": path, "wait_minutes": n}` (`wait_minutes` default 60). Before its first step a run takes it and writes `owner` inside (`forge-pr-check <instance> #<pr> <sha> pid <pid> since <time>`), so an agent waiting on it sees who holds it. It lets go when the run ends, however it ends, and only while the owner file still names it. While someone else holds it the run waits, then after `wait_minutes` gives up as a `HOST-FAULT`, naming the holder. That fault isn't counted toward a head's `error`, since the host is busy rather than broken. |
 
 Any other key in a block is refused. An instance's name is lower-case
 letters, digits and hyphens. It keeps its own state directory
 (`<state>/pr-check-<name>`), its `verdicts.log` lines carry its name
 after the first word (`GREEN mac #7 …`), and its workers and chained
-ticks are started with the same `--instance`. The Merger still requires
-`checks.context` alone, so an instance's red can't stall merges.
+ticks are started with the same `--instance`. The Merger requires
+`checks.context` alone, so an instance's red can't stall merges, unless
+the block sets `gate`.
+
+**`gate`: the Merger waits for the instance** (designs/0034, amendment
+of 2026-11-05). With `gate: true`, a pull request the instance applies
+to (every one without `pull_requests`; else one carrying its `label`
+or changing a path its `paths` match, as git lists the pull request's
+changes since it left the default branch) is the Merger's only once
+the instance's context, posted by the block's `poster`'s App, is
+`success`. Until then it is held, `waiting for <context> (absent)` or
+`(pending)`, and while it is red, `<context> is failure at <sha>`; the
+queue moves past it, since an instance's run can take an hour. The
+verdict is read on the head and, while that has none final, on the
+commit before each merge of the default branch into it, so a head the
+Merger updated keeps the verdict of the head it updated. Without
+`gate` nothing changes.
 
 **`pull_requests`: which heads an instance runs** (designs/0034). A
 pull request's head is run only when the pull request carries
