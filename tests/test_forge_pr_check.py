@@ -580,14 +580,17 @@ class Posting(unittest.TestCase):
 
 class Tick(StateCase):
 
-    def tick(self, heads=None, post=None, fail=False, slots=2,
+    slots = 2
+
+    def tick(self, heads=None, post=None, fail=False, slots=None,
              merger_dir=None):
         run = FakeRun((is_pulls, done([], 1 if fail else 0,
                                       heads_tsv(*(heads or [])))))
         self.spawned = []
         rc = pc.tick(self.state_dir, "tok", run,
                      lambda *a: self.spawned.append(a), self.lines.append,
-                     when=T0, post=post, slots=slots, merger_dir=merger_dir)
+                     when=T0, post=post, slots=slots or self.slots,
+                     merger_dir=merger_dir)
         return rc
 
     def merger_says(self, pr, age=datetime.timedelta(minutes=1)):
@@ -622,6 +625,7 @@ class Tick(StateCase):
                                       "after 3 failures"])
 
     def test_starts_the_oldest_waiting_head_after_saving_the_queue(self):
+        self.slots = 1  # which goes first, not how many start
         self.write_state({"waiting": {SHA_B: {
             "pr": 8, "since": pc.iso(T0 - datetime.timedelta(hours=1))}}})
         self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")])
@@ -833,7 +837,30 @@ class Tick(StateCase):
 
     # The Merger's pull request first.
 
+    def test_a_tick_fills_every_free_slot(self):
+        heads = [(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false"),
+                 (9, SHA_C, REPO, "false")]
+        self.tick(heads, slots=3)
+        self.assertEqual(sorted((a[1], a[4]) for a in self.spawned),
+                         sorted(zip((SHA_A, SHA_B, SHA_C), (1, 2, 3))))
+        started = [w.get("started") for w in self.state()["waiting"].values()]
+        self.assertEqual(started, [pc.iso(T0)] * 3)
+
+    def test_a_tick_leaves_waiting_what_the_slots_cannot_take(self):
+        heads = [(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false"),
+                 (9, SHA_C, REPO, "false")]
+        self.tick(heads, slots=2)
+        self.assertEqual([a[4] for a in self.spawned], [1, 2])
+        self.assertEqual(len({a[1] for a in self.spawned}), 2)
+        self.assertEqual(sum("started" in w for w in
+                             self.state()["waiting"].values()), 2)
+
+    def test_a_tick_starts_a_head_once_however_many_slots_are_free(self):
+        self.tick([(7, SHA_A, REPO, "false")], slots=3)
+        self.assertEqual([a[1] for a in self.spawned], [SHA_A])
+
     def test_starts_the_mergers_head_before_an_older_one(self):
+        self.slots = 1  # which goes first, not how many start
         self.write_state({"waiting": {SHA_B: {
             "pr": 8, "since": pc.iso(T0 - datetime.timedelta(hours=1))}}})
         self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
@@ -2505,6 +2532,7 @@ class TickAhead(Tick):
                             SHA_C[:10] in line for line in self.lines))
 
     def test_a_prediction_runs_while_the_mergers_head_is_not_waiting(self):
+        self.slots = 1  # which goes first, not how many start
         self.write_state({"waiting": {SHA_B: {
             "pr": 8, "since": pc.iso(T0 - datetime.timedelta(hours=1))}}})
         self.tick([(8, SHA_B, REPO, "false")], merger_dir=self.merger(),
@@ -2516,6 +2544,7 @@ class TickAhead(Tick):
         self.assertEqual(self.state()["ahead_started"], {SHA_P: pc.iso(T0)})
 
     def test_the_mergers_own_head_comes_first(self):
+        self.slots = 1  # which goes first, not how many start
         self.tick([(7, SHA_A, REPO, "false")], merger_dir=self.merger())
         self.assertEqual(self.spawned, [(self.state_dir, SHA_A, 7, False, 1)])
 
@@ -2542,6 +2571,7 @@ class TickAhead(Tick):
                          [(self.state_dir, SHA_Q, 3, False, 2, None, True)])
 
     def test_predictions_go_before_other_heads_and_then_they_resume(self):
+        self.slots = 1  # which goes first, not how many start
         self.write_state({"waiting": {SHA_B: {"pr": 8, "since": pc.iso(T0)}}})
         merger = self.merger()
         self.tick([(8, SHA_B, REPO, "false")], merger_dir=merger)
@@ -2554,6 +2584,7 @@ class TickAhead(Tick):
         self.assertEqual(self.spawned, [(self.state_dir, SHA_B, 8, False, 1)])
 
     def test_spare_slots_only_puts_any_waiting_head_first(self):
+        self.slots = 1  # which goes first, not how many start
         # designs/0014: predictions only in a slot nothing else wants.
         self.write_state({"waiting": {SHA_B: {"pr": 8, "since": pc.iso(T0)}}})
         with mock.patch.object(pc, "SPARE_ONLY", True):
@@ -2566,6 +2597,7 @@ class TickAhead(Tick):
         self.assertEqual(self.spawned[0][1], SHA_P)
 
     def test_a_default_branch_head_due_goes_before_predictions(self):
+        self.slots = 1  # which goes first, not how many start
         # checks.main: once its head has waited depends_minutes, the
         # default branch goes first, before the Merger's predictions too.
         self.write_state({"waiting": {
@@ -2576,17 +2608,19 @@ class TickAhead(Tick):
         pc.tick(self.state_dir, "tok", FakeRun((is_pulls, done(
             [], 0, heads_tsv((8, SHA_B, REPO, "false"))))),
             lambda *a, **k: spawned.append((a, k)), self.lines.append,
-            when=T0, slots=2, merger_dir=self.merger())
+            when=T0, slots=1, merger_dir=self.merger())
         self.assertEqual(spawned, [((self.state_dir, SHA_C, 0, False, 1,
                                      None), {"main": True})])
 
     def test_a_default_branch_head_not_yet_due_waits_for_predictions(self):
+        self.slots = 1  # which goes first, not how many start
         self.write_state({"waiting": {SHA_C: {"pr": 0, "main": True,
                                               "since": pc.iso(T0)}}})
         self.tick([], merger_dir=self.merger())
         self.assertEqual(self.spawned[0][1], SHA_P)
 
     def test_a_head_that_has_waited_max_wait_goes_before_predictions(self):
+        self.slots = 1  # which goes first, not how many start
         # checks.max_wait_minutes: priority can't starve a head.
         self.write_state({"waiting": {SHA_B: {
             "pr": 8, "since": pc.iso(T0 - datetime.timedelta(minutes=31))}}})
@@ -2598,6 +2632,7 @@ class TickAhead(Tick):
                          "it has waited 30 minutes" % SHA_B[:10])
 
     def test_a_head_put_first_goes_before_predictions(self):
+        self.slots = 1  # which goes first, not how many start
         # checks.first_authors: put first on purpose, so not behind the
         # Merger's predictions either.
         lead = "leaddevwidgetagent[bot]"
@@ -2657,6 +2692,19 @@ class TickAhead(Tick):
                                datetime.timedelta(minutes=30)):
             self.tick([(8, SHA_B, REPO, "false")], merger_dir=self.merger())
         self.assertEqual(self.spawned[0][1], SHA_P)
+
+    def test_a_head_waits_for_a_prediction_this_tick_started(self):
+        # The slots read at the top of the tick don't show it yet; run
+        # beside it, the head would check the same tree twice.
+        self.write_state({"waiting": {SHA_B: {"pr": 8, "since": pc.iso(T0)}}})
+
+        def twins(state, running, checkout, run):
+            return {SHA_B: "the same tree"} if any(
+                f and f[1] == SHA_P and f[4] for f in running) else {}
+        with mock.patch.object(pc, "twin_heads", twins):
+            self.tick([(8, SHA_B, REPO, "false")], merger_dir=self.merger(
+                entries=[entry(8, SHA_P, TREE_1)]))
+        self.assertEqual([a[1] for a in self.spawned], [SHA_P])
 
     def test_a_head_whose_prediction_is_running_waits_to_be_matched(self):
         # #621 at 06:23Z: its head ran beside its own prediction.
