@@ -654,3 +654,14 @@ class Main(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LegacyStateNames(unittest.TestCase):
+    def test_history_reads_the_held_state_by_its_old_name(self):
+        line = json.dumps({"hour": "2026-11-05T10:00Z",
+                           "states": {"eligible but held": 7,
+                                      tool.HELD: 2, tool.MERGING: 3}})
+        got = tool.history_lines([line])["2026-11-05T10:00Z"]["states"]
+        self.assertEqual(got[tool.HELD], 9)
+        self.assertNotIn("eligible but held", got)
+        self.assertEqual(got[tool.MERGING], 3)
