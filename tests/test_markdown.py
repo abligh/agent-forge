@@ -3,6 +3,7 @@ read, and their settings with and without a configuration."""
 import io
 import json
 import os
+import subprocess
 import pathlib
 import tempfile
 import unittest
@@ -93,6 +94,42 @@ class Files(Tree):
         os.chdir(self.dir / "docs")
         docs = markdown.Settings({}, str(self.dir))
         self.assertEqual(markdown.files([], docs), ["../README.md", "./a.md"])
+
+
+class Ignored(unittest.TestCase):
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        subprocess.run(["git", "init", "-q", self.root], check=True)
+        for path in ("a.md", "docs/b.md", "node_modules/x/README.md",
+                     "scratch.md"):
+            full = os.path.join(self.root, path)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as handle:
+                handle.write("# t\n")
+        with open(os.path.join(self.root, ".gitignore"), "w") as handle:
+            handle.write("node_modules/\nscratch.md\n")
+        self.docs = markdown.Settings({"paths": ["**/*.md"]}, self.root)
+
+    def names(self, found):
+        return sorted(os.path.relpath(os.path.abspath(p), self.root)
+                      for p in found)
+
+    def test_configured_globs_leave_out_what_git_ignores(self):
+        self.assertEqual(self.names(markdown.files([], self.docs)),
+                         ["a.md", os.path.join("docs", "b.md")])
+
+    def test_a_named_path_is_read_even_if_ignored(self):
+        path = os.path.join(self.root, "scratch.md")
+        self.assertEqual(self.names(markdown.files([path], self.docs)),
+                         ["scratch.md"])
+
+    def test_outside_a_checkout_nothing_is_ignored(self):
+        fail = lambda args: subprocess.CompletedProcess(args, 128, "", "")
+        found = markdown.tracked_or_new(["a.md"], self.root, fail)
+        self.assertEqual(found, ["a.md"])
 
 
 class Choose(Tree):
