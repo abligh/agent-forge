@@ -50,7 +50,12 @@ was already said:
   (UPDATE_NOTE) that the approval still covers it, so nobody asks for
   a review again;
 * `MERGE` squash-merges, pinned the same way, with GitHub's default
-  message;
+  message. A later live tick, `CLOSE_AFTER` on, closes each issue the
+  pull request's `closingIssuesReferences` names that GitHub left
+  open, with a comment naming the merge, and prints `CLOSED-ISSUE`
+  (`closing.json` in the state directory; one reopened since, or in
+  another repository, is left alone). GitHub does this itself, but
+  not always;
 * `HAND-BACK` comments once per approval and head, whatever the
   reason (`merge.hand_back_once_per_head`, designs/0044; without it,
   once per approval, head and reason), signed `— Merger`. To the author it is a plain comment, and for a conflict
@@ -643,6 +648,27 @@ CHANGERS = frozenset()
 # The App a tick reads and writes with, dry run or not.
 ACT_AS = "Merger"
 SIGNATURE = "— Merger"
+# After a merge, the issues the pull request closes that GitHub left
+# open (agent-forge-next-bundle item 4): asked about once CLOSE_AFTER
+# has passed, so that GitHub's own closing comes first, and forgotten
+# after CLOSE_GIVE_UP. Kept in CLOSING_FILE in the state directory.
+CLOSING_FILE = "closing.json"
+CLOSE_AFTER = datetime.timedelta(minutes=2)
+CLOSE_GIVE_UP = datetime.timedelta(hours=24)
+CLOSING_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      merged
+      mergeCommit { oid }
+      closingIssuesReferences(first: 50) {
+        nodes { number state stateReason repository { nameWithOwner } }
+      }
+    }
+  }
+}"""
+CLOSED_NOTE = ("Closed by the Merger: #%d, which says it closes this "
+               "issue, merged as %s, and GitHub left the issue open.\n\n%s")
 # What the Merger says on a pull request once it has merged `main` in.
 UPDATE_NOTE = ("Merged `%s` into this, cleanly, on top of %s. The approval "
                "of that head still covers the new one, so no review is "
@@ -4778,6 +4804,78 @@ def clear_returned_heads(said, prs, out):
     return cleared
 
 
+def note_closing(state_dir, number, when):
+    """Remember that pull request `number` merged at `when`, so that a
+    later tick closes what it says it closes and GitHub left open."""
+    path = os.path.join(state_dir, CLOSING_FILE)
+    closing = load_json(path, {})
+    if not isinstance(closing, dict):
+        closing = {}
+    closing[str(number)] = iso(when)
+    save_json(path, closing)
+
+
+def close_merged_issues(state_dir, github, when, out):
+    """Close each issue a merged pull request in CLOSING_FILE names in
+    its closingIssuesReferences that is still open CLOSE_AFTER after the
+    merge, with a comment naming the merge (CLOSED_NOTE), and log
+    `CLOSED-ISSUE`. GitHub closes them itself, but not always: seen on
+    2026-11-04, a pull request whose body said `Fixes #N` merged and
+    left #N open, with no event to say why. An issue reopened since
+    (`stateReason` REOPENED) was opened again on purpose and is left
+    alone, as is one in another repository. A pull request is forgotten
+    once asked about, or after CLOSE_GIVE_UP if GitHub can't be read.
+    Returns [{"pr", "issue", "result"}]."""
+    path = os.path.join(state_dir, CLOSING_FILE)
+    closing = load_json(path, {})
+    if not isinstance(closing, dict) or not closing:
+        return []
+    owner, name = REPO_SLUG.split("/")
+    done, keep = [], {}
+    for key, at in sorted(closing.items()):
+        try:
+            merged_at = parse_time(at)
+        except (TypeError, ValueError):
+            continue
+        if when - merged_at < CLOSE_AFTER:
+            keep[key] = at
+            continue
+        try:
+            got = github.api("graphql", "-f", "query=" + CLOSING_QUERY,
+                             "-F", "owner=" + owner, "-F", "name=" + name,
+                             "-F", "number=" + key)
+            node = got["data"]["repository"]["pullRequest"]
+            refs = node["closingIssuesReferences"]["nodes"]
+        except (RuntimeError, KeyError, TypeError, ValueError):
+            if when - merged_at < CLOSE_GIVE_UP:
+                keep[key] = at
+            continue
+        if not node.get("merged"):
+            continue
+        sha = ((node.get("mergeCommit") or {}).get("oid") or "")[:10]
+        for ref in refs or []:
+            if (ref.get("repository") or {}).get("nameWithOwner",
+                                                  REPO_SLUG) != REPO_SLUG:
+                continue
+            if ref.get("state") != "OPEN" or ref.get("stateReason") \
+                    == "REOPENED":
+                continue
+            issue = ref["number"]
+            ok, why = github.write(
+                "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG, issue),
+                body=CLOSED_NOTE % (int(key), sha or "its merge", SIGNATURE))
+            if ok:
+                ok, why = github.write(
+                    "PATCH", "repos/%s/issues/%d" % (REPO_SLUG, issue),
+                    state="closed", state_reason="completed")
+            result = "done" if ok else "refused: " + why
+            out("CLOSED-ISSUE #%d: still open after #%s merged as %s; %s"
+                % (issue, key, sha or "?", result))
+            done.append({"pr": int(key), "issue": issue, "result": result})
+    save_json(path, keep)
+    return done
+
+
 def clear_red_suspects(state_dir, reds, prs, check_state, repo, github,
                        said, live, out, run=sh):
     """Release each red suspect in `reds` whose head the build check has
@@ -5320,6 +5418,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     queue = [pr for pr in queue if pr["number"] not in held_by]
     record = {"at": iso(when), "main": main_tip, "held": held,
               "queue": [pr["number"] for pr in queue], "decisions": []}
+    if live:
+        closed = close_merged_issues(state_dir, github, when, out)
+        if closed:
+            record["closed_issues"] = closed
     if cleared:
         record["suspects_cleared"] = cleared
     QUEUE_VIEW.clear()
@@ -5552,6 +5654,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 "%s, and the Merger could not resolve it (%s)"
                 % (CONFLICT_REASON, step)))
             continue
+        if (live and decision["action"] == "MERGE"
+                and decision.get("result") == "done"):
+            note_closing(state_dir, pr["number"], when)
         if (STACKS and live and decision["action"] == "MERGE"
                 and decision.get("result") == "done"):
             stack = note_merge(state_dir, stack or {}, pr, prs, when)

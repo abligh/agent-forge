@@ -1183,6 +1183,9 @@ class Tick(Decide):
              "result": "done"}])
         self.assertEqual(lines, ["TICK 1 eligible, 0 approved but held; "
                                  "#5 MERGE (done)"])
+        # A later tick closes what it closes, if GitHub left it open.
+        self.assertIn("5", m.load_json(os.path.join(
+            self.state, m.CLOSING_FILE), {}))
 
     def test_live_updates_pinned_to_the_judged_head(self):
         self.advance_main("n.txt")
@@ -7625,3 +7628,77 @@ class ReturnedHead(unittest.TestCase):
         item = pr(5, head="a" * 40,
                   reviews=[review(REVIEWER, at=T3, oid="a" * 40)])
         self.assertEqual(m.clear_returned_heads(said, [item], print), [])
+
+
+class CloseMergedIssues(unittest.TestCase):
+    """After a merge, the issues GitHub left open are closed by a later
+    tick (agent-forge-next-bundle item 4)."""
+
+    def setUp(self):
+        m.configure(project())
+        self.addCleanup(m.configure, project())
+        self.state = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.state]))
+        self.merged = datetime.datetime(2026, 11, 4, 19, 44,
+                                        tzinfo=datetime.timezone.utc)
+        m.note_closing(self.state, 8200, self.merged)
+
+    def answer(self, *refs, merged=True):
+        return {"graphql": {"data": {"repository": {"pullRequest": {
+            "merged": merged, "mergeCommit": {"oid": "f" * 40},
+            "closingIssuesReferences": {"nodes": list(refs)}}}}}}
+
+    def ref(self, number, state="OPEN", reason=None, repo=None):
+        return {"number": number, "state": state, "stateReason": reason,
+                "repository": {"nameWithOwner": repo or m.REPO_SLUG}}
+
+    def close(self, github, minutes=3):
+        lines = []
+        got = m.close_merged_issues(
+            self.state, github,
+            self.merged + datetime.timedelta(minutes=minutes), lines.append)
+        return got, lines
+
+    def test_an_open_issue_is_closed_with_a_comment(self):
+        github = FakeGitHub(self.answer(self.ref(7981),
+                                        self.ref(7982, "CLOSED")))
+        got, lines = self.close(github)
+        self.assertEqual(got, [{"pr": 8200, "issue": 7981,
+                                "result": "done"}])
+        self.assertEqual([(w[0], w[1]) for w in github.writes], [
+            ("POST", "%s/issues/7981/comments" % SLUG),
+            ("PATCH", "%s/issues/7981" % SLUG)])
+        self.assertIn("#8200, which says it closes this issue, merged as "
+                      "ffffffffff", github.writes[0][2]["body"])
+        self.assertEqual(github.writes[1][2], {"state": "closed",
+                                               "state_reason": "completed"})
+        self.assertIn("CLOSED-ISSUE #7981: still open after #8200 merged",
+                      lines[0])
+        # Asked about once: the next tick asks nothing.
+        github = FakeGitHub({})
+        self.assertEqual(self.close(github, minutes=10)[0], [])
+        self.assertEqual(github.calls, [])
+
+    def test_it_waits_for_github_first(self):
+        github = FakeGitHub({})
+        self.assertEqual(self.close(github, minutes=1)[0], [])
+        self.assertEqual(github.calls, [])
+        self.assertIn("8200", m.load_json(
+            os.path.join(self.state, m.CLOSING_FILE), {}))
+
+    def test_reopened_and_other_repositories_are_left_alone(self):
+        github = FakeGitHub(self.answer(
+            self.ref(1, reason="REOPENED"), self.ref(2, repo="x/y")))
+        self.assertEqual(self.close(github)[0], [])
+        self.assertEqual(github.writes, [])
+
+    def test_unreadable_is_kept_until_it_gives_up(self):
+        def refuse():
+            raise RuntimeError("gh api graphql: boom")
+        github = FakeGitHub({"graphql": refuse})
+        self.close(github)
+        self.assertIn("8200", m.load_json(
+            os.path.join(self.state, m.CLOSING_FILE), {}))
+        self.close(github, minutes=25 * 60)
+        self.assertEqual(m.load_json(
+            os.path.join(self.state, m.CLOSING_FILE), {}), {})
