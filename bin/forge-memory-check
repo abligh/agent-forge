@@ -36,6 +36,10 @@ Exit status:
         is gone while topic files remain
     2   no directory named: no --dir, no variable, no configuration
 
+"In the index" means reachable from it: a `(file.md)` link in MEMORY.md,
+or in an index page or topic file it leads to, or a `[[name]]` link
+naming a file's front-matter `name:` or basename.
+
 Warnings don't change the status: the index nearing the limit, or one
 index line longer than `--long-line` bytes, which names the topic file
 its detail belongs in.
@@ -69,6 +73,66 @@ LONG_LINE = memory.LONG_LINE
 WARN_FRACTION = 0.85
 
 LINK = re.compile(r"\(([-A-Za-z0-9_]+\.md)\)")
+# A wiki-style link to another memory by its `name:` slug (or its file's
+# basename): `[[some-memory]]`.
+WIKI = re.compile(r"\[\[([^\]|#\n]+)\]\]")
+NAME = re.compile(r"^name:\s*[\"']?([^\"'\n]+?)[\"']?\s*$", re.M)
+
+
+def _frontmatter_name(text):
+    """The `name:` of a topic file's front matter, or None."""
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    m = NAME.search(text[:end if end != -1 else len(text)])
+    return m.group(1).strip() if m else None
+
+
+def reachable(path, index, present):
+    """The topic files reachable from the index.
+
+    **An index can be layered.** A large memory keeps MEMORY.md short by
+    pointing at index pages (`people-index.md`), which point at topic
+    files; and topic files point at each other with `[[name]]`. A file is
+    loaded when something already loaded leads to it, so a file is
+    indexed when it is reachable from MEMORY.md: through `(file.md)`
+    links and `[[name]]` links, followed transitively, within this
+    directory only. `[[name]]` matches a file's front-matter `name:` or
+    its basename without `.md`. A `[[name]]` that matches nothing is
+    not an error: it marks a memory worth writing later.
+    """
+    texts = {}
+    by_name = {}
+    for f in present:
+        try:
+            with open(os.path.join(path, f), errors="replace") as fh:
+                texts[f] = fh.read()
+        except OSError:
+            texts[f] = ""
+        by_name.setdefault(f[:-3], f)
+    for f, text in texts.items():
+        name = _frontmatter_name(text)
+        if name:
+            by_name.setdefault(name, f)
+
+    def targets(text):
+        for f in LINK.findall(text):
+            if f in present:
+                yield f
+        for name in WIKI.findall(text):
+            f = by_name.get(name.strip())
+            if f:
+                yield f
+
+    seen = set()
+    todo = list(targets(index))
+    while todo:
+        f = todo.pop()
+        if f in seen:
+            continue
+        seen.add(f)
+        todo.extend(targets(texts.get(f, "")))
+    return seen
 
 
 def long_lines(index, threshold):
@@ -134,7 +198,7 @@ def check(path, limit, long_line=LONG_LINE):
             said.append("  ... and %d more" % (len(grown) - 10))
 
     dangling = sorted(linked - present)
-    unindexed = sorted(present - linked)
+    unindexed = sorted(present - reachable(path, index, present))
     if dangling:
         said.append("memory: %d index entr(ies) point at no file: %s"
                     % (len(dangling), ", ".join(dangling[:5])))
@@ -143,12 +207,13 @@ def check(path, limit, long_line=LONG_LINE):
         # An unindexed topic file is not loaded at session start, so it
         # is written and never read: the same silent loss as truncation,
         # arriving by a different route.
-        said.append("memory: %d file(s) are in no index entry: %s"
+        said.append("memory: %d file(s) are in no index entry, directly "
+                    "or through linked files: %s"
                     % (len(unindexed), ", ".join(unindexed[:5])))
         status = 1
 
     if not said:
-        said.append("memory: clean (%d bytes of %d, %d topics, all indexed) "
+        said.append("memory: clean (%d bytes of %d, %d topics, all reachable) "
                     "-- room for about %d more at the current mean of %.0f "
                     "bytes per entry" % (size, limit, entries, room,
                                          mean_line))
