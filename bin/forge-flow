@@ -41,7 +41,10 @@ target about 2).
    on a pull request in a batch of two or more), `waiting on a head
    check` (it waits on, or updated, a head outside such a batch),
    `handed back` (every eligible pull request is back with its author),
-   `eligible but held` (approved pull requests, all held) and `nothing
+   `approved, all held` (approved pull requests, every one held: its
+   own head check pending or red, stacked, Blocked-by, an instance
+   check; the Merger has nothing it may merge, and the cause is in
+   panel 2's waiting list) and `nothing
    eligible`. Minutes in each state, each hour.
 2. Flow: merges, arrivals (pull requests the build check first ran),
    runs, hand-backs and re-cuts, each per hour; the pull requests
@@ -146,7 +149,9 @@ SEARCH = "culprit search"
 BATCH_WAIT = "waiting on a batch top"
 HEAD_WAIT = "waiting on a head check"
 HANDED = "handed back"
-HELD = "eligible but held"
+HELD = "approved, all held"
+# The name this state had before; history lines written then still use it.
+LEGACY_STATES = {"eligible but held": HELD}
 NOTHING = "nothing eligible"
 NO_TICKS = "Merger not ticking"
 STATES = (MERGING, SEARCH, BATCH_WAIT, HEAD_WAIT, HANDED, HELD, NOTHING,
@@ -965,6 +970,11 @@ def history_lines(lines):
     for line in lines:
         try:
             got = json.loads(line)
+            states = got.get("states")
+            if isinstance(states, dict):
+                for old, new in LEGACY_STATES.items():
+                    if old in states:
+                        states[new] = states.get(new, 0) + states.pop(old)
             out[got["hour"]] = got
         except (ValueError, KeyError, TypeError):
             continue
@@ -1108,7 +1118,8 @@ WHAT = {
     BATCH_WAIT: "waiting for the run of a batch's top",
     HEAD_WAIT: "waiting for a head's own check, or its update",
     HANDED: "every eligible pull request is back with its author",
-    HELD: "approved pull requests, but every one held",
+    HELD: "approved pull requests, but every one held (check pending,"
+          " stacked, Blocked-by): nothing may merge",
     NOTHING: "no approved pull request",
     NO_TICKS: "no Merger record for over %d minutes" % (
         GAP.total_seconds() // 60),
