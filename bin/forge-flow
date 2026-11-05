@@ -53,9 +53,12 @@ target about 2).
    on), sized 1, 2-3 and 4+; green batch tops on which all, part or
    none of the batch merged. Graphs of (a), (b) and pull requests per
    merge slot each hour.
-4. Rework: hand-backs told per merge, by cause, with those repeating one
-   already told for the same head apart; red head checks that were
-   `red(merge)` (a conflict) against the other reds.
+4. Rework: hand-backs told to every pull request, divided by the
+   merges (so not a per-pull-request rate), by cause, with those
+   repeating one already told for the same head apart; red head checks
+   that were `red(merge)` (a conflict) against the other reds; and the
+   batch tops' runs, green against red, since a red batch top is a red
+   no single head's check shows.
 5. Latency: first approval to merge, median and p90. Locally, the first
    approval is when the Merger first listed the pull request as queued
    or held. `--github` asks GitHub for the first approving review of
@@ -720,20 +723,23 @@ class Flow:
         first = collections.Counter(h["cause"] for h in told
                                     if not h["repeat"])
         again = collections.Counter(h["cause"] for h in told if h["repeat"])
-        reds = collections.Counter()
+        reds, tops = collections.Counter(), collections.Counter()
         for run in runs:
             end = run["end"]
-            if run["kind"] in ("head", LANE) and end and \
-                    end["res"] in ("green", "red"):
+            if not end or end["res"] not in ("green", "red"):
+                continue
+            if run["kind"] in ("head", LANE):
                 reds["green" if end["res"] == "green" else
                      "red(merge)" if end["steps"] == "merge" else "red"] += 1
+            elif run["kind"] == "ahead":
+                tops[end["res"]] += 1
         return {"hand_backs": {
             "told": len(told), "per_merge": ratio(len(told), n),
             "new": dict(first), "repeats": dict(again),
             "repeats_total": sum(again.values()),
             "per_merge_by_cause": {c: ratio(v, n) for c, v in (
                 first + again).most_common()}},
-            "head_checks": dict(reds)}
+            "head_checks": dict(reds), "batch_checks": dict(tops)}
 
     def _latency(self, merges):
         local, remote = [], []
@@ -925,7 +931,8 @@ class Flow:
 
 HISTORY_KEYS = ("merges", "arrivals", "states", "runs_total",
                 "runs_per_merge", "merge_slots", "hand_backs",
-                "head_checks", "slot_hours", "recuts", "right_of_way_share",
+                "head_checks", "batch_checks", "slot_hours", "recuts",
+                "right_of_way_share",
                 "overdue_mean", "runs_per_merged_pr", "approval_to_merge",
                 "run_seconds", "run_seconds_by_kind")
 
@@ -1666,7 +1673,7 @@ def page(data):
     # 4. Rework.
     causes = sorted({c for k in names for c in
                      w[k]["hand_backs"]["per_merge_by_cause"]})
-    rows = [["hand-backs told per merge"]
+    rows = [["hand-backs told, all pull requests, &divide; merges"]
             + [num(w[k]["hand_backs"]["per_merge"], 2) for k in names]]
     for cause in causes:
         rows.append(["&nbsp;&nbsp;%s" % esc(cause)] + [num(
@@ -1680,10 +1687,19 @@ def page(data):
                           w[k]["head_checks"].get("red(merge)", 0),
                           w[k]["head_checks"].get("red", 0))
         for k in names])
-    out.append("<section><h2>4. Rework</h2>%s<p class=\"note\">A repeat is a "
-               "hand-back told again for a head already handed back. "
-               "red(merge) is a head that conflicts with the default "
-               "branch.</p></section>" % table(head, rows))
+    rows.append(["batch tops: green / red"] + [
+        "%d / %d" % (w[k].get("batch_checks", {}).get("green", 0),
+                     w[k].get("batch_checks", {}).get("red", 0))
+        for k in names])
+    out.append("<section><h2>4. Rework</h2>%s<p class=\"note\">The first "
+               "row counts the hand-backs told to every pull request, "
+               "merged or not, and divides them by the merges: it is not "
+               "how often one merged pull request was handed back. A "
+               "repeat is a hand-back told again for a head already "
+               "handed back. red(merge) is a head that conflicts with the "
+               "default branch. A batch top is the Merger's prediction "
+               "of several pull requests together; its red is not any "
+               "one head's red.</p></section>" % table(head, rows))
     # 5. Latency.
 
     def lat(f, key):

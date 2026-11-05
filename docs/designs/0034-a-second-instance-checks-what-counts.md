@@ -105,6 +105,17 @@ later.
 
 ### 4. A gate later
 
+**Amendment, 2026-11-05.** A pull request in an instance's scope merged
+while its run was still pending, and broke the instance's default
+branch for nearly three hours. A block may now set `gate: true`
+(docs/config.md): the Merger holds each pull request the instance
+applies to until the instance's context is green on it, and the queue
+moves past it meanwhile. The verdict on the head before the Merger's
+own merges of the default branch counts, so the instance need not
+keep up with every update. The three needs below remain for a gate on
+every candidate; this one gates only the pull requests in scope, which
+the instance already runs.
+
 Requiring the instance's context is still left to a later design. It
 needs three things this design doesn't provide:
 - **The instance keeping up with the queue.** Every candidate's head

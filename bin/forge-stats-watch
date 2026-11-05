@@ -33,8 +33,9 @@ configuration's `stats_watch.figures`:
 From `forge-flow`'s figures (designs/0045), read in this process from
 the same state directory:
 
-    hand_backs_per_merge  hand-backs told per merge: over `limit`, or
-                   over `ratio` x the baseline's; its samples are the
+    hand_backs_per_merge  hand-backs told to every pull request,
+                   divided by the merges: over `limit`, or over
+                   `ratio` x the baseline's; its samples are the
                    merges
     prs_per_slot   pull requests merged per green run they rested on:
                    under `limit`, or under the baseline's over `ratio`;
@@ -117,7 +118,8 @@ WHAT = {
     "main_red": ("red build checks of the default branch", "red"),
     "nightly_red_hours": ("the hours since the last green nightly", "h"),
     "main_cpu": ("a default-branch run's CPU time, median", "CPU-s"),
-    "hand_backs_per_merge": ("hand-backs told per merge", "per merge"),
+    "hand_backs_per_merge": ("hand-backs told (all pull requests) ÷ merges",
+                             "per merge"),
     "prs_per_slot": ("pull requests merged per green run", "per run"),
     "reviewer_busy": ("the busiest reviewer's time busy", "%"),
 }

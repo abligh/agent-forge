@@ -50,7 +50,12 @@ was already said:
   (UPDATE_NOTE) that the approval still covers it, so nobody asks for
   a review again;
 * `MERGE` squash-merges, pinned the same way, with GitHub's default
-  message;
+  message. A later live tick, `CLOSE_AFTER` on, closes each issue the
+  pull request's `closingIssuesReferences` names that GitHub left
+  open, with a comment naming the merge, and prints `CLOSED-ISSUE`
+  (`closing.json` in the state directory; one reopened since, or in
+  another repository, is left alone). GitHub does this itself, but
+  not always;
 * `HAND-BACK` comments once per approval and head, whatever the
   reason (`merge.hand_back_once_per_head`, designs/0044; without it,
   once per approval, head and reason), signed `— Merger`. To the author it is a plain comment, and for a conflict
@@ -255,6 +260,11 @@ or a value that is not a time, holds it.
   created count, so nobody else can post a green one;
 * every run of the Actions workflow `merge.ci_workflow` (default `ci`)
   on it succeeded. `""` means the project has no such workflow;
+* with `checks.instances.<name>.gate`, that instance's context is
+  `success` on the head, or before the merges of `main` into it, for
+  each pull request the instance applies to; until then the pull
+  request is held, not waited on, so the queue moves past it
+  (`instance_wait`);
 * every gate tool in `merge.gate` exits 0. Each is an argument list
   with `{pr}`, `{base}` (main's tip) and `{head}` filled in, and an
   argument that is exactly `{below}` replaced by the number of a
@@ -608,6 +618,7 @@ token, GitHub or git failed) or the head it waits on is `STALLED`.
 import argparse
 import base64
 import datetime
+import fnmatch
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -643,6 +654,27 @@ CHANGERS = frozenset()
 # The App a tick reads and writes with, dry run or not.
 ACT_AS = "Merger"
 SIGNATURE = "— Merger"
+# After a merge, the issues the pull request closes that GitHub left
+# open (agent-forge-next-bundle item 4): asked about once CLOSE_AFTER
+# has passed, so that GitHub's own closing comes first, and forgotten
+# after CLOSE_GIVE_UP. Kept in CLOSING_FILE in the state directory.
+CLOSING_FILE = "closing.json"
+CLOSE_AFTER = datetime.timedelta(minutes=2)
+CLOSE_GIVE_UP = datetime.timedelta(hours=24)
+CLOSING_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      merged
+      mergeCommit { oid }
+      closingIssuesReferences(first: 50) {
+        nodes { number state stateReason repository { nameWithOwner } }
+      }
+    }
+  }
+}"""
+CLOSED_NOTE = ("Closed by the Merger: #%d, which says it closes this "
+               "issue, merged as %s, and GitHub left the issue open.\n\n%s")
 # What the Merger says on a pull request once it has merged `main` in.
 UPDATE_NOTE = ("Merged `%s` into this, cleanly, on top of %s. The approval "
                "of that head still covers the new one, so no review is "
@@ -962,6 +994,13 @@ RESOLVE_MESSAGE = "Merge %s into %s; %s regenerated"
 UNION = ()
 # merge.hold_labels: labels that hold a pull request.
 HOLD_LABELS = ()
+# checks.instances.<name>.gate: the contexts the Merger requires besides
+# checks.context, on the pull requests each instance applies to, as
+# (context, creator login, path globs or None, label or None).
+GATED = ()
+# How far back through merges of the default branch an instance's
+# verdict on an earlier head of the pull request still counts.
+GATE_DEPTH = 20
 # merge.blocked_by: "body", or "everywhere" as `blocker_state` reads it.
 BLOCKED_BY = "body"
 # merge.said_since: whether the author's remarks and later approvals by
@@ -1020,7 +1059,7 @@ def configure(project):
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
     global FIXED_ORDER, RED_SUSPECT_OUT, UNSTABLE_AFTER, UNSTABLE_BATCHES
-    global RERUN_LABEL, TRAINS, TRAINS_WITHIN
+    global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -1031,6 +1070,12 @@ def configure(project):
     CHANGERS = frozenset(APPROVERS) | {project.owner}
     STATUS_CONTEXT = checks.get("context", DEFAULT_CONTEXT)
     STATUS_CREATOR = project.bot_login(checks.get("poster", ACT_AS))
+    GATED = tuple(
+        (context, project.bot_login(poster or ACT_AS),
+         tuple((scope or {}).get("paths", ())) if scope else None,
+         (scope or {}).get("label") if scope else None)
+        for _name, context, poster, scope
+        in config.gated_instances(project.data))
     BUILD_HOST = project.host
     GATE = tuple(tuple(argv) for argv in merge.get("gate", DEFAULT_GATE))
     CI_WORKFLOW = merge.get("ci_workflow", "ci")
@@ -3469,6 +3514,84 @@ def owners_of(path, rules):
     return owners
 
 
+def newest_status(statuses, context, creator):
+    """(state, description) of the newest status named `context` that
+    `creator` created in `statuses` (REST's list, newest first), or
+    (None, "")."""
+    for status in statuses or []:
+        if (status.get("context") == context
+                and (status.get("creator") or {}).get("login") == creator):
+            return (status.get("state") or "unknown",
+                    status.get("description") or "")
+    return None, ""
+
+
+def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
+    """(state, description, sha) of `context` for `pr`: on its head,
+    or, while the head has none final, on the commit before each merge
+    of the default branch into it (the Merger's own `update-branch`, or
+    the author's), back to the first commit that isn't one. A merge of
+    the default branch changes nothing of the pull request's own, and
+    an instance whose verdicts take an hour would otherwise never
+    catch up with a head the Merger updates whenever the default
+    branch moves. A head's own pending verdict is the answer when no
+    earlier one is final."""
+    commit, first, depth = pr["headRefOid"], None, 0
+    while commit and depth < GATE_DEPTH:
+        depth += 1
+        state, said = newest_status(github.api(
+            "repos/%s/commits/%s/statuses?per_page=100"
+            % (REPO_SLUG, commit)), context, creator)
+        if state not in (None, "pending"):
+            return state, said, commit
+        if first is None:
+            first = (state, said, commit)
+        parents = git(repo, "rev-list", "--parents", "-n", "1", commit,
+                      run=run).stdout.split()
+        if len(parents) != 3 or not is_ancestor(repo, parents[2],
+                                                main_tip, run):
+            break
+        commit = parents[1]
+    return first or (None, "", pr["headRefOid"])
+
+
+def instance_wait(repo, pr, main_tip, github, cache, run=sh):
+    """Why `pr` waits for an instance's context (checks.instances.<name>.
+    gate), or None. An instance applies to a pull request when its
+    block has no `pull_requests`, or the pull request carries its
+    `label`, or changes a path its `paths` match (since it left the
+    default branch; one whose paths git can't list applies). The
+    pull request waits, held, while an instance that applies has no
+    final verdict (`instance_verdict`), and stays held while it is red:
+    the author's push, or the instance's rerun, moves it on. It is held
+    rather than waited on at the front so the queue moves past it: an
+    instance's run can take an hour. Seen on 2026-11-05: a pull request
+    merged with a second platform's run still pending, and broke that
+    platform's default branch for nearly three hours."""
+    labels = None
+    for context, creator, globs, label in GATED:
+        applies = globs is None and label is None
+        if not applies and label:
+            labels = label_names(pr) if labels is None else labels
+            applies = label in labels
+        if not applies and globs:
+            paths = changed_files(repo, main_tip, pr, cache, run)
+            applies = paths is None or any(
+                fnmatch.fnmatchcase(path, glob)
+                for path in paths for glob in globs)
+        if not applies:
+            continue
+        state, said, sha = instance_verdict(repo, pr, main_tip, github,
+                                            context, creator, run)
+        if state == "success":
+            continue
+        if state in (None, "pending"):
+            return "waiting for %s (%s)" % (context, state or "absent")
+        return "%s is %s at %s%s" % (context, state, sha[:10],
+                                     ": " + said if said else "")
+    return None
+
+
 def code_owner_wait(repo, pr, rules, main_ref, run=sh, regenerated=None):
     """Why `pr` waits for a code owner, or None. Each path it changes
     since `main_ref` that `rules` gives owners needs one of them: its
@@ -4746,6 +4869,110 @@ def clear_green_reruns(said, prs, check_state, out):
     return cleared
 
 
+def clear_returned_heads(said, prs, out):
+    """Forget each hand-back in `said` said under the approval a pull
+    request has now, for another head than it has now, when its head is
+    now the approved commit itself: whatever was wrong with the other
+    head, the approval covers this one exactly. Without this, with
+    `update_once`, the pull request stayed out of the queue until it was
+    approved again: seen on 2026-11-04, a head the Merger's own update
+    left without the approved commit in its history went back to the
+    approved commit, and waited 2.5 hours for a second approval of the
+    commit already approved. Returns the numbers released, after
+    logging `HAND-BACK-CLEARED` for each."""
+    cleared = []
+    for pr in prs:
+        key = str(pr["number"])
+        before = said.get(key)
+        approval = approval_of(pr)
+        if not isinstance(before, dict) or approval is None:
+            continue
+        approved = (approval.get("commit") or {}).get("oid")
+        head = pr.get("headRefOid")
+        if not approved or head != approved or before.get("head") == head \
+                or before.get("approved") != approval.get("submittedAt"):
+            continue
+        out("HAND-BACK-CLEARED #%s: the head is back at the approved "
+            "commit %s, not %s it was handed back at; back in the queue "
+            "under its approval" % (key, head[:10],
+                                    str(before.get("head") or "")[:10]))
+        del said[key]
+        cleared.append(pr["number"])
+    return cleared
+
+
+def note_closing(state_dir, number, when):
+    """Remember that pull request `number` merged at `when`, so that a
+    later tick closes what it says it closes and GitHub left open."""
+    path = os.path.join(state_dir, CLOSING_FILE)
+    closing = load_json(path, {})
+    if not isinstance(closing, dict):
+        closing = {}
+    closing[str(number)] = iso(when)
+    save_json(path, closing)
+
+
+def close_merged_issues(state_dir, github, when, out):
+    """Close each issue a merged pull request in CLOSING_FILE names in
+    its closingIssuesReferences that is still open CLOSE_AFTER after the
+    merge, with a comment naming the merge (CLOSED_NOTE), and log
+    `CLOSED-ISSUE`. GitHub closes them itself, but not always: seen on
+    2026-11-04, a pull request whose body said `Fixes #N` merged and
+    left #N open, with no event to say why. An issue reopened since
+    (`stateReason` REOPENED) was opened again on purpose and is left
+    alone, as is one in another repository. A pull request is forgotten
+    once asked about, or after CLOSE_GIVE_UP if GitHub can't be read.
+    Returns [{"pr", "issue", "result"}]."""
+    path = os.path.join(state_dir, CLOSING_FILE)
+    closing = load_json(path, {})
+    if not isinstance(closing, dict) or not closing:
+        return []
+    owner, name = REPO_SLUG.split("/")
+    done, keep = [], {}
+    for key, at in sorted(closing.items()):
+        try:
+            merged_at = parse_time(at)
+        except (TypeError, ValueError):
+            continue
+        if when - merged_at < CLOSE_AFTER:
+            keep[key] = at
+            continue
+        try:
+            got = github.api("graphql", "-f", "query=" + CLOSING_QUERY,
+                             "-F", "owner=" + owner, "-F", "name=" + name,
+                             "-F", "number=" + key)
+            node = got["data"]["repository"]["pullRequest"]
+            refs = node["closingIssuesReferences"]["nodes"]
+        except (RuntimeError, KeyError, TypeError, ValueError):
+            if when - merged_at < CLOSE_GIVE_UP:
+                keep[key] = at
+            continue
+        if not node.get("merged"):
+            continue
+        sha = ((node.get("mergeCommit") or {}).get("oid") or "")[:10]
+        for ref in refs or []:
+            if (ref.get("repository") or {}).get("nameWithOwner",
+                                                  REPO_SLUG) != REPO_SLUG:
+                continue
+            if ref.get("state") != "OPEN" or ref.get("stateReason") \
+                    == "REOPENED":
+                continue
+            issue = ref["number"]
+            ok, why = github.write(
+                "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG, issue),
+                body=CLOSED_NOTE % (int(key), sha or "its merge", SIGNATURE))
+            if ok:
+                ok, why = github.write(
+                    "PATCH", "repos/%s/issues/%d" % (REPO_SLUG, issue),
+                    state="closed", state_reason="completed")
+            result = "done" if ok else "refused: " + why
+            out("CLOSED-ISSUE #%d: still open after #%s merged as %s; %s"
+                % (issue, key, sha or "?", result))
+            done.append({"pr": int(key), "issue": issue, "result": result})
+    save_json(path, keep)
+    return done
+
+
 def clear_red_suspects(state_dir, reds, prs, check_state, repo, github,
                        said, live, out, run=sh):
     """Release each red suspect in `reds` whose head the build check has
@@ -5140,6 +5367,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
+    if GATED:
+        files = {}
+        for pr in list(candidates):
+            have_head(repo, pr, run)
+            why = instance_wait(repo, pr, main_tip, github, files, run)
+            if why:
+                held[str(pr["number"])] = why
+                candidates.remove(pr)
     queue = order(candidates, prs)
     in_flight = None
     if TEST_AHEAD:
@@ -5169,6 +5404,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         state_dir, reds, prs, check_state, repo, github, said, live, out,
         run) if reds else []
     clear_green_reruns(said, prs, check_state, out)
+    clear_returned_heads(said, prs, out)
     since, overdue = {}, {}
     if AGE_FIRST is not None:
         since = waiting_since(os.path.join(
@@ -5287,6 +5523,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     queue = [pr for pr in queue if pr["number"] not in held_by]
     record = {"at": iso(when), "main": main_tip, "held": held,
               "queue": [pr["number"] for pr in queue], "decisions": []}
+    if live:
+        closed = close_merged_issues(state_dir, github, when, out)
+        if closed:
+            record["closed_issues"] = closed
     if cleared:
         record["suspects_cleared"] = cleared
     QUEUE_VIEW.clear()
@@ -5519,6 +5759,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 "%s, and the Merger could not resolve it (%s)"
                 % (CONFLICT_REASON, step)))
             continue
+        if (live and decision["action"] == "MERGE"
+                and decision.get("result") == "done"):
+            note_closing(state_dir, pr["number"], when)
         if (STACKS and live and decision["action"] == "MERGE"
                 and decision.get("result") == "done"):
             stack = note_merge(state_dir, stack or {}, pr, prs, when)

@@ -23,7 +23,7 @@ AT = "2026-10-09T11:55:00Z"
 AT_2 = "2026-10-09T11:58:00Z"
 
 
-def configured(rerun=RERUN, instance=None):
+def configured(rerun=RERUN, instance=None, as_instance=True):
     data = example()
     if rerun:
         data.setdefault("labels", {})["rerun"] = rerun
@@ -31,7 +31,8 @@ def configured(rerun=RERUN, instance=None):
         data["checks"]["instances"] = {instance: {
             "context": "other/check", "steps": [{"name": "t",
                                                  "run": ["true"]}]}}
-    pc.configure(config.Project(data, None), instance)
+    pc.configure(config.Project(data, None),
+                 instance if as_instance else None)
 
 
 def red(pr=7, failed=("test",), finished=T0 - datetime.timedelta(hours=1)):
@@ -77,9 +78,12 @@ class RerunConfig(unittest.TestCase):
         configured()
         self.assertEqual(pc.RERUN_LABEL, RERUN)
 
-    def test_an_instance_leaves_it_to_the_check_itself(self):
+    def test_an_instance_acts_on_it_too(self):
         configured(instance="mac")
-        self.assertIsNone(pc.RERUN_LABEL)
+        self.assertEqual(pc.RERUN_LABEL, RERUN)
+        self.assertEqual(pc.OTHER_CONTEXTS, ("vm/build-and-test",))
+        configured(instance="mac", as_instance=False)
+        self.assertEqual(pc.OTHER_CONTEXTS, ("other/check",))
 
 
 class RerunTick(base.StateCase):
@@ -546,3 +550,64 @@ class MainRerun(unittest.TestCase):
             todo = pc.take_reruns(self.state, [(92, SHA_A, False, None)],
                                   {SHA_A: (LABELLER, AT_2)}, T0, "/s")
         self.assertEqual(todo, [(92, SHA_A, "again", LABELLER)])
+
+
+def is_status(args):
+    return args[:2] == ["gh", "api"] and args[2].endswith("/status")
+
+
+class RerunAcrossInstances(base.StateCase):
+    """labels.rerun on a head red in another instance's context: each
+    instance runs its own red again, and the label stays on until none
+    is red (agent-forge-next-bundle item 1)."""
+
+    def tearDown(self):
+        pc.configure(config.Project(example(), None))
+        super().tearDown()
+
+    def tick(self, reds, as_instance):
+        configured(instance="mac", as_instance=as_instance)
+        text = "7\t%s\t%s\tfalse\t%s\t%s\n" % (
+            SHA_A, REPO, AUTHOR, json.dumps([RERUN]))
+        statuses = "".join("%s\tfailure\n" % c for c in reds)
+        self.run = FakeRun(
+            (is_pulls, done([], 0, text)),
+            (is_events, done([], 0, "%s\t%s\n" % (LABELLER, AT))),
+            (is_status, done([], 0, statuses)),
+            (is_unlabel, done([], 0, "")),
+            (is_comment, done([], 0, "{}")))
+        self.posts = []
+        return pc.tick(self.state_dir, "tok", self.run, lambda *a: None,
+                       self.lines.append, when=T0,
+                       post=lambda *a: self.posts.append(a) or True,
+                       slots=1)
+
+    def unlabels(self):
+        return [c for c in self.run.calls if is_unlabel(c["args"])]
+
+    def test_the_check_s_green_head_waits_for_the_red_instance(self):
+        self.write_state({"results": {SHA_A: green()}})
+        self.tick(["other/check"], as_instance=False)
+        self.assertIn(SHA_A, self.state()["results"])
+        self.assertEqual((self.unlabels(), self.posts), ([], []))
+
+    def test_the_instance_runs_its_red_and_takes_the_label_off(self):
+        self.write_state({"results": {SHA_A: red()}})
+        self.tick([], as_instance=True)
+        self.assertNotIn(SHA_A, self.state()["results"])
+        self.assertEqual(len(self.unlabels()), 1)
+
+    def test_both_red_the_first_keeps_the_label_for_the_other(self):
+        self.write_state({"results": {SHA_A: red()}})
+        self.tick(["vm/build-and-test"], as_instance=True)
+        self.assertIn(SHA_A, self.state()["reruns"])
+        self.assertEqual(self.unlabels(), [])
+        self.assertIn((SHA_A, "pending", "queued again after a red, by %s"
+                       % LABELLER), self.posts)
+
+    def test_an_instance_never_drops_a_label_it_has_no_red_for(self):
+        self.write_state({"results": {SHA_A: green()}})
+        self.tick([], as_instance=True)
+        self.assertEqual(self.unlabels(), [])
+        self.assertIn(SHA_A, self.state()["results"])
+
