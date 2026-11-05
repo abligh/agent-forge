@@ -35,6 +35,10 @@ printing an empty list that reads as "you own nothing". The items are
 the open issues and pull requests labeled `<labels.owner_prefix><agent>`
 (default `Owner:`), with their `<labels.status_prefix>` labels (default
 `Status:`).
+Items carrying one of `session_start.skip_labels` (default none) are
+left out, such as heartbeat issues a cron job keeps under an owner,
+which are machinery rather than work; the brief says how many it left
+out, so the list never reads as complete when it isn't.
 
 **Then the agent's own role**: its `## <Name>` section of the roles
 file (`docs.roles`, default docs/roles.md). One section can brief
@@ -102,12 +106,22 @@ def listing_path(project, agent):
         project.repo, urllib.parse.quote(owner + agent, safe=":"))
 
 
+class Listing(list):
+    """The listed items, and how many were left out by a skip label."""
+    skipped = 0
+
+
+def skip_labels_of(project):
+    return tuple(project.section("session_start").get("skip_labels") or ())
+
+
 def open_items(project, agent, token, call=github.api_call):
     """[(number, "PR"|"issue", status labels, title)], or an error string.
 
     The agent's open items, PRs included, since the issues endpoint
-    returns both. At most 100: an agent owning more has a different
-    problem.
+    returns both, less those with a `session_start.skip_labels` label
+    (counted in the result's `skipped`). At most 100: an agent owning
+    more has a different problem.
     """
     _, status_prefix = labels_of(project)
     status, raw = github.rest(token, "GET", listing_path(project, agent),
@@ -118,9 +132,13 @@ def open_items(project, agent, token, call=github.api_call):
                                           ": " + message if message else ""))[:200]
     if not isinstance(raw, list):
         return "GitHub returned %s, not a list" % type(raw).__name__
-    items = []
+    skip = skip_labels_of(project)
+    items = Listing()
     for it in raw:
         labels = [l.get("name", "") for l in it.get("labels") or []]
+        if any(l in skip for l in labels):
+            items.skipped += 1
+            continue
         # A PR is marked by the key's presence, not by what it holds.
         items.append((it.get("number"),
                       "PR" if "pull_request" in it else "issue",
@@ -178,6 +196,10 @@ def brief(source, agent, items, project=None, now=None, role=None,
             lines.append("  #%s %-5s %s%s" % (
                 number, kind, (",".join(statuses) + " ") if statuses else "",
                 title[:90]))
+    skipped = getattr(items, "skipped", 0)
+    if agent and skipped:
+        lines.append("  (%d more not listed: they carry a "
+                     "session_start.skip_labels label)" % skipped)
     if agent:
         lines.append("")
         lines.append("Your role (%s, ## %s):\n%s" % (roles_name, agent, role)
