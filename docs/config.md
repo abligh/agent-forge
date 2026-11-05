@@ -713,9 +713,10 @@ request, `unparsed Blocked-by line: ...`, since it was meant as a hold.
 
 `{"author": bool, "approvals": bool, "quiet": [names]}`. With
 `author: true`, the author's own remarks after the approval hold it as
-anyone else's do. With `approvals: true`, a later approval by anyone
-whose approval doesn't count (not a reviewer App) is a remark too, and
-holds it until a reviewer approves again. `quiet`
+anyone else's do. With `approvals: true`, a later approval with text by
+anyone whose approval doesn't count (not a reviewer App) is a remark
+too, and holds it until a reviewer approves again. An approval with no
+text never holds: it says nothing the approver hasn't seen. `quiet`
 names more agents or machinery Apps whose remarks never hold, beside
 the Merger's own. Off by default.
 
