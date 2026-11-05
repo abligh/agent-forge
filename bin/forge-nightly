@@ -56,7 +56,9 @@ dispatch is a comment on the issue, with the commit and why. With
 line at the run's expected end: now plus the median length of the last
 five completed runs, rounded up to the quarter hour, kept in the state
 as `dispatched.until`; forge-router's rules 20 and 21 hold the issue
-until then, or until a red run ends.
+until then, or until a red run ends. A red run that ends before then
+says so with `Defer-until:` now, the issue's newest line, so the idle
+offer (rule 15) stops holding it too.
 
 **A retry fails fast.** When the workflow's file on the default
 branch declares a `workflow_dispatch` input named `first`, a dispatch
@@ -598,7 +600,7 @@ class Tick:
                 saved["issue_open"] = True
                 self.out("%sREOPEN #%d" % (self.would, number))
             if not self.comment(number, "Red again.\n\n" + detail + "\n\n"
-                                + commits):
+                                + commits + self.supersede(saved)):
                 return False
             if labels:
                 ok, _ = self.write("POST", "/repos/%s/issues/%d/labels" % (
@@ -615,6 +617,20 @@ class Tick:
                         "ended": run["updated_at"], "steps": names}
         saved["newest"] = "red"
         return True
+
+    def supersede(self, saved):
+        """With `defer_until`, a line ending the deferral a dispatch wrote
+        when its run ended red before then: `Defer-until:` now, the
+        newest line, which rule 15 reads (designs/0048 §5)."""
+        until = (saved.get("dispatched") or {}).get("until")
+        if not self.cfg["defer_until"] or not until:
+            return ""
+        try:
+            if parse_time(until) <= self.now:
+                return ""
+        except (TypeError, ValueError, AttributeError):
+            return ""
+        return "\n\nDefer-until: %s" % stamp(self.now)
 
     def closed_by(self, pr):
         """The issue numbers pull request `pr` (GraphQL) closes: its

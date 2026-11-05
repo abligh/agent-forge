@@ -511,6 +511,40 @@ class Main(unittest.TestCase):
         self.assertEqual(self.saved()["dispatched"]["until"],
                          "2026-10-23T14:15:00Z")
 
+    def test_an_early_red_supersedes_the_deferral(self):
+        self.data["nightly"]["defer_until"] = True
+        self.save_config()
+        self.red_night()
+        self.main(now=NOW)
+        later = NOW + HOUR + datetime.timedelta(minutes=7)
+        self.main(now=later)
+        self.assertEqual(self.saved()["dispatched"]["until"],
+                         "2026-10-23T14:15:00Z")
+        # Its run ends red at 13:40, before 14:15.
+        ended = NOW + HOUR + datetime.timedelta(minutes=40)
+        self.gh.runs.insert(0, run(3, NEXT_SHA, event="workflow_dispatch",
+                                   ended=ended, started=later))
+        self.gh.jobs[3] = red_jobs()
+        self.main(now=ended + datetime.timedelta(minutes=2))
+        comments = [w[2]["body"] for w in self.writes("POST", "/comments")]
+        dispatch, red = comments[-2], comments[-1]
+        self.assertTrue(red.startswith("Red again."), red)
+        self.assertIn("\n\nDefer-until: 2026-10-23T13:42Z\n\n", red)
+        # The issue's newest line is now, so rule 15 holds it no more.
+        from agent_forge import markers
+        self.assertIsNone(markers.deferred(
+            [("1", dispatch), ("2", red)],
+            ended + datetime.timedelta(minutes=3)))
+        # A red after the expected end adds nothing.
+        self.gh.runs.insert(0, run(4, NEXT_SHA, event="workflow_dispatch",
+                                   ended=NOW + 3 * HOUR,
+                                   started=NOW + 2 * HOUR))
+        self.gh.jobs[4] = red_jobs()
+        self.main(now=NOW + 3 * HOUR + datetime.timedelta(minutes=2))
+        red = self.writes("POST", "/comments")[-1][2]["body"]
+        self.assertTrue(red.startswith("Red again."), red)
+        self.assertNotIn("Defer-until", red)
+
     def test_without_defer_until_no_line(self):
         self.red_night()
         self.main(now=NOW + HOUR)
