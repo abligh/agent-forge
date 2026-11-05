@@ -228,6 +228,11 @@ class Figures(Base):
         self.assertEqual(self.got["head_checks"],
                          {"green": 2, "red(merge)": 1, "red": 1})
 
+    def test_batch_tops_are_counted_apart_from_heads(self):
+        # The one prediction, #3's batch top, went green; no head's
+        # count includes it.
+        self.assertEqual(self.got["batch_checks"], {"green": 1})
+
     def test_first_approval_is_the_first_tick_that_lists_it(self):
         lat = self.got["approval_to_merge"]["local_minutes"]
         # #1 listed at 10:05, merged 10:32; #3 at 10:15, merged 10:33.
@@ -575,6 +580,9 @@ class Main(Base):
         self.assertIn("Builds per merge (all build runs &divide; PRs "
                       "merged)", page)
         self.assertIn("Builds per merged PR along its own path", page)
+        self.assertIn("hand-backs told, all pull requests, &divide; merges",
+                      page)
+        self.assertIn("batch tops: green / red", page)
         self.assertIn('<span title="2 in 1.0 h">2.0 /h</span>', page)
         self.assertEqual(page.count("<svg"), 8)
         self.assertLess(len(page.encode()), 200 * 1024)
