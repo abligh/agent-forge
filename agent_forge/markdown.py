@@ -8,7 +8,10 @@ files, chosen the same way, so they share it here:
   error, so a typo is reported rather than silently checking less;
 * else the configuration's `docs.paths`, globs relative to the
   project's checkout. A glob that matches nothing is skipped, so a
-  project can list a directory it doesn't have yet;
+  project can list a directory it doesn't have yet. What git ignores
+  is left out: a dependency's own Markdown under `node_modules` isn't
+  the project's to fix. A path named on the command line is read
+  regardless;
 * and either way, matching no Markdown file at all is an error: a check
   that read nothing must not pass as one that found nothing wrong.
 
@@ -95,13 +98,37 @@ def expand(patterns, root):
     return found
 
 
-def files(argv_paths, docs):
+def ignored(root, run=proc.sh):
+    """What git ignores under `root`, as absolute paths; a directory
+    ends in a separator. Nothing outside a git checkout."""
+    got = run(["git", "-C", root, "ls-files", "--others", "--ignored",
+               "--exclude-standard", "--directory"])
+    if got.returncode != 0:
+        return ()
+    return tuple(os.path.join(os.path.abspath(root), line)
+                 for line in got.stdout.splitlines() if line)
+
+
+def tracked_or_new(found, root, run=proc.sh):
+    """`found` without the files git ignores."""
+    skip = ignored(root, run)
+    dirs = tuple(path for path in skip if path.endswith("/"))
+    names = set(skip)
+
+    def kept(path):
+        full = os.path.abspath(path)
+        return full not in names and not full.startswith(dirs)
+    return [path for path in found if kept(path)] if skip else found
+
+
+def files(argv_paths, docs, run=proc.sh):
     """The Markdown files to check: `argv_paths` if any were given,
-    else the configured globs. FileNotFoundError for a named path that
-    doesn't exist."""
+    else the configured globs, less what git ignores. FileNotFoundError
+    for a named path that doesn't exist."""
     if argv_paths:
         return markdown_files(argv_paths)
-    return markdown_files(expand(docs.paths, docs.root))
+    return tracked_or_new(markdown_files(expand(docs.paths, docs.root)),
+                          docs.root, run)
 
 
 def choose(prog, argv_paths, err, environ=None, run=proc.sh):
@@ -114,7 +141,7 @@ def choose(prog, argv_paths, err, environ=None, run=proc.sh):
         print(f"{prog}: {exc}", file=err)
         return 2
     try:
-        found = files(argv_paths, docs)
+        found = files(argv_paths, docs, run)
     except FileNotFoundError as exc:
         print(f"{prog}: {exc}", file=err)
         return 2
