@@ -146,7 +146,12 @@ That is not its one run again, and it can be done as often as needed.
 The default branch's red head has no pull request: the label on the
 open `checks.main_red_issue` issue runs it again instead, once, the
 same way, and the label comes off the issue.
-Only a posting tick, and not an instance's (designs/0021), acts on it.
+Only a posting tick acts on it. Every instance (designs/0021) does, for
+its own context: while another of the project's contexts is red on the
+head, a red head here is run again but the label stays on, for the
+instance whose red it is, and a head with nothing of its own to run
+again is left alone. An instance never takes the label off a head it
+has no red for; the check itself does, once nothing else is red there.
 
 **With `checks.approved_first`, approved pull requests go first**: a
 waiting head of a pull request one of the reviewer agents has approved,
@@ -816,6 +821,10 @@ APPROVED_FILE = "approved.json"
 # labels.rerun: the label that runs a red head once more (designs/0022),
 # or None.
 RERUN_LABEL = None
+# The project's other check contexts (checks.context and each instance's
+# but this process's own): labels.rerun stays on a head while one of
+# them is red there, for the instance that posted it.
+OTHER_CONTEXTS = ()
 # checks.max_wait_minutes: how long a pull request's head waits behind
 # others' priority before it goes first itself, or None.
 MAX_WAIT = None
@@ -960,6 +969,7 @@ def configure(project, instance=None):
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
     global MAIN_NEWEST
     global RED_COMMENT, RERUN_LABEL, HOST_FAULT_EXTRA, STEP_ALERT
+    global OTHER_CONTEXTS
     global CACHE_FAULT_TEXT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
     global PULL_REQUESTS, HOST_LOCK, APPROVED_FIRST, REVIEWER_LOGINS
@@ -1026,10 +1036,14 @@ def configure(project, instance=None):
     REVIEWER_LOGINS = frozenset(project.bot_login(name).lower()
                                 for name in project.reviewers())
     URGENT_LABEL = project.section("labels").get("urgent")
-    # One instance taking the label off would hide it from the others,
-    # so only the check checks itself describes acts on it.
-    RERUN_LABEL = project.section("labels").get("rerun") \
-        if instance is None else None
+    # Every instance acts on it, for its own red; one leaves the label
+    # on while another context of the project is red on the head, so
+    # that instance runs its red again too (OTHER_CONTEXTS).
+    RERUN_LABEL = project.section("labels").get("rerun")
+    every = [project.section("checks").get("context", DEFAULT_CONTEXT)] + [
+        b.get("context") for b in (project.section("checks").get(
+            "instances") or {}).values() if isinstance(b, dict)]
+    OTHER_CONTEXTS = tuple(c for c in every if c and c != STATUS_CONTEXT)
     HOST_FAULT_EXTRA = tuple(checks.get("host_fault_text", ()))
     HOST_LOCK = dict(checks["lock"]) \
         if instance is not None and checks.get("lock") else None
@@ -1761,7 +1775,23 @@ def labelled_by(pr, token, run=sh):
     return rows[-1][0] or "someone", rows[-1][1]
 
 
-def take_reruns(state, labelled, labellers, when, state_dir, out=print):
+def reds_elsewhere(sha, token, run=sh):
+    """The OTHER_CONTEXTS whose newest status on `sha` is red (`failure`
+    or `error`), sorted, or None when GitHub can't say."""
+    got = gh(["repos/%s/commits/%s/status" % (REPO_SLUG, sha), "--jq",
+              ".statuses[] | [.context, .state] | @tsv"], token, run)
+    if got.returncode != 0:
+        return None
+    reds = set()
+    for line in got.stdout.splitlines():
+        context, _, state = line.partition("\t")
+        if context in OTHER_CONTEXTS and state in ("failure", "error"):
+            reds.add(context)
+    return sorted(reds)
+
+
+def take_reruns(state, labelled, labellers, when, state_dir, out=print,
+                others=None):
     """labels.rerun, under the state lock, before the heads are queued:
     move each labelled red head's verdict into `reruns`, so note_heads
     queues it as if new, and say what is still to do on GitHub, as
@@ -1774,11 +1804,34 @@ def take_reruns(state, labelled, labellers, when, state_dir, out=print):
     labeller GitHub couldn't name, or that wasn't read (`labellers`), is
     left labelled, for the next tick.
     A head already answered for that labelling only loses the label:
-    taking it off failed last time."""
+    taking it off failed last time.
+
+    `others` ({sha: [context, ...] or None}, from `reds_elsewhere`) is
+    the project's other contexts red on each head: the label is then
+    another instance's to act on too. A red or stuck head here is run
+    again as above, but its todo carries a fifth item, True, so the
+    label stays on (one already answered is left alone); a head with
+    nothing of its own to run again (green, pending, answered) is left
+    alone, label and all. An instance never takes the label off a head
+    with nothing of its own to run again: the check itself does. A head
+    whose other contexts GitHub couldn't read (None) waits a tick."""
     todo = []
     reruns = state.setdefault("reruns", {})
+    others = others or {}
     for pr, sha, draft, repo in labelled:
+        if sha in others and others[sha] is None:
+            continue
+        elsewhere = bool(others.get(sha))
         kind = rerun_kind(state, sha, draft, repo)
+        answered = kind == "again" and (
+            reruns[sha].get("answered") == (labellers.get(sha) or (0, 0))[1])
+        if kind in ("nothing", "green") or answered:
+            if elsewhere or (INSTANCE is not None and kind != "green"):
+                continue
+        if kind == "green" and INSTANCE is not None:
+            # An instance's green is no batch's suspect: the check
+            # itself runs its own green again.
+            continue
         if kind == "nothing":
             todo.append((pr, sha, "drop", None))
             continue
@@ -1831,7 +1884,8 @@ def take_reruns(state, labelled, labellers, when, state_dir, out=print):
         todo.append((pr, sha, "rerun" if kind == "red" else "green", login))
     if not reruns:
         del state["reruns"]
-    return todo
+    return [item + (True,) if others.get(item[1]) and len(item) == 4
+            else item for item in todo]
 
 
 def rerun_text(sha):
@@ -1844,7 +1898,7 @@ def finish_reruns(todo, token, run=sh, post=None, out=print):
     """GitHub's half of take_reruns: the pending status, the comment and
     taking the label off. A write GitHub refuses is printed
     RERUN-FAILED; a label left on is taken off by a later tick."""
-    for pr, sha, what, login in todo:
+    for pr, sha, what, login, *keep in todo:
         if what in ("rerun", "green") and post is not None:
             post(sha, "pending", "queued again after a %s, by %s"
                  % ("red" if what == "rerun" else "green", login))
@@ -1858,6 +1912,10 @@ def finish_reruns(todo, token, run=sh, post=None, out=print):
             if got.returncode != 0:
                 out("RERUN-FAILED #%d %s: commenting: %s"
                     % (pr, sha[:10], (got.stderr or "").strip()[:200]))
+        if keep and keep[0]:
+            # Another context is red here: its instance runs it again
+            # and takes the label off.
+            continue
         got = gh(["-X", "DELETE", "repos/%s/issues/%d/labels/%s"
                   % (REPO_SLUG, pr, urllib.parse.quote(RERUN_LABEL,
                                                        safe=""))],
@@ -3249,13 +3307,18 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     # outside the lock. Only a posting tick writes to GitHub.
     labelled = rerun_labelled(heads) if post is not None else []
     seen = load(state_dir)
+    main_issue = set()
     if post is not None:
-        labelled += main_rerun_labelled(seen, head_of_main, token, run)
-    labellers = {}
+        on_issue = main_rerun_labelled(seen, head_of_main, token, run)
+        main_issue = {sha for _, sha, _, _ in on_issue}
+        labelled += on_issue
+    labellers, others = {}, {}
     if labelled:
         for pr, sha, draft, repo in labelled:
             if rerun_kind(seen, sha, draft, repo) != "nothing":
                 labellers[sha] = labelled_by(pr, token, run)
+            if OTHER_CONTEXTS and sha not in main_issue:
+                others[sha] = reds_elsewhere(sha, token, run)
     # checks.main_red_issue: the pull requests that close the open issue
     # go first (designs/0011, amendment), read outside the lock.
     global MAIN_RED_FIXES
@@ -3279,7 +3342,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             and red.get("issue") else ())
         if labelled:
             todo = take_reruns(state, labelled, labellers, when, state_dir,
-                               out)
+                               out, others)
         # One left out after it was queued here has a pending status
         # that would otherwise never end.
         unrun = [(pr, sha) for pr, sha in dropped if sha in state["waiting"]]
