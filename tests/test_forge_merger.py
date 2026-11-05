@@ -333,6 +333,14 @@ class Deferral(unittest.TestCase):
         self.assertIsNone(self.deferred(
             [comment(AUTHOR, body="Defer-until: 2026-10-07T23:59:59Z")]))
 
+    def test_a_body_edited_after_a_comment_is_the_newer_line(self):
+        older = comment(AUTHOR, at=T2, body="Defer-until: 2026-10-01")
+        edited = pr(body="Defer-until: 2026-10-09", comments=[older])
+        self.assertIsNone(m.deferral_of(edited, NOW))
+        edited["lastEditedAt"] = T3
+        self.assertEqual(m.deferral_of(edited, NOW),
+                         "deferred until 2026-10-09T00:00:00Z")
+
     def test_the_newest_line_wins(self):
         self.assertIsNone(self.deferred([
             comment(AUTHOR, at=T3, body="Defer-until: 2026-10-01"),
