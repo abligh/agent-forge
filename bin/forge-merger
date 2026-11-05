@@ -1378,13 +1378,11 @@ def deferral_of(pr, now):
     """Why `pr` is deferred at `now`, or None. The newest `Defer-until:`
     line wins, across the body, comments and reviews. An unexpired one
     holds the pull request, and so does one that isn't a time: a
-    deferral nobody can read is not a release."""
-    texts = [("", pr.get("body"))]
-    texts += [(c.get("createdAt") or "", c.get("body")) for c in pr["comments"]]
-    texts += [(r.get("submittedAt") or "", r.get("body"))
-              for r in pr["reviews"] if r.get("submittedAt")]
+    deferral nobody can read is not a release. The body is dated by its
+    last edit, as `texts_of` dates it, so a `Defer-until:` edited into the
+    body after a comment's is the newer one."""
     latest = None
-    for _, text in sorted(texts, key=lambda t: t[0]):
+    for _, text in texts_of(pr):
         found = DEFER_ANY_RE.findall(markers_of(text))
         if found:
             latest = found[-1]
