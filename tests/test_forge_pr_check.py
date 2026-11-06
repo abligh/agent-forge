@@ -1131,6 +1131,21 @@ class Tail(unittest.TestCase):
             "[18 earlier lines left out]"])
         self.assertEqual(got[7:], text.splitlines()[-pc.TAIL_LINES:])
 
+    def test_a_panic_that_names_its_thread_id_is_kept(self):
+        """Newer toolchains print the thread's id after its name."""
+        text = ("---- a_bad_input_is_refused stdout ----\n"
+                "thread 'a_bad_input_is_refused' (550726) panicked at "
+                "tests/cli.rs:412:5:\n"
+                "assertion `left == right` failed\n"
+                "\n"
+                + "".join("   Compiling crate%d v0.1.0\n" % i
+                          for i in range(50)))
+        self.assertEqual(pc.tail(text).splitlines()[:3], [
+            "---- a_bad_input_is_refused stdout ----",
+            "thread 'a_bad_input_is_refused' (550726) panicked at "
+            "tests/cli.rs:412:5:",
+            "assertion `left == right` failed"])
+
     def test_a_panics_message_stops_at_a_blank_line_and_its_cap(self):
         text = ("thread 'a' panicked at x.rs:1:1:\n"
                 + "".join("message %d\n" % i

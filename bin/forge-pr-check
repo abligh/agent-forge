@@ -773,16 +773,17 @@ TAIL_LINES = 40
 # prints a failed test's name and messages before the rest of its
 # package's output, and Rust's test harness prints each failed test's
 # captured output under `---- name stdout ----`, where a panic is
-# `thread 'name' panicked at file:line:column:`.
+# `thread 'name' panicked at file:line:column:`, or, from newer Rust
+# toolchains, `thread 'name' (1234) panicked at file:line:column:`.
 FAILURE_LINE = re.compile(
     r"^\s*--- FAIL\b|_test\.go:\d+:|^panic: "
-    r"|^---- \S.* std(out|err) ----$|^thread '.*' panicked at "
+    r"|^---- \S.* std(out|err) ----$|^thread '.*'(?: \(\d+\))? panicked at "
     r"|^test \S+ \.\.\. FAILED$")
 FAILURE_LINES = 40
 # A Rust panic's message is on the lines after its location: up to this
 # many of them are kept with it, stopping at a blank line or at the
 # harness's `note:`.
-PANIC_LINE = re.compile(r"^thread '.*' panicked at ")
+PANIC_LINE = re.compile(r"^thread '.*'(?: \(\d+\))? panicked at ")
 PANIC_MESSAGE_LINES = 6
 # Verdicts older than this are dropped from state.json.
 KEEP = datetime.timedelta(days=21)
