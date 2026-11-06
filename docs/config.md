@@ -165,8 +165,9 @@ slot's caches as it finishes, while it still holds the slot:
    than a day, that the default branch's last green run in the slot
    didn't write (written between its start and end; 3 hours from its
    start when no end was recorded), each with its split debug info
-   (`<name>.*.dwo`); and any `.dwo` older than a day whose unit has
-   nothing left in the directory but its `.d`;
+   (`<name>.*.dwo`); any `.dwo` older than a day whose unit has
+   nothing left in the directory but its `.d`; and any `.o` there
+   older than a day that run didn't write, a Mac's split debug info;
 2. directories directly in an `incremental` directory with nothing in
    them touched for 7 days;
 3. then, until the slot's caches hold at most `cache_limit`, whole

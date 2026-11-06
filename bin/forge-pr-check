@@ -484,9 +484,9 @@ if it is then cheap. The Merger's head and a cheap head never wait.
 
 **With `checks.cache_limit` (say `"40G"`), each run prunes its slot's
 build caches** while it still holds the slot, since nothing else trims
-them and a build tool rarely does: test executables directly in a
-`deps` directory older than a day that the default branch's last green
-run in the slot didn't write go first, then `incremental` directories
+them and a build tool rarely does: test executables and `.o` files
+directly in a `deps` directory older than a day that the default
+branch's last green run in the slot didn't write go first, then `incremental` directories
 untouched for 7 days, then the oldest files until the slot's caches
 hold at most the limit. Links are never followed. What went is logged
 as `CACHE-PRUNED`; a failure to prune is logged and changes nothing
@@ -1589,14 +1589,16 @@ def open_heads(token, run=sh, why=None):
 def changed_paths(pr, token, run=sh):
     """The paths pull request `pr` changes since its merge base, as
     GitHub lists its files, both names of a rename; None when GitHub
-    couldn't be read, and None too for a list GitHub cut short."""
+    couldn't be read, and None too for a list GitHub cut short, or an
+    empty one: a head read just after a push can list nothing, and a
+    pull request that changes nothing has nothing to wait for."""
     got = gh(["--paginate", "repos/%s/pulls/%d/files?per_page=100"
               % (REPO_SLUG, pr), "--jq",
               '.[] | .filename, (.previous_filename // empty)'], token, run)
     if got.returncode != 0:
         return None
     paths = [line for line in got.stdout.splitlines() if line]
-    return None if len(paths) >= FILES_LIMIT else paths
+    return None if not paths or len(paths) >= FILES_LIMIT else paths
 
 
 def files_count(pr, token, run=sh):
@@ -4572,8 +4574,8 @@ def newest_mtime(path):
 
 def prune_caches(roots, limit, now, main_since=None, main_until=None):
     """Prune a slot's build caches, `roots`, in three passes, and return
-    what went: {"executables", "dwo", "incremental", "units", "freed",
-    "left", "over"}.
+    what went: {"executables", "dwo", "objects", "incremental", "units",
+    "freed", "left", "over"}.
 
     1. Executables (no extension) directly in any `deps` directory older
        than STALE_EXECUTABLE that the default branch's last green run in
@@ -4584,7 +4586,10 @@ def prune_caches(roots, limit, now, main_since=None, main_until=None):
        `.dwo` that old whose unit (`<stem>-<hash>`, before the first
        dot) has no other file left in the directory but its `.d`. A
        start alone never keeps everything newer than it: the default
-       branch may not run green in the slot for days.
+       branch may not run green in the slot for days. Also any `.o`
+       that old there, by the same test: split debug info on a Mac,
+       one per codegen unit of every build, which nothing rebuilds from
+       and which slow every process that reads the directory.
     2. Directories directly in any `incremental` directory with nothing
        in them touched for STALE_INCREMENTAL.
     3. Then, until the caches hold at most `limit`, whole directories
@@ -4601,8 +4606,8 @@ def prune_caches(roots, limit, now, main_since=None, main_until=None):
 
     `now`, `main_since` and `main_until` are epoch seconds. A root that
     is a link, or isn't there, is left alone."""
-    gone = {"executables": 0, "dwo": 0, "incremental": 0, "units": 0,
-            "freed": 0, "over": 0}
+    gone = {"executables": 0, "dwo": 0, "objects": 0, "incremental": 0,
+            "units": 0, "freed": 0, "over": 0}
     roots = [r for r in roots if os.path.isdir(r) and not os.path.islink(r)]
     stale = now - STALE_EXECUTABLE.total_seconds()
     if main_since is not None and main_until is None:
@@ -4663,7 +4668,8 @@ def prune_caches(roots, limit, now, main_since=None, main_until=None):
 
 def prune_deps(top, files, stale, mains, remove):
     """Pass 1 of prune_caches in one `deps` directory, `top`, holding
-    `files`: stale executables, their `.dwo`, and orphaned `.dwo`."""
+    `files`: stale executables, their `.dwo`, orphaned `.dwo`, and stale
+    `.o`."""
     def unit(entry):
         return entry.split(".", 1)[0]
 
@@ -4674,6 +4680,17 @@ def prune_deps(top, files, stale, mains, remove):
             dwo.setdefault(unit(entry), []).append(entry)
         elif not entry.endswith(".d"):
             live.add(unit(entry[3:] if entry.startswith("lib") else entry))
+    for entry in files:
+        if not entry.endswith(".o"):
+            continue
+        path = os.path.join(top, entry)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if (not os.path.islink(path) and stat.S_ISREG(st.st_mode)
+                and st.st_mtime < stale and not mains(st.st_mtime)):
+            remove(path, st.st_size, "objects")
     for entry in files:
         if "." in entry or entry.endswith(".dwo"):
             continue
@@ -4760,10 +4777,10 @@ def prune_slot_caches(state_dir, slot, out=print):
     if gone["freed"]:
         log(state_dir, "CACHE-PRUNED %s: freed %d bytes (%d executables, %d "
             "incremental directories, %d directories over the limit); %d "
-            "bytes left; %d split debug info files"
+            "bytes left; %d split debug info files, %d object files"
             % (slot_label(slot), gone["freed"], gone["executables"],
                gone["incremental"], gone["units"], gone["left"],
-               gone["dwo"]),
+               gone["dwo"], gone["objects"]),
             now_utc(), out)
     if gone.get("over"):
         log(state_dir, "CACHE-OVER-LIMIT %s: %d bytes over the limit of %d "
