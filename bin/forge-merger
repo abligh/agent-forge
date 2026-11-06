@@ -978,6 +978,10 @@ ROW_WHILE_ELIGIBLE = True
 AGE_FIRST = None
 AGE_FILE = "waiting-since.json"
 AGE_FORGET = datetime.timedelta(hours=24)
+# merge.own_head_green: commits found green, kept across ticks so that a
+# held pull request costs no status read a tick. GREENS_KEEP newest.
+GREENS_FILE = "greens.json"
+GREENS_KEEP = 2000
 # Design 0026: settings for a project with stricter holds, each off
 # unless set.
 # merge.resolve: [{paths, command, check}], conflicts in generated
@@ -3586,7 +3590,8 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
     that minute, leave its batch, and the batch would be recut, every
     member updated and built again. The merge itself still waits for
     the context on the head it merges (`decide`). Statuses are read
-    once a tick per commit, through `cache`. A pending, red or absent
+    once a tick per commit, through `cache`, which keeps a green across
+    ticks (`load_greens`). A pending, red or absent
     context holds the pull request: nothing merges, boards a batch or a
     train, or is predicted until the build check has passed on it."""
     approved = ((approval or {}).get("commit") or {}).get("oid")
@@ -3618,6 +3623,30 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
     sha, state = seen[-1] if seen else ("", None)
     return GREEN_WAIT_REASON % (STATUS_CONTEXT, state or "absent",
                                 sha[:10] or "its head")
+
+
+def load_greens(state_dir):
+    """The commits earlier ticks found green, for `own_green_wait`. A
+    green is kept though a rerun could turn it red: this only says a
+    pull request may be a candidate, and `decide` reads the head it
+    merges afresh."""
+    try:
+        with open(os.path.join(state_dir, GREENS_FILE)) as handle:
+            kept = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return ({sha: "success" for sha in kept if isinstance(sha, str)}
+            if isinstance(kept, list) else {})
+
+
+def save_greens(state_dir, greens):
+    """Keep the GREENS_KEEP newest green commits of `greens`. A failure
+    only costs the next tick its reads."""
+    kept = [sha for sha, state in greens.items() if state == "success"]
+    try:
+        save_json(os.path.join(state_dir, GREENS_FILE), kept[-GREENS_KEEP:])
+    except OSError:
+        pass
 
 
 def instance_wait(repo, pr, main_tip, github, cache, run=sh):
@@ -5432,7 +5461,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
-    greens = {}
+    greens = load_greens(state_dir) if OWN_HEAD_GREEN else {}
     if OWN_HEAD_GREEN:
         for pr in list(candidates):
             why = own_green_wait(pr, approvals[pr["number"]], github, greens,
@@ -5440,6 +5469,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
+        save_greens(state_dir, greens)
     if GATED:
         files = {}
         for pr in list(candidates):

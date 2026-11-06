@@ -7886,6 +7886,33 @@ class OwnGreenWait(unittest.TestCase):
                                {} if cache is None else cache)
         return got, github
 
+    def test_a_green_kept_from_an_earlier_tick_reads_nothing(self):
+        with tempfile.TemporaryDirectory() as state:
+            first = {}
+            self.assertIsNone(self.wait({self.APPROVED: [status()]}, first)[0])
+            m.save_greens(state, first)
+            kept = m.load_greens(state)
+            got, github = self.wait({}, kept)
+            self.assertIsNone(got)
+            self.assertEqual(github.calls, [])
+
+    def test_only_greens_are_kept(self):
+        with tempfile.TemporaryDirectory() as state:
+            m.save_greens(state, {"a": "pending", "b": "success", "c": None})
+            self.assertEqual(m.load_greens(state), {"b": "success"})
+
+    def test_kept_greens_are_bounded_newest_last(self):
+        with tempfile.TemporaryDirectory() as state:
+            with mock.patch.object(m, "GREENS_KEEP", 2):
+                m.save_greens(state, {s: "success" for s in "abc"})
+            self.assertEqual(list(m.load_greens(state)), ["b", "c"])
+
+    def test_a_broken_greens_file_is_empty(self):
+        with tempfile.TemporaryDirectory() as state:
+            with open(os.path.join(state, m.GREENS_FILE), "w") as handle:
+                handle.write("{")
+            self.assertEqual(m.load_greens(state), {})
+
     def test_green_on_either_commit_passes(self):
         self.assertIsNone(self.wait({self.APPROVED: [status()]})[0])
         self.assertIsNone(self.wait({self.APPROVED: [status("pending")],
