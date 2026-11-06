@@ -8,6 +8,7 @@ changes since its merge base.
 import datetime
 import os
 import pathlib
+import types
 import unittest
 from unittest import mock
 
@@ -482,6 +483,24 @@ class Predictions(ScopedCase):
         top = self.predict(one)
         self.work_ahead(top, {"f" * 40: ["Check:slow"]})
         self.assertEqual(self.ran(), ["fast"])
+
+
+class ChangedPaths(unittest.TestCase):
+    def paths(self, stdout, returncode=0):
+        got = types.SimpleNamespace(returncode=returncode, stdout=stdout)
+        with mock.patch.object(pc, "gh", lambda *args: got):
+            return pc.changed_paths(7, "token")
+
+    def test_the_files_github_lists(self):
+        self.assertEqual(self.paths("a\nb\n"), ["a", "b"])
+
+    def test_unread_is_unknown(self):
+        self.assertIsNone(self.paths("", returncode=1))
+
+    def test_an_empty_list_is_unknown(self):
+        # Stored as out of scope, it held a head out of a gate for good:
+        # a pull request read just after a push can list nothing.
+        self.assertIsNone(self.paths(""))
 
 
 if __name__ == "__main__":

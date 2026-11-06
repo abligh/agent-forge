@@ -295,6 +295,21 @@ class PruneCaches(unittest.TestCase):
         self.assertTrue(os.path.exists(mains))
         self.assertFalse(os.path.exists(later))
 
+    def test_stale_object_files_in_deps_go(self):
+        # A Mac's split debug info: one per codegen unit, millions of them,
+        # and they slow every process that reads the directory.
+        old = make(self.path("debug", "deps", "x-aaa.cgu0.rcgu.o"), 10, 3)
+        new = make(self.path("debug", "deps", "x-bbb.cgu0.rcgu.o"), 10, 0.1)
+        mains = make(self.path("debug", "deps", "x-ccc.cgu0.rcgu.o"), 10, 3.5)
+        elsewhere = make(self.path("debug", "build", "x", "y.o"), 10, 3)
+        gone = pc.prune_caches([self.root], None, NOW,
+                               main_since=NOW - 4 * DAY,
+                               main_until=NOW - 3.2 * DAY)
+        self.assertFalse(os.path.exists(old))
+        for kept in (new, mains, elsewhere):
+            self.assertTrue(os.path.exists(kept), kept)
+        self.assertEqual((gone["objects"], gone["freed"]), (1, 10))
+
     def test_only_extensionless_executables_are_test_binaries(self):
         macro = make(self.path("debug", "deps", "libm-aaa.so"), 1, 3, True)
         script = make(self.path("debug", "deps", "run.sh"), 1, 3, True)
@@ -439,7 +454,8 @@ class PruneSlotCaches(StateCase):
         self.assertEqual(gone["freed"], 80)
         self.assertIn("CACHE-PRUNED slot 2: freed 80 bytes (0 executables, "
                       "0 incremental directories, 1 directories over the limit); "
-                      "0 bytes left; 0 split debug info files", self.lines[-1])
+                      "0 bytes left; 0 split debug info files, 0 object files",
+                      self.lines[-1])
 
     def test_over_the_limit_under_the_ceiling_is_logged(self):
         now = pc.time.time()
