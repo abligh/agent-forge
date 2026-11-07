@@ -510,7 +510,9 @@ tick every candidate it didn't reach whose head conflicts with the
 default branch's tip (`git merge-tree`) is handed back to its author at
 once. The comment and reason are the same as at the front, it is said
 once per approval and head, and it is recorded with `"early": true`.
-A held candidate isn't checked: its hold already covers it. Off by
+A held candidate isn't checked, as its hold already covers it, except
+one held only for an instance's context on `checks.instances`: waiting
+won't remove the conflict, and the instance may never run. Off by
 default (designs/0012).
 
 ### `merge.code_owners`
