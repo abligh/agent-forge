@@ -103,6 +103,25 @@ tracks them), for example:
 
     */5 * * * * … forge-prune-builds --root $HOME/agents --shared $HOME/agents --high-water 85 --low-water 70 --every-minutes 60
 
+### Live caches
+
+Added 2026-11-07. Rule 1 keeps any cache whose worktree has a process
+in it, and a long-running agent's session always has one, so the cache
+that is growing is the one the pressure pass can't reach. On one host
+the filesystem filled in seven hours with one `target/` at 761 GB, and
+the pass saw 87% and cleared nothing.
+
+`--live-trim-hours H`, off unless given, needs `--high-water`. If the
+pressure pass leaves a root at or over the mark, the caches of
+worktrees in use are trimmed, the one with most to give first, until
+the root is under `--low-water`. A trim takes only the files under
+`deps` directories, and the whole sessions under `incremental` ones,
+neither read nor written for H hours and not open, so it leaves what
+current builds use: most of the bulk is earlier copies of re-linked
+test binaries. Rule 2 stands: every Cargo lock is held for the trim, or
+the cache is left alone. A file wrongly taken costs a rebuild, since
+Cargo treats a missing output as stale.
+
 ## Trade-offs
 
 * **Pressure clears build output agents will want again.** That costs

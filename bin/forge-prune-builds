@@ -37,6 +37,16 @@ Designs/0041 adds, each off unless given:
      any cache that passes rules 1 and 2, whatever its idle time, least
      recently used first, until the filesystem is under --low-water. A
      cache used in the last --pressure-floor-hours (default 1) is kept.
+  --live-trim-hours H: if that wasn't enough, the caches of worktrees
+     in use are trimmed too, the one with most to give first, until the
+     filesystem is under --low-water. Rule 1 keeps a whole cache from a
+     live session, which is when it grows: each re-link leaves another
+     copy of a test binary, and nothing else removes them. So this takes
+     only what a build no longer needs: under each `deps` directory the
+     files, and under each `incremental` directory the whole sessions,
+     neither read nor written for H hours and not open. Rule 2 still
+     holds, so a running build is never touched. Cargo rebuilds what is
+     missing, so a wrong guess costs a rebuild.
   --every-minutes N: a run that finds every root under --high-water,
      with the last full scan less than N minutes ago, exits at once,
      so cron can run this every few minutes cheaply.
@@ -376,7 +386,8 @@ def drop_leftovers(leftovers, *, dry_run, out):
 def prune(roots, *, dry_run, merged_hours, idle_hours, repo, token,
           now=None, busy=None, branch_of=current_branch, finished_of=pr_finished,
           out=print, shared=(), high_water=None, low_water=None,
-          floor_hours=1.0, targets=None, usage=used_percent):
+          floor_hours=1.0, targets=None, usage=used_percent,
+          live_trim_hours=None):
     """Scan `roots` (and `shared`), clear what the rules allow, then,
     with `high_water`, clear more under pressure; (cleared, kept, KiB)."""
     now = time.time() if now is None else now
@@ -385,6 +396,8 @@ def prune(roots, *, dry_run, merged_hours, idle_hours, repo, token,
     # Kept caches nothing is using, for the pressure pass:
     # (newest file time, cache, the root it was found under).
     spare = []
+    # Caches of worktrees in use, for --live-trim-hours: (cache, root).
+    live = []
     for root in roots:
         for wt in worktrees(root):
             caches, leftovers = find_caches(wt)
@@ -407,7 +420,9 @@ def prune(roots, *, dry_run, merged_hours, idle_hours, repo, token,
                     if not ok:
                         out("kept %s: %s" % (cache, reason))
                     kept += 1
-                    if not in_use:
+                    if in_use:
+                        live.append((cache, root))
+                    else:
                         spare.append((newest, cache, root))
                     continue
                 cleared += 1
@@ -448,6 +463,13 @@ def prune(roots, *, dry_run, merged_hours, idle_hours, repo, token,
         cleared += n
         kept -= n
         freed += kib
+        if live_trim_hours is not None:
+            _, kib = trim_live(
+                live, sorted(set(roots) | set(shared)), dry_run=dry_run,
+                now=now, hours_old=live_trim_hours, busy=busy,
+                low_water=low_water, high_water=high_water, usage=usage,
+                out=out)
+            freed += kib
     return cleared, kept, freed
 
 
@@ -514,6 +536,106 @@ def mark_scan(path, now):
     os.utime(path, (now, now))
 
 
+def stale_outputs(cache, cutoff, open_paths):
+    """[(path, KiB, is a directory)] for what --live-trim-hours may take
+    from `cache`: the files under its `deps` directories and the sessions
+    under its `incremental` ones (<crate>/<session>, taken whole, since
+    rustc treats a session as one thing) with nothing read or written
+    since `cutoff`, and nothing open. Links are never followed."""
+    found = []
+    for dirpath, dirs, names in os.walk(cache, followlinks=False):
+        leaf = os.path.basename(dirpath)
+        if leaf == "deps":
+            dirs[:] = []
+            for name in names:
+                full = os.path.join(dirpath, name)
+                try:
+                    st = os.lstat(full)
+                except OSError:
+                    continue
+                if max(st.st_atime, st.st_mtime) < cutoff and \
+                        os.path.realpath(full) not in open_paths:
+                    found.append((full, st.st_blocks // 2, False))
+        elif leaf == "incremental":
+            dirs[:] = []
+            for crate in subdirectories(dirpath):
+                for session in subdirectories(crate):
+                    if newest_file_time(session) >= cutoff or is_busy(
+                            session, open_paths):
+                        continue
+                    found.append((session, size_kib(session), True))
+    return found
+
+
+def subdirectories(path):
+    try:
+        with os.scandir(path) as entries:
+            return sorted(e.path for e in entries
+                          if e.is_dir(follow_symlinks=False))
+    except OSError:
+        return []
+
+
+def trim_live(live, roots, *, dry_run, now, hours_old, busy, low_water,
+              high_water, usage, out):
+    """The last resort under pressure (--live-trim-hours): for each root
+    still at `high_water`, take the stale outputs of the caches in
+    `live` [(cache, root)], most to give first, until it is under
+    `low_water`; a cache whose Cargo locks are held is left alone. The
+    locks are held while it is trimmed, so a build that starts waits.
+    Returns (caches trimmed, KiB)."""
+    trimmed = freed = 0
+    cutoff = now - hours_old * 3600
+    for root in roots:
+        now_used = usage(root)
+        if now_used < high_water:
+            continue
+        st = os.statvfs(root)
+        total_kib = ((st.f_blocks - st.f_bfree) + st.f_bavail) * st.f_frsize / 1024
+        ranked = []
+        for cache, where in live:
+            if where != root:
+                continue
+            found = stale_outputs(cache, cutoff, busy)
+            kib = sum(item[1] for item in found)
+            if found:
+                ranked.append((-kib, cache))
+        for give, cache in sorted(ranked):
+            if now_used < low_water:
+                break
+            locks = Locks(cache)
+            try:
+                if not locks.acquired:
+                    out("kept %s: a build holds its lock" % cache)
+                    continue
+                # Read again under the lock: a build may have just ended.
+                found = stale_outputs(cache, cutoff, busy)
+                kib = sum(item[1] for item in found)
+                if not dry_run:
+                    for path, _, is_dir in found:
+                        try:
+                            if is_dir:
+                                shutil.rmtree(path)
+                            else:
+                                os.unlink(path)
+                        except OSError:
+                            pass
+            finally:
+                locks.release()
+            out("%s %.1f GB from live %s: unused for %gh" % (
+                "would trim" if dry_run else "trimmed", kib / 1048576,
+                cache, hours_old))
+            trimmed += 1
+            freed += kib
+            if dry_run:
+                now_used -= 100.0 * kib / total_kib if total_kib else 0
+            else:
+                now_used = usage(root)
+        out("pressure: %s %s %.0f%% used after trimming live caches" % (
+            root, "would be" if dry_run else "now", now_used))
+    return trimmed, freed
+
+
 def trim_aged(path, max_age_s, *, now, dry_run, out):
     """Delete every file under `path` not read or written for `max_age_s`
     seconds (newest of atime and mtime, by lstat: a link is judged by
@@ -565,6 +687,9 @@ def main(argv=None, out=print, err=None, environ=None, **hooks):
     parser.add_argument("--pressure-floor-hours", type=float, default=1,
                         help="under pressure, keep caches used this recently "
                              "(default 1)")
+    parser.add_argument("--live-trim-hours", type=float,
+                        help="if that isn't enough, also trim the caches of "
+                             "worktrees in use: outputs unused this long")
     parser.add_argument("--aged-cache", action="append", default=[],
                         help="an untagged cache (such as GOCACHE) whose "
                              "files are deleted once --aged-days old "
@@ -585,6 +710,10 @@ def main(argv=None, out=print, err=None, environ=None, **hooks):
     if args.high_water is not None and not (
             0 < args.low_water <= args.high_water <= 100):
         err("%s: need 0 < --low-water <= --high-water <= 100" % PROG)
+        return 2
+    if args.live_trim_hours is not None and (
+            args.high_water is None or args.live_trim_hours <= 0):
+        err("%s: --live-trim-hours must be > 0 and needs --high-water" % PROG)
         return 2
     if args.aged_days <= 0:
         err("%s: --aged-days must be > 0" % PROG)
@@ -634,7 +763,8 @@ def main(argv=None, out=print, err=None, environ=None, **hooks):
         roots, dry_run=args.dry_run, merged_hours=args.merged_hours,
         idle_hours=args.idle_hours, repo=repo, token=token, out=out,
         shared=shared, high_water=args.high_water, low_water=args.low_water,
-        floor_hours=args.pressure_floor_hours, **hooks)
+        floor_hours=args.pressure_floor_hours,
+        live_trim_hours=args.live_trim_hours, **hooks)
     for top in aged:
         trim_aged(top, args.aged_days * 86400, now=now,
                   dry_run=args.dry_run, out=out)
