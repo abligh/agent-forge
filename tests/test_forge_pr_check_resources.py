@@ -6,6 +6,7 @@ slot's build caches."""
 import datetime
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -76,6 +77,59 @@ class CheckCpus(unittest.TestCase):
             self.assertEqual(pc.busy_slots(state, slots=2), 2)
             self.assertEqual(pc.busy_slots(state, slots=1), 2)
 
+    def cgroups(self, *quotas):
+        """A cgroup tree with `quotas` from the root down, and this
+        process in the last; (root, proc file)."""
+        top = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, top)
+        root = os.path.join(top, "cg")
+        folder, path = root, ""
+        for depth, quota in enumerate(quotas):
+            os.makedirs(folder, exist_ok=True)
+            if quota is not None:
+                with open(os.path.join(folder, "cpu.max"), "w") as f:
+                    f.write(quota + "\n")
+            if depth < len(quotas) - 1:
+                folder = os.path.join(folder, "d%d" % depth)
+                path += "/d%d" % depth
+        proc = os.path.join(top, "proc")
+        with open(proc, "w") as f:
+            f.write("0::%s\n" % (path or "/"))
+        return root, proc
+
+    def test_cgroup_cpus_rounds_a_quota_up(self):
+        root, proc = self.cgroups("1050000 100000")
+        self.assertEqual(pc.cgroup_cpus(root, proc), 11)
+
+    def test_cgroup_cpus_takes_the_tightest_above_this_process(self):
+        root, proc = self.cgroups("1000000 100000", "max 100000",
+                                  "2000000 100000")
+        self.assertEqual(pc.cgroup_cpus(root, proc), 10)
+
+    def test_cgroup_cpus_is_none_with_no_quota(self):
+        self.assertIsNone(pc.cgroup_cpus(*self.cgroups("max 100000", None)))
+
+    def test_cgroup_cpus_is_none_with_no_cgroup_v2(self):
+        root, proc = self.cgroups("1000000 100000")
+        with open(proc, "w") as f:
+            f.write("1:cpu:/x\n")
+        self.assertIsNone(pc.cgroup_cpus(root, proc))
+        self.assertIsNone(pc.cgroup_cpus(root, proc + ".gone"))
+
+    def test_a_small_quota_is_still_one_cpu(self):
+        root, proc = self.cgroups("50000 100000")
+        self.assertEqual(pc.cgroup_cpus(root, proc), 1)
+
+    def test_online_cpus_takes_the_quota_only_when_it_is_less(self):
+        with mock.patch.object(os, "sched_getaffinity",
+                               lambda _: set(range(32))):
+            with mock.patch.object(pc, "cgroup_cpus", lambda: 10):
+                self.assertEqual(pc.online_cpus(), 10)
+            with mock.patch.object(pc, "cgroup_cpus", lambda: 64):
+                self.assertEqual(pc.online_cpus(), 32)
+            with mock.patch.object(pc, "cgroup_cpus", lambda: None):
+                self.assertEqual(pc.online_cpus(), 32)
+
     def test_online_cpus_is_at_least_one(self):
         self.assertGreaterEqual(pc.online_cpus(), 1)
 
@@ -124,6 +178,22 @@ class CheckResults(unittest.TestCase):
         _, results = self.check(writes({}))
         self.assertEqual(os.listdir(self.kept), [])
         self.assertEqual(results[1]["results_bytes"], 0)
+
+    def test_results_max_is_10_mib_unless_configured(self):
+        self.addCleanup(pc.configure, config.Project(example(), None))
+        pc.configure(config.Project(example(), None))
+        self.assertEqual(pc.RESULTS_MAX, 10 * 1024 * 1024)
+        data = example()
+        data["checks"]["results_max"] = "64M"
+        pc.configure(config.Project(data, None))
+        self.assertEqual(pc.RESULTS_MAX, 64 * 1024 * 1024)
+
+    def test_results_max_must_be_a_size(self):
+        data = example()
+        data["checks"]["results_max"] = "lots"
+        self.assertEqual(config.check(data),
+                         ["checks.results_max must be a size such as 64M "
+                          "(K, M, G or T)"])
 
     def test_too_much_is_dropped_whole(self):
         with mock.patch.object(pc, "RESULTS_MAX", 10):

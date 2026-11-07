@@ -505,7 +505,8 @@ once every `warm.minutes`.
 leave results in, such as a test runner's per-shard times. It is
 `results/<head>/<step>` in the state directory, kept as long as the
 verdict (KEEP), and the verdict's `results` names it. A step that
-leaves more than RESULTS_MAX bytes keeps none, logged as
+leaves more than RESULTS_MAX bytes (10 MiB, or `checks.results_max`)
+keeps none, logged as
 `RESULTS-DROPPED`; one that leaves nothing has no directory.
 
 **While a quiet hold is live on the host, a tick starts nothing**
@@ -794,7 +795,8 @@ KEEP = datetime.timedelta(days=21)
 RESULTS_DIR = "results"
 # Each slot's TMPDIR, in the state directory (slot_tmp).
 TMP_DIR = "tmp"
-RESULTS_MAX = 10 * 1024 * 1024
+DEFAULT_RESULTS_MAX = 10 * 1024 * 1024
+RESULTS_MAX = DEFAULT_RESULTS_MAX
 RESULTS_ORPHAN_AGE = datetime.timedelta(days=1)
 # Each run's step logs, by head, in the state directory (sh_logged):
 # kept for LOGS_AGE, each step's at most LOGS_MAX bytes before
@@ -983,7 +985,8 @@ def configure(project, instance=None):
     (`context`, `poster`, `steps`, `caches`, `slots`, `memory_max`,
     `step_timeout_minutes`, `merger_first`, `depends`,
     `depends_minutes`, `tracer`, `fast_lane`, `merge_default`,
-    `cache_limit`, `reuse`, `fresh`, `first_authors`, `max_wait_minutes`,
+    `cache_limit`, `results_max`, `reuse`, `fresh`, `first_authors`,
+    `max_wait_minutes`,
     `keep_ignored`, `cpu_share`, `side_by_side`, `warm`,
     `scoped_minutes`, each step's `always`, `pull_requests`,
     `version`, `outputs`, `after`, `alone`, `light` and `caches`),
@@ -1001,6 +1004,7 @@ def configure(project, instance=None):
     global STEP_CACHES
     global TEST_AHEAD, SPARE_ONLY, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT, WARM_PATHS, WARM_EVERY
+    global RESULTS_MAX
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     global TRACE_MATCHED_MAIN, CHAIN_WRITES_ONLY, DIRS_BY_NAMES, OUTPUTS
     global MATCH_MAIN_UNRECORDED
@@ -1119,6 +1123,8 @@ def configure(project, instance=None):
     DROP_PREFIXES = tuple(d[:-1] for d in drop if d.endswith("*"))
     CACHE_LIMIT = size_bytes(checks["cache_limit"]) \
         if "cache_limit" in checks else None
+    RESULTS_MAX = size_bytes(checks["results_max"]) \
+        if "results_max" in checks else DEFAULT_RESULTS_MAX
     WARM_PATHS = tuple(checks["warm"]["paths"]) if "warm" in checks else None
     WARM_EVERY = datetime.timedelta(minutes=(checks.get("warm") or {}).get(
         "minutes", DEFAULT_WARM_MINUTES))
@@ -3999,12 +4005,45 @@ def matched(state_dir, sha, pr, same, tree, started, post, out=print,
     return 0
 
 
-def online_cpus():
-    """The CPUs this process may run on, else the host's count."""
+def cgroup_cpus(root="/sys/fs/cgroup", proc="/proc/self/cgroup"):
+    """The CPUs the tightest cgroup v2 `cpu.max` above this process
+    allows, rounded up, else None: a container's quota, which
+    sched_getaffinity can't see, is in the namespace's root. No cgroup
+    v2, or no quota, is None."""
     try:
-        return len(os.sched_getaffinity(0))
+        with open(proc, encoding="utf-8") as f:
+            path = next((line.split(":", 2)[2].strip() for line in f
+                         if line.startswith("0::")), None)
+    except OSError:
+        return None
+    if path is None:
+        return None
+    cpus = []
+    folder = os.path.normpath(root + "/" + path)
+    while True:
+        try:
+            with open(os.path.join(folder, "cpu.max"),
+                      encoding="utf-8") as f:
+                quota, period = f.read().split()
+            if quota != "max":
+                cpus.append(-(-int(quota) // int(period)))
+        except (OSError, ValueError, ZeroDivisionError):
+            pass
+        if len(folder) <= len(root) or not folder.startswith(root):
+            break
+        folder = os.path.dirname(folder)
+    return max(1, min(cpus)) if cpus else None
+
+
+def online_cpus():
+    """The CPUs this process may use: those it may run on, else the
+    host's count, and no more than its cgroup's quota."""
+    try:
+        cpus = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):
-        return os.cpu_count() or 1
+        cpus = os.cpu_count() or 1
+    quota = cgroup_cpus()
+    return cpus if quota is None else min(cpus, quota)
 
 
 def check_cpus(online=None, slots=None, busy=None):
