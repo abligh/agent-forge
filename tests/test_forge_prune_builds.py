@@ -318,6 +318,124 @@ class Pressure(unittest.TestCase):
         self.assertTrue(lines[-1].startswith("pressure: %s would be" % self.fx.root))
 
 
+class LiveTrim(unittest.TestCase):
+    """--live-trim-hours: under pressure a live session's cache gives up
+    only what a build no longer needs."""
+
+    def setUp(self):
+        self.fx = Fixture(self)
+        self.wt = self.fx.worktree("live")
+        self.cache = self.fx.cache(self.wt, age_hours=100)
+        self.old = os.path.join(self.cache, "debug", "deps", "libx.rlib")
+        self.fresh = self.file("debug/deps/liby.rlib", age_hours=1)
+        self.session = os.path.join(self.cache, "debug", "incremental",
+                                    "x-1", "s-old")
+        self.file("debug/incremental/x-1/s-old/a.bin", age_hours=100)
+        self.mixed = os.path.join(self.cache, "debug", "incremental",
+                                  "x-1", "s-new")
+        self.file("debug/incremental/x-1/s-new/a.bin", age_hours=100)
+        self.file("debug/incremental/x-1/s-new/b.bin", age_hours=1)
+        self.other = self.file("debug/build/x/out", age_hours=100)
+
+    def file(self, rel, age_hours):
+        path = os.path.join(self.cache, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"y" * 4096)
+        t = NOW - age_hours * HOUR
+        os.utime(path, (t, t))
+        return path
+
+    def run_it(self, *, usage=lambda r: 90, busy=None, dry_run=False,
+               hours=6):
+        lines = []
+        result = prune.prune(
+            [self.fx.root], dry_run=dry_run, merged_hours=6, idle_hours=48,
+            repo="o/r", token=None, now=NOW,
+            busy={os.path.realpath(self.wt)} | set(busy or ()),
+            branch_of=lambda wt: "b", finished_of=lambda *a: False,
+            out=lines.append, high_water=85, low_water=70,
+            floor_hours=1.0, targets=set(), usage=usage,
+            live_trim_hours=hours)
+        return result, lines
+
+    def test_it_takes_stale_outputs_and_nothing_else(self):
+        self.run_it()
+        self.assertFalse(os.path.exists(self.old))
+        self.assertFalse(os.path.exists(self.session))
+        self.assertTrue(os.path.exists(self.fresh))
+        self.assertTrue(os.path.exists(self.mixed + "/a.bin"))
+        self.assertTrue(os.path.exists(self.other))
+        self.assertTrue(os.path.exists(
+            os.path.join(self.cache, "debug", ".cargo-lock")))
+
+    def test_off_unless_given(self):
+        self.run_it(hours=None)
+        self.assertTrue(os.path.exists(self.old))
+
+    def test_under_high_water_it_does_nothing(self):
+        self.run_it(usage=lambda r: 50)
+        self.assertTrue(os.path.exists(self.old))
+
+    def test_a_held_lock_keeps_everything(self):
+        lock = os.path.join(self.cache, "debug", ".cargo-lock")
+        with open(lock, "rb") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            _, lines = self.run_it()
+        self.assertTrue(os.path.exists(self.old))
+        self.assertIn("kept %s: a build holds its lock" % self.cache, lines)
+
+    def test_an_open_file_stays(self):
+        self.run_it(busy=[os.path.realpath(self.old)])
+        self.assertTrue(os.path.exists(self.old))
+
+    def test_a_link_is_not_followed_out_of_the_cache(self):
+        keep = os.path.join(self.fx.root, "precious")
+        with open(keep, "w") as f:
+            f.write("mine")
+        os.utime(keep, (NOW - 900 * HOUR, NOW - 900 * HOUR))
+        link = os.path.join(self.cache, "debug", "deps", "elsewhere")
+        os.symlink(keep, link)
+        self.run_it()
+        self.assertTrue(os.path.exists(keep))
+
+    def test_it_stops_at_low_water(self):
+        second = self.fx.worktree("second")
+        other = self.fx.cache(second, age_hours=100)
+        lines = []
+        prune.prune(
+            [self.fx.root], dry_run=False, merged_hours=6, idle_hours=48,
+            repo="o/r", token=None, now=NOW,
+            busy={os.path.realpath(self.wt), os.path.realpath(second)},
+            branch_of=lambda wt: "b", finished_of=lambda *a: False,
+            out=lines.append, high_water=85, low_water=70, floor_hours=1.0,
+            targets=set(),
+            usage=self.falling(),
+            live_trim_hours=6)
+        # The first cache was enough: the other is untouched.
+        self.assertTrue(os.path.exists(
+            os.path.join(other, "debug", "deps", "libx.rlib")))
+
+    def falling(self):
+        readings = iter([90, 90, 60])
+        return lambda root: next(readings, 60)
+
+    def test_dry_run_deletes_nothing(self):
+        (_, _, kib), lines = self.run_it(dry_run=True)
+        self.assertTrue(os.path.exists(self.old))
+        self.assertTrue(os.path.exists(self.session))
+        self.assertGreater(kib, 0)
+        self.assertTrue(any(l.startswith("would trim") for l in lines))
+
+    def test_the_flag_needs_a_high_water_mark(self):
+        errors = []
+        code = prune.main(["--root", self.fx.root, "--live-trim-hours", "6"],
+                          out=lambda m: None, err=errors.append, environ={},
+                          finished_of=lambda *a: None)
+        self.assertEqual(code, 2)
+        self.assertIn("needs --high-water", errors[0])
+
+
 class Shared(unittest.TestCase):
     """designs/0041: tagged directories directly under --shared are caches
     shared between worktrees."""
