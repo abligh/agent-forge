@@ -505,8 +505,11 @@ cleanly onto the train's base (the default branch's tip, then each
 train's top), then each next one that touches no file the train
 touches (`trains_within: "clean"`: merges cleanly), up to `batch` pull
 requests, urgent ones only with urgent ones. A stack is never split;
-one longer than `batch` is a train of its own. One that conflicts with
-a train ahead waits for a later train: it is not handed back for that.
+one longer than `batch` is a train of its own. A layer that is red, or
+won't merge onto the layers below it, stays behind with those above it
+(`TRAIN-LEFT`), and the layers below it board without them: a layer
+holds nothing under it back. One that conflicts with a train ahead
+waits for a later train: it is not handed back for that.
 A cut train is fixed: ahead.json says `"trains": true`, its entries
 their `train` and `carriage`, and every train counts as started
 (`fixed_order`), so nothing joins it or moves into it. A member that
@@ -4083,7 +4086,12 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
        next one that touches no file the train touches (or, with
        TRAINS_WITHIN "clean", merges cleanly) and keeps it within
        AHEAD_BATCH, urgent ones only with urgent ones. A stack is never
-       split; one longer than AHEAD_BATCH is a train on its own."""
+       split; one longer than AHEAD_BATCH is a train on its own. Only
+       a layer that is red or won't merge parts from what is below it:
+       it stays behind with the layers above it, and the ones below
+       board. On 2026-11-07 two stacks' bottom pull requests, each
+       fine, waited two hours while newer ones went past, because a
+       layer above conflicted and the whole carriage was skipped."""
     trains = AHEAD_BATCHES if trains is None else trains
     files = {} if files is None else files
     by_number = {pr["number"]: pr for c in carriages for pr in c}
@@ -4161,11 +4169,17 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             sizes.append(len(entries) - start)
     cut = []
     pool = sorted(carriages, key=lambda c: not urgent(c[0]))
+    behind = set()
     while len(sizes) < trains:
         start, touched, kind = len(entries), set(), None
         for carriage in pool:
-            members = [pr for pr in carriage if pr["number"] not in used]
-            if not members or any(pr["number"] in red for pr in members):
+            members = [pr for pr in carriage if pr["number"] not in used
+                       and pr["number"] not in behind]
+            for k, pr in enumerate(members):
+                if pr["number"] in red:
+                    members = members[:k]
+                    break
+            if not members:
                 continue
             size = len(entries) - start
             if size and (urgent(members[0]) != kind
@@ -4185,7 +4199,6 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             for pr in members:
                 entry, failed = predict_one(repo, top, pr, restacks, run)
                 if entry is None:
-                    made = None
                     break
                 entry.update(train=len(sizes),
                              carriage=members[0]["number"])
@@ -4193,8 +4206,18 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                 top = entry["sha"]
             if not made:
                 continue
+            left = [pr["number"] for pr in carriage
+                    if pr["number"] not in used
+                    and pr["number"] not in behind][len(made):]
+            if left:
+                behind.update(left)
+                events.append(("left", "LEFT #%d: won't board with the "
+                               "layers below it, which go without it%s" % (
+                                   left[0], "; also held back: %s" % ", ".join(
+                                       "#%d" % n for n in left[1:])
+                                   if left[1:] else "")))
             entries += made
-            used.update(pr["number"] for pr in members)
+            used.update(e["pr"] for e in made)
             touched |= changed
             kind, parent = urgent(members[0]), top
             if len(entries) - start >= AHEAD_BATCH:

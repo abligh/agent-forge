@@ -140,7 +140,9 @@ of way, overdue, `age_first`, then approval order.
    and is first in line for the next train.
 4. **A train is full** at `batch` pull requests. A stack is never
    split; one that doesn't fit waits for the next train. The first
-   carriage is taken even when its stack is longer than `batch`.
+   carriage is taken even when its stack is longer than `batch`. A
+   layer that is red or won't merge onto the layers below stays behind
+   with those above it, and the layers below board without them.
 5. **Who may not board.** As today, a pull request held, handed back
    under its approval and head, or a red suspect (designs/0044 rule 4)
    can't board. A pull request whose own head has a red verdict can't
