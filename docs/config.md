@@ -670,6 +670,12 @@ exits 0 in a worktree of that merge (the verdict is kept per commit and
 rule in `resolve-checked.json`). Any other conflict is handed back as
 before. Off by default.
 
+With `merge.test_ahead.trains` live, a pull request with such a
+conflict can't board as it stands, and train members stay ahead of it,
+so each live tick resolves the first one behind the trains ahead of its
+turn, with `merge.resolve.union` too (the decision has `"early": true`).
+It boards at the next cut.
+
 ### `merge.resolve.union`
 
 A list of path globs

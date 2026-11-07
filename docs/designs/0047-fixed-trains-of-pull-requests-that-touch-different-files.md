@@ -143,6 +143,10 @@ of way, overdue, `age_first`, then approval order.
    carriage is taken even when its stack is longer than `batch`. A
    layer that is red or won't merge onto the layers below stays behind
    with those above it, and the layers below board without them.
+   A pull request that conflicts with `main` only where
+   `merge.resolve` or its `union` would resolve it can't board as it
+   stands, and train members stay ahead of it, so the Merger resolves
+   it ahead of its turn, one each tick, and it boards at the next cut.
 5. **Who may not board.** As today, a pull request held, handed back
    under its approval and head, or a red suspect (designs/0044 rule 4)
    can't board. A pull request whose own head has a red verdict can't

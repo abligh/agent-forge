@@ -6869,6 +6869,40 @@ class Union(unittest.TestCase):
         return m.union_push(self.repo.path, decision, self.repo.main_tip(),
                             github or FakeGitHub({}), self.git_run())
 
+    def ahead(self, skip=(), item=None, github=None):
+        item = item or self.item()
+        item.setdefault("baseRefName", "main")
+        item.setdefault("headRefName", "b5")
+        return m.resolve_ahead(
+            self.repo.path, self.state, [item], set(skip),
+            {5: m.approval_of(item)}, self.repo.main_tip(),
+            github or FakeGitHub({}), {}, self.git_run())
+
+    def test_resolved_ahead_of_its_turn_with_trains(self):
+        got = self.ahead()
+        self.assertEqual([d["action"] for d in got], ["UNION"])
+        self.assertEqual(got[0]["result"], "done")
+        self.assertTrue(got[0]["early"])
+        self.assertEqual(got[0]["files"], {"CHANGES.md": [[1, 1]]})
+
+    def test_a_member_of_a_train_is_left_alone(self):
+        self.assertEqual(self.ahead(skip=[5]), [])
+
+    def test_a_layer_is_left_alone(self):
+        item = self.item()
+        item["baseRefName"] = "lower"
+        self.assertEqual(self.ahead(item=item), [])
+
+    def test_one_it_cannot_resolve_waits_for_its_turn(self):
+        self.configure(globs=("*.txt",))
+        self.assertEqual(self.ahead(), [])
+
+    def test_a_failed_resolve_is_handed_back(self):
+        m.RESOLVE_IDENTITY = None
+        got = self.ahead()
+        self.assertEqual([d["action"] for d in got], ["UNION", "HAND-BACK"])
+        self.assertIn("could not resolve it (identity)", got[1]["reason"])
+
     def hand_merge(self, text):
         """The author's own merge of main, resolved as `text`."""
         got = subprocess.run(["git", "-C", self.repo.path, "merge", "-q",
@@ -7038,6 +7072,16 @@ class Union(unittest.TestCase):
                                     "identity is unknown"),
                           ("HAND-BACK", "already said")])
         self.assertEqual(github.writes, [])
+
+    def test_early_conflicts_leave_generated_files_to_the_merger(self):
+        m.configure(project(early_conflicts=True, resolve=[
+            {"paths": ["CHANGES.md"], "command": ["true"],
+             "check": ["true"]}]))
+        got = m.early_conflicts(
+            self.repo.path, self.repo.main_tip(), [self.item()],
+            {5: m.approval_of(self.item())}, FakeGitHub({}), {}, True,
+            self.git_run())
+        self.assertEqual(got, [])
 
     def test_early_conflicts_leave_a_resolvable_one_to_the_merger(self):
         self.configure(early_conflicts=True)
@@ -7403,6 +7447,29 @@ class Trains(RepoCase):
         entries, sizes, _ = self.cut([[self.item()], [six], [seven],
                                       [eight]])
         self.assertEqual(self.numbers(entries, sizes), [[5, 6, 7], [8]])
+
+    def test_a_resolvable_conflict_is_resolved_behind_the_train(self):
+        # Clean ones overtook such a pull request for as long as there
+        # were any; it now gets a head that boards at the next cut.
+        data = urgent_project(
+            resolve={"union": ["*.md"]},
+            test_ahead={"batch": 3, "batches": 2, "depth": 5,
+                        "trains": "live"})
+        m.configure(data)
+        m.RESOLVE_IDENTITY = IDENTITY
+        self.addCleanup(setattr, m, "RESOLVE_IDENTITY", None)
+        self.advance_main("base.md", "* base\n")
+        six = self.change(6, "x.txt", "x\n")
+        seven = self.change(7, "base.md", "* base\n* seven\n")
+        run_git(self.repo.path, "push", "-q", "-f", "origin",
+                seven["headRefOid"] + ":refs/heads/b7")
+        self.advance_main("base.md", "* base\n* main\n")
+        record, lines = self.tick([self.item(), six, seven],
+                                  conclusions=(None,), live=True,
+                                  run=Resolve.git_run(self))
+        got = [d for d in record["decisions"] if d.get("early")]
+        self.assertEqual([(d["pr"], d["action"], d["result"]) for d in got],
+                         [(7, "UNION", "done")], lines)
 
     def test_one_that_conflicts_with_the_train_ahead_waits(self):
         # designs/0047 §6: not handed back for a conflict with the
