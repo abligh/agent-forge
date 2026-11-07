@@ -5559,6 +5559,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
         save_greens(state_dir, greens)
+    # Held for an instance, so outside the queue, but a conflict with
+    # main won't go away by waiting for it: told like one in the queue.
+    instance_held = []
     if GATED:
         files = {}
         for pr in list(candidates):
@@ -5567,6 +5570,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
+                if pr.get("baseRefName", MAIN) == MAIN:
+                    instance_held.append(pr)
     queue = order(candidates, prs)
     in_flight = None
     if TEST_AHEAD:
@@ -6010,8 +6015,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             break
     if EARLY_CONFLICTS:
         record["decisions"] += early_conflicts(
-            repo, main_tip, queue[stopped:], approvals, github, said, live,
-            run, layers, restacks if PREDICT_RESTACKED else None)
+            repo, main_tip, queue[stopped:] + instance_held, approvals,
+            github, said, live, run, layers,
+            restacks if PREDICT_RESTACKED else None)
     if live:
         minutes = stalled_for(state_dir, waiting, when, check_state)
         if minutes is not None and "stalled" not in record:
@@ -6102,7 +6108,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 write_ahead_refs(repo, entries, run)
                 if live and (RESOLVE or UNION):
                     record["decisions"] += resolve_ahead(
-                        repo, state_dir, ahead_queue,
+                        repo, state_dir, ahead_queue + instance_held,
                         {e["pr"] for e in entries}
                         | {d.get("pr") for d in record["decisions"]}
                         | {pr["number"] for pr in ahead_queue

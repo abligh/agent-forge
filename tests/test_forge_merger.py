@@ -4611,6 +4611,27 @@ class EarlyConflicts(RepoCase):
         self.assertNotIn(6, [d["pr"] for d in record["decisions"]])
         self.assertEqual([c for c in self.comments() if "/6/" in c[0]], [])
 
+    def test_one_held_for_an_instance_is_told_too(self):
+        # Seen on 2026-11-07: a layer whose base merged conflicted with
+        # main and sat, held for an instance that never ran, unseen by
+        # its author, who thought the Merger had it.
+        six = self.behind()
+        m.configure(gated_project({"paths": ["g.*"]}, early_conflicts=True))
+        record, _ = self.tick([self.item(), six], conclusions=(None,),
+                              live=True)
+        self.assertEqual(record["held"]["6"], "waiting for vm/mac (absent)")
+        self.assertIn((6, "HAND-BACK", True),
+                      [(d["pr"], d["action"], d.get("early"))
+                       for d in record["decisions"]])
+
+    def test_a_layer_held_for_an_instance_is_left_to_its_restack(self):
+        six = self.behind()
+        six["baseRefName"] = "lower"
+        m.configure(gated_project({"paths": ["g.*"]}, early_conflicts=True))
+        record, _ = self.tick([self.item(), six], conclusions=(None,),
+                              live=True)
+        self.assertNotIn(6, [d["pr"] for d in record["decisions"]])
+
     def early(self, six, said, layers=()):
         github = FakeGitHub({})
         got = m.early_conflicts(self.repo.path, self.repo.main_tip(), [six],
@@ -7885,10 +7906,10 @@ class CloseMergedIssues(unittest.TestCase):
             os.path.join(self.state, m.CLOSING_FILE), {}), {})
 
 
-def gated_project(scope=None):
+def gated_project(scope=None, **merge):
     """The example project with a `mac` instance the Merger waits for."""
     data = example()
-    data["merge"] = {"gate": GATE, "own_head_green": False}
+    data["merge"] = dict({"gate": GATE, "own_head_green": False}, **merge)
     block = {"context": "vm/mac", "steps": [{"name": "t", "run": ["true"]}],
              "poster": "Merger", "gate": True}
     if scope is not None:
