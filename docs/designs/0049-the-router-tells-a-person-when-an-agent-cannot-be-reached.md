@@ -1,6 +1,6 @@
 # 0049: The router tells a person when an agent can't be reached
 
-* Status: proposed
+* Status: approved (Alex, 2026-11-07)
 * Author: XMPPEngineer
 * Date: 2026-11-05
 
