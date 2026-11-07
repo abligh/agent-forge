@@ -522,7 +522,11 @@ train after the first again, and the default branch moving to a tree
 no train predicted cuts them all (`TRAIN-RECUT: ...`). A red top's
 members are the suspects, as a red batch's, and the trains are cut
 again once the search ends. A pull request whose own head is red
-doesn't board while the default branch is green. New trains are said
+doesn't board while the default branch is green. One that conflicts
+with the default branch only where `merge.resolve` or its `union` would
+resolve it can't board as it stands, and train members stay ahead of
+it, so a live tick resolves the first such pull request ahead of its
+turn, and it boards at the next cut. New trains are said
 as `TRAIN-CUT k: #a #b`; the record has `trains` and `train_events`.
 `"dry-run"` changes nothing: the batches are cut as without it, and the
 trains this tick would have, from the dry run's own (`trains-dry.json`),
@@ -3156,11 +3160,16 @@ def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
         have_head(repo, pr, run)
         if is_ancestor(repo, main_tip, pr["headRefOid"], run):
             continue
-        if git(repo, "merge-tree", "--write-tree", "--name-only",
-               "--no-messages", main_tip, pr["headRefOid"],
-               run=run).returncode != 1:
+        merged = git(repo, "merge-tree", "--write-tree", "--name-only",
+                     "--no-messages", main_tip, pr["headRefOid"], run=run)
+        if merged.returncode != 1:
             continue
         reason, detail = CONFLICT_REASON, None
+        if (RESOLVE and pr["number"] not in restacks
+                and resolve_rule(conflicted_paths(merged.stdout)) is not None):
+            # Generated files: the Merger regenerates them when it is
+            # reached.
+            continue
         if UNION and pr["number"] not in restacks:
             got = union.resolve(repo, pr["headRefOid"], main_tip, UNION, run)
             if got.tree:
@@ -5409,6 +5418,63 @@ def resolve_once(state_dir, repo, decision, approval, branch, main_tip,
                 lambda: resolve(repo, decision, branch, main_tip, github, run))
 
 
+def resolve_ahead(repo, state_dir, queue, skip, approvals, main_tip, github,
+                  said, run=sh):
+    """With trains: the decisions for the first pull request of `queue`
+    not in `skip` (the trains' members, and any acted on this tick)
+    whose only conflict with `main_tip` is one the Merger resolves, with
+    the resolve carried out, and its hand-back if that failed.
+
+    A train boards only what merges plainly, and `merge.resolve` and
+    its `union` otherwise run only at the front of the queue, where
+    train members come first. So such a pull request reached the front
+    only when nothing clean was left to board, and nothing said so: on
+    2026-11-07 one project's waited all morning. Resolving it now gives
+    it a head that boards at the next cut. One a tick, like the front's.
+    A stack's layer is restacked, not resolved, so it is left alone."""
+    for pr in queue:
+        head = pr["headRefOid"]
+        if pr["number"] in skip or pr.get("baseRefName") != MAIN:
+            continue
+        have_head(repo, pr, run)
+        if is_ancestor(repo, main_tip, head, run):
+            continue
+        merged = git(repo, "merge-tree", "--write-tree", "--name-only",
+                     "--no-messages", main_tip, head, run=run)
+        if merged.returncode != 1:
+            continue
+        decision = {"pr": pr["number"], "head": head, "early": True,
+                    "branch": pr["headRefName"]}
+        approval = approvals[pr["number"]]
+        rule = resolve_rule(conflicted_paths(merged.stdout))
+        if RESOLVE and rule is not None:
+            decision.update(action="RESOLVE", rule=rule)
+            decision["result"] = resolve_once(
+                state_dir, repo, decision, approval, pr["headRefName"],
+                main_tip, github, run)
+        elif UNION:
+            got = union.resolve(repo, head, main_tip, UNION, run)
+            if not got.tree:
+                continue
+            decision.update(action="UNION", tree=got.tree, files=got.files)
+            decision["result"] = once(
+                os.path.join(state_dir, UNIONED_FILE), decision, approval,
+                lambda: union_push(repo, decision, main_tip, github, run))
+            decision["files"] = {path: [[len(h), len(m)] for h, m in hunks]
+                                 for path, hunks in decision["files"]}
+        else:
+            continue
+        decisions = [decision]
+        if decision["result"].startswith("failed"):
+            step = decision["result"][len("failed: "):].split(": ")[0]
+            decisions.append(conflict_hand_back(
+                pr, approval, github, said, True,
+                "%s, and the Merger could not resolve it (%s)"
+                % (CONFLICT_REASON, step)))
+        return decisions
+    return []
+
+
 def restack_once(state_dir, decision, approval, github, said):
     """RESTACK, at most once per approval and head (RESTACKED_FILE), as
     `resolve_once`: "done", or "failed: why"."""
@@ -6034,6 +6100,15 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 # designs/0047: trains, cut once and kept.
                 entries, sizes, events = cut(last)
                 write_ahead_refs(repo, entries, run)
+                if live and (RESOLVE or UNION):
+                    record["decisions"] += resolve_ahead(
+                        repo, state_dir, ahead_queue,
+                        {e["pr"] for e in entries}
+                        | {d.get("pr") for d in record["decisions"]}
+                        | {pr["number"] for pr in ahead_queue
+                           if head_red(check_state, pr)},
+                        approvals, main_tip, github, said, run)
+                    save_json(said_path, said)
             else:
                 if searching:
                     # Layers and pull requests owed a place wait behind
