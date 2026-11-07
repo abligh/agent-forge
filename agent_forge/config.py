@@ -138,7 +138,8 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "slots": int, "memory_max": (str, type(None)), "step_timeout_minutes": int,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
           "tracer": str, "cpu_weight": int, "fast_lane": dict,
-          "merge_default": bool, "cache_limit": str, "reuse": dict,
+          "merge_default": bool, "cache_limit": str, "results_max": str,
+          "reuse": dict,
           "fresh": dict, "first_authors": list, "max_wait_minutes": int,
           "main": str, "main_red_issue": dict, "drop_env": list,
           "keep_ignored": list, "red_comment": bool, "instances": dict,
@@ -170,6 +171,7 @@ STEP_ALERT = {"growth": (int, float), "min_seconds": int, "window_days": int,
 INSTANCE_OWN = ("host", "context", "steps", "poster")
 INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight",
                       "step_timeout_minutes", "caches", "cache_limit",
+                      "results_max",
                       "keep_ignored", "drop_env", "merge_default",
                       "red_comment", "max_wait_minutes", "host_fault_text",
                       "cache_fault_text", "step_alert", "cpu_share",
@@ -195,7 +197,8 @@ DROP_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\*?$")
 # once, before any pull request's.
 MAIN_MODES = ("needed", "every", "newest")
 MAIN_RED_ISSUE = {"label": str, "labels": list, "title": str}
-# checks.cache_limit: a size in systemd's style, at least one byte.
+# checks.cache_limit, checks.results_max: a size in systemd's style, at
+# least one byte.
 SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 # checks.fast_lane: a slot for heads whose chosen steps are cheap.
 FAST_LANE = {"max_seconds": int}
@@ -1003,6 +1006,10 @@ def _check_checks(checks, data, problems, where="checks"):
     if isinstance(checks.get("cache_limit"), str) \
             and not SIZE_RE.match(checks["cache_limit"]):
         problems.append("%s.cache_limit must be a size such as 40G "
+                        "(K, M, G or T)" % where)
+    if isinstance(checks.get("results_max"), str) \
+            and not SIZE_RE.match(checks["results_max"]):
+        problems.append("%s.results_max must be a size such as 64M "
                         "(K, M, G or T)" % where)
     if isinstance(checks.get("tracer"), str) \
             and checks["tracer"] not in TRACERS:
