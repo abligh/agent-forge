@@ -7426,6 +7426,35 @@ class Trains(RepoCase):
         self.assertEqual(self.numbers(entries, sizes), [[7, 8], [6, 9]])
         self.assertEqual([e["carriage"] for e in entries], [7, 8, 6, 6])
 
+    def test_a_layer_that_conflicts_stays_and_the_one_below_boards(self):
+        six = self.change(6, "s.txt", "one\n")
+        # Written from main, so it conflicts with #6 in s.txt, and #10
+        # above it can't board either.
+        layer = self.change(9, "s.txt", "other\n")
+        top = self.change(10, "t.txt", "top\n", start=layer["headRefOid"])
+        seven = self.change(7, "y.txt", "y\n")
+        self.configure(batch=3, batches=2, depth=5)
+        entries, sizes, events = self.cut([[six, layer, top], [seven]])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 7]])
+        self.assertEqual([e["carriage"] for e in entries], [6, 7])
+        self.assertIn(("left", "LEFT #9: won't board with the layers below "
+                       "it, which go without it; also held back: #10"), events)
+
+    def test_a_red_layer_stays_and_the_one_below_boards(self):
+        six = self.change(6, "s.txt", "one\n")
+        layer = self.change(9, "s2.txt", "two\n", start=six["headRefOid"])
+        self.configure(batch=3, batches=2, depth=5)
+        entries, sizes, _ = self.cut([[six, layer]], check={9})
+        self.assertEqual(self.numbers(entries, sizes), [[6]])
+
+    def test_a_carriage_whose_first_is_red_stays_whole(self):
+        six = self.change(6, "s.txt", "one\n")
+        layer = self.change(9, "s2.txt", "two\n", start=six["headRefOid"])
+        seven = self.change(7, "y.txt", "y\n")
+        self.configure(batch=3, batches=2, depth=5)
+        entries, sizes, _ = self.cut([[six, layer], [seven]], check={6})
+        self.assertEqual(self.numbers(entries, sizes), [[7]])
+
     def test_a_stack_longer_than_batch_is_a_train_of_its_own(self):
         six = self.change(6, "s.txt", "one\n")
         layer = self.change(9, "s2.txt", "two\n", start=six["headRefOid"])
