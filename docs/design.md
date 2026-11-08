@@ -117,7 +117,8 @@ delivery) with each project's rules as a module:
 * from one side: turns read from commits, never clocks (a review is at
   the head by SHA); a cooldown keyed on agent and event, so one event
   wakes once whichever rule matches it; reviewers chosen by changed
-  lines their `reviews` globs match; one process under one lock; a dry-run journal;
+  lines their `reviews` globs match; one process under one lock; a
+  dry-run journal;
 * from the other: a conflicted pull request goes to its owner; required
   checks read from branch protection; `Defer-until:` and `Blocked-by:`;
   a wake when a merge unblocks someone; reminders that back off with
