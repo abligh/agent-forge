@@ -37,8 +37,8 @@ Designs/0041 adds, each off unless given:
      any cache that passes rules 1 and 2, whatever its idle time, least
      recently used first, until the filesystem is under --low-water. A
      cache used in the last --pressure-floor-hours (default 1) is kept.
-  --live-trim-hours H: if that wasn't enough, the caches of worktrees
-     in use are trimmed too, the one with most to give first, until the
+  --live-trim-hours H: if that wasn't enough, the caches in use, of
+     worktrees and shared ones, are trimmed too, the one with most to give first, until the
      filesystem is under --low-water. Rule 1 keeps a whole cache from a
      live session, which is when it grows: each re-link leaves another
      copy of a test binary, and nothing else removes them. So this takes
@@ -50,11 +50,14 @@ Designs/0041 adds, each off unless given:
   --every-minutes N: a run that finds every root under --high-water,
      with the last full scan less than N minutes ago, exits at once,
      so cron can run this every few minutes cheaply.
-  --shared DIR: DIR's direct subdirectories that carry a valid
-     CACHEDIR.TAG are caches shared between worktrees (a Cargo
-     CARGO_TARGET_DIR). They are judged by --idle-hours alone, and are
-     in use also while a process's environment names them as
-     CARGO_TARGET_DIR.
+  --shared DIR: the tagged directories in DIR, down to the same depth
+     as in a worktree, are caches shared between worktrees (a Cargo
+     CARGO_TARGET_DIR, or one per build kind beneath a directory of
+     them). A worktree under DIR is not searched. They are judged by
+     --idle-hours alone, and are in use also while a process's
+     environment names them, or a directory above them, as
+     CARGO_TARGET_DIR. One in use is trimmed by --live-trim-hours as a
+     live worktree's cache is.
 
 Trimming by age (off unless given):
 
@@ -213,22 +216,32 @@ def target_dirs(proc="/proc"):
 
 
 def shared_caches(root):
-    """The tagged cache directories directly under `root` that aren't
-    worktrees, and leftovers of an interrupted run there."""
+    """The tagged cache directories under `root`, down to CACHE_DEPTH
+    levels and outside any worktree, and leftovers of an interrupted run
+    there. A tagged directory is not searched further: it is one cache.
+    A directory of per-kind targets (`.tgt-x/wasm32-wasip1`,
+    `.tgt-x/vet-windows`) carries its tags one level down."""
     caches, leftovers = [], []
-    try:
-        entries = sorted(os.scandir(root), key=lambda e: e.name)
-    except OSError:
-        return caches, leftovers
-    for entry in entries:
-        if not entry.is_dir(follow_symlinks=False):
+    for path, level, names in walk_limited(root, CACHE_DEPTH):
+        if path == root:
             continue
-        if entry.name.endswith(PRUNING):
-            leftovers.append(entry.path)
-        elif not os.path.exists(os.path.join(entry.path, ".git")) and \
-                is_cache_dir(entry.path):
-            caches.append(entry.path)
+        if path.endswith(PRUNING):
+            leftovers.append(path)
+            names[:] = []
+        elif os.path.exists(os.path.join(path, ".git")):
+            names[:] = []
+        elif is_cache_dir(path):
+            caches.append(path)
+            names[:] = []
     return caches, leftovers
+
+
+def names_cache(target, cache):
+    """True if the CARGO_TARGET_DIR `target` is `cache`, inside it, or a
+    directory above it (resolved paths)."""
+    target, cache = target.rstrip("/"), cache.rstrip("/")
+    return (target == cache or target.startswith(cache + "/")
+            or cache.startswith(target + "/"))
 
 
 def used_percent(path):
@@ -429,17 +442,22 @@ def prune(roots, *, dry_run, merged_hours, idle_hours, repo, token,
                 freed += kib
     if shared:
         targets = target_dirs() if targets is None else targets
+    seen = set()
     for root in shared:
         caches, leftovers = shared_caches(root)
         drop_leftovers(leftovers, dry_run=dry_run, out=out)
         for cache in caches:
             real = os.path.realpath(cache)
+            # One --shared inside another reaches the same caches twice.
+            if real in seen:
+                continue
+            seen.add(real)
             in_use = is_busy(cache, busy) or any(
-                t == real or t.startswith(real.rstrip("/") + "/")
-                for t in targets)
+                names_cache(t, real) for t in targets)
             if in_use:
                 out("kept %s: busy (a process is using it)" % cache)
                 kept += 1
+                live.append((cache, root))
                 continue
             newest = newest_file_time(cache)
             idle = hours(now - newest)
