@@ -575,7 +575,14 @@ class Check(unittest.TestCase):
             "merge.test_ahead.depth must be an integer",
             "merge.test_ahead.max_age_hours must be an integer"])
         self.assertEqual(self.problems(merge={"test_ahead": 3}),
-                         ["merge.test_ahead must be an object"])
+                         ["merge.test_ahead must be an object or true or "
+                          "false"])
+        self.assertEqual(self.problems(merge={"test_ahead": False}), [])
+        self.assertEqual(self.problems(merge={"test_ahead": True}), [])
+        self.assertEqual(self.problems(merge={"test_ahead": True},
+                                       checks=None),
+                         ["merge.test_ahead needs checks: the build check "
+                          "runs the predictions"])
         self.assertEqual(self.problems(merge={"test_ahead": {}}), [])
         self.assertEqual(self.problems(merge={"test_ahead": {"depth": 0}}),
                          [])
@@ -587,7 +594,9 @@ class Check(unittest.TestCase):
             "depth": 7, "batch": 8, "batches": 2}}), [
             "merge.test_ahead.batches x batch must be at most depth + 1 (8)"])
         self.assertEqual(self.problems(merge={"test_ahead": {
-            "batches": 2}}), [
+            "batches": 2}}), [])   # designs/0050: batch defaults to 4
+        self.assertEqual(self.problems(merge={"test_ahead": {
+            "batch": 1, "batches": 2}}), [
             "merge.test_ahead.batches above 1 needs batch above 1"])
         self.assertEqual(self.problems(merge={"test_ahead": {
             "batches": 0}}), ["merge.test_ahead.batches must be at least 1"])
@@ -637,15 +646,20 @@ class Check(unittest.TestCase):
             ahead, trains="live", trains_within="clean")}), [])
         self.assertEqual(self.problems(merge={"test_ahead": dict(
             ahead, trains="on", trains_within="any")}), [
-            "merge.test_ahead.trains must be one of dry-run, live",
+            "merge.test_ahead.trains must be one of dry-run, live, off",
             "merge.test_ahead.trains_within must be one of files, clean"])
         self.assertEqual(self.problems(merge={"test_ahead": {
-            "trains": "live", "fixed_order": False}}), [
+            "trains": "live", "batch": 1, "fixed_order": False}}), [
             "merge.test_ahead.trains needs batch above 1",
             "merge.test_ahead.trains keeps a train's order, so fixed_order "
             "must not be false"])
+        # designs/0050: trains are the default, and "off" turns them off.
         self.assertEqual(self.problems(merge={"test_ahead": dict(
-            ahead, trains_within="files")}), [
+            ahead, trains_within="files")}), [])
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, trains="off")}), [])
+        self.assertEqual(self.problems(merge={"test_ahead": dict(
+            ahead, trains="off", trains_within="files")}), [
             "merge.test_ahead.trains_within needs trains"])
         self.assertEqual(self.problems(merge={"test_ahead": dict(
             ahead, trains=1)}), [
@@ -656,7 +670,8 @@ class Check(unittest.TestCase):
                          [])
         self.assertEqual(self.problems(merge={"test_ahead": {
             "depth": 1, "batch": 2}}), [])
-        self.assertEqual(self.problems(merge={"test_ahead": {"batch": 5}}), [
+        self.assertEqual(self.problems(merge={"test_ahead": {
+            "depth": 3, "batch": 5}}), [
             "merge.test_ahead.batch must be at least 1 and at most "
             "depth + 1 (4)"])
         self.assertEqual(self.problems(merge={"test_ahead": {
@@ -675,7 +690,7 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"test_ahead": {
             "batch": 2, "stacks": True}}), need)
         self.assertEqual(self.problems(merge={"stacks": {}, "test_ahead": {
-            "stacks": True}}), need)
+            "batch": 1, "stacks": True}}), need)
         self.assertEqual(self.problems(merge={"stacks": {}, "test_ahead": {
             "batch": 2, "stacks": "yes"}}),
             ["merge.test_ahead.stacks must be true or false"])
@@ -980,6 +995,68 @@ class Check(unittest.TestCase):
     def test_not_an_object(self):
         self.assertEqual(config.check([]),
                          ["the configuration must be a JSON object"])
+
+
+class TestAheadDefaults(unittest.TestCase):
+    """designs/0050: testing ahead in trains is the default."""
+
+    def ahead(self, merge=None, checks=True):
+        data = {"merge": {} if merge is None else merge}
+        if checks is True:
+            data["checks"] = {"context": "build"}
+        elif checks is not None:
+            data["checks"] = checks
+        return config.test_ahead(data)
+
+    def test_with_nothing_said_it_is_trains(self):
+        self.assertEqual(self.ahead(), {"depth": 7, "batch": 4,
+                                        "batches": 2, "trains": "live"})
+
+    def test_without_a_build_check_it_is_off(self):
+        self.assertIsNone(self.ahead(checks=None))
+        self.assertIsNone(self.ahead(checks={"merger_first": False}))
+
+    def test_false_turns_it_off_and_true_or_empty_take_the_defaults(self):
+        self.assertIsNone(self.ahead({"test_ahead": False}))
+        for given in (True, {}):
+            self.assertEqual(self.ahead({"test_ahead": given}),
+                             {"depth": 7, "batch": 4, "batches": 2,
+                              "trains": "live"})
+
+    def test_what_is_given_wins_and_the_rest_fits_it(self):
+        self.assertEqual(self.ahead({"test_ahead": {"depth": 3}}),
+                         {"depth": 3, "batch": 4, "batches": 1,
+                          "trains": "live"})
+        self.assertEqual(self.ahead({"test_ahead": {"depth": 1}}),
+                         {"depth": 1, "batch": 2, "batches": 1,
+                          "trains": "live"})
+        self.assertEqual(self.ahead({"test_ahead": {"batch": 8}}),
+                         {"depth": 7, "batch": 8, "batches": 1,
+                          "trains": "live"})
+        self.assertEqual(self.ahead({"test_ahead": {
+            "depth": 23, "batch": 8, "batches": 3, "trains": "dry-run"}}),
+            {"depth": 23, "batch": 8, "batches": 3, "trains": "dry-run"})
+
+    def test_no_trains_without_batches_or_order(self):
+        self.assertEqual(self.ahead({"test_ahead": {"depth": 0}}),
+                         {"depth": 0, "batch": 1, "batches": 1})
+        self.assertEqual(self.ahead({"test_ahead": {"batch": 1}}),
+                         {"depth": 7, "batch": 1, "batches": 1})
+        self.assertNotIn("trains", self.ahead({"test_ahead": {
+            "fixed_order": False}}))
+
+    def test_off_keeps_batches_without_trains(self):
+        self.assertEqual(self.ahead({"test_ahead": {
+            "trains": "off", "trains_within": "clean"}}),
+            {"depth": 7, "batch": 4, "batches": 2})
+
+    def test_an_explicit_dict_is_not_changed(self):
+        given = {"depth": 3}
+        self.ahead({"test_ahead": given})
+        self.assertEqual(given, {"depth": 3})
+
+    def test_the_example_configuration_gets_trains(self):
+        self.assertEqual(config.test_ahead(example()).get("trains"), "live")
 
 
 class LoadReviewed(unittest.TestCase):
