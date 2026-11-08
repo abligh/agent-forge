@@ -7,31 +7,27 @@ that reviews nothing but moves work along. agent-forge is that
 machinery, and the small tools around it, shared by every project that
 runs this way.
 
-## Why
+## What it is for
 
-Two projects have grown this tooling independently. The second began as
-a port of the first and the two have diverged since, each gaining fixes
-the other lacks: one has the safer webhook receiver and the merge gate
-that trusts only its own build status, the other has the faster
-build-check queue, cron locking that can't starve, and a router that
-covers more cases. Every fix has to be found twice, and both copies
-hard-code their project's repository, Apps, labels and paths.
-
-agent-forge holds one copy, with everything project-specific moved to
-configuration, so a fix made once reaches every project, and a new
-project starts with the whole pipeline.
+Agents that each work in their own session need something to move
+work between them: to build and test what they push, merge what a
+reviewer approved, hand back what can't merge, and tell each agent
+when it is its turn. That machinery is the same for every project run
+this way; only the names, labels, paths and build steps differ.
+agent-forge is that machinery, with everything project-specific in one
+configuration file, so a fix made once reaches every project that uses
+it, and a new project starts with the whole pipeline.
 
 ## Goals
 
-* **One copy of every generic tool**, each improvement merged from
-  whichever project had it.
+* **One copy of every generic tool**, shared by every project that
+  uses it.
 * **Nothing project-specific in the code**: a project is described by
   one configuration file in its own repository.
 * **Installed per host** at a pinned version, so a project upgrades
   deliberately.
-* **The projects' own guarantees kept**: every tool tested, standard
-  library Python only, no tool that can merge or approve on its own
-  judgment.
+* **Guarantees every tool keeps**: every tool tested, standard library
+  Python only, no tool that can merge or approve on its own judgment.
 
 ## Non-goals
 
@@ -41,7 +37,7 @@ project starts with the whole pipeline.
 * **Product tooling**: deployment, image builds, simulators, format
   converters. Those stay in their projects.
 * **The agent supervisor** (claude-agent-supervisor) and the XMPP
-  channel (xmpp-mcp), which are separate repositories already.
+  channel (xmpp-mcp), which are separate repositories.
 
 ## Shape
 
@@ -73,84 +69,67 @@ host differences. State lives under
 `agent_forge/`, standard library only: GitHub REST and GraphQL calls,
 App token minting, the roster, the markers tools agree on
 (`Not-a-review`, `Blocked-by:`, `Defer-until:`), locking and state
-files. Today each tool copies these or loads another tool's file as a
-module.
+files.
 
 ### Tools
 
-Names drop the project prefix: `forge-merger`, `forge-build-check`,
-`forge-receiver`, `forge-router`, and so on. A project can install
-prefixed shims if it wants its old names.
+Each is `bin/forge-<name>`, with a page under [tools/](tools/); the
+[README](../README.md#tools) lists them by what they do.
 
-## What moves, and what each side contributes
+## What it does
 
-**Merge pipeline**
+**The merge pipeline.**
 
-* **Merger.** From one side: only statuses posted by the build-check
-  App count; approvers come from the roster; an empty code-owner
-  approval isn't "someone spoke"; a re-review hand-back lists the paths
-  to look at; a conflict is handed back once, never retried. From the
-  other: a stalled queue alerts the owner; the Merger tells the build
-  check which head to build first; a hook for files that are
-  regenerated rather than merged.
-* **Build check.** Parallel slots with their own worktrees and caches;
-  steps, conditional steps and a step timeout from configuration; heads
-  that moved are dropped. Plus: the Merger's head first; flake
-  detection; a timing report; an optional hook to check the default
-  branch first.
-* **Receiver.** A body cap checked before reading, path and
-  secret-file checks, and a configurable event-to-tool table (a push or
-  an approval ticks the Merger, a new head ticks the build check). Plus:
-  de-duplication that survives a restart, and a sweep that asks GitHub
-  to redeliver what was missed. Project-specific labelling stays a
-  plug-in.
-* **Cron runner.** Per-tool locks plus a shared checkout lock that is
-  taken exclusively only to reset, so frequent ticks can't starve the
-  reset.
+* **The Merger** (`forge-merger`) merges what a reviewer agent
+  approved, at a head the approval covers. It counts only the status
+  the build check's App posted, and the approvers the roster names. It
+  tests the queue ahead in trains and hands back, once and with the
+  reason, what can't merge. A stalled queue is reported.
+* **The build check** (`forge-pr-check`) runs each head's steps in
+  parallel slots, each with its own worktree, caches and memory limit.
+  It skips heads that moved, and runs the Merger's head first.
+* **The receiver** (`forge-receiver`) takes GitHub's webhooks, with
+  the body size capped and the secret checked. It runs the tools a
+  configurable table names for each event, and de-duplicates
+  deliveries across restarts.
+* **The cron runner** (`forge-cron-run`) runs each job against a
+  checkout reset to the default branch, under per-tool locks and at
+  the pinned release.
 
-**Routing and wakes**
+**Routing and wakes.** The router (`forge-router`) decides whose turn
+every open item is and wakes that agent through the relay. It is an
+engine (fetching, state, locking, once-per-turn keys, reminders,
+delivery, a journal) with each project's rules as a module
+([router.md](router.md)):
 
-The router decides whose turn every open item is and wakes that agent
-through the relay. It becomes an engine (fetch, state, lock, cooldown,
-delivery) with each project's rules as a module:
+* turns are read from commits, never clocks (a review is at the head
+  by SHA);
+* one event wakes once, whichever rule matches it;
+* reviewers are chosen by the changed lines their `reviews` globs
+  match;
+* `Blocked-by:` and `Defer-until:` lines are honoured;
+* delivery retries, is idempotent, and tells a missing agent from a
+  missing relay.
 
-* from one side: turns read from commits, never clocks (a review is at
-  the head by SHA); a cooldown keyed on agent and event, so one event
-  wakes once whichever rule matches it; reviewers chosen by changed
-  lines their `reviews` globs match; one process under one lock; a
-  dry-run journal;
-* from the other: a conflicted pull request goes to its owner; required
-  checks read from branch protection; `Defer-until:` and `Blocked-by:`;
-  a wake when a merge unblocks someone; reminders that back off with
-  jitter; delivery that retries, is idempotent and tells a missing
-  agent from a missing relay.
+**Identity and sessions.** Every agent acts through its own GitHub
+App:
+* App tokens;
+* a worktree's git identity, and the git credential helper that goes
+  with it;
+* signed comments and bodies;
+* checks that a design's approval still covers it, and that the
+  owner's decisions were made after they were asked;
+* the session-start brief.
 
-**Identity and sessions**: App tokens with slug overrides and
-not-yet-created Apps; worktree identity; the git credential helper;
-signed comments and bodies; approval scope; the owner's decisions; the
-session-start hook (role brief, open items, handoff note); handoff
-notes; a `gh` wrapper that refuses to run as the human's account; idle
-detection.
-
-**Small tools**: documentation checks (a reflower and a linter, line
-width, links and anchors, spelling, stale citations), guards against
-force-pushes that strand reviewed commits and against branches that
-revert their base, a discussion snapshot, temp and orphan-process
-cleanup, memory sampling, token usage, the tool index and test runner,
-and the meta-tests every tool directory runs.
-
-## Order of work
-
-1. Skeleton: configuration loader and schema, the library, the test
-   runner and meta-tests, the neutrality check.
-2. The tools that are already identical on both sides or need no
-   configuration.
-3. The merge pipeline.
-4. The router engine, with the smaller project's rules first; the
-   larger project's rules last, as they carry the most risk.
-5. Switch-over, one project at a time, the smaller first; within a
-   project, one tool at a time, each through that project's own
-   review.
+**The tools around them.**
+* documentation checks: format, line width, links and anchors;
+* host settings and crontabs installed from the repository;
+* shared agent memory;
+* quiet holds and a job queue;
+* build-output pruning;
+* statistics and a watch on them;
+* the flow page;
+* the nightly watch.
 
 ## Staying neutral
 

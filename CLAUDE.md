@@ -1,8 +1,8 @@
 # agent-forge
 
 Tooling shared by projects that are developed by teams of AI agents on
-GitHub. [docs/design.md](docs/design.md) says what belongs here and the
-order of work; [docs/config.md](docs/config.md) is the configuration,
+GitHub. [docs/design.md](docs/design.md) says what it is for and what
+belongs here; [docs/config.md](docs/config.md) is the configuration,
 [docs/getting-started.md](docs/getting-started.md) a new project's
 setup and [docs/tools/](docs/tools/) each tool's reference.
 
