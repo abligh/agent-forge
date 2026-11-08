@@ -6389,6 +6389,29 @@ class SaidSince0026(unittest.TestCase):
         item = pr(reviews=[approval] + list(reviews), comments=list(comments))
         return m.said_since(item, approval)
 
+    def test_the_hold_says_approvals_never_hold_by_default(self):
+        text = m.spoken_text(review(REVIEWER, at=T1), (PEER, T2, "comment"))
+        self.assertIn("Comments by the author, approvals and comments "
+                      "marked `Not-a-review` don't hold", text)
+        self.assertNotIn("with text", text)
+
+    def test_the_hold_says_an_approval_with_text_holds_with_approvals(self):
+        # An approval with text was said to hold nothing, while the
+        # hold it explained was for one.
+        m.configure(project(said_since={"approvals": True}))
+        text = m.spoken_text(review(REVIEWER, at=T1), (PEER, T2, "review"))
+        self.assertIn("Comments by the author, approvals with no text and "
+                      "comments marked `Not-a-review` don't hold", text)
+        self.assertIn("An approval with text after the one that counts "
+                      "does", text)
+
+    def test_the_hold_leaves_the_author_out_with_author(self):
+        m.configure(project(said_since={"author": True}))
+        text = m.spoken_text(review(REVIEWER, at=T1), (AUTHOR, T2, "comment"))
+        self.assertIn("Approvals and comments marked `Not-a-review` don't "
+                      "hold", text)
+        self.assertNotIn("by the author", text)
+
     def test_the_authors_remark_holds_with_author(self):
         m.configure(project(said_since={"author": True}))
         self.assertEqual(self.said([comment(AUTHOR, at=T2)]),
