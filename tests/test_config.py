@@ -892,6 +892,15 @@ class Check(unittest.TestCase):
             "router.rules must be a string",
             "router: unknown key 'rule'"])
 
+    def test_session_start(self):
+        self.assertEqual(self.problems(session_start={
+            "skip_labels": ["heartbeat"],
+            "identity_command": "tools/widget-worktree-identity"}), [])
+        self.assertEqual(self.problems(session_start={
+            "skip_labels": [""], "identity_command": " "}), [
+            "session_start.skip_labels must be a list of non-empty strings",
+            "session_start.identity_command must not be empty"])
+
     def test_router_quiet_labels(self):
         self.assertEqual(self.problems(router={
             "quiet_labels": ["Status:venue"]}), [])

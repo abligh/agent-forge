@@ -69,7 +69,7 @@ AREAS = {"paths": list, "labels": list}
 IDENTITY = {"unattributed_domain": (str, list), "unattributed_name": str}
 HOST_SETTINGS = {"files": list, "host_keys": list, "crontabs": dict}
 # forge-memory-sync, -check and -trim (agent_forge/memory.py).
-SESSION_START = {"skip_labels": list}
+SESSION_START = {"skip_labels": list, "identity_command": str}
 MEMORY = {"dir": str, "remote": str, "git_dir": str, "seed_dir": str,
           "ssh_key": str, "branch": str, "labels": list, "limit": int,
           "long_line": int}
@@ -365,7 +365,8 @@ def _fields(where, entry, allowed, problems):
 
 def _check_session_start(section, problems):
     """session_start.skip_labels: labels whose items the restart brief
-    leaves out, each a non-empty string."""
+    leaves out, each a non-empty string; identity_command: what the
+    brief tells an unstamped worktree to run, not empty."""
     if not _fields("session_start", section, SESSION_START, problems):
         return
     skip = section.get("skip_labels")
@@ -373,6 +374,9 @@ def _check_session_start(section, problems):
             isinstance(l, str) and l for l in skip):
         problems.append("session_start.skip_labels must be a list of "
                         "non-empty strings")
+    command = section.get("identity_command")
+    if isinstance(command, str) and not command.strip():
+        problems.append("session_start.identity_command must not be empty")
 
 
 def _check_identity(ident, problems):
