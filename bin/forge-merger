@@ -3824,10 +3824,27 @@ def spoken_text(approval, remark):
     return ("Not-a-review\n\nHolding this: %s's %s at %s came after %s's "
             "approval, and anything said after an approval might be an "
             "objection. A newer approval releases it, so %s, if nothing "
-            "needs to change, please approve again.\n\n"
-            "Comments by the author, approvals and comments marked "
-            "`Not-a-review` don't hold a pull request.\n\n%s"
-            % (who, kind, when, approver, approver, SIGNATURE))
+            "needs to change, please approve again.\n\n%s\n\n%s"
+            % (who, kind, when, approver, approver, what_holds(),
+               SIGNATURE))
+
+
+def what_holds():
+    """The sentence that says what doesn't hold a pull request, as
+    `merge.said_since` configures it."""
+    free = []
+    if not SAID_AUTHOR:
+        free.append("comments by the author")
+    free.append("approvals with no text" if SAID_APPROVALS
+                else "approvals")
+    free.append("comments marked `Not-a-review`")
+    text = "%s and %s don't hold a pull request." % (", ".join(free[:-1]),
+                                                     free[-1])
+    text = text[0].upper() + text[1:]
+    if SAID_APPROVALS:
+        text += (" An approval with text after the one that counts does, "
+                 "unless a line of it starts `Not-a-review`.")
+    return text
 
 
 def tell_spoken(state_dir, github, prs, spoken, live):
