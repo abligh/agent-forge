@@ -3267,6 +3267,18 @@ def retry_due(before, when):
         return True
 
 
+def layers_below(layer, prs):
+    """The numbers of the open pull requests under `layer` in its stack,
+    walking down the bases. A layer's Blocked-by on one of them waits
+    only for the stack, as in ready_layers and a retarget."""
+    by_head = {pr.get("headRefName"): pr for pr in prs}
+    numbers, base = set(), layer.get("baseRefName")
+    while base in by_head and by_head[base]["number"] not in numbers:
+        numbers.add(by_head[base]["number"])
+        base = by_head[base].get("baseRefName")
+    return numbers
+
+
 def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
                  regenerated=None, rules=None, green=None):
     """designs/0035: the layers stacked on `base`, climbing the stack,
@@ -5790,8 +5802,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     batch_layers = [pr for pr in prs if AHEAD_STACKS
                     and pr.get("baseRefName") != MAIN
                     and str(pr["number"]) in held
-                    and eligible(pr, open_numbers, when,
-                                 any_base=True)[0] is not None]
+                    and eligible(pr, open_numbers - layers_below(pr, prs),
+                                 when, any_base=True)[0] is not None]
     for at, pr in enumerate([] if retarget is not None else queue):
         approval = approvals[pr["number"]]
         found_red = reds.get(str(pr["number"]))

@@ -5600,8 +5600,9 @@ class Stacks(RepoCase):
         return pr(5, head=self.lower,
                   reviews=[review(REVIEWER, oid=self.lower)])
 
-    def layer(self, base="b5", reviews=None, head=None):
-        return pr(6, T1, base=base, head=head or self.upper, reviews=[
+    def layer(self, base="b5", reviews=None, head=None, body=""):
+        return pr(6, T1, base=base, head=head or self.upper, body=body,
+                  reviews=[
             review(REVIEWER, oid=self.upper)] if reviews is None else reviews)
 
     def tick(self, prs, live=True, minutes=0, check_state=None):
@@ -5688,6 +5689,15 @@ class Stacks(RepoCase):
     def test_the_base_merges_on_its_batchs_green_with_the_layer_held(self):
         # #6 is still held as stacked when #5's covered head merges; the
         # batch holds while #6 is ready at the head predicted.
+        self.base_merges_on_the_batchs_green(self.layer())
+
+    def test_a_layer_blocked_by_its_base_doesnt_hold_the_base_for_ever(self):
+        # A layer that names the layer below as Blocked-by waits only for
+        # the stack: the batch hold still finds it ready, so #5 merges.
+        self.base_merges_on_the_batchs_green(
+            self.layer(body="Blocked-by: #5"))
+
+    def base_merges_on_the_batchs_green(self, layer):
         m.configure(project(stacks={},
                             test_ahead={"batch": 2, "stacks": True}))
         covered = {SLUG + "/commits/": [status(
@@ -5696,8 +5706,8 @@ class Stacks(RepoCase):
                                   tzinfo=datetime.timezone.utc)
 
         def tick(check_state=None):
-            github = FakeGitHub(dict(answers(prs=[self.bottom(),
-                                                  self.layer()]), **covered))
+            github = FakeGitHub(dict(answers(prs=[self.bottom(), layer]),
+                                     **covered))
             return m.tick(self.repo.path, self.state, github, tools_run(),
                           lambda line: None, now=lambda: start, live=True,
                           check_state=check_state)
