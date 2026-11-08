@@ -1,5 +1,7 @@
 """Tests for bin/forge-worktree-identity. Real git throughout where git's
 scoping is the point; GitHub is faked."""
+import contextlib
+import io
 import os
 import unittest
 
@@ -188,6 +190,28 @@ class PushApp(Worktrees):
                            value)
         self.assertEqual(self.main("--check", "--push", "app", "LeadDev"), 1)
         self.assertEqual(self.main("--push", "app", "LeadDev"), 0)
+
+    def test_helper_names_the_helper_stored(self):
+        stable = "!" + self.script("stable", "x-access-token", "ghs_ours")
+        self.assertEqual(self.main("--push", "app", "--helper", stable,
+                                   "LeadDev"), 0)
+        self.assertEqual(self.read(self.wt, "config", "--worktree",
+                                   "--get-all", tool.HELPER_KEY),
+                         "\n" + stable + "\n")
+        self.assertEqual(self.main("--check", "--push", "app", "--helper",
+                                   stable, "LeadDev"), 0)
+        # The default helper is not the one stored, so --check fails.
+        self.assertEqual(self.main("--check", "--push", "app", "LeadDev"), 1)
+        self.assertIn("ghs_ours", self.fill(self.wt).stdout)
+
+    def test_helper_without_push_is_a_usage_error(self):
+        for argv in (["--helper", "!x", "LeadDev"],
+                     ["--push", "app", "--helper", "", "LeadDev"]):
+            with self.subTest(argv=argv), \
+                    self.assertRaises(SystemExit) as raised, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.main(*argv)
+            self.assertEqual(raised.exception.code, 2)
 
     def test_the_default_helper_is_the_one_beside_this_tool(self):
         self.assertEqual(tool.HELPER, "!" + os.path.join(
