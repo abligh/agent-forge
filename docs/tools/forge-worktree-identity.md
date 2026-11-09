@@ -13,6 +13,7 @@ with a deploy key that GitHub attributes to the key's owner.
     forge-worktree-identity AGENT               stamp, then verify
     forge-worktree-identity --check AGENT       verify only
     forge-worktree-identity --push app AGENT    stamp, and push as the App
+    forge-worktree-identity --push app --helper COMMAND AGENT
 
 An agent runs it in its session, inside each worktree it creates,
 before its first commit:
@@ -34,6 +35,7 @@ changes nothing. A session-start hook or a check script can run
 | `AGENT` | required | The agent to stamp as: a name under `agents` in the configuration. Machinery Apps are not accepted. |
 | `--check` | off | Verify only; write nothing. Exits 1 if the worktree's identity (or, with `--push app`, its push settings) is not the agent's. |
 | `--push app` | none | Also set this worktree to push as the agent's App, over HTTPS, through [forge-git-credential](forge-git-credential.md). `app` is the only value. |
+| `--helper COMMAND` | this copy's | With `--push app`, the credential helper to store, written as git takes it (such as `!/opt/tools/git-credential`). Use it when agent-forge runs from a path that changes with each release, such as a pinned cache, so worktrees keep a helper that still exists. `--check` compares against it too. |
 | `-h`, `--help` | | Print the usage and exit. |
 
 ## Environment
@@ -92,7 +94,8 @@ scope only:
     credential.https://github.com.useHttpPath = false
 
 `<install>` is the directory of the agent-forge copy this tool runs
-from, which outlives any worktree. The empty helper comes first to
+from, which outlives any worktree. `--helper` stores another command in
+its place. The empty helper comes first to
 clear a helper set at a broader scope, such as by `gh auth setup-git`.
 A key that already holds exactly these values is left alone; one that
 holds anything else is replaced, not added to. `remote.origin.url` is

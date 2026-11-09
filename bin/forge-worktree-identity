@@ -23,6 +23,7 @@ Two traps, and how this handles them:
     forge-worktree-identity AGENT               stamp, then verify
     forge-worktree-identity --check AGENT       verify only
     forge-worktree-identity --push app AGENT    stamp, and push as the App
+    forge-worktree-identity --push app --helper '!/stable/helper' AGENT
 
 **`--push app`** also makes this worktree push as the agent's App,
 rather than over SSH with a deploy key, which GitHub attributes to the
@@ -37,7 +38,9 @@ key's owner. It writes, at worktree scope only:
 empty helper value first clears any helper a broader scope configures
 (`gh auth setup-git` writes one to ~/.gitconfig), since git asks every
 helper in turn and the first answer wins. The helper is the installed
-agent-forge's, which outlives any worktree. Running it again changes
+agent-forge's, which outlives any worktree, unless `--helper` names
+another: a project that runs agent-forge from a cache whose path moves
+with each release passes a path that doesn't. Running it again changes
 nothing; with `--check` it verifies instead of writing. Undo it for one
 worktree with `git config --worktree --unset remote.origin.pushurl`.
 
@@ -130,7 +133,16 @@ def main(argv=None, run=proc.sh, load=config.load_reviewed, lookup=None,
                         help="verify only; change nothing")
     parser.add_argument("--push", choices=["app"],
                         help="also push as the agent's App")
+    parser.add_argument("--helper", metavar="COMMAND",
+                        help="with --push app, the credential helper to "
+                        "store, as git takes it (default: this copy's "
+                        "forge-git-credential)")
     args = parser.parse_args(argv)
+    if args.helper is not None and not args.push:
+        parser.error("--helper needs --push app")
+    if args.helper == "":
+        parser.error("--helper needs a command")
+    helper = args.helper or helper
     try:
         project = load()
     except config.ConfigError as e:
