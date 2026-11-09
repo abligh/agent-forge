@@ -38,7 +38,7 @@
     "caches": {"CARGO_TARGET_DIR": "cargo-target"}
   },
   "merge": {"merger": "Merger", "ci_workflow": "ci", "stall_minutes": 30,
-            "test_ahead": {"depth": 3, "max_age_hours": 24},
+            "test_ahead": {"max_age_hours": 24},
             "gate": [["forge-closing-keywords", "--pr", "{pr}", "--include-subject"],
                      ["forge-commit-identity", "{base}..{head}"]],
             "stall_alert": {"tell": ["LeadDev", "Reviewer"],

@@ -30,12 +30,27 @@ GATE = [["tools/closing-keywords", "--pr", "{pr}", "--include-subject"],
         ["forge-commit-identity", "{base}..{head}"]]
 
 
+def old_defaults(ahead):
+    """These tests were written when a test_ahead object meant depth 3,
+    batches of one and no trains unless it said so; designs/0050 made
+    trains the default. The defaults themselves are tested in Trains
+    and in test_config."""
+    if not isinstance(ahead, dict):
+        return ahead
+    return dict({"depth": 3, "batch": 1, "batches": 1, "trains": "off"},
+                **ahead)
+
+
 def project(**merge):
     # own_head_green is off here, so the older tests' answers needn't
     # carry statuses for every approved commit; OwnGreenWait and the
     # Tick tests that name it turn it on.
     data = example()
-    data["merge"] = dict({"gate": GATE, "own_head_green": False}, **merge)
+    # designs/0050 makes testing ahead the default; these tests say
+    # when they want it.
+    data["merge"] = dict({"gate": GATE, "own_head_green": False,
+                          "test_ahead": False}, **merge)
+    data["merge"]["test_ahead"] = old_defaults(data["merge"]["test_ahead"])
     return config.Project(data, None)
 
 
@@ -71,7 +86,11 @@ def pr(number=1, created=T0, reviews=None, comments=None, body="",
 
 def urgent_project(**merge):
     data = example()
-    data["merge"] = dict({"gate": GATE, "own_head_green": False}, **merge)
+    # designs/0050 makes testing ahead the default; these tests say
+    # when they want it.
+    data["merge"] = dict({"gate": GATE, "own_head_green": False,
+                          "test_ahead": False}, **merge)
+    data["merge"]["test_ahead"] = old_defaults(data["merge"]["test_ahead"])
     data.setdefault("labels", {})["urgent"] = "Priority:urgent"
     return config.Project(data, None)
 
@@ -2801,7 +2820,7 @@ class PredictAhead(unittest.TestCase):
 
     def test_no_more_than_the_depth_and_old_refs_go(self):
         q = [self.pr_on(n, self.base, {"f%d.txt" % n: "x\n"})
-             for n in range(1, 7)]
+             for n in range(1, m.DEFAULT_AHEAD_DEPTH + 4)]
         self.assertEqual(len(m.predict_ahead(self.repo.path, self.base, q)),
                          m.DEFAULT_AHEAD_DEPTH + 1)
         self.assertEqual(len(m.predict_ahead(self.repo.path, self.base, q,
@@ -7318,7 +7337,8 @@ class Main0026(unittest.TestCase):
         self.run_main({"queued_stall_minutes": 90},
                       ["--check-state", check])
         self.assertEqual(self.ticks[0]["check_state"], {"waiting": {"h": {}}})
-        self.run_main({}, ["--check-state", check])
+        # Without batches (designs/0050 makes them the default).
+        self.run_main({"test_ahead": False}, ["--check-state", check])
         self.assertNotIn("check_state", self.ticks[0])
 
 
@@ -7748,8 +7768,25 @@ class Trains(RepoCase):
         _, lines = self.tick(prs, conclusions=(None,), live=True, minutes=1)
         self.assertNotIn("TRAIN-DRY 1: #5 #6 | 2: #7", lines)
 
-    def test_off_by_default(self):
-        m.configure(project(test_ahead={"batch": 3}))
+    def test_on_by_default(self):
+        # designs/0050: a project that says nothing about testing ahead
+        # gets trains, and so does one whose test_ahead leaves trains out.
+        data = example()
+        data["merge"] = {"gate": GATE, "own_head_green": False}
+        m.configure(config.Project(data, None))
+        self.addCleanup(m.configure, project())
+        self.assertEqual((m.TEST_AHEAD, m.AHEAD_DEPTH, m.AHEAD_BATCH,
+                          m.AHEAD_BATCHES, m.TRAINS),
+                         (True, 7, 4, 2, "live"))
+        data["merge"]["test_ahead"] = {"batch": 3}
+        m.configure(config.Project(data, None))
+        self.assertEqual(m.TRAINS, "live")
+        data["merge"]["test_ahead"] = False
+        m.configure(config.Project(data, None))
+        self.assertIs(m.TEST_AHEAD, False)
+
+    def test_off_says_nothing_of_trains(self):
+        m.configure(project(test_ahead={"batch": 3, "trains": "off"}))
         self.assertIsNone(m.TRAINS)
         six = self.line(6, 1)
         record, lines = self.tick([self.item(), six], conclusions=(None,),
@@ -7942,7 +7979,11 @@ class CloseMergedIssues(unittest.TestCase):
 def gated_project(scope=None, **merge):
     """The example project with a `mac` instance the Merger waits for."""
     data = example()
-    data["merge"] = dict({"gate": GATE, "own_head_green": False}, **merge)
+    # designs/0050 makes testing ahead the default; these tests say
+    # when they want it.
+    data["merge"] = dict({"gate": GATE, "own_head_green": False,
+                          "test_ahead": False}, **merge)
+    data["merge"]["test_ahead"] = old_defaults(data["merge"]["test_ahead"])
     block = {"context": "vm/mac", "steps": [{"name": "t", "run": ["true"]}],
              "poster": "Merger", "gate": True}
     if scope is not None:

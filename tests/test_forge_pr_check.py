@@ -136,7 +136,9 @@ class Configure(unittest.TestCase):
         self.assertEqual((pc.SLOTS, pc.MEMORY_MAX, pc.STEP_TIMEOUT_S,
                           pc.POSTER, pc.STATUS_CONTEXT),
                          (2, "16G", 1800, "Merger", "vm/build-and-test"))
-        self.assertIs(pc.MERGER_FIRST, False)
+        # designs/0050: with a build check, testing ahead is the default,
+        # and it puts the Merger's head first.
+        self.assertEqual((pc.TEST_AHEAD, pc.MERGER_FIRST), (True, True))
 
     def test_the_poster_defaults_to_the_merger(self):
         data = example()
@@ -168,7 +170,7 @@ class Configure(unittest.TestCase):
 
     def test_without_test_ahead_it_is_off(self):
         data = example()
-        del data["merge"]["test_ahead"]
+        data["merge"]["test_ahead"] = False
         data["checks"]["merger_first"] = False
         pc.configure(config.Project(data, None))
         self.assertEqual((pc.TEST_AHEAD, pc.MERGER_FIRST), (False, False))
@@ -2068,7 +2070,7 @@ class Main(StateCase):
     def test_the_mergers_directory_is_read_only_when_configured(self):
         data = example()
         data["checks"]["merger_first"] = False
-        del data["merge"]["test_ahead"]
+        data["merge"]["test_ahead"] = False
         self.write_config(data)
         with mock.patch.object(pc, "tick", return_value=0) as tick:
             self.main()
@@ -2742,7 +2744,7 @@ class TickAhead(Tick):
 
     def test_without_test_ahead_the_predictions_are_not_read(self):
         data = example()
-        del data["merge"]["test_ahead"]
+        data["merge"]["test_ahead"] = False
         pc.configure(config.Project(data, None))
         self.addCleanup(pc.configure, config.Project(example(), None))
         self.tick([], merger_dir=self.merger())
@@ -3383,7 +3385,7 @@ class WorkerAhead(Worker):
 
     def test_without_test_ahead_nothing_is_matched_or_recorded_by_tree(self):
         data = example()
-        del data["merge"]["test_ahead"]
+        data["merge"]["test_ahead"] = False
         pc.configure(config.Project(data, None))
         self.addCleanup(pc.configure, config.Project(example(), None))
         self.write_state(dict(empty(), results={SHA_B: verdict(pr=4)}))

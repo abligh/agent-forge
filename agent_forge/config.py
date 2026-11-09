@@ -105,7 +105,8 @@ NIGHTLY = {"workflow": str, "job": str, "owners": dict, "labels": list,
 # A workflow is named by its file, which is read for its inputs.
 WORKFLOW_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
-         "stall_minutes": int, "stall_alert": dict, "test_ahead": dict,
+         "stall_minutes": int, "stall_alert": dict,
+         "test_ahead": (dict, bool),
          "hold_conflicting": bool, "yield_after_hand_back": int,
          "yield_cap": int, "yield_ignores_conflicts": bool,
          "right_of_way": dict, "code_owners": bool,
@@ -128,7 +129,14 @@ TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "fixed_order": bool, "hand_back_red_suspect": bool,
               "unstable_after_recuts": int, "batches_when_unstable": int,
               "trains": str, "trains_within": str}
-TRAINS = ("dry-run", "live")
+TRAINS = ("dry-run", "live", "off")
+# designs/0050: what testing ahead is when the project says nothing.
+# Trains of up to 4, two in flight, predicted 7 deep; batches x batch
+# is then depth + 1.
+DEFAULT_AHEAD_DEPTH = 7
+DEFAULT_AHEAD_BATCH = 4
+DEFAULT_AHEAD_BATCHES = 2
+DEFAULT_TRAINS = "live"
 TRAINS_WITHIN = ("files", "clean")
 STALL_ALERT = {"tell": list, "retell_minutes": int,
                "owner_after_minutes": int, "title": str, "labels": list}
@@ -614,13 +622,23 @@ def check(data):
             problems.append("merge.merger %r is not in machinery" % name)
         if isinstance(merge.get("stall_alert"), dict):
             _check_stall_alert(merge["stall_alert"], data["agents"], problems)
+        if merge.get("test_ahead") is True and not isinstance(
+                data.get("checks"), dict):
+            problems.append("merge.test_ahead needs checks: the build "
+                            "check runs the predictions")
         if isinstance(merge.get("test_ahead"), dict):
-            _check_test_ahead(merge["test_ahead"], data.get("checks"),
-                              problems)
-            if merge["test_ahead"].get("stacks") is True and (
+            given = merge["test_ahead"]
+            _fields("merge.test_ahead", given, TEST_AHEAD, problems)
+            if given.get("trains") == "off" and "trains_within" in given:
+                problems.append("merge.test_ahead.trains_within needs "
+                                "trains")
+            # designs/0050: what applies is checked, defaults included.
+            ahead = test_ahead(data)
+            _check_test_ahead(ahead, data.get("checks"), problems)
+            if ahead.get("stacks") is True and (
                     "stacks" not in merge
-                    or not _is(merge["test_ahead"].get("batch"), int)
-                    or merge["test_ahead"]["batch"] < 2):
+                    or not _is(ahead.get("batch"), int)
+                    or ahead["batch"] < 2):
                 # designs/0035: a layer joins its base's batch, so there
                 # must be stacks and batches.
                 problems.append("merge.test_ahead.stacks needs merge.stacks "
@@ -1243,13 +1261,57 @@ def instance_checks(data, name):
     return section, block.get("host", data.get("host", ""))
 
 
+def test_ahead(data):
+    """merge.test_ahead as it applies (designs/0050), or None when off.
+
+    Testing ahead in trains is the default: with no `test_ahead` key it
+    is on whenever the project has a `checks` section (the build check
+    that runs predictions) whose `merger_first` isn't false. `false`
+    turns it off. Within it, whatever the project leaves out takes the
+    default: `depth` 7, `batch` 4 (at most depth + 1), `batches` as many
+    as fit up to 2, and `trains` "live" when batch is above 1 ("off"
+    otherwise). `"trains": "off"` keeps batches without trains."""
+    merge = data.get("merge") or {}
+    if not isinstance(merge, dict):
+        return None
+    ahead = merge.get("test_ahead")
+    if ahead is False:
+        return None
+    if ahead is None or ahead is True:
+        checks = data.get("checks")
+        if ahead is None and (not isinstance(checks, dict)
+                              or checks.get("merger_first") is False):
+            return None
+        ahead = {}
+    if not isinstance(ahead, dict):
+        return None
+    out = dict(ahead)
+    depth = out.setdefault("depth", DEFAULT_AHEAD_DEPTH)
+    if not _is(depth, int) or depth < 0:
+        return out
+    batch = out.setdefault("batch", min(DEFAULT_AHEAD_BATCH, depth + 1))
+    if not _is(batch, int) or not 1 <= batch <= depth + 1:
+        return out
+    if "batches" not in out:
+        out["batches"] = (max(1, min(DEFAULT_AHEAD_BATCHES,
+                                     (depth + 1) // batch))
+                          if batch > 1 else 1)
+    if "trains" not in out:
+        out["trains"] = (DEFAULT_TRAINS
+                         if batch > 1 and out.get("fixed_order") is not False
+                         else "off")
+    if out["trains"] == "off":
+        del out["trains"]
+        out.pop("trains_within", None)
+    return out
+
+
 def _check_test_ahead(ahead, checks, problems):
     """merge.test_ahead: how far ahead the Merger predicts, and how long
     the build check reuses a green verdict for another commit with its
     tree. Testing ahead puts the Merger's pull request first, so
     `checks.merger_first: false` contradicts it."""
     where = "merge.test_ahead"
-    _fields(where, ahead, TEST_AHEAD, problems)
     if _is(ahead.get("depth"), int) and ahead["depth"] < 0:
         problems.append("%s.depth must be at least 0" % where)
     if _is(ahead.get("max_age_hours"), int) and ahead["max_age_hours"] < 1:
@@ -1257,14 +1319,16 @@ def _check_test_ahead(ahead, checks, problems):
     if _is(ahead.get("batch"), int):
         # designs/0032: one run covers the first `batch` predictions,
         # so there must be that many.
-        depth = ahead["depth"] if _is(ahead.get("depth"), int) else 3
+        depth = ahead["depth"] if _is(ahead.get("depth"), int) \
+            else DEFAULT_AHEAD_DEPTH
         if not 1 <= ahead["batch"] <= depth + 1:
             problems.append("%s.batch must be at least 1 and at most "
                             "depth + 1 (%d)" % (where, depth + 1))
     if _is(ahead.get("batches"), int):
         # designs/0035 part 2: up to `batches` batches of up to `batch`
         # each are predicted end to end.
-        depth = ahead["depth"] if _is(ahead.get("depth"), int) else 3
+        depth = ahead["depth"] if _is(ahead.get("depth"), int) \
+            else DEFAULT_AHEAD_DEPTH
         batch = ahead["batch"] if _is(ahead.get("batch"), int) else 1
         if ahead["batches"] < 1:
             problems.append("%s.batches must be at least 1" % where)

@@ -1138,8 +1138,8 @@ def configure(project, instance=None):
         if instance is None and "docker_slices" in checks else None
     STEP_TIMEOUT_S = 60 * checks.get("step_timeout_minutes",
                                      DEFAULT_STEP_TIMEOUT_S // 60)
-    ahead = project.section("merge").get("test_ahead") \
-        if instance is None else None
+    ahead = config.test_ahead(project.data) \
+        if instance is None else None   # designs/0050
     TEST_AHEAD = ahead is not None
     SPARE_ONLY = bool((ahead or {}).get("spare_slots_only"))
     MATCH_MAX_AGE = datetime.timedelta(hours=(ahead or {}).get(

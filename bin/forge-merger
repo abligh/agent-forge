@@ -832,7 +832,7 @@ STALL_ALERT_NAME = "stall-alert.json"
 # predicted for the build check to test ahead, and how many behind the
 # one acted on. The predictions are local commits under AHEAD_REF<k>,
 # with a fixed identity and date so the same inputs give the same SHA.
-DEFAULT_AHEAD_DEPTH = 3
+DEFAULT_AHEAD_DEPTH = config.DEFAULT_AHEAD_DEPTH
 TEST_AHEAD = False
 AHEAD_DEPTH = DEFAULT_AHEAD_DEPTH
 AHEAD_FILE = "ahead.json"
@@ -1114,7 +1114,7 @@ def configure(project):
                                                   DEFAULT_WAITING_OWNER)
     URGENT_LABEL = project.section("labels").get("urgent")
     RERUN_LABEL = project.section("labels").get("rerun")
-    ahead = merge.get("test_ahead")
+    ahead = config.test_ahead(project.data)   # designs/0050
     TEST_AHEAD = ahead is not None
     AHEAD_DEPTH = (ahead or {}).get("depth", DEFAULT_AHEAD_DEPTH)
     AHEAD_BATCH = (ahead or {}).get("batch", 1)
