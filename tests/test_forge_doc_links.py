@@ -38,6 +38,17 @@ class SlugTest(unittest.TestCase):
         self.assertIn("here", links.anchors('<a id="here"></a>\n'))
         self.assertIn("old", links.anchors("<a name='old'></a>\n"))
 
+    def test_a_headings_code_spans_are_part_of_its_anchor(self):
+        # GitHub keeps a code span's text: "### `merge.stacks`" is
+        # #mergestacks, and "What `depends` records" keeps "depends".
+        text = ("### `merge.stacks`\n"
+                "### What `depends` records and passes on\n")
+        self.assertEqual(links.anchors(text), {
+            "mergestacks", "what-depends-records-and-passes-on"})
+
+    def test_an_html_anchor_in_a_code_span_is_an_example(self):
+        self.assertEqual(links.anchors('Write `<a id="x"></a>`.\n'), set())
+
     def test_headings_in_fences_are_not_anchors(self):
         self.assertEqual(links.anchors("```\n# not\n```\n"), set())
 

@@ -95,6 +95,13 @@ letter.
 Only these keys are checked; the section may hold others, for tools
 not here yet.
 
+### `naming`
+
+| Key | Default | What it is |
+| --- | --- | --- |
+| `app_slug_suffix` | none | What follows an agent's name, lower case, in its GitHub App's slug: with `widgetagent`, `LeadDev`'s App is `leaddevwidgetagent`. An agent's `slug` overrides it, and an agent with neither is a problem. The identity tools use the slug for the bot's login and commit address (`<slug>[bot]`). |
+| `session_prefix` | `""` | What comes before an agent's name in the session name the router wakes: with `Widget`, `LeadDev` is woken as `WidgetLeadDev`. An agent's `session_name` overrides it. Use it when one relay serves several projects, so their sessions' names don't collide. |
+
 ### What every step gets
 
 Besides the host's environment (less `GH_TOKEN`, `GITHUB_TOKEN`,
@@ -610,8 +617,9 @@ when it is eligible but for its base, and once its base is the default
 branch it goes first in the queue, after only the one a `test_ahead`
 run is in flight for. While such a run is in flight, a layer that
 isn't in that run's batch goes after the batch instead, first in the
-next one, so it doesn't change the batch being run. It is then updated, checked and merged like any
-other. A layer that isn't eligible ends the stack, and is held as
+next one, so it doesn't change the batch being run. It is then
+updated, checked and merged like any other. A layer that isn't eligible
+ends the stack, and is held as
 usual. With `wait_hours` (1 to 168), it stays in the stack instead,
 held as `stacked on #Q, which merged; waiting for: <why>`, and is
 judged again every tick: once it is eligible but for its base it is
@@ -625,8 +633,9 @@ author retargets it and asks for its approvals again (the record's
 `stack_waited`). A layer whose base was merged without the Merger, by
 hand on GitHub, is found and retargeted the same way: the Merger asks
 GitHub about a branch that is no open pull request's head, once an
-hour while none from it has merged (`merged-elsewhere.json`). A merge of the layer below's branch into a layer, made after
-its approval, covers its head when it is a clean merge and that
+hour while none from it has merged (`merged-elsewhere.json`). A merge
+of the layer below's branch into a layer, made after its approval,
+covers its head when it is a clean merge and that
 branch's head has merged in this stack. When the default branch
 conflicts with a retargeted layer that lacks the final head of the
 layer below, and merging that head into it is clean, the Merger makes
@@ -836,8 +845,9 @@ reference, or `#N`, its URL or "issue N" in the body). With
 its turn has ended and only a background task it started still runs,
 such as a wait loop that will never finish (designs/0017). Its offer
 says since when the task has been running. One offer per idle period,
-never reminded, unless `retell_minutes` is set. An idle developer with nothing to act on is
-reported to `report_to`, once per idle period. A directory that can't
+never reminded, unless `retell_minutes` is set. An idle developer with
+nothing to act on is reported to `report_to`, once per idle period. A
+directory that can't
 be read, or isn't complete, makes nobody idle. Off without the key;
 `{}` turns it on with the defaults. `agent_forge/rules_default.py`
 (rules 15 and 16) has the detail.
@@ -1187,6 +1197,21 @@ never a tag. It refuses an installation with local changes or another
 * A marker over an hour old was left by an installer that died, and is
   ignored.
 
+Its options:
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `--checkout` | `$FORGE_CRON_CHECKOUT` | The project's cron checkout, whose `.agent-forge/pin` is followed. Required one way or the other. |
+| `--install` | the installation it runs from | The installation to move. |
+| `--url` | agent-forge's GitHub URL | Where a release is fetched from. |
+| `--wait` | 240 | Seconds to wait for running jobs before giving up until the next run. |
+| `--versions` | off | Install beside the running release and switch a symlink (below). |
+| `--bin` | `~/.local/bin` | Where the host links the tools. When it already links one tool into the installation, each tool it lacks gets a link of the same kind, said as `LINKED`, so a new tool runs by name from its first release. Nothing there is replaced. |
+| `--dry-run` | off | Say what would be done and change nothing. |
+
+[tools/forge-install.md](tools/forge-install.md) has its messages and
+exit statuses.
+
 With `--versions` it never waits ([designs/0015](designs/0015-install-beside-never-under.md)).
 The installation is a symlink to `<install>.d/<sha>`, one clean clone
 per release, and a new release is cloned beside the running one and the
@@ -1224,3 +1249,39 @@ Each tool keeps its state in
 `$XDG_STATE_HOME` if set). `$FORGE_STATE_DIR` replaces
 `~/.local/state/agent-forge` for tests and for hosts that keep state
 elsewhere.
+
+## Environment variables
+
+Every variable starts `FORGE_`, and each only overrides something,
+for a host or a test: the configuration is the place to say how a
+project works. The tool pages under [tools/](tools/) give each tool's
+own.
+
+| Variable | Read by | What it does |
+| --- | --- | --- |
+| `FORGE_CONFIG` | every tool | The configuration file itself ([Finding it](#finding-it)). |
+| `FORGE_PROJECT_ROOT` | every tool | The checkout whose `.agent-forge/config.json` is read. |
+| `FORGE_CRON_CHECKOUT` | `forge-cron-run`, `forge-install`, the identity tools, `forge-session-start`, `forge-router`, `forge-receiver` | The checkout kept at the default branch. Jobs run in it; the identity tools read the roster from it. |
+| `FORGE_STATE_DIR` | every tool with state | Replaces `~/.local/state/agent-forge` ([Where state lives](#where-state-lives)). |
+| `FORGE_AGENT` | `forge-new-body`, `forge-gh-signed`, `forge-queue`, reads through `agent_forge.github` | The agent a session is: its sign-off, and whose App token reads with. Set it in each agent's session environment; never guessed. |
+| `FORGE_BODY_DIR` | `forge-new-body` | Where body files are written (default `${TMPDIR:-/tmp}/agent-forge-bodies/<agent>`). |
+| `FORGE_GITHUB_API` | every tool that calls GitHub | The API's base URL (default `https://api.github.com`), for GitHub Enterprise Server or a test server. |
+| `FORGE_CRON_APP` | `forge-cron-run` | The App (an agent or machinery name) whose token the job gets as `GH_TOKEN`. |
+| `FORGE_CRON_LOGDIR`, `FORGE_CRON_PATH`, `FORGE_CRON_LOCK`, `FORGE_CRON_LOCK_WAIT_S`, `FORGE_CRON_FETCH_RETRY_S` | `forge-cron-run` | Where logs go, the job's `PATH`, its lock, how long to wait for it, and how long to retry a failed fetch ([tools/forge-cron-run.md](tools/forge-cron-run.md)). |
+| `FORGE_PR_CHECK_SLOTS`, `FORGE_PR_CHECK_MEMORY_MAX`, `FORGE_PR_CHECK_INSTANCE` | `forge-pr-check` | `checks.slots`, `checks.memory_max` and `--instance`, for one host. |
+| `FORGE_ROUTER_RELAY`, `FORGE_ROUTER_REMIND` | `forge-router`, `forge-queue` | `relay.url` and `relay.remind_seconds`. |
+| `FORGE_RECEIVER_PORT`, `FORGE_RECEIVER_SECRET_FILE` | `forge-receiver` | `receiver.port` and `receiver.secret_file`. |
+| `FORGE_HOST_NAME` | `forge-host-settings` | The host's short name (default `hostname -s`). |
+| `FORGE_UNATTRIBUTED_DOMAIN` | `forge-commit-identity` | `identity.unattributed_domain`. |
+| `FORGE_SESSION_START_TIMEOUT` | `forge-session-start` | Seconds before the brief gives up on GitHub. |
+| `FORGE_MEMORY_DIR`, `FORGE_MEMORY_GIT_DIR`, `FORGE_MEMORY_REMOTE`, `FORGE_MEMORY_SEED_DIR`, `FORGE_MEMORY_SSH_KEY`, `FORGE_MEMORY_HOST` | the memory tools | The `memory` section's keys, and the host's name ([memory-sync.md](memory-sync.md)). |
+| `FORGE_QUIET_DIR` | `forge-quiet`, `forge-pr-check` | `quiet.dir`. |
+| `FORGE_FORBIDDEN_WORDS` | `tools/check-neutral` | This repository's own neutrality word list. |
+
+Tools set some for what they start, and nothing else should:
+`FORGE_INSTALL_LOCK_FD` (the installation lock a job hands on),
+`FORGE_QUEUE_TICKET` and `FORGE_QUEUE_SUMMARY` (a queued job's ticket,
+and a file whose last line is its end message), `FORGE_QUIET_HOLDER`,
+`FORGE_QUIET_MINUTES` and `FORGE_QUIET_UNTIL` (a quiet hold's command),
+`FORGE_UNTIMED_SCOPE` and `FORGE_TRACE_FILE` (the build check's
+tracer).

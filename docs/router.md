@@ -1,16 +1,14 @@
 # The router: an engine and a project's rules
 
 `forge-router` decides whose turn every open issue and pull request is,
-and wakes that agent. Its rules used to be written into it. Two projects
-route very differently, so this splits it into an **engine** that every
-project shares and a **rules module** that each project chooses.
+and wakes that agent. It is an **engine** that every project shares
+and a **rules module** that each project chooses.
 
-The engine is the part that has been found twice and should be found
-once: fetching, locking, state, the once-per-turn key, reminders,
-delivery and the journal. The rules are the part that differs: what a
-turn is, and who it falls to.
+The engine does what is the same everywhere: fetching, locking, state,
+the once-per-turn key, reminders, delivery and the journal. The rules
+say what differs: what a turn is, and who it falls to.
 
-## What the two routers do differently
+## The default rules, and what a module can add
 
 The rules shipped here (the "default" rules, 0a–14 in
 `agent_forge/rules_default.py`) read everything from GitHub: who wrote
@@ -18,21 +16,20 @@ something by login, what a review saw by commit. A turn is a decision
 about one open item, edge triggered: a new event starts it, and it is
 woken once.
 
-The larger project's router does more, and some of it doesn't fit that
-shape:
+A project's own module can go further, and the engine carries it:
 
 * **Several recipients for one item.** An item can be one agent's turn
-  while another subscribed to it (a `Notify:` label), and its owner gets
-  a periodic re-look while it is parked.
+  while another is told of it (a `Notify:` label, say), and its owner
+  gets a periodic re-look while it is parked.
 * **Wakes not tied to an open item.** A pull request that merged wakes
   its owner (it is no longer open). A red workflow on the default
   branch, or a stalled queue, is reported with no item.
 * **Level-triggered turns.** An owned issue is its owner's turn until
   it is settled, with reminders that back off with jitter, rather than
   once per event.
-* **Write side effects.** Choosing a reviewer writes a `Reviewer:`
+* **Write side effects.** Choosing a reviewer can write a `Reviewer:`
   label before the wake, so a later run reads the choice back.
-* **Identity from signatures.** Its agents share one login, so who
+* **Identity from signatures.** Where agents share one login, who
   wrote something is read from the `— Name` line.
 * **More data.** Merge state (a conflicted pull request goes to its
   owner), branch protection's required checks, Actions runs, the
@@ -62,7 +59,7 @@ The engine runs one pass:
    App, before delivery, so a failed send leaves them in place.
 5. **Deliver.** Due decisions batched into one message per agent, in
    sections by kind, through the relay, with the confirmed-delivery
-   rules `forge-router` already has.
+   rules [forge-router](tools/forge-router.md) describes.
 6. **Record.** State only for what was delivered (and for what was
    withheld or surfaced, once); the journal for every wake sent,
    failed, withheld, withdrawn or surfaced; and every decision the run
@@ -136,7 +133,7 @@ it doesn't change the exit status: they run on every run, so the next
 tries again. A module that wants one only every N minutes compares
 `ctx.when` with what an `Action` of its own wrote in `state_dir`.
 
-**`--seed`.** A project switching from a router of its own starts with
+**`--seed`.** A project moving from a router of its own starts with
 empty state, so its first sending run would wake every open turn at
 once. `--seed` is a run, under the lock, that decides as a sending run
 does (with no recheck: it sends nothing), then records every due turn
@@ -382,37 +379,3 @@ engine and the default rules, and tests the engine against both.
 Host-specific delivery, such as redirecting a wake to a renamed session
 found in the host's own session registry, stays out of the engine: the
 relay already answers `unknown-name`, and that is reported.
-
-## Order of work
-
-1. Done. Move `forge-router`'s rules behind this interface as the
-   `default` module. No decision changes: every existing test passes
-   unchanged, and its dry-run journal is compared before and after on
-   the same input.
-2. Done. Engine features the default rules don't use yet: several
-   decisions per item and decisions about no item, `sweep` (told
-   `ctx.only`), kinds and sections, actions (`AddLabel`), the reminder
-   policy (`Reminder`), recheck, and the exit status above. Rule 7,
-   which the engine used to print by number, is now the default rules'
-   `surface`, printed as before. Each is tested against a small rules
-   module in the tests (`tests/router_rules.py`), and no decision of
-   the default rules changed. What the engine still refuses is the
-   malformed decision (Decide, above).
-3. Done. `router.rules` pointing at a project file, loaded from the
-   checkout by `load_rules` in `agent_forge/router.py`.
-   [examples/rules.py](../examples/rules.py) is a starting point: the
-   default rules, plus one that makes a conflicted pull request its
-   author's turn, adding the field it needs to the query; its tests
-   load it as the engine does.
-4. The larger project writes its rules module in its own repository and
-   compares its journal with its current router's before switching.
-5. What that module needs that it couldn't write
-   ([designs/0030](designs/0030-what-a-projects-own-router-rules-need.md)),
-   each off, or changing nothing, until a module or the configuration
-   uses it. Done so far: the merged pull requests' fields
-   (`graphql["Merged"]`), the previous run's decisions
-   (`ctx.previous`), actions once a run (`each_run`), a turn already
-   woken (`Decision.woken`), the grace period before a turn is
-   forgotten (`router.forget_minutes`), `--seed`, per-agent `areas`
-   and `offer` (`roster.areas`, `roster.offered`), `router.quiet_labels`,
-   and `router.merge_notice`'s `skip_label` and `to`.

@@ -57,9 +57,9 @@ HTML_ANCHOR_RE = re.compile(r"<a\s[^>]*\b(?:id|name)=[\"']([^\"']+)[\"']",
                             re.IGNORECASE)
 
 
-def prose_lines(text):
+def prose_lines(text, keep_code=False):
     """(line number, line) for each line outside fenced code, with
-    inline code spans removed."""
+    inline code spans removed unless `keep_code`."""
     fence = None
     for number, line in enumerate(text.split("\n"), 1):
         match = FENCE_RE.match(line)
@@ -70,12 +70,13 @@ def prose_lines(text):
         if match:
             fence = match.group(1)
             continue
-        yield number, CODE_SPAN_RE.sub("", line)
+        yield number, line if keep_code else CODE_SPAN_RE.sub("", line)
 
 
 def slug(heading):
     """GitHub's anchor for a heading's text."""
-    # A link in a heading renders as its text, so the slug uses that.
+    # A link in a heading renders as its text, so the slug uses that;
+    # so does a code span, without its backticks.
     text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", heading)
     text = re.sub(r"<[^>]+>", "", text).strip().lower()
     text = re.sub(r"[^\w\s-]", "", text)
@@ -85,8 +86,11 @@ def slug(heading):
 def anchors(text):
     """Every anchor a link may name in a Markdown document."""
     found, seen = set(), {}
-    for _, line in prose_lines(text):
-        found.update(HTML_ANCHOR_RE.findall(line))
+    for _, line in prose_lines(text, keep_code=True):
+        # An <a id> inside a code span is an example, not an anchor.
+        found.update(HTML_ANCHOR_RE.findall(CODE_SPAN_RE.sub("", line)))
+        # A heading's code spans are part of its text: GitHub's anchor
+        # for "### `merge.stacks`" is "mergestacks".
         heading = HEADING_RE.match(line)
         if not heading:
             continue

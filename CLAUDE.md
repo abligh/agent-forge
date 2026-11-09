@@ -1,8 +1,10 @@
 # agent-forge
 
 Tooling shared by projects that are developed by teams of AI agents on
-GitHub. [docs/design.md](docs/design.md) says what belongs here and the
-order of work; [docs/config.md](docs/config.md) is the configuration.
+GitHub. [docs/design.md](docs/design.md) says what it is for and what
+belongs here; [docs/config.md](docs/config.md) is the configuration,
+[docs/getting-started.md](docs/getting-started.md) a new project's
+setup and [docs/tools/](docs/tools/) each tool's reference.
 
 ## Rules
 
@@ -22,6 +24,15 @@ order of work; [docs/config.md](docs/config.md) is the configuration.
   override configuration.
 * **Anything that shells out takes `run`**, defaulting to
   `agent_forge.proc.sh`, so tests can fake it.
+* **Every pull request keeps the documentation current, in the same
+  pull request.** A new or changed tool, option, configuration key,
+  default or environment variable changes its page under `docs/tools/`,
+  `docs/config.md`, and `docs/getting-started.md` when a new project's
+  setup changes. Write for a reader who knows nothing of agent-forge or
+  of the projects that use it. `tests/test_docs.py` checks that every
+  tool, option, key and variable is documented and that the Markdown
+  passes its checks; it can't check that what is written is still true,
+  so a reviewer does.
 * **No tool merges or approves on its own judgment.** The Merger merges
   what reviewers approved, and nothing else does either.
 
