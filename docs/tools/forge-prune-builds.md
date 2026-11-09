@@ -44,13 +44,13 @@ To see what it would clear, run it by hand with `--dry-run`.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--root DIR` | required | A directory whose direct subdirectories with a `.git` are worktrees, such as a supervisor's agents directory. Repeatable. |
-| `--shared DIR` | none | A directory whose direct subdirectories that carry a valid `CACHEDIR.TAG` and have no `.git` are caches shared between worktrees (a Cargo `CARGO_TARGET_DIR`). Repeatable. May be the same directory as a `--root`. |
+| `--shared DIR` | none | A directory whose tagged subdirectories, down to three levels and outside any worktree, are caches shared between worktrees (a Cargo `CARGO_TARGET_DIR`, or one per build kind beneath a directory of them). Repeatable. May be the same directory as a `--root`, or contain another `--shared`; each cache is judged once. |
 | `--merged-hours H` | `6` | Idle hours before a cache is cleared when its worktree's branch heads a merged or closed pull request. |
 | `--idle-hours H` | `48` | Idle hours before a cache is cleared otherwise, and for shared caches. Must be at least `--merged-hours`. |
 | `--high-water PCT` | off | Used percent of a root's filesystem at which more is cleared after the normal pass. Needs `--low-water`. |
 | `--low-water PCT` | off | Used percent to clear down to under pressure. Needs `--high-water`, and must be above 0 and at most `--high-water`. |
 | `--pressure-floor-hours H` | `1` | Under pressure, keep a cache used this recently. At least 0. |
-| `--live-trim-hours H` | off | If the pressure pass isn't enough, trim the caches of worktrees in use too, taking outputs unused for `H` hours. Needs `--high-water`; above 0. |
+| `--live-trim-hours H` | off | If the pressure pass isn't enough, trim the caches in use too, of worktrees and shared ones, taking outputs unused for `H` hours. Needs `--high-water`; above 0. |
 | `--every-minutes N` | off | Skip the run when every root is under `--high-water` (or no `--high-water` is given) and the last full scan was less than `N` minutes ago. Above 0. |
 | `--aged-cache DIR` | none | An untagged cache, such as `GOCACHE`, whose files are deleted once `--aged-days` old. Repeatable. |
 | `--aged-days D` | `5` | Days unused before an `--aged-cache` file is deleted. Above 0. |
@@ -115,11 +115,17 @@ interrupted run is deleted on the next.
 
 ### Shared caches (`--shared`)
 
+A shared cache is any directory under `--shared` that carries a valid
+`CACHEDIR.TAG`, down to three levels: `.tgt-x` itself, or
+`.tgt-x/wasm32-wasip1` beneath an untagged `.tgt-x`. A tagged directory
+is one cache and isn't searched further. A directory with a `.git` is a
+worktree, and nothing inside it is a shared cache.
+
 Each is judged by rules 1 to 3 with two differences: no pull request
 decides it, so only `--idle-hours` applies; and it is also in use while
-any process this user can read names it, or a directory inside it, as
-`CARGO_TARGET_DIR`. A directory with a `.git` is a worktree, not a
-shared cache.
+any process this user can read names it, a directory inside it, or a
+directory above it as `CARGO_TARGET_DIR`. One in use is trimmed by
+`--live-trim-hours` like a live worktree's cache.
 
 ### Under pressure (`--high-water`, `--low-water`)
 
@@ -132,15 +138,16 @@ filesystem is under `--low-water`. A cache used in the last
 
 ### Live caches (`--live-trim-hours`)
 
-If a root is still at or over `--high-water`, the caches of worktrees
-in use are trimmed, the one with most to give first, until it is under
-`--low-water`. Rule 1 keeps a whole cache from a live session, which is
-exactly when it grows: each re-link leaves another copy of a test
-binary. So this takes only what a build no longer needs: under each
-`deps` directory, the files, and under each `incremental` directory,
-whole sessions (`<crate>/<session>`), neither read nor written for `H`
-hours and not open. Rule 2 still holds, and the locks are held while it
-trims, so a running build is never touched.
+If a root is still at or over `--high-water`, the caches in use, of
+worktrees and shared ones, are trimmed, the one with most to give
+first, until it is under `--low-water`. Rule 1 keeps a whole cache from
+a live session, which is exactly when it grows: each re-link leaves
+another copy of a test binary. So this takes only what a build no
+longer needs: under each `deps` directory, the files, and under each
+`incremental` directory, whole sessions (`<crate>/<session>`), neither
+read nor written for `H` hours and not open. Rule 2 still holds, and
+the locks are held while it trims, so a running build is never
+touched.
 
 ### Aged caches (`--aged-cache`)
 

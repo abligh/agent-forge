@@ -142,3 +142,42 @@ Cargo treats a missing output as stale.
 * Removing worktrees, branches or anything untagged.
 * Changing how agents choose their target directories. That's for each
   project.
+
+## Amendment, 2026-11-08: shared caches one level down, and trimmed live
+
+Section 3 finds a shared cache only as a direct subdirectory of
+`--shared` with a tag at its top. On 2026-11-08 one host's filesystem
+filled to 100% while the pass ran every five minutes, saw 99–100%, and
+cleared nothing. It saw five caches and kept them all, because each was
+busy or had been used within the hour. Most of the space was in places
+section 3 doesn't reach:
+
+* **Per-kind targets.** An agent built into `<agents>/.tgt-<name>-a/`
+  with one target directory per kind of build beneath it
+  (`wasm32-wasip1/`, `vet-windows/` and so on). Cargo tags each of
+  those, but not their parent, so the parent isn't a cache and the
+  tagged ones are a level too deep. That was about 180 GB on that host.
+* **A busy shared cache.** One shared target in use held 150 GB, most
+  of it stale `incremental` sessions. The live trim of 2026-11-07 only
+  reaches worktrees' caches, so nothing could take any of it.
+
+So, in place of section 3's "direct subdirectories":
+
+1. **A shared cache is any tagged directory under `--shared`, down to
+   the same depth as in a worktree** (three levels). A tagged directory
+   is one cache and isn't searched further. A directory with a `.git` is
+   a worktree, and nothing inside it counts as a shared cache: `--root`
+   judges it.
+2. **"In use" counts a `CARGO_TARGET_DIR` at or above the cache**, as
+   well as one inside it. A process building into `.tgt-x` uses
+   `.tgt-x/wasm32-wasip1`.
+3. **A shared cache in use is trimmed by `--live-trim-hours`**, under
+   the same rules as a live worktree's cache: only stale `deps` files
+   and `incremental` sessions, not open, with every Cargo lock held.
+4. **One `--shared` inside another**, such as `$HOME` and
+   `$HOME/agents`, judges each cache once.
+
+The safety line is unchanged: nothing without a valid `CACHEDIR.TAG` is
+ever cleared, and nothing inside a worktree is judged as shared. A cron
+line that already gives `--shared` gets the deeper search with the next
+pin. `--live-trim-hours` stays off unless the line gives it.

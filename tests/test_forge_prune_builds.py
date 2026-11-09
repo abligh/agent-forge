@@ -437,8 +437,8 @@ class LiveTrim(unittest.TestCase):
 
 
 class Shared(unittest.TestCase):
-    """designs/0041: tagged directories directly under --shared are caches
-    shared between worktrees."""
+    """designs/0041: tagged directories under --shared, outside worktrees,
+    are caches shared between worktrees."""
 
     def setUp(self):
         self.fx = Fixture(self)
@@ -491,6 +491,69 @@ class Shared(unittest.TestCase):
         old = self.tgt(".tgt-old", 100)
         self.go(busy=[os.path.realpath(os.path.join(old, "debug", "x"))])
         self.assertTrue(os.path.exists(old))
+
+    def test_a_cache_one_level_down_is_found(self):
+        # A directory of per-kind targets carries its tags one level
+        # down: .tgt-x/wasm32-wasip1, .tgt-x/vet-windows.
+        old = self.tgt(".tgt-kinds/wasm32-wasip1", 100)
+        new = self.tgt(".tgt-kinds/vet-windows", 10)
+        (cleared, kept, _), lines = self.go()
+        self.assertEqual((cleared, kept), (1, 1))
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(new))
+        self.assertTrue(os.path.isdir(os.path.join(self.shared, ".tgt-kinds")))
+
+    def test_nested_shared_dirs_judge_each_cache_once(self):
+        old = self.tgt("agents/.tgt-kinds/wasm32-wasip1", 100)
+        lines = []
+        cleared, kept, _ = prune.prune(
+            [], dry_run=False, merged_hours=6, idle_hours=48, repo="o/r",
+            token=None, now=NOW, busy=set(), out=lines.append,
+            shared=[self.shared, os.path.join(self.shared, "agents")],
+            targets=set(), high_water=None, low_water=None,
+            usage=lambda r: 0)
+        self.assertEqual((cleared, kept), (1, 0))
+        self.assertFalse(os.path.exists(old))
+
+    def test_a_tagged_cache_is_not_searched_inside(self):
+        outer = self.tgt(".tgt-outer", 10)
+        inner = self.fx.cache(outer, rel="nested", age_hours=100)
+        (cleared, kept, _), _ = self.go()
+        self.assertEqual((cleared, kept), (0, 1))
+        self.assertTrue(os.path.exists(inner))
+
+    def test_nothing_inside_a_worktree_is_a_shared_cache(self):
+        wt = os.path.join(self.shared, "wt")
+        os.makedirs(wt)
+        with open(os.path.join(wt, ".git"), "w") as f:
+            f.write("gitdir: /nowhere\n")
+        inner = self.fx.cache(wt, rel="sub/target", age_hours=100)
+        self.go()
+        self.assertTrue(os.path.exists(inner))
+
+    def test_a_target_dir_above_the_cache_makes_it_busy(self):
+        old = self.tgt(".tgt-kinds/wasm32-wasip1", 100)
+        _, lines = self.go(targets=[os.path.realpath(
+            os.path.join(self.shared, ".tgt-kinds"))])
+        self.assertTrue(os.path.exists(old))
+        self.assertIn("busy", lines[0])
+
+    def test_a_busy_shared_cache_is_trimmed_live(self):
+        cache = self.tgt(".tgt-live", 1)
+        stale = os.path.join(cache, "debug", "deps", "libstale.rlib")
+        with open(stale, "wb") as f:
+            f.write(b"z" * 4096)
+        os.utime(stale, (NOW - 100 * HOUR, NOW - 100 * HOUR))
+        lines = []
+        prune.prune(
+            [], dry_run=False, merged_hours=6, idle_hours=48, repo="o/r",
+            token=None, now=NOW, busy=set(), out=lines.append,
+            shared=[self.shared], targets={os.path.realpath(cache)},
+            high_water=85, low_water=70, floor_hours=1.0,
+            usage=lambda r: 90, live_trim_hours=6)
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(
+            os.path.join(cache, "debug", "deps", "libx.rlib")))
 
     def test_shared_caches_go_under_pressure_too(self):
         old = self.tgt(".tgt-a", 30)
