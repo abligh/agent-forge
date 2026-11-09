@@ -145,8 +145,9 @@ a live session, which is exactly when it grows: each re-link leaves
 another copy of a test binary. So this takes only what a build no
 longer needs: under each `deps` directory, the files, and under each
 `incremental` directory, whole sessions (`<crate>/<session>`), neither
-read nor written for `H` hours and not open. Rule 2 still holds, and the locks are held while it
-trims, so a running build is never touched.
+read nor written for `H` hours and not open. Rule 2 still holds, and
+the locks are held while it trims, so a running build is never
+touched.
 
 ### Aged caches (`--aged-cache`)
 
