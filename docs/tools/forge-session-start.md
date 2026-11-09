@@ -77,6 +77,10 @@ From `.agent-forge/config.json` ([config.md, Keys](../config.md#keys)):
   (default `Status:`).
 * `session_start.skip_labels`: items with any of these labels are left
   out of the listing.
+* `session_start.identity_command` (default `forge-worktree-identity`):
+  what the brief tells an unstamped worktree to run, followed by
+  `<YourName>`. Set it when the project wraps that tool under its own
+  name or path.
 * `docs.roles` (default `docs/roles.md`; see the `docs` section of
   [config.md](../config.md)): the roles file.
 * `identity.unattributed_name` (default `Anonymous Agent`): a worktree

@@ -38,7 +38,10 @@ the open issues and pull requests labeled `<labels.owner_prefix><agent>`
 Items carrying one of `session_start.skip_labels` (default none) are
 left out, such as heartbeat issues a cron job keeps under an owner,
 which are machinery rather than work; the brief says how many it left
-out, so the list never reads as complete when it isn't.
+out, so the list never reads as complete when it isn't. An unstamped
+worktree is told to run `session_start.identity_command` (default
+forge-worktree-identity), for a project that wraps it under its own
+name.
 
 **Then the agent's own role**: its `## <Name>` section of the roles
 file (`docs.roles`, default docs/roles.md). One section can brief
@@ -111,6 +114,12 @@ class Listing(list):
     skipped = 0
 
 
+def identity_command_of(project):
+    """What an unstamped worktree is told to run, before `<YourName>`."""
+    return ((project.section("session_start").get("identity_command")
+             if project else None) or "forge-worktree-identity").strip()
+
+
 def skip_labels_of(project):
     return tuple(project.section("session_start").get("skip_labels") or ())
 
@@ -180,7 +189,8 @@ def brief(source, agent, items, project=None, now=None, role=None,
                      "(git config --worktree user.name is unset or the "
                      "unattributed name; a name set for the whole repository "
                      "does not count), so your open items can't be listed. "
-                     "Run forge-worktree-identity <YourName> first.")
+                     "Run %s <YourName> first."
+                     % identity_command_of(project))
     elif isinstance(items, str):
         lines.append("Could not list your open items (%s). Run this "
                      "yourself:\n  gh api '%s'"

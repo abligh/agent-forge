@@ -169,6 +169,15 @@ class Brief(Checkout):
             self.assertIn("forge-worktree-identity", ctx)
             self.assertEqual(calls, [], "no name, so no listing")
 
+    def test_an_unstamped_worktree_is_told_the_projects_own_command(self):
+        self.data.setdefault("session_start", {})["identity_command"] = \
+            "tools/widget-worktree-identity"
+        self.write_config()
+        ctx = self.context(run=fake_run(name=None))[1]["additionalContext"]
+        self.assertIn("Run tools/widget-worktree-identity <YourName> first.",
+                      ctx)
+        self.assertNotIn("forge-worktree-identity", ctx)
+
     def test_a_configured_unattributed_name_is_unstamped_too(self):
         self.data["identity"]["unattributed_name"] = "Nobody Yet"
         self.write_config()
