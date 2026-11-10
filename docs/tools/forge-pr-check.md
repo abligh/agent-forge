@@ -255,6 +255,11 @@ reads history belongs in `merge.gate` instead.
   and closes it when it is back (`CLOSED`). A refused write is
   `REPORT-FAILED`, tried again next time.
 
+Its comments on a pull request (`red_comment`, and the refusal of a
+second `labels.rerun` on one head) start with a `Not-a-review` line, so
+the Merger's `merge.said_since` doesn't hold an approved pull request
+on one posted after the approval.
+
 A post GitHub refuses changes neither the verdict nor the exit status
 (`POST-FAILED`); each tick posts again what never arrived.
 
