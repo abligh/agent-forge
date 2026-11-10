@@ -1246,6 +1246,18 @@ class Poster(unittest.TestCase):
         self.assertEqual(headers["x-xmpp-verbatim"], "1")
         self.assertTrue(headers["content-type"].startswith("text/plain"))
 
+    def test_a_room_poster_posts_to_the_rooms_jid(self):
+        seen = []
+
+        def opener(req, timeout):
+            seen.append(req)
+            return self.Response(200)
+        poster = r.make_poster("http://relay:8788", "s3cret", opener,
+                               stamp="run1", kind="room")
+        self.assertIsNone(poster("ops@conference.example.org", "From: x"))
+        self.assertEqual(seen[0].full_url, "http://relay:8788/room/"
+                         "ops%40conference.example.org")
+
     def test_only_the_relay_taking_one_message_counts(self):
         self.assertIsNone(self.post((200, {"status": "duplicate"}))[0])
         for answer in ({}, {"status": "queued", "targets": []},

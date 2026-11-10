@@ -85,18 +85,25 @@ QUEUE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # forge-stats-watch (designs/0024): a watch on forge-stats' figures.
 STATS_WATCH = {"owner": str, "window_hours": int, "baseline_days": int,
                "figures": dict, "label": str, "remind_hours": int,
-               "min_samples": int, "as": str}
-# Each watched figure, and the rules it takes: `limit` and `ratio`.
+               "min_samples": int, "as": str, "notify": list,
+               "notify_rooms": list}
+# Each watched figure, and the rules it takes: `limit`, `ratio` and
+# `short_hours` (a shorter window judged as well, designs/0024 fourth
+# amendment).
 STATS_WATCH_FIGURES = {
-    "check_run": ("limit", "ratio"), "check_wait": ("limit", "ratio"),
-    "pr_turnaround": ("limit", "ratio"), "merge_time": ("limit", "ratio"),
-    "merge_rate": ("limit", "ratio"), "slots_busy": ("limit",),
+    "check_run": ("limit", "ratio", "short_hours"),
+    "check_wait": ("limit", "ratio", "short_hours"),
+    "pr_turnaround": ("limit", "ratio", "short_hours"),
+    "merge_time": ("limit", "ratio", "short_hours"),
+    "merge_rate": ("limit", "ratio", "short_hours"),
+    "slots_busy": ("limit", "short_hours"),
     "main_red": (),
     "nightly_red_hours": ("limit",),
-    "main_cpu": ("limit", "ratio", "step"),
+    "main_cpu": ("limit", "ratio", "step", "short_hours"),
     # From forge-flow (designs/0045).
-    "hand_backs_per_merge": ("limit", "ratio"),
-    "prs_per_slot": ("limit", "ratio"), "reviewer_busy": ("limit",)}
+    "hand_backs_per_merge": ("limit", "ratio", "short_hours"),
+    "prs_per_slot": ("limit", "ratio", "short_hours"),
+    "reviewer_busy": ("limit", "short_hours")}
 # forge-nightly (designs/0028): a red nightly is a red main.
 NIGHTLY = {"workflow": str, "job": str, "owners": dict, "labels": list,
            "retry_hours": int, "escalate_hours": list, "as": str,
@@ -476,6 +483,19 @@ def _check_stats_watch(watch, data, problems):
             problems.append("%s.%s must be at least 1" % (where, key))
     if isinstance(watch.get("label"), str) and not watch["label"].strip():
         problems.append("%s.label must not be empty" % where)
+    for to in watch.get("notify") or [] \
+            if isinstance(watch.get("notify"), list) else []:
+        if not isinstance(to, str) or not to.strip() or (
+                to not in data["agents"] and "@" not in to):
+            problems.append("%s.notify: %r is not an agent or an XMPP "
+                            "address" % (where, to))
+    for room in watch.get("notify_rooms") or [] \
+            if isinstance(watch.get("notify_rooms"), list) else []:
+        if not isinstance(room, str) or "@" not in room or "/" in room:
+            problems.append("%s.notify_rooms: %r is not a room's JID"
+                            % (where, room))
+    hours = watch.get("window_hours")
+    hours = hours if _is(hours, int) else 6
     for figure, rules in (watch.get("figures") or {}).items():
         at = "%s.figures.%s" % (where, figure)
         if figure not in STATS_WATCH_FIGURES:
@@ -498,6 +518,11 @@ def _check_stats_watch(watch, data, problems):
             elif key == "step":
                 if not isinstance(value, str) or not value.strip():
                     problems.append("%s.step must be a step's name" % at)
+            elif key == "short_hours":
+                if not _is(value, int) or not 1 <= value < hours:
+                    problems.append("%s.short_hours must be a whole number "
+                                    "of hours from 1 to under window_hours "
+                                    "(%d)" % (at, hours))
             elif not _is(value, (int, float)) or value <= 0:
                 problems.append("%s.%s must be a number above 0"
                                 % (at, key))

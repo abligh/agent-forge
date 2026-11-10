@@ -254,11 +254,30 @@ class Main(unittest.TestCase):
         self.gh = FakeGitHub()
         self.window = stats()
         self.base = stats()
+        self.short = None
         self.out, self.err, self.minted = [], [], []
+        self.loads = [(1.0, 2.0, 3.0)]
+        self.sent, self.refuse = [], set()
 
     def stats(self, since, until):
+        if self.short is not None and until - since <= 3 * HOUR:
+            return self.short
         return self.window if until - since < datetime.timedelta(days=1) \
             else self.base
+
+    def loadavg(self):
+        return self.loads[0]
+
+    def send(self, kind, to, text):
+        self.sent.append((kind, to, text))
+        return "HTTP 503 queue-full" if to in self.refuse else None
+
+    def configure(self, **watch):
+        with open(self.config) as handle:
+            data = json.load(handle)
+        data["stats_watch"].update(watch)
+        with open(self.config, "w") as handle:
+            json.dump(data, handle)
 
     def mint(self, project, name):
         self.minted.append(name)
@@ -267,7 +286,8 @@ class Main(unittest.TestCase):
     def main(self, *argv, now=NOW, mint=None):
         return tool.main(list(argv), self.out.append, self.err.append,
                          self.env, now, call=self.gh, stats=self.stats,
-                         mint=mint or self.mint)
+                         mint=mint or self.mint, send=self.send,
+                         loadavg=self.loadavg, cpus=lambda: 8)
 
     def saved(self):
         with open(self.state) as handle:
@@ -352,6 +372,111 @@ class Main(unittest.TestCase):
         self.assertEqual((method, shut, body["state"]),
                          ("PATCH", "/issues/100", "closed"))
         self.assertEqual(self.saved()["figures"], {})
+
+    def test_a_short_window_catches_a_dip_the_long_one_hides(self):
+        figures = dict(WATCH["figures"], merge_rate={
+            "limit": 6, "short_hours": 3})
+        self.configure(figures=figures)
+        self.window = stats(merges=42, held=6)
+        self.short = stats(merges=10, held=3)
+        self.assertEqual(self.main(), 0)
+        [(_, _, body)] = self.gh.writes
+        self.assertEqual(body["title"], "forge-stats-watch: merge_rate over "
+                         "the last 3 h, 3.3 an hour, under the limit of "
+                         "6.0 an hour")
+        self.assertIn("| `merge_rate`, last 3 h | 3.3 an hour (12 samples) "
+                      "| |", body["body"])
+        self.assertIn("judged over the last 3 h as well", body["body"])
+        # A quiet short window (the queue held no work) is no dip.
+        self.gh, self.short = FakeGitHub(), stats(merges=0, held=0)
+        os.remove(self.state)
+        self.assertEqual(self.main(), 0)
+        self.assertEqual(self.gh.writes, [])
+        self.assertIn("IN merge_rate: 7.0 an hour", self.out)
+
+    def test_without_short_hours_only_the_window_is_read(self):
+        asked = []
+
+        def stats_(since, until):
+            asked.append(until - since)
+            return self.stats(since, until)
+        tool.main([], self.out.append, self.err.append, self.env, NOW,
+                  call=self.gh, stats=stats_, mint=self.mint,
+                  send=self.send, loadavg=self.loadavg, cpus=lambda: 8)
+        self.assertEqual(asked, [6 * HOUR, datetime.timedelta(days=7)])
+
+    def test_notify_tells_agents_addresses_and_rooms_once(self):
+        self.configure(notify=["Reviewer", "ops@example.org"],
+                       notify_rooms=["ops@conference.example.org"])
+        self.window = stats(ran=14)
+        self.refuse = {"ops@conference.example.org"}
+        self.main()
+        self.assertEqual([(k, to) for k, to, _ in self.sent], [
+            ("agent", "Reviewer"), ("agent", "ops@example.org"),
+            ("room", "ops@conference.example.org")])
+        self.assertEqual(self.sent[0][2], "forge-stats-watch: check_run is "
+                         "out of line: 14.0 min, over the limit of 12.0 "
+                         "min. Issue #100, for LeadDev: "
+                         "https://github.com/example/widget/issues/100")
+        self.assertEqual(self.saved()["figures"]["check_run"]["notify"],
+                         [["room", "ops@conference.example.org"]])
+        # The next run tries only the one the relay didn't take.
+        self.sent, self.refuse = [], set()
+        self.main(now=NOW + HOUR)
+        self.assertEqual([to for _, to, _ in self.sent],
+                         ["ops@conference.example.org"])
+        self.assertNotIn("notify", self.saved()["figures"]["check_run"])
+        self.sent = []
+        self.main(now=NOW + 2 * HOUR)
+        self.assertEqual(self.sent, [])
+
+    def test_no_notify_tells_nobody(self):
+        self.window = stats(ran=14)
+        self.main()
+        self.assertEqual(self.sent, [])
+        self.assertNotIn("notify", self.saved()["figures"]["check_run"])
+
+    def test_a_dry_run_says_who_it_would_tell(self):
+        self.configure(notify=["Reviewer"])
+        self.window = stats(ran=14)
+        self.main("--dry-run")
+        self.assertEqual(self.sent, [])
+        self.assertIn("WOULD NOTIFY check_run: Reviewer", self.out)
+
+    def test_reminders_carry_the_context_too(self):
+        self.window = stats(ran=14, busy=0.81)
+        self.main()
+        self.loads = [(0, 0, 9.0)]
+        self.main(now=NOW + 6 * HOUR)
+        (_, path, body) = self.gh.writes[-1]
+        self.assertEqual(path, "/issues/100/comments")
+        self.assertIn("Over the last 6 h the build check's slots were 81% "
+                      "busy; the host's 15-minute load average was 9.0 "
+                      "median and 9.0 at most (1 samples, one a run) on 8 "
+                      "CPUs.", body["body"])
+
+    def test_the_context_covers_the_runs_in_the_window(self):
+        self.window = stats(ran=14, busy=0.81)
+        os.makedirs(os.path.dirname(self.state))
+        with open(self.state, "w") as handle:
+            json.dump({"figures": {}, "load": [
+                ["2026-10-21T05:00:00Z", 30.0], ["2026-10-21T08:00:00Z", 4.0],
+                ["2026-10-21T10:00:00Z", 9.0]]}, handle)
+        self.loads = [(0, 0, 14.2)]
+        self.main()
+        [(_, _, body)] = self.gh.writes
+        self.assertIn("load average was 9.0 median and 14.2 at most (3 "
+                      "samples, one a run) on 8 CPUs", body["body"])
+        self.assertEqual([t for t, _ in self.saved()["load"]], [
+            "2026-10-21T08:00:00Z", "2026-10-21T10:00:00Z",
+            "2026-10-21T12:00:00Z"])
+        # Not for a figure the host's load doesn't explain.
+        self.gh = FakeGitHub()
+        os.remove(self.state)
+        self.window = stats(merge=60)
+        self.main()
+        [(_, _, body)] = self.gh.writes
+        self.assertNotIn("load average", body["body"])
 
     def test_out_again_restarts_the_clean_window(self):
         self.window = stats(ran=14)
@@ -491,10 +616,51 @@ class Main(unittest.TestCase):
         self.assertIn("no stats_watch section", self.out[0])
 
 
+class RelayNotifier(unittest.TestCase):
+    """The real sender: the router's poster, to agents' sessions, to
+    addresses and to rooms."""
+
+    class Response:
+        status = 200
+
+        def read(self, limit=-1):
+            return b'{"status": "queued", "targets": [{"to": "x"}]}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def test_agents_addresses_and_rooms(self):
+        from agent_forge import config
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        token_file = os.path.join(tmp.name, "token")
+        with open(token_file, "w") as handle:
+            handle.write("WEBHOOK_TOKEN=s3cret\n")
+        data = example()
+        data["relay"] = {"url": "http://relay:8788", "token_file": token_file}
+        seen = []
+
+        def opener(req, timeout):
+            seen.append(req.full_url)
+            return self.Response()
+        send = tool.relay_notifier(config.Project(data, None), {}, opener)
+        self.assertIsNone(send("agent", "LeadDev", "x"))
+        self.assertIsNone(send("agent", "ops@example.org", "x"))
+        self.assertIsNone(send("room", "ops@conference.example.org", "x"))
+        self.assertEqual(seen, [
+            "http://relay:8788/agent/WidgetLeadDev",
+            "http://relay:8788/agent/ops%40example.org",
+            "http://relay:8788/room/ops%40conference.example.org"])
+
+
 class ForgeFlow(unittest.TestCase):
     """forge-flow's figures (designs/0045), from the state directory."""
 
     setUp, stats, mint, main = Main.setUp, Main.stats, Main.mint, Main.main
+    send, loadavg = Main.send, Main.loadavg
 
     def watch(self, figures):
         with open(self.config) as handle:
