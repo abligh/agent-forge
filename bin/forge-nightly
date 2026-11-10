@@ -74,6 +74,27 @@ relay with the Merger's sender (`relay.url`, `relay.token_file`;
 issue too, the owner's mentioning her. One nobody took is tried again
 on the next tick, and not commented on.
 
+**One lead, an issue per step, a notice** (designs/0051, each off
+until set). With `nightly.lead`, an agent, the issue is labelled
+`nightly.labels` and her Owner label alone, a later red run adds no
+Owner label, its body says she leads, the escalations name her, and a
+step `owners` doesn't name is hers, not triage's.
+With `nightly.step_issues` as well, each failed step gets an issue of
+its own, titled `The nightly's <step> is red at <sha>`, labelled
+`nightly.labels` and the Owner label of the step's owner (the lead
+when `owners` names none), with the step's output, a link to the
+nightly's issue and a `Nightly-step: <workflow> <step>` line by which
+it is found again. A later red run comments `Red again at <sha>` on
+it, and the nightly's issue then lists the step issues instead of
+quoting output. A step issue closes when a later run shows its step
+succeeding (one skipped proves nothing), and every one closes at the
+first green run. Its Owner label is the issue's own: changed by hand,
+it stays. nightly.json lists the open ones as `steps`, for the router.
+With `nightly.announce`, a name or a room's JID (one with `@`) the
+relay resolves, the run that opens the nightly's issue sends one
+notice there, and the green run that closes it another; one the relay
+doesn't take is tried again each tick for an hour.
+
 Everything is written as the App named by `nightly.as` (default
 `merge.merger`, else `Merger`), with a token minted as forge-app-token
 does; it needs Actions (to dispatch), Issues and Pull requests. State
@@ -138,6 +159,11 @@ LOG_STAMP_RE = re.compile(
     r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z ?")
 MARKER = "Nightly: %s"
 TITLE = "The nightly is red at %s"
+# designs/0051: a step issue's title and the line it is found by.
+STEP_TITLE = "The nightly's %s is red at %s"
+STEP_MARKER = "Nightly-step: %s %s"
+# How long a notice the relay didn't take is tried again.
+ANNOUNCE_RETRY = datetime.timedelta(hours=1)
 REQUEST_TIMEOUT_S = 60
 # `nightly.defer_until` (designs/0048 §5): the expected end of a run is
 # its start plus the median length of this many recent runs, rounded up.
@@ -203,6 +229,24 @@ def owner_of(step, owners, triage):
                                                                pattern):
             return agent
     return triage
+
+
+def step_map(saved):
+    """nightly.json's `steps` (designs/0051), [{name, issue, owner}], as
+    {name: entry}; malformed entries are dropped."""
+    return {e["name"]: e for e in saved.get("steps") or ()
+            if isinstance(e, dict) and isinstance(e.get("name"), str)
+            and isinstance(e.get("issue"), int)}
+
+
+def step_conclusions(jobs):
+    """{step name: [conclusion, ...]} over `jobs`' steps."""
+    found = {}
+    for job in jobs:
+        for step in job.get("steps") or ():
+            found.setdefault(step.get("name"), []).append(
+                step.get("conclusion"))
+    return found
 
 
 def decisive_jobs(jobs, name):
@@ -354,7 +398,7 @@ class Tick:
     """One tick: the settings, GitHub and what to write."""
 
     def __init__(self, project, token, now, dry_run, out, err, call, logs,
-                 send):
+                 send, send_room=None):
         self.project = project
         self.cfg = dict(DEFAULTS, **project.section("nightly"))
         self.name = self.cfg.get("as") or project.section("merge").get(
@@ -371,8 +415,17 @@ class Tick:
         self.call = call
         self.logs = logs
         self.send = send
+        self.send_room = send_room or send
         self.would = "WOULD " if dry_run else ""
         self.failed = False
+        # designs/0051.
+        self.lead = self.cfg.get("lead")
+        self.step_issues = bool(self.lead) and \
+            self.cfg.get("step_issues") is True
+        if self.lead:
+            # A step `owners` doesn't name is the lead's, not triage's.
+            self.triage = self.lead
+        self.listed = None
         self.closing = _load_tool("forge-closing-keywords")
         self.closing.configure(project)
 
@@ -429,16 +482,52 @@ class Tick:
         return sorted(runs, key=lambda r: (r.get("created_at") or "",
                                            r.get("id") or 0), reverse=True)
 
+    def open_issues(self):
+        """The open issues the App opened, oldest first, read once a
+        tick."""
+        if self.listed is None:
+            status, items = github.paged(
+                self.token, "/repos/%s/issues?state=open&creator=%s" % (
+                    self.repo, urllib.parse.quote(
+                        self.project.bot_login(self.name), safe="")),
+                call=self.call)
+            if status != 200:
+                raise RuntimeError("GitHub answered %s for the open issues"
+                                   % status)
+            self.listed = sorted((i for i in items
+                                  if "pull_request" not in i),
+                                 key=lambda i: i.get("number", 0))
+        return self.listed
+
+    def find_steps(self, saved):
+        """designs/0051: keep `saved["steps"]` to the step issues still
+        open, {step: {"issue", "owner"}}, finding by their
+        `Nightly-step:` line any an earlier tick opened; the owner is
+        the issue's Owner label (changed by hand, it stays)."""
+        prefix = self.owner_label("")
+        head = STEP_MARKER % (self.workflow, "")
+        known = step_map(saved)
+        steps = {}
+        for item in self.open_issues():
+            for line in (item.get("body") or "").splitlines():
+                if line.startswith(head) and line[len(head):].strip():
+                    name = line[len(head):].strip()
+                    if name in steps:
+                        break
+                    owners = [l["name"][len(prefix):] if isinstance(l, dict)
+                              else l[len(prefix):]
+                              for l in item.get("labels") or ()
+                              if (l.get("name") if isinstance(l, dict)
+                                  else l or "").startswith(prefix)]
+                    steps[name] = {"name": name, "issue": item["number"],
+                                   "owner": owners[0] if owners else
+                                   (known.get(name) or {}).get("owner")}
+                    break
+        saved["steps"] = list(steps.values())
+
     def find_issue(self):
         """The open issue the App opened for this workflow, or None."""
-        status, items = github.paged(
-            self.token, "/repos/%s/issues?state=open&creator=%s" % (
-                self.repo, urllib.parse.quote(
-                    self.project.bot_login(self.name), safe="")),
-            call=self.call)
-        if status != 200:
-            raise RuntimeError("GitHub answered %s for the open issues"
-                               % status)
+        items = self.open_issues()
         marker = MARKER % self.workflow
         for item in sorted(items, key=lambda i: i.get("number", 0)):
             if "pull_request" not in item and marker in (
@@ -490,6 +579,134 @@ class Tick:
                 "", mark, text or "(no output)", mark]
         return names, owners, "\n".join(lines)
 
+    def lead_text(self):
+        """designs/0051: what the lead is for, in the nightly's issue."""
+        return ("%s leads: she drives the nightly to green, chases the "
+                "owners of its steps, takes any step without an owner or "
+                "given to the wrong agent, and says here when it is green."
+                % self.lead)
+
+    def step_outputs(self, jobs):
+        """{step name: (job, step, its output quoted)} for each failed
+        step, the first of a name."""
+        failed = failed_steps(jobs)
+        limit = STEP_CHARS
+        texts, found = {}, {}
+        for job, step in failed:
+            if step["name"] in found:
+                continue
+            if job["id"] not in texts:
+                texts[job["id"]] = self.logs(job["id"])
+            log = texts[job["id"]]
+            found[step["name"]] = (job, step, quote(step_output(log, step),
+                                                    limit) if log else
+                                   "(the job's log could not be read)")
+        return found
+
+    def steps_red(self, saved, run, jobs, number):
+        """designs/0051: for each failed step, open its issue or comment
+        on the open one. Returns the lines listing them, for the
+        nightly's issue."""
+        steps = step_map(saved)
+        sha = run["head_sha"]
+        where = "[run %s](%s)" % (run["id"], run.get("html_url", ""))
+        listed = []
+        for name, (job, step, text) in self.step_outputs(jobs).items():
+            mark = fence(text)
+            output = "\n".join(["**%s**%s, the end of its output:" % (
+                name, " in `%s`" % job["name"] if len(jobs) > 1 else ""),
+                "", mark, text or "(no output)", mark])
+            entry = steps.get(name)
+            if entry:
+                if not self.comment(entry["issue"], "Red again at %s: %s."
+                                    "\n\n%s" % (sha[:10], where, output)):
+                    return None
+                self.out("%sCOMMENT #%d: %s red again at %s" % (
+                    self.would, entry["issue"], name, sha[:10]))
+            else:
+                owner = owner_of(name, self.cfg["owners"], self.triage)
+                title = STEP_TITLE % (name, sha[:10])
+                ok, got = self.write("POST", "/repos/%s/issues" % self.repo, {
+                    "title": title, "body": "\n\n".join([
+                        "`%s`, a step of the nightly's job `%s`, is red at "
+                        "%s: %s. It is %s's to fix; the nightly as a whole "
+                        "is #%s, which %s leads. This closes when a later "
+                        "run shows the step succeeding." % (
+                            name, self.cfg["job"], sha[:10], where, owner,
+                            number, self.lead),
+                        output, STEP_MARKER % (self.workflow, name),
+                        self.signature()]),
+                    "labels": list(self.cfg["labels"])
+                    + [self.owner_label(owner)]}, (201,))
+                if not ok:
+                    return None
+                entry = steps[name] = {"name": name,
+                                       "issue": (got or {}).get("number"),
+                                       "owner": owner}
+                saved["steps"] = list(steps.values())
+                self.out("%sOPEN %s, for %s" % (self.would, title, owner))
+            listed.append("- `%s` (%s): #%s" % (name, entry["owner"],
+                                                 entry["issue"]))
+        return listed
+
+    def steps_green(self, saved, run, jobs, every):
+        """designs/0051: close each open step issue whose step a run
+        shows succeeding, or every one (`every`, a green run)."""
+        steps = step_map(saved)
+        seen = step_conclusions(jobs)
+        sha = run["head_sha"]
+        for name in list(steps):
+            got = seen.get(name) or []
+            if not every and not (got and all(c in GREEN for c in got)):
+                continue
+            number = steps[name]["issue"]
+            if not self.comment(number, "`%s` succeeded at %s: [run %s](%s). "
+                                "Closing." % (name, sha[:10], run["id"],
+                                              run.get("html_url", ""))):
+                return False
+            ok, _ = self.write("PATCH", "/repos/%s/issues/%d" % (
+                self.repo, number), {"state": "closed",
+                                     "state_reason": "completed"}, (200,))
+            if not ok:
+                return False
+            del steps[name]
+            saved["steps"] = list(steps.values())
+            self.out("%sCLOSE #%d: %s succeeded at %s" % (
+                self.would, number, name, sha[:10]))
+        return True
+
+    def queue_notice(self, saved, text):
+        """designs/0051: a notice for `nightly.announce`, sent by
+        `announce`."""
+        if self.cfg.get("announce"):
+            saved["announce"] = {"text": text, "since": iso(self.now)}
+
+    def announce(self, saved):
+        """Send the waiting notice to `nightly.announce`; one the relay
+        doesn't take is tried again each tick for ANNOUNCE_RETRY."""
+        notice = saved.get("announce")
+        where = self.cfg.get("announce")
+        if not notice or not where:
+            saved.pop("announce", None)
+            return
+        if self.dry_run:
+            self.out("WOULD ANNOUNCE to %s: %s" % (where, notice["text"]))
+            return
+        why = self.send_room(where, "From: forge-nightly\n%s\n"
+                             % notice["text"])
+        if why is None:
+            self.out("ANNOUNCED to %s" % where)
+            saved.pop("announce")
+            return
+        try:
+            old = self.now - parse_time(notice["since"]) >= ANNOUNCE_RETRY
+        except (KeyError, TypeError, ValueError, AttributeError):
+            old = True
+        self.out("NOT SENT notice to %s: %s; %s" % (
+            where, why, "dropped" if old else "tried again next tick"))
+        if old:
+            saved.pop("announce")
+
     def commits_since(self, green, sha):
         """Lines listing the commits from the last green nightly to `sha`."""
         if not green or not green.get("sha"):
@@ -538,6 +755,9 @@ class Tick:
             if got != "green":
                 self.out("PUBLISHED run %s at %s" % (run["id"], sha[:10]))
         number = saved.get("issue")
+        if self.step_issues and not self.steps_green(saved, run, jobs,
+                                                     got == "green"):
+            return False
         if got == "green":
             self.out("GREEN run %s at %s" % (run["id"], sha[:10]))
             if number is not None:
@@ -554,6 +774,8 @@ class Tick:
                         return False
                 self.out("%sCLOSE #%d: green at %s" % (self.would, number,
                                                        sha[:10]))
+                self.queue_notice(saved, "The nightly is green again at %s."
+                                  % sha[:10])
             for key in ("issue", "issue_open", "red", "red_since", "opened",
                         "escalated", "dispatched"):
                 saved.pop(key, None)
@@ -571,19 +793,44 @@ class Tick:
         commits = self.commits_since(saved.get("green"), sha)
         labels = list(self.cfg["labels"]) + [self.owner_label(a)
                                              for a in owners if a]
+        if self.lead:
+            # designs/0051: her Owner label alone, and none added later.
+            labels = list(self.cfg["labels"]) + [self.owner_label(
+                self.lead)]
+        if self.step_issues and names:
+            # The output goes to the step issues; this lists them.
+            detail = detail.split("\n\n**", 1)[0]
         self.out("RED run %s at %s: %s" % (run["id"], sha[:10],
                                            ", ".join(names) or "no step"))
         if number is None:
             title = TITLE % sha[:10]
+            head = [detail] + ([self.lead_text()] if self.lead else [])
             ok, got_issue = self.write("POST", "/repos/%s/issues" % self.repo, {
                 "title": title,
-                "body": "\n\n".join([detail, commits, self.explain(),
-                                     MARKER % self.workflow,
-                                     self.signature()]),
+                "body": "\n\n".join(head + [commits, self.explain(),
+                                            MARKER % self.workflow,
+                                            self.signature()]),
                 "labels": labels}, (201,))
             if not ok:
                 return False
             saved["issue"] = (got_issue or {}).get("number")
+            if self.step_issues and names:
+                listed = self.steps_red(saved, run, jobs, saved["issue"])
+                if listed is None:
+                    return False
+                if saved["issue"] is not None:
+                    self.comment(saved["issue"], "One issue a red step:\n\n"
+                                 + "\n".join(listed))
+            self.queue_notice(saved, "The nightly is red at %s: %s. %s%s. "
+                              "Merging continues; idle developers, take a "
+                              "red step first." % (
+                                  sha[:10], ", ".join(
+                                      "%s (%s)" % (n, owner_of(
+                                          n, self.cfg["owners"], self.triage))
+                                      for n in names) or "the job",
+                                  "%s leads: " % self.lead if self.lead
+                                  else "", self.url(saved["issue"])
+                                  if saved["issue"] else "its issue"))
             saved["issue_open"] = True
             saved["opened"] = iso(self.now)
             saved["escalated"] = []
@@ -599,10 +846,17 @@ class Tick:
                     return False
                 saved["issue_open"] = True
                 self.out("%sREOPEN #%d" % (self.would, number))
-            if not self.comment(number, "Red again.\n\n" + detail + "\n\n"
-                                + commits + self.supersede(saved)):
+            listed = []
+            if self.step_issues and names:
+                listed = self.steps_red(saved, run, jobs, number)
+                if listed is None:
+                    return False
+            if not self.comment(number, "Red again.\n\n" + detail + (
+                    "\n\nOne issue a red step:\n\n" + "\n".join(listed)
+                    if listed else "") + "\n\n" + commits
+                    + self.supersede(saved)):
                 return False
-            if labels:
+            if labels and not self.lead:
                 ok, _ = self.write("POST", "/repos/%s/issues/%d/labels" % (
                     self.repo, number), {"labels": labels}, (200,))
                 if not ok:
@@ -684,7 +938,7 @@ class Tick:
         found.discard(number)
         return found
 
-    def fixes_how(self, pr, number, linked):
+    def fixes_how(self, pr, number, linked, steps=()):
         """How pull request `pr` fixes the nightly's issue `number`, for
         the dispatch comment, or None. Without `fixes_named` only
         closing it counts (designs/0028 §3); with it, naming it or
@@ -696,12 +950,17 @@ class Tick:
             return None
         if self.names(pr, number):
             return "names #%d" % number
+        for step in sorted(steps):
+            # designs/0051: a step issue's fix fixes the nightly.
+            if step in closed or self.names(pr, step):
+                return "%s #%d, a step of #%d" % (
+                    "closes" if step in closed else "names", step, number)
         both = sorted(closed & linked)
         if both:
             return "closes #%d, linked with #%d" % (both[0], number)
         return None
 
-    def fixes(self, number):
+    def fixes(self, number, steps=()):
         """(whether the issue is open, the open pull requests that fix
         it, [(number, mergedAt, how)] of those merged that fix it)."""
         owner, _, name = self.repo.partition("/")
@@ -720,13 +979,13 @@ class Tick:
             else set()
         done = []
         for p in merged:
-            how = self.fixes_how(p, number, linked) if p.get("mergedAt") \
-                else None
+            how = self.fixes_how(p, number, linked, steps) \
+                if p.get("mergedAt") else None
             if how:
                 done.append((p["number"], p["mergedAt"], how))
         return (is_open,
                 [p["number"] for p in open_prs
-                 if self.fixes_how(p, number, linked)], done)
+                 if self.fixes_how(p, number, linked, steps)], done)
 
     def expected_end(self, runs):
         """With `defer_until`, when a run started now should end: now
@@ -853,13 +1112,17 @@ class Tick:
                 text = ("From: forge-nightly\nThe nightly has been red for "
                         "%d h: %s (%s). A pull request that closes #%d goes "
                         "first: checked, merged and routed before other "
-                        "work.\n" % (after, self.url(number), steps, number))
+                        "work.%s\n" % (after, self.url(number), steps, number,
+                                       " %s leads." % self.lead
+                                       if self.lead else ""))
             else:
                 who = [self.cfg.get("tell_owner") or self.project.owner]
                 text = ("From: forge-nightly\nThe nightly has been red for "
                         "%d h, and the developers were told at %d h: %s "
-                        "(%s).\n" % (after, self.cfg["escalate_hours"][0],
-                                     self.url(number), steps))
+                        "(%s).%s\n" % (after, self.cfg["escalate_hours"][0],
+                                       self.url(number), steps,
+                                       " %s leads." % self.lead
+                                       if self.lead else ""))
             if self.dry_run:
                 self.out("WOULD ESCALATE #%d after %d h to %s" % (
                     number, after, ", ".join(who)))
@@ -892,9 +1155,25 @@ def relay_sender(project, environ):
     return _load_tool("forge-merger").relay_sender(project, environ)
 
 
+def room_sender(project, environ):
+    """designs/0051: a sender (where, text) for `nightly.announce`: a
+    room's JID (with `@`) through the router's poster to the room, any
+    other name as the Merger's sender sends it."""
+    router = _load_tool("forge-router")
+    router.configure(project, rules=False)
+    room = router.make_poster(environ.get("FORGE_ROUTER_RELAY",
+                                          router.RELAY),
+                              router.relay_token(), kind="room")
+    agent = relay_sender(project, environ)
+
+    def send(where, text):
+        return room(where, text) if "@" in where else agent(where, text)
+    return send
+
+
 def main(argv=None, out=print, err=None, environ=None, now=None,
          call=github.api_call, sign=github.openssl_sign, mint=None,
-         logs=None, sender=None):
+         logs=None, sender=None, announcer=None):
     err = err or (lambda line: print(line, file=sys.stderr))
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(prog=PROG,
@@ -938,9 +1217,15 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
             if not made:
                 made.append((sender or relay_sender)(project, environ))
             return made[0](who, text)
+        rooms = []
+
+        def send_room(where, text):
+            if not rooms:
+                rooms.append((announcer or room_sender)(project, environ))
+            return rooms[0](where, text)
         tick = Tick(project, token, now, args.dry_run, out, err, call,
                     logs or (lambda job: fetch_log(token, project.repo, job)),
-                    send)
+                    send, send_room)
         try:
             runs = tick.runs()
             done = [r for r in runs if r.get("status") == "completed"]
@@ -957,12 +1242,19 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
                     saved["issue_open"] = True
                     saved["opened"] = found.get("created_at") or iso(now)
                     saved.setdefault("escalated", [])
+            if tick.step_issues:
+                tick.find_steps(saved)
+            else:
+                saved.pop("steps", None)
             if newest is not None and newest["id"] != saved.get("judged"):
                 if tick.judge(saved, newest):
                     saved["judged"] = newest["id"]
+            tick.announce(saved)
             merged = []
             if saved.get("issue") is not None:
-                is_open, fixes, merged = tick.fixes(saved["issue"])
+                is_open, fixes, merged = tick.fixes(
+                    saved["issue"], [e["issue"] for e in
+                                     step_map(saved).values()])
                 saved["issue_open"] = is_open
                 saved["fixes"] = fixes if is_open else []
                 if fixes and is_open:

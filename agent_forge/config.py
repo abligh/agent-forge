@@ -108,7 +108,9 @@ STATS_WATCH_FIGURES = {
 NIGHTLY = {"workflow": str, "job": str, "owners": dict, "labels": list,
            "retry_hours": int, "escalate_hours": list, "as": str,
            "tell_owner": str, "release_jobs": list, "fixes_named": bool,
-           "defer_until": bool}
+           "defer_until": bool,
+           # designs/0051.
+           "lead": str, "step_issues": bool, "announce": str}
 # A workflow is named by its file, which is read for its inputs.
 WORKFLOW_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
@@ -256,7 +258,7 @@ STUCK = {"retarget": bool, "self_blocked": bool, "draft_hours": int}
 OWNERS = {"triage": str}
 UNREVIEWED = {"ignore": list, "depth2": list}
 # designs/0039: its keys, each a number checked by `_check_red_first`.
-RED_FIRST = ("fallback_hours",)
+RED_FIRST = ("fallback_hours", "everyone")
 # designs/0040: the label marking an issue as waiting for a nightly check.
 NIGHTLY_WAKE = {"label": str}
 RECEIVER = {"address": str, "port": int, "path": str, "secret_file": str,
@@ -577,6 +579,15 @@ def _check_nightly(nightly, data, problems):
     if isinstance(nightly.get("tell_owner"), str) \
             and not nightly["tell_owner"].strip():
         problems.append("%s.tell_owner must not be empty" % where)
+    # designs/0051: one lead, an issue per step, a notice in a room.
+    lead = nightly.get("lead")
+    if isinstance(lead, str) and lead not in data["agents"]:
+        problems.append("%s.lead %r is not an agent" % (where, lead))
+    if nightly.get("step_issues") is True and lead is None:
+        problems.append("%s.step_issues needs %s.lead" % (where, where))
+    if isinstance(nightly.get("announce"), str) \
+            and not nightly["announce"].strip():
+        problems.append("%s.announce must not be empty" % where)
     name = nightly.get("as")
     if name is None:
         name = data.get("merge", {}).get("merger", "Merger")
@@ -625,6 +636,10 @@ def check(data):
             _check_unreviewed(router["unreviewed"], router, problems)
         if isinstance(router.get("red_first"), dict):
             _check_red_first(router["red_first"], problems)
+            if router["red_first"].get("everyone") is True and not (
+                    data.get("nightly") or {}).get("step_issues") is True:
+                problems.append("router.red_first.everyone needs "
+                                "nightly.step_issues")
         if isinstance(router.get("nightly_wake"), dict):
             _check_nightly_wake(router["nightly_wake"], "nightly" in data,
                                 problems)
@@ -1538,6 +1553,9 @@ def _check_red_first(red, problems):
             continue
         if key not in RED_FIRST:
             problems.append("%s: unknown key %r" % (where, key))
+        elif key == "everyone":
+            if not _is(value, bool):
+                problems.append("%s.everyone must be true or false" % where)
         elif not _is(value, (int, float)) or not math.isfinite(value) \
                 or value <= 0:
             problems.append("%s.%s must be a number above 0"

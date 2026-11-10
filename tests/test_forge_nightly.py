@@ -147,7 +147,10 @@ class FakeGitHub:
         if method == "POST" and path == "/issues":
             number = 101 + len(self.issues)
             self.issues.append({"number": number, "state": "open",
+                                "title": body["title"],
                                 "body": body["body"],
+                                "labels": [{"name": l}
+                                           for l in body["labels"]],
                                 "created_at": stamp(NOW)})
             return 201, {"number": number}
         if method == "PATCH":
@@ -625,6 +628,207 @@ class Main(unittest.TestCase):
         self.gh.fail = None
         self.assertEqual(self.main(), 0)
         self.assertEqual(self.saved()["issue"], 101)
+
+
+class LeadAndSteps(unittest.TestCase):
+    """designs/0051: one lead, an issue per red step, a notice."""
+
+    setUp, save_config, send, saved, red_night, writes = (
+        Main.setUp, Main.save_config, Main.send, Main.saved,
+        Main.red_night, Main.writes)
+
+    def announcer(self, project, environ):
+        def send(where, text):
+            if where in self.refuse:
+                return "HTTP 503 queue-full"
+            self.announced.append((where, text))
+            return None
+        return send
+
+    def main(self, *argv, now=NOW):
+        return tool.main(list(argv), self.out.append, self.err.append,
+                         self.env, now, call=self.gh,
+                         mint=lambda project, name: "tok",
+                         logs=lambda job: LOG, sender=self.send,
+                         announcer=self.announcer)
+
+    def configure(self, **keys):
+        self.data["nightly"].update(keys)
+        self.save_config()
+        self.announced = []
+
+    def opened(self):
+        return [w[2] for w in self.writes("POST", "/issues")]
+
+    def later(self, number, steps, conclusion="failure", minutes=30):
+        self.gh.runs.insert(0, run(number, NEXT_SHA, conclusion,
+                                   ended=NOW + datetime.timedelta(
+                                       minutes=minutes)))
+        self.gh.jobs[number] = steps
+        self.gh.writes.clear()
+        self.main(now=NOW + datetime.timedelta(minutes=minutes + 5))
+
+    def test_the_lead_alone_labels_the_issue(self):
+        self.configure(lead="LeadDev")
+        self.red_night(("test-slow", "vet-advisories"))
+        self.main()
+        [body] = self.opened()
+        self.assertEqual(body["labels"], ["bug", "Owner:LeadDev"])
+        self.assertIn("LeadDev leads: she drives the nightly to green",
+                      body["body"])
+        # Without step issues it still quotes the output.
+        self.assertIn("FAIL test_wait", body["body"])
+        self.later(3, red_jobs(("vet-advisories",)))
+        self.assertEqual(self.writes("POST", "/labels"), [])
+
+    def test_without_a_lead_nothing_changes(self):
+        self.configure()
+        self.red_night(("test-slow", "vet-advisories"))
+        self.main()
+        [body] = self.opened()
+        self.assertEqual(body["labels"], ["bug", "Owner:UIDev",
+                                          "Owner:Helper"])
+        self.assertNotIn("steps", self.saved())
+
+    def test_each_red_step_gets_an_issue_for_its_owner(self):
+        self.configure(lead="LeadDev", step_issues=True,
+                       owners={"test-slow": "UIDev"})
+        self.red_night(("test-slow", "vet-advisories"))
+        self.main()
+        main, slow, vet = self.opened()
+        self.assertNotIn("FAIL test_wait", main["body"])
+        self.assertIn("Failed: `test-slow` (UIDev)", main["body"])
+        self.assertEqual(slow["title"],
+                         "The nightly's test-slow is red at bbbbbbbbbb")
+        self.assertEqual(slow["labels"], ["bug", "Owner:UIDev"])
+        self.assertIn("FAIL test_wait", slow["body"])
+        self.assertIn("is #101, which LeadDev leads", slow["body"])
+        self.assertIn("\nNightly-step: ci.yaml test-slow\n", slow["body"])
+        # A step `owners` doesn't name is the lead's, not triage's.
+        self.assertEqual(vet["labels"], ["bug", "Owner:LeadDev"])
+        listing = [w for w in self.writes("POST", "/comments")
+                   if w[1] == "/issues/101/comments"][0][2]["body"]
+        self.assertIn("- `test-slow` (UIDev): #102\n- `vet-advisories` "
+                      "(LeadDev): #103", listing)
+        self.assertEqual(self.saved()["steps"], [
+            {"name": "test-slow", "issue": 102, "owner": "UIDev"},
+            {"name": "vet-advisories", "issue": 103, "owner": "LeadDev"}])
+
+    def test_a_step_red_again_is_commented_on_not_opened(self):
+        self.configure(lead="LeadDev", step_issues=True)
+        self.red_night()
+        self.main()
+        self.later(3, red_jobs())
+        self.assertEqual(self.opened(), [])
+        paths = [w[1] for w in self.writes("POST", "/comments")]
+        self.assertIn("/issues/102/comments", paths)
+        body = [w[2]["body"] for w in self.writes("POST", "/comments")
+                if w[1] == "/issues/102/comments"][0]
+        self.assertTrue(body.startswith("Red again at cccccccccc"), body)
+
+    def test_a_step_that_succeeds_closes_its_issue_a_skipped_one_not(self):
+        self.configure(lead="LeadDev", step_issues=True)
+        self.red_night(("test-slow", "vet-advisories"))
+        self.main()
+        jobs = red_jobs(("vet-advisories",))
+        self.later(3, jobs)
+        self.assertEqual(self.writes("PATCH"), [(
+            "PATCH", "/issues/102", {"state": "closed",
+                                     "state_reason": "completed"})])
+        self.assertEqual([e["name"] for e in self.saved()["steps"]],
+                         ["vet-advisories"])
+        # Skipped is no proof: #103 stays.
+        jobs = red_jobs(("test-slow",))
+        jobs[0]["steps"][2]["conclusion"] = "skipped"
+        self.later(4, jobs, minutes=60)
+        self.assertEqual(self.writes("PATCH"), [])
+
+    def test_a_green_run_closes_every_step_issue(self):
+        self.configure(lead="LeadDev", step_issues=True)
+        self.red_night(("test-slow", "vet-advisories"))
+        self.main()
+        self.later(3, GREEN_JOBS, "success")
+        self.assertEqual(sorted(w[1] for w in self.writes("PATCH")),
+                         ["/issues/101", "/issues/102", "/issues/103"])
+        self.assertEqual(self.saved().get("steps"), [])
+
+    def test_an_owner_changed_by_hand_stays(self):
+        self.configure(lead="LeadDev", step_issues=True)
+        self.red_night()
+        self.main()
+        self.gh.issues[1]["labels"] = [{"name": "bug"},
+                                       {"name": "Owner:Helper"}]
+        self.later(3, red_jobs())
+        self.assertEqual(self.writes("POST", "/labels"), [])
+        self.assertEqual(self.saved()["steps"][0]["owner"], "Helper")
+
+    def test_a_step_issue_closed_by_hand_is_opened_again(self):
+        self.configure(lead="LeadDev", step_issues=True)
+        self.red_night()
+        self.main()
+        self.gh.issues[1]["state"] = "closed"
+        self.later(3, red_jobs())
+        [body] = self.opened()
+        self.assertEqual(body["title"],
+                         "The nightly's test-slow is red at cccccccccc")
+
+    def test_a_pull_request_naming_a_step_issue_is_a_fix(self):
+        self.configure(lead="LeadDev", step_issues=True, fixes_named=True)
+        self.red_night()
+        self.main()
+        self.gh.open_prs = [pr(5, body="For #102: wait longer"),
+                            pr(6, body="Fixes #102"), pr(7, body="#1020")]
+        self.main(now=NOW + datetime.timedelta(minutes=5))
+        self.assertEqual(self.saved()["fixes"], [5, 6])
+
+    def test_the_room_is_told_once_on_red_and_once_on_green(self):
+        self.configure(lead="LeadDev", step_issues=True,
+                       announce="ops@conference.example.org",
+                       owners={"test-slow": "UIDev"})
+        self.red_night()
+        self.main()
+        [(where, text)] = self.announced
+        self.assertEqual(where, "ops@conference.example.org")
+        self.assertEqual(text, "From: forge-nightly\nThe nightly is red at "
+                         "bbbbbbbbbb: test-slow (UIDev). LeadDev leads: "
+                         "https://github.com/example/widget/issues/101. "
+                         "Merging continues; idle developers, take a red "
+                         "step first.\n")
+        self.later(3, red_jobs())
+        self.assertEqual(len(self.announced), 1)
+        self.later(4, GREEN_JOBS, "success", minutes=60)
+        self.assertEqual(self.announced[-1][1], "From: forge-nightly\nThe "
+                         "nightly is green again at cccccccccc.\n")
+
+    def test_a_notice_not_taken_is_tried_again_for_an_hour(self):
+        self.configure(announce="ops@conference.example.org")
+        self.refuse = {"ops@conference.example.org"}
+        self.red_night()
+        self.main()
+        self.assertIn("announce", self.saved())
+        self.main(now=NOW + datetime.timedelta(minutes=30))
+        self.assertIn("announce", self.saved())
+        self.main(now=NOW + datetime.timedelta(minutes=61))
+        self.assertNotIn("announce", self.saved())
+        self.assertEqual(self.announced, [])
+        self.refuse = set()
+        self.main(now=NOW + datetime.timedelta(minutes=70))
+        self.assertEqual(self.announced, [])
+
+    def test_escalations_name_the_lead(self):
+        self.configure(lead="LeadDev")
+        self.red_night()
+        self.main()
+        self.main(now=NOW + 24 * HOUR)
+        self.assertIn("LeadDev leads.", self.sent[0][1])
+
+    def test_a_dry_run_opens_and_tells_nothing(self):
+        self.configure(lead="LeadDev", step_issues=True,
+                       announce="ops@conference.example.org")
+        self.red_night()
+        self.main("--dry-run")
+        self.assertEqual((self.gh.writes, self.announced), ([], []))
+        self.assertTrue(any(l.startswith("WOULD ANNOUNCE") for l in self.out))
 
 
 class Pieces(unittest.TestCase):

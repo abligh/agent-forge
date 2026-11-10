@@ -2,7 +2,8 @@
 requests that fix a red nightly, and which issue says it is red.
 
 forge-nightly writes NIGHTLY_FILE in its state directory on every
-tick. While its issue saying the nightly is red is open, `fixes` there
+tick. While its issue saying the nightly is red is open, `steps` there
+lists its step issues (designs/0051), and `fixes`
 lists the open pull requests that close the issue, by the rule
 forge-closing-keywords applies: a closing keyword in the title, the
 body or a commit message, or the issue in `closingIssuesReferences`.
@@ -53,6 +54,20 @@ def current(project, environ=None, now=None):
     except (KeyError, TypeError, ValueError, AttributeError):
         return {}
     return data
+
+
+def steps(project, environ=None, now=None):
+    """designs/0051: the open step issues, [{"name", "issue", "owner"}],
+    while the nightly's issue is open and the file fresh; [] otherwise.
+    Malformed entries are dropped."""
+    data = current(project, environ, now)
+    if not data.get("issue_open") or not isinstance(data.get("steps"),
+                                                    list):
+        return []
+    return [e for e in data["steps"] if isinstance(e, dict)
+            and isinstance(e.get("name"), str)
+            and isinstance(e.get("issue"), int)
+            and not isinstance(e.get("issue"), bool)]
 
 
 def fixes(project, environ=None, now=None):

@@ -200,9 +200,11 @@ class RedFirstConfig(unittest.TestCase):
         self.addCleanup(rules.configure, PROJECT, merger)
         self.assertIsNone(rules.RED_FIRST)
         rules.configure(red_project({}), merger)
-        self.assertEqual(rules.RED_FIRST, {"fallback_hours": 2})
+        self.assertEqual(rules.RED_FIRST, {"fallback_hours": 2,
+                                           "everyone": False})
         rules.configure(red_project({"fallback_hours": 0.5}), merger)
-        self.assertEqual(rules.RED_FIRST, {"fallback_hours": 0.5})
+        self.assertEqual(rules.RED_FIRST, {"fallback_hours": 0.5,
+                                           "everyone": False})
 
 
 class Rule20(RedFirstCase):
@@ -312,6 +314,67 @@ class Rule15RedFirst(RedFirstCase):
         [got] = self.offer()
         self.assertTrue(got.line.startswith('#30 "item 30" is yours and '
                                             'nothing blocks it'), got.line)
+
+
+def step_issue(number, step, owner="UIDev", created="2026-10-09T09:05:00Z",
+               labels=()):
+    """designs/0051: a red nightly's step issue."""
+    item = red_issue(number, owner, labels=labels,
+                     what="the nightly's `%s`" % step, created=created)
+    item["title"] = "The nightly's %s is red at 5b257c8" % step
+    item["redBuild"]["step"] = True
+    return item
+
+
+class EveryoneOffered(RedFirstCase):
+    """designs/0051: with `red_first.everyone`, rule 15 offers every idle
+    developer a red step first, whoever owns it."""
+
+    def setUp(self):
+        self.use(red_project({"everyone": True}, idle_offer={}))
+
+    def sweep(self, issues, prs=()):
+        ctx = self.ctx(issues=issues, prs=prs, directory=listing(
+            entry("WidgetLeadDev", status="busy"),
+            entry("WidgetUIDev", since="2026-10-09T13:00:00Z"),
+            entry("Helper", since="2026-10-09T13:30:00Z"),
+            entry("WidgetReviewer", since="2026-10-09T12:00:00Z")))
+        return rules.sweep(ctx)
+
+    def test_each_idle_developer_gets_a_step_oldest_first(self):
+        got = self.sweep([plain_issue(30, "Helper"),
+                          step_issue(51, "vet", owner="LeadDev",
+                                     created="2026-10-09T09:06:00Z"),
+                          step_issue(50, "test-slow", owner="LeadDev")])
+        offers = {d.agent: d for d in got if d.rule == 15}
+        self.assertEqual(sorted(offers), ["Helper", "UIDev"])
+        self.assertTrue(offers["Helper"].line.startswith(
+            '#50 "The nightly\'s test-slow is red at 5b257c8" says the '
+            "nightly's `test-slow` is red (LeadDev's). Red builds go "
+            "first"), offers["Helper"].line)
+        self.assertIn("move its owner label to Owner:Helper",
+                      offers["Helper"].line)
+        self.assertTrue(offers["UIDev"].line.startswith("#51 "),
+                        offers["UIDev"].line)
+        # A reviewer is not offered one; rule 21 leaves steps to rule 15.
+        self.assertNotIn(21, [d.rule for d in got])
+
+    def test_not_one_a_pull_request_references(self):
+        got = self.sweep([step_issue(50, "test-slow"), plain_issue(30,
+                                                                   "Helper")],
+                         prs=[draft(60, author=LEADDEV, body="For #50")])
+        offers = {d.agent: d.line for d in got if d.rule == 15}
+        self.assertTrue(offers["Helper"].startswith("#30 "), offers)
+
+    def test_without_everyone_a_step_is_its_owners_turn(self):
+        self.use(red_project({}, idle_offer={}))
+        item = step_issue(50, "test-slow", owner="Helper")
+        got = rules.decide(item, self.ctx(issues=[item]))[0]
+        self.assertEqual((got.agent, got.rule), ("Helper", 20))
+        self.assertIn("says the nightly's `test-slow` is red", got.line)
+        # And rule 21's fallback, per step issue, as for the nightly's.
+        self.assertEqual([d.rule for d in self.sweep([item])
+                          if d.agent == "UIDev"], [21])
 
 
 class Rule21(RedFirstCase):
@@ -484,6 +547,17 @@ class RedBuilds(unittest.TestCase):
         del data["dispatched"]["until"]
         self.write("nightly", "nightly.json", data)
         self.assertIsNone(self.rerun())
+
+    def test_each_step_issue_is_a_red_build(self):
+        self.write("nightly", "nightly.json", {
+            "at": "2026-10-09T13:55:00Z", "issue": 40, "issue_open": True,
+            "opened": "2026-10-09T05:00:00Z",
+            "red": {"ended": "2026-10-09T05:40:00Z"},
+            "steps": [{"name": "test-slow", "issue": 41, "owner": "UIDev"},
+                      {"name": "bad", "issue": "42"}]})
+        self.assertEqual(self.found(), {
+            40: ("the nightly", "2026-10-09T05:40:00Z"),
+            41: ("the nightly's `test-slow`", "2026-10-09T05:40:00Z")})
 
     def test_the_lookup(self):
         # The lookup reads the file as of now.
