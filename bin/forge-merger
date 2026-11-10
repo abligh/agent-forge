@@ -311,7 +311,10 @@ is, `STALL_AFTER` after it started.
 ..., "pr": N}`, the first in the queue it neither handed back nor
 skipped, whether it updates, merges or waits on it, or `"pr": null`
 when there is none. Every live tick writes it, and a dry run never
-does. With `checks.merger_first` on, the build check (`forge-pr-check`)
+does. It also lists, as `"blocked": [N, ...]`, the approved pull
+requests held for a reason only another merge clears (`Blocked-by:` an
+open one, or stacked on one), when there are any; the build check
+starts their heads after other approved ones. With `checks.merger_first` on, the build check (`forge-pr-check`)
 reads it and checks that pull request's head before any other, since
 the next merge waits on that verdict.
 
@@ -1410,6 +1413,15 @@ def deferral_of(pr, now):
         return "deferred until %s" % iso(until.astimezone(
             datetime.timezone.utc))
     return None
+
+
+def blocked_prs(held):
+    """The pull requests `held` (number -> why) holds for a reason only
+    another merge clears: a `Blocked-by:` still open, or stacked on
+    another. next.json lists them as `blocked`, and the build check
+    starts their heads after other approved ones (agent-forge #256)."""
+    return sorted(int(number) for number, why in held.items()
+                  if why.startswith(("Blocked-by: #", "stacked on #")))
 
 
 def eligible(pr, open_numbers, now=None, stacked=None, any_base=False):
@@ -6059,6 +6071,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     record["stalled"]["lost"] = waiting["lost"]
         save_json(said_path, said)
         said_next = {"at": record["at"], "pr": waiting_on}
+        blocked = blocked_prs(held)
+        if blocked:
+            said_next["blocked"] = blocked
         if TEST_AHEAD:
             acted = [d["action"] for d in record["decisions"]
                      if d["pr"] == waiting_on]

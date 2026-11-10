@@ -3497,6 +3497,40 @@ class ApprovedFirst(StateCase):
                          (SHA_B, 2))
         self.assertEqual(pc.next_head(state, when=T0), (SHA_A, 1))
 
+    def test_blocked_approved_heads_go_last_and_predicted_ones_first(self):
+        # agent-forge #256: right after a merge the Merger's next head
+        # isn't waiting yet; one it holds as Blocked-by or stacked must
+        # not take the slot ahead of the rest.
+        state = self.waiting(**{SHA_A: (1, 120), SHA_B: (2, 60),
+                                SHA_C: (3, 10)})
+        for sha in (SHA_A, SHA_B, SHA_C):
+            state["waiting"][sha]["approved"] = True
+        self.assertEqual(pc.next_head(state, when=T0, blocked={1}),
+                         (SHA_B, 2))
+        self.assertEqual(pc.next_head(state, when=T0, blocked={1},
+                                      queued={3}), (SHA_C, 3))
+        self.assertEqual(pc.next_head(state, first_pr=1, when=T0,
+                                      blocked={1}, queued={3}), (SHA_A, 1))
+        # They still run when nothing better waits.
+        self.assertEqual(pc.next_head(state, when=T0, blocked={1, 2, 3}),
+                         (SHA_A, 1))
+
+    def test_blocked_is_read_from_a_fresh_next_json(self):
+        merger = os.path.join(self.state_dir, "merger")
+        os.makedirs(merger)
+        path = os.path.join(merger, "next.json")
+        with open(path, "w") as handle:
+            json.dump({"at": pc.iso(T0), "pr": 5,
+                       "blocked": [6, 7, True, "8"]}, handle)
+        self.assertEqual(pc.merger_blocked(merger, T0), {6, 7})
+        self.assertEqual(pc.merger_blocked(
+            merger, T0 + pc.MERGER_FRESH + datetime.timedelta(seconds=1)),
+            set())
+        with open(path, "w") as handle:
+            json.dump({"at": pc.iso(T0), "pr": 5}, handle)
+        self.assertEqual(pc.merger_blocked(merger, T0), set())
+        self.assertEqual(pc.merger_blocked(None, T0), set())
+
     def test_urgent_still_goes_before_approved(self):
         state = self.waiting(**{SHA_A: (1, 10), SHA_B: (2, 120)})
         state["waiting"][SHA_A]["urgent"] = True
