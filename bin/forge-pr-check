@@ -399,6 +399,11 @@ maps an environment variable to a directory name, such as
 directory in the state directory, outside the worktree, so a head isn't
 built from nothing each time. A variable the host already sets wins.
 A step is stopped after `checks.step_timeout_minutes` (default 30).
+A step's `env_file`, a mode-0600 file of the check user's on the host,
+adds its `KEY=VALUE` lines to that step's environment: secrets the
+check can't take from CI. A file others can reach, or that can't be
+read, makes the step red without running it; a missing one is logged
+and the step runs without it. No value is written anywhere.
 Each slot also has its own `TMPDIR` there (`tmp`, `tmp-2`, ...), which
 the host's never overrides: it is emptied as a run starts, under the
 slot's lock, and removed when the run ends, stopped or not. A step
@@ -688,6 +693,9 @@ LIGHT = frozenset()
 # Each step's own `caches`: {step: {variable: directory name}}, each
 # directory per slot like CACHES'.
 STEP_CACHES = {}
+# Each step's own `env_file`: {step: path}, `~` expanded, a file of
+# KEY=VALUE lines added to that step's environment (read_env_file).
+ENV_FILES = {}
 # Step keys that say how a step is run beside others, not what it
 # tests: left out of its input digest, so setting them reuses nothing
 # less.
@@ -1004,7 +1012,7 @@ def configure(project, instance=None):
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
     global CPU_WEIGHT, CPU_SHARE, SIDE_BY_SIDE, AFTER, ALONE, LIGHT
     global MERGER_CPU_WEIGHT, DOCKER_SLICES
-    global STEP_CACHES
+    global STEP_CACHES, ENV_FILES
     global TEST_AHEAD, SPARE_ONLY, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT, WARM_PATHS, WARM_EVERY
     global RESULTS_MAX
@@ -1060,6 +1068,8 @@ def configure(project, instance=None):
     SCOPED_S = 60 * checks.get("scoped_minutes", DEFAULT_SCOPED_MINUTES)
     STEP_CACHES = {s["name"]: dict(s["caches"])
                    for s in checks.get("steps", []) if s.get("caches")}
+    ENV_FILES = {s["name"]: os.path.expanduser(s["env_file"])
+                 for s in checks.get("steps", []) if s.get("env_file")}
     # The configuration refuses reuse without depends.
     REUSE_AGE = datetime.timedelta(days=checks["reuse"].get(
         "max_age_days", DEFAULT_REUSE_DAYS)) if "reuse" in checks else None
@@ -4398,9 +4408,53 @@ def children_cpu():
     return usage.ru_utime + usage.ru_stime
 
 
+ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def read_env_file(path, uid=None):
+    """A step's `env_file`: (values, problem, missing). values is
+    {KEY: VALUE} from its lines (blank ones and `#` comments left out,
+    each VALUE as written, up to the line's end). The file must be the
+    check user's (uid, default this process's) and readable by nobody
+    else: otherwise values is None and problem says why, naming no
+    value. A missing file is ({}, None, True), so the step runs without
+    it and its own skip-if-unset applies."""
+    uid = os.getuid() if uid is None else uid
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return {}, None, True
+    except OSError as e:
+        return None, "env_file %s can't be read: %s" % (
+            path, e.strerror or e), False
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        return None, "env_file %s is not a file" % path, False
+    with os.fdopen(fd, encoding="utf-8", errors="replace") as handle:
+        if st.st_uid != uid:
+            return None, "env_file %s is owned by uid %d, not the check's " \
+                "user (%d)" % (path, st.st_uid, uid), False
+        if st.st_mode & 0o077:
+            return None, "env_file %s is mode %04o: group or others can " \
+                "reach it; it must be 0600" % (
+                    path, stat.S_IMODE(st.st_mode)), False
+        values = {}
+        for number, line in enumerate(handle.read().splitlines(), 1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            key, sep, value = line.partition("=")
+            if not sep or not ENV_KEY.match(key):
+                return None, "env_file %s: line %d is not KEY=VALUE" % (
+                    path, number), False
+            values[key] = value
+    return values, None, False
+
+
 def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
           cpu=children_cpu, logs=None, stream=None, share=None,
-          caches=None, side_by_side=None, front=None, deadline=None):
+          caches=None, side_by_side=None, front=None, deadline=None,
+          env_files=None, out=print):
     """Every step that applies to the head, each run even if an earlier
     one failed, and none retried, each after `prefix` (memory_cap).
     `wrap(name, prefix, argv, env)` gives a traced step's (argv, env).
@@ -4423,13 +4477,28 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
     other's. With `deadline`, a time.monotonic() value (designs/0048's
     checks.scoped_minutes), no step runs past it: one is stopped there,
     and one that would start after it isn't run, either red with
-    `over_budget` and a tail saying so. Returns (ok, results), the
+    `over_budget` and a tail saying so. With `env_files`, {step: path}
+    (default ENV_FILES), a step's file's values are added to its
+    environment (read_env_file); a file that is exposed or unreadable
+    makes the step red without running it, and a missing one is said to
+    `out` and the step runs without it. No value is ever written out.
+    Returns (ok, results), the
     results in the steps' order."""
     chosen = applicable(wt, steps)
-    weights = {}
+    weights, refused = {}, {}
+    env_files = ENV_FILES if env_files is None else env_files
 
     def prepare(name, args, extra):
         step_env_, folder = dict(env, **extra), None
+        if name in env_files:
+            values, problem, missing = read_env_file(env_files[name])
+            if problem is not None:
+                refused[name] = problem
+            elif missing:
+                out("step %s: env_file %s not found; it runs without it"
+                    % (name, env_files[name]))
+            else:
+                step_env_.update(values)
         step_env_.update((caches or {}).get(name, {}))
         step_prefix = list(prefix)
         if front is not None:
@@ -4452,6 +4521,9 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
 
     def execute(name, step_args, step_env_, folder, usage=None,
                 on_start=None):
+        if name in refused:
+            return {"name": name, "rc": 1, "seconds": 0, "wall": 0.0,
+                    "tail": "not run: " + refused[name]}
         started = time.monotonic()
         timeout, budget = STEP_TIMEOUT_S, False
         if deadline is not None:
@@ -6221,7 +6293,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                        wrap=wrap, kept=kept, logs=logs,
                        stream=sh_logged if run is sh else None,
                        share=share, caches=step_caches,
-                       side_by_side=SIDE_BY_SIDE,
+                       side_by_side=SIDE_BY_SIDE, out=out,
                        front=None if front is None or slot == LANE
                        or main else lambda: front(clock()))
             ok, results = check(wt, env, run, steps=steps, **how)

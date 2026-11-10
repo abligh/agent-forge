@@ -237,3 +237,22 @@ A project then adds the nightly's steps it wants scoped to its
   the issue for a few minutes before the run ends, as now. Late: a
   run that ends sooner is reported by the red comment, which routes
   it at once.
+
+## Amendment, 2026-11-10: a step's secrets
+
+A nightly step that needs secrets, such as a test account's tokens for
+a third-party service, gets them from the CI system's own secrets. The
+build check runs outside CI and can't see them, so such a step either
+skips on pull requests (green, but nothing tested) or stays
+nightly-only. A step's `env_file` closes the gap. It names a file on
+the check host of `KEY=VALUE` lines, added to that step's environment
+only.
+
+* The file must be the check user's, at mode 0600. Otherwise the step
+  is red without running, and its tail says why without naming a value.
+* A missing file is logged, and the step runs without it, so a host
+  without the secrets still checks everything else.
+* No value is written to a log, comment, state or digest.
+* Any head that runs the step can read the values. The check runs only
+  branches of the project's own repository, and `pull_requests` scopes
+  the step to the code that uses them.

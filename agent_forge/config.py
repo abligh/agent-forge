@@ -231,7 +231,7 @@ FRESH = {"wait_minutes": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool,
         "version": list, "reads_base": bool, "outputs": list,
         "after": list, "alone": bool, "light": bool, "caches": dict,
-        "pull_requests": dict}
+        "pull_requests": dict, "env_file": str}
 # checks.tracer's values (docs/designs/0005).
 TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.
@@ -1112,6 +1112,11 @@ def _check_checks(checks, data, problems, where="checks"):
                 else:
                     _check_pull_requests(step["pull_requests"], problems,
                                          at + ".pull_requests")
+            env_file = step.get("env_file")
+            if isinstance(env_file, str) and not os.path.isabs(
+                    os.path.expanduser(env_file)):
+                problems.append("%s.env_file must be an absolute path or "
+                                "start with ~" % at)
             if isinstance(step.get("caches"), dict) and not all(
                     isinstance(v, str) and v and "/" not in v
                     for v in step["caches"].values()):
