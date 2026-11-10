@@ -99,6 +99,31 @@ comments and closes it (`CLOSE #N: green at <sha>`). The issue carries
 a `Nightly: <workflow>` line, by which it is found again among the open
 issues its App opened, even without the state file.
 
+**One lead, an issue per step, a notice**
+([designs/0051](../designs/0051-a-red-nightly-has-one-lead-and-an-issue-per-step.md);
+each off until set):
+
+* With `nightly.lead`, the issue is labelled `nightly.labels` and the
+  lead's Owner label alone, says what leading means, and later red runs
+  add no Owner label. Escalations name her.
+* With `nightly.step_issues` too, each failed step gets its own issue,
+  `The nightly's <step> is red at <sha>`, labelled for the step's
+  owner (`nightly.owners`' agent, else the lead), with its output, a
+  link to the nightly's issue and a `Nightly-step: <workflow> <step>`
+  line by which it is found again. The nightly's issue lists them
+  instead of quoting output. A later red run comments `Red again at
+  <sha>` on a step's open issue. A run in which the step succeeds
+  closes it (a skipped step proves nothing), and the first green run
+  closes them all. An Owner label changed by hand stays. nightly.json
+  lists the open ones as `steps`, which the router reads; with
+  `nightly.fixes_named`, a pull request that closes or names a step
+  issue is a fix of the nightly.
+* With `nightly.announce`, the run that opens the issue sends one
+  notice there (`ANNOUNCED to …`), and the green run that closes it
+  another; a room's JID (with `@`) gets a room message. One the relay
+  doesn't take is tried again each tick for an hour
+  (`NOT SENT notice …`).
+
 **Puts fixes first.** While the issue is open, each tick lists the open
 pull requests that close it (`FIXES #N: #12, #14`) in its state. A fix
 is one with a closing keyword for the issue in its title, body or a

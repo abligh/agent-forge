@@ -429,6 +429,34 @@ class Check(unittest.TestCase):
                                    "escalate_hours": hours}
                 self.assertEqual(len(config.check(data)), 1)
 
+    def test_nightly_lead_step_issues_and_announce(self):
+        # designs/0051.
+        data = example()
+        data["router"] = {"owners": {"triage": "LeadDev"},
+                          "red_first": {"everyone": True}}
+        data["nightly"] = {"workflow": "ci.yaml", "job": "build-and-test",
+                           "lead": "LeadDev", "step_issues": True,
+                           "announce": "ops@conference.example.org"}
+        self.assertEqual(config.check(data), [])
+        data["nightly"] = {"workflow": "ci.yaml", "job": "build-and-test",
+                           "lead": "Nobody", "announce": " ",
+                           "step_issues": "yes"}
+        data["router"]["red_first"] = {"everyone": 1}
+        self.assertEqual(config.check(data), [
+            "router.red_first.everyone must be true or false",
+            "nightly.step_issues must be true or false",
+            "nightly.lead 'Nobody' is not an agent",
+            "nightly.announce must not be empty"])
+        data["nightly"] = {"workflow": "ci.yaml", "job": "build-and-test",
+                           "step_issues": True}
+        data["router"]["red_first"] = {}
+        self.assertEqual(config.check(data), [
+            "nightly.step_issues needs nightly.lead"])
+        data["nightly"] = {"workflow": "ci.yaml", "job": "build-and-test"}
+        data["router"]["red_first"] = {"everyone": True}
+        self.assertEqual(config.check(data), [
+            "router.red_first.everyone needs nightly.step_issues"])
+
     def test_nightly_needs_its_workflow_job_and_triage(self):
         self.assertEqual(self.problems(nightly={"job": " "}), [
             "nightly: missing 'workflow'",

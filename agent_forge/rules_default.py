@@ -125,7 +125,8 @@ Issues:
 With `router.red_first` (designs/0039), a red-build issue is one a
 build tool on this host keeps open while a build is red: forge-nightly's
 (`issue` in its nightly.json, while `issue_open` and the file is
-fresh) and forge-pr-check's (`main_red.issue` in its state.json). Its
+fresh, and each of its step issues, `steps`, designs/0051, with the
+same red event) and forge-pr-check's (`main_red.issue` in its state.json). Its
 **red event** is when its build was last reported red: for the
 nightly, the end of its newest red run, else when the issue was
 opened; for the default branch, the issue's newest comment by the
@@ -189,6 +190,11 @@ agents with nothing to do (off without it):
     references it (a closing reference, `#N` or its URL in the body).
     With `router.red_first`, red-build issues come first (oldest first
     among themselves), and the offer says "Red builds go first".
+    With `red_first.everyone` (designs/0051), an idle developer (as
+    rule 16 reads one) is offered instead an open step issue of a red
+    nightly (`nightly.step_issues`), whoever owns it, oldest first and
+    one not yet offered that run if there is one, skipping a parked one,
+    one a pull request references and one rerunning: "take it".
     The event is when the idle period began, and it is about no item,
     so it is offered once per idle period, never reminded, and the
     next idle period offers again. With `idle_offer.retell_minutes`
@@ -224,7 +230,8 @@ With `router.red_first` as well (designs/0039; off without either):
     is offered it, "take it". One issue a developer, and she is then
     offered nothing by rules 15 and 16 that run. The event is the issue
     and its red event, so it is said once to her for each red event,
-    never reminded. With no such developer nothing is said.
+    never reminded. With no such developer nothing is said. With
+    `red_first.everyone`, step issues are left to rule 15.
 
 A directory that couldn't be read, or isn't complete, makes nobody
 idle: unknown is never idle.
@@ -473,7 +480,8 @@ def configure(project, merger_tool):
         "depth2": list(gaps.get("depth2") or [])}
     red = project.section("router").get("red_first")
     RED_FIRST = None if red is None else {
-        "fallback_hours": red.get("fallback_hours", DEFAULT_FALLBACK_HOURS)}
+        "fallback_hours": red.get("fallback_hours", DEFAULT_FALLBACK_HOURS),
+        "everyone": red.get("everyone") is True}
     wake = project.section("router").get("nightly_wake")
     NIGHTLY_WAKE = None if wake is None else {"label": wake.get("label")}
     ISSUE_BLOCKED_BY = project.section("router").get("issue_blocked_by",
@@ -1330,9 +1338,32 @@ def idle_offers(ctx, skip=()):
     developer with none. Agents in `skip` (rule 21's) are left out."""
     report_to = IDLE_OFFER["report_to"]
     decisions = []
+    steps = open_steps(ctx)
+    offered = set()
     for agent, (stamp, shell) in sorted(idle_sweep(ctx).items()):
         if agent in skip or not ctx.roster.is_agent(agent) \
                 or not ctx.roster.offered(agent) or has_turn(agent, ctx):
+            continue
+        if steps and ctx.roster.project.kind(agent) not in NOT_REPORTED:
+            # `red_first.everyone` (designs/0051): a red step first,
+            # whoever owns it; one not yet offered this run if any.
+            issue = next((i for i in steps if i["number"] not in offered),
+                         steps[0])
+            offered.add(issue["number"])
+            owner = issue_owner(issue, ctx.roster)
+            decisions.append(Decision(
+                None, agent, 15, stamp,
+                "#%d%s says %s is red%s. Red builds go first, and while "
+                "the nightly is red every idle developer is offered its "
+                "steps: take it (move its owner label to %s%s and say so "
+                "on the issue), unless a pull request is about to "
+                "reference it. You have been idle since %s." % (
+                    issue["number"], ' "%s"' % (issue.get("title") or "")
+                    .strip() if (issue.get("title") or "").strip() else "",
+                    red_build(issue)["what"],
+                    " (%s's)" % owner if owner else "",
+                    OWNER_PREFIX, agent, since_text(stamp, ctx.when)),
+                reminder=retell()))
             continue
         actionable, held, waiting = owned_issues(agent, ctx)
         if actionable:
@@ -1439,6 +1470,11 @@ def red_builds(project, environ=None, now=None):
         red = data.get("red") if isinstance(data.get("red"), dict) else {}
         found[number] = ("the nightly", as_stamp(red.get("ended"))
                          or as_stamp(data.get("opened")))
+        # designs/0051: each step issue is a red build of its own.
+        for step in nightly.steps(project, environ, now):
+            if step["issue"] not in found:
+                found[step["issue"]] = (
+                    "the nightly's `%s`" % step["name"], found[number][1])
     check = state.load(os.path.join(locks.state_dir(
         project.name, "pr-check", environ, create=False), CHECK_STATE))
     main = check.get("main_red")
@@ -1497,6 +1533,8 @@ def attach_red_builds(github, repo, prs, issues):
         event = red_event(issue, event)
         if event:
             issue["redBuild"] = {"what": what, "event": event}
+            if what.startswith("the nightly's "):
+                issue["redBuild"]["step"] = True
             if rerun and rerun[0] == issue["number"]:
                 issue["redBuild"]["rerun_until"] = rerun[1]
 
@@ -1549,6 +1587,24 @@ def red_turn(issue, owner, comments, roster, ctx):
                     red["what"], since_text(red["event"], ctx.when)))
 
 
+def open_steps(ctx):
+    """With `router.red_first.everyone` (designs/0051): the open step
+    issues of a red nightly, oldest first, that rule 15 offers every
+    idle developer: not parked, not in hand, not rerunning. [] without
+    it."""
+    if RED_FIRST is None or not RED_FIRST.get("everyone"):
+        return []
+    found = []
+    for issue in ctx.issues:
+        red = red_build(issue)
+        if red is None or not red.get("step") or parked(issue) \
+                or in_hand(issue["number"], ctx) or rerunning(red, ctx):
+            continue
+        found.append(issue)
+    return sorted(found, key=lambda i: (i.get("createdAt") or "",
+                                        i["number"]))
+
+
 def red_fallbacks(ctx):
     """Rule 21: ([Decision], {agent offered}): each open red-build issue
     not parked and not in hand, whose red event is `fallback_hours` old
@@ -1570,6 +1626,9 @@ def red_fallbacks(ctx):
         n = issue["number"]
         if red is None or parked(issue) or in_hand(n, ctx) \
                 or red["event"] > cutoff or rerunning(red, ctx):
+            continue
+        if red.get("step") and RED_FIRST.get("everyone"):
+            # Rule 15 offers it to everyone idle already.
             continue
         owner = issue_owner(issue, ctx.roster)
         if owner and last_by(issue.get("comments") or [],

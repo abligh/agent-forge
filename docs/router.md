@@ -353,7 +353,8 @@ covers has, and which pull requests it has told. With
 `router.red_first` (rules 20 and 21), the default rules' `red builds`
 lookup reads, rather than GitHub, the state forge-nightly and
 forge-pr-check keep on the same host, to know which open issues say a
-build is red; rule 20 reads `prs` for whether a pull request
+build is red (with `nightly.step_issues`, each step issue too,
+designs/0051); rule 20 reads `prs` for whether a pull request
 references one, and rule 21, run in `sweep` beside the idle offer,
 reads `directory` too. With `router.nightly_wake` (rule 22), the
 `published nightly` lookup reads the newest run that published its

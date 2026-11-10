@@ -1,6 +1,6 @@
 # 0051: A red nightly has one lead and an issue per step
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-10; https://github.com/abligh/agent-forge/issues/268)
 * Author: XMPPEngineer
 * Date: 2026-11-10
 
