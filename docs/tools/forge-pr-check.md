@@ -187,6 +187,9 @@ less `keep_ignored`), merged with the default branch's tip under
   `OOMPolicy=continue` and `CPUWeight` (`cpu_weight`, default 1000;
   `merger_cpu_weight` for the run the next merge waits on). A worker
   that can't start a scope logs `UNCAPPED` and runs without it.
+  With `cpu_quota`, a slot's scopes share one user slice whose
+  `CPUQuota` is that many CPUs, or the run's `CHECK_CPUS` share with
+  `"share"`, set as each step starts; `UNCAPPED-CPU` if systemd refuses.
 * A step is stopped after `step_timeout_minutes` (default 30).
 * A step with `env_file` gets that file's `KEY=VALUE` lines in its
   environment: secrets such as a test account's tokens, which the

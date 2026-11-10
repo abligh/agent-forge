@@ -154,7 +154,8 @@ STALL_ALERT = {"tell": list, "retell_minutes": int,
 CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "slots": int, "memory_max": (str, type(None)), "step_timeout_minutes": int,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
-          "tracer": str, "cpu_weight": int, "fast_lane": dict,
+          "tracer": str, "cpu_weight": int, "cpu_quota": (int, str, type(None)),
+          "fast_lane": dict,
           "merge_default": bool, "cache_limit": str, "results_max": str,
           "reuse": dict,
           "fresh": dict, "first_authors": list, "max_wait_minutes": int,
@@ -186,7 +187,7 @@ STEP_ALERT = {"growth": (int, float), "min_seconds": int, "window_days": int,
 # first host's tracer (BLOCK_ONLY), or from `checks` alone, because they
 # belong to the context the Merger requires (CHECKS_ONLY).
 INSTANCE_OWN = ("host", "context", "steps", "poster")
-INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight",
+INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight", "cpu_quota",
                       "step_timeout_minutes", "caches", "cache_limit",
                       "results_max",
                       "keep_ignored", "drop_env", "merge_default",
@@ -985,6 +986,11 @@ def _check_checks(checks, data, problems, where="checks"):
     if _is(checks.get("cpu_weight"), int) \
             and not 0 <= checks["cpu_weight"] <= 10000:
         problems.append("%s.cpu_weight must be 0 (none) or 1 to 10000" % where)
+    quota = checks.get("cpu_quota")
+    if (_is(quota, int) and quota < 1) or (
+            isinstance(quota, str) and quota != "share"):
+        problems.append("%s.cpu_quota must be a number of CPUs (1 or more), "
+                        "\"share\" or null" % where)
     if _is(checks.get("merger_cpu_weight"), int):
         floor = checks["cpu_weight"] if _is(checks.get("cpu_weight"), int) \
             else 1000
