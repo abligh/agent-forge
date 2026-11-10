@@ -45,9 +45,10 @@ class RedCommentText(unittest.TestCase):
             ("browser", "\x1b[31mFAIL\x1b[39m src/a.test.ts\n"),
             ("vet", "error: unused\n")])
         lines = text.splitlines()
-        self.assertTrue(lines[0].startswith(
+        self.assertEqual(lines[:2], ["Not-a-review", ""])
+        self.assertTrue(lines[2].startswith(
             "%s is red at %s" % (pc.STATUS_CONTEXT, SHA_A[:10])))
-        self.assertTrue(lines[0].endswith(": browser, vet."))
+        self.assertTrue(lines[2].endswith(": browser, vet."))
         self.assertIn("FAIL src/a.test.ts", text)
         self.assertNotIn("\x1b", text)
         self.assertIn("error: unused", text)

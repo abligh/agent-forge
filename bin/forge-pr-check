@@ -2042,8 +2042,8 @@ def take_reruns(state, labelled, labellers, when, state_dir, out=print,
 
 def rerun_text(sha):
     """The comment a second labels.rerun on one head gets."""
-    return ("%s has already been run again once; push a new head to run "
-            "it a third time.\n\n%s" % (sha[:10], signature()))
+    return ("%s%s has already been run again once; push a new head to run "
+            "it a third time.\n\n%s" % (NOT_A_REVIEW, sha[:10], signature()))
 
 
 def finish_reruns(todo, token, run=sh, post=None, out=print):
@@ -2728,6 +2728,12 @@ REOPENED_TEXT = ("Reopened: this was closed while `%s` is still red for "
                  "`%s`, at %s: %s. It closes when a later tip is green.\n\n%s")
 
 
+# How every comment on a pull request starts: forge-merger's
+# `merge.said_since` then reads it as the machinery's note, not as a
+# remark the approver hasn't seen, and doesn't hold the pull request.
+NOT_A_REVIEW = "Not-a-review\n\n"
+
+
 def signature():
     """How an issue or comment forge-pr-check writes ends: a line saying
     the machinery wrote it, then `— <poster>`, the App it writes as, the
@@ -2767,7 +2773,7 @@ def red_comment_text(sha, failed):
     """The comment a red pull request head gets (checks.red_comment):
     which steps failed, and the end of each one's output, colour codes
     removed and cut to RED_COMMENT_CHARS."""
-    lines = ["%s is red at %s%s: %s." % (
+    lines = [NOT_A_REVIEW + "%s is red at %s%s: %s." % (
         STATUS_CONTEXT, sha[:10], on_host(),
         ", ".join(n for n, _ in failed) or "a step failed")]
     for name, text in failed:

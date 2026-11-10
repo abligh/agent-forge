@@ -168,7 +168,8 @@ class RerunTick(base.StateCase):
         (comment,) = self.calls(is_comment)
         body = comment[comment.index("-f") + 1]
         self.assertTrue(body.startswith(
-            "body=aaaaaaaaaa has already been run again once; push a new "
+            "body=Not-a-review\n\naaaaaaaaaa has already been run again "
+            "once; push a new "
             "head to run it a third time."))
         self.assertTrue(body.endswith("— %s" % pc.POSTER))
         self.assertEqual(len(self.calls(is_unlabel)), 1)
@@ -611,3 +612,23 @@ class RerunAcrossInstances(base.StateCase):
         self.assertEqual(self.unlabels(), [])
         self.assertIn(SHA_A, self.state()["results"])
 
+
+
+class CommentsHoldNothing(unittest.TestCase):
+    """forge-pr-check's comments on a pull request start `Not-a-review`,
+    so forge-merger's `merge.said_since` never holds an approved pull
+    request on one posted after its approval."""
+
+    def test_a_rerun_refusal_after_an_approval_holds_nothing(self):
+        from tests import test_forge_merger as tm
+        for body in (pc.rerun_text(SHA_A),
+                     pc.red_comment_text(SHA_A, [("vet", "error\n")])):
+            approval = tm.review(tm.REVIEWER, at=tm.T1)
+            item = tm.pr(reviews=[approval], comments=[
+                tm.comment("widget-poster[bot]", at=tm.T2, body=body)])
+            self.assertEqual(tm.m.said_since(item, approval), [])
+        # Without the line, the same comment would hold it.
+        item = tm.pr(reviews=[approval], comments=[tm.comment(
+            "widget-poster[bot]", at=tm.T2,
+            body=pc.rerun_text(SHA_A).replace(pc.NOT_A_REVIEW, ""))])
+        self.assertEqual(len(tm.m.said_since(item, approval)), 1)
