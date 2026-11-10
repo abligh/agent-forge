@@ -502,41 +502,41 @@ and no layer pushes an owed one out again.
 
 **With `merge.test_ahead.trains`, batches are trains** (designs/0047;
 default off). `"live"`: each batch is a train of carriages, a stack's
-ready layers with their base (`stacks`) or one pull request, cut once
-in the queue's order, urgent ones first: the first carriage that merges
+ready layers with their base (`stacks`) or one pull request, cut once in
+the queue's order, urgent ones first: the first carriage that merges
 cleanly onto the train's base (the default branch's tip, then each
-train's top), then each next one that touches no file the train
-touches (`trains_within: "clean"`: merges cleanly), up to `batch` pull
-requests, urgent ones only with urgent ones. A stack is never split;
-one longer than `batch` is a train of its own. A layer that is red, or
-won't merge onto the layers below it, stays behind with those above it
+train's top), then each next one that touches no file the train touches
+(`trains_within: "clean"`: merges cleanly), up to `batch` pull requests,
+urgent ones only with urgent ones. A stack is never split; one longer
+than `batch` is a train of its own. A layer that is red, or won't merge
+onto the layers below it, stays behind with those above it
 (`TRAIN-LEFT`), and the layers below it board without them: a layer
-holds nothing under it back. One that conflicts with a train ahead
-waits for a later train: it is not handed back for that.
-A cut train is fixed: ahead.json says `"trains": true`, its entries
-their `train` and `carriage`, and every train counts as started
-(`fixed_order`), so nothing joins it or moves into it. A member that
-leaves, by a push to a tree other than the one predicted, a hand-back
-or a lost approval, goes alone, with the layers of its stack above it:
-`TRAIN-LEFT #n: pushed <sha> mid-train`. The rest keep their places,
-and the train's top, now a new tree, is run again. A pull request that
-is urgent or fixes a red default branch and is in no train cuts every
-train after the first again, and the default branch moving to a tree
-no train predicted cuts them all (`TRAIN-RECUT: ...`). A red top's
-members are the suspects, as a red batch's, and the trains are cut
-again once the search ends. A pull request whose own head is red
-doesn't board while the default branch is green. One that conflicts
-with the default branch only where `merge.resolve` or its `union` would
-resolve it can't board as it stands, and train members stay ahead of
-it, so a live tick resolves the first such pull request ahead of its
-turn, and it boards at the next cut. New trains are said
-as `TRAIN-CUT k: #a #b`; the record has `trains` and `train_events`.
-`"dry-run"` changes nothing: the batches are cut as without it, and the
-trains this tick would have, from the dry run's own (`trains-dry.json`),
-are said as `TRAIN-DRY 1: #a #b | 2: #c` when they change, each change
-as `TRAIN-DRY LEFT ...`, and kept in the record as `trains` with
-`"trains_dry": true`, with `recut_avoided` when the batches were cut
-again but no train was.
+holds nothing under it back. One that conflicts with a train ahead waits
+for a later train: it is not handed back for that. A cut train is fixed:
+ahead.json says `"trains": true`, its entries their `train` and
+`carriage`, and every train counts as started (`fixed_order`), so
+nothing joins it or moves into it. A member that leaves, by a push to a
+tree other than the one predicted, a hand-back or a lost approval, goes
+alone, with the layers of its stack above it: `TRAIN-LEFT #n: pushed
+<sha> mid-train`. The Merger's own RESTACK of a layer is not a push:
+with STACK-UPDATE still to come, it is in flight. The rest keep their
+places, and the train's top, now a new tree, is run again. A pull
+request that is urgent or fixes a red default branch and is in no train
+cuts every train after the first again, and the default branch moving to
+a tree no train predicted cuts them all (`TRAIN-RECUT: ...`). A red
+top's members are the suspects, as a red batch's, and the trains are cut
+again once the search ends. A pull request whose own head is red doesn't
+board while the default branch is green. One that conflicts with the
+default branch only where `merge.resolve` or its `union` would resolve
+it can't board as it stands, and train members stay ahead of it, so a
+live tick resolves the first such pull request ahead of its turn, and it
+boards at the next cut. New trains are said as `TRAIN-CUT k: #a #b`; the
+record has `trains` and `train_events`. `"dry-run"` changes nothing: the
+batches are cut as without it, and the trains this tick would have, from
+the dry run's own (`trains-dry.json`), are said as `TRAIN-DRY 1: #a #b |
+2: #c` when they change, each change as `TRAIN-DRY LEFT ...`, and kept
+in the record as `trains` with `"trains_dry": true`, with
+`recut_avoided` when the batches were cut again but no train was.
 
 **With `merge.hold_conflicting`, a pull request that conflicts with
 one ahead of it waits for that one instead of going round again**
@@ -3938,6 +3938,19 @@ def restacked_tree(repo, base, head, lower, run=sh):
     return (tree, None) if tree is not None else (None, "update")
 
 
+def restacking(repo, before, head, restack, run=sh):
+    """Whether `head` is the Merger's own RESTACK of the layer at
+    `before`: a merge whose parents are `before` and the final head of
+    the merged layer below (`restack`, (after, lower), from `restacks`).
+    STACK-UPDATE is still to come, so the layer is in flight, not pushed
+    to: its tree is judged again once the restack is complete."""
+    if not before or restack is None:
+        return False
+    parents = git(repo, "rev-list", "--parents", "-n", "1", head, run=run)
+    return parents.returncode == 0 and \
+        parents.stdout.split()[1:] == [before, restack[1]]
+
+
 def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
                   overdue=(), restacks=None):
     """The commits the first `depth` + 1 pull requests in `queue`
@@ -4194,8 +4207,11 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                     have_head(repo, pr, run)
                     tree = git(repo, "rev-parse",
                                pr["headRefOid"] + "^{tree}", run=run)
-                    if tree.returncode != 0 or \
-                            tree.stdout.strip() != e.get("tree"):
+                    if (tree.returncode != 0
+                            or tree.stdout.strip() != e.get("tree")) \
+                            and not restacking(repo, e.get("head"),
+                                               pr["headRefOid"],
+                                               (restacks or {}).get(n), run):
                         why = "pushed %s mid-train" % pr["headRefOid"][:10]
                 if why is None:
                     entry, failed = predict_one(repo, parent, pr, restacks,

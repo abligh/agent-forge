@@ -2952,6 +2952,54 @@ class PredictRestacked(unittest.TestCase):
         self.assertEqual(self.predict([seven, layer, eight], self.restacks),
                          got)
 
+    def test_a_train_keeps_a_layer_through_its_restack(self):
+        # agent-forge #281: RESTACK's head, with STACK-UPDATE still to
+        # come, had sent the layer out of its train as a push.
+        self.addCleanup(m.configure, project())
+        m.configure(urgent_project(test_ahead={
+            "batch": 3, "batches": 2, "depth": 5, "trains": "live"}))
+        layer = self.stack(self.lines(l3="Y"))
+        # main moves on past #5's squash, so the halfway head's own tree
+        # is not the predicted one.
+        self.repo.branch("onward", self.repo.main_tip())
+        onward = self.repo.commit("m.txt", "m\n", "main moves on")
+        run_git(self.repo.path, "push", "-q", "origin", onward + ":main")
+        run_git(self.repo.path, "fetch", "-q", "origin")
+        seven = self.other(7, "g.txt")
+        open_numbers = {6, 7}
+        entries, sizes, _ = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), [[layer], [seven]], None,
+            {6: self.upper, 7: seven["headRefOid"]}, open_numbers,
+            restacks=self.restacks)
+        self.assertEqual(m.train_lists(entries, sizes), [[6, 7]])
+        _, _, later = m.train_batches(entries, sizes, lambda t: None)
+        last = {"base": self.repo.main_tip(), "trains": True,
+                "entries": entries, "later": later,
+                "batch": {"size": sizes[0],
+                          "trees": [e["tree"] for e in entries]}}
+        halfway = self.restacked_by_hand()
+        self.repo.publish_pr(6, halfway)
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            [[pr(6, T1, head=halfway)], [seven]], last,
+            {6: halfway, 7: seven["headRefOid"]}, open_numbers,
+            restacks=self.restacks)
+        self.assertEqual(events, [])
+        self.assertEqual(m.train_lists(got, sizes), [[6, 7]])
+        self.assertEqual([e["tree"] for e in got],
+                         [e["tree"] for e in entries])
+        # Any other push still takes it out.
+        self.repo.branch("other", self.upper)
+        pushed = self.repo.commit("o.txt", "o\n", "a push")
+        self.repo.publish_pr(6, pushed)
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            [[pr(6, T1, head=pushed)], [seven]], last,
+            {6: pushed, 7: seven["headRefOid"]}, open_numbers,
+            restacks=self.restacks)
+        self.assertEqual(events[0], ("left", "LEFT #6: pushed %s mid-train"
+                                     % pushed[:10]))
+
     def test_without_the_option_the_layer_is_left_out(self):
         layer = self.stack(self.lines(l3="Y"))
         seven, eight = self.other(7, "g.txt"), self.other(8, "h.txt")
