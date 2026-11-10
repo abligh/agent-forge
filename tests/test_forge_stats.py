@@ -84,6 +84,17 @@ class Check(unittest.TestCase):
                                "unused_seconds": 120})
         self.assertEqual(self.got["busy_share"], round(720 / 14400, 3))
 
+    def test_a_batch_top_whose_green_covered_merges_was_used(self):
+        # agent-forge #281: a COVERED line names the batch's top
+        # prediction, which the batch's merges used.
+        lines = VERDICTS + [
+            "2026-10-12T01:20:00Z VERDICT AHEAD #9 5555555555: green "
+            "waited=0s ran=200s",
+            "2026-10-12T01:30:00Z COVERED #7 6666666666: the top of the "
+            "Merger's batch #7..#9 tested green as 5555555555; not run"]
+        got = tool.check_stats(lines, SINCE, UNTIL, 2)["predictions"]
+        self.assertEqual(got, {"run": 2, "used": 1, "seconds": 320,
+                               "unused_seconds": 120})
 
 class MainCpu(unittest.TestCase):
     """designs/0024, third amendment: the default branch's CPU."""
