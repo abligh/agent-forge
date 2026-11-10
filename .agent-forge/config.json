@@ -1,0 +1,52 @@
+{
+  "project": "agent-forge",
+  "repo": "abligh/agent-forge",
+  "owner": "abligh",
+  "key_dir": "~/agent-keys/agent-forge",
+  "naming": {
+    "app_slug_suffix": "amonagent"
+  },
+  "agents": {
+    "XMPPEngineer": {
+      "app_id": 5111152,
+      "installation_id": 165866872
+    }
+  },
+  "merge": {
+    "merger": "Merger",
+    "ci_workflow": ""
+  },
+  "checks": {
+    "context": "build-and-test",
+    "poster": "Merger",
+    "slots": 1,
+    "memory_max": "8G",
+    "step_timeout_minutes": 20,
+    "steps": [
+      {
+        "name": "test",
+        "run": [
+          "env",
+          "-u",
+          "GH_TOKEN",
+          "make",
+          "test"
+        ]
+      }
+    ]
+  },
+  "relay": {
+    "url": "http://127.0.0.1:8788"
+  },
+  "router": {
+    "idle_offer": {}
+  },
+  "machinery": {
+    "Merger": {
+      "app_id": 5111152,
+      "installation_id": 165866872,
+      "slug": "xmppengineeramonagent",
+      "key": "XMPPEngineer.pem"
+    }
+  }
+}
