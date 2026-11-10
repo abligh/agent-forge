@@ -63,8 +63,9 @@ lane's slot is not counted) and whether there is a `nightly` section
 * runs by kind: pull-request heads, the Merger's predictions (`AHEAD`)
   and the default branch; verdicts posted without a run (`MATCHED`);
   reds by step; runs red at once for a conflict;
-* the predictions: how many a later head was matched to, and the
-  slot-hours of those never used;
+* the predictions: how many were used, by a later head matched to one
+  (`MATCHED`) or by a batch whose top's green covered its merges
+  (`COVERED`), and the slot-hours of those never used;
 * the wait for a slot, the run time, and a pull-request head's wait
   and run together;
 * the slots busy: the run time of runs that finished in the window,
