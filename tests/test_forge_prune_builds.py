@@ -152,10 +152,50 @@ class SafetyLine(unittest.TestCase):
         self.wt = self.fx.worktree("a")
 
     def test_untagged_target_is_never_touched(self):
-        path = self.fx.cache(self.wt, age_hours=1000, tag=None)
+        # No tag and no Cargo profile (no .cargo-lock, no .fingerprint).
+        path = self.fx.cache(self.wt, age_hours=1000, tag=None, locks=())
         (cleared, kept, _), _, _ = run(self.fx, finished=True)
         self.assertEqual((cleared, kept), (0, 0))
         self.assertTrue(os.path.exists(os.path.join(path, "debug", "deps", "libx.rlib")))
+
+    def test_a_profile_under_an_untagged_target_is_a_cache(self):
+        # designs/0041, second amendment: Cargo didn't create target/
+        # (a nested build did), so only target/vet-wasm is tagged, and
+        # target/debug is judged as a cache of its own.
+        path = self.fx.cache(self.wt, age_hours=1000, tag=None)
+        nested = self.fx.cache(self.wt, rel="target/vet-wasm", age_hours=1)
+        os.makedirs(os.path.join(path, "release", ".fingerprint"))
+        with open(os.path.join(path, "keep.json"), "w") as f:
+            f.write("{}")
+        (cleared, kept, _), lines, _ = run(self.fx, finished=True)
+        self.assertEqual((cleared, kept), (2, 1))
+        self.assertFalse(os.path.exists(os.path.join(path, "debug")))
+        self.assertFalse(os.path.exists(os.path.join(path, "release")))
+        self.assertTrue(os.path.exists(os.path.join(path, "keep.json")))
+        self.assertTrue(os.path.exists(nested))
+
+    def test_a_debug_directory_that_isnt_cargos_is_never_touched(self):
+        path = os.path.join(self.wt, "docs", "debug")
+        os.makedirs(path)
+        with open(os.path.join(path, "notes.txt"), "w") as f:
+            f.write("mine")
+        os.utime(os.path.join(path, "notes.txt"), (0, 0))
+        run(self.fx, finished=True)
+        self.assertTrue(os.path.exists(os.path.join(path, "notes.txt")))
+
+    def test_a_profile_one_below_the_deepest_level_is_found(self):
+        path = self.fx.cache(self.wt, rel="a/b/target", age_hours=1000,
+                             tag=None)
+        run(self.fx, finished=True)
+        self.assertFalse(os.path.exists(os.path.join(path, "debug")))
+
+    def test_a_held_lock_keeps_an_untagged_profile(self):
+        path = self.fx.cache(self.wt, age_hours=1000, tag=None)
+        lock = os.path.join(path, "debug", ".cargo-lock")
+        with open(lock, "rb") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            run(self.fx, finished=True)
+        self.assertTrue(os.path.exists(os.path.join(path, "debug")))
 
     def test_wrong_signature_is_not_a_tag(self):
         path = self.fx.cache(self.wt, age_hours=1000, tag=b"Signature: nope\n")
@@ -297,6 +337,35 @@ class Pressure(unittest.TestCase):
         run_pressure(self.fx, usage=self.usage(), low=45)
         self.assertEqual(self.left(), ["d"])
 
+    def test_each_cache_the_floor_keeps_is_logged(self):
+        _, lines = run_pressure(self.fx, usage=self.usage(), low=45)
+        self.assertIn("pressure: kept %s: used 0.5h ago, inside the floor "
+                      "(1h)" % self.caches["d"], lines)
+
+    def test_still_over_high_water_it_clears_inside_the_floor(self):
+        # Each cache is 30 points over 60: after a, b and c go, d alone
+        # keeps the disk at 90%, over high-water, so it goes too.
+        (cleared, _, _), lines = run_pressure(
+            self.fx, usage=self.usage(per_cache=30, base=60), low=45)
+        self.assertEqual(self.left(), [])
+        self.assertEqual(cleared, 4)
+        self.assertTrue(any("clearing caches inside the floor" in l
+                            for l in lines))
+
+    def test_inside_the_floor_a_held_lock_still_keeps_it(self):
+        lock = os.path.join(self.caches["d"], "debug", ".cargo-lock")
+        with open(lock, "rb") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            run_pressure(self.fx, usage=self.usage(per_cache=30, base=60),
+                         low=45)
+        self.assertEqual(self.left(), ["d"])
+
+    def test_inside_the_floor_a_busy_worktree_still_keeps_it(self):
+        wt = os.path.dirname(self.caches["d"])
+        run_pressure(self.fx, usage=self.usage(per_cache=30, base=60),
+                     low=45, busy=[os.path.realpath(wt)])
+        self.assertEqual(self.left(), ["d"])
+
     def test_a_busy_worktree_is_kept_under_pressure(self):
         wt = os.path.dirname(self.caches["a"])
         run_pressure(self.fx, usage=self.usage(), busy=[os.path.realpath(wt)],
@@ -314,7 +383,8 @@ class Pressure(unittest.TestCase):
         (cleared, _, kib), lines = run_pressure(
             self.fx, usage=lambda r: 99.9, dry_run=True)
         self.assertEqual(self.left(), ["a", "b", "c", "d"])
-        self.assertEqual(cleared, 3)
+        # Still 99.9% after the three, so d, inside the floor, too.
+        self.assertEqual(cleared, 4)
         self.assertTrue(lines[-1].startswith("pressure: %s would be" % self.fx.root))
 
 
@@ -347,12 +417,13 @@ class LiveTrim(unittest.TestCase):
         return path
 
     def run_it(self, *, usage=lambda r: 90, busy=None, dry_run=False,
-               hours=6):
+               hours=6, idle=False):
         lines = []
         result = prune.prune(
             [self.fx.root], dry_run=dry_run, merged_hours=6, idle_hours=48,
             repo="o/r", token=None, now=NOW,
-            busy={os.path.realpath(self.wt)} | set(busy or ()),
+            busy=(set() if idle else {os.path.realpath(self.wt)})
+            | set(busy or ()),
             branch_of=lambda wt: "b", finished_of=lambda *a: False,
             out=lines.append, high_water=85, low_water=70,
             floor_hours=1.0, targets=set(), usage=usage,
@@ -420,6 +491,15 @@ class LiveTrim(unittest.TestCase):
         readings = iter([90, 90, 60])
         return lambda root: next(readings, 60)
 
+    def test_a_spare_cache_the_floor_keeps_is_trimmed_too(self):
+        # Nothing is using it, but it was used within the hour: the
+        # floor keeps it whole, and the live trim takes its stale part.
+        self.file("debug/deps/recent.rlib", age_hours=0.2)
+        _, lines = self.run_it(usage=self.falling(), idle=True)
+        self.assertFalse(os.path.exists(self.old))
+        self.assertTrue(os.path.exists(self.fresh))
+        self.assertTrue(any(l.startswith("trimmed") for l in lines))
+
     def test_dry_run_deletes_nothing(self):
         (_, _, kib), lines = self.run_it(dry_run=True)
         self.assertTrue(os.path.exists(self.old))
@@ -445,8 +525,9 @@ class Shared(unittest.TestCase):
         self.shared = os.path.join(self.fx.root, "shared")
         os.makedirs(self.shared)
 
-    def tgt(self, name, age, tag=TAG):
-        return self.fx.cache(self.shared, rel=name, age_hours=age, tag=tag)
+    def tgt(self, name, age, tag=TAG, locks=("debug",)):
+        return self.fx.cache(self.shared, rel=name, age_hours=age, tag=tag,
+                             locks=locks)
 
     def go(self, **kw):
         lines = []
@@ -467,8 +548,15 @@ class Shared(unittest.TestCase):
         self.assertTrue(os.path.exists(new))
 
     def test_untagged_is_never_touched(self):
-        plain = self.tgt(".tgt-plain", 100, tag=None)
+        plain = self.tgt(".tgt-plain", 100, tag=None, locks=())
         self.go()
+        self.assertTrue(os.path.exists(plain))
+
+    def test_an_untagged_targets_profiles_are_shared_caches(self):
+        plain = self.tgt(".tgt-plain", 100, tag=None)
+        (cleared, _, _), _ = self.go()
+        self.assertEqual(cleared, 1)
+        self.assertFalse(os.path.exists(os.path.join(plain, "debug")))
         self.assertTrue(os.path.exists(plain))
 
     def test_a_worktree_is_not_a_shared_cache(self):
@@ -569,6 +657,91 @@ class Shared(unittest.TestCase):
             with open(os.path.join(proc, pid, "environ"), "wb") as f:
                 f.write(env)
         self.assertEqual(prune.target_dirs(proc), {os.path.realpath("/x/t")})
+
+
+class Alert(unittest.TestCase):
+    """designs/0041, second amendment: a filesystem still nearly full
+    after pruning is reported, and told through the relay."""
+
+    def setUp(self):
+        self.fx = Fixture(self)
+        self.state = tempfile.TemporaryDirectory()
+        self.addCleanup(self.state.cleanup)
+        self.env = {"FORGE_STATE_DIR": self.state.name,
+                    "HOME": self.state.name}
+        self.sent, self.refuse = [], False
+
+    def send(self, name, text):
+        self.sent.append((name, text))
+        return "HTTP 503 queue-full" if self.refuse else None
+
+    def main(self, *extra, now=NOW, usage=lambda r: 98):
+        errors = []
+        rc = prune.main(["--root", self.fx.root, "--high-water", "85",
+                         "--low-water", "70", *extra],
+                        out=lambda m: None, err=errors.append,
+                        environ=self.env, finished_of=lambda *a: None,
+                        busy=set(), branch_of=lambda wt: "b", now=now,
+                        usage=usage, send=self.send)
+        return rc, errors
+
+    def test_still_full_is_reported_and_told_once_an_hour(self):
+        rc, errors = self.main("--alert-to", "LeadDev",
+                               "--alert-to", "ops@example.org")
+        self.assertEqual(rc, 0)
+        self.assertIn("forge-prune-builds: ALERT: %s is 98%% used after "
+                      "pruning (alert at 97%%)" % self.fx.root, errors)
+        self.assertEqual([n for n, _ in self.sent],
+                         ["LeadDev", "ops@example.org"])
+        self.assertIn("%s 98%% used" % self.fx.root, self.sent[0][1])
+        self.main("--alert-to", "LeadDev", now=NOW + 600)
+        self.assertEqual(len(self.sent), 2)
+        self.main("--alert-to", "LeadDev", now=NOW + 3700)
+        self.assertEqual(len(self.sent), 3)
+
+    def test_not_taken_is_tried_again_next_run(self):
+        self.refuse = True
+        _, errors = self.main("--alert-to", "LeadDev")
+        self.assertTrue(any("not taken: HTTP 503" in e for e in errors))
+        self.refuse = False
+        self.main("--alert-to", "LeadDev", now=NOW + 300)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_under_the_mark_says_nothing(self):
+        _, errors = self.main("--alert-to", "LeadDev", usage=lambda r: 96)
+        self.assertEqual((errors, self.sent), ([], []))
+
+    def test_alert_percent_sets_the_mark(self):
+        _, errors = self.main("--alert-percent", "90", usage=lambda r: 92)
+        self.assertTrue(any("ALERT" in e for e in errors))
+        self.assertEqual(self.sent, [])
+
+    def test_a_dry_run_reports_but_tells_nobody(self):
+        _, errors = self.main("--alert-to", "LeadDev", "--dry-run")
+        self.assertTrue(any("ALERT" in e for e in errors))
+        self.assertEqual(self.sent, [])
+
+    def test_the_real_sender_is_forge_mergers(self):
+        import json
+        from tests.helpers import example
+        path = os.path.join(self.state.name, "config.json")
+        with open(path, "w") as handle:
+            json.dump(example(), handle)
+        send = prune.relay_sender({"FORGE_CONFIG": path,
+                                   "HOME": self.state.name})
+        self.assertTrue(callable(send))
+
+    def test_flags_are_checked(self):
+        for extra in (["--alert-percent", "0"],
+                      ["--alert-percent", "101"]):
+            rc, errors = self.main(*extra)
+            self.assertEqual(rc, 2, extra)
+        errors = []
+        rc = prune.main(["--root", self.fx.root, "--alert-to", "LeadDev"],
+                        out=lambda m: None, err=errors.append, environ={},
+                        finished_of=lambda *a: None)
+        self.assertEqual(rc, 2)
+        self.assertIn("--alert-to needs --high-water", errors[0])
 
 
 class Often(unittest.TestCase):

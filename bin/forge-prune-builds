@@ -5,8 +5,13 @@ Agents work in a git worktree per task, and each builds its own cache
 (a Rust `target/` is 10 to 30 GB) that nothing removes when the task
 ends. This deletes such caches, and only them: a directory is a
 candidate only if it carries a valid CACHEDIR.TAG, which Cargo writes
-into every `target/`. Source, git data and anything written by hand are
-never touched, so a wrong decision costs one rebuild.
+into every `target/` it creates, or is a Cargo profile directory
+(`debug/` or `release/` holding `.fingerprint/` or `.cargo-lock`) in an
+untagged directory (designs/0041, second amendment). Cargo doesn't tag
+a `target/` that something else created first, such as a nested
+build's CARGO_TARGET_DIR=target/vet-wasm, and then only the nested one
+carries a tag. Source, git data and anything written by hand are never
+touched, so a wrong decision costs one rebuild.
 
 A cache directory is cleared only when ALL of these hold:
 
@@ -36,7 +41,8 @@ Designs/0041 adds, each off unless given:
      --high-water percent used after the normal pass, more is cleared:
      any cache that passes rules 1 and 2, whatever its idle time, least
      recently used first, until the filesystem is under --low-water. A
-     cache used in the last --pressure-floor-hours (default 1) is kept.
+     cache used in the last --pressure-floor-hours (default 1) is kept,
+     and each one so kept is logged.
   --live-trim-hours H: if that wasn't enough, the caches in use, of
      worktrees and shared ones, are trimmed too, the one with most to give first, until the
      filesystem is under --low-water. Rule 1 keeps a whole cache from a
@@ -46,7 +52,18 @@ Designs/0041 adds, each off unless given:
      files, and under each `incremental` directory the whole sessions,
      neither read nor written for H hours and not open. Rule 2 still
      holds, so a running build is never touched. Cargo rebuilds what is
-     missing, so a wrong guess costs a rebuild.
+     missing, so a wrong guess costs a rebuild. Caches nothing is
+     using but the floor kept are trimmed the same way.
+     If the filesystem is still at --high-water after all that, the
+     caches the floor kept are cleared too, least recently used first,
+     until it is under --low-water: nothing is using them (rule 1) and
+     no build holds their locks (rule 2), and a full disk fails every
+     build on the host.
+  --alert-percent PCT (default 97, with --high-water): a filesystem
+     still at least this full when the run ends is reported on stderr,
+     and, with --alert-to NAME (an agent or an XMPP address; repeatable),
+     told to each through the relay (the configuration's `relay`), at
+     most once an hour (designs/0041, second amendment).
   --every-minutes N: a run that finds every root under --high-water,
      with the last full scan less than N minutes ago, exits at once,
      so cron can run this every few minutes cheaply.
@@ -81,7 +98,10 @@ import argparse
 import errno
 import fcntl
 import hashlib
+import importlib.machinery
+import importlib.util
 import os
+import socket
 import shutil
 import subprocess
 import sys
@@ -102,8 +122,13 @@ CACHE_DEPTH = 3
 # The lock files Cargo holds while it builds, in each profile directory
 # (debug/, release/) and each target's (wasm32-unknown-unknown/debug/).
 CARGO_LOCKS = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
+# Cargo's profile directories, and what marks one as Cargo's.
+CARGO_PROFILES = ("debug", "release")
 LOCK_DEPTH = 2
 PRUNING = ".forge-pruning"
+# --alert-to: how often the same roots' alert is sent again.
+ALERT_EVERY_S = 3600
+BIN = os.path.dirname(os.path.realpath(__file__))
 
 
 def is_cache_dir(path):
@@ -113,6 +138,29 @@ def is_cache_dir(path):
             return handle.read(len(SIGNATURE)) == SIGNATURE
     except OSError:
         return False
+
+
+def is_cargo_profile(path):
+    """True if `path` is a Cargo profile directory: named `debug` or
+    `release`, holding a `.fingerprint` directory or a `.cargo-lock`.
+    Links are not followed."""
+    if os.path.basename(path) not in CARGO_PROFILES or os.path.islink(path):
+        return False
+    return (os.path.isdir(os.path.join(path, ".fingerprint"))
+            and not os.path.islink(os.path.join(path, ".fingerprint"))) \
+        or os.path.isfile(os.path.join(path, ".cargo-lock"))
+
+
+def untagged_profiles(path, names):
+    """The Cargo profile directories among `names`, the subdirectories
+    of the untagged `path`, taken out of `names` so the walk doesn't
+    search them: each is a cache of its own (designs/0041, second
+    amendment)."""
+    found = [os.path.join(path, n) for n in names
+             if n in CARGO_PROFILES and is_cargo_profile(os.path.join(path, n))
+             and not is_cache_dir(os.path.join(path, n))]
+    names[:] = [n for n in names if os.path.join(path, n) not in found]
+    return found
 
 
 def walk_limited(top, depth):
@@ -145,6 +193,8 @@ def find_caches(worktree):
         elif path != worktree and is_cache_dir(path):
             caches.append(path)
             names[:] = []
+        elif path != worktree:
+            caches.extend(untagged_profiles(path, names))
     return caches, leftovers
 
 
@@ -233,6 +283,8 @@ def shared_caches(root):
         elif is_cache_dir(path):
             caches.append(path)
             names[:] = []
+        else:
+            caches.extend(untagged_profiles(path, names))
     return caches, leftovers
 
 
@@ -474,20 +526,28 @@ def prune(roots, *, dry_run, merged_hours, idle_hours, repo, token,
             cleared += 1
             freed += kib
     if high_water is not None:
-        n, kib = relieve(spare, sorted(set(roots) | set(shared)),
-                         dry_run=dry_run, now=now, high_water=high_water,
-                         low_water=low_water, floor_hours=floor_hours,
-                         usage=usage, out=out)
+        tops = sorted(set(roots) | set(shared))
+        n, kib, floored = relieve(spare, tops, dry_run=dry_run, now=now,
+                                  high_water=high_water, low_water=low_water,
+                                  floor_hours=floor_hours, usage=usage,
+                                  out=out)
         cleared += n
         kept -= n
         freed += kib
         if live_trim_hours is not None:
+            # Caches the floor kept give up their stale outputs too.
             _, kib = trim_live(
-                live, sorted(set(roots) | set(shared)), dry_run=dry_run,
-                now=now, hours_old=live_trim_hours, busy=busy,
-                low_water=low_water, high_water=high_water, usage=usage,
-                out=out)
+                live + [(cache, root) for _, cache, root in floored], tops,
+                dry_run=dry_run, now=now, hours_old=live_trim_hours,
+                busy=busy, low_water=low_water, high_water=high_water,
+                usage=usage, out=out)
             freed += kib
+        n, kib = break_floor(floored, tops, dry_run=dry_run, now=now,
+                             high_water=high_water, low_water=low_water,
+                             usage=usage, out=out)
+        cleared += n
+        kept -= n
+        freed += kib
     return cleared, kept, freed
 
 
@@ -495,8 +555,11 @@ def relieve(spare, roots, *, dry_run, now, high_water, low_water,
             floor_hours, usage, out):
     """The pressure pass: for each root whose filesystem is at least
     `high_water` percent used, clear its spare caches, least recently
-    used first, until it is under `low_water`; (cleared, KiB)."""
+    used first, until it is under `low_water`; (cleared, KiB, the spare
+    caches the floor kept as (newest, cache, root)). Each one the floor
+    keeps is logged."""
     cleared = freed = 0
+    floored = []
     for root in roots:
         before = usage(root)
         if before < high_water:
@@ -513,6 +576,9 @@ def relieve(spare, roots, *, dry_run, now, high_water, low_water,
                 break
             idle = hours(now - newest)
             if idle < floor_hours:
+                out("pressure: kept %s: used %.1fh ago, inside the floor "
+                    "(%gh)" % (cache, idle, floor_hours))
+                floored.append((newest, cache, where))
                 continue
             kib = clear(cache, "pressure: used %.0fh ago" % idle,
                         dry_run=dry_run, out=out)
@@ -527,6 +593,44 @@ def relieve(spare, roots, *, dry_run, now, high_water, low_water,
                 now_used = usage(root)
         out("pressure: %s %s %.0f%% used (low-water %g%%)" % (
             root, "would be" if dry_run else "now", now_used, low_water))
+    return cleared, freed, floored
+
+
+def break_floor(floored, roots, *, dry_run, now, high_water, low_water,
+                usage, out):
+    """The last resort: for each root still at `high_water` after every
+    other pass, clear the spare caches the floor kept (`floored`,
+    [(newest, cache, root)]), least recently used first, until it is
+    under `low_water`. Nothing is using them, and `clear` keeps one
+    whose Cargo locks are held. Returns (cleared, KiB)."""
+    cleared = freed = 0
+    for root in roots:
+        now_used = usage(root)
+        mine = sorted(c for c in floored if c[2] == root)
+        if now_used < high_water or not mine:
+            continue
+        out("pressure: %s is still %.0f%% used; clearing caches inside the "
+            "floor" % (root, now_used))
+        st = os.statvfs(root)
+        total_kib = ((st.f_blocks - st.f_bfree) + st.f_bavail) * st.f_frsize / 1024
+        for newest, cache, _ in mine:
+            if now_used < low_water:
+                break
+            if not os.path.exists(cache):
+                continue
+            kib = clear(cache, "pressure: still %.0f%% used, used %.1fh ago"
+                        % (now_used, hours(now - newest)),
+                        dry_run=dry_run, out=out)
+            if kib is None:
+                continue
+            cleared += 1
+            freed += kib
+            if dry_run:
+                now_used -= 100.0 * kib / total_kib if total_kib else 0
+            else:
+                now_used = usage(root)
+        out("pressure: %s %s %.0f%% used after clearing inside the floor" % (
+            root, "would be" if dry_run else "now", now_used))
     return cleared, freed
 
 
@@ -682,6 +786,69 @@ def trim_aged(path, max_age_s, *, now, dry_run, out):
     return files, kib
 
 
+def relay_sender(environ):
+    """A function (name, text) -> None when the relay took it, else why
+    not: forge-merger's sender (forge-router's poster, from the
+    configuration's `relay`), to an agent's sessions or to an address
+    as it is. Raises config.ConfigError without a configuration."""
+    project = config.load(environ=environ)
+    loader = importlib.machinery.SourceFileLoader(
+        "forge_merger", os.path.join(BIN, "forge-merger"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    merger = importlib.util.module_from_spec(spec)
+    loader.exec_module(merger)
+    return merger.relay_sender(project, environ)
+
+
+def alert(roots, *, percent, usage, to, send, stamp, now, dry_run, err):
+    """--alert-percent: report each filesystem among `roots` still at
+    least `percent` used on stderr, and, with `to`, tell each name
+    through `send()` (a function returning the sender), at most once
+    every ALERT_EVERY_S, as `stamp` records. Returns the roots so
+    full."""
+    full, devices = [], set()
+    for root in roots:
+        try:
+            device = os.stat(root).st_dev
+        except OSError:
+            continue
+        if device in devices:
+            continue
+        devices.add(device)
+        used = usage(root)
+        if used >= percent:
+            full.append((root, used))
+            err("%s: ALERT: %s is %.0f%% used after pruning (alert at %g%%)"
+                % (PROG, root, used, percent))
+    if not full or not to or dry_run:
+        return full
+    last = last_scan(stamp)
+    if last is not None and now - last < ALERT_EVERY_S:
+        err("%s: alert already sent %.0f min ago; not again yet"
+            % (PROG, (now - last) / 60))
+        return full
+    text = ("From: %s\nThe disk is nearly full on %s, after pruning: %s. "
+            "Builds there fail with no space left; clear build output by "
+            "hand." % (PROG, socket.gethostname(), ", ".join(
+                "%s %.0f%% used" % (root, used) for root, used in full)))
+    try:
+        sender = send()
+    except config.ConfigError as e:
+        err("%s: can't send the alert: no configuration (%s)" % (PROG, e))
+        return full
+    told = False
+    for name in to:
+        why = sender(name, text)
+        if why is None:
+            told = True
+            err("%s: alert sent to %s" % (PROG, name))
+        else:
+            err("%s: alert to %s not taken: %s" % (PROG, name, why))
+    if told:
+        mark_scan(stamp, now)
+    return full
+
+
 def main(argv=None, out=print, err=None, environ=None, **hooks):
     err = err or (lambda m: print(m, file=sys.stderr))
     environ = os.environ if environ is None else environ
@@ -715,6 +882,12 @@ def main(argv=None, out=print, err=None, environ=None, **hooks):
     parser.add_argument("--aged-days", type=float, default=5,
                         help="days unused before an --aged-cache file is "
                              "deleted (default 5)")
+    parser.add_argument("--alert-percent", type=float, default=97,
+                        help="with --high-water, report a filesystem still "
+                             "this full after pruning (default 97)")
+    parser.add_argument("--alert-to", action="append", default=[],
+                        help="an agent or XMPP address told of such a "
+                             "filesystem through the relay (repeatable)")
     parser.add_argument("--every-minutes", type=float,
                         help="skip the scan if every root is under "
                              "--high-water and the last was this recent")
@@ -732,6 +905,11 @@ def main(argv=None, out=print, err=None, environ=None, **hooks):
     if args.live_trim_hours is not None and (
             args.high_water is None or args.live_trim_hours <= 0):
         err("%s: --live-trim-hours must be > 0 and needs --high-water" % PROG)
+        return 2
+    if not 0 < args.alert_percent <= 100 or (
+            args.alert_to and args.high_water is None):
+        err("%s: --alert-percent must be above 0 and at most 100, and "
+            "--alert-to needs --high-water" % PROG)
         return 2
     if args.aged_days <= 0:
         err("%s: --aged-days must be > 0" % PROG)
@@ -776,6 +954,7 @@ def main(argv=None, out=print, err=None, environ=None, **hooks):
         except config.ConfigError as e:
             err("%s: no configuration (%s); judging every worktree by --idle-hours"
                 % (PROG, e))
+    send = hooks.pop("send", None)
     hooks = dict(hooks, now=now)
     cleared, kept, kib = prune(
         roots, dry_run=args.dry_run, merged_hours=args.merged_hours,
@@ -788,6 +967,13 @@ def main(argv=None, out=print, err=None, environ=None, **hooks):
                   dry_run=args.dry_run, out=out)
     if args.every_minutes is not None and not args.dry_run:
         mark_scan(stamp, now)
+    if args.high_water is not None:
+        alert(roots + shared, percent=args.alert_percent, usage=usage,
+              to=args.alert_to,
+              send=(lambda: send) if send else (lambda: relay_sender(environ)),
+              stamp=os.path.join(os.path.dirname(stamp), "alert-" +
+                                 os.path.basename(stamp).split("-")[-1]),
+              now=now, dry_run=args.dry_run, err=err)
     out("%s: %s %d, kept %d, %.1f GB" % (
         PROG, "would clear" if args.dry_run else "cleared", cleared, kept, kib / 1048576))
     return 0
