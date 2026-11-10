@@ -68,10 +68,32 @@ saying so. Everything is written as the App named by `as` (default
 the Merger, `merge.merger`), with a token minted as forge-app-token
 does.
 
+**A shorter window as well** (designs/0024, fourth amendment). A
+figure with `short_hours` (from 1 to under `window_hours`) is also
+judged over its last `short_hours`, against the same baseline, and is
+out of line when either window is: a dip of a few hours shows before
+it moves the long window. merge_rate's hours are still only those the
+queue held work, so a quiet night is not a dip. An issue still closes
+only after a whole `window_hours` in line.
+
+**Who else is told.** `notify` lists agents (sent to their sessions,
+or a stand-in's) and XMPP addresses, and `notify_rooms` rooms' JIDs;
+each is sent one line through the router's relay (the `relay`
+section) when an issue is opened. One the relay doesn't take is tried
+again at the next run while the issue stays open.
+
+**Context for slow checks.** When check_run, check_wait,
+pr_turnaround or main_cpu is out of line, the issue and its reminders
+also give the slots busy over the window and the host's load average:
+the 15-minute load this watch samples at each run, over the window,
+beside the host's CPUs. A check that is slow because the host is busy
+then reads as contention, not as heavier tests.
+
 The watch only reports: it changes no slot, setting or queue.
 
-State (each figure's issue, when it was last commented on and since
-when it has been in line) is kept in
+State (each figure's issue, when it was last commented on, since
+when it has been in line and who is still to be told; the load
+samples) is kept in
 ~/.local/state/agent-forge/<project>/stats-watch/state.json. A failure
 to reach GitHub skips the hour and says so on stderr; nothing is
 saved, so the next hour tries again. `--dry-run` prints what it would
@@ -127,6 +149,8 @@ WHAT = {
 # floors: out of line when too low.
 FLOW = ("hand_backs_per_merge", "prs_per_slot", "reviewer_busy")
 FLOORS = ("merge_rate", "prs_per_slot")
+# The figures a busy host slows down: their issues say how busy it was.
+CONTENDED = ("check_run", "check_wait", "pr_turnaround", "main_cpu")
 FIGURE_RE = re.compile(r"^Figure: ([a-z_]+)\s*$", re.MULTILINE)
 OUT, IN, UNJUDGED = "out", "in", "unjudged"
 
@@ -352,15 +376,21 @@ class Watch:
         return ("Written by forge-stats-watch, agent-forge's watch on how "
                 "fast work lands.\n\n— %s" % self.name)
 
-    def table(self, figure, window, baseline):
+    def table(self, figure, window, baseline, short=None):
+        """The window's and the baseline's figures; with `short`
+        ((hours, (value, samples))), the short window's too."""
         hours = self.cfg["window_hours"]
-        return "\n".join([
+        rows = [
             "| | Last %d h, to %s | The %d days before |" % (
                 hours, stamp(self.now), self.cfg["baseline_days"]),
             "| --- | --- | --- |",
             "| `%s` | %s (%d samples) | %s (%d samples) |" % (
                 figure, show(figure, window[0]), window[1],
-                show(figure, baseline[0]), baseline[1])])
+                show(figure, baseline[0]), baseline[1])]
+        if short:
+            rows.append("| `%s`, last %d h | %s (%d samples) | |" % (
+                figure, short[0], show(figure, short[1][0]), short[1][1]))
+        return "\n".join(rows)
 
     def rules_text(self, figure, rules):
         parts = ["step `%s`" % rules["step"]] if "step" in rules else []
@@ -368,16 +398,21 @@ class Watch:
             parts.append("limit %s" % show(figure, rules["limit"]))
         if "ratio" in rules:
             parts.append("ratio %g x the baseline" % rules["ratio"])
+        if "short_hours" in rules:
+            parts.append("judged over the last %d h as well"
+                         % rules["short_hours"])
         return ", ".join(parts) or "any is out of line"
 
     def command(self):
         return "forge-stats --since %s --until %s" % (
             stamp(self.now - self.window), stamp(self.now))
 
-    def open_body(self, figure, rules, why, window, baseline):
+    def open_body(self, figure, rules, why, window, baseline, short=None,
+                  context=None):
         return "\n\n".join([
             "`%s`, %s, is out of line: %s." % (figure, WHAT[figure][0], why),
-            self.table(figure, window, baseline),
+            self.table(figure, window, baseline, short)] + (
+                [context] if context else []) + [
             "Its rules: %s (the configuration's `stats_watch`)."
             % self.rules_text(figure, rules),
             "To see more, on the build-check host:\n\n    %s"
@@ -389,6 +424,92 @@ class Watch:
                                     self.cfg["window_hours"],
                                     self.owner(figure)),
             "Figure: %s" % figure, self.signature()])
+
+
+def worse(verdict, short, hours):
+    """The verdict of a figure judged over its window and, with `short`
+    (that window's verdict), over its last `hours` too: out of line
+    when either window is."""
+    if short and short[0] == OUT and verdict[0] != OUT:
+        return OUT, "over the last %d h, %s" % (hours, short[1])
+    return verdict
+
+
+def contention(figure, window, loads, cpus, hours):
+    """For a figure a busy host slows down, a paragraph on how busy it
+    was over the window: slots busy, and the load samples `loads`
+    (15-minute load averages) beside `cpus`. None for other figures."""
+    if figure not in CONTENDED:
+        return None
+    busy = window.get("slots_busy", (None, 0))[0]
+    parts = ["Over the last %d h the build check's slots were %s busy"
+             % (hours, "-" if busy is None else "%.0f%%" % busy)]
+    if loads:
+        ordered = sorted(loads)
+        parts.append("the host's 15-minute load average was %.1f median "
+                     "and %.1f at most (%d samples, one a run) on %s CPUs"
+                     % (ordered[len(ordered) // 2], ordered[-1], len(loads),
+                        cpus or "?"))
+    else:
+        parts.append("no load average was sampled")
+    return "%s. A check that runs slower as the host gets busier is " \
+        "contention, not heavier work." % "; ".join(parts)
+
+
+def relay_notifier(project, environ, opener=None):
+    """A function (kind, address, text) -> None when the relay took the
+    message, else why not: the router's own poster, from the same
+    `relay` section. `kind` "room" posts to a room's JID; "agent" to an
+    XMPP address or, for one of `agents`, to each of her sessions (or
+    her stand-in's), as forge-merger does."""
+    router = _load_tool("forge-router")
+    router.configure(project, rules=False)
+    relay = environ.get("FORGE_ROUTER_RELAY", router.RELAY)
+    token = router.relay_token()
+    posters = {kind: router.make_poster(relay, token, *(
+        [opener] if opener else []), kind=kind) for kind in ("agent", "room")}
+
+    def send(kind, to, text):
+        if kind == "room" or to not in project.agents:
+            return posters[kind](to, text)
+        problems = []
+        for session in project.sessions(project.stand_in(to)):
+            why = posters["agent"](session, text)
+            if why is None:
+                return None
+            problems.append(why)
+        return "; ".join(problems) or "no session"
+    return send
+
+
+def notify(watch, send, figure, entry):
+    """Tell everyone still in `entry`'s `notify` of its issue; keep
+    those the relay didn't take, for the next run."""
+    pending = entry.get("notify") or []
+    if not pending:
+        return
+    number = entry.get("issue")
+    text = "%s: %s is out of line: %s. Issue #%s, for %s: " \
+        "https://github.com/%s/issues/%s" % (
+            PROG, figure, entry.get("why", "see the issue"), number,
+            watch.owner(figure), watch.project.repo, number)
+    if watch.dry_run:
+        watch.out("WOULD NOTIFY %s: %s" % (
+            figure, ", ".join(to for _, to in pending)))
+        return
+    left = []
+    for kind, to in pending:
+        why = send(kind, to, text)
+        if why is None:
+            watch.out("NOTIFIED %s %s of #%s" % (kind, to, number))
+        else:
+            watch.err("%s: telling %s %s of #%s: %s" % (PROG, kind, to,
+                                                        number, why))
+            left.append([kind, to])
+    if left:
+        entry["notify"] = left
+    else:
+        entry.pop("notify", None)
 
 
 def find_issues(token, project, label, call):
@@ -412,7 +533,8 @@ def find_issues(token, project, label, call):
 
 def main(argv=None, out=print, err=None, environ=None, now=None,
          call=github.api_call, sign=github.openssl_sign, stats=None,
-         mint=None, flow=None):
+         mint=None, flow=None, send=None, loadavg=os.getloadavg,
+         cpus=os.cpu_count):
     err = err or (lambda line: print(line, file=sys.stderr))
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(prog=PROG,
@@ -444,19 +566,43 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
             flow = flow or forge_flow(environ)
             window.update(flow(start, now))
             baseline.update(flow(start - watch.baseline, start))
+        shorts = {}
+        for hours in sorted({r["short_hours"] for r in watched.values()
+                             if isinstance(r, dict) and "short_hours" in r}):
+            since = now - datetime.timedelta(hours=hours)
+            shorts[hours] = figures(stats(since, now), hours, watched)
+            if any(f in watched for f in FLOW):
+                shorts[hours].update(flow(since, now))
     except (RuntimeError, OSError, ValueError,
             config.ConfigError) as error:
         err("%s: skipping this hour: %s" % (PROG, error))
         return 2
-    verdicts = {}
+    verdicts, short = {}, {}
     for figure, rules in watched.items():
         verdicts[figure] = judge(figure, rules, window[figure],
                                  baseline[figure], cfg["min_samples"])
+        hours = rules.get("short_hours")
+        if hours:
+            short[figure] = (hours, shorts[hours][figure])
+            verdicts[figure] = worse(verdicts[figure], judge(
+                figure, rules, shorts[hours][figure], baseline[figure],
+                cfg["min_samples"]), hours)
         out("%s %s: %s" % (verdicts[figure][0].upper(), figure,
                            verdicts[figure][1]))
     path = os.path.join(locks.state_dir(project.name, "stats-watch",
                                         environ), "state.json")
     saved = state.load(path, {"figures": {}})
+    loads = [sample for sample in saved.get("load") or []
+             if parse_time(sample[0]) > start]
+    try:
+        loads.append([iso(now), round(loadavg()[2], 2)])
+    except (OSError, AttributeError):
+        pass
+    saved["load"] = loads
+    targets = [["agent", to] for to in cfg.get("notify") or []] + \
+        [["room", to] for to in cfg.get("notify_rooms") or []]
+    if targets and send is None and not args.dry_run:
+        send = relay_notifier(project, environ)
     try:
         token = (mint or (lambda p, n: github.token(p, n, call, sign)))(
             project, watch.name)
@@ -474,9 +620,14 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
             # Filed by an earlier run whose state is gone, or by hand.
             entry = {"issue": issue["number"],
                      "told": issue.get("updated_at") or iso(now)}
+        context = contention(figure, window, [l for _, l in loads],
+                             cpus(), cfg["window_hours"])
         new, ok = act(watch, token, call, figure, verdict, why, entry,
-                      watched[figure], window[figure], baseline[figure])
+                      watched[figure], window[figure], baseline[figure],
+                      short.get(figure), context, targets)
         failed = failed or not ok
+        if new:
+            notify(watch, send, figure, new)
         if new:
             saved["figures"][figure] = new
         else:
@@ -490,9 +641,11 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
 
 
 def act(watch, token, call, figure, verdict, why, entry, rules, window,
-        baseline):
+        baseline, short=None, context=None, targets=()):
     """What one figure's verdict does to its issue: (the figure's new
-    state entry, or {} for none; whether GitHub took every write)."""
+    state entry, or {} for none; whether GitHub took every write). A
+    new issue's entry lists `targets`, [kind, address] pairs, under
+    `notify`: who is still to be told of it."""
     repo, now = watch.project.repo, watch.now
     say = watch.out
     would = "WOULD " if watch.dry_run else ""
@@ -516,7 +669,8 @@ def act(watch, token, call, figure, verdict, why, entry, rules, window,
             title = "%s: %s %s" % (PROG, figure, why)
             ok, got = write("POST", "/repos/%s/issues" % repo, {
                 "title": title,
-                "body": watch.open_body(figure, rules, why, window, baseline),
+                "body": watch.open_body(figure, rules, why, window, baseline,
+                                        short, context),
                 "labels": [watch.cfg["label"], watch.owner_label(figure)]},
                 201)
             if not ok:
@@ -524,8 +678,10 @@ def act(watch, token, call, figure, verdict, why, entry, rules, window,
             number = got.get("number")
             say("%sOPEN %s: %s, for %s" % (would, figure, title,
                                             watch.owner(figure)))
-            return {"issue": number, "opened": iso(now), "told": iso(now)}, \
-                True
+            new = {"issue": number, "opened": iso(now), "told": iso(now)}
+            if targets:
+                new.update(notify=[list(t) for t in targets], why=why)
+            return new, True
         try:
             due = now - parse_time(entry["told"]) >= watch.remind
         except (KeyError, TypeError, ValueError):
@@ -534,8 +690,9 @@ def act(watch, token, call, figure, verdict, why, entry, rules, window,
             ok, _ = write("POST", "/repos/%s/issues/%d/comments"
                           % (repo, number), {"body": "\n\n".join([
                               "Still out of line: %s." % why,
-                              watch.table(figure, window, baseline),
-                              watch.signature()])}, 201)
+                              watch.table(figure, window, baseline, short)]
+                              + ([context] if context else [])
+                              + [watch.signature()])}, 201)
             if not ok:
                 return entry, False
             say("%sREMIND #%d %s: %s" % (would, number, figure, why))
@@ -558,7 +715,7 @@ def act(watch, token, call, figure, verdict, why, entry, rules, window,
                   {"body": "\n\n".join([
                       "Back in line for a whole window (%d h, since %s): "
                       "%s. Closing." % (watch.cfg["window_hours"], since, why),
-                      watch.table(figure, window, baseline),
+                      watch.table(figure, window, baseline, short),
                       watch.signature()])}, 201)
     if ok:
         ok, _ = write("PATCH", "/repos/%s/issues/%d" % (repo, number),

@@ -222,3 +222,35 @@ check already records each step's CPU seconds (`step_cpu`, beside
 **What it doesn't do.** It says that the cost grew, not which test
 grew it; a project's own per-test ledger, if it has one, says that.
 It changes no gate: like every figure, it only reports.
+
+## Fourth amendment (2026-11-10): a shorter window, more readers, and the host's load
+
+* Status: approved (Alex Bligh, 2026-11-10, in the terminal: "Yes, please do all this"; https://github.com/abligh/agent-forge/issues/267)
+
+**Why.** On 10 November a project's merges fell from about 10 an hour
+to between 2 and 5 from 09:00Z, and a person noticed before any issue
+did. Over its 6 h window `merge_rate` read 7.0 to 8.3 an hour while
+the hours themselves were 4, 8, 6, 2, 3 and 5. `check_run` and
+`main_cpu` went out of line hours later, each for the watch's owner
+alone, and neither issue said why: the build check's slots were 81%
+busy, and run time and CPU seconds both rise with contention.
+
+**Change.**
+1. Any figure but `main_red` and `nightly_red_hours` may take
+   `short_hours`, a whole number of hours under `window_hours`. It is
+   also judged over that last stretch, against the same baseline, and
+   is out of line when either window is. An issue still closes only
+   after a whole `window_hours` in line. `merge_rate`'s hours remain
+   those the queue held work, so a quiet night is not a dip.
+2. `stats_watch.notify` (agents or XMPP addresses) and
+   `stats_watch.notify_rooms` (rooms' JIDs) are told of every issue
+   opened, through the router's relay, besides its owner. One the
+   relay doesn't take is tried again at the next run while the issue
+   stays open.
+3. For `check_run`, `check_wait`, `pr_turnaround` and `main_cpu`, the
+   issue and its reminders give the slots busy over the window and
+   the host's 15-minute load average over it, sampled at each run,
+   beside its CPUs.
+
+All three are off until configured, except the context, which only
+adds lines to an issue.

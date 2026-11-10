@@ -604,11 +604,11 @@ def accepted(answer):
 
 
 def make_poster(relay, token, opener=urllib.request.urlopen, sleep=time.sleep,
-                stamp=None):
+                stamp=None, kind="agent"):
     """A function (session name, text) -> None when the relay took the
     message, else why not (see the module docstring). A reason starting
     UNREACHABLE means the relay gave no answer. No reason ever contains
-    the token."""
+    the token. With `kind` "room", it posts to a room's JID instead."""
     stamp = repr(time.time()) if stamp is None else stamp
     base = relay.rstrip("/")
 
@@ -629,7 +629,7 @@ def make_poster(relay, token, opener=urllib.request.urlopen, sleep=time.sleep,
     def post(session, text):
         if not token:
             return "no relay token in %s" % TOKEN_FILE
-        url = "%s/agent/%s" % (base, urllib.parse.quote(session, safe=""))
+        url = "%s/%s/%s" % (base, kind, urllib.parse.quote(session, safe=""))
         req = urllib.request.Request(
             url, data=text.encode("utf-8"), method="POST",
             headers={"X-Webhook-Token": token, "X-XMPP-Verbatim": "1",

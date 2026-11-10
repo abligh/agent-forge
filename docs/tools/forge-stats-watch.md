@@ -52,16 +52,18 @@ exits 0. A figure left out of `figures` is not watched. An example:
       "owner": "LeadDev",
       "figures": {
         "check_run": {"limit": 40, "ratio": 1.5},
-        "merge_rate": {"limit": 2},
+        "merge_rate": {"limit": 2, "short_hours": 3},
         "main_red": {},
         "nightly_red_hours": {"limit": 12, "owner": "Tester"}
-      }
+      },
+      "notify": ["Tester"],
+      "notify_rooms": ["ops@conference.example.org"]
     }
 
 It also reads `labels.owner_prefix` (the `Owner:` label), `merge.merger`
 (the default for `stats_watch.as`), `checks.slots` and the reviewers
-among `agents`, for the `forge-flow` figures, and what `forge-stats`
-reads.
+among `agents`, for the `forge-flow` figures, the `relay` section, for
+`notify` and `notify_rooms`, and what `forge-stats` reads.
 
 ## What it does
 
@@ -86,6 +88,14 @@ No watched figure comes from GitHub.
 | `prs_per_slot` | Pull requests merged per green run are under `limit`, or under the baseline's over `ratio`. |
 | `reviewer_busy` | The busiest reviewer's share of the window busy, in percent, is over `limit`. |
 
+**A shorter window as well.** A figure with `short_hours` (from 1 to
+under `window_hours`) is also judged over its last `short_hours`,
+against the same baseline, and is out of line when either window is,
+so a dip of a few hours shows before it moves the whole window. Its
+why then starts `over the last <n> h`. `merge_rate`'s hours are still
+only those the queue held work, so a quiet night is not a dip. The
+issue still closes only after a whole `window_hours` in line.
+
 A figure from fewer than `min_samples` (default 5) samples is not
 judged, nor a `ratio` against a baseline that thin. `main_red`,
 `nightly_red_hours` and `reviewer_busy` don't use `min_samples`. For
@@ -100,13 +110,24 @@ Each verdict is printed: `OUT <figure>: …`, `IN <figure>: …` or
   (default `stats-watch`) and `Owner:<owner>` (the figure's own
   `owner`, else the watch's). It gives the window's and the baseline's
   figures, the rule that tripped, and the `forge-stats` command to see
-  more (`OPEN <figure>: …`).
+  more (`OPEN <figure>: …`). Then it tells each of `notify` and
+  `notify_rooms` through the relay, in one line naming the figure, the
+  why and the issue (`NOTIFIED <kind> <address> of #N`). One the relay
+  doesn't take is reported on standard error and tried again at the
+  next run while the issue stays open.
 * **Out, issue open:** a comment with the new figures every
   `remind_hours` (default 6) (`REMIND #N <figure>: …`).
 * **In line, issue open:** once the figure has been in line at every
   run for a whole window, a comment saying so, and the issue is closed
   (`CLOSE #N …`). Until then, `IN LINE #N <figure> since <time>`. A run
   that couldn't judge the figure restarts that count.
+
+**Context for slow checks.** For `check_run`, `check_wait`,
+`pr_turnaround` and `main_cpu`, the issue and its reminders also say
+how busy the build check's slots were over the window, and the host's
+15-minute load average over it (median and highest of the samples
+this watch takes at each run) beside its CPUs. A check that is slow
+because the host is busy then reads as contention, not heavier tests.
 
 An issue is found again by its label and its `Figure: <name>` line, so
 one an earlier run filed, or one filed by hand, is found even without
@@ -122,8 +143,9 @@ next hour tries again. A refused write is reported as
 
 `~/.local/state/agent-forge/<project>/stats-watch/state.json` holds,
 for each figure, its issue, when it was opened and last commented on,
-and since when it has been in line. A figure no longer watched is
-dropped from it. `--dry-run` writes nothing.
+since when it has been in line, and who of `notify` is still to be
+told; and the load average sampled at each run over the last window.
+A figure no longer watched is dropped from it. `--dry-run` writes nothing.
 
 It reads the state directories `forge-stats` and `forge-flow` read
 (`pr-check/`, `merger/`, `router/`, `nightly/`). From cron, its output

@@ -330,6 +330,28 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(stats_watch=[]),
                          ["'stats_watch' must be an object"])
 
+    def test_stats_watch_short_hours_and_notify(self):
+        self.assertEqual(self.problems(stats_watch={
+            "owner": "LeadDev", "notify": ["Reviewer", "ops@example.org"],
+            "notify_rooms": ["ops@conference.example.org"],
+            "figures": {"merge_rate": {"limit": 6, "short_hours": 3}}}), [])
+        self.assertEqual(self.problems(stats_watch={
+            "owner": "LeadDev", "window_hours": 4,
+            "notify": ["Nobody", 3], "notify_rooms": ["ops", "a@b/c"],
+            "figures": {"merge_rate": {"short_hours": 4},
+                        "check_run": {"short_hours": 1.5},
+                        "main_red": {"short_hours": 1}}}), [
+            "stats_watch.notify: 'Nobody' is not an agent or an XMPP "
+            "address",
+            "stats_watch.notify: 3 is not an agent or an XMPP address",
+            "stats_watch.notify_rooms: 'ops' is not a room's JID",
+            "stats_watch.notify_rooms: 'a@b/c' is not a room's JID",
+            "stats_watch.figures.merge_rate.short_hours must be a whole "
+            "number of hours from 1 to under window_hours (4)",
+            "stats_watch.figures.check_run.short_hours must be a whole "
+            "number of hours from 1 to under window_hours (4)",
+            "stats_watch.figures.main_red: unknown key 'short_hours'"])
+
     def test_stats_watch_takes_forge_flows_figures(self):
         self.assertEqual(self.problems(stats_watch={
             "owner": "LeadDev", "figures": {
