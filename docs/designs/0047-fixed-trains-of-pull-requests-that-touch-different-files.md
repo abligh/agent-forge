@@ -227,6 +227,13 @@ tested.
 
 * **Its update still gives the predicted tree.** This is the case when
   the author merged `main` cleanly. Nothing changes, as today.
+* **The Merger's own restack is one update in two pushes.** A stack's
+  layer is restacked by RESTACK, which merges the lower layer's final
+  head, and then STACK-UPDATE, which merges `main`. The head between
+  the two is in flight, not pushed to: the layer keeps its place, and
+  its tree is judged again once STACK-UPDATE has pushed. (Amended
+  2026-11-10: the halfway head had sent the layer out of its train,
+  and every train after it was cut again.)
 * **Otherwise the member leaves the train, and only it.** The new
   commits aren't covered by its approval anyway, so it couldn't merge
   until reviewed again. The train is not abandoned. It keeps its other
