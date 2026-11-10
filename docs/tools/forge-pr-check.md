@@ -127,9 +127,11 @@ for `labels.rerun`, `main_red_issue`, `step_alert` and `red_comment`.
    reached GitHub, and prunes old verdicts, results and logs.
 3. Stops any run of a head that is no longer its pull request's
    (`SUPERSEDED`: SIGTERM to the worker's process group), a run its
-   batch's green top now covers (`STOPPED-COVERED`), and a prediction
-   longer than a red one (`STOPPED-AHEAD`). Prints `RUNNING` or `BUSY`
-   for each held slot.
+   batch's green top now covers (`STOPPED-COVERED`), a prediction
+   longer than a red one (`STOPPED-AHEAD`), and, with
+   `merge.test_ahead.stop_spent`, a prediction whose tree the Merger no
+   longer predicts (`STOPPED-SPENT`). Prints `RUNNING` or `BUSY` for
+   each held slot.
 4. Matches, without a slot, each head whose tree already has a green
    verdict here that ran every step it would (`MATCHED`, `COVERED`).
 5. Starts nothing while a quiet hold is live (`QUIET:`).
@@ -249,6 +251,13 @@ and a member's head is posted `green on <host>: covered by batch
 #a..#b (tested as <sha>)`; a head whose tree is in a batch waits for
 its top (`HELD`). The steps must depend on the tree alone: a step that
 reads history belongs in `merge.gate` instead.
+
+With `stop_spent`, a running prediction whose commit and tree are in
+none of `ahead.json`'s entries is stopped (`STOPPED-SPENT`): a re-cut
+spent it. With `retry_red`, a prediction's red steps run once more in
+the same slot on the same tree before the red stands (`RETRIED
+AHEAD`); green the second time, the run is green, and the verdict
+records `retried`.
 
 ### Reports and labels
 

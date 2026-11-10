@@ -611,6 +611,16 @@ jumped it would merge, move `main` and put it behind again, spending
 the run it was already having. One merged or handed back keeps
 nothing. `next.json` then also says that tick's `action`.
 
+**With `test_ahead.green_batch_first`, a green batch goes before it**
+(designs/0047, amendment of 2026-11-10). When the last tick predicted
+the batch on the default branch's tip as it is now, the batch's top is
+green, and the one in flight is not a member and has no verdict on its
+head yet, the one in flight keeps no place and the batch merges
+first, logged `BATCH-FIRST`. Waiting for its run would hold a batch
+that is ready, and its merge would move `main` under the green top
+and spend it; updated onto the tip, it loses only the run it was
+having.
+
 **With `test_ahead`, those already predicted keep their order.** The
 candidates the last live tick predicted (`ahead.json`), at the heads
 it predicted, go first, in its order, after only the one in flight.
@@ -855,6 +865,10 @@ AHEAD_BATCHES = 1
 # the last whose top's run has started keep their order; nothing but an
 # urgent one or a red default branch's fix goes in front of them.
 FIXED_ORDER = True
+# merge.test_ahead.green_batch_first (designs/0047, amendment of
+# 2026-11-10): a batch green on the default branch's tip merges before
+# the pull request in flight while that one's own run hasn't finished.
+GREEN_BATCH_FIRST = False
 # merge.test_ahead.unstable_after_recuts and batches_when_unstable
 # (designs/0044, rule 5): when more than UNSTABLE_AFTER ticks in the
 # last UNSTABLE_WINDOW re-cut a batch whose top's run had started, only
@@ -1080,7 +1094,8 @@ def configure(project):
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
-    global FIXED_ORDER, RED_SUSPECT_OUT, UNSTABLE_AFTER, UNSTABLE_BATCHES
+    global FIXED_ORDER, GREEN_BATCH_FIRST, RED_SUSPECT_OUT, UNSTABLE_AFTER
+    global UNSTABLE_BATCHES
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
@@ -1123,6 +1138,7 @@ def configure(project):
     AHEAD_BATCH = (ahead or {}).get("batch", 1)
     AHEAD_BATCHES = (ahead or {}).get("batches", 1)
     FIXED_ORDER = (ahead or {}).get("fixed_order", True) is not False
+    GREEN_BATCH_FIRST = (ahead or {}).get("green_batch_first") is True
     RED_SUSPECT_OUT = (ahead or {}).get("hand_back_red_suspect",
                                         True) is not False
     UNSTABLE_AFTER = (ahead or {}).get("unstable_after_recuts")
@@ -4576,6 +4592,33 @@ def green_batch(state_dir, queue, check_state):
     return bool(members) and tree_verdict(check_state, trees[-1]) is True
 
 
+def green_batch_first(state_dir, queue, check_state, in_flight, main_tip):
+    """designs/0047, amendment of 2026-11-10 (`green_batch_first`): the
+    green batch that goes before `in_flight`, as (trees, members), or
+    None. It does when the last tick predicted it on `main_tip`, the
+    default branch's tip now, its top's tree is green, `in_flight` isn't
+    one of its members, and `in_flight`'s own head has no verdict yet:
+    its run would make the batch wait, and its merge would move the
+    default branch under the green top and spend it. In flight, it was
+    updated onto the tip anyway, so the batch's merge costs it only a
+    run it was having."""
+    if in_flight is None:
+        return None
+    last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+    if not isinstance(last, dict) or last.get("base") != main_tip:
+        return None
+    trees, members = current_batch(state_dir, queue)
+    if not members or in_flight in members \
+            or tree_verdict(check_state, trees[-1]) is not True:
+        return None
+    head = next((pr["headRefOid"] for pr in queue
+                 if pr["number"] == in_flight), None)
+    results = (check_state or {}).get("results") or {}
+    if head is None or isinstance(results.get(head), dict):
+        return None
+    return trees, members
+
+
 def batch_members(state_dir, queue):
     """The pull requests of the batch being merged (current_batch) still
     in `queue` at the head they were predicted at."""
@@ -5644,6 +5687,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         counts = hand_backs(records, not YIELD_IGNORES_CONFLICTS)
         spent = yields_spent(records, not YIELD_IGNORES_CONFLICTS)
         queue, yielded = yield_places(queue, prs, counts, in_flight, spent)
+    first = green_batch_first(state_dir, queue, check_state, in_flight,
+                              main_tip) if GREEN_BATCH_FIRST else None
+    if first is not None:
+        out("BATCH-FIRST #%s: the batch of %s is green on the tip; #%d's "
+            "own run is still to come, so the batch merges first"
+            % (", #".join(str(n) for n in sorted(first[1])),
+               first[0][-1][:10], in_flight))
+        in_flight = None
     if in_flight is not None:
         # The pull request the last tick updated or waited on keeps its
         # place: a blocker promoted past it would spend the run it is

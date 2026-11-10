@@ -17,6 +17,10 @@ defaults to the last `--hours` (24) up to now.
   matched to one (so posted without running) or by a batch whose top's
   green covered its merges (COVERED), and the run time of those that
   were not;
+- red predictions whose red steps ran once more (RETRIED, with
+  `merge.test_ahead.retry_red`), and how many were green the second
+  time; and predictions stopped once the Merger no longer predicted
+  them (STOPPED-SPENT, with `stop_spent`). Shown only when some were;
 - the time each run spent waiting for a slot, and running;
 - how busy the slots were: the run time of runs that finished in the
   window, over `checks.slots` times the window. The fast lane's runs
@@ -98,6 +102,11 @@ USED_RE = re.compile(r"prediction for #(\d+) ([0-9a-f]{10})")
 # COVERED line) was used too: the top is the batch's last pull request.
 COVERED_RE = re.compile(r"batch #\d+\.\.#(\d+) tested green as "
                         r"([0-9a-f]{10})")
+# A prediction's red steps run once more (merge.test_ahead.retry_red),
+# and a prediction the Merger no longer predicts stopped (stop_spent).
+RETRIED_RE = re.compile(r"^(\S+) RETRIED AHEAD \S+ ([0-9a-f]{10}): .*: "
+                        r"(green|red again)")
+SPENT_RE = re.compile(r"^(\S+) STOPPED-SPENT ")
 DEFAULT_SLOTS = 2
 BATCH = 40
 
@@ -164,7 +173,17 @@ def check_stats(lines, since, until, slots):
     busy = 0
     predictions = {}
     used = set()
+    retried, retried_green, spent = 0, 0, 0
     for line in lines:
+        hit = RETRIED_RE.match(line)
+        if hit and since <= parse_time(hit.group(1)) < until:
+            retried += 1
+            retried_green += hit.group(3) == "green"
+            continue
+        hit = SPENT_RE.match(line)
+        if hit and since <= parse_time(hit.group(1)) < until:
+            spent += 1
+            continue
         for hit in USED_RE.finditer(line):
             used.add((hit.group(1), hit.group(2)))
         for hit in COVERED_RE.finditer(line):
@@ -209,6 +228,8 @@ def check_stats(lines, since, until, slots):
                 "seconds": sum(predictions.values()),
                 "unused_seconds": sum(v for k, v in predictions.items()
                                       if k not in used)},
+            "retried": {"run": retried, "green": retried_green},
+            "stopped_spent": spent,
             "waited": summary(waited), "ran": summary(ran),
             "pull_request_seen_to_verdict": summary(pr_total),
             "slots": slots, "busy_seconds": busy,
@@ -707,6 +728,14 @@ def report(name, since, until, check, queue, approval, authors,
                      "%.1f slot-hours, %.1f of them on ones never used"
                      % (pred["run"], pred["used"], pred["seconds"] / 3600,
                         pred["unused_seconds"] / 3600))
+    again = check.get("retried") or {}
+    if again.get("run"):
+        lines.append("  red predictions whose red steps ran again: %d, "
+                     "green the second time: %d"
+                     % (again["run"], again["green"]))
+    if check.get("stopped_spent"):
+        lines.append("  predictions stopped once the Merger no longer "
+                     "predicted them: %d" % check["stopped_spent"])
     if check["busy_share"] is not None:
         lines.append("  slots busy: %.0f%% of %d slots (%.1f slot-hours)"
                      % (100 * check["busy_share"], check["slots"],
