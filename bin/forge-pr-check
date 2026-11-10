@@ -565,6 +565,19 @@ default 1000 against systemd's 100; 0 for none), so on a host where
 the agents build too, the check, which every merge waits on, gets most
 of the CPU when they compete, and theirs when it is idle.
 
+**With `checks.cpu_quota`, a slot's steps share one CPU limit.** A
+weight shares the CPU only when it is short, and per step: a run whose
+steps go side by side, each told its whole CHECK_CPUS, takes several
+shares. So with a number of CPUs, or `"share"` (the run's CHECK_CPUS,
+taken again as each step starts, as `cpu_share` takes it), each step's
+scope goes in the slot's own user slice (`slot_slice`: one per state
+directory and slot), and the slice's `CPUQuota` is set to that many
+CPUs with `systemctl --user set-property --runtime` as each step starts,
+when the number has changed. It needs `memory_max` (the steps'
+scopes); if systemd refuses the property, the run says `UNCAPPED-CPU`
+once and its steps run without a CPU limit. A step's containers are in
+docker's slices, not the slot's.
+
 **With `checks.merger_cpu_weight`, the run the next merge waits on
 gets more** (designs/0031): a head of the pull request in the Merger's
 `next.json`, or with `merge.test_ahead` its first prediction. As each
@@ -776,6 +789,11 @@ CPU_WEIGHT = DEFAULT_CPU_WEIGHT
 # checks.merger_cpu_weight (designs/0031): the CPUWeight of the steps
 # of the run the next merge waits on (`front`), or None: off.
 MERGER_CPU_WEIGHT = None
+# checks.cpu_quota: a slot's CPU limit, over all of its steps at once.
+# A number of CPUs, "share" (the run's CHECK_CPUS share, taken again as
+# each step starts), or None: off. Each run's step scopes go in the
+# slot's own slice (slot_slice), whose CPUQuota is set from it.
+CPU_QUOTA = None
 # checks.docker_slices (designs/0031): {"front": slice, "other": slice},
 # each step's CHECK_DOCKER_SLICE, or None: off.
 DOCKER_SLICES = None
@@ -1011,7 +1029,7 @@ def configure(project, instance=None):
     global REPO_SLUG, MAIN, CONFIG_PATH, STATUS_CONTEXT, POSTER, HOST
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
     global CPU_WEIGHT, CPU_SHARE, SIDE_BY_SIDE, AFTER, ALONE, LIGHT
-    global MERGER_CPU_WEIGHT, DOCKER_SLICES
+    global MERGER_CPU_WEIGHT, DOCKER_SLICES, CPU_QUOTA
     global STEP_CACHES, ENV_FILES
     global TEST_AHEAD, SPARE_ONLY, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT, WARM_PATHS, WARM_EVERY
@@ -1144,6 +1162,7 @@ def configure(project, instance=None):
     SLOTS = checks.get("slots", DEFAULT_SLOTS)
     MEMORY_MAX = checks.get("memory_max", DEFAULT_MEMORY_MAX)
     CPU_WEIGHT = checks.get("cpu_weight", DEFAULT_CPU_WEIGHT)
+    CPU_QUOTA = checks.get("cpu_quota")
     # The Merger waits on the first context's runs only.
     MERGER_CPU_WEIGHT = checks.get("merger_cpu_weight") \
         if instance is None else None
@@ -4324,23 +4343,83 @@ def memory_max_from_env(environ=None):
     return None if value.lower() in ("", "off") else value
 
 
-def scope_prefix(memory_max, cpu_weight=None):
+def scope_prefix(memory_max, cpu_weight=None, slice_=None):
     """What runs a command in its own user scope under memory_max, with
-    cpu_weight (default CPU_WEIGHT; 0 for systemd's own)."""
+    cpu_weight (default CPU_WEIGHT; 0 for systemd's own), in the user
+    slice `slice_` when given (checks.cpu_quota's slot slice)."""
     weight = CPU_WEIGHT if cpu_weight is None else cpu_weight
-    return (["systemd-run", "--user", "--scope", "--quiet", "--collect",
-             "-p", "MemoryMax=" + memory_max, "-p", "MemorySwapMax=0",
-             "-p", "OOMPolicy=continue"]
+    return (["systemd-run", "--user", "--scope", "--quiet", "--collect"]
+            + (["--slice=" + slice_] if slice_ else [])
+            + ["-p", "MemoryMax=" + memory_max, "-p", "MemorySwapMax=0",
+               "-p", "OOMPolicy=continue"]
             + (["-p", "CPUWeight=%d" % weight] if weight else [])
             + ["--"])
 
 
-def memory_cap(memory_max, env, run=sh, out=print):
+def slot_slice(state_dir, slot):
+    """The user slice a slot's step scopes share under checks.cpu_quota:
+    one per state directory and slot, so two checks on one host, or two
+    instances, never share a limit. No `-` in it: systemd reads a dash
+    in a slice's name as nesting."""
+    digest = hashlib.sha256(
+        os.path.realpath(state_dir).encode()).hexdigest()[:8]
+    return "forgecheck%sslot%s.slice" % (
+        digest, re.sub(r"[^A-Za-z0-9]", "", str(slot)))
+
+
+def quota_cpus(quota, share=None, env=None):
+    """The CPUs a slot's slice may use now under checks.cpu_quota
+    (`quota`): the number itself, or with "share" the run's share
+    (`share()`, as each step starts, else env's CHECK_CPUS); None when
+    there is none to set."""
+    if quota is None:
+        return None
+    if quota != "share":
+        return int(quota)
+    if share is not None:
+        return max(1, int(share()))
+    try:
+        return max(1, int((env or {}).get("CHECK_CPUS", "")))
+    except ValueError:
+        return None
+
+
+def slot_quota(slice_, env, run=sh, out=print):
+    """A function that sets `slice_`'s CPUQuota to its argument's CPUs,
+    each time the number changes, and says so once; if systemd refuses
+    it says that once, and the steps run in the slice without a limit."""
+    last = {}
+
+    def set_quota(cpus):
+        if cpus is None or last.get("cpus") == cpus:
+            return
+        last["cpus"] = cpus
+        got = run(["systemctl", "--user", "set-property", "--runtime",
+                   slice_, "CPUQuota=%d%%" % (100 * cpus)],
+                  env=env, timeout=60)
+        if got.returncode != 0:
+            if not last.get("said"):
+                why = ((got.stderr or "") + (got.stdout or "")).strip()
+                out("UNCAPPED-CPU: could not set %s's CPUQuota (rc=%d%s); "
+                    "the steps run without a CPU limit"
+                    % (slice_, got.returncode,
+                       ": " + why.splitlines()[-1] if why else ""))
+                last["said"] = True
+            return
+        if not last.get("told"):
+            out("  the slot's steps share %s, at most %d CPUs"
+                % (slice_, cpus))
+            last["told"] = True
+    return set_quota
+
+
+def memory_cap(memory_max, env, run=sh, out=print, slice_=None):
     """The prefix for each step: scope_prefix(memory_max) once a scope
-    is seen to start, else none, saying so."""
+    is seen to start, else none, saying so. With `slice_`, the scopes
+    go in that slice (checks.cpu_quota)."""
     if memory_max is None:
         return []
-    prefix = scope_prefix(memory_max)
+    prefix = scope_prefix(memory_max, slice_=slice_)
     got = run(prefix + ["true"], env=env, timeout=60)
     if got.returncode != 0:
         why = ((got.stderr or "") + (got.stdout or "")).strip()
@@ -4454,7 +4533,7 @@ def read_env_file(path, uid=None):
 def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
           cpu=children_cpu, logs=None, stream=None, share=None,
           caches=None, side_by_side=None, front=None, deadline=None,
-          env_files=None, out=print):
+          env_files=None, out=print, quota=None):
     """Every step that applies to the head, each run even if an earlier
     one failed, and none retried, each after `prefix` (memory_cap).
     `wrap(name, prefix, argv, env)` gives a traced step's (argv, env).
@@ -4482,7 +4561,8 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
     environment (read_env_file); a file that is exposed or unreadable
     makes the step red without running it, and a missing one is said to
     `out` and the step runs without it. No value is ever written out.
-    Returns (ok, results), the
+    With `quota` (checks.cpu_quota, slot_quota), it is given the slot's
+    CPUs (quota_cpus) as each step starts. Returns (ok, results), the
     results in the steps' order."""
     chosen = applicable(wt, steps)
     weights, refused = {}, {}
@@ -4501,6 +4581,8 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
                 step_env_.update(values)
         step_env_.update((caches or {}).get(name, {}))
         step_prefix = list(prefix)
+        if quota is not None and step_prefix:
+            quota(quota_cpus(CPU_QUOTA, share, env))
         if front is not None:
             now_front = front()
             if now_front and MERGER_CPU_WEIGHT and step_prefix:
@@ -6289,7 +6371,13 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             shutil.rmtree(logs, ignore_errors=True)
             steps_began = time.monotonic()
             # A test's own `run` stands in for every program, steps too.
-            how = dict(prefix=memory_cap(memory_max, env, run, out),
+            slice_ = (slot_slice(state_dir, slot)
+                      if CPU_QUOTA is not None and memory_max is not None
+                      else None)
+            how = dict(prefix=memory_cap(memory_max, env, run, out,
+                                         slice_=slice_),
+                       quota=None if slice_ is None
+                       else slot_quota(slice_, env, run, out),
                        wrap=wrap, kept=kept, logs=logs,
                        stream=sh_logged if run is sh else None,
                        share=share, caches=step_caches,
