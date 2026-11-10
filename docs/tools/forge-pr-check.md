@@ -149,7 +149,9 @@ start oldest first. The full order, as each setting adds to it:
 2. urgent heads: `labels.urgent`, or a fix of a red nightly or of the
    red default branch (`main_red_issue`);
 3. with `approved_first`, heads of pull requests a reviewer agent has
-   approved, the Merger's own first;
+   approved: the Merger's own first, then those in its `ahead.json`,
+   then the rest, and last those its `next.json` lists as `blocked`
+   (held until another pull request merges);
 4. with `max_wait_minutes`, heads that have waited that long;
 5. with `first_authors`, those agents' heads;
 6. with `merger_first` (or `test_ahead`), a head of the pull request in

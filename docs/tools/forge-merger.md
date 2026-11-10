@@ -391,7 +391,7 @@ In the state directory (`--state-dir`, default
 | --- | --- |
 | `lock` | Held by the running tick; a second tick prints `BUSY` and exits 0. |
 | `merger.jsonl`, `dry-run.jsonl` | One record per tick, live and dry run. |
-| `next.json` | The pull request the last live tick stopped at. |
+| `next.json` | The pull request the last live tick stopped at, and as `blocked` the approved ones held until another merges (`Blocked-by:`, stacked), for the build check's `approved_first` order. |
 | `ahead.json` | The predictions, batches and trains (`test_ahead`). |
 | `handed-back.json` | What was handed back, per approval and head. |
 | `held-said.json`, `held-conflicting.json` | Which holds were said. |

@@ -159,7 +159,10 @@ has no red for; the check itself does, once nothing else is red there.
 waiting head of a pull request one of the reviewer agents has approved,
 at any commit, is started before every other pull request's but an
 urgent one's, overdue ones included, the Merger's own first among them,
-then the oldest; the `STARTED` line ends `, first: it is approved`.
+then those it predicts (`ahead.json`), then the oldest, and last those
+the Merger holds until another merges (`Blocked-by:` an open one, or
+stacked on one: its `next.json`'s `blocked`); the `STARTED` line ends
+`, first: it is approved`.
 The reviews are read by `approved_prs`, each pull request at most every
 APPROVED_FRESH, at most APPROVED_MAX_CALLS a tick, and kept in
 approved.json. Allowed in an instance block too: an instance can't see
@@ -2310,7 +2313,7 @@ def lane_head(state, cheap, busy=(), when=None):
 
 
 def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
-              urgent=False):
+              urgent=False, blocked=(), queued=()):
     """(sha, pr) of the head that has waited longest, or None. A head
     that failed to prepare goes behind every head that has not; one
     whose run the host broke keeps its place, since the fault was not
@@ -2333,7 +2336,13 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
     shorten it, only delay the merge.
 
     With the fast lane, a head in `cheap` is picked only when no other
-    head could be: the lane is for it (`lane_head`)."""
+    head could be: the lane is for it (`lane_head`).
+
+    Among approved heads (checks.approved_first), after the Merger's
+    own, those of pull requests in `queued` (the Merger's predictions)
+    go first, and those in `blocked` (held by the Merger until another
+    merges: next.json's `blocked`) last; they still run when nothing
+    better waits (agent-forge #256)."""
     waiting = state["waiting"]
     live = live_heads(state, busy, when)
     if not live:
@@ -2367,6 +2376,8 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
              if waiting[s].get("approved") and not waiting[s].get("errors")]
     if ready:
         sha = min(ready, key=lambda s: (waiting[s]["pr"] != first_pr,
+                                        waiting[s]["pr"] not in queued,
+                                        waiting[s]["pr"] in blocked,
                                         order(waiting, s)))
         return sha, waiting[sha]["pr"]
     # checks.max_wait_minutes: a head that has waited that long goes
@@ -2403,6 +2414,23 @@ def merger_first(merger_dir, when):
             else None
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def merger_blocked(merger_dir, when):
+    """The pull requests the Merger holds until another merges, from its
+    next.json's `blocked`, or an empty set when there are none, it can't
+    be read, or it is older than MERGER_FRESH."""
+    if not merger_dir:
+        return set()
+    try:
+        with open(os.path.join(merger_dir, "next.json")) as handle:
+            said = json.load(handle)
+        if when - parse(said["at"]) > MERGER_FRESH:
+            return set()
+        return {pr for pr in said.get("blocked") or []
+                if isinstance(pr, int) and not isinstance(pr, bool)}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return set()
 
 
 def merger_ahead(merger_dir, when, repo=None):
@@ -3604,6 +3632,11 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     first_pr = merger_first(merger_dir, when)
     ahead = (merger_ahead(merger_dir, when, checkout)
              if TEST_AHEAD and merger_dir else [])
+    # checks.approved_first: approved heads the Merger can't merge until
+    # another merges go after other approved ones, and those it predicts
+    # before them.
+    blocked = merger_blocked(merger_dir, when) if APPROVED_FIRST else set()
+    predicted_prs = {e["pr"] for e in ahead} if APPROVED_FIRST else set()
     # Fill every free slot, not one per tick: a tick's start rate was the
     # queue's ceiling (see the module docstring). What a pass starts is
     # as good as running to the next pass; the listing above isn't redone.
@@ -3654,8 +3687,10 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 for s in twins)
             if free:
                 pick = next_head(state, taken | set(held), first_pr, when,
-                                 cheap, urgent) if fresh else \
-                    next_head(state, taken, first_pr, when, cheap)
+                                 cheap, urgent, blocked, predicted_prs) \
+                    if fresh else next_head(state, taken, first_pr, when,
+                                            cheap, blocked=blocked,
+                                            queued=predicted_prs)
                 if TEST_AHEAD:
                     forget_ahead(state, ahead)
                     # The Merger's predictions go before an ordinary pick,

@@ -1611,6 +1611,20 @@ class Tick(Decide):
         self.assertEqual(self.next_json(),
                          {"at": "2026-10-07T12:01:00Z", "pr": None})
 
+    def test_it_lists_the_approved_ones_held_for_another_merge(self):
+        # agent-forge #256: the build check starts them last.
+        other = self.other_pr()
+        other["body"] = "Blocked-by: #5"
+        self.tick([self.item(), other], live=True)
+        self.assertEqual(self.next_json()["blocked"], [6])
+
+    def test_blocked_names_only_holds_another_merge_clears(self):
+        self.assertEqual(m.blocked_prs({
+            "6": "Blocked-by: #5", "7": "stacked on #6",
+            "8": "stacked on #6, which merged; waiting for: no Reviewer "
+                 "approval", "9": "labelled hold", "10": "deferred until x",
+            "11": "unparsed Blocked-by line: soon"}), [6, 7, 8])
+
     def test_a_dry_run_names_nothing(self):
         self.waits(0, live=False)
         self.assertFalse(os.path.exists(
