@@ -78,3 +78,26 @@ before:
 - approval to merge;
 - merges per hour;
 - predictions run and used.
+
+## Amendment (2026-11-10): a spent prediction is stopped
+
+Approved by Alex on 2026-11-10 at about 20:58Z, in answer to the proposal in agent-forge #281 ("Shall I go ahead with 2 and 3?" — "Yes").
+
+**What happened.** On one busy evening (7 slots, 84% busy), seven
+prediction runs went on for 5 to 22 minutes each after a re-cut had
+spent them, about 1.5 slot-hours in 1 h 45 min. No later head or batch
+used their trees. A superseded pull-request head is stopped
+(`SUPERSEDED`), but a prediction never was: it is no pull request's
+head.
+
+**The rule.** With `merge.test_ahead.stop_spent`, each tick of the
+build check compares every running prediction with the Merger's
+`ahead.json`. One whose commit and tree are in none of its entries,
+later batches' included, is stopped as a superseded head is: SIGTERM
+to the worker's process group, `STOPPED-SPENT` in the log, no verdict,
+and the slot is freed. A prediction whose tree is still among the
+entries under another commit keeps running, since a head can still be
+matched to it. Nothing is stopped while `ahead.json` is stale,
+unreadable or empty, or when git can't name the commit's tree.
+
+**Switch.** `merge.test_ahead.stop_spent`, default `false`.

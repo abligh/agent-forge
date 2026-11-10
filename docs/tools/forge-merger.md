@@ -165,7 +165,9 @@ moves past it. A hold posts nothing, except where noted.
 1. With [`merge.test_ahead`](../config.md#mergetest_ahead), the pull
    request a run is in flight for (the one the last tick updated or
    waited on) keeps first place, then those already predicted, in the
-   order predicted.
+   order predicted. With `test_ahead.green_batch_first`, a batch green
+   on the default branch's tip goes before it while its own run hasn't
+   finished (`BATCH-FIRST`).
 2. Urgent ones: those carrying `labels.urgent`, those that fix a red
    nightly while `forge-nightly`'s issue is open, and those that fix a
    red default branch while `forge-pr-check`'s `main_red_issue` is

@@ -96,6 +96,27 @@ class Check(unittest.TestCase):
         self.assertEqual(got, {"run": 2, "used": 1, "seconds": 320,
                                "unused_seconds": 120})
 
+    def test_retried_and_spent_predictions(self):
+        # agent-forge #281: retry_red's and stop_spent's lines.
+        lines = VERDICTS + [
+            "2026-10-12T01:20:00Z RETRIED AHEAD #8 3333333333: test red; "
+            "run once more on the same tree: green, so the red was a flake "
+            "and the run is green",
+            "2026-10-12T01:25:00Z RETRIED AHEAD #9 4444444444: vet red; "
+            "run once more on the same tree: red again; the red stands",
+            "2026-10-12T03:00:00Z RETRIED AHEAD #9 5555555555: vet red; "
+            "run once more on the same tree: red again; the red stands",
+            "2026-10-12T01:30:00Z STOPPED-SPENT #7 6666666666: the Merger "
+            "no longer predicts its tree; stopped the run in /w (pid 9), "
+            "since 2026-10-12T01:20:00Z"]
+        got = tool.check_stats(lines, SINCE, UNTIL, 2)
+        self.assertEqual(got["retried"], {"run": 2, "green": 1})
+        self.assertEqual(got["stopped_spent"], 1)
+        self.assertEqual(got["runs"], self.got["runs"])
+        self.assertEqual(self.got["retried"], {"run": 0, "green": 0})
+        self.assertEqual(self.got["stopped_spent"], 0)
+
+
 class MainCpu(unittest.TestCase):
     """designs/0024, third amendment: the default branch's CPU."""
 

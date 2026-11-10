@@ -91,6 +91,22 @@ push to a pull request being checked kept a slot busy for a whole run
 of a commit nobody would merge. A prediction (`ahead`) is never
 stopped this way: it is no pull request's head to begin with.
 
+**With `merge.test_ahead.stop_spent`, a spent prediction is stopped**
+(designs/0014, amendment of 2026-11-10). A running prediction whose
+commit and tree are in none of `ahead.json`'s entries (later batches'
+included) has been spent by a re-cut: no head or batch will be matched
+to it. Its run is stopped as a superseded head's is, logged
+`STOPPED-SPENT`, and its slot is freed. Nothing is stopped while
+`ahead.json` is stale, unreadable or empty.
+
+**With `merge.test_ahead.retry_red`, a prediction's red steps run once
+more** (designs/0035, amendment of 2026-11-10). In the same slot, on
+the same tree, only the steps that were red, except one stopped by
+`checks.scoped_minutes`. Green the second time, the run is green;
+red again, the red stands. Logged `RETRIED AHEAD`, and the verdict
+records `retried` (the steps and how it ended). A pull request's own
+head is never run again this way.
+
 **A head just started isn't started again.** Until its worker has
 taken its slot's lock and said who it is, nothing else shows the head
 is being checked, and a tick in that window (from cron, an event, or a
@@ -909,6 +925,13 @@ TEST_AHEAD = False
 # merge.test_ahead.spare_slots_only (designs/0014): predictions only when
 # no ordinary head is waiting.
 SPARE_ONLY = False
+# merge.test_ahead.stop_spent (designs/0014, amendment of 2026-11-10): a
+# running prediction whose tree the Merger no longer predicts is stopped.
+STOP_SPENT = False
+# merge.test_ahead.retry_red (designs/0035, amendment of 2026-11-10): a
+# prediction's red steps are run once more on the same tree before the
+# red stands.
+RETRY_RED = False
 DEFAULT_MATCH_MAX_HOURS = 24
 MATCH_MAX_AGE = datetime.timedelta(hours=DEFAULT_MATCH_MAX_HOURS)
 # `checks.depends` (docs/designs/0005): each new head of the default
@@ -1031,7 +1054,7 @@ def configure(project, instance=None):
     global CPU_WEIGHT, CPU_SHARE, SIDE_BY_SIDE, AFTER, ALONE, LIGHT
     global MERGER_CPU_WEIGHT, DOCKER_SLICES, CPU_QUOTA
     global STEP_CACHES, ENV_FILES
-    global TEST_AHEAD, SPARE_ONLY, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
+    global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT, WARM_PATHS, WARM_EVERY
     global RESULTS_MAX
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
@@ -1174,6 +1197,8 @@ def configure(project, instance=None):
         if instance is None else None   # designs/0050
     TEST_AHEAD = ahead is not None
     SPARE_ONLY = bool((ahead or {}).get("spare_slots_only"))
+    STOP_SPENT = (ahead or {}).get("stop_spent") is True
+    RETRY_RED = (ahead or {}).get("retry_red") is True
     MATCH_MAX_AGE = datetime.timedelta(hours=(ahead or {}).get(
         "max_age_hours", DEFAULT_MATCH_MAX_HOURS))
     # The configuration refuses test_ahead with merger_first false.
@@ -2554,6 +2579,29 @@ def merger_stop(merger_dir, when, repo=None):
         return set()
 
 
+def merger_spent(merger_dir, when, running, repo=None, run=sh):
+    """designs/0014, amendment of 2026-11-10 (`stop_spent`): of the
+    predictions `running` ({sha: worktree or checkout to read it in}),
+    those whose tree none of the Merger's predictions (ahead.json's
+    entries, later batches' included) has any more. A re-cut has spent
+    them: no head and no batch will be matched to their trees. Empty
+    when ahead.json can't be read as merger_ahead reads it or lists
+    nothing, and a prediction whose tree git can't name is kept."""
+    entries = merger_ahead(merger_dir, when, repo)
+    if not entries or not running:
+        return set()
+    shas = {e["sha"] for e in entries}
+    trees = {e["tree"] for e in entries}
+    spent = set()
+    for sha, where in running.items():
+        if sha in shas:
+            continue
+        tree = tree_of(where, sha, run)
+        if tree is not None and tree not in trees:
+            spent.add(sha)
+    return spent
+
+
 def is_front(merger_dir, when, sha, pr, ahead=False, repo=None):
     """designs/0031: whether sha's run is one the next merge waits on,
     as the Merger's files say at `when`: with `ahead`, the first of its
@@ -3582,6 +3630,10 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     current = {head[1] for head in heads}
     halt = merger_stop(merger_dir, when, checkout) \
         if TEST_AHEAD and merger_dir else set()
+    spent = merger_spent(merger_dir, when, {
+        got[1]: checkout for got in fields.values()
+        if got and got[4] and got[3]}, checkout, run) \
+        if TEST_AHEAD and STOP_SPENT and merger_dir else set()
     batch = merger_batch(merger_dir, when, checkout) \
         if TEST_AHEAD and merger_dir else []
     # A head a slot is running that its batch's green top now covers:
@@ -3626,6 +3678,13 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 "%s" % (pr, sha[:10], "stopping" if sent else
                         "could not stop", slot_label(slot), pid, since),
                 when, out)
+        elif got and got[4] and got[1] in spent and got[3]:
+            pr, sha, since, pid, _ = got
+            sent = stop(pid)
+            log(state_dir, "STOPPED-SPENT #%d %s: the Merger no longer "
+                "predicts its tree; %s the run in %s (pid %d), since %s"
+                % (pr, sha[:10], "stopping" if sent else "could not stop",
+                   slot_label(slot), pid, since), when, out)
         elif got:
             out("RUNNING #%d %s since %s%s; %d waiting"
                 % (got[0], got[1][:10], got[2],
@@ -6424,6 +6483,35 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                    slot_label(slot), stale[0],
                    json.dumps(list(stale[1]), ensure_ascii=False)),
                 now_utc(), out)
+        # designs/0035, amendment of 2026-11-10 (`retry_red`): a
+        # prediction's red steps run once more, in this slot, on the same
+        # tree, before the red stands. A red the second run doesn't repeat
+        # was the steps' own flake, and a red top would otherwise send its
+        # batch's members into a search that finds nothing.
+        retried = None
+        if RETRY_RED and ahead and not ok and stale is None \
+                and host_fault(results) is None:
+            redo = [r["name"] for r in results
+                    if r["rc"] != 0 and not r.get("over_budget")]
+            pool = list(STEPS if steps is None else steps) \
+                + list(scoped_steps or [])
+            subset = [s for s in pool if s[0] in redo]
+            if subset:
+                again_ok, again = check(wt, env, run, steps=subset, **how)
+                for r in again:
+                    r["retried"] = True
+                    out("  %-20s rc=%-3d %4ds (run again)"
+                        % (r["name"], r["rc"], r["seconds"]))
+                by = {r["name"]: r for r in again}
+                results = [by.get(r["name"], r) for r in results]
+                ok = all(r["rc"] == 0 for r in results)
+                retried = {"steps": [s[0] for s in subset], "ok": ok}
+                log(state_dir, "RETRIED AHEAD %s %s: %s red; run once more on "
+                    "the same tree: %s" % (
+                        name, sha[:10], ", ".join(retried["steps"]),
+                        "green, so the red was a flake and the run is green"
+                        if ok else "red again; the red stands"),
+                    now_utc(), out)
         finished = clock()
         for r in results:
             if "results_dropped" in r:
@@ -6464,6 +6552,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 "pr": pr, "slot": slot, "seen": seen, "started": iso(started),
                 "finished": iso(finished), "ok": ok,
                 "failed": [r["name"] for r in results if r["rc"] != 0],
+                **({"retried": retried} if retried else {}),
                 # Side by side, the steps' own walls overlap: the run's
                 # is how long they took together.
                 "seconds": sum(r["seconds"] for r in results)

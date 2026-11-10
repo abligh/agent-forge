@@ -66,6 +66,11 @@ lane's slot is not counted) and whether there is a `nightly` section
 * the predictions: how many were used, by a later head matched to one
   (`MATCHED`) or by a batch whose top's green covered its merges
   (`COVERED`), and the slot-hours of those never used;
+* with `merge.test_ahead.retry_red`, the red predictions whose red
+  steps ran once more (`RETRIED`) and how many of those were green the
+  second time; with `stop_spent`, the predictions stopped once the
+  Merger no longer predicted them (`STOPPED-SPENT`). Each only when
+  some were;
 * the wait for a slot, the run time, and a pull-request head's wait
   and run together;
 * the slots busy: the run time of runs that finished in the window,

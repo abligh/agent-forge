@@ -137,7 +137,8 @@ TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "batch": int, "stacks": bool, "batches": int,
               "fixed_order": bool, "hand_back_red_suspect": bool,
               "unstable_after_recuts": int, "batches_when_unstable": int,
-              "trains": str, "trains_within": str}
+              "trains": str, "trains_within": str, "stop_spent": bool,
+              "green_batch_first": bool, "retry_red": bool}
 TRAINS = ("dry-run", "live", "off")
 # designs/0050: what testing ahead is when the project says nothing.
 # Trains of up to 4, two in flight, predicted 7 deep; batches x batch

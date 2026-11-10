@@ -415,3 +415,26 @@ and `agent_forge/config.py`. Where it differs, and why:
 * **Risk:** carriages that share no file can still break each other,
   for example a renamed function and a new caller of it. The train's
   run tests them together, as a batch's does today.
+
+## Amendment (2026-11-10): a green batch goes before the one in flight
+
+Approved by Alex on 2026-11-10 at about 20:58Z, in answer to the proposal in agent-forge #281 ("Shall I go ahead with 2 and 3?" — "Yes").
+
+**What happened.** A carriage cut out of its train was updated onto
+the default branch (`UPDATE`), so it was in flight and kept first
+place. The next batch's top was green on the current tip, but the
+batch waited behind that carriage's own run; when the carriage then
+merged alone, it moved the default branch under the green top and
+spent it. In the window, that cost one batch and its run.
+
+**The rule.** With `merge.test_ahead.green_batch_first`, the one in
+flight keeps no place when all of these hold: the last tick predicted
+the batch on the default branch's tip as it is now (`ahead.json`'s
+`base`), the batch's top is green, the one in flight isn't one of its
+members, and the one in flight has no verdict on its head yet. The
+batch merges first, logged `BATCH-FIRST`. The one in flight is then
+behind the trains already cut, and is updated onto the new tip in its
+turn; it loses only the run it was having, which a merge of the batch
+afterwards would have spent anyway.
+
+**Switch.** `merge.test_ahead.green_batch_first`, default `false`.

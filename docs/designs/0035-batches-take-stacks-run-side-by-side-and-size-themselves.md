@@ -545,3 +545,30 @@ Two changes, written up in
 
 Rule 5 caps the batches in flight while started batches are re-cut
 often (`merge.test_ahead.unstable_after_recuts`, off by default).
+
+## Amendment (2026-11-10, seventh): a red prediction's red steps run once more
+
+Approved by Alex on 2026-11-10 at about 20:58Z, in answer to the proposal in agent-forge #281 ("Shall I go ahead with 2 and 3?" — "Yes").
+
+**What happened.** On one evening a flaky test made a batch's top red.
+Its 8 members became suspects, and the search ran shorter prefixes for
+over half an hour while the queue waited; the same test had been red
+on another head 20 minutes before, and its fix was already under
+review.
+
+**The rule.** With `merge.test_ahead.retry_red`, when a prediction's
+run is red, the build check runs the steps that were red once more, in
+the same slot on the same tree, before the verdict is recorded. A step
+stopped by `checks.scoped_minutes` isn't run again, nor is a run that
+was a host fault or a stale cache. Green the second time, the run is
+green and the batch merges with no search; red again, the red stands
+and the search goes on as before. The log says `RETRIED AHEAD`, the
+verdict records `retried` (the steps, and whether they were green),
+and `forge-stats` counts both. A pull request's own head is not run
+again this way: its red is its author's to see.
+
+**What it risks.** A green after one retry can let a flaky test merge.
+That flake was there before the batch; the nightly and later runs keep
+testing it, and the retry is logged, so it can be found.
+
+**Switch.** `merge.test_ahead.retry_red`, default `false`.
