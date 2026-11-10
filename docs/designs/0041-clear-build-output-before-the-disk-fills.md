@@ -181,3 +181,42 @@ The safety line is unchanged: nothing without a valid `CACHEDIR.TAG` is
 ever cleared, and nothing inside a worktree is judged as shared. A cron
 line that already gives `--shared` gets the deeper search with the next
 pin. `--live-trim-hours` stays off unless the line gives it.
+
+## Second amendment, 2026-11-10: untagged targets, a floor that gives, and an alert
+
+* Status: approved (Alex Bligh, 2026-11-10, in the terminal: "Yes, please do all this"; https://github.com/abligh/agent-forge/issues/265)
+
+On 2026-11-10 one host's filesystem reached 0 bytes free while the
+pass ran every five minutes under pressure. It cleared one cache and
+kept 31, and builds failed until agents deleted about 700 GB by hand.
+
+* **Untagged target roots.** Fourteen target directories had no tag at
+  their root but tagged subdirectories (`vet-wasm/`, `wasm32-*/`).
+  Cargo tags only a target directory it creates itself, so when a
+  nested build or a tool creates `target/` first, the host's `debug/`
+  and `release/` beneath it were never seen: about 458 GB.
+* **The floor.** Every spare cache used within
+  `--pressure-floor-hours` was kept, silently, and the live trim only
+  reaches busy caches, so nothing could touch those even at 100%.
+
+So:
+
+1. **A Cargo profile directory is a cache.** In a directory with no
+   tag, a `debug/` or `release/` holding `.fingerprint/` or
+   `.cargo-lock` (which only Cargo writes) is judged as a cache of its
+   own, by the same rules as a tagged one. The untagged parent and
+   anything else in it are never touched.
+2. **The floor is logged, and gives way last.** Each cache the floor
+   keeps is logged. The live trim (`--live-trim-hours`) also takes
+   their stale outputs. If the filesystem is still at `--high-water`
+   after that, they are cleared too, least recently used first, until
+   under `--low-water`. Rules 1 and 2 still hold: nothing busy or
+   locked is cleared.
+3. **An alert.** With `--high-water`, a filesystem still at least
+   `--alert-percent` (default 97) used after the run is reported on
+   standard error, and, with `--alert-to`, told through the relay, at
+   most once an hour.
+
+The safety line changes from "a valid `CACHEDIR.TAG`" to "a valid
+`CACHEDIR.TAG`, or a Cargo profile directory": both are output only a
+build writes, so a wrong decision still costs a rebuild.
