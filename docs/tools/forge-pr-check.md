@@ -188,6 +188,12 @@ less `keep_ignored`), merged with the default branch's tip under
   `merger_cpu_weight` for the run the next merge waits on). A worker
   that can't start a scope logs `UNCAPPED` and runs without it.
 * A step is stopped after `step_timeout_minutes` (default 30).
+* A step with `env_file` gets that file's `KEY=VALUE` lines in its
+  environment: secrets such as a test account's tokens, which the
+  check can't take from CI. The file must be the check user's and mode
+  0600; otherwise the step is red, not run, and says why. A missing
+  file is logged and the step runs without it. No value is written to
+  a log, comment or state.
 * Each slot has its own build caches (`caches`), and its own `TMPDIR`
   (`tmp`, `tmp-N`), emptied as a run starts and removed when it ends.
 * With `depends`, only the steps that read what the head changes run;
