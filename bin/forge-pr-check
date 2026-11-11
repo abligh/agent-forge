@@ -99,6 +99,11 @@ to it. Its run is stopped as a superseded head's is, logged
 `STOPPED-SPENT`, and its slot is freed. Nothing is stopped while
 `ahead.json` is stale, unreadable or empty.
 
+With it too, once the Merger has folded the trains in front of a later
+train's green top into its batch (amendment of 2026-11-11), a run of a
+prediction inside that batch, such as an earlier train's top, is
+stopped, logged `STOPPED-FOLDED`: the green top covers its tree.
+
 **With `stop_spent`, the Merger's batch top never waits for a slot**
 (amendment of 2026-11-11). When every slot is busy and the top of the
 Merger's batch (designs/0032; a red batch's suspects included) waits
@@ -3905,6 +3910,16 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         if TEST_AHEAD and STOP_SPENT and merger_dir else set()
     batch = merger_batch(merger_dir, when, checkout) \
         if TEST_AHEAD and merger_dir else []
+    # A later train's green top folded the trains in front of it into the
+    # Merger's batch (amendment of 2026-11-11): a member's prediction
+    # still running is spent, since the green top covers its tree.
+    if STOP_SPENT and len(batch) > 1 and tested(
+            state, batch[-1]["tree"], when, ok=True) is not None:
+        inner = {e["sha"] for e in batch[:-1]}
+        folded = {got[1] for got in fields.values()
+                  if got and got[4] and got[0] and got[1] in inner}
+    else:
+        folded = set()
     # A head a slot is running that its batch's green top now covers:
     # the Merger updated it to its predicted tree, and a free slot took
     # it before the cover could. Its run is stopped and it is matched.
@@ -3955,6 +3970,14 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 "%s" % (pr, sha[:10], "stopping" if sent else
                         "could not stop", slot_label(slot), pid, since),
                 when, out)
+        elif got and got[4] and got[1] in folded and got[3]:
+            pr, sha, since, pid, _ = got
+            sent = stop(pid)
+            log(state_dir, "STOPPED-FOLDED #%d %s: the Merger's batch top %s "
+                "is green and covers its tree; %s the run in %s (pid %d), "
+                "since %s" % (pr, sha[:10], batch[-1]["sha"][:10],
+                              "stopping" if sent else "could not stop",
+                              slot_label(slot), pid, since), when, out)
         elif got and got[4] and got[0] and got[1] in spent and got[3]:
             # got[0] is 0 for the default branch's run, which `ahead`
             # also marks (holder_fields): it is never a prediction, so

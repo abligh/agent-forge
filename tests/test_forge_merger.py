@@ -8074,6 +8074,32 @@ class Trains(RepoCase):
         self.assertEqual(m.train_batches(entries, [2, 2, 1], red({"t2"})),
                          (2, 2, []))
 
+    def test_a_later_trains_green_top_folds_the_trains_in_front(self):
+        # Amendment of 2026-11-11: its tree contains them all, so they
+        # merge at once rather than waiting for their own tops.
+        entries = [{"pr": n, "tree": "t%d" % n} for n in (1, 2, 3, 4, 5)]
+        says = lambda good, bad=(): (
+            lambda tree: True if tree in good else
+            False if tree in bad else None)
+        self.assertEqual(m.train_batches(entries, [2, 2, 1], says({"t4"})),
+                         (4, None, [{"size": 1, "trees": ["t5"],
+                                     "fixed": True}]))
+        # The last train's green folds all three.
+        self.assertEqual(m.train_batches(entries, [2, 2, 1], says({"t5"})),
+                         (5, None, []))
+        # A red top in front of a green one is overruled, as a flake:
+        # no suspects.
+        self.assertEqual(m.train_batches(entries, [2, 2, 1],
+                                         says({"t4"}, {"t2"})),
+                         (4, None, [{"size": 1, "trees": ["t5"],
+                                     "fixed": True}]))
+        # The first train's own green folds nothing.
+        self.assertEqual(m.train_batches(entries, [2, 2, 1], says({"t2"})),
+                         (2, None, [{"size": 2, "trees": ["t3", "t4"],
+                                     "fixed": True},
+                                    {"size": 1, "trees": ["t5"],
+                                     "fixed": True}]))
+
     def test_trains_longer_than_the_entries_left_are_dropped(self):
         # A member handed back after the trains were cut: the sizes run
         # past the entries. That raised IndexError and ended the tick.

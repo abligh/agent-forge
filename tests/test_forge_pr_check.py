@@ -2816,6 +2816,50 @@ class TickAhead(Tick):
         self.assertTrue(any("STOPPED-SPENT #3 %s" % SHA_Q[:10] in line
                             for line in self.lines))
 
+    def test_a_green_folded_top_stops_the_tops_in_front_of_it(self):
+        # Amendment of 2026-11-11: a later train's green top was folded
+        # with the train in front of it into the Merger's batch; that
+        # train's own top, still running, is spent.
+        merger = self.merger_says(7)
+        write_ahead(merger, [entry(7, SHA_P, TREE_1),
+                             entry(8, SHA_Q, TREE_3)],
+                    when=T0 - datetime.timedelta(minutes=1), batch=2)
+        self.write_state({"waiting": {}, "results": {
+            "e" * 40: verdict(pr=8, tree=TREE_3, ahead=True)}})
+        self.hold(1, "#7 %s %s pid=4242 ahead" % (SHA_P, pc.iso(T0)))
+        stopped = []
+        old = pc.STOP_SPENT
+        pc.STOP_SPENT = True
+        try:
+            pc.tick(self.state_dir, "tok", FakeRun((is_pulls, done(
+                [], 0, heads_tsv()))), lambda *a: None, self.lines.append,
+                when=T0, slots=2, merger_dir=merger,
+                stop=lambda pid: stopped.append(pid) or True)
+        finally:
+            pc.STOP_SPENT = old
+        self.assertEqual(stopped, [4242])
+        self.assertTrue(any("STOPPED-FOLDED #7 %s" % SHA_P[:10] in line
+                            for line in self.lines))
+
+    def test_a_running_top_is_kept_while_the_folded_top_has_no_green(self):
+        merger = self.merger_says(7)
+        write_ahead(merger, [entry(7, SHA_P, TREE_1),
+                             entry(8, SHA_Q, TREE_3)],
+                    when=T0 - datetime.timedelta(minutes=1), batch=2)
+        self.write_state(empty())
+        self.hold(1, "#7 %s %s pid=4242 ahead" % (SHA_P, pc.iso(T0)))
+        stopped = []
+        old = pc.STOP_SPENT
+        pc.STOP_SPENT = True
+        try:
+            pc.tick(self.state_dir, "tok", FakeRun((is_pulls, done(
+                [], 0, heads_tsv()))), lambda *a: None, self.lines.append,
+                when=T0, slots=2, merger_dir=merger,
+                stop=lambda pid: stopped.append(pid) or True)
+        finally:
+            pc.STOP_SPENT = old
+        self.assertNotIn(4242, stopped)
+
     def test_a_prediction_runs_while_the_mergers_head_is_not_waiting(self):
         self.slots = 1  # which goes first, not how many start
         self.write_state({"waiting": {SHA_B: {

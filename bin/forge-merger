@@ -530,8 +530,13 @@ request that is urgent or fixes a red default branch and is in no train
 cuts every train after the first again, and the default branch moving to
 a tree no train predicted cuts them all (`TRAIN-RECUT: ...`). A red
 top's members are the suspects, as a red batch's, and the trains are cut
-again once the search ends. A pull request whose own head is red doesn't
-board while the default branch is green. One that conflicts with the
+again once the search ends. A later train's green top covers that
+train and every one in front of it (amendment of 2026-11-11): its tree
+contains them all, and its run took in every step their changes touch,
+so they are folded into the first batch and start merging at once,
+without waiting for the tops in front of it, whose runs are then spent;
+a red top in front of it is overruled, as a flake. A pull request whose
+own head is red doesn't board while the default branch is green. One that conflicts with the
 default branch only where `merge.resolve` or its `union` would resolve
 it can't board as it stands, and train members stay ahead of it, so a
 live tick resolves the first such pull request ahead of its turn, and it
@@ -4530,15 +4535,29 @@ def train_batches(entries, sizes, verdict):
     size again when its top is red (else None), and the trains after it
     as ahead.json's `later`, each fixed, since a train is fixed once
     cut. Nothing follows a red first train, nor a later one whose top is
-    red."""
+    red. A later train whose top is green is folded into the first with
+    every train in front of it: the first `size` is then theirs together,
+    whatever their own tops say."""
     if not sizes or sizes[0] > len(entries):
         # Fixed trains longer than what is left (a member handed back
         # since they were cut): none of them holds; the next cut says.
         return 0, None, []
-    size = sizes[0]
+    size, first = sizes[0], 1
+    # A later train's green top covers it and every train in front of
+    # it (amendment of 2026-11-11): its tree contains them all, and its
+    # run took in every step their changes touch. They are folded into
+    # the first, which merges at once, rather than waiting for their
+    # own tops' verdicts.
+    at = 0
+    for k, n in enumerate(sizes):
+        if at + n > len(entries):
+            break
+        at += n
+        if k and verdict(entries[at - 1]["tree"]) is True:
+            size, first = at, k + 1
     red = size if verdict(entries[size - 1]["tree"]) is False else None
     later, at = [], size
-    for n in sizes[1:] if red is None else ():
+    for n in sizes[first:] if red is None else ():
         if at + n > len(entries):
             break
         later.append({"size": n, "trees": [e["tree"] for e in
