@@ -4719,6 +4719,13 @@ def green_batch_first(state_dir, queue, check_state, in_flight, main_tip):
     if not members or in_flight in members \
             or tree_verdict(check_state, trees[-1]) is not True:
         return None
+    # A member the Merger itself just updated has a new head, neither
+    # the one predicted nor the predicted merge, so current_batch no
+    # longer counts it; it is still the batch's own, and the others
+    # were predicted on top of it.
+    if any(isinstance(e, dict) and e.get("pr") == in_flight
+           and e.get("tree") in trees for e in last.get("entries") or ()):
+        return None
     head = next((pr["headRefOid"] for pr in queue
                  if pr["number"] == in_flight), None)
     results = (check_state or {}).get("results") or {}
