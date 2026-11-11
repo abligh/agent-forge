@@ -259,7 +259,28 @@ def generation(repo, gens, sha, deadline, clock=time.monotonic,
                     if got.returncode != 0:
                         raise Stop("SYNC-FAILED: worktree add: %s"
                                    % got.stderr.strip())
-                    os.rename(temp, path)
+                    # Moved by git, not renamed behind its back: git's
+                    # record of a renamed worktree still names `.new`,
+                    # so the next `worktree prune` (this function's own,
+                    # above, when the next generation is made) deleted
+                    # the record of the live one, and every job in it ran
+                    # with no checkout (2026-11-11, 44 runs).
+                    got = git(repo, "worktree", "move", temp, path)
+                    if got.returncode != 0:
+                        raise Stop("SYNC-FAILED: worktree move: %s"
+                                   % got.stderr.strip())
+                elif not sound(path, sha):
+                    remake(repo, path, sha)
+            finally:
+                maker.close()
+        elif not sound(path, sha):
+            maker = open(os.path.join(gens, ".make" + GEN_LOCK), "a")
+            try:
+                if not lock(maker, True, deadline, clock, nap):
+                    raise Stop("LOCK-TIMEOUT: another job was making a "
+                               "generation")
+                if os.path.isdir(path) and not sound(path, sha):
+                    remake(repo, path, sha)
             finally:
                 maker.close()
         handle = open(path + GEN_LOCK, "a")
@@ -271,6 +292,28 @@ def generation(repo, gens, sha, deadline, clock=time.monotonic,
             return path, handle
         # Removed between the look and the lock: make it again.
         handle.close()
+
+
+def sound(path, sha):
+    """Whether git sees the generation at `path` as a checkout of `sha`."""
+    got = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"],
+                         capture_output=True, text=True)
+    return got.returncode == 0 and got.stdout.strip() == sha
+
+
+def remake(repo, path, sha):
+    """Make a generation git has lost track of sound again: `worktree
+    repair` when only its record's path is wrong (one renamed into
+    place before agent-forge #306), else it is made afresh. Under the
+    make lock."""
+    git(repo, "worktree", "repair", path)
+    if sound(path, sha):
+        return
+    subprocess.run(["rm", "-rf", path])
+    git(repo, "worktree", "prune")
+    got = git(repo, "worktree", "add", "-q", "--detach", path, sha)
+    if got.returncode != 0:
+        raise Stop("SYNC-FAILED: worktree add: %s" % got.stderr.strip())
 
 
 def prune_generations(repo, gens, keep):
