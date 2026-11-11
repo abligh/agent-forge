@@ -7604,6 +7604,24 @@ class Trains(RepoCase):
                                entries[3]["sha"] + "^").stdout.strip(),
                          entries[2]["sha"])
 
+    def test_urgent_ones_share_a_train_when_they_merge_cleanly(self):
+        # agent-forge #298: two urgent configuration changes to one file
+        # board together, not one train each.
+        six = labelled(self.line(6, 1), "Priority:urgent")
+        seven = labelled(self.line(7, 20), "Priority:urgent")
+        eight = self.change(8, "x.txt", "x\n")
+        entries, sizes, _ = self.cut([[six], [seven], [eight]])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 7], [8]])
+
+    def test_urgent_ones_that_conflict_still_go_apart(self):
+        six = labelled(self.line(6, 1), "Priority:urgent")
+        seven = labelled(self.change(7, "shared.txt", "other\n"),
+                         "Priority:urgent")
+        entries, sizes, _ = self.cut([[six], [seven]])
+        # #7 doesn't merge onto #6, so it doesn't board with it (nor
+        # after it, as any conflict behind a train).
+        self.assertEqual(self.numbers(entries, sizes), [[6]])
+
     def test_within_clean_takes_an_overlap_that_merges_cleanly(self):
         self.configure(trains_within="clean")
         six, seven = self.line(6, 1), self.line(7, 20)
