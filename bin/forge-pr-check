@@ -3791,7 +3791,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         if TEST_AHEAD and merger_dir else set()
     spent = merger_spent(merger_dir, when, {
         got[1]: checkout for got in fields.values()
-        if got and got[4] and got[3]}, checkout, run) \
+        if got and got[4] and got[0] and got[3]}, checkout, run) \
         if TEST_AHEAD and STOP_SPENT and merger_dir else set()
     batch = merger_batch(merger_dir, when, checkout) \
         if TEST_AHEAD and merger_dir else []
@@ -3837,7 +3837,10 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 "%s" % (pr, sha[:10], "stopping" if sent else
                         "could not stop", slot_label(slot), pid, since),
                 when, out)
-        elif got and got[4] and got[1] in spent and got[3]:
+        elif got and got[4] and got[0] and got[1] in spent and got[3]:
+            # got[0] is 0 for the default branch's run, which `ahead`
+            # also marks (holder_fields): it is never a prediction, so
+            # it is never spent (agent-forge #294).
             pr, sha, since, pid, _ = got
             sent = stop(pid)
             log(state_dir, "STOPPED-SPENT #%d %s: the Merger no longer "
