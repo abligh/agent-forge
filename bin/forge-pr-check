@@ -933,6 +933,9 @@ TEST_AHEAD = False
 # merge.test_ahead.spare_slots_only (designs/0014): predictions only when
 # no ordinary head is waiting.
 SPARE_ONLY = False
+# merge.test_ahead.later_first (designs/0035, amendment of 2026-11-11):
+# how many later batches' tops go before an ordinary head.
+LATER_FIRST = 0
 # merge.test_ahead.stop_spent (designs/0014, amendment of 2026-11-10): a
 # running prediction whose tree the Merger no longer predicts is stopped.
 STOP_SPENT = False
@@ -1068,7 +1071,7 @@ def configure(project, instance=None):
     global MERGER_CPU_WEIGHT, DOCKER_SLICES, CPU_QUOTA
     global STEP_CACHES, ENV_FILES
     global FLAKE_ISSUE
-    global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
+    global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, LATER_FIRST, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT, WARM_PATHS, WARM_EVERY
     global RESULTS_MAX
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
@@ -1212,6 +1215,7 @@ def configure(project, instance=None):
     TEST_AHEAD = ahead is not None
     SPARE_ONLY = bool((ahead or {}).get("spare_slots_only"))
     STOP_SPENT = (ahead or {}).get("stop_spent") is True
+    LATER_FIRST = (ahead or {}).get("later_first", 0)
     RETRY_RED = (ahead or {}).get("retry_red") is True
     FLAKE_ISSUE = None
     if instance is None and isinstance(checks.get("flake_issue"), dict):
@@ -2558,6 +2562,22 @@ def merger_batch(merger_dir, when, repo=None):
             or [e["tree"] for e in entries[:size]] != trees:
         return []
     return entries[:size]
+
+
+def later_tops(merger_dir, when, repo, pick):
+    """The later batches' tops this start may choose from: all of them
+    when no ordinary head waits (`pick` is None), else the first
+    `merge.test_ahead.later_first` (designs/0035, amendment of
+    2026-11-11). On a host whose slots are always full, a later top
+    otherwise never runs: each batch waits for the one before it to
+    merge before its own top starts, and the merge rate is one batch
+    per run. Seen on 2026-11-11: seven slots full of ordinary heads, a
+    batch of six whose top waited six minutes for a slot and ran
+    twenty, and about five merges an hour."""
+    if pick is not None and not LATER_FIRST:
+        return ()
+    tops = merger_later(merger_dir, when, repo)
+    return tops if pick is None else tops[:LATER_FIRST]
 
 
 def merger_later(merger_dir, when, repo=None):
@@ -3977,8 +3997,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                         predicted = next_ahead(
                             state, ahead, taken, when,
                             busy_trees(taken - set(twins), checkout, run), batch,
-                            merger_later(merger_dir, when, checkout)
-                            if pick is None else ())
+                            later_tops(merger_dir, when, checkout, pick))
                 if predicted is not None:
                     state.setdefault("ahead_started", {})[predicted[0]] = \
                         iso(when)

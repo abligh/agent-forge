@@ -2344,6 +2344,18 @@ class Batch(unittest.TestCase):
         self.assertIsNone(pc.next_ahead(state, entries, busy={SHA_Q},
                                         when=T0, batch=entries[:2]))
 
+    def test_later_first_lets_a_later_top_go_before_a_waiting_head(self):
+        entries = self.later()
+        pick = ("f" * 40, 99)
+        self.assertEqual(pc.later_tops(self.dir, T0, None, None),
+                         pc.merger_later(self.dir, T0))
+        self.assertEqual(pc.later_tops(self.dir, T0, None, pick), ())
+        with mock.patch.object(pc, "LATER_FIRST", 1):
+            self.assertEqual(pc.later_tops(self.dir, T0, None, pick),
+                             entries[2:3])
+            self.assertEqual(pc.later_tops(self.dir, T0, None, None),
+                             entries[2:])
+
     def test_nothing_after_a_red_top(self):
         entries = self.later()
         tops = pc.merger_later(self.dir, T0)

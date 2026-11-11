@@ -139,7 +139,7 @@ TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "unstable_after_recuts": int, "batches_when_unstable": int,
               "trains": str, "trains_within": str, "stop_spent": bool,
               "green_batch_first": bool, "retry_red": bool,
-              "tell_boarded": bool}
+              "tell_boarded": bool, "later_first": int}
 TRAINS = ("dry-run", "live", "off")
 # designs/0050: what testing ahead is when the project says nothing.
 # Trains of up to 4, two in flight, predicted 7 deep; batches x batch
@@ -1418,6 +1418,8 @@ def _check_test_ahead(ahead, checks, problems):
         elif ahead["batches"] * batch > depth + 1:
             problems.append("%s.batches x batch must be at most depth + 1 "
                             "(%d)" % (where, depth + 1))
+    if _is(ahead.get("later_first"), int) and ahead["later_first"] < 0:
+        problems.append("%s.later_first must be at least 0" % where)
     if _is(ahead.get("unstable_after_recuts"), int) and \
             ahead["unstable_after_recuts"] < 1:
         problems.append("%s.unstable_after_recuts must be at least 1" % where)
