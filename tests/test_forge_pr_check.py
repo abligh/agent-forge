@@ -2594,6 +2594,29 @@ class TickAhead(Tick):
         self.assertTrue(any("STOPPED-AHEAD #3 %s: a shorter prefix" %
                             SHA_C[:10] in line for line in self.lines))
 
+    def test_stop_spent_never_stops_the_default_branchs_run(self):
+        # agent-forge #294: holder_fields marks main's lock line `ahead`
+        # too, and a main run whose tree no prediction has was stopped
+        # as spent, every time, so main never finished a traced run.
+        merger = self.merger(entries=[entry(2, SHA_P, TREE_1)])
+        self.hold(1, "#0 %s %s pid=4242 main" % (SHA_C, pc.iso(T0)))
+        self.hold(2, "#3 %s %s pid=4343 ahead" % (SHA_Q, pc.iso(T0)))
+        stopped = []
+        run = FakeRun((is_pulls, done([], 0, heads_tsv())))
+        old = pc.STOP_SPENT, pc.tree_of
+        pc.STOP_SPENT, pc.tree_of = True, lambda *a: TREE_2
+        try:
+            pc.tick(self.state_dir, "tok", run, lambda *a: None,
+                    self.lines.append, when=T0, slots=2, merger_dir=merger,
+                    stop=lambda pid: stopped.append(pid) or True)
+        finally:
+            pc.STOP_SPENT, pc.tree_of = old
+        self.assertEqual(stopped, [4343])
+        self.assertFalse(any("STOPPED-SPENT #0" in line
+                             for line in self.lines))
+        self.assertTrue(any("STOPPED-SPENT #3 %s" % SHA_Q[:10] in line
+                            for line in self.lines))
+
     def test_a_prediction_runs_while_the_mergers_head_is_not_waiting(self):
         self.slots = 1  # which goes first, not how many start
         self.write_state({"waiting": {SHA_B: {
