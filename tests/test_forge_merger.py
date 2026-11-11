@@ -19,7 +19,7 @@ import unittest
 import urllib.error
 from unittest import mock
 
-from agent_forge import config
+from agent_forge import checkout, config
 from tests.helpers import example, load_tool
 
 m = load_tool("forge-merger")
@@ -4080,8 +4080,8 @@ class TickAhead(RepoCase):
         ahead = self.ahead_json()
         self.assertEqual([e["pr"] for e in ahead["entries"]], [5, 6])
         self.assertEqual((ahead["base"], ahead["repo"], ahead["at"]),
-                         (self.repo.main_tip(), self.repo.path,
-                          record["at"]))
+                         (self.repo.main_tip(),
+                          checkout.store(self.repo.path), record["at"]))
         self.assertEqual(self.next_json(), {"at": record["at"], "pr": 5,
                                             "action": "WAIT"})
 

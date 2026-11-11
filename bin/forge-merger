@@ -662,6 +662,7 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from agent_forge import config, github as forge_github, locks, \
     nightly, stamps, union  # noqa: E402
+from agent_forge.checkout import store as git_store  # noqa: E402
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 
@@ -4437,7 +4438,8 @@ def dry_trains(state_dir, cut, main_tip, repo, record, out, when,
     for cause, line in events:
         if cause != "cut":
             out("TRAIN-DRY " + line)
-    said = {"at": iso(when), "base": main_tip, "repo": repo,
+    said = {"at": iso(when), "base": main_tip,
+            "repo": git_store(repo),
             "trains": True, "entries": entries,
             "said": "TRAIN-DRY " + train_line(sizes, entries)}
     if (note or {}).get("urgent_cut"):
@@ -6333,7 +6335,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     restacks=restacks if PREDICT_RESTACKED else None)
             record["ahead"] = [e["pr"] for e in entries]
             said_ahead = {"at": record["at"], "base": main_tip,
-                          "repo": repo, "entries": entries}
+                          "repo": git_store(repo),
+                          "entries": entries}
             if sizes is not None:
                 said_ahead["trains"] = True
                 if note.get("urgent_cut"):

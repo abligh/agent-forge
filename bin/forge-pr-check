@@ -690,6 +690,7 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from agent_forge import (config, github, locks, nightly, quiet,  # noqa: E402
                          trace)
+from agent_forge.checkout import store as git_store  # noqa: E402
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 
@@ -2521,8 +2522,8 @@ def merger_ahead(merger_dir, when, repo=None):
             said = json.load(handle)
         if when - parse(said["at"]) > MERGER_FRESH:
             return []
-        if repo is not None and os.path.realpath(said["repo"]) \
-                != os.path.realpath(repo):
+        if repo is not None and git_store(said["repo"]) \
+                != git_store(repo):
             return []
         return [e for e in said["entries"]
                 if isinstance(e.get("pr"), int)
@@ -3674,9 +3675,10 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
                   "fast lane" if slot == LANE else "slot %d" % slot,
                   " ahead" if ahead else " warm" if warm else ""))
     wlog.flush()
-    # The installation lock forge-cron-run handed this tick goes on to
-    # the worker, which outlives it: the release can't move under a run.
-    held = locks.inherited_install_lock()
+    # The installation's and the generation's locks forge-cron-run
+    # handed this tick go on to the worker, which outlives it: neither
+    # the release nor the checkout it runs from goes under a run.
+    held = locks.inherited_fds()
     subprocess.Popen(
         [sys.executable, os.path.realpath(__file__), "--worker", sha,
          "--pr", str(pr), "--state-dir", state_dir, "--slot", str(slot)]
@@ -3689,7 +3691,7 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
         + (["--instance", INSTANCE] if INSTANCE is not None else []),
         cwd=state_dir, stdin=subprocess.DEVNULL, stdout=wlog,
         stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
-        pass_fds=() if held is None else (held,))
+        pass_fds=held)
     wlog.close()
 
 
