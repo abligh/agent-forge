@@ -4251,7 +4251,7 @@ def last_trains(last):
 
 def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                trains=None, red=frozenset(), restacks=None, run=sh,
-               files=None, note=None, force_merges=True):
+               files=None, note=None, force_merges=True, started=None):
     """designs/0047: (entries, sizes, events) for the trains this tick,
     end to end from `main_tip`: the predictions as `predict_ahead` makes
     them, each with `train` (its train's place) and `carriage` (its
@@ -4265,7 +4265,10 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
     red, which can't board; `files` a cache for `changed_files`; `note`
     a dict given `urgent_cut`, the urgent pull requests that have had
     their cut, to keep with the trains (`last`'s is read): one that then
-    can't board doesn't cut them again every tick. `force_merges` false
+    can't board doesn't cut them again every tick. `started(sha, tree)`
+    says whether the build check has started a train's top (or has a
+    verdict on its tree); without it, only the first train is kept for
+    an urgent one. `force_merges` false
     (a dry run, whose trains the batches' merges don't follow) keeps the
     trains when the default branch moves.
 
@@ -4275,19 +4278,22 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
        tree other than the one predicted, leaves with the layers of its
        stack above it (`TRAIN-LEFT`). The others keep their places.
     2. An urgent pull request, or a red default branch's fix, that is in
-       no train cuts every train but the first (`TRAIN-RECUT`), or all of
-       them when the queue has put it in front of the first; and the
-       default branch moving to a tree no train predicted, a force merge,
-       cuts them all.
+       no train cuts again the trains after the first whose tops the
+       build check hasn't started (`TRAIN-RECUT`): a train whose run has
+       started keeps it (designs/0047, amendment of 2026-11-11); or
+       all of them when the queue has put it in front of the first; and
+       the default branch moving to a tree no train predicted, a force
+       merge, cuts them all.
     3. New trains are cut from what is left, in the queue's order, urgent
        ones first: the first carriage that merges cleanly, then each
        next one that touches no file the train touches (or, with
        TRAINS_WITHIN "clean", merges cleanly) and keeps it within
-       AHEAD_BATCH, urgent ones only with urgent ones. Urgent ones
-       share a train whenever they merge cleanly in order, even
-       touching the same files (agent-forge #298). A stack is never
-       split; one longer than AHEAD_BATCH is a train on its own. Only
-       a layer that is red or won't merge parts from what is below it:
+       AHEAD_BATCH. Urgent ones board first and share a train whenever
+       they merge cleanly in order, even touching the same files
+       (agent-forge #298); the train then fills up with the others,
+       as any train does, rather than leaving with only the urgent
+       ones. A stack is never split; one longer than AHEAD_BATCH is a
+       train on its own. Only a layer that is red or won't merge parts from what is below it:
        it stays behind with the layers above it, and the ones below
        board. On 2026-11-07 two stacks' bottom pull requests, each
        fine, waited two hours while newer ones went past, because a
@@ -4322,9 +4328,21 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
     if note is not None:
         note["urgent_cut"] = hot
     if len(prior) > 1 and jump:
-        events.append(("urgent", "RECUT: #%d goes first; the trains "
-                       "after the first are cut again" % min(jump)))
-        prior = prior[:1]
+        # Keep the trains whose top runs have started: cutting them
+        # again would throw those runs away (designs/0047, amendment of
+        # 2026-11-11). The first always stays.
+        keep = 1
+        if started is not None:
+            while keep < len(prior):
+                top = prior[keep][-1][-1]
+                if not started(top.get("sha"), top.get("tree")):
+                    break
+                keep += 1
+        if keep < len(prior):
+            events.append(("urgent", "RECUT: #%d goes first; the trains "
+                           "after train %d are cut again"
+                           % (min(jump), keep)))
+            prior = prior[:keep]
     entries, sizes, used, parent = [], [], set(), main_tip
     for k, train in enumerate(prior[:trains]):
         start = len(entries)
@@ -4385,8 +4403,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             if not members:
                 continue
             size = len(entries) - start
-            if size and (urgent(members[0]) != kind
-                         or size + len(members) > AHEAD_BATCH):
+            if size and size + len(members) > AHEAD_BATCH:
                 continue
             changed = set()
             for pr in members:
@@ -4395,13 +4412,14 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                     changed = None
                     break
                 changed |= got
-            # Urgent ones in a train of their own share it whenever they
-            # merge cleanly in order, whatever files they touch: they are
-            # usually small and often the same file (a project's
-            # configuration), and one train each would merge them one at
-            # a time (agent-forge #298).
+            # Urgent ones share a train whenever they merge cleanly in
+            # order, whatever files they touch: they are usually small
+            # and often the same file (a project's configuration), and
+            # one train each would merge them one at a time (agent-forge
+            # #298). The others behind them board by the usual rule.
             if changed is None or (size and TRAINS_WITHIN == "files"
-                                   and not kind and changed & touched):
+                                   and not (kind and urgent(members[0]))
+                                   and changed & touched):
                 continue
             made, top = [], parent
             for pr in members:
@@ -4427,7 +4445,9 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             entries += made
             used.update(e["pr"] for e in made)
             touched |= changed
-            kind, parent = urgent(members[0]), top
+            kind = urgent(members[0]) if not size else \
+                kind and urgent(members[0])
+            parent = top
             if len(entries) - start >= AHEAD_BATCH:
                 break
         if len(entries) == start:
@@ -6442,7 +6462,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 open_numbers, red={pr["number"] for pr in ahead_queue
                                    if head_red(check_state, pr)},
                 restacks=restacks if PREDICT_RESTACKED else None, run=run,
-                files=files, note=note, force_merges=TRAINS == "live")
+                files=files, note=note, force_merges=TRAINS == "live",
+                started=lambda sha, tree: ahead_started(check_state, sha,
+                                                        tree))
             files, note = {}, {}
             if TRAINS == "live" and not searching and ahead_queue:
                 # designs/0047: trains, cut once and kept.

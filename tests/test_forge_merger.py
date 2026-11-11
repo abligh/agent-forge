@@ -7667,12 +7667,13 @@ class Trains(RepoCase):
                               % (k, number))
         return self.change(number, "shared.txt", text, created)
 
-    def cut(self, carriages, last=None, open_numbers=None, check=None):
+    def cut(self, carriages, last=None, open_numbers=None, check=None,
+            started=None):
         heads = {p["number"]: p["headRefOid"]
                  for c in carriages for p in c}
         return m.cut_trains(self.repo.path, self.repo.main_tip(), carriages,
                             last, heads, open_numbers or set(heads),
-                            red=check or frozenset())
+                            red=check or frozenset(), started=started)
 
     def said(self, entries, sizes):
         """ahead.json as a tick writes it for these trains."""
@@ -7703,12 +7704,13 @@ class Trains(RepoCase):
 
     def test_urgent_ones_share_a_train_when_they_merge_cleanly(self):
         # agent-forge #298: two urgent configuration changes to one file
-        # board together, not one train each.
+        # board together, not one train each; the train then fills up
+        # with what follows (designs/0047, amendment of 2026-11-11).
         six = labelled(self.line(6, 1), "Priority:urgent")
         seven = labelled(self.line(7, 20), "Priority:urgent")
         eight = self.change(8, "x.txt", "x\n")
         entries, sizes, _ = self.cut([[six], [seven], [eight]])
-        self.assertEqual(self.numbers(entries, sizes), [[6, 7], [8]])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 7, 8]])
 
     def test_urgent_ones_that_conflict_still_go_apart(self):
         six = labelled(self.line(6, 1), "Priority:urgent")
@@ -7897,15 +7899,55 @@ class Trains(RepoCase):
             [[self.item()], [six], [seven], [hot]],
             self.said(entries, sizes))
         self.assertEqual(events[0], ("urgent", "RECUT: #8 goes first; the "
-                                     "trains after the first are cut "
+                                     "trains after train 1 are cut "
                                      "again"))
         self.assertEqual(self.numbers(got, sizes), [[5], [8], [6]])
 
-    def test_urgent_ones_board_apart(self):
+    def test_others_fill_an_urgent_ones_train(self):
+        # designs/0047, amendment of 2026-11-11: an urgent one goes first
+        # in its train, which then fills up like any other, rather than
+        # leaving with the urgent one alone.
         hot = labelled(self.change(8, "u.txt", "u\n"), "Priority:urgent")
         six = self.change(6, "y.txt", "y\n")
         entries, sizes, _ = self.cut([[six], [hot]])
-        self.assertEqual(self.numbers(entries, sizes), [[8], [6]])
+        self.assertEqual(self.numbers(entries, sizes), [[8, 6]])
+
+    def test_an_urgent_one_heads_the_first_train_not_started(self):
+        # Train 2 hasn't started: #9 heads it again, and it fills up
+        # with the queue's next ones, not a train of its own.
+        self.configure(batch=2, batches=3)
+        six, seven = self.change(6, "y.txt", "y\n"), self.change(
+            7, "z.txt", "z\n")
+        ten = self.change(10, "w.txt", "w\n")
+        entries, sizes, _ = self.cut([[self.item()], [six], [seven],
+                                      [ten]])
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6], [7, 10]])
+        hot = labelled(self.change(9, "u.txt", "u\n"), "Priority:urgent")
+        got, sizes, events = self.cut(
+            [[self.item()], [six], [seven], [ten], [hot]],
+            self.said(entries, sizes), started=lambda sha, tree: False)
+        self.assertEqual(events[0], ("urgent", "RECUT: #9 goes first; the "
+                                     "trains after train 1 are cut "
+                                     "again"))
+        self.assertEqual(self.numbers(got, sizes), [[5, 6], [9, 7], [10]])
+
+    def test_a_train_whose_top_started_is_not_cut_again(self):
+        # Train 2's top is testing: an urgent one waits for train 3
+        # rather than throwing that run away.
+        self.configure(batch=2, batches=3)
+        six, seven = self.change(6, "y.txt", "y\n"), self.change(
+            7, "z.txt", "z\n")
+        ten = self.change(10, "w.txt", "w\n")
+        entries, sizes, _ = self.cut([[self.item()], [six], [seven],
+                                      [ten]])
+        top = entries[3]["sha"]
+        hot = labelled(self.change(9, "u.txt", "u\n"), "Priority:urgent")
+        got, sizes, events = self.cut(
+            [[self.item()], [six], [seven], [ten], [hot]],
+            self.said(entries, sizes),
+            started=lambda sha, tree: sha == top)
+        self.assertEqual([c for c, _ in events if c == "urgent"], [])
+        self.assertEqual(self.numbers(got, sizes), [[5, 6], [7, 10], [9]])
 
     def test_a_red_head_cannot_board(self):
         six, seven = self.change(6, "y.txt", "y\n"), self.change(
@@ -8104,7 +8146,9 @@ class Trains(RepoCase):
         got, sizes, events = self.cut([[hot], [self.item()], [six]],
                                       self.said(entries, sizes))
         self.assertEqual(events[0][0], "urgent")
-        self.assertEqual(self.numbers(got, sizes), [[8], [5, 6]])
+        # Every train is cut again, whatever has started; #8 goes first
+        # and its train fills up.
+        self.assertEqual(self.numbers(got, sizes), [[8, 5], [6]])
 
 
 class ToldBoarded(unittest.TestCase):
