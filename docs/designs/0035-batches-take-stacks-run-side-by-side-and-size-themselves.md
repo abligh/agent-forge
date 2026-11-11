@@ -572,27 +572,3 @@ That flake was there before the batch; the nightly and later runs keep
 testing it, and the retry is logged, so it can be found.
 
 **Switch.** `merge.test_ahead.retry_red`, default `false`.
-
-## Amendment (2026-11-11, eighth): a layer boards only on the default branch
-
-**Rule.** A member of a batch or train never leaves it, except when the
-batch is red and its suspects are searched. So a pull request boards
-only when it could merge as it is, apart from the batch's own build
-check: approved at a commit that covers its head, every gated
-instance's context green, and its base the default branch.
-
-**What changes.** A stack's layer no longer joins its base's batch.
-After the layer below merges, the layer is restacked or retargeted, and
-its head changes. The batch only holds while every later member is at
-the head it was predicted at (`batch_holds`), so that change spent the
-whole batch, and each member then needed a new run. One project saw
-13 such drops in 14 hours, about four hours of runs. A layer that
-joined this way was also never checked against the gated instances,
-which apply only once its base is the default branch.
-
-A layer now waits outside the batch, not in front of it, until it is
-retargeted. It then boards like any other pull request. A stack
-therefore merges one layer per batch, not all at once.
-
-**Switch.** None. `merge.test_ahead.stacks` is still accepted, so
-configurations that name it stay valid, but it has no effect.

@@ -1189,12 +1189,8 @@ def configure(project):
     STACK_MAX_RUN = (stacks or {}).get("max_run", 0)
     wait = (stacks or {}).get("wait_hours")
     STACK_WAIT = datetime.timedelta(hours=wait) if wait else None
-    # A layer never boards a batch or a train (designs/0035, amendment
-    # of 2026-11-11): a member must be able to merge as it is, and a
-    # layer's head changes when it is restacked or retargeted after the
-    # layer below merges, which spent the whole batch. The setting is
-    # still accepted, and has no effect.
-    AHEAD_STACKS = False
+    AHEAD_STACKS = (STACKS and AHEAD_BATCH > 1
+                    and (ahead or {}).get("stacks") is True)
     PREDICT_RESTACKED = (STACKS and TEST_AHEAD
                          and stacks.get("predict_restacked") is True)
     UNION = union.globs(merge)
