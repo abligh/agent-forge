@@ -179,7 +179,9 @@ Two things still go in front of a cut train, as today. One is a
 red-default-branch fix (designs/0011): every train built on a red
 `main` is red too. The other is a pull request labelled
 `labels.urgent`, which a person sets. Each cuts the trains behind the
-one being merged, and the log says why.
+one being merged, and the log says why. (Amended 2026-11-11, below: an
+urgent one cuts only trains whose run hasn't started, and its train
+fills up with the others.)
 
 ### 3. Trains in flight
 
@@ -438,3 +440,33 @@ turn; it loses only the run it was having, which a merge of the batch
 afterwards would have spent anyway.
 
 **Switch.** `merge.test_ahead.green_batch_first`, default `false`.
+
+## Amendment (2026-11-11): an urgent pull request joins a train
+
+**What happened.** An urgent pull request that was in no train cut
+again every train but the first, and boarded only with other urgent
+ones. In one project, two urgent pull requests became a train of two
+ahead of a full train of eight, and the next merges waited a whole run
+for those two. A later train whose top was already being tested (with
+`merge.test_ahead.later_first`) also lost that run. The Merger
+simulator (tests/merger_sim.py) showed the same: one seed lost a
+started train of five members to a re-cut.
+
+**The rule.** Trains fill the way Alex put it: start with an empty
+train, take the highest-ranking pull request and the layers stacked on
+it, and go on until the train is full. Urgent ones rank first, so:
+
+* An urgent one that is in no train cuts again only the trains whose
+  top the build check hasn't started (`ahead_started`, or a verdict on
+  the top's tree), and never the first. A train whose run has started
+  stays as cut, so a train is never undone once its test is under way.
+* It heads the first train cut again, and that train then fills up
+  with the others in the queue's order, by the usual rule (files, or
+  `trains_within: clean`), instead of leaving with the urgent ones
+  alone. Urgent ones still share a train whenever they merge cleanly
+  in order, even touching the same files (agent-forge #298).
+* An urgent one the queue puts in front of the first train (a red
+  default branch's fix) still cuts every train, as before.
+
+**Cost.** An urgent pull request may wait for a train that has already
+started, at most one run, rather than costing that train its run.
