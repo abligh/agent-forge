@@ -3476,13 +3476,17 @@ def have_head(repo, pr, run=sh):
         fetch_pr(repo, pr["number"], pr["headRefOid"], run)
 
 
-def conflicts_ahead(repo, queue, run=sh, main_ref=None, cache=None):
+def conflicts_ahead(repo, queue, run=sh, main_ref=None, cache=None,
+                    gone=()):
     """{P: Q} for each pull request P in `queue` whose head conflicts
     with the head of a Q ahead of it, Q not itself held this way. The
     first is never held. A comparison git can't make (anything but 0 or
     1) holds nothing. With `main_ref`, one whose head conflicts with it
     is going back to its author, so nothing waits behind it: it is
-    neither a Q nor held.
+    neither a Q nor held. Nor is one whose number is in `gone`, already
+    handed back at the head it has: it can't merge until its author
+    pushes again (on 2026-11-11 one such held 26 others for over an
+    hour).
 
     `cache`, {"<a> <b>": 0 or 1}, remembers each pair of commits' answer:
     two commits merge the same way every time, and asking git again for
@@ -3505,6 +3509,8 @@ def conflicts_ahead(repo, queue, run=sh, main_ref=None, cache=None):
 
     kept, held = [], {}
     for pr in queue:
+        if pr["number"] in gone:
+            continue
         have_head(repo, pr, run)
         if main_ref and conflict(main_ref, pr["headRefOid"]):
             continue
@@ -6034,7 +6040,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         pairs_path = os.path.join(state_dir, PAIRS_FILE)
         pairs = {k: v for k, v in load_json(pairs_path, {}).items()
                  if v in (0, 1)}
-        held_by = conflicts_ahead(repo, queue, run, main_tip, pairs)
+        held_by = conflicts_ahead(
+            repo, queue, run, main_tip, pairs,
+            {pr["number"] for pr in queue
+             if handed_back(said, pr, approvals[pr["number"]], when)})
         if live:
             os.makedirs(state_dir, exist_ok=True)
             save_json(pairs_path, pairs.get("used", {}))
