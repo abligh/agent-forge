@@ -3009,6 +3009,54 @@ class PredictAhead(unittest.TestCase):
                          [".git", "a.txt", "b.txt", "base.txt", "shared.txt"])
 
 
+class PredictLayerOnItsBase(unittest.TestCase):
+    """A layer that changes its lower layer's lines again is predicted
+    right behind it: the lower layer's prediction has its head as a
+    second parent, so the layer merges from its real merge base (the
+    lower head), not from where the stack left the default branch."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Repo(tmp.name)
+        self.repo.branch("main", "main")
+        self.repo.commit("l.txt", "1\n2\n3\n", "main l.txt")
+        self.repo.push("main")
+        self.repo.branch("lower", "main")
+        self.lower = self.repo.commit("l.txt", "1\nA\n3\n", "lower")
+        self.repo.publish_pr(5, self.lower)
+        self.repo.branch("upper", self.lower)
+        self.upper = self.repo.commit("l.txt", "1\nB\n3\n", "upper")
+        self.repo.publish_pr(6, self.upper)
+
+    def test_the_layer_boards_behind_its_base(self):
+        got = m.predict_ahead(self.repo.path, self.repo.main_tip(),
+                              [pr(5, T1, head=self.lower),
+                               pr(6, T1, head=self.upper)])
+        self.assertEqual([e["pr"] for e in got], [5, 6])
+        self.assertEqual(got[1]["tree"],
+                         run_git(self.repo.path, "rev-parse",
+                                 self.upper + "^{tree}"))
+        # The tested commit keeps one parent, so an update of #5's head
+        # to the same tree is the same prediction; its graph holds #5.
+        def parents(sha):
+            return run_git(self.repo.path, "rev-list", "--parents", "-n",
+                           "1", sha).split()[1:]
+        self.assertEqual(parents(got[0]["sha"]), [self.repo.main_tip()])
+        self.assertEqual(parents(got[0]["graph"]),
+                         [self.repo.main_tip(), self.lower])
+        self.assertEqual(parents(got[1]["sha"]), [got[0]["sha"]])
+
+    def test_a_head_already_in_the_parent_is_not_a_parent_again(self):
+        entry, why = m.predict_one(self.repo.path, self.lower,
+                                   pr(5, T1, head=self.lower))
+        self.assertIsNone(why)
+        parents = run_git(self.repo.path, "rev-list", "--parents", "-n",
+                          "1", entry["sha"]).split()[1:]
+        self.assertEqual(parents, [self.lower])
+        self.assertNotIn("graph", entry)
+
+
 class PredictRestacked(unittest.TestCase):
     """merge.stacks.predict_restacked (designs/0042): a layer whose lower
     layer merged is predicted, and checked early, as the Merger will
