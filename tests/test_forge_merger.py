@@ -4008,7 +4008,6 @@ class TickAhead(RepoCase):
         record, _ = self.tick(prs, conclusions=(None,), live=True,
                               minutes=12,
                               run=self.gate_lags(6, lagging, calls))
-        self.assertIn(6, record["ahead"])
         self.assertEqual(comments(), 0)
 
     def test_a_refusal_for_good_is_not_asked_again(self):
@@ -5814,50 +5813,18 @@ class Stacks(RepoCase):
         self.assertEqual(record["decisions"][0]["action"], "RETARGET")
         self.assertEqual(m.load_json(path, None), before)
 
-    def test_a_ready_layer_joins_its_bases_batch(self):
-        # designs/0035: #6 is predicted straight after #5, so the run of
-        # #5's batch covers it too.
+    def test_a_ready_layer_never_boards_its_bases_batch(self):
+        # designs/0035, amendment of 2026-11-11: a layer's head changes
+        # when it is restacked or retargeted after #5 merges, so in #5's
+        # batch it would spend the batch. It waits outside, and boards
+        # on its own once its base is the default branch. The setting
+        # is still accepted.
         m.configure(project(stacks={},
                             test_ahead={"batch": 2, "stacks": True}))
         record = self.merge_bottom()
-        self.assertEqual(record["ahead"], [5, 6])
+        self.assertEqual(record["ahead"], [5])
         ahead = m.load_json(os.path.join(self.state, m.AHEAD_FILE), None)
-        self.assertEqual([e["pr"] for e in ahead["entries"]], [5, 6])
-        self.assertEqual(ahead["batch"]["size"], 2)
-
-    def test_the_base_merges_on_its_batchs_green_with_the_layer_held(self):
-        # #6 is still held as stacked when #5's covered head merges; the
-        # batch holds while #6 is ready at the head predicted.
-        self.base_merges_on_the_batchs_green(self.layer())
-
-    def test_a_layer_blocked_by_its_base_doesnt_hold_the_base_for_ever(self):
-        # A layer that names the layer below as Blocked-by waits only for
-        # the stack: the batch hold still finds it ready, so #5 merges.
-        self.base_merges_on_the_batchs_green(
-            self.layer(body="Blocked-by: #5"))
-
-    def base_merges_on_the_batchs_green(self, layer):
-        m.configure(project(stacks={},
-                            test_ahead={"batch": 2, "stacks": True}))
-        covered = {SLUG + "/commits/": [status(
-            description="green: covered by batch #5..#6 (tested as x)")]}
-        start = datetime.datetime(2026, 10, 7, 12, 0, 0,
-                                  tzinfo=datetime.timezone.utc)
-
-        def tick(check_state=None):
-            github = FakeGitHub(dict(answers(prs=[self.bottom(), layer]),
-                                     **covered))
-            return m.tick(self.repo.path, self.state, github, tools_run(),
-                          lambda line: None, now=lambda: start, live=True,
-                          check_state=check_state)
-        record = tick()
-        self.assertEqual(record["decisions"][0]["action"], "WAIT")
-        self.assertEqual(record["batch"], [5, 6])
-        top = m.load_json(os.path.join(self.state, m.AHEAD_FILE),
-                          None)["entries"][1]
-        record = tick({"results": {top["sha"]: {"tree": top["tree"],
-                                                "ok": True}}})
-        self.assertEqual(record["decisions"][0]["action"], "MERGE")
+        self.assertEqual([e["pr"] for e in ahead["entries"]], [5])
 
     def test_a_layer_not_yet_approved_stays_out(self):
         m.configure(project(stacks={},
