@@ -46,6 +46,13 @@ class Check(unittest.TestCase):
                 data[key] = value
         return config.check(data)
 
+    def test_test_ahead_later_first_is_not_negative(self):
+        data = example()
+        data.setdefault("merge", {})["test_ahead"] = {"later_first": 1}
+        self.assertEqual(config.check(data), [])
+        data["merge"]["test_ahead"] = {"later_first": -1}
+        self.assertEqual(len(config.check(data)), 1)
+
     def test_test_ahead_spare_slots_only_is_a_boolean(self):
         data = example()
         data.setdefault("merge", {})["test_ahead"] = {"spare_slots_only": True}
