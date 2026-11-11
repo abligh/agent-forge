@@ -4212,7 +4212,9 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
        ones first: the first carriage that merges cleanly, then each
        next one that touches no file the train touches (or, with
        TRAINS_WITHIN "clean", merges cleanly) and keeps it within
-       AHEAD_BATCH, urgent ones only with urgent ones. A stack is never
+       AHEAD_BATCH, urgent ones only with urgent ones. Urgent ones
+       share a train whenever they merge cleanly in order, even
+       touching the same files (agent-forge #298). A stack is never
        split; one longer than AHEAD_BATCH is a train on its own. Only
        a layer that is red or won't merge parts from what is below it:
        it stays behind with the layers above it, and the ones below
@@ -4322,8 +4324,13 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                     changed = None
                     break
                 changed |= got
+            # Urgent ones in a train of their own share it whenever they
+            # merge cleanly in order, whatever files they touch: they are
+            # usually small and often the same file (a project's
+            # configuration), and one train each would merge them one at
+            # a time (agent-forge #298).
             if changed is None or (size and TRAINS_WITHIN == "files"
-                                   and changed & touched):
+                                   and not kind and changed & touched):
                 continue
             made, top = [], parent
             for pr in members:
