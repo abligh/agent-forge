@@ -56,6 +56,12 @@ class GreenBatchFirst(unittest.TestCase):
                                  **{HEAD_9: {"ok": True}})}
         self.assertIsNone(self.first(check=check))
 
+    def test_not_for_a_member_the_merger_just_updated(self):
+        # #3 updated onto the tip: a new head, neither its predicted
+        # head nor its predicted merge, yet still the batch's own.
+        self.queue = [pr(3, head="5" * 40), pr(4, head=HEAD_4)]
+        self.assertIsNone(self.first(in_flight=3))
+
     def test_not_for_a_member_or_none_in_flight(self):
         self.assertIsNone(self.first(in_flight=3))
         self.assertIsNone(self.first(in_flight=None))

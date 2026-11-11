@@ -304,7 +304,7 @@ def sound(path, sha):
 def remake(repo, path, sha):
     """Make a generation git has lost track of sound again: `worktree
     repair` when only its record's path is wrong (one renamed into
-    place before agent-forge #306), else it is made afresh. Under the
+    place before agent-forge #305), else it is made afresh. Under the
     make lock."""
     git(repo, "worktree", "repair", path)
     if sound(path, sha):
