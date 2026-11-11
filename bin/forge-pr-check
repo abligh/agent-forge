@@ -105,7 +105,12 @@ the same tree, only the steps that were red, except one stopped by
 `checks.scoped_minutes`. Green the second time, the run is green;
 red again, the red stands. Logged `RETRIED AHEAD`, and the verdict
 records `retried` (the steps and how it ended). A pull request's own
-head is never run again this way.
+head is never run again this way. With `checks.flake_issue` (agent-forge
+#287), each step that turns green on its retry files an issue, titled
+by the step and the first test its red output names, with that output,
+the prediction and the pull requests it held (`FLAKE-FILED`); a later
+flake of the same step and test comments on it while it is open
+(`FLAKE-COMMENTED`).
 
 **A head just started isn't started again.** Until its worker has
 taken its slot's lock and said who it is, nothing else shows the head
@@ -932,6 +937,11 @@ STOP_SPENT = False
 # prediction's red steps are run once more on the same tree before the
 # red stands.
 RETRY_RED = False
+# checks.flake_issue (agent-forge #287): with RETRY_RED, a retried step
+# that turns green files an issue, {"labels"} (the owner's label
+# included), or None: off. Which step and test each open issue is for
+# is kept in state.json's `flake_issues`.
+FLAKE_ISSUE = None
 DEFAULT_MATCH_MAX_HOURS = 24
 MATCH_MAX_AGE = datetime.timedelta(hours=DEFAULT_MATCH_MAX_HOURS)
 # `checks.depends` (docs/designs/0005): each new head of the default
@@ -1054,6 +1064,7 @@ def configure(project, instance=None):
     global CPU_WEIGHT, CPU_SHARE, SIDE_BY_SIDE, AFTER, ALONE, LIGHT
     global MERGER_CPU_WEIGHT, DOCKER_SLICES, CPU_QUOTA
     global STEP_CACHES, ENV_FILES
+    global FLAKE_ISSUE
     global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT, WARM_PATHS, WARM_EVERY
     global RESULTS_MAX
@@ -1199,6 +1210,14 @@ def configure(project, instance=None):
     SPARE_ONLY = bool((ahead or {}).get("spare_slots_only"))
     STOP_SPENT = (ahead or {}).get("stop_spent") is True
     RETRY_RED = (ahead or {}).get("retry_red") is True
+    FLAKE_ISSUE = None
+    if instance is None and isinstance(checks.get("flake_issue"), dict):
+        flake = checks["flake_issue"]
+        owner = flake.get("owner") or project.section("router").get(
+            "owners", {}).get("triage")
+        FLAKE_ISSUE = {"labels": list(flake.get("labels", [])) + (
+            [project.section("labels").get("owner_prefix", "Owner:") + owner]
+            if owner else [])}
     MATCH_MAX_AGE = datetime.timedelta(hours=(ahead or {}).get(
         "max_age_hours", DEFAULT_MATCH_MAX_HOURS))
     # The configuration refuses test_ahead with merger_first false.
@@ -2996,6 +3015,123 @@ def report_main(state_dir, repo, sha, ok, failed, same, write, out=print,
     with state_lock(state_dir):
         state = load(state_dir)
         state["main_red"] = red
+        save(state_dir, state)
+
+
+# The test a red step's output names first (failing_test): Go's
+# `--- FAIL: name`, Rust's `test name ... FAILED`, `---- name stdout ----`
+# and `thread 'name' panicked at`, and Python's `FAIL: name (Case)`.
+FAILING_TEST = (
+    re.compile(r"^\s*--- FAIL: (\S+)"),
+    re.compile(r"^test (\S+) \.\.\. FAILED$"),
+    re.compile(r"^---- (\S+) std(?:out|err) ----$"),
+    re.compile(r"^thread '([^']+)'(?: \(\d+\))? panicked at "),
+    re.compile(r"^(?:FAIL|ERROR): (\S+ \([^)]+\))"),
+)
+# How much of a test's name an issue's title keeps.
+FLAKE_TITLE_TEST = 120
+
+
+def failing_test(text):
+    """The first test a step's output names as failed, or None. A panic
+    on a thread named `main` names no test."""
+    for line in ANSI_RE.sub("", text).splitlines():
+        for pattern in FAILING_TEST:
+            hit = pattern.search(line)
+            if hit and hit.group(1) != "main":
+                return hit.group(1)
+    return None
+
+
+def prediction_prs(merger_dir, sha, repo=None):
+    """The pull requests in the Merger's prediction sha, oldest first:
+    every entry of ahead.json up to and including sha's, since each
+    prediction holds all those before it. [] when sha isn't there."""
+    entries = merger_ahead(merger_dir, now_utc(), repo)
+    for at, e in enumerate(entries):
+        if e["sha"] == sha:
+            return [x["pr"] for x in entries[:at + 1]]
+    return []
+
+
+def flake_text(sha, pr, prs, name, test, text, first):
+    """An issue's body (`first`) or a later comment, for step `name`
+    (and `test`) red on the prediction sha for pr and green again."""
+    text = ANSI_RE.sub("", text).rstrip()
+    if len(text) > RED_COMMENT_CHARS:
+        text = "[…]\n" + text[-RED_COMMENT_CHARS:]
+    mark = fence(text)
+    what = "`%s`%s" % (name, " (`%s`)" % test if test else "")
+    lines = ["%s %s red on the Merger's prediction for #%s at %s%s, and "
+             "green when run again on the same tree, so the red was a "
+             "flake and the prediction counted as green." % (
+                 "" if first else "Again:", what, pr, sha[:10], on_host())]
+    lines[0] = lines[0].lstrip()
+    if prs:
+        lines += ["", "The prediction held %s." % ", ".join(
+            "#%s" % n for n in prs)]
+    lines += ["", "**%s**, the end of its red output:" % name, "",
+              mark, text, mark]
+    if first:
+        lines += ["", "Each later flake of this step%s is commented here "
+                  "while this issue is open." % (" and test" if test
+                                                 else "")]
+    lines += ["", signature()]
+    return "\n".join(lines)
+
+
+def report_flake(state_dir, pr, sha, failed, write, prs=(), out=print):
+    """checks.flake_issue (agent-forge #287): for each step in `failed`
+    ((name, the red run's tail)) that turned green when the prediction
+    sha for pr ran it again, file an issue, labelled FLAKE_ISSUE's
+    `labels`, or comment on the open one already filed for that step
+    and test (state.json's `flake_issues`). Logged FLAKE-FILED or
+    FLAKE-COMMENTED; a write GitHub refuses is logged REPORT-FAILED."""
+    when = now_utc()
+    with state_lock(state_dir):
+        known = dict(load(state_dir).get("flake_issues") or {})
+    for name, text in failed:
+        test = failing_test(text)
+        key = "%s\t%s" % (name, test or "")
+        number = known.get(key)
+        if number is not None:
+            got, issue = write("GET", "/repos/%s/issues/%d"
+                               % (REPO_SLUG, number))
+            if got == 200 and isinstance(issue, dict) \
+                    and issue.get("state") == "open":
+                got, _ = write("POST", "/repos/%s/issues/%d/comments"
+                               % (REPO_SLUG, number), {"body": flake_text(
+                                   sha, pr, prs, name, test, text, False)})
+                if got != 201:
+                    log(state_dir, "REPORT-FAILED #%s %s: commenting on "
+                        "#%d: HTTP %s" % (pr, sha[:10], number, got),
+                        when, out)
+                else:
+                    log(state_dir, "FLAKE-COMMENTED #%d: %s%s flaked on "
+                        "#%s %s" % (number, name, " (%s)" % test if test
+                                    else "", pr, sha[:10]), when, out)
+                continue
+        shown = test if test is None or len(test) <= FLAKE_TITLE_TEST \
+            else test[:FLAKE_TITLE_TEST] + "…"
+        body = {"title": "Flaky step: %s%s" % (
+                    name, ", %s" % shown if shown else ""),
+                "body": flake_text(sha, pr, prs, name, test, text, True)}
+        if FLAKE_ISSUE["labels"]:
+            body["labels"] = list(FLAKE_ISSUE["labels"])
+        got, made = write("POST", "/repos/%s/issues" % REPO_SLUG, body)
+        if got != 201 or not isinstance(made, dict) or "number" not in made:
+            log(state_dir, "REPORT-FAILED #%s %s: filing a flake of %s: "
+                "HTTP %s %s" % (pr, sha[:10], name, got,
+                                (made or {}).get("message", "")), when, out)
+            continue
+        known[key] = made["number"]
+        log(state_dir, "FLAKE-FILED #%d: %s%s flaked on #%s %s"
+            % (made["number"], name, " (%s)" % test if test else "", pr,
+               sha[:10]), when, out)
+    with state_lock(state_dir):
+        state = load(state_dir)
+        state["flake_issues"] = dict(state.get("flake_issues") or {},
+                                     **known)
         save(state_dir, state)
 
 
@@ -6121,7 +6257,7 @@ class Phases:
 
 def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
            post=None, chain=None, slot=1, memory_max=None, ahead=False,
-           main=False, report=None, front=None, warm=False):
+           main=False, report=None, front=None, warm=False, flake=None):
     """Check sha, pull request pr's head, now, in this process, in
     `slot`, each step limited to memory_max (None: no limit). With
     `ahead`, sha is the Merger's prediction for pr: checked out without
@@ -6150,7 +6286,11 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     again only so that `slot`'s caches are built at it: never matched,
     untraced, posted nowhere, its outcome kept in state.json's `warm`
     by slot rather than as sha's verdict, so a flaky red here can't make
-    the default branch red. Logged WARM-GREEN or WARM-RED."""
+    the default branch red. Logged WARM-GREEN or WARM-RED.
+
+    `flake(sha, pr, failed)` is called when a prediction's red steps
+    (`failed`, each (name, the red run's tail)) turned green when run
+    again (checks.flake_issue, agent-forge #287)."""
     if warm:
         main, post, report = True, None, None
     os.makedirs(state_dir, exist_ok=True)
@@ -6489,6 +6629,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         # was the steps' own flake, and a red top would otherwise send its
         # batch's members into a search that finds nothing.
         retried = None
+        first_red = []
         if RETRY_RED and ahead and not ok and stale is None \
                 and host_fault(results) is None:
             redo = [r["name"] for r in results
@@ -6497,6 +6638,9 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 + list(scoped_steps or [])
             subset = [s for s in pool if s[0] in redo]
             if subset:
+                named = [s[0] for s in subset]
+                first_red = [(r["name"], r.get("tail", "")) for r in results
+                             if r["rc"] != 0 and r["name"] in named]
                 again_ok, again = check(wt, env, run, steps=subset, **how)
                 for r in again:
                     r["retried"] = True
@@ -6679,6 +6823,9 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             if report is not None and not ok and not ahead:
                 report(sha, ok, [(r["name"], r.get("tail", ""))
                                  for r in results if r["rc"] != 0], None)
+            if flake is not None and retried and retried["ok"] \
+                    and first_red:
+                flake(sha, pr, first_red)
             if ok and tracer is not None:
                 record_run(state_dir, wt, sha, checked,
                            tree_of(wt, checked, run), files, env, tracer,
@@ -6859,6 +7006,15 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
             write = make_writer(project, out)
             report = lambda sha, ok, failed, same: report_pr(
                 state_dir, args.pr, sha, failed, write, out)
+        flake = None
+        if FLAKE_ISSUE is not None and RETRY_RED and args.post \
+                and args.ahead and not args.warm:
+            write = make_writer(project, out)
+            ahead_dir = args.merger_dir or locks.state_dir(
+                project.name, "merger", environ)
+            flake = lambda sha, pr, failed: report_flake(
+                state_dir, pr, sha, failed, write, prediction_prs(
+                    ahead_dir, sha, repo), out)
         front = None
         if (MERGER_CPU_WEIGHT or DOCKER_SLICES) and not args.main:
             merger_dir = args.merger_dir or locks.state_dir(
@@ -6869,7 +7025,7 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
                       post=post, chain=chain, slot=args.slot,
                       memory_max=memory_max_from_env(environ),
                       ahead=args.ahead, main=args.main, report=report,
-                      front=front, warm=args.warm)
+                      front=front, warm=args.warm, flake=flake)
     token = mint(run)
     if token is None:
         out("NO-TOKEN: could not mint %s's token" % POSTER)

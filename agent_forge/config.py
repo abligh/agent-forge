@@ -167,7 +167,10 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "side_by_side": dict, "merger_cpu_weight": int,
           "docker_slices": dict, "pull_requests": dict, "warm": dict,
           "approved_first": bool, "scoped_minutes": int,
-          "gate": bool}
+          "gate": bool, "flake_issue": dict}
+# checks.flake_issue (agent-forge #287): an issue for each step a
+# prediction's retry (merge.test_ahead.retry_red) turned green.
+FLAKE_ISSUE = {"labels": list, "owner": str}
 # checks.docker_slices (designs/0031): the slices each step's
 # containers go in, the next merge's run's and every other's.
 DOCKER_SLICES = {"front": str, "other": str}
@@ -198,7 +201,7 @@ INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight", "cpu_quota",
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main", "main_red_issue")
 INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
-                        "merger_cpu_weight", "docker_slices")
+                        "merger_cpu_weight", "docker_slices", "flake_issue")
 # And from the block alone, never `checks`: a context the Merger requires
 # can't leave heads unrun (designs/0034). `gate`: the Merger also waits
 # for the instance's context on the pull requests it applies to.
@@ -974,6 +977,24 @@ def _check_step_alert(alert, data, problems, where):
         problems.append("%s.owner %r is not an agent" % (where, owner))
 
 
+def _check_flake_issue(flake, data, problems, where):
+    """checks.flake_issue (agent-forge #287): its labels are label
+    names, its owner an agent, and it needs merge.test_ahead.retry_red,
+    without which no step is ever run again."""
+    if not _fields(where, flake, FLAKE_ISSUE, problems):
+        return
+    if isinstance(flake.get("labels"), list) and not all(
+            isinstance(label, str) and label for label in flake["labels"]):
+        problems.append("%s.labels must be label names" % where)
+    owner = flake.get("owner")
+    if isinstance(owner, str) and owner not in data.get("agents", {}):
+        problems.append("%s.owner %r is not an agent" % (where, owner))
+    ahead = test_ahead(data) or {}
+    if ahead.get("retry_red") is not True:
+        problems.append("%s needs merge.test_ahead.retry_red: without it "
+                        "no step is run again, so none can flake" % where)
+
+
 def _check_checks(checks, data, problems, where="checks"):
     """The `checks` section, or a block of `checks.instances`, whose
     problems then name it as `where`."""
@@ -1042,6 +1063,9 @@ def _check_checks(checks, data, problems, where="checks"):
     if isinstance(checks.get("step_alert"), dict):
         _check_step_alert(checks["step_alert"], data, problems,
                           where + ".step_alert")
+    if isinstance(checks.get("flake_issue"), dict):
+        _check_flake_issue(checks["flake_issue"], data, problems,
+                           where + ".flake_issue")
     if isinstance(checks.get("keep_ignored"), list):
         for path in checks["keep_ignored"]:
             if not (isinstance(path, str) and path.strip("/")
