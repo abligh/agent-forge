@@ -105,6 +105,27 @@ build runs per merged pull request (target about 2). Then:
    requests, batch re-cuts and their causes, and, while
    `merge.test_ahead.trains` is a dry run, what trains would have done.
 
+Between panels 2 and 3, two pictures of now, drawn in HTML and CSS
+with no script (each pull request linked to GitHub when the
+configuration names the repository):
+
+* **Trains now**, from `merger/ahead.json`: one row per train, the
+  one merging next first, each carriage a box and the top (the commit
+  tested for the whole train) double-bordered. A train's colour says
+  where its top's run is: waiting for a slot (no run in `worker.log`),
+  testing, green (merging) or red. A train cut for urgent pull
+  requests (`urgent_cut`) says so. An `ahead.json` without trains is
+  cut by its batch's and later batches' sizes, and what is left is
+  shown as predicted but in no train yet. In `flow.json` as `trains`
+  (`train`, `prs`, `top`, `state`, `since`, `urgent`) and `ahead_at`.
+* **Stacks now**, from the last Merger record's `stacked on #N` holds:
+  each stack a tree rooted at its base (the pull request on the
+  default branch), largest first, with its layers, depth, and where
+  the base waits (in a train, in the queue, held and why, back with
+  its author, or not a candidate), since the whole stack waits there.
+  In `flow.json` as `stacks` (`pr`, `layers`, `count`, `depth`,
+  `root_where`).
+
 `forge-stats-watch` reads three of these figures in its own process
 (`hand_backs_per_merge`, `prs_per_slot`, `reviewer_busy`).
 

@@ -547,6 +547,103 @@ class Snapshot(Base):
         self.assertEqual(got["overdue"], 2)
 
 
+class StacksAndTrains(Base):
+    """The stacks as trees and the trains now, for the page."""
+
+    def last(self, **more):
+        return RECORDS[:-1] + [rec("10:40:00", [20, 30], [d("WAIT", 20)],
+                                   **more)]
+
+    def test_stacks_are_trees_rooted_at_their_base(self):
+        # 20 <- 21 <- 22 <- 23, and 21 <- 24 (a branch); 30 <- 31;
+        # 40's base is not open or not approved (not held, not queued).
+        held = {"21": "stacked on #20", "22": "stacked on #21",
+                "23": "stacked on #22", "24": "stacked on #21",
+                "31": "stacked on #30", "41": "stacked on #40",
+                "30": "conflicts with #20, ahead of it in the queue",
+                "50": "draft"}
+        got = self.flow(records=self.last(held=held), ahead={
+            "entries": [{"pr": 20, "train": 1, "sha": sha("a")}]}).stacks()
+        self.assertEqual([(t["pr"], t["count"], t["depth"]) for t in got],
+                         [(20, 4, 3), (30, 1, 1), (40, 1, 1)])
+        twenty = got[0]
+        self.assertEqual([k["pr"] for k in twenty["layers"]], [21])
+        self.assertEqual([k["pr"] for k in twenty["layers"][0]["layers"]],
+                         [22, 24])
+        self.assertEqual(twenty["root_where"], "in train 1")
+        self.assertEqual(got[1]["root_where"],
+                         "held: conflicts with #20, ahead of it in the queue")
+        self.assertTrue(got[2]["root_where"].startswith("not a candidate"))
+
+    def test_a_loop_in_the_holds_does_not_hang(self):
+        held = {"21": "stacked on #20", "20": "stacked on #21"}
+        self.assertEqual(self.flow(records=self.last(held=held)).stacks(),
+                         [])
+
+    def test_trains_from_ahead_json(self):
+        worker = WORKER + [header("10:45:00", 33, "9", 4, ahead=True)]
+        ahead = {"at": "2026-11-04T10:50:00Z",
+                 "batch": {"said": "BATCH #11..#12: top bbbbbbbbbb green, "
+                           "merging 2", "size": 2},
+                 "urgent_cut": [21],
+                 "entries": [
+                     {"pr": 11, "train": 0, "sha": sha("a")},
+                     {"pr": 12, "train": 0, "sha": sha("b")},
+                     {"pr": 21, "train": 1, "sha": sha("8")},
+                     {"pr": 31, "train": 2, "sha": sha("c")},
+                     {"pr": 33, "train": 2, "sha": sha("9")}]}
+        got = self.flow(worker=worker, ahead=ahead).trains()
+        self.assertEqual([(t["train"], t["prs"], t["top"], t["state"],
+                           t["urgent"]) for t in got], [
+            (0, [11, 12], "b" * 10, "green, merging", False),
+            (1, [21], "8" * 10, "waiting for a slot", True),
+            (2, [31, 33], "9" * 10, "testing", False)])
+        self.assertEqual(got[2]["since"], "2026-11-04T10:45Z")
+
+    def test_without_trains_the_batch_sizes_cut_them(self):
+        ahead = {"batch": {"size": 2}, "later": [{"size": 1}],
+                 "entries": [{"pr": str(n), "sha": sha(c)} for n, c in
+                             ((11, "a"), (12, "b"), (13, "c"), (14, "d"))]}
+        got = self.flow(ahead=ahead).trains()
+        self.assertEqual([(t["train"], t["prs"]) for t in got],
+                         [(0, [11, 12]), (1, [13]), (None, [14])])
+        self.assertEqual(got[2]["state"], "predicted, not yet in a train")
+        self.assertIn("in no train yet", tool.trains_html({"trains": got}))
+
+    def test_nothing_ahead_is_no_train_and_no_stack(self):
+        flow = self.flow(records=self.last())
+        self.assertEqual(flow.trains(), [])
+        self.assertEqual(flow.stacks(), [])
+
+    def test_the_page_draws_them(self):
+        data = {"repo": "owner/widget", "ahead_at": "2026-11-04T10:50:00Z",
+                "trains": [{"train": 0, "prs": [11, 12], "top": "b" * 10,
+                            "state": "green, merging", "since": None,
+                            "urgent": False},
+                           {"train": 1, "prs": [21], "top": "8" * 10,
+                            "state": "waiting for a slot", "since": None,
+                            "urgent": True}],
+                "stacks": [{"pr": 20, "count": 2, "depth": 2,
+                            "root_where": "in the queue", "layers": [
+                                {"pr": 21, "count": 1, "depth": 1,
+                                 "layers": [{"pr": 22, "count": 0,
+                                             "depth": 0, "layers": []}]}]}]}
+        trains = tool.trains_html(data)
+        self.assertIn('class="train t-green"', trains)
+        self.assertIn("cut for urgent PRs", trains)
+        self.assertIn('href="https://github.com/owner/widget/pull/12"',
+                      trains)
+        self.assertEqual(trains.count('class="car top"'), 2)
+        stacks = tool.stacks_html(data)
+        self.assertIn("<b>2</b> layers in <b>1</b> stacks", stacks)
+        self.assertIn("2 layers, 2 deep", stacks)
+        self.assertEqual(stacks.count("<ul"), 3)
+        self.assertNotIn("<script", trains + stacks)
+        self.assertIn("No train", tool.trains_html({}))
+        self.assertIn("No stacked", tool.stacks_html({}))
+        self.assertIn(">#20<", tool.stacks_html(dict(data, repo=None)))
+
+
 class Main(Base):
 
     def main(self, *argv, call=None, environ=None):
