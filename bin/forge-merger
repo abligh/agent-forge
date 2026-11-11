@@ -537,6 +537,11 @@ the dry run's own (`trains-dry.json`), are said as `TRAIN-DRY 1: #a #b |
 2: #c` when they change, each change as `TRAIN-DRY LEFT ...`, and kept
 in the record as `trains` with `"trains_dry": true`, with
 `recut_avoided` when the batches were cut again but no train was.
+With `tell_boarded` (agent-forge #286), each pull request that boards a
+live train is told once, in a `Not-a-review` comment, not to push to it
+unless it is handed back (`TOLD-BOARDED #<pr> <sha>`, the record's
+`told_boarded`); the Merger's own updates don't repeat it, and one that
+leaves the trains is told again when it reboards.
 
 **With `merge.hold_conflicting`, a pull request that conflicts with
 one ahead of it waits for that one instead of going round again**
@@ -869,6 +874,17 @@ FIXED_ORDER = True
 # 2026-11-10): a batch green on the default branch's tip merges before
 # the pull request in flight while that one's own run hasn't finished.
 GREEN_BATCH_FIRST = False
+# merge.test_ahead.tell_boarded (agent-forge #286): a pull request that
+# boards a live train is told once, with TOLD_BOARDED_NOTE, not to push
+# unless it is handed back. Kept in TOLD_BOARDED_FILE ({pr: head told})
+# while it rides the trains, so the Merger's own updates and restacks
+# don't repeat it; one that leaves them is told again when it reboards.
+TELL_BOARDED = False
+TOLD_BOARDED_FILE = "told-boarded.json"
+TOLD_BOARDED_NOTE = ("Not-a-review\n\nIn the Merger's train at %s: please "
+                     "don't push to this branch unless it is handed back. "
+                     "A push takes it out of the train and runs the check "
+                     "again for every pull request after it.\n\n%s")
 # merge.test_ahead.unstable_after_recuts and batches_when_unstable
 # (designs/0044, rule 5): when more than UNSTABLE_AFTER ticks in the
 # last UNSTABLE_WINDOW re-cut a batch whose top's run had started, only
@@ -1095,7 +1111,7 @@ def configure(project):
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
     global FIXED_ORDER, GREEN_BATCH_FIRST, RED_SUSPECT_OUT, UNSTABLE_AFTER
-    global UNSTABLE_BATCHES
+    global UNSTABLE_BATCHES, TELL_BOARDED
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
@@ -1139,6 +1155,7 @@ def configure(project):
     AHEAD_BATCHES = (ahead or {}).get("batches", 1)
     FIXED_ORDER = (ahead or {}).get("fixed_order", True) is not False
     GREEN_BATCH_FIRST = (ahead or {}).get("green_batch_first") is True
+    TELL_BOARDED = (ahead or {}).get("tell_boarded") is True
     RED_SUSPECT_OUT = (ahead or {}).get("hand_back_red_suspect",
                                         True) is not False
     UNSTABLE_AFTER = (ahead or {}).get("unstable_after_recuts")
@@ -5393,6 +5410,41 @@ def tell_waited(github, expired, live):
     return told
 
 
+def tell_boarded(github, state_dir, entries, heads, live):
+    """merge.test_ahead.tell_boarded (agent-forge #286): [{pr, head,
+    result}] for each pull request in `entries` (this tick's live
+    trains) not yet told since it boarded; when `live`,
+    TOLD_BOARDED_NOTE is posted on it and TOLD_BOARDED_FILE records it.
+    A pull request no longer in the trains is forgotten, so it is told
+    again if it reboards. `heads` are the open pull requests' heads by
+    number."""
+    path = os.path.join(state_dir, TOLD_BOARDED_FILE)
+    told_before = load_json(path, {})
+    riding = []
+    for entry in entries:
+        if entry["pr"] not in riding:
+            riding.append(entry["pr"])
+    kept = {key: head for key, head in told_before.items()
+            if int(key) in riding}
+    told = []
+    for number in riding:
+        if str(number) in kept or number not in heads:
+            continue
+        head = heads[number]
+        item = {"pr": number, "head": head[:10]}
+        if live:
+            ok, why = github.write(
+                "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG, number),
+                body=TOLD_BOARDED_NOTE % (head[:10], SIGNATURE))
+            item["result"] = "done" if ok else "refused: " + why
+            if ok:
+                kept[str(number)] = head
+        told.append(item)
+    if live and kept != told_before:
+        save_json(path, kept)
+    return told
+
+
 def save_stack(state_dir, stack):
     """Write `stack` to STACK_FILE, or remove the file when it's empty."""
     path = os.path.join(state_dir, STACK_FILE)
@@ -6217,6 +6269,17 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 # designs/0047: trains, cut once and kept.
                 entries, sizes, events = cut(last)
                 write_ahead_refs(repo, entries, run)
+                if TELL_BOARDED:
+                    told = tell_boarded(
+                        github, state_dir, entries,
+                        {pr["number"]: pr["headRefOid"] for pr in prs}, live)
+                    if told:
+                        record["told_boarded"] = told
+                    for item in told:
+                        out("TOLD-BOARDED #%d %s%s" % (
+                            item["pr"], item["head"],
+                            "" if item.get("result", "done") == "done"
+                            else ": " + item["result"]))
                 if live and (RESOLVE or UNION):
                     record["decisions"] += resolve_ahead(
                         repo, state_dir, ahead_queue + instance_held,

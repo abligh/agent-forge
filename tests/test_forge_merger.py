@@ -7797,6 +7797,36 @@ class Trains(RepoCase):
     def ahead_json(self):
         return m.load_json(os.path.join(self.state, m.AHEAD_FILE), None)
 
+    def test_a_live_tick_tells_who_boarded_once(self):
+        # agent-forge #286: merge.test_ahead.tell_boarded.
+        self.configure(tell_boarded=True)
+        six, seven = self.line(6, 1), self.line(7, 20)
+        prs = [self.item(), six, seven]
+        record, lines = self.tick(prs, conclusions=(None,), live=True)
+        told = [w for w in self.github.writes
+                if w[1].endswith("/comments")
+                and "In the Merger's train" in w[2].get("body", "")]
+        self.assertEqual(sorted(w[1] for w in told), sorted(
+            "repos/%s/issues/%d/comments" % (m.REPO_SLUG, n)
+            for n in (5, 6, 7)))
+        self.assertEqual(sorted(t["pr"] for t in record["told_boarded"]),
+                         [5, 6, 7])
+        self.assertIn("TOLD-BOARDED #6 %s" % six["headRefOid"][:10], lines)
+        # The next tick, the same trains: nobody is told again.
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=1)
+        self.assertNotIn("told_boarded", record)
+        self.assertFalse([l for l in lines if l.startswith("TOLD-BOARDED")])
+
+    def test_off_by_default_nobody_is_told(self):
+        six = self.line(6, 1)
+        record, _ = self.tick([self.item(), six], conclusions=(None,),
+                              live=True)
+        self.assertNotIn("told_boarded", record)
+        self.assertFalse([w for w in self.github.writes
+                          if "In the Merger's train"
+                          in w[2].get("body", "")])
+
     def test_a_live_tick_writes_trains_and_keeps_them(self):
         six, seven = self.line(6, 1), self.line(7, 20)
         prs = [self.item(), six, seven]
@@ -7922,6 +7952,59 @@ class Trains(RepoCase):
                                       self.said(entries, sizes))
         self.assertEqual(events[0][0], "urgent")
         self.assertEqual(self.numbers(got, sizes), [[8], [5, 6]])
+
+
+class ToldBoarded(unittest.TestCase):
+    """agent-forge #286: a pull request that boards a live train is told
+    once not to push, and again only after it leaves and reboards."""
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp()
+        self.github = FakeGitHub({})
+
+    def tell(self, numbers, heads, live=True):
+        return m.tell_boarded(self.github, self.state,
+                              [{"pr": n} for n in numbers], heads, live)
+
+    def test_told_once_while_it_rides(self):
+        heads = {5: "a" * 40, 6: "b" * 40}
+        told = self.tell([5, 6], heads)
+        self.assertEqual([t["pr"] for t in told], [5, 6])
+        self.assertEqual(len(self.github.writes), 2)
+        method, path, fields = self.github.writes[0]
+        self.assertEqual((method, path),
+                         ("POST", "repos/%s/issues/5/comments" % m.REPO_SLUG))
+        self.assertTrue(fields["body"].startswith("Not-a-review\n"))
+        self.assertIn("train at aaaaaaaaaa", fields["body"])
+        self.assertIn("handed back", fields["body"])
+        # The Merger's own update gives #5 a new head: not told again.
+        self.assertEqual(self.tell([5, 6], {5: "c" * 40, 6: "b" * 40}), [])
+        self.assertEqual(len(self.github.writes), 2)
+
+    def test_told_again_after_it_leaves_and_reboards(self):
+        self.tell([5, 6], {5: "a" * 40, 6: "b" * 40})
+        # #6 leaves the trains (a push, a hand-back): forgotten.
+        self.tell([5], {5: "a" * 40})
+        told = self.tell([5, 6], {5: "a" * 40, 6: "d" * 40})
+        self.assertEqual([(t["pr"], t["head"]) for t in told],
+                         [(6, "dddddddddd")])
+
+    def test_a_dry_run_posts_and_keeps_nothing(self):
+        told = self.tell([5], {5: "a" * 40}, live=False)
+        self.assertEqual([t["pr"] for t in told], [5])
+        self.assertEqual(self.github.writes, [])
+        self.assertEqual(len(self.tell([5], {5: "a" * 40})), 1)
+
+    def test_a_refused_comment_is_tried_again(self):
+        self.github.refuse = "403"
+        told = self.tell([5], {5: "a" * 40})
+        self.assertEqual(told[0]["result"], "refused: 403")
+        self.github.refuse = None
+        self.assertEqual(self.tell([5], {5: "a" * 40})[0]["result"], "done")
+
+    def test_a_layer_and_its_base_in_one_train_are_each_told_once(self):
+        told = self.tell([5, 5, 9], {5: "a" * 40, 9: "e" * 40})
+        self.assertEqual([t["pr"] for t in told], [5, 9])
 
 
 class ReturnedHead(unittest.TestCase):
