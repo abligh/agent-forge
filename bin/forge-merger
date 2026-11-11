@@ -3807,6 +3807,25 @@ def save_greens(state_dir, greens):
         pass
 
 
+def gated_instances(repo, pr, main_tip, cache, run=sh):
+    """The (context, creator) of each gated instance that applies to
+    `pr` (see instance_wait): only these need its head's statuses."""
+    labels, found = None, []
+    for context, creator, globs, label in GATED:
+        applies = globs is None and label is None
+        if not applies and label:
+            labels = label_names(pr) if labels is None else labels
+            applies = label in labels
+        if not applies and globs:
+            paths = changed_files(repo, main_tip, pr, cache, run)
+            applies = paths is None or any(
+                fnmatch.fnmatchcase(path, glob)
+                for path in paths for glob in globs)
+        if applies:
+            found.append((context, creator))
+    return found
+
+
 def instance_wait(repo, pr, main_tip, github, cache, run=sh):
     """Why `pr` waits for an instance's context (checks.instances.<name>.
     gate), or None. An instance applies to a pull request when its
@@ -3820,19 +3839,7 @@ def instance_wait(repo, pr, main_tip, github, cache, run=sh):
     instance's run can take an hour. Seen on 2026-11-05: a pull request
     merged with a second platform's run still pending, and broke that
     platform's default branch for nearly three hours."""
-    labels = None
-    for context, creator, globs, label in GATED:
-        applies = globs is None and label is None
-        if not applies and label:
-            labels = label_names(pr) if labels is None else labels
-            applies = label in labels
-        if not applies and globs:
-            paths = changed_files(repo, main_tip, pr, cache, run)
-            applies = paths is None or any(
-                fnmatch.fnmatchcase(path, glob)
-                for path in paths for glob in globs)
-        if not applies:
-            continue
+    for context, creator in gated_instances(repo, pr, main_tip, cache, run):
         state, said, sha = instance_verdict(repo, pr, main_tip, github,
                                             context, creator, run)
         if state == "success":
@@ -5855,9 +5862,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     instance_held = []
     if GATED:
         files = {}
-        github.prefetch(status_path(pr["headRefOid"]) for pr in candidates)
-        for pr in list(candidates):
+        for pr in candidates:
             have_head(repo, pr, run)
+        # Only the heads a gated instance applies to: the others' statuses
+        # are never read, and fetching every candidate's spent the App's
+        # hourly API allowance (2026-11-11).
+        github.prefetch(status_path(pr["headRefOid"]) for pr in candidates
+                        if gated_instances(repo, pr, main_tip, files, run))
+        for pr in list(candidates):
             why = instance_wait(repo, pr, main_tip, github, files, run)
             if why:
                 held[str(pr["number"])] = why
