@@ -4301,7 +4301,8 @@ def last_trains(last):
 
 def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                trains=None, red=frozenset(), restacks=None, run=sh,
-               files=None, note=None, force_merges=True, started=None):
+               files=None, note=None, force_merges=True, started=None,
+               acting=None):
     """designs/0047: (entries, sizes, events) for the trains this tick,
     end to end from `main_tip`: the predictions as `predict_ahead` makes
     them, each with `train` (its train's place) and `carriage` (its
@@ -4318,7 +4319,12 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
     can't board doesn't cut them again every tick. `started(sha, tree)`
     says whether the build check has started a train's top (or has a
     verdict on its tree); without it, only the first train is kept for
-    an urgent one. `force_merges` false
+    an urgent one. `acting`, the pull request the Merger acts on (its
+    update or own run in flight), stays first in a train cut afresh,
+    ahead of urgent ones: the Merger merges it next whatever the train
+    says, and a train that didn't start with it would be predicted on a
+    tree the default branch never reaches (designs/0047, second
+    amendment of 2026-11-11). `force_merges` false
     (a dry run, whose trains the batches' merges don't follow) keeps the
     trains when the default branch moves.
 
@@ -4441,7 +4447,12 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
         if len(entries) > start:
             sizes.append(len(entries) - start)
     cut = []
-    pool = sorted(carriages, key=lambda c: not urgent(c[0]))
+    # Urgent ones first, but never ahead of the one the Merger acts on:
+    # on 2026-11-11 a nightly's fix headed a train while the Merger
+    # waited on another member's own run, merged that member on its own
+    # green, and the green train's prediction no longer held.
+    pool = sorted(carriages, key=lambda c: (
+        acting is None or c[0]["number"] != acting, not urgent(c[0])))
     behind = set()
     while len(sizes) < trains:
         start, touched, kind = len(entries), set(), None
@@ -6516,7 +6527,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 restacks=restacks if PREDICT_RESTACKED else None, run=run,
                 files=files, note=note, force_merges=TRAINS == "live",
                 started=lambda sha, tree: ahead_started(check_state, sha,
-                                                        tree))
+                                                        tree),
+                acting=waiting_on if acting else None)
             files, note = {}, {}
             if TRAINS == "live" and not searching and ahead_queue:
                 # designs/0047: trains, cut once and kept.

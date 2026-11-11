@@ -7748,12 +7748,13 @@ class Trains(RepoCase):
         return self.change(number, "shared.txt", text, created)
 
     def cut(self, carriages, last=None, open_numbers=None, check=None,
-            started=None):
+            started=None, acting=None):
         heads = {p["number"]: p["headRefOid"]
                  for c in carriages for p in c}
         return m.cut_trains(self.repo.path, self.repo.main_tip(), carriages,
                             last, heads, open_numbers or set(heads),
-                            red=check or frozenset(), started=started)
+                            red=check or frozenset(), started=started,
+                            acting=acting)
 
     def said(self, entries, sizes):
         """ahead.json as a tick writes it for these trains."""
@@ -7991,6 +7992,20 @@ class Trains(RepoCase):
         six = self.change(6, "y.txt", "y\n")
         entries, sizes, _ = self.cut([[six], [hot]])
         self.assertEqual(self.numbers(entries, sizes), [[8, 6]])
+
+    def test_the_one_the_merger_acts_on_stays_ahead_of_an_urgent_one(self):
+        # 2026-11-11: the Merger waited on #5's own run while a nightly's
+        # fix (#8) headed the train cut behind it. #5 then merged on its
+        # own green, out of the train's order, and the green train no
+        # longer predicted the default branch. #5 stays first.
+        hot = labelled(self.change(8, "u.txt", "u\n"), "Priority:urgent")
+        six = self.change(6, "y.txt", "y\n")
+        entries, sizes, _ = self.cut([[self.item()], [six], [hot]],
+                                     acting=5)
+        self.assertEqual(self.numbers(entries, sizes), [[5, 8, 6]])
+        # Without one in flight, the urgent one leads as before.
+        entries, sizes, _ = self.cut([[self.item()], [six], [hot]])
+        self.assertEqual(self.numbers(entries, sizes), [[8, 5, 6]])
 
     def test_an_urgent_one_heads_the_first_train_not_started(self):
         # Train 2 hasn't started: #9 heads it again, and it fills up
