@@ -4189,11 +4189,12 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
     it, as `decide` will once it is reached, and says `restacked`;
     only if that fails too is it a conflict."""
     depth = AHEAD_DEPTH if depth is None else depth
-    entries, parent = [], main_tip
+    entries, parent, graph = [], main_tip, None
     for pr in queue:
         if len(entries) > depth:
             break
-        entry, failed = predict_one(repo, parent, pr, restacks, run)
+        entry, failed = predict_one(repo, parent, pr, restacks, run,
+                                    graph)
         if failed == "conflict" and entries \
                 and pr["number"] not in overdue:
             # It conflicts with one predicted ahead of it: skip it,
@@ -4202,20 +4203,32 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
         if entry is None:
             break
         entries.append(entry)
-        parent = entry["sha"]
+        parent, graph = entry["sha"], entry.get("graph")
     write_ahead_refs(repo, entries, run)
     return entries
 
 
-def predict_one(repo, parent, pr, restacks=None, run=sh):
+def predict_one(repo, parent, pr, restacks=None, run=sh, graph=None):
     """(entry, None) for `pr`'s head merged onto `parent`, as one of
     `predict_ahead`'s entries, its commit made (but no ref written); or
     (None, "conflict") when it conflicts, and (None, "git") when git
-    failed otherwise. `restacks` is `predict_ahead`'s."""
+    failed otherwise. `restacks` is `predict_ahead`'s.
+
+    `graph` is the previous entry's "graph": a commit with `parent`'s
+    tree whose history also holds every head predicted so far. The
+    head is merged onto that, so a stack's layer merges from its real
+    merge base, the lower layer's head, not from where the stack left
+    the default branch: from there, its copy of the lower layer's
+    changes met their predicted copy as a conflict wherever it changed
+    those lines again, and the layer was left out of its base's train.
+    The entry's own commit keeps `parent` as its only parent, so a
+    head the Merger updates (same tree) is still the same prediction
+    and isn't built again; the entry's "graph" is the next one's."""
     head = pr["headRefOid"]
     have_head(repo, pr, run)
+    graph = graph or parent
     merged = git(repo, "merge-tree", "--write-tree", "--no-messages",
-                 parent, head, run=run)
+                 graph, head, run=run)
     restacked = None
     if merged.returncode == 1 and pr["number"] in (restacks or {}):
         # A layer still holds the lower layer's own commits, which
@@ -4236,6 +4249,17 @@ def predict_one(repo, parent, pr, restacks=None, run=sh):
     if made.returncode != 0 or len(sha) != 40:
         return None, "git"
     entry = {"pr": pr["number"], "head": head, "sha": sha, "tree": tree}
+    if not is_ancestor(repo, head, graph, run):
+        made = run(["git", "-C", repo, "commit-tree", "--no-gpg-sign",
+                    tree, "-p", graph, "-p", head, "-m",
+                    "forge-merger: #%d ahead, with its head"
+                    % pr["number"]], env=ahead_env())
+        joined = (made.stdout or "").strip()
+        if made.returncode != 0 or len(joined) != 40:
+            return None, "git"
+        entry["graph"] = joined
+    elif graph != parent:
+        entry["graph"] = graph
     if restacked:
         # designs/0042: the tree the restack will give, which the
         # head's own check doesn't test.
@@ -4426,6 +4450,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                            % (min(jump), keep)))
             prior = prior[:keep]
     entries, sizes, used, parent = [], [], set(), main_tip
+    graph = None
     for k, train in enumerate(prior[:trains]):
         start = len(entries)
         for carriage in train:
@@ -4454,7 +4479,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                         why = "pushed %s mid-train" % pr["headRefOid"][:10]
                 if why is None:
                     entry, failed = predict_one(repo, parent, pr, restacks,
-                                                run)
+                                                run, graph)
                     if entry is None:
                         why = "no longer merges cleanly onto train %d's " \
                             "base" % (k + 1)
@@ -4469,7 +4494,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                 entry.update(train=k, carriage=carriage[0].get("pr"))
                 entries.append(entry)
                 used.add(n)
-                parent = entry["sha"]
+                parent, graph = entry["sha"], entry.get("graph")
         if len(entries) > start:
             sizes.append(len(entries) - start)
     cut = []
@@ -4510,15 +4535,16 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                                    and not (kind and urgent(members[0]))
                                    and changed & touched):
                 continue
-            made, top = [], parent
+            made, top, top_graph = [], parent, graph
             for pr in members:
-                entry, failed = predict_one(repo, top, pr, restacks, run)
+                entry, failed = predict_one(repo, top, pr, restacks, run,
+                                            top_graph)
                 if entry is None:
                     break
                 entry.update(train=len(sizes),
                              carriage=members[0]["number"])
                 made.append(entry)
-                top = entry["sha"]
+                top, top_graph = entry["sha"], entry.get("graph")
             if not made:
                 continue
             left = [pr["number"] for pr in carriage
@@ -4536,7 +4562,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             touched |= changed
             kind = urgent(members[0]) if not size else \
                 kind and urgent(members[0])
-            parent = top
+            parent, graph = top, top_graph
             if len(entries) - start >= AHEAD_BATCH:
                 break
         if len(entries) == start:
