@@ -322,3 +322,92 @@ run in flight, a layer goes first, as before.
 **Order of work.** One pull request: the queue's order in
 `forge-merger`, its usage text, docs/config.md's `merge.stacks`, and a
 test of a layer coming back while a batch it isn't in is running.
+
+## Amendment (2026-11-11, fourth): stacks come from commits
+
+* Status: asked for by Alex Bligh, 2026-11-11, in the terminal
+  session ("you should just look at every PR, find out what commit it
+  is based on, and build your own graph").
+
+**What went wrong.** The Merger took a stack from GitHub's base
+branches, which record only what a pull request was opened against. On
+one project on 2026-11-11, a stack's base was brought up to date with
+`main` by its author, and its second layer was not. That layer then
+conflicted with its own base's head. The Merger found this only when
+it predicted a train: the base boarded alone, and the layer and the
+five above it were left behind (`TRAIN-LEFT`), with nobody told. The
+layer's hold still read `stacked on #N`, as if nothing were wrong, for
+an hour, until it was found by hand. Of 150 open pull requests that
+evening, 85 were layers once that one was restacked: 78 had their
+base's current head, 6 lacked it but merged with it cleanly, and 1 more
+conflicted.
+
+**The change.**
+1. **Stacks are checked against commits.** Each tick, for every open
+   pull request, the Merger lists its commits not on `main`. A pull
+   request GitHub has on another open one's branch is built on it when
+   it holds any of that one's commits, its head or an older head;
+   otherwise its commits put it on `main`. A pull request GitHub has
+   on `main` is built on an open one whose head it holds, the nearest
+   of them. Only a head counts there. Two pull requests can share
+   commits that no open pull request owns, such as a merged pull
+   request's own commits, which `main` holds as one squash commit, and
+   those say nothing about order: a replay of a real day that matched
+   shared commits alone stacked unrelated pull requests on each other,
+   and merged fewer. A layer whose base merged as a squash is handled
+   by `stacks.json` as before.
+2. **GitHub's base becomes a cross-check.** A pull request GitHub has
+   on `main` but that is built on an open one is held as stacked on
+   it. GitHub merges a pull request into the base GitHub has, so one
+   GitHub has on another open pull request's branch keeps that base,
+   whatever its commits say. Either way the author is told once per
+   head (`stack-notices.json`), naming both bases.
+3. **A layer behind its base is brought up to date while the base is
+   still open.** This applies when the layer lacks its base's head but
+   that head merges into it cleanly. If a reviewer's approval covers
+   the layer's head, the Merger merges the base's head into it through
+   GitHub's merges API, as RESTACK already does once a base has
+   merged. It does this once per approval and head
+   (`stale-restacked.json`) and says so on the pull request. git made
+   every line, and a merge of a lower layer's head covers an approval
+   (`covers_head`'s `below`), so no review is needed again. The layers
+   above follow on later ticks, one write a layer a tick, each once the
+   layer below it is up to date. A layer without an approval is only
+   told, once. A layer in the Merger's predictions (`ahead.json`) is
+   left alone: its prediction already merges the base's head, and a
+   push would move a train member.
+4. **A layer whose base's head conflicts with it is told at once.** Its
+   author is told, naming the paths, while its base is still open, not
+   when the base merges, once per head and base head. Its hold says so
+   (`stacked on #N, but it conflicts with #N's head ...`), it is never
+   predicted (so it isn't silently left behind a train), and the
+   layers above it stay held as stacked. It is told rather than handed
+   back: a hand-back would keep the Merger's own restack off that head
+   once the base merges, and in a replay such layers then waited for
+   ever.
+5. **The record and the flow page show it.** The record's `stack_graph`
+   holds each layer's base, whether it is behind, and what conflicts.
+   `forge-flow`'s stack tree is drawn from it, and marks a layer
+   "behind, merges cleanly", or, in red, "conflicts with #N in <paths>".
+
+6. **A restacked layer is covered when checked ahead.** The check
+   before a batch (designs/0035, fourth amendment) judged a layer's
+   approval without the stack's merged heads, so a layer the Merger
+   had restacked went back to its reviewer as merging "nothing from
+   `main`", though it would have merged. It now gets the same heads as
+   the merge-time check. Without this, item 3 lost merges in the
+   replay below: its pushes made more such layers.
+
+**Replay.** One real day (2026-11-10 18:00Z, 24 hours, 211 pull
+requests, 84 of them stacked) was replayed with the project's
+settings: 190 merges without this change, 194 with it; median approval
+to merge 64 minutes, 58 with it; started trains re-cut 11 times, 3
+with it. The same day with item 3's pushes but without item 6 gave
+167, and without the pushes 191.
+
+This replaces telling people to restack with doing it for them. Only a
+conflict still needs the author.
+
+**Cost.** One `git rev-list` per open pull request a tick, one fetch of
+any heads the checkout lacks, and one `git merge-tree` per layer that
+is behind.

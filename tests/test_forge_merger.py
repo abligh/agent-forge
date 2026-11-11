@@ -6404,6 +6404,28 @@ class Stacks(RepoCase):
         self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
                          [(6, "UPDATE")])
 
+    def test_a_restacked_layer_is_covered_when_checked_ahead(self):
+        # The Merger's restack merges #5's final head into #6 after its
+        # approval: checked ahead with the stack's merged heads it is
+        # covered, as at merge time; without them it would go back to
+        # its reviewer as merging "nothing from main".
+        self.lower_moves_on(self.lines(l8="U"), self.lines(l3="Y"))
+        self.repo.branch("upper", "upper")
+        head = self.repo.merge("feature")
+        self.repo.publish_pr(6, head)
+        layer = self.layer("main", head=head)
+        approval = m.approval_of(layer)
+        os.makedirs(self.state, exist_ok=True)
+        gate, m.GATE = m.GATE, []
+        self.addCleanup(setattr, m, "GATE", gate)
+        self.assertIsNone(m.checked_ahead(
+            self.state, self.repo.path, layer, approval, None, {}, m.sh,
+            below=(self.lower,)))
+        os.remove(os.path.join(self.state, m.CHECKED_FILE))
+        failed = m.checked_ahead(self.state, self.repo.path, layer, approval,
+                                 None, {}, m.sh)
+        self.assertIn("merges nothing from main", failed[1])
+
     def test_a_restack_is_tried_once_per_head(self):
         self.lower_moves_on(self.lines(l8="U"), self.lines(l3="Y"))
         self.tick([self.layer("main")], minutes=2)
@@ -6418,7 +6440,10 @@ class Stacks(RepoCase):
         self.assertNotIn("/merges", self.github.writes[0][1])
 
     def test_a_restack_that_conflicts_goes_to_the_author(self):
-        # #5 later changes the line #6 changed: a real conflict.
+        # #5 later changes the line #6 changed: a real conflict. Its
+        # author was told while #5 was still open (designs/0025,
+        # amendment of 2026-11-11); that was a notice, so the restack
+        # still hands it back once #5 has merged.
         self.lower_moves_on(self.lines(l8="U"), self.lines(l8="V"))
         record, _ = self.tick([self.layer("main")], minutes=2)
         self.assertEqual([(d["action"], d.get("to"), d.get("result"))
@@ -6431,6 +6456,156 @@ class Stacks(RepoCase):
         self.assertIn("Merge #5's final head, %s, into the branch first, "
                       "then `main`." % self.lower[:10], body)
         self.assertNotIn("/merges", "".join(w[1] for w in self.github.writes))
+
+    def test_a_layer_behind_its_open_base_that_conflicts_goes_back_at_once(
+            self):
+        self.repo.branch("main", "main")
+        self.repo.commit("l.txt", self.lines(l2="2"), "main l.txt")
+        self.repo.push("main")
+        self.repo.branch("feature", "feature")
+        self.repo.merge("origin/main")
+        first = self.repo.commit("l.txt", self.lines(), "lower l.txt")
+        self.repo.branch("upper", first)
+        self.upper = self.repo.commit("l.txt", self.lines(l8="U"),
+                                      "upper l.txt")
+        self.repo.publish_pr(6, self.upper)
+        self.repo.branch("feature", "feature")
+        self.lower = self.repo.commit("l.txt", self.lines(l8="V"),
+                                      "lower again")
+        self.repo.publish_pr(5, self.lower)
+        record, lines = self.tick([self.bottom(), self.layer()])
+        self.assertEqual([(d["action"], d.get("kind"), d["pr"],
+                           d.get("result")) for d in record["stale"]],
+                         [("NOTICE", "conflict", 6, "done")])
+        # Not a hand-back: the Merger's own restack stays open to it.
+        said = os.path.join(self.state, "handed-back.json")
+        if os.path.exists(said):
+            with open(said) as handle:
+                self.assertNotIn("6", json.load(handle))
+        self.assertEqual(record["held"]["6"], m.STALE_REASON % (
+            5, 5, self.lower[:10]))
+        self.assertEqual(record["stack_graph"]["6"], {
+            "base": 5, "behind": True, "conflicts": ["l.txt"]})
+        body = [w for w in self.github.writes if w[1].endswith(
+            "/issues/6/comments")][0][2]["body"]
+        self.assertIn("conflicts in: l.txt", body)
+        self.assertTrue(any(l.startswith("STALE #6:") for l in lines))
+        # Once a head: the next tick says nothing more, and still holds.
+        record, _ = self.tick([self.bottom(), self.layer()], minutes=1)
+        self.assertNotIn("stale", record)
+        self.assertEqual(record["held"]["6"], m.STALE_REASON % (
+            5, 5, self.lower[:10]))
+        self.assertFalse([w for w in self.github.writes
+                          if w[1].endswith("/issues/6/comments")])
+
+    def stale_but_clean(self):
+        """#6 is built on #5's first head; #5 then changes another file:
+        #6 is behind #5, and #5's head merges into it cleanly."""
+        self.repo.branch("feature", "feature")
+        self.lower = self.repo.commit("v.txt", "lower again\n", "lower again")
+        self.repo.publish_pr(5, self.lower)
+
+    def test_an_approved_layer_behind_its_open_base_is_brought_up_to_date(
+            self):
+        self.stale_but_clean()
+        record, lines = self.tick([self.bottom(), self.layer()])
+        self.assertEqual(record["stack_graph"]["6"], {
+            "base": 5, "behind": True, "conflicts": []})
+        self.assertEqual([(d["action"], d["pr"], d.get("result"))
+                          for d in record["stale"]],
+                         [("RESTACK", 6, "done")])
+        self.assertEqual(self.github.writes[0], (
+            "POST", SLUG + "/merges", {
+                "base": "b6", "head": self.lower,
+                "commit_message": "Merge #5's head %s into b6"
+                                  % self.lower[:10]}))
+        note = self.github.writes[1][2]["body"]
+        self.assertIn("Merged #5's head %s into this" % self.lower[:10], note)
+        self.assertIn("no review is needed again", note)
+        self.assertIn("STALE #6: behind #5; merged #5's head %s into it"
+                      % self.lower[:12], lines)
+        self.assertEqual(record["held"]["6"], "stacked on #5")
+        # Once per approval and head, and not said again.
+        record, _ = self.tick([self.bottom(), self.layer()], minutes=1)
+        self.assertNotIn("stale", record)
+        self.assertNotIn("/merges", "".join(w[1] for w in self.github.writes))
+        # GitHub's merge is covered by the approval: no hand-back to the
+        # reviewer once the layer's head is the merge.
+        self.repo.branch("upper", "upper")
+        head = self.repo.merge("feature")
+        self.repo.publish_pr(6, head)
+        self.assertTrue(m.covers_head(
+            self.repo.path, self.upper, head, "refs/remotes/origin/main",
+            m.sh, (self.lower,))[0])
+        record, _ = self.tick([self.bottom(), self.layer(head=head)],
+                              minutes=2)
+        self.assertEqual(record["stack_graph"]["6"]["behind"], False)
+        self.assertNotIn("stale", record)
+
+    def test_an_unapproved_layer_behind_its_base_is_told_once(self):
+        self.stale_but_clean()
+        record, _ = self.tick([self.bottom(), self.layer(reviews=[])])
+        self.assertEqual([(d["action"], d.get("kind"), d.get("result"))
+                          for d in record["stale"]],
+                         [("NOTICE", "behind", "done")])
+        self.assertNotIn("/merges", "".join(w[1] for w in self.github.writes))
+        self.assertIn("This layer is behind #5",
+                      self.github.writes[0][2]["body"])
+        record, _ = self.tick([self.bottom(), self.layer(reviews=[])],
+                              minutes=1)
+        self.assertNotIn("stale", record)
+        self.assertFalse([w for w in self.github.writes
+                          if "/issues/6/" in w[1] or "/merges" in w[1]])
+
+    def test_a_layer_in_the_mergers_predictions_is_not_pushed_to(self):
+        self.stale_but_clean()
+        os.makedirs(self.state, exist_ok=True)
+        with open(os.path.join(self.state, "ahead.json"), "w") as handle:
+            json.dump({"entries": [{"pr": 5}, {"pr": 6}]}, handle)
+        record, _ = self.tick([self.bottom(), self.layer()])
+        self.assertNotIn("stale", record)
+        self.assertNotIn("/merges", "".join(w[1] for w in self.github.writes))
+
+    def test_a_hidden_stack_is_held_as_stacked_and_its_author_told(self):
+        # #6 is on main on GitHub, but built on #5's head.
+        record, lines = self.tick([self.bottom(), self.layer("main")])
+        self.assertEqual(record["held"]["6"], "stacked on #5")
+        self.assertEqual([(d["action"], d.get("kind"), d.get("github"),
+                           d.get("graph"), d.get("result"))
+                          for d in record["stale"]],
+                         [("NOTICE", "mismatch", None, 5, "done")])
+        body = [w for w in self.github.writes if w[1].endswith(
+            "/issues/6/comments")][0][2]["body"]
+        self.assertIn("GitHub has this based on `main`, but its commits say "
+                      "it is built on #5", body)
+        self.assertIn("STACK-BASE #6: GitHub has it on `main`, its commits "
+                      "on #5", lines)
+        self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
+                         [(5, "MERGE")])
+        record, _ = self.tick([self.bottom(), self.layer("main")], minutes=1)
+        self.assertNotIn("stale", record)
+
+    def test_github_base_kept_when_the_commits_disagree(self):
+        # #6 is on b5 on GitHub, but none of #5's commits are in it.
+        self.repo.branch("solo", "main")
+        self.upper = self.repo.commit("s.txt", "solo\n", "solo")
+        self.repo.publish_pr(6, self.upper)
+        record, lines = self.tick([self.bottom(), self.layer()])
+        self.assertEqual(record["held"]["6"], "stacked on #5")
+        self.assertEqual([(d["action"], d.get("github"), d.get("graph"))
+                          for d in record["stale"]],
+                         [("NOTICE", 5, None)])
+        body = [w for w in self.github.writes if w[1].endswith(
+            "/issues/6/comments")][0][2]["body"]
+        self.assertIn("with none of #5's commits", body)
+        self.assertIn("goes by GitHub's base", body)
+
+    def test_a_layer_whose_base_merged_is_on_main_in_the_graph(self):
+        self.merge_bottom()
+        record, _ = self.tick([self.layer()], minutes=1)
+        self.assertEqual(record["decisions"][0]["action"], "RETARGET")
+        self.assertNotIn("6", record.get("stack_graph", {}))
+        self.assertNotIn("stale", record)
 
     def github_restacks(self):
         """What GitHub's merges API makes of the RESTACK: #6 holds #5's

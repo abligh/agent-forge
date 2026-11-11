@@ -168,6 +168,27 @@ branch asked about: one with no merged pull request for an hour, the
 rest, and those the Merger merged, for 30 days, so a layer that left
 its stack doesn't come back).
 
+**Stacks are checked against commits** (designs/0025, amendment of
+2026-11-11). Each tick, every open pull request's commits not on
+`main` are listed. One GitHub has on another open pull request's branch
+is built on it when it holds any of that one's commits, its head or an
+older one. One GitHub has on `main` that holds an open one's head is
+held as stacked on it, the nearest such. One GitHub has on another
+branch keeps that base, since GitHub merges into it. Where they differ,
+the author is told once (`STACK-BASE`, `stack-notices.json`).
+A layer that lacks its base's head (`STALE`) is handled while the base
+is still open:
+- if that head conflicts with it, it is held and its author told at
+  once, naming the paths (once per head and base head);
+- if the merge is clean and a reviewer's approval covers its head, the
+  Merger merges the base's head into it through GitHub's merges API,
+  once per approval and head (`stale-restacked.json`), and the layers
+  above follow on later ticks;
+- without an approval, it is told once;
+- a layer in `ahead.json` is left alone.
+The record's `stack_graph` keeps each layer's base, `behind` and
+`conflicts`, and `stale` what was done.
+
 **`--dry-run` writes nothing to GitHub.** It reads with the Merger's
 App too, since a dry run is how to watch the Merger before it acts.
 
@@ -3309,7 +3330,7 @@ def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
 
 
 def checked_ahead(state_dir, repo, pr, approval, main_tip, env, run=sh,
-                  regenerated=None, when=None):
+                  regenerated=None, when=None, below=()):
     """designs/0035, fourth amendment: (to, reason) when `pr` would be
     handed back at merge time for something its place in the queue
     doesn't change (its approval doesn't cover its head, or a
@@ -3317,7 +3338,11 @@ def checked_ahead(state_dir, repo, pr, approval, main_tip, env, run=sh,
     approved commit, title and body (CHECKED_FILE); merge time checks
     again, as before. A gate's refusal for now (GATE_RETRY_EXIT) comes
     back as (to, reason, True) and is checked again GATE_RETRY after
-    `when`, the clock it was checked by."""
+    `when`, the clock it was checked by. `below` are the final heads of
+    a stack's merged layers, as at merge time: a layer the Merger
+    restacked, by a merge of the layer below's head after its approval,
+    is covered, as `decide` finds it. Without them, a replay handed
+    such layers back to their reviewers as merging "nothing from main"."""
     approved = (approval.get("commit") or {}).get("oid")
     approver = APPROVERS.get(login(approval), "a reviewer")
     if not approved:
@@ -3332,8 +3357,8 @@ def checked_ahead(state_dir, repo, pr, approval, main_tip, env, run=sh,
     if fetch_pr(repo, pr["number"], pr["headRefOid"], run).returncode != 0:
         return None
     covered, why = covers_head(repo, approved, pr["headRefOid"],
-                               "refs/remotes/origin/" + MAIN, run, (),
-                               regenerated)
+                               "refs/remotes/origin/" + MAIN, run,
+                               tuple(below), regenerated)
     if covered is None:
         return None
     failed, retry = (None if covered else (approver, why)), False
@@ -3394,7 +3419,8 @@ def layers_below(layer, prs):
 
 
 def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
-                 regenerated=None, rules=None, green=None, gated=None):
+                 regenerated=None, rules=None, green=None, gated=None,
+                 conflicted=()):
     """designs/0035: the layers stacked on `base`, climbing the stack,
     that would be eligible but for their base, each with an approval
     that covers its head, as [(pull request, approval)]. The first that
@@ -3403,7 +3429,9 @@ def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
     when it could merge as it is but for the batch's own check: with
     `gated` (`instance_wait`), a layer still waiting for a gated
     instance's context isn't, since the batch's run is not that
-    instance's, and it would leave the batch at its merge."""
+    instance's, and it would leave the batch at its merge. Nor is one in
+    `conflicted`, whose base's head conflicts with it (designs/0025,
+    amendment of 2026-11-11): it could only be left behind."""
     layers, below, numbers = [], base, {base["number"]}
     while True:
         above = [pr for pr in prs
@@ -3411,6 +3439,8 @@ def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
         if len(above) != 1:
             return layers
         layer = above[0]
+        if layer["number"] in conflicted:
+            return layers
         approval, _ = eligible(layer, open_numbers - numbers, when,
                                any_base=True)
         oid = ((approval or {}).get("commit") or {}).get("oid")
@@ -5862,6 +5892,317 @@ def resolve_ahead(repo, state_dir, queue, skip, approvals, main_tip, github,
     return []
 
 
+# designs/0025, amendment of 2026-11-11: stacks are read from commits.
+GRAPH_FILE = "stack-graph.json"
+STACK_NOTICES_FILE = "stack-notices.json"
+STALE_RESTACKED_FILE = "stale-restacked.json"
+STALE_PUSH = True
+STALE_REASON = ("stacked on #%d, but it conflicts with #%d's head %s, so "
+                "it can't be restacked")
+STALE_DETAIL = ("This layer was built on an older head of #%d, and #%d has "
+                "moved since. Merging #%d's head %s into it conflicts in: "
+                "%s. Merge `%s` into this branch, resolve those files, and "
+                "push; the Merger takes the stack from there.")
+STALE_RESTACK_NOTE = ("Merged #%d's head %s into this, cleanly, on top of "
+                      "%s: #%d moved after this layer was built on it. git "
+                      "made every line of the merge, so the approval of "
+                      "the old head still covers the new one, and no "
+                      "review is needed again.\n\n%s")
+CONFLICT_NOTE = ("Not merging %s yet: it conflicts with the head of the "
+                 "pull request it is built on.\n\n%s The Merger holds it, "
+                 "and the layers above it, until then.\n\n%s")
+BEHIND_NOTE = ("Not-a-review\n\nThis layer is behind #%d: it lacks #%d's "
+               "head %s, which merges into it cleanly. It has no approval "
+               "yet, so the Merger won't push to it; merge `%s` into this "
+               "branch when you next push.\n\n%s")
+MISMATCH_NOTE = ("Not-a-review\n\nGitHub has this based on %s, but its "
+                 "commits say %s. The Merger %s. Please make the base on "
+                 "GitHub match what the branch is built on (retarget the "
+                 "pull request, or merge the right head in).\n\n%s")
+
+
+def commit_graph(repo, prs, main_ref, run=sh):
+    """designs/0025, amendment of 2026-11-11: each open pull request's
+    base checked against its commits. {number: {"base": the number of
+    the open pull request it is built on, or None for the default
+    branch, "behind": whether it lacks that base's head now,
+    "conflicts": the paths a merge of the base's head into it conflicts
+    in, when it is behind, else []}}.
+
+    A pull request's own commits are those not on the default branch
+    (`git rev-list head ^main`). One GitHub has on another open pull
+    request's branch is built on it when it holds any of that one's own
+    commits, its head or an older one; otherwise its commits say it is
+    on the default branch. One GitHub has on the default branch is built
+    on an open pull request whose head it holds, the nearest of them (the
+    one with the most own commits). Only a head counts there: two pull
+    requests can share commits that are no open one's (a merged pull
+    request's own commits, which the default branch holds as one squash
+    commit), and those say nothing about which is below which; a replay
+    of a real day, matching shared commits alone, stacked unrelated
+    pull requests on each other. Heads the checkout lacks are fetched in
+    one go by SHA; a pull request whose head can't be read is left
+    out."""
+    numbered = [pr for pr in prs if pr.get("headRefOid")]
+    missing = [pr["headRefOid"] for pr in numbered if git(
+        repo, "cat-file", "-e", pr["headRefOid"] + "^{commit}",
+        run=run).returncode != 0]
+    if missing:
+        git(repo, "fetch", "-q", "origin", *missing, run=run)
+    own = {}
+    for pr in numbered:
+        got = git(repo, "rev-list", pr["headRefOid"], "^" + main_ref,
+                  run=run)
+        if got.returncode == 0:
+            own[pr["number"]] = set(got.stdout.split())
+    by_number = {pr["number"]: pr for pr in numbered}
+    heads = {by_number[n]["headRefOid"]: n for n in own}
+    graph = {}
+    for n, commits in own.items():
+        on = github_base(by_number[n], prs)
+        if on is False:
+            continue
+        if on is not None and on in own:
+            base = on if own[on] & commits else None
+        else:
+            below = {heads[c] for c in commits if c in heads} - {n}
+            base = max(below, key=lambda b: (len(own[b]), b)) \
+                if below else None
+        node = {"base": base, "behind": False, "conflicts": []}
+        if base is not None:
+            base_head = by_number[base]["headRefOid"]
+            if base_head not in commits:
+                node["behind"] = True
+                merged = git(repo, "merge-tree", "--write-tree",
+                             "--name-only", "--no-messages",
+                             by_number[n]["headRefOid"], base_head, run=run)
+                if merged.returncode == 1:
+                    node["conflicts"] = sorted(conflicted_paths(
+                        merged.stdout)) or ["(unknown paths)"]
+        graph[n] = node
+    return graph
+
+
+def github_base(pr, prs):
+    """The number of the open pull request whose head branch `pr` is
+    based on on GitHub, None for the default branch, or False for a
+    branch no open pull request has (a base that merged: the stack's
+    record handles it)."""
+    branch = pr.get("baseRefName")
+    if branch in (None, MAIN):
+        return None
+    for other in prs:
+        if other.get("headRefName") == branch and other is not pr:
+            return other["number"]
+    return False
+
+
+def apply_graph(prs, graph):
+    """Read the stacks from `graph` (`commit_graph`): a pull request
+    GitHub has on the default branch that is built on an open one is
+    taken as stacked on it, its `baseRefName` set to that one's head
+    branch (GitHub's kept as `githubBaseRefName`), so every stack rule
+    holds it until its base merges. A pull request GitHub has on another
+    open one's branch keeps it, whatever its commits say: GitHub merges
+    into the base it has, so the Merger can't act on another. Returns
+    {number: (github's base, the graph's base)} for each that disagree,
+    the base being a number or None for the default branch."""
+    by_number = {pr["number"]: pr for pr in prs}
+    differ = {}
+    for pr in prs:
+        node = graph.get(pr["number"])
+        if node is None:
+            continue
+        on = github_base(pr, prs)
+        if on is False or on == node["base"]:
+            continue
+        differ[pr["number"]] = (on, node["base"])
+        if on is None and node["base"] in by_number:
+            pr["githubBaseRefName"] = pr.get("baseRefName")
+            pr["baseRefName"] = by_number[node["base"]]["headRefName"]
+    return differ
+
+
+def stale_layers(state_dir, repo, prs, graph, said, github, live, held,
+                 when, out, run=sh):
+    """designs/0025, amendment of 2026-11-11: act on each layer that is
+    behind its base (`graph`), at most one write a layer a tick.
+
+    A layer whose base's head conflicts with it is held, and its author
+    told at once, naming the paths, rather than when its base merges;
+    the layers above it stay held as stacked. It is told, not handed
+    back: a hand-back would keep the Merger's own RESTACK off its head
+    once the base merges, and a replay of a real day showed such layers
+    then waited for ever. A clean one with a reviewer's
+    approval that covers its head is brought up to date by the Merger
+    itself: GitHub's merges API merges the base's head into its branch,
+    once per approval and head (STALE_RESTACKED_FILE), and says so on
+    it. git made every line, and a merge of a lower layer's head covers
+    the head (`covers_head`), so no review is needed again. A layer
+    without one is told once (STACK_NOTICES_FILE). A layer in a train or
+    the Merger's predictions (ahead.json) is left alone: its prediction
+    already merged the base's head, and a push would move it. The layers
+    above follow on later ticks, each once the one below it is up to
+    date. Returns the decisions, for the record."""
+    by_number = {pr["number"]: pr for pr in prs}
+    ahead = load_json(os.path.join(state_dir, "ahead.json"), {})
+    predicted = {e.get("pr") for e in (ahead or {}).get("entries") or ()
+                 if isinstance(e, dict)} if isinstance(ahead, dict) else set()
+    notices = load_json(os.path.join(state_dir, STACK_NOTICES_FILE), {})
+    if not isinstance(notices, dict):
+        notices = {}
+    done = []
+    for n in sorted(graph):
+        node, pr = graph[n], by_number.get(n)
+        if pr is None or not node["behind"] or pr.get("isDraft") \
+                or node["base"] not in by_number:
+            continue
+        # GitHub must agree: a pull request it has elsewhere is only
+        # told (`base_mismatches`), never pushed to.
+        if pr.get("githubBaseRefName") or github_base(pr, prs) \
+                != node["base"]:
+            continue
+        base = by_number[node["base"]]
+        base_head = base["headRefOid"]
+        approval = approval_of(pr) or {}
+        if node["conflicts"]:
+            # Told, not handed back: a hand-back (`said`) would keep the
+            # Merger's own RESTACK off this head once the base merges,
+            # and the base may yet move to a head that merges cleanly.
+            reason = STALE_REASON % (node["base"], node["base"],
+                                     base_head[:10])
+            held[str(n)] = reason
+            key = {"head": pr["headRefOid"], "base": base_head,
+                   "kind": "conflict"}
+            if {k: (notices.get(str(n)) or {}).get(k) for k in key} == key:
+                continue
+            decision = {"action": "NOTICE", "kind": "conflict", "pr": n,
+                        "head": pr["headRefOid"], "after": node["base"],
+                        "paths": node["conflicts"]}
+            if live:
+                ok, why = github.write(
+                    "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG, n),
+                    body=CONFLICT_NOTE % (
+                        pr["headRefOid"][:10], STALE_DETAIL % (
+                            node["base"], node["base"], node["base"],
+                            base_head[:10], ", ".join(node["conflicts"]),
+                            base["headRefName"]), SIGNATURE))
+                decision["result"] = "done" if ok else "refused: " + why
+                if ok:
+                    notices[str(n)] = dict(key, at=iso(when))
+            done.append(decision)
+            out("STALE #%d: behind #%d, and #%d's head %s conflicts with it "
+                "in %s; %s" % (n, node["base"], node["base"], short(base_head),
+                               ", ".join(node["conflicts"]),
+                               "told its author" if live else
+                               "a live tick tells its author"))
+            continue
+        if n in predicted or not STALE_PUSH:
+            continue
+        oid = (approval.get("commit") or {}).get("oid")
+        covered = bool(oid) and git(repo, "cat-file", "-e",
+                                    oid + "^{commit}",
+                                    run=run).returncode == 0 and covers_head(
+            repo, oid, pr["headRefOid"], "refs/remotes/origin/" + MAIN, run,
+            (base_head,))[0]
+        if not covered:
+            key = {"head": pr["headRefOid"], "base": base_head,
+                   "kind": "behind"}
+            if {k: (notices.get(str(n)) or {}).get(k) for k in key} == key:
+                continue
+            decision = {"action": "NOTICE", "kind": "behind", "pr": n,
+                        "head": pr["headRefOid"], "after": node["base"]}
+            if live:
+                ok, why = github.write(
+                    "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG, n),
+                    body=BEHIND_NOTE % (node["base"], node["base"],
+                                        base_head[:10], base["headRefName"],
+                                        SIGNATURE))
+                decision["result"] = "done" if ok else "refused: " + why
+                if ok:
+                    notices[str(n)] = dict(key, at=iso(when))
+            done.append(decision)
+            continue
+        decision = {"action": "RESTACK", "pr": n, "head": pr["headRefOid"],
+                    "after": node["base"], "below": base_head,
+                    "branch": pr["headRefName"], "stale": True}
+        if live:
+            def attempt(decision=decision, approval=approval, pr=pr,
+                        base_head=base_head, n=n):
+                ok, why = github.write(
+                    "POST", "repos/%s/merges" % REPO_SLUG,
+                    base=pr["headRefName"], head=base_head,
+                    commit_message="Merge #%d's head %s into %s" % (
+                        decision["after"], base_head[:10],
+                        pr["headRefName"]))
+                if not ok:
+                    return "failed: " + why
+                github.write("POST", "repos/%s/issues/%d/comments"
+                             % (REPO_SLUG, n), body=STALE_RESTACK_NOTE % (
+                                 decision["after"], base_head[:10],
+                                 pr["headRefOid"][:10], decision["after"],
+                                 SIGNATURE))
+                return "done"
+            decision["result"] = once(
+                os.path.join(state_dir, STALE_RESTACKED_FILE), decision,
+                approval, attempt)
+        if decision.get("result") == "failed: already tried at this head":
+            continue
+        done.append(decision)
+        out("STALE #%d: behind #%d; %s #%d's head %s into it" % (
+            n, node["base"], "merged" if live and decision.get("result")
+            == "done" else "would merge" if not live else "could not merge",
+            node["base"], short(base_head)))
+    if live:
+        save_json(os.path.join(state_dir, STACK_NOTICES_FILE), notices)
+    return done
+
+
+def base_mismatches(state_dir, prs, differ, github, live, when, out):
+    """Tell each author once (per head and the two bases) where GitHub's
+    base and the commits' disagree (`apply_graph`). Returns the
+    decisions, for the record."""
+    path = os.path.join(state_dir, STACK_NOTICES_FILE)
+    notices = load_json(path, {})
+    if not isinstance(notices, dict):
+        notices = {}
+    by_number = {pr["number"]: pr for pr in prs}
+
+    def name(n):
+        return "#%d" % n if n is not None else "`%s`" % MAIN
+    done = []
+    for n, (on, built) in sorted(differ.items()):
+        pr = by_number[n]
+        if pr.get("isDraft"):
+            continue
+        key = {"head": pr["headRefOid"], "kind": "mismatch",
+               "github": on, "graph": built}
+        if {k: (notices.get("m%d" % n) or {}).get(k) for k in key} == key:
+            continue
+        acts = ("holds it as stacked on %s until that merges" % name(built)
+                if on is None else
+                "goes by GitHub's base, since GitHub merges into it")
+        decision = {"action": "NOTICE", "kind": "mismatch", "pr": n,
+                    "head": pr["headRefOid"], "github": on, "graph": built}
+        if live:
+            ok, why = github.write(
+                "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG, n),
+                body=MISMATCH_NOTE % (
+                    name(on), "it is built on %s" % name(built)
+                    if built is not None else
+                    "it is built on `%s`, with none of %s's commits" % (
+                        MAIN, name(on)), acts, SIGNATURE))
+            decision["result"] = "done" if ok else "refused: " + why
+            if ok:
+                notices["m%d" % n] = dict(key, at=iso(when))
+        done.append(decision)
+        out("STACK-BASE #%d: GitHub has it on %s, its commits on %s" % (
+            n, name(on), name(built)))
+    if live:
+        save_json(path, notices)
+    return done
+
+
 def restack_once(state_dir, decision, approval, github, said):
     """RESTACK, at most once per approval and head (RESTACKED_FILE), as
     `resolve_once`: "done", or "failed: why"."""
@@ -5911,6 +6252,12 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     main_tip = git(repo, "rev-parse", "refs/remotes/origin/" + MAIN,
                    run=run).stdout.strip()
     prs = fetch_prs(github)
+    # designs/0025, amendment of 2026-11-11: stacks from commits.
+    graph, differ = {}, {}
+    if STACKS:
+        graph = commit_graph(repo, prs, main_tip, run)
+        differ = apply_graph(prs, graph)
+    conflicted = {n for n, node in graph.items() if node["conflicts"]}
     open_numbers = {pr["number"] for pr in prs} | fetch_open_issues(github)
     candidates, approvals, held, spoken = [], {}, {}, []
     when = now()
@@ -6005,6 +6352,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         run) if reds else []
     clear_green_reruns(said, prs, check_state, out)
     clear_returned_heads(said, prs, out)
+    stale = []
+    if graph:
+        stale = base_mismatches(state_dir, prs, differ, github, live, when,
+                                out) + stale_layers(
+            state_dir, repo, prs, graph, said, github, live, held, when, out,
+            run)
+        if live and any(d["action"] == "HAND-BACK" for d in stale):
+            save_json(said_path, said)
     since, overdue = {}, {}
     if AGE_FIRST is not None:
         since = waiting_since(os.path.join(
@@ -6137,6 +6492,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     queue = [pr for pr in queue if pr["number"] not in held_by]
     record = {"at": iso(when), "main": main_tip, "held": held,
               "queue": [pr["number"] for pr in queue], "decisions": []}
+    if graph:
+        record["stack_graph"] = {str(n): node for n, node in sorted(
+            graph.items()) if node["base"] is not None}
+    if stale:
+        record["stale"] = stale
     if live:
         closed = close_merged_issues(state_dir, github, when, out)
         if closed:
@@ -6471,7 +6831,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 # of it (designs/0035, fourth amendment).
                 failed = checked_ahead(state_dir, repo, pr,
                                        approvals[pr["number"]], main_tip,
-                                       github.env, run, regenerated, when)
+                                       github.env, run, regenerated, when,
+                                       below)
                 if not failed:
                     continue
                 decision = {"action": "HAND-BACK", "to": failed[0],
@@ -6518,7 +6879,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 if OWN_HEAD_GREEN else None,
                 (lambda layer: instance_wait(repo, layer, main_tip, github,
                                              gated_files, run))
-                if GATED else None)) if AHEAD_STACKS else None
+                if GATED else None, conflicted)) if AHEAD_STACKS else None
             cut = lambda before: cut_trains(
                 repo, main_tip, train_carriages(ahead_queue, layers_of),
                 before, {pr["number"]: pr["headRefOid"] for pr in prs},

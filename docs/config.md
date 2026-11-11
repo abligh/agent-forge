@@ -611,9 +611,20 @@ whose top's run has started, and goes behind those batches.
 `{"max_run": N, "wait_hours": H, "predict_restacked": B}` (`max_run`
 default 0, no limit; designs/0025; `wait_hours` default none,
 designs/0033; `predict_restacked` default false, designs/0042). A pull request
-whose base branch is another open pull request's head branch is
-stacked on it, and held as `stacked on #Q` rather than as based on
-another branch, so it can be reviewed and approved while it waits.
+built on another open one is stacked on it, and held as `stacked on #Q`
+rather than as based on another branch, so it can be reviewed and
+approved while it waits. Stacks are checked against commits
+(designs/0025, amendment of 2026-11-11): one GitHub has on the default
+branch that holds an open pull request's head is held as stacked on
+it; one GitHub has on another open one's branch is built on it if it
+holds any of its commits, even an older head's, and keeps that base
+either way; where they differ its author is told once
+(`STACK-BASE`). A layer that lacks its base's head (`STALE`) is held,
+and its author told at once, if that head conflicts with it, naming
+the paths.
+If the merge is clean and an approval covers its head, the Merger
+merges that head into it itself, once per approval and head. Without
+an approval it is told once.
 When a live tick merges Q, the open pull requests stacked on it are
 recorded (`stacks.json` in the Merger's state directory) and the run
 goes on: the next tick retargets such a layer to the default branch

@@ -883,11 +883,25 @@ class Flow:
             return []
         last = self.records[-1]
         held = {int(k): str(v) for k, v in (last.get("held") or {}).items()}
-        below = {}
+        below, state = {}, {}
         for pr, reason in held.items():
             got = STACKED_RE.search(reason)
             if got:
                 below[pr] = int(got.group(1))
+        # The Merger's stacks read from commits (designs/0025, amendment
+        # of 2026-11-11), where it wrote them: every layer, held or not,
+        # with whether it is behind its base and what conflicts.
+        for key, node in (last.get("stack_graph") or {}).items():
+            try:
+                pr, base = int(key), int(node["base"])
+            except (TypeError, KeyError, ValueError):
+                continue
+            below[pr] = base
+            if node.get("conflicts"):
+                state[pr] = ("conflict", "conflicts with #%d in %s" % (
+                    base, ", ".join(node["conflicts"])))
+            elif node.get("behind"):
+                state[pr] = ("behind", "behind #%d, merges cleanly" % base)
         above = collections.defaultdict(list)
         for pr, base in below.items():
             above[base].append(pr)
@@ -896,9 +910,12 @@ class Flow:
             seen = seen | {pr}
             kids = [tree(k, seen) for k in sorted(above.get(pr, ()))
                     if k not in seen]
-            return {"pr": pr, "layers": kids,
+            node = {"pr": pr, "layers": kids,
                     "count": sum(1 + k["count"] for k in kids),
                     "depth": max((1 + k["depth"] for k in kids), default=0)}
+            if pr in state:
+                node["state"], node["note"] = state[pr]
+            return node
         snap = self.snapshot()
         trains = {pr: t["train"] for t in self.trains() for pr in t["prs"]}
         roots = []
@@ -1766,8 +1783,13 @@ def trains_html(data):
 
 def stack_items(data, node):
     inner = "".join(stack_items(data, k) for k in node["layers"])
-    return "<li>%s%s</li>" % (pr_link(data, node["pr"]),
-                              "<ul>%s</ul>" % inner if inner else "")
+    note = ""
+    if node.get("note"):
+        note = ' <span class="%s">%s</span>' % (
+            "urgent" if node.get("state") == "conflict" else "note",
+            esc(node["note"]))
+    return "<li>%s%s%s</li>" % (pr_link(data, node["pr"]), note,
+                                "<ul>%s</ul>" % inner if inner else "")
 
 
 def stacks_html(data):
@@ -1789,7 +1811,11 @@ def stacks_html(data):
             "is rooted at the stack's base, the pull request on the "
             "default branch; every layer above it waits (held as "
             "<i>stacked on #N</i>) until the one below merges, so where "
-            "the base waits is where the whole stack waits.</p></section>"
+            "the base waits is where the whole stack waits. Stacks are "
+            "read from each pull request's commits; a layer built on an "
+            "older head of the one below says so: <i>behind, merges "
+            "cleanly</i> (the Merger brings it up to date) or, in red, "
+            "what conflicts (back with its author).</p></section>"
             % (layers, len(stacks), "".join(parts)))
 
 

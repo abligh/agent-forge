@@ -575,6 +575,32 @@ class StacksAndTrains(Base):
                          "held: conflicts with #20, ahead of it in the queue")
         self.assertTrue(got[2]["root_where"].startswith("not a candidate"))
 
+    def test_stacks_come_from_the_mergers_commit_graph(self):
+        # The Merger's graph adds #61 (on #60 by its commits, not held as
+        # stacked) and says which layers are behind or conflict.
+        held = {"21": "stacked on #20",
+                "22": "stacked on #21, but it conflicts with #21's head "
+                      "abc, so it can't be restacked"}
+        graph = {"21": {"base": 20, "behind": True, "conflicts": []},
+                 "22": {"base": 21, "behind": True,
+                        "conflicts": ["docs/a.md"]},
+                 "61": {"base": 60, "behind": False, "conflicts": []}}
+        got = self.flow(records=self.last(held=held, stack_graph=graph)
+                        ).stacks()
+        self.assertEqual([(t["pr"], t["count"]) for t in got],
+                         [(20, 2), (60, 1)])
+        layer = got[0]["layers"][0]
+        self.assertEqual((layer["pr"], layer["state"], layer["note"]),
+                         (21, "behind", "behind #20, merges cleanly"))
+        top = layer["layers"][0]
+        self.assertEqual((top["state"], top["note"]),
+                         ("conflict", "conflicts with #21 in docs/a.md"))
+        html = tool.stacks_html({"stacks": got})
+        self.assertIn('<span class="urgent">conflicts with #21 in '
+                      'docs/a.md</span>', html)
+        self.assertIn('<span class="note">behind #20, merges cleanly</span>',
+                      html)
+
     def test_a_loop_in_the_holds_does_not_hang(self):
         held = {"21": "stacked on #20", "20": "stacked on #21"}
         self.assertEqual(self.flow(records=self.last(held=held)).stacks(),
