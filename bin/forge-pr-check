@@ -367,9 +367,10 @@ older base counted more as changed, so it ran a superset: the Merger's
 second prediction and on); a match keeps the selection it stands for.
 
 **`checks.fast_lane` (`{"max_seconds": 60}`) adds a slot for cheap
-heads** (designs/0006; only with `depends`). Each tick works out, in
-the cron checkout, the steps each waiting head would run, as the
-worker does, fetching the head there if it hasn't it; the answer is
+heads** (designs/0006). Each tick works out, in the cron checkout, the
+steps each waiting head would run, as the worker does (with `depends`,
+the tracer's choice; without it, every step that applies, scoped steps
+by their scope: agent-forge #261), fetching the head there if it hasn't it; the answer is
 kept with the head in `state.json` (`lane_steps`). A step's cost is
 the median of its last COST_RUNS runs here, from the verdicts'
 `step_seconds`; with fewer than COST_MIN_RUNS it has none. A head is
@@ -1136,7 +1137,8 @@ def configure(project, instance=None):
     DEPENDS_WAIT = datetime.timedelta(minutes=checks.get(
         "depends_minutes", DEFAULT_DEPENDS_MINUTES))
     TRACER = checks.get("tracer", trace.DEFAULT_TRACER)
-    # The configuration refuses fast_lane without depends.
+    # Without depends, a head's chosen steps are every step that
+    # applies, scoped ones by their scope (agent-forge #261).
     FAST_LANE_S = checks["fast_lane"].get("max_seconds", DEFAULT_FAST_LANE_S) \
         if "fast_lane" in checks else None
     MERGE_DEFAULT = checks.get("merge_default", False)
@@ -3676,8 +3678,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     """Queue the open heads and start the next one in a free slot. With
     `merger_dir` (only with MERGER_FIRST), the Merger's pull request goes
     first; with TEST_AHEAD too, its predictions come next (see the
-    module docstring). With FAST_LANE_S, `depends` and a checkout, the
-    fast lane is one more slot, which starts the oldest cheap head."""
+    module docstring). With FAST_LANE_S and a checkout, the fast lane
+    is one more slot, which starts the oldest cheap head."""
     when = when or now_utc()
     why = []
     heads = open_heads(token, run, why)
@@ -3689,7 +3691,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     # rest of the tick, the others aren't open (designs/0034).
     heads, dropped = in_scope(heads, state_dir, token, run, out, when)
     slots = slots or slots_from_env()
-    lane = FAST_LANE_S is not None and DEPENDS and bool(checkout)
+    lane = FAST_LANE_S is not None and bool(checkout)
     holders = {slot: running(state_dir, slot)
                for slot in list(range(1, slots + 1)) + ([LANE] if lane else [])}
     fields = {slot: holder_fields(h) for slot, h in holders.items()}
@@ -5741,7 +5743,13 @@ def lane_steps(checkout, sha, pr, state_dir, run=sh, tip=None):
     worked out in the cron checkout without a worktree, fetching the
     head first if the checkout doesn't have it. The fetch writes no
     FETCH_HEAD, which the checkout's other users may read. As `choose`
-    returns, with {"every": why} when the steps can't be worked out."""
+    returns, with {"every": why} when the steps can't be worked out.
+
+    Without `depends` (agent-forge #261) nothing is traced, so a run
+    takes every step that applies: that is the answer, as {"ran"}, and
+    `estimate` puts the scoped steps (designs/0048) by their scope, as
+    a run does. A head with a scoped step in scope never takes the
+    lane, so only the light, unscoped steps can make a head cheap."""
     def have():
         return run(["git", "-C", checkout, "cat-file", "-e",
                     sha + "^{commit}"]).returncode == 0
@@ -5755,6 +5763,9 @@ def lane_steps(checkout, sha, pr, state_dir, run=sh, tip=None):
         if not have():
             return {"every": "pull/%d/head is no longer %s" % (pr, sha[:10])}
     names = [name for name, _, _ in applicable_at(checkout, sha, run)]
+    if not DEPENDS:
+        return {"ran": {name: "every step runs without depends"
+                        for name in names}}
     if FRESH_WAIT is not None:
         return choose_fresh(checkout, sha, state_dir, run, names,
                             tip if MERGE_DEFAULT else None)

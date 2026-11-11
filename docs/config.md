@@ -152,6 +152,16 @@ run has a cost and they add up to at most `max_seconds`. A head whose
 steps can't be worked out yet (no record, a fetch or diff that fails)
 is not cheap, and waits in the ordinary queue.
 
+Without `depends` nothing is traced, so a run takes every step that
+applies (`only_if`), and a scoped step (`pull_requests`, designs/0048)
+only when the head's changed paths or labels take it in. The estimate
+is that, worked out the same way. A head that would run a scoped step
+is never cheap, as with `depends`, so a project gets a lane only when
+its unscoped steps are light: documentation-only heads, say, when the
+heavy steps are scoped to the code (agent-forge #261). The lane run
+itself chooses its steps as any slot does; the estimate only decides
+which slot takes the head.
+
 The lane is one more slot, `worker-lane.lock`, with its own worktree
 (`wt-lane`) and build caches (`<directory>-lane`), and the same memory
 limit and CPU weight. It runs only cheap heads, oldest first. An
@@ -1100,7 +1110,7 @@ unaffected: their lines stay body-only, as the Merger reads them
 | `drop_env` | none | Variables never passed to the steps, beyond `GH_TOKEN`, `GITHUB_TOKEN` and every `FORGE_` setting: each a name, or a prefix ending in `*` (`["INVOCATION_ID", "RECEIVER_*"]`). For variables a host's service passes on that a test must not see. |
 | `depends_minutes` | `30` | How long the newest default-branch head waits behind pull requests' heads before it goes first, before the Merger's predictions too. |
 | `tracer` | `preload` | How `depends` traces: `preload`, an `LD_PRELOAD` library built from lib/forge-trace.c with the host's C compiler (no root, cheap, blind to statically linked programs), or `strace` (everything, slower; needs strace installed). Go is the common case `preload` can't see: its toolchain and test binaries are statically linked, so a Go step would record almost nothing it reads and be skipped wrongly. A Go project uses `strace`. |
-| `fast_lane` | none | `{"max_seconds": 60}`: one more slot, for heads whose chosen steps are cheap (designs/0006; see below). Refused without `depends`. |
+| `fast_lane` | none | `{"max_seconds": 60}`: one more slot, for heads whose chosen steps are cheap (designs/0006; see below). Without `depends`, a head's chosen steps are every step that applies, scoped steps (`pull_requests`) by their scope (agent-forge #261). |
 | `fast_lane.max_seconds` | `60` | The most a head's chosen steps may together have taken here for it to be cheap. At least 1. |
 | `merge_default` | `false` | Check a pull request's head merged with the default branch's tip, the tree GitHub's update makes, instead of the head alone (designs/0007; see below). |
 | `reuse` | none | `{"max_age_days": 7}`: don't run a step on inputs a green run here already passed (designs/0009; see below). Refused without `depends`. |
