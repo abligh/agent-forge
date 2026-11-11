@@ -640,7 +640,12 @@ class Monitor:
     3. No pull request boards a train without an approval of its
        author's latest change, nor without the gated instance's green
        on that change when it needs one.
-    4. Nothing red ever reaches the default branch."""
+    4. Nothing red ever reaches the default branch.
+    5. A train whose top has started merges in its own order: no member
+       merges while one before it in the train is still unmerged (on
+       2026-11-11 a member merged on its own green ahead of an urgent
+       one cut in front of it, and the green train's prediction no
+       longer held)."""
 
     def __init__(self, sim):
         self.sim = sim
@@ -711,6 +716,23 @@ class Monitor:
                     "members": [(e["pr"], e["tree"]) for e in batch],
                     "since": check.state["ahead_started"][top["sha"]],
                     "tree": top["tree"], "done": False}
+        # Rule 5: a started train merges in its own order.
+        before = {m["pr"] for m in w.merges[:self.seen_merges]}
+        for m in w.merges[self.seen_merges:]:
+            for train in self.trains.values():
+                if train["done"]:
+                    continue
+                order = [n for n, _ in train["members"]]
+                if m["pr"] not in order:
+                    continue
+                ahead = [n for n in order[:order.index(m["pr"])]
+                         if n not in before]
+                if ahead:
+                    self.say(5, "#%d merged ahead of #%d, before it in the "
+                             "train #%d..#%d (%s)" % (
+                                 m["pr"], ahead[0], order[0], order[-1],
+                                 self.why(m["pr"])))
+            before.add(m["pr"])
         merged = {m["pr"]: m["tree"] for m in w.merges}
         for top, train in self.trains.items():
             if train["done"]:

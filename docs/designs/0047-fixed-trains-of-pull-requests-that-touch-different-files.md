@@ -470,3 +470,23 @@ it, and go on until the train is full. Urgent ones rank first, so:
 
 **Cost.** An urgent pull request may wait for a train that has already
 started, at most one run, rather than costing that train its run.
+
+## Amendment (2026-11-11, second): the one in flight stays first
+
+**What happened.** The Merger was waiting on one pull request's own
+run when a train was cut afresh behind a culprit hunt. A red nightly's
+fix ranks as urgent, so it headed the new train, and the pull request
+the Merger was acting on became the train's second member. The train's
+top went green, but the Merger was still acting on the second member:
+when that member's own run went green it merged it alone. The default
+branch then reached a tree no train predicted, every train was cut
+again, and the green run of eight was thrown away.
+
+**The rule.** A train cut afresh starts with the pull request the
+Merger is acting on, its update or own run in flight, ahead of urgent
+ones, since the Merger merges it next whatever the train says. Urgent
+ones come next, then the rest. With nothing in flight, nothing changes.
+
+The Merger simulator gains a fifth rule: a train whose top has started
+merges in its own order, and no member merges while one before it in
+the train is unmerged.
