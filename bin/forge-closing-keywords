@@ -268,15 +268,34 @@ class GitHub:
     `call`, which has `agent_forge.github.api_call`'s signature."""
 
     def __init__(self, token=None, call=forge_github.api_call):
+        global LAST_GITHUB
         self.token = token
         self.call = call
+        # Whether GitHub failed to answer for now: unreachable, a 5xx, or
+        # a rate limit. A question that failed that way is asked again
+        # later (exit 3), not refused.
+        self.unanswered = False
+        LAST_GITHUB = self
+
+    def note(self, got):
+        status, body = got
+        message = str((body or {}).get("message", "")) \
+            if isinstance(body, dict) else ""
+        if status == 0 or status == 429 or status >= 500 or (
+                status == 403 and "rate limit" in message.lower()):
+            self.unanswered = True
+        return got
 
     def get(self, path):
-        return forge_github.rest(self.token, "GET", path, call=self.call)
+        return self.note(forge_github.rest(self.token, "GET", path,
+                                           call=self.call))
 
     def graphql(self, query, variables):
-        return forge_github.graphql(self.token, query, variables,
-                                    call=self.call)
+        return self.note(forge_github.graphql(self.token, query, variables,
+                                              call=self.call))
+
+
+LAST_GITHUB = None
 
 
 def closers(message, body_only=False):
@@ -748,6 +767,22 @@ def pr_messages(args, github, run):
 
 def main(argv=None, run=proc.sh, call=forge_github.api_call,
          load=config.load, environ=None):
+    """`judge`'s status, except that a question GitHub failed to answer
+    for now (`GitHub.unanswered`) is exit 3, to be asked again, rather
+    than exit 2: a merge gate's 2 hands the pull request back to its
+    author, who has nothing to fix."""
+    global LAST_GITHUB
+    LAST_GITHUB = None
+    status = judge(argv, run, call, load, environ)
+    if status == 2 and LAST_GITHUB is not None and LAST_GITHUB.unanswered:
+        err("GitHub did not answer for now (unreachable, an error on its "
+            "side, or a rate limit); run it again in a few minutes")
+        return 3
+    return status
+
+
+def judge(argv=None, run=proc.sh, call=forge_github.api_call,
+          load=config.load, environ=None):
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(prog=PROG,
                                      description=__doc__.splitlines()[0])

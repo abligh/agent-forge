@@ -1419,10 +1419,32 @@ class TheCommitsComeFromThePullRequest(unittest.TestCase):
         self.assertIn("1 commit(s) examined, from pull request 1972's "
                       "commits", out)
 
-    def test_commits_it_could_not_fetch_are_two(self):
+    def test_commits_github_did_not_answer_for_are_three(self):
+        # A 5xx (World's 502) is GitHub failing for now: asked again later,
+        # not refused. As a merge gate, 2 handed a pull request back to
+        # an author with nothing to fix (2026-11-11).
         world = World(log=None, pr_log=None, facts=None)
-        code, _, _ = world.main(["--pr", "1972"])
-        self.assertEqual(code, 2)
+        code, _, err = world.main(["--pr", "1972"])
+        self.assertEqual(code, 3)
+        self.assertIn("did not answer for now", err)
+
+    def test_a_rate_limit_is_three_and_a_plain_refusal_two(self):
+        for status, body, want in (
+                (403, {"message": "API rate limit exceeded for x"}, 3),
+                (429, {}, 3), (0, {"message": "timed out"}, 3),
+                (404, {"message": "Not Found"}, 2),
+                (403, {"message": "Resource not accessible"}, 2)):
+            world = World(log=None, pr_log=None, facts=None)
+            plain = world.call
+
+            def call(url, token, scheme="Bearer", method="GET", body_=None,
+                     **kw):
+                if "/commits?" in url:
+                    return status, body
+                return plain(url, token, scheme, method, kw.get("body"))
+            world.call = call
+            code, _, _ = world.main(["--pr", "1972"])
+            self.assertEqual(code, want, (status, body))
 
     def test_an_empty_commit_list_is_two_and_not_a_clean_run(self):
         world = World(log=None, pr_log="", facts=None)
