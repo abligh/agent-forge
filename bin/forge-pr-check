@@ -99,6 +99,20 @@ to it. Its run is stopped as a superseded head's is, logged
 `STOPPED-SPENT`, and its slot is freed. Nothing is stopped while
 `ahead.json` is stale, unreadable or empty.
 
+**With `stop_spent`, the Merger's batch top never waits for a slot**
+(amendment of 2026-11-11). When every slot is busy and the top of the
+Merger's batch (designs/0032; a red batch's suspects included) waits
+unstarted with no verdict, the ordinary pull request's head started
+last is stopped for it: not a prediction, not the default branch's
+run, not a head of the Merger's own pull request, nor one put first on
+purpose. It is logged `PREEMPTED`, keeps its place in the queue (its
+`since`) and starts again later; the freed slot goes to the top, before
+an overdue head or one put first. One at a time: no other run is
+stopped for it for PREEMPT_HOLD, while the top waits to start. Every
+merge waits on that top's verdict, and a culprit hunt's steps
+otherwise waited behind ordinary runs for a slot each (an hour's
+merges lost on one red batch).
+
 **With `merge.test_ahead.retry_red`, a prediction's red steps run once
 more** (designs/0035, amendment of 2026-11-10). In the same slot, on
 the same tree, only the steps that were red, except one stopped by
@@ -939,6 +953,10 @@ LATER_FIRST = 0
 # merge.test_ahead.stop_spent (designs/0014, amendment of 2026-11-10): a
 # running prediction whose tree the Merger no longer predicts is stopped.
 STOP_SPENT = False
+# How long one run stopped for the Merger's batch top holds off another
+# (stop_spent, amendment of 2026-11-11): the stopped run's slot frees in
+# seconds, and the tick its worker chains starts the top in it.
+PREEMPT_HOLD = datetime.timedelta(minutes=5)
 # merge.test_ahead.retry_red (designs/0035, amendment of 2026-11-10): a
 # prediction's red steps are run once more on the same tree before the
 # red stands.
@@ -2644,6 +2662,76 @@ def merger_spent(merger_dir, when, running, repo=None, run=sh):
     return spent
 
 
+def preempt_victim(state, fields, first_pr):
+    """(slot, holder fields) of the run to stop for the Merger's batch
+    top, or None: of the ordinary pull requests' heads running, the one
+    started last. Never a prediction, the default branch's run, the fast
+    lane's, a head of the Merger's own pull request (`first_pr`), one put
+    first on purpose, or one this host's queue doesn't list."""
+    best = None
+    for slot, got in fields.items():
+        if slot == LANE or not got or got[4] or not got[0] or not got[3]:
+            continue
+        entry = state["waiting"].get(got[1])
+        if got[0] == first_pr or entry is None or put_first(entry):
+            continue
+        try:
+            since = parse(got[2])
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if best is None or since > best[0]:
+            best = (since, slot, got)
+    return best[1:] if best else None
+
+
+def preempt_front(state_dir, fields, batch, busy, when, checkout, run,
+                  merger_dir, stop, out):
+    """stop_spent, amendment of 2026-11-11: with every slot busy, stop
+    the last-started ordinary run for the Merger's batch top, if it
+    waits unstarted with no verdict (see the module docstring). Forgets
+    a preemption once its top has started or isn't the top any more."""
+    top = batch[-1] if batch else None
+    trees = busy_trees(busy, checkout, run) if top else frozenset()
+    with state_lock(state_dir):
+        state = load(state_dir)
+        pre = state.get("preempting")
+        if pre is not None and pre.get("victim") not in busy and (
+                top is None or pre.get("for") != top["sha"]
+                or pre.get("for") in state.get("ahead_started", {})):
+            del state["preempting"]
+            save(state_dir, state)
+            pre = None
+        if top is None:
+            return
+        if pre is not None and pre.get("for") == top["sha"]:
+            try:
+                if when - parse(pre["at"]) < PREEMPT_HOLD:
+                    return
+            except (KeyError, TypeError, ValueError):
+                pass
+        if next_ahead(state, [], busy, when, trees, batch) is None:
+            return
+        victim = preempt_victim(state, fields, merger_first(merger_dir, when))
+        if victim is None:
+            return
+        slot, (pr, sha, since, pid, _) = victim
+        state["preempting"] = {"for": top["sha"], "victim": sha,
+                               "at": iso(when)}
+        save(state_dir, state)
+    sent = stop(pid)
+    if not sent:
+        with state_lock(state_dir):
+            state = load(state_dir)
+            if (state.get("preempting") or {}).get("victim") == sha:
+                del state["preempting"]
+                save(state_dir, state)
+    log(state_dir, "PREEMPTED #%d %s: the Merger's batch top %s waits for a "
+        "slot; %s the run in %s (pid %d), since %s"
+        % (pr, sha[:10], top["sha"][:10],
+           "stopping" if sent else "could not stop", slot_label(slot), pid,
+           since), when, out)
+
+
 def is_front(merger_dir, when, sha, pr, ahead=False, repo=None):
     """designs/0031: whether sha's run is one the next merge waits on,
     as the Merger's files say at `when`: with `ahead`, the first of its
@@ -3828,6 +3916,14 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         covering = {got[0]: got for got in settled_heads(
             unstarted, checkout, (), when, run, state_dir, batch)
             if got[4] and got[0] in busy}
+    # Whether this tick stopped a run already: its slot frees by itself.
+    stopped_now = []
+
+    def stop(pid, _stop=stop):
+        sent = _stop(pid)
+        stopped_now.append(sent)
+        return sent
+
     for slot, holder in holders.items():
         if holder is None:
             continue
@@ -3888,6 +3984,11 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     free = [slot for slot, holder in holders.items()
             if holder is None and slot != LANE]
     lane_free = lane and holders[LANE] is None
+    if TEST_AHEAD and STOP_SPENT and merger_dir and not free \
+            and not any(stopped_now) \
+            and not (QUIET_DIR and quiet.live(QUIET_DIR, when)):
+        preempt_front(state_dir, fields, batch, busy, when, checkout, run,
+                      merger_dir, stop, out)
     if not free and not lane_free:
         return 0
     holds = quiet.live(QUIET_DIR, when) if QUIET_DIR else []
@@ -3982,7 +4083,12 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                     # own verdict, and a pick put before it would otherwise
                     # let predictions starve both. With spare_slots_only
                     # (designs/0014), never before an ordinary pick.
-                    if front_held or not merger_head_waits(
+                    # A run was stopped for the batch's top: its slot
+                    # is the top's, before an overdue head or one put
+                    # first.
+                    preferring = bool(batch) and (state.get(
+                        "preempting") or {}).get("for") == batch[-1]["sha"]
+                    if front_held or preferring or not merger_head_waits(
                             state, first_pr, taken, when) and (
                             pick is None or not SPARE_ONLY and not (
                             pick[1] == first_pr
@@ -6970,11 +7076,20 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     except Stopped:
         with state_lock(state_dir):
             state = load(state_dir)
-            state["waiting"].pop(sha, None)
+            # Stopped for the Merger's batch top (stop_spent): it keeps
+            # its place and starts again later.
+            kept = (state.get("preempting") or {}).get("victim") == sha \
+                and sha in state["waiting"]
+            if kept:
+                state["waiting"][sha].pop("started", None)
+            else:
+                state["waiting"].pop(sha, None)
             save(state_dir, state)
         stopped = clock()
-        log(state_dir, "STOPPED %s %s after %ds: superseded; no verdict"
-            % (name, sha[:10], (stopped - started).total_seconds()),
+        log(state_dir, "STOPPED %s %s after %ds: %s"
+            % (name, sha[:10], (stopped - started).total_seconds(),
+               "preempted for the Merger's batch top; back in the queue"
+               if kept else "superseded; no verdict"),
             stopped, out)
         settled = True
         return 3

@@ -1680,6 +1680,31 @@ class Worker(StateCase):
         self.assertEqual(steps[0]["env"]["TMPDIR"], tmp)
         self.assertFalse(os.path.exists(tmp))
 
+    def test_a_run_stopped_for_the_batchs_top_keeps_its_place(self):
+        # stop_spent, amendment of 2026-11-11: preempted, not superseded.
+        self.queue()
+        state = self.state()
+        state["preempting"] = {"for": SHA_B, "victim": SHA_A,
+                               "at": pc.iso(T0)}
+        state["waiting"][SHA_A]["started"] = pc.iso(T0)
+        self.write_state(state)
+        self.addCleanup(signal.signal, signal.SIGTERM,
+                        signal.getsignal(signal.SIGTERM))
+
+        def preempted(args):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return done(args)
+        run = self.run_for()
+        run.rules.insert(0, (lambda a: a == ["make", "test"], preempted))
+        self.assertEqual(self.work(run), 3)
+        state = self.state()
+        self.assertEqual(state["waiting"], {SHA_A: {
+            "pr": 7, "since": pc.iso(T0 - datetime.timedelta(minutes=3))}})
+        self.assertEqual(state["results"], {})
+        self.assertIn("STOPPED #7 aaaaaaaaaa after 600s: preempted for the "
+                      "Merger's batch top; back in the queue", pathlib.Path(
+                          self.state_dir, "verdicts.log").read_text())
+
     def test_a_stopped_run_leaves_no_tmpdir(self):
         self.queue()
         self.addCleanup(signal.signal, signal.SIGTERM,
@@ -2110,6 +2135,7 @@ class Main(StateCase):
 SHA_P = "d" * 40
 SHA_Q = "e" * 40
 TREE_1 = "1" * 40
+TIP_PREEMPT = "9" * 40
 TREE_2 = "2" * 40
 
 
@@ -2605,6 +2631,167 @@ class TickAhead(Tick):
         self.assertEqual(stopped, [4242])
         self.assertTrue(any("STOPPED-AHEAD #3 %s: a shorter prefix" %
                             SHA_C[:10] in line for line in self.lines))
+
+    def preempt(self, holders, state=None, first=7, when=T0, heads=None):
+        """A tick with every slot busy (`holders`, slot: lock line) and
+        the Merger's batch #7..#8 waiting for its top, SHA_Q, under
+        stop_spent. The pids it stopped."""
+        merger = self.merger_says(first)
+        write_ahead(merger, [entry(7, SHA_P, TREE_1),
+                             entry(8, SHA_Q, TREE_3)],
+                    when=when - datetime.timedelta(minutes=1), batch=2)
+        if state is not None:
+            self.write_state(state)
+        for slot, line in holders.items():
+            self.hold(slot, line)
+        stopped = []
+        run = FakeRun((is_pulls, done([], 0, heads_tsv(*(heads or [
+            (5, SHA_A, REPO, "false"), (6, SHA_B, REPO, "false"),
+            (7, SHA_C, REPO, "false")])))))
+        old = pc.STOP_SPENT
+        pc.STOP_SPENT = True
+        try:
+            pc.tick(self.state_dir, "tok", run, lambda *a: None,
+                    self.lines.append, when=when, slots=len(holders),
+                    merger_dir=merger,
+                    stop=lambda pid: stopped.append(pid) or True)
+        finally:
+            pc.STOP_SPENT = old
+        return stopped
+
+    def busy_state(self, **more):
+        waiting = {
+            SHA_A: {"pr": 5, "since": pc.iso(T0 - datetime.timedelta(
+                hours=2)), "started": pc.iso(T0 - datetime.timedelta(
+                    minutes=20))},
+            SHA_B: {"pr": 6, "since": pc.iso(T0 - datetime.timedelta(
+                hours=1)), "started": pc.iso(T0 - datetime.timedelta(
+                    minutes=5))},
+            SHA_C: {"pr": 7, "since": pc.iso(T0 - datetime.timedelta(
+                hours=1)), "started": pc.iso(T0 - datetime.timedelta(
+                    minutes=1))}}
+        return dict({"waiting": waiting}, **more)
+
+    def test_the_batchs_top_stops_the_last_started_ordinary_run(self):
+        stopped = self.preempt({
+            1: "#5 %s %s pid=4242" % (SHA_A, pc.iso(
+                T0 - datetime.timedelta(minutes=20))),
+            2: "#6 %s %s pid=4343" % (SHA_B, pc.iso(
+                T0 - datetime.timedelta(minutes=5)))}, self.busy_state())
+        self.assertEqual(stopped, [4343])
+        self.assertEqual(self.state()["preempting"],
+                         {"for": SHA_Q, "victim": SHA_B, "at": pc.iso(T0)})
+        self.assertTrue(any(
+            "PREEMPTED #6 %s: the Merger's batch top %s waits for a slot"
+            % (SHA_B[:10], SHA_Q[:10]) in line for line in self.lines))
+
+    def test_no_prediction_main_run_or_mergers_head_is_preempted(self):
+        stopped = self.preempt({
+            1: "#7 %s %s pid=4141" % (SHA_C, pc.iso(T0)),
+            2: "#0 %s %s pid=4242 main" % (TIP_PREEMPT, pc.iso(T0)),
+            3: "#3 %s %s pid=4343 ahead" % (SHA_P, pc.iso(T0))},
+            self.busy_state())
+        self.assertEqual(stopped, [])
+        self.assertNotIn("preempting", self.state())
+
+    def test_a_head_put_first_is_not_preempted(self):
+        # labels.urgent or checks.first_authors, as the tick reads them.
+        old = pc.put_first
+        pc.put_first = lambda entry: entry.get("pr") == 6
+        try:
+            stopped = self.preempt({
+                1: "#5 %s %s pid=4242" % (SHA_A, pc.iso(
+                    T0 - datetime.timedelta(minutes=20))),
+                2: "#6 %s %s pid=4343" % (SHA_B, pc.iso(
+                    T0 - datetime.timedelta(minutes=5)))}, self.busy_state())
+        finally:
+            pc.put_first = old
+        self.assertEqual(stopped, [4242])
+
+    def test_nothing_is_preempted_for_a_top_with_a_verdict(self):
+        stopped = self.preempt({
+            1: "#5 %s %s pid=4242" % (SHA_A, pc.iso(T0)),
+            2: "#6 %s %s pid=4343" % (SHA_B, pc.iso(T0))},
+            self.busy_state(results={SHA_Q: verdict(
+                pr=8, tree=TREE_3, ok=False, ahead=True)}))
+        self.assertEqual(stopped, [])
+
+    def test_one_preemption_at_a_time(self):
+        holders = {
+            1: "#5 %s %s pid=4242" % (SHA_A, pc.iso(
+                T0 - datetime.timedelta(minutes=20))),
+            2: "#6 %s %s pid=4343" % (SHA_B, pc.iso(
+                T0 - datetime.timedelta(minutes=5)))}
+        pending = {"for": SHA_Q, "victim": SHA_B,
+                   "at": pc.iso(T0 - datetime.timedelta(minutes=1))}
+        self.assertEqual(self.preempt(holders, self.busy_state(
+            preempting=pending)), [])
+        self.assertEqual(self.state()["preempting"], pending)
+
+    def test_another_preemption_once_the_hold_is_over(self):
+        holders = {
+            1: "#5 %s %s pid=4242" % (SHA_A, pc.iso(
+                T0 - datetime.timedelta(minutes=20))),
+            2: "#6 %s %s pid=4343" % (SHA_B, pc.iso(
+                T0 - datetime.timedelta(minutes=5)))}
+        pending = {"for": SHA_Q, "victim": SHA_B,
+                   "at": pc.iso(T0 - pc.PREEMPT_HOLD)}
+        self.assertEqual(self.preempt(holders, self.busy_state(
+            preempting=pending)), [4343])
+
+    def test_a_preemption_is_forgotten_once_its_top_has_started(self):
+        state = self.busy_state(
+            preempting={"for": SHA_Q, "victim": "9" * 40,
+                        "at": pc.iso(T0 - datetime.timedelta(minutes=1))},
+            ahead_started={SHA_Q: pc.iso(T0 - datetime.timedelta(
+                minutes=1))})
+        self.preempt({
+            1: "#5 %s %s pid=4242" % (SHA_A, pc.iso(T0)),
+            2: "#8 %s %s pid=4343 ahead" % (SHA_Q, pc.iso(T0))}, state)
+        self.assertNotIn("preempting", self.state())
+
+    def test_nothing_is_preempted_while_a_slot_is_free(self):
+        merger = self.merger_says(7)
+        write_ahead(merger, [entry(7, SHA_P, TREE_1),
+                             entry(8, SHA_Q, TREE_3)],
+                    when=T0 - datetime.timedelta(minutes=1), batch=2)
+        self.write_state(self.busy_state())
+        self.hold(1, "#5 %s %s pid=4242" % (SHA_A, pc.iso(T0)))
+        stopped = []
+        old = pc.STOP_SPENT
+        pc.STOP_SPENT = True
+        try:
+            pc.tick(self.state_dir, "tok", FakeRun((is_pulls, done(
+                [], 0, heads_tsv((5, SHA_A, REPO, "false"))))),
+                lambda *a: None, self.lines.append, when=T0, slots=2,
+                merger_dir=merger,
+                stop=lambda pid: stopped.append(pid) or True)
+        finally:
+            pc.STOP_SPENT = old
+        self.assertEqual(stopped, [])
+
+    def test_the_freed_slot_goes_to_the_top_before_an_overdue_head(self):
+        merger = self.merger_says(7)
+        write_ahead(merger, [entry(7, SHA_P, TREE_1),
+                             entry(8, SHA_Q, TREE_3)],
+                    when=T0 - datetime.timedelta(minutes=1), batch=2)
+        self.write_state({"waiting": {SHA_B: {
+            "pr": 6, "since": pc.iso(T0 - datetime.timedelta(hours=3)),
+            "urgent": True}},
+            "preempting": {"for": SHA_Q, "victim": SHA_A,
+                           "at": pc.iso(T0 - datetime.timedelta(
+                               seconds=30))}})
+        self.spawned = []
+        old = pc.STOP_SPENT, pc.MAX_WAIT
+        pc.STOP_SPENT, pc.MAX_WAIT = True, datetime.timedelta(minutes=30)
+        try:
+            pc.tick(self.state_dir, "tok", FakeRun((is_pulls, done(
+                [], 0, heads_tsv((6, SHA_B, REPO, "false"))))),
+                lambda *a: self.spawned.append(a), self.lines.append,
+                when=T0, slots=1, merger_dir=merger)
+        finally:
+            pc.STOP_SPENT, pc.MAX_WAIT = old
+        self.assertEqual([a[1] for a in self.spawned], [SHA_Q])
 
     def test_stop_spent_never_stops_the_default_branchs_run(self):
         # agent-forge #294: holder_fields marks main's lock line `ahead`
