@@ -471,6 +471,39 @@ it, and go on until the train is full. Urgent ones rank first, so:
 **Cost.** An urgent pull request may wait for a train that has already
 started, at most one run, rather than costing that train its run.
 
+## Amendment (2026-11-11): the Merger's own pushes keep a member's place
+
+**What went wrong.** A member keeps its place through a new head only
+when that head's tree is the one predicted, or when the head is the
+RESTACK of a layer in `restacks`. But `restacks` holds only the stack
+the tick is acting on. So a layer of another stack that the Merger
+restacked, or restacked and then updated, read as an author's push:
+`TRAIN-LEFT #n: pushed <sha> mid-train`, and its train and every later
+one were cut again. In one project, 20 of the day's 23 such drops followed a
+minute or so after the Merger's own STACK or UPDATE of the same pull
+request. A replay of that day on the simulator showed the rest of
+them.
+
+**The rule.** A new head counts as no push at all when it is the
+boarded head brought up to date and nothing else (`own_push`). Walking
+back along first parents from the new head to the boarded one, each
+commit must be a clean merge, with its tree exactly what git merges its
+parents to, and its other parent must add nothing the default branch
+lacks. That covers GitHub's update (the default branch merged in), a
+RESTACK (the lower layer's final head, which the default branch has as
+a squash) and a STACK-UPDATE, in any order and for any stack. It also
+covers an author who merges the default branch in by hand. A member
+like that keeps its place. Anything else still leaves: a commit of the
+author's own, or a merge edited by hand.
+
+**Not changed.** A member whose new head is out of the queue still
+leaves, even when the Merger made that head: say its new head waits on
+an instance's check, such as a Mac's. A train holds only what may merge
+now, and a member's checks must pass before it boards. Keeping it
+breaks that rule, and in the simulator's replay it also cut the trains
+again on every tick. Such a member rides the next train once its checks
+pass.
+
 ## Amendment (2026-11-11, second): the one in flight stays first
 
 **What happened.** The Merger was waiting on one pull request's own

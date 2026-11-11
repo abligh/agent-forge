@@ -521,7 +521,10 @@ nothing joins it or moves into it. A member that leaves, by a push to a
 tree other than the one predicted, a hand-back or a lost approval, goes
 alone, with the layers of its stack above it: `TRAIN-LEFT #n: pushed
 <sha> mid-train`. The Merger's own RESTACK of a layer is not a push:
-with STACK-UPDATE still to come, it is in flight. The rest keep their
+with STACK-UPDATE still to come, it is in flight. Nor is any head that
+is the boarded one brought up to date and nothing else (`own_push`:
+clean merges of what the default branch already has, whichever stack
+the tick acts on). The rest keep their
 places, and the train's top, now a new tree, is run again. A pull
 request that is urgent or fixes a red default branch and is in no train
 cuts every train after the first again, and the default branch moving to
@@ -1005,6 +1008,9 @@ STACK_WAITED_NOTE = ("Not-a-review\n\nThis layer waited %d hours for its "
                      "approval after #%d merged, and the Merger no longer "
                      "retargets it. Retarget it to `%s` and ask for its "
                      "approvals again.\n\n%s")
+# How many of the Merger's own merges (updates, restacks) a train
+# member's head may be past the head it boarded with (`own_push`).
+OWN_PUSH_DEPTH = 6
 RESTACKED_FILE = "restacked.json"
 STACK_UPDATED_FILE = "stack-updated.json"
 # How far back `main`'s first-parent history is searched for the squash
@@ -4086,6 +4092,50 @@ def restacking(repo, before, head, restack, run=sh):
         parents.stdout.split()[1:] == [before, restack[1]]
 
 
+def own_push(repo, before, head, main_tip, run=sh, depth=OWN_PUSH_DEPTH):
+    """Whether `head` is `before` brought up to date and nothing else:
+    each commit from `head` back along first parents to `before` is a
+    clean merge (its tree is what git merges its two parents to) whose
+    second parent adds nothing `main_tip` lacks. That is what the
+    Merger's own pushes make, an update (GitHub merges the default
+    branch in), a RESTACK (the layer below's final head, which the
+    default branch has as one squash) and a STACK-UPDATE, in any
+    order, and what an author's own merge of the default branch makes.
+    None of them is a push mid-train: the layer's changes are the ones
+    the train boarded with, so it stays (designs/0047, amendment of
+    2026-11-11: a train member the Merger restacked or updated was told
+    it had left, and its train and every later one were cut again).
+    Anything else, a commit of the author's or a merge edited by hand,
+    is a push."""
+    if not before or not head:
+        return False
+    main_tree = git(repo, "rev-parse", main_tip + "^{tree}", run=run)
+    if main_tree.returncode != 0:
+        return False
+    for _ in range(depth):
+        if head == before:
+            return True
+        parents = git(repo, "rev-list", "--parents", "-n", "1", head,
+                      run=run)
+        got = parents.stdout.split() if parents.returncode == 0 else []
+        if len(got) != 3:
+            return False
+        _, first, second = got
+        merged = git(repo, "merge-tree", "--write-tree", "--no-messages",
+                     first, second, run=run)
+        tree = git(repo, "rev-parse", head + "^{tree}", run=run)
+        if merged.returncode != 0 or tree.returncode != 0 or \
+                merged.stdout.split()[:1] != tree.stdout.split():
+            return False
+        into = git(repo, "merge-tree", "--write-tree", "--no-messages",
+                   main_tip, second, run=run)
+        if into.returncode != 0 or \
+                into.stdout.split()[:1] != main_tree.stdout.split():
+            return False
+        head = first
+    return head == before
+
+
 def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
                   overdue=(), restacks=None):
     """The commits the first `depth` + 1 pull requests in `queue`
@@ -4372,7 +4422,9 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                             or tree.stdout.strip() != e.get("tree")) \
                             and not restacking(repo, e.get("head"),
                                                pr["headRefOid"],
-                                               (restacks or {}).get(n), run):
+                                               (restacks or {}).get(n), run) \
+                            and not own_push(repo, e.get("head"),
+                                             pr["headRefOid"], main_tip, run):
                         why = "pushed %s mid-train" % pr["headRefOid"][:10]
                 if why is None:
                     entry, failed = predict_one(repo, parent, pr, restacks,

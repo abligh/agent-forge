@@ -3040,6 +3040,86 @@ class PredictRestacked(unittest.TestCase):
         self.assertEqual(events[0], ("left", "LEFT #6: pushed %s mid-train"
                                      % pushed[:10]))
 
+    def boarded(self):
+        """#6 (a layer whose lower layer merged) and #7 cut into one
+        train, with main moved on past #5's squash: (seven, last)."""
+        self.addCleanup(m.configure, project())
+        m.configure(project(stacks={"predict_restacked": True}, test_ahead={
+            "batch": 3, "batches": 2, "depth": 5, "trains": "live"}))
+        layer = self.stack(self.lines(l3="Y"))
+        self.repo.branch("onward", self.repo.main_tip())
+        onward = self.repo.commit("m.txt", "m\n", "main moves on")
+        run_git(self.repo.path, "push", "-q", "origin", onward + ":main")
+        run_git(self.repo.path, "fetch", "-q", "origin")
+        seven = self.other(7, "g.txt")
+        entries, sizes, _ = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), [[layer], [seven]], None,
+            {6: self.upper, 7: seven["headRefOid"]}, {6, 7},
+            restacks=self.restacks)
+        self.assertEqual(m.train_lists(entries, sizes), [[6, 7]])
+        _, _, later = m.train_batches(entries, sizes, lambda t: None)
+        return seven, {"base": self.repo.main_tip(), "trains": True,
+                       "entries": entries, "later": later,
+                       "batch": {"size": sizes[0],
+                                 "trees": [e["tree"] for e in entries]}}
+
+    def updated(self, head):
+        """`head` with main merged in, as GitHub's update makes it."""
+        self.repo.branch("updated", head)
+        return self.repo.merge(self.repo.main_tip())
+
+    def recut(self, seven, last, head, queued=True):
+        self.repo.publish_pr(6, head)
+        return m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            ([[pr(6, T1, head=head)]] if queued else []) + [[seven]], last,
+            {6: head, 7: seven["headRefOid"]}, {6, 7}, restacks=None)
+
+    def test_the_mergers_own_restack_of_another_stack_stays(self):
+        # 2026-11-11: the tick acting on another stack had only that
+        # stack's restacks, so this layer's RESTACK read as a push and
+        # its train and every later one were cut again.
+        seven, last = self.boarded()
+        got, sizes, events = self.recut(seven, last,
+                                        self.restacked_by_hand())
+        self.assertEqual(events, [])
+        self.assertEqual(m.train_lists(got, sizes), [[6, 7]])
+
+    def test_the_mergers_update_after_its_restack_stays(self):
+        seven, last = self.boarded()
+        got, sizes, events = self.recut(
+            seven, last, self.updated(self.restacked_by_hand()))
+        self.assertEqual(events, [])
+        self.assertEqual(m.train_lists(got, sizes), [[6, 7]])
+
+    def test_one_out_of_the_queue_still_leaves(self):
+        # Out of the queue (its new head's Mac check pending, say), it
+        # may not ride: a train holds only what may merge now.
+        seven, last = self.boarded()
+        head = self.updated(self.restacked_by_hand())
+        _, _, events = self.recut(seven, last, head, queued=False)
+        self.assertEqual(events[0], ("left", "LEFT #6: pushed %s mid-train"
+                                     % head[:10]))
+
+    def test_a_merge_edited_by_hand_is_a_push(self):
+        seven, last = self.boarded()
+        updated = self.updated(self.restacked_by_hand())
+        with open(os.path.join(self.repo.path, "extra.txt"), "w") as f:
+            f.write("extra\n")
+        run_git(self.repo.path, "add", "extra.txt")
+        run_git(self.repo.path, "commit", "-q", "--amend", "--no-edit")
+        edited = run_git(self.repo.path, "rev-parse", "HEAD")
+        self.assertNotEqual(edited, updated)
+        _, _, events = self.recut(seven, last, edited)
+        self.assertEqual(events[0], ("left", "LEFT #6: pushed %s mid-train"
+                                     % edited[:10]))
+        # And so is a commit of the author's on top of an update.
+        self.repo.branch("more", updated)
+        more = self.repo.commit("n.txt", "n\n", "more")
+        _, _, events = self.recut(seven, last, more)
+        self.assertEqual(events[0], ("left", "LEFT #6: pushed %s mid-train"
+                                     % more[:10]))
+
     def test_without_the_option_the_layer_is_left_out(self):
         layer = self.stack(self.lines(l3="Y"))
         seven, eight = self.other(7, "g.txt"), self.other(8, "h.txt")
