@@ -998,6 +998,115 @@ class Decide(RepoCase):
         self.assertIn("fetch failed", got["reason"])
 
 
+class TrainMerge(RepoCase):
+    """merge.test_ahead.train_merge (designs/0047, amendment of
+    2026-11-11): a green train goes in as one pull request."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.publish_pr(5, self.approved)
+        self.repo.branch("other", "main")
+        self.other = self.repo.commit("g.txt", "other\n", "other")
+        self.repo.publish_pr(6, self.other)
+        self.repo.branch("main", "main")
+        self.tip = self.repo.main_tip()
+        self.queue = [dict(pr(5, head=self.approved), title="five"),
+                      dict(pr(6, head=self.other), title="six")]
+        self.entries, parent = [], self.tip
+        for item in self.queue:
+            entry, failed = m.predict_one(self.repo.path, parent, item)
+            self.assertIsNone(failed)
+            self.entries.append(entry)
+            parent = entry["sha"]
+        self.last = {"base": self.tip, "entries": self.entries,
+                     "batch": {"size": 2, "trees": [
+                         e["tree"] for e in self.entries]}}
+        self.check = {"results": {"r": {"ok": True,
+                                        "tree": self.entries[-1]["tree"]}}}
+        self.lines = []
+        for name, value in (("RESOLVE_IDENTITY", ("Merger", "m@example")),
+                            ("CI_WORKFLOW", ""), ("REPO_SLUG",
+                                                  "example/widget")):
+            patch = mock.patch.object(m, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def git(self, args, cwd=None, env=None):
+        """git, with a push to GitHub sent to the test's origin."""
+        if "push" in args:
+            args = [self.repo.origin if a.startswith("https://github.com/")
+                    else a for a in args]
+        return m.sh(args, cwd, env)
+
+    def merge(self, merged=(5, 6), refuse=None):
+        self.github = FakeGitHub({
+            SLUG + "/pulls/%d" % n: {"merged": n in merged} for n in (5, 6)},
+            refuse)
+        return m.train_merge(self.repo.path, "/nonexistent", self.entries,
+                             self.queue, self.tip, self.check, self.github,
+                             self.git, lambda s: None, self.lines.append)
+
+    def test_a_green_train_merges_as_one_pull_request(self):
+        self.assertEqual(self.merge(), ([5, 6], []))
+        top = run_git(self.repo.origin, "rev-parse", "forge/train-5-6")
+        # Every member's head is in the train, and its tree is the one
+        # the green top tested.
+        for head in (self.approved, self.other):
+            run_git(self.repo.path, "fetch", "-q", "origin",
+                    "forge/train-5-6")
+            self.assertEqual(subprocess.run(
+                ["git", "-C", self.repo.path, "merge-base",
+                 "--is-ancestor", head, top]).returncode, 0)
+        self.assertEqual(run_git(self.repo.path, "rev-parse",
+                                 top + "^{tree}"), self.entries[-1]["tree"])
+        methods = [(w[0], w[1]) for w in self.github.writes]
+        self.assertEqual(methods, [
+            ("POST", SLUG + "/statuses/" + top),
+            ("POST", SLUG + "/pulls"),
+            ("PUT", SLUG + "/pulls/900/merge"),
+            ("DELETE", SLUG + "/git/refs/heads/forge/train-5-6")])
+        self.assertEqual(self.github.writes[0][2]["context"],
+                         m.STATUS_CONTEXT)
+        self.assertEqual(self.github.writes[2][2],
+                         {"sha": top, "merge_method": "merge",
+                          "commit_title": "Merge train #5..#6 (#900)"})
+        self.assertIn("* #5 at %s" % self.approved[:10],
+                      self.github.writes[1][2]["body"])
+
+    def test_a_member_github_does_not_mark_merged_goes_on_its_own(self):
+        self.assertEqual(self.merge(merged=(5,)), ([5], [6]))
+        self.assertIn("#6", self.lines[-1])
+
+    def test_a_refused_merge_closes_the_train_and_falls_back(self):
+        refuse = lambda method, path: "protected" \
+            if path.endswith("/merge") else None
+        self.assertEqual(self.merge(refuse=refuse), ([], [5, 6]))
+        self.assertIn(("PATCH", SLUG + "/pulls/900"),
+                      [(w[0], w[1]) for w in self.github.writes])
+        self.assertIn("each member merges on its own", self.lines[-1])
+
+    def test_a_layer_is_retargeted_to_main_first(self):
+        self.queue[1]["baseRefName"] = "b5"
+        self.merge()
+        self.assertIn(("PATCH", SLUG + "/pulls/6", {"base": "main"}),
+                      self.github.writes)
+
+    def test_ready_only_while_main_is_the_trains_base(self):
+        self.assertEqual(m.train_ready(self.last, self.queue, self.tip,
+                                       self.check), self.entries)
+        self.assertIsNone(m.train_ready(self.last, self.queue, "f" * 40,
+                                        self.check))
+
+    def test_ready_only_with_a_green_top(self):
+        self.assertIsNone(m.train_ready(self.last, self.queue, self.tip,
+                                        {"results": {}}))
+
+    def test_ready_only_while_every_member_is_at_its_predicted_head(self):
+        moved = [self.queue[0], dict(self.queue[1], headRefOid="9" * 40)]
+        self.assertIsNone(m.train_ready(self.last, moved, self.tip,
+                                        self.check))
+
+
 def graphql_page(nodes, more=False, cursor="c1"):
     nodes = [dict(n, reviews={"nodes": n["reviews"]},
                   comments={"nodes": n["comments"]}) for n in nodes]
@@ -3603,6 +3712,36 @@ class TickAhead(RepoCase):
                              check_state={"results": {top["sha"]: {
                                  "tree": top["tree"], "ok": True}}})
         self.assertNotIn(line, lines)
+
+    def test_a_green_train_merges_whole_in_one_tick(self):
+        # merge.test_ahead.train_merge (designs/0047, amendment of
+        # 2026-11-11).
+        m.configure(project(test_ahead={"batch": 2, "train_merge": True}))
+        self.assertIs(m.TRAIN_MERGE, True)
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        origin = self.repo.origin
+
+        def run(args, cwd=None, env=None):
+            if "push" in args:
+                args = [origin if a.startswith("https://github.com/")
+                        else a for a in args]
+            return tools_run()(args, cwd, env)
+        with mock.patch.object(m, "RESOLVE_IDENTITY", ("Merger", "m@x")), \
+                mock.patch.object(m, "CI_WORKFLOW", ""):
+            record, lines = self.tick(
+                prs, conclusions=(None,), live=True, minutes=1, run=run,
+                check_state={"results": {top["sha"]: {
+                    "tree": top["tree"], "ok": True}}},
+                extra={SLUG + "/pulls/5": {"merged": True},
+                       SLUG + "/pulls/6": {"merged": True}})
+        self.assertEqual([(d["pr"], d["action"], d.get("train"))
+                          for d in record["decisions"]],
+                         [(5, "MERGE", True), (6, "MERGE", True)])
+        self.assertTrue(any(line.startswith("TRAIN-MERGE #5..#6: merged 2")
+                            for line in lines))
+        self.assertTrue(m.moved_a_stack(record))
 
     def test_later_batches_are_written_and_fixed_once_started(self):
         # designs/0035 part 2.

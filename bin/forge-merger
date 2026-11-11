@@ -547,6 +547,14 @@ the dry run's own (`trains-dry.json`), are said as `TRAIN-DRY 1: #a #b |
 2: #c` when they change, each change as `TRAIN-DRY LEFT ...`, and kept
 in the record as `trains` with `"trains_dry": true`, with
 `recut_avoided` when the batches were cut again but no train was.
+With `train_merge` (amendment of 2026-11-11, default off), a green
+train goes in as one: while the default branch is still the tip it was
+predicted from, a chain of merge commits, one per member with its head
+as a parent and the tree its prediction tested, is pushed to
+`train_branch` + `<first>-<last>`, given `checks.context`'s green, and
+merged by one pull request as a merge commit pinned to its top
+(`TRAIN-MERGE`). GitHub then marks each member merged; any it doesn't,
+and any train it refuses, merge one at a time as before.
 With `tell_boarded` (agent-forge #286), each pull request that boards a
 live train is told once, in a `Not-a-review` comment, not to push to it
 unless it is handed back (`TOLD-BOARDED #<pr> <sha>`, the record's
@@ -961,6 +969,16 @@ BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
                      "waits for the new batch's top")
 # The most ticks one run makes: it ticks again straight after a merge.
 TICKS_PER_RUN = 10
+# merge.test_ahead.train_merge (designs/0047, amendment of 2026-11-11):
+# a green train is merged as one: a chain of merge commits, one per
+# member's head, pushed to a branch named TRAIN_BRANCH + "<first>-<last>"
+# and merged by one pull request.
+TRAIN_MERGE = False
+TRAIN_BRANCH = "forge/train-"
+# How long GitHub is given to mark the members merged once the train
+# is in: TRAIN_POLLS times TRAIN_POLL_S seconds.
+TRAIN_POLLS = 10
+TRAIN_POLL_S = 2
 # The actions that leave a run in progress or about to start on the
 # pull request: with test_ahead, it keeps its place in the queue.
 IN_FLIGHT = ("UPDATE", "RESOLVE", "UNION", "RESTACK", "STACK-UPDATE",
@@ -1131,6 +1149,7 @@ def configure(project):
     global FIXED_ORDER, GREEN_BATCH_FIRST, RED_SUSPECT_OUT, UNSTABLE_AFTER
     global UNSTABLE_BATCHES, TELL_BOARDED
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
+    global TRAIN_MERGE, TRAIN_BRANCH
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -1180,6 +1199,8 @@ def configure(project):
     UNSTABLE_BATCHES = (ahead or {}).get("batches_when_unstable", 1)
     TRAINS = (ahead or {}).get("trains")
     TRAINS_WITHIN = (ahead or {}).get("trains_within", "files")
+    TRAIN_MERGE = (ahead or {}).get("train_merge") is True
+    TRAIN_BRANCH = (ahead or {}).get("train_branch", "forge/train-")
     HOLD_CONFLICTING = merge.get("hold_conflicting", False) is True
     YIELD_PLACES = merge.get("yield_after_hand_back", 0)
     YIELD_CAP = merge.get("yield_cap", 3)
@@ -5113,6 +5134,149 @@ def batch_holds(last, pr, tree, queue, check_state, tree_of=None):
             and tree_verdict(check_state, entries[-1]["tree"]) is True)
 
 
+def train_ready(last, queue, main_tip, check_state):
+    """merge.test_ahead.train_merge: the members of the batch in `last`
+    (ahead.json) that can merge as one train now, or None: two or more,
+    its top's tree green, predicted from `main_tip` itself (the default
+    branch hasn't moved since), and each member still in `queue` at the
+    head it was predicted at."""
+    batch = (last or {}).get("batch") or {}
+    entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
+    if len(entries) < 2 or [e.get("tree") for e in entries] \
+            != batch.get("trees") or (last or {}).get("base") != main_tip \
+            or tree_verdict(check_state, entries[-1].get("tree")) is not True:
+        return None
+    prs = {pr["number"]: pr for pr in queue}
+    if not all(prs.get(e.get("pr"), {}).get("headRefOid") == e.get("head")
+               for e in entries):
+        return None
+    return entries
+
+
+def train_commits(repo, main_tip, entries, prs, run=sh):
+    """The chain of merge commits for a green train: for each member, in
+    order, a commit of the tree its prediction tested, whose parents are
+    the commit before it (the default branch's tip first) and the
+    member's head, so every head is in the train's history. As the
+    Merger (RESOLVE_IDENTITY). The top's sha, or None when git fails."""
+    if RESOLVE_IDENTITY is None:
+        return None
+    name, email = RESOLVE_IDENTITY
+    env = dict(os.environ, GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
+               GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
+    parent = main_tip
+    for entry in entries:
+        pr = prs[entry["pr"]]
+        have_head(repo, pr, run)
+        made = run(["git", "-C", repo, "commit-tree", "--no-gpg-sign",
+                    entry["tree"], "-p", parent, "-p", entry["head"], "-m",
+                    "Merge #%d: %s" % (entry["pr"], pr.get("title", ""))],
+                   env=env)
+        sha = (made.stdout or "").strip()
+        if made.returncode != 0 or len(sha) != 40:
+            return None
+        parent = sha
+    return parent
+
+
+def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
+                github, run=sh, sleep=time.sleep, out=print):
+    """merge.test_ahead.train_merge (designs/0047, amendment of
+    2026-11-11): merge a green train with one pull request. The chain
+    of `train_commits` is pushed to TRAIN_BRANCH<first>-<last>, given
+    checks.context's green (its tree is the green top's), opened as a
+    pull request to the default branch listing the members, and merged
+    as a merge commit pinned to its top. Each member's head is then in
+    the default branch, so GitHub marks it merged. A member based on
+    another's branch is retargeted to the default branch first, or
+    GitHub wouldn't. Returns (merged, unmerged): the members GitHub says
+    are merged, and the rest, left to the usual path; ([], members)
+    when the train didn't go in, with the reason said."""
+    prs = {pr["number"]: pr for pr in queue}
+    numbers = [e["pr"] for e in entries]
+    span = "#%d..#%d" % (numbers[0], numbers[-1])
+
+    def fail(why):
+        out("TRAIN-MERGE %s: %s; each member merges on its own" % (span, why))
+        return [], numbers
+    if CI_WORKFLOW:
+        return fail("merge.ci_workflow is set, and the train's commits "
+                    "have no runs of it")
+    top = train_commits(repo, main_tip, entries, prs, run)
+    if top is None:
+        return fail("git could not make the train's commits")
+    branch = "%s%d-%d" % (TRAIN_BRANCH, numbers[0], numbers[-1])
+    pushed = run(["git", "-C", repo, "push", "-q", "-f",
+                  "https://github.com/%s.git" % REPO_SLUG,
+                  "%s:refs/heads/%s" % (top, branch)], env=push_env(github))
+    if pushed.returncode != 0:
+        return fail("push refused: " + tail(pushed.stderr + "\n"
+                                            + pushed.stdout, 1))
+    tested = [sha for sha, r in ((check_state or {}).get("results")
+                                 or {}).items()
+              if isinstance(r, dict) and r.get("ok") is True
+              and r.get("tree") == entries[-1]["tree"]
+              and not r.get("covered")]
+    ok, why = github.write(
+        "POST", "repos/%s/statuses/%s" % (REPO_SLUG, top), state="success",
+        context=STATUS_CONTEXT, description=(
+            "green: the Merger's train %s, its tree tested as %s"
+            % (span, short(tested[0]) if tested else "its top"))[:140])
+    if not ok:
+        github.write("DELETE", "repos/%s/git/refs/heads/%s"
+                     % (REPO_SLUG, branch))
+        return fail("could not post %s: %s" % (STATUS_CONTEXT, why))
+    for number in numbers:
+        if prs[number].get("baseRefName", MAIN) != MAIN:
+            ok, why = github.write("PATCH", "repos/%s/pulls/%d"
+                                   % (REPO_SLUG, number), base=MAIN)
+            if not ok:
+                github.write("DELETE", "repos/%s/git/refs/heads/%s"
+                             % (REPO_SLUG, branch))
+                return fail("could not retarget #%d: %s" % (number, why))
+    body = ("The Merger's train %s, tested green as one tree. Each "
+            "member's head is merged here as it was approved:\n\n%s\n\n%s"
+            % (span, "\n".join("* #%d at %s" % (e["pr"], e["head"][:10])
+                               for e in entries), SIGNATURE))
+    number, why = github.create("repos/%s/pulls" % REPO_SLUG,
+                                title="Merge train %s" % span, head=branch,
+                                base=MAIN, body=body)
+    if number is None:
+        github.write("DELETE", "repos/%s/git/refs/heads/%s"
+                     % (REPO_SLUG, branch))
+        return fail("could not open its pull request: " + why)
+    ok, why = github.write("PUT", "repos/%s/pulls/%d/merge"
+                           % (REPO_SLUG, number), sha=top,
+                           merge_method="merge",
+                           commit_title="Merge train %s (#%d)" % (span, number))
+    if not ok:
+        github.write("PATCH", "repos/%s/pulls/%d" % (REPO_SLUG, number),
+                     state="closed")
+        github.write("DELETE", "repos/%s/git/refs/heads/%s"
+                     % (REPO_SLUG, branch))
+        return fail("GitHub refused to merge #%d: %s" % (number, why))
+    github.write("DELETE", "repos/%s/git/refs/heads/%s" % (REPO_SLUG, branch))
+    unmerged = list(numbers)
+    for k in range(TRAIN_POLLS):
+        for n in list(unmerged):
+            try:
+                got = github.api("repos/%s/pulls/%d" % (REPO_SLUG, n))
+            except RuntimeError:
+                continue
+            if isinstance(got, dict) and got.get("merged") is True:
+                unmerged.remove(n)
+        if not unmerged:
+            break
+        if k + 1 < TRAIN_POLLS:
+            sleep(TRAIN_POLL_S)
+    merged = [n for n in numbers if n not in unmerged]
+    out("TRAIN-MERGE %s: merged %d as #%d (%s)%s" % (
+        span, len(merged), number, short(top),
+        "; GitHub doesn't say %s merged: each goes on its own" % ", ".join(
+            "#%d" % n for n in unmerged) if unmerged else ""))
+    return merged, unmerged
+
+
 def load_suspects(state_dir):
     """designs/0035, second amendment: the search in progress, from
     SUSPECTS_FILE, as {suspects: [{pr, head}], tree, merged, left,
@@ -6211,7 +6375,35 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     and str(pr["number"]) in held
                     and eligible(pr, open_numbers - layers_below(pr, prs),
                                  when, any_base=True)[0] is not None]
-    for at, pr in enumerate([] if retarget is not None else queue):
+    # merge.test_ahead.train_merge: a green train goes in as one. Every
+    # ready member merges this tick, not one a tick.
+    trained = None
+    if TRAIN_MERGE and live and retarget is None and AHEAD_BATCH > 1:
+        last_ahead = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+        entries = train_ready(last_ahead, queue, main_tip, check_state)
+        if entries:
+            merged, _ = train_merge(repo, state_dir, entries, queue,
+                                    main_tip, check_state, github, run,
+                                    sleep, out)
+            if merged:
+                trained = set(merged)
+                heads = {e["pr"]: e["head"] for e in entries}
+                prs_by = {pr["number"]: pr for pr in queue}
+                for number in merged:
+                    record["decisions"].append({
+                        "action": "MERGE", "pr": number,
+                        "head": heads[number], "result": "done",
+                        "train": True})
+                    note_closing(state_dir, number, when)
+                    if STACKS:
+                        stack = note_merge(state_dir, stack or {}, dict(
+                            prs_by[number], headRefOid=heads[number]),
+                            prs, when)
+                if STACKS and stack:
+                    record["stack"] = [{"pr": e["pr"], "after": e["after"]}
+                                       for e in stack["pending"]]
+    for at, pr in enumerate([] if retarget is not None or trained
+                            else queue):
         approval = approvals[pr["number"]]
         found_red = reds.get(str(pr["number"]))
         if found_red:
@@ -6479,7 +6671,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # predicts nothing. It leaves ahead.json as the last tick wrote
         # it: written empty, the batch the queue is merging was forgotten,
         # and its members waited for a new run of their own.
-        if TEST_AHEAD and retarget is None:
+        if TEST_AHEAD and retarget is None and not trained:
             acting = [pr for pr in queue if pr["number"] == waiting_on]
             for pr in [pr for pr in queue if pr["number"] != waiting_on
                        and pr.get("baseRefName", MAIN) == MAIN
@@ -6818,7 +7010,7 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
         if token is None:
             out("NO-TOKEN: could not mint %s's token" % reader)
             return 2
-        if (RESOLVE or UNION or STACKS) and not args.dry_run:
+        if (RESOLVE or UNION or STACKS or TRAIN_MERGE) and not args.dry_run:
             RESOLVE_IDENTITY = identity(project, ACT_AS)
         check_state = None
         if QUEUED_STALL_AFTER is not None or AHEAD_BATCH > 1:
