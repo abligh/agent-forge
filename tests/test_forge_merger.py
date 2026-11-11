@@ -6699,6 +6699,34 @@ class BatchTopStall(unittest.TestCase):
         self.assertEqual(self.stalled(
             30, {"q" * 40: "2026-10-07T12:16:00Z"}, action="UPDATE"), 30)
 
+    def test_the_stall_names_the_batch_and_its_top(self):
+        # agent-forge #285: "look at the build check" sent agents to a
+        # status that still said "queued for a check slot".
+        self.ahead({"size": 2, "trees": ["t1", "t2"]}, [
+            {"pr": 5, "head": self.HEAD, "sha": "p" * 40, "tree": "t1"},
+            {"pr": 6, "head": "j" * 40, "sha": "q" * 40, "tree": "t2"}])
+        batch = m.stall_batch(self.state, 5)
+        self.assertEqual(batch, ("#5..#6", "q" * 40))
+        text = m.stall_text({"pr": 5, "head": self.HEAD, "minutes": 40},
+                            batch=batch)
+        self.assertIn("it is in the Merger's batch #5..#6, whose top `%s` "
+                      "the build check runs for it" % ("q" * 10), text)
+
+    def test_no_batch_for_a_pull_request_outside_it(self):
+        self.assertIsNone(m.stall_batch(self.state, 9))
+        self.assertNotIn("batch", m.stall_text(
+            {"pr": 9, "head": self.HEAD, "minutes": 40}))
+
+    def test_a_later_batch_is_found_too(self):
+        m.save_json(os.path.join(self.state, m.AHEAD_FILE), {
+            "at": "2026-10-07T12:00:00Z",
+            "batch": {"size": 1, "trees": ["t1"]},
+            "later": [{"size": 2, "trees": ["t2", "t3"]}],
+            "entries": [{"pr": 5, "sha": "p" * 40, "tree": "t1"},
+                        {"pr": 6, "sha": "q" * 40, "tree": "t2"},
+                        {"pr": 7, "sha": "r" * 40, "tree": "t3"}]})
+        self.assertEqual(m.stall_batch(self.state, 6), ("#6..#7", "r" * 40))
+
     def test_no_or_a_bad_ahead_file_is_as_before(self):
         self.ahead(None, None)
         self.assertEqual(self.stalled(
