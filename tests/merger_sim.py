@@ -109,6 +109,11 @@ def iso(when):
     return when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def parse(text):
+    return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc)
+
+
 class Git:
     """git in one repository, raising on failure unless `check` is off."""
 
@@ -179,10 +184,18 @@ class World:
         return self.og("write-tree", env=env)
 
     def tree(self, sha):
-        return self.og("rev-parse", sha + "^{tree}")
+        # A commit's tree never changes: asked once.
+        cache = self.__dict__.setdefault("trees", {})
+        if sha not in cache:
+            cache[sha] = self.og("rev-parse", sha + "^{tree}")
+        return cache[sha]
 
     def main(self):
-        return self.og("rev-parse", "refs/heads/main")
+        # Only a squash merge moves main (SimGitHub.merge), which
+        # forgets this.
+        if self.__dict__.get("main_sha") is None:
+            self.main_sha = self.og("rev-parse", "refs/heads/main")
+        return self.main_sha
 
     def ref(self, name):
         return self.og("rev-parse", "--verify", "-q", name, check=False)
@@ -191,11 +204,15 @@ class World:
         """Whether #`number` changes a path the gated instance runs on,
         since it left the default branch (as the Merger asks it)."""
         pr = self.prs[number]
-        base = self.og("merge-base", self.main(), pr["head"], check=False)
-        if not base:
-            return True
-        return any(path.startswith("mac/") for path in self.og(
-            "diff", "--name-only", base, pr["head"]).split())
+        main = self.main()
+        cache = self.__dict__.setdefault("gates", {})
+        key = (pr["head"], main)
+        if key not in cache:
+            base = self.og("merge-base", main, pr["head"], check=False)
+            cache[key] = not base or any(
+                path.startswith("mac/") for path in self.og(
+                    "diff", "--name-only", base, pr["head"]).split())
+        return cache[key]
 
     def gate_verdict(self, number):
         """The gated instance's verdict for #`number` as the Merger reads
@@ -260,12 +277,17 @@ class World:
         self.note("approve", pr=number)
 
     def open(self, number, base=None, mac=False, red=False, urgent=False,
-             approve=True):
+             approve=True, shared=()):
         """Opens #`number`, on main or on the pull request `base`, with a
-        change of its own (a file of its own, so nothing conflicts)."""
+        change of its own (a file of its own, so nothing conflicts), and
+        a line of its own in each of the `shared` files, so that it
+        conflicts with every other pull request that writes one of
+        them."""
         branch = "b%d" % number
         start = self.main() if base is None else self.prs[base]["head"]
         files = {"p%d.txt" % number: "v1\n"}
+        for name in shared:
+            files[name] = "#%d\n" % number
         if mac:
             files["mac/p%d.txt" % number] = "v1\n"
         if red:
@@ -291,6 +313,51 @@ class World:
                                        % pr["version"]}, "push")
         self.set_head(number, sha)
         self.note("push", pr=number)
+
+    def fix(self, number):
+        """The author of a red #`number` pushes its fix."""
+        pr = self.prs[number]
+        pr["version"] += 1
+        tree = self.tree(pr["head"])
+        index = os.path.join(self.root, "index.tmp")
+        env = {"GIT_INDEX_FILE": index}
+        if os.path.exists(index):
+            os.remove(index)
+        self.og("read-tree", tree, env=env)
+        self.og("rm", "--cached", "-q", "--ignore-unmatch",
+                "red-%d.txt" % number, env=env)
+        fixed = self.og("write-tree", env=env)
+        sha = self.og("commit-tree", fixed, "-p", pr["head"], "-m", "fix")
+        self.set_head(number, sha)
+        pr["red"] = False
+        self.note("fix", pr=number)
+
+    def resolve(self, number):
+        """The author of #`number` merges main into it, taking main's
+        side of every conflict: a new head that no longer conflicts with
+        what has merged."""
+        pr = self.prs[number]
+        if pr["state"] != "OPEN":
+            return
+        pr["version"] += 1
+        main = self.main()
+        got = subprocess.run(
+            ["git", "-C", self.origin, "merge-tree", "--write-tree",
+             "--no-messages", "-X", "theirs", pr["head"], main],
+            capture_output=True, text=True, env=git_env())
+        tree = got.stdout.split()[0] if got.returncode == 0 \
+            else self.tree(main)
+        sha = self.og("commit-tree", tree, "-p", pr["head"], "-p", main,
+                      "-m", "Merge main into %s" % pr["branch"])
+        self.set_head(number, sha)
+        self.note("resolve", pr=number)
+
+    def close(self, number):
+        """#`number` is closed without merging."""
+        pr = self.prs.get(number)
+        if pr is not None and pr["state"] == "OPEN":
+            pr["state"] = "CLOSED"
+            self.note("close", pr=number)
 
     def sync(self):
         """GitHub follows a branch pushed to: a pull request's head is
@@ -435,6 +502,7 @@ class SimGitHub:
         squash = w.og("commit-tree", tree, "-p", main, "-m",
                       "#%d" % number)
         w.og("update-ref", "refs/heads/main", squash, main)
+        w.main_sha = None
         pr["state"] = "MERGED"
         pr["merged_at"] = iso(w.now)
         w.merges.append({"pr": number, "tree": tree, "at": iso(w.now),
@@ -455,10 +523,32 @@ class SimCheck:
     of its own with `mac_slots` slots taking `mac_minutes`."""
 
     def __init__(self, world, merger_dir, slots=4, minutes=8,
-                 mac_slots=1, mac_minutes=12, notice=2):
+                 mac_slots=1, mac_minutes=12, notice=2, later_first=None,
+                 max_wait=None, stop_spent=False, background=(),
+                 first_pr=None):
+        """`minutes` is a run's length, or a function of (pull request
+        number, whether the run is a top) giving it. With `later_first`
+        (a number), runs start in `forge-pr-check`'s order rather than
+        every top first: the default branch's runs, a head that has
+        waited `max_wait` minutes, the head of `first_pr()` (the pull
+        request the Merger waits on), the batch's top and then
+        `later_first` later tops, the other heads oldest first, and the
+        remaining later tops only in a slot no head wants. With
+        `stop_spent`, a top the Merger no longer predicts, and a head no
+        pull request has any more, stop. `background` is other work in
+        the same slots: [{"at": minute, "minutes": n, "main": bool}],
+        each queued at its minute (a default-branch run first, anything
+        else as an ordinary head)."""
         self.world = world
         self.merger_dir = merger_dir
         self.slots, self.minutes = slots, minutes
+        self.later_first, self.max_wait = later_first, max_wait
+        self.stop_spent = stop_spent
+        self.background = sorted(background, key=lambda b: b["at"])
+        self.first_pr = first_pr or (lambda: None)
+        self.stopped = 0
+        self.busy_minutes = 0
+        self.background_runs = 0
         self.mac_slots, self.mac_minutes = mac_slots, mac_minutes
         self.state = {"results": {}, "ahead_started": {}}
         self.running = []
@@ -526,7 +616,15 @@ class SimCheck:
     def busy(self, sha):
         return any(r["sha"] == sha for r in self.running + self.queue)
 
+    def length(self, pr, top):
+        """A run's length in minutes, as a timedelta."""
+        minutes = self.minutes(pr, top) if callable(self.minutes) \
+            else self.minutes
+        return datetime.timedelta(minutes=minutes)
+
     def step(self):
+        if self.later_first is not None:
+            return self.step_in_order()
         w = self.world
         now = w.now
         for run in [r for r in self.running if r["done"] <= now]:
@@ -549,13 +647,111 @@ class SimCheck:
         self.heads(batches)
         while self.queue and len(self.running) < self.slots:
             run = self.queue.pop(0)
-            run["done"] = now + datetime.timedelta(minutes=self.minutes)
+            run["done"] = now + self.length(run["pr"], run["top"])
             self.running.append(run)
             self.runs += 1
             if run["top"]:
                 self.top_runs += 1
                 self.state["ahead_started"][run["sha"]] = iso(now)
         self.mac()
+
+    def finish(self, now):
+        """Takes the runs that have ended out of their slots."""
+        for run in [r for r in self.running if r["done"] <= now]:
+            self.running.remove(run)
+            if run.get("background"):
+                continue
+            ok = self.verdict(run["tree"])
+            self.state["results"][run["sha"]] = {
+                "tree": run["tree"], "ok": ok, "pr": run["pr"],
+                "ahead": run["top"], "finished": iso(now)}
+            if not run["top"]:
+                self.post(run["sha"], "success" if ok else "failure",
+                          "green" if ok else "red: test")
+
+    def step_in_order(self):
+        """`step`, in forge-pr-check's order (see __init__)."""
+        w = self.world
+        now = w.now
+        minute = (now - START).total_seconds() / 60
+        self.finish(now)
+        while self.background and self.background[0]["at"] <= minute:
+            b = self.background.pop(0)
+            self.queue.append({"sha": "background-%d" % id(b), "tree": None,
+                               "pr": 0, "top": False, "background": True,
+                               "main": bool(b.get("main")),
+                               "length": b["minutes"], "queued": now})
+        entries, batches = self.ahead()
+        tops = [b[-1] for b in batches]
+        if self.stop_spent:
+            wanted = {t["sha"] for t in tops}
+            heads = {p["head"] for p in w.prs.values()
+                     if p["state"] == "OPEN"}
+            for run in list(self.running):
+                if run.get("background"):
+                    continue
+                if (run["top"] and run["sha"] not in wanted) or (
+                        not run["top"] and run["sha"] not in heads):
+                    self.running.remove(run)
+                    self.stopped += 1
+            self.queue = [r for r in self.queue if r.get("background")
+                          or r["top"] or r["sha"] in heads]
+        self.heads(batches)
+        for run in self.queue:
+            run.setdefault("queued", now)
+        # The tops are never queued in this order: each free slot asks
+        # which is next.
+        self.queue = [r for r in self.queue if not r["top"]]
+        while len(self.running) < self.slots:
+            run = self.pick(tops, now)
+            if run is None:
+                break
+            if run in self.queue:
+                self.queue.remove(run)
+            length = run.get("length")
+            run["done"] = now + (datetime.timedelta(minutes=length)
+                                 if length else
+                                 self.length(run["pr"], run["top"]))
+            self.running.append(run)
+            if run.get("background"):
+                self.background_runs += 1
+                continue
+            self.runs += 1
+            if run["top"]:
+                self.top_runs += 1
+                self.state["ahead_started"][run["sha"]] = iso(now)
+        if getattr(self, "counted", None) != minute:
+            self.counted = minute
+            self.busy_minutes += len(self.running)
+        self.mac()
+
+    def pick(self, tops, now):
+        """The next run to start, as forge-pr-check picks it, or None."""
+        main = [r for r in self.queue if r.get("main")]
+        if main:
+            return main[0]
+        heads = sorted((r for r in self.queue if not r.get("main")),
+                       key=lambda r: r["queued"])
+        if self.max_wait is not None:
+            late = [r for r in heads if now - r["queued"]
+                    >= datetime.timedelta(minutes=self.max_wait)]
+            if late:
+                return late[0]
+        first = self.first_pr()
+        own = [r for r in heads if first is not None and r["pr"] == first]
+        if own:
+            return own[0]
+        # The batch's top, then the later tops: the first `later_first`
+        # of them before an ordinary head, the rest only when no head
+        # wants the slot.
+        done = set(self.state["results"]) | {r["sha"] for r in self.running}
+        allowed = tops[:1] + (tops[1:] if not heads
+                              else tops[1:1 + self.later_first])
+        for t in allowed:
+            if t["sha"] not in done:
+                return {"sha": t["sha"], "tree": t["tree"], "pr": t["pr"],
+                        "top": True}
+        return heads[0] if heads else None
 
     def heads(self, batches):
         w = self.world
@@ -651,6 +847,11 @@ class Monitor:
         self.boarded = set()
         self.batches = {}
         self.recuts = []
+        # Members that left a started train, judged once it is known
+        # whether they merged at the tree their train tested after all:
+        # a member can be out of the predictions for a tick while its
+        # train merges, and lose nothing.
+        self.pending = []
 
     def say(self, rule, text):
         line = "%s rule %d: %s" % (iso(self.sim.world.now)[11:16], rule, text)
@@ -658,8 +859,9 @@ class Monitor:
             self.broken.append(line)
 
     def touched(self, number, since):
-        return any(e.get("pr") == number and e["what"] in ("push", "approve")
-                   and e["at"] > since for e in self.sim.world.events)
+        return any(e.get("pr") == number and e["what"] in (
+            "push", "approve", "fix", "resolve", "close")
+            and e["at"] > since for e in self.sim.world.events)
 
     def why(self, number):
         """What the Merger did to or said about #`number` this tick or
@@ -689,6 +891,11 @@ class Monitor:
             for e in batch:
                 pr = w.prs.get(e["pr"])
                 if pr is None or (e["pr"], pr["head"]) in self.boarded:
+                    continue
+                if e.get("head") and e["head"] != pr["head"]:
+                    # Predicted for a head it no longer has (the
+                    # Merger's own restack this tick): judged when it
+                    # is predicted for this one.
                     continue
                 self.boarded.add((e["pr"], pr["head"]))
                 if pr["approved"] != pr["version"]:
@@ -734,11 +941,16 @@ class Monitor:
                     # break.
                     self.recuts.append("%s #%d" % (minute, number))
                     break
-                self.left += 1
-                self.say(1, "#%d left the train #%d..#%d without merging "
-                         "and through nothing done to it (%s)" % (
-                             number, train["members"][0][0],
-                             train["members"][-1][0], self.why(number)))
+                if self.pushed_ahead(minute, train["since"]):
+                    # Its author pushed to one predicted ahead of it:
+                    # every prediction after that one is cut again.
+                    break
+                self.pending.append((number, tree, (
+                    "#%d left the train #%d..#%d without merging and "
+                    "through nothing done to it (%s)" % (
+                        number, train["members"][0][0],
+                        train["members"][-1][0], self.why(number))),
+                    "%s rule 1: " % minute))
                 break
             else:
                 train["done"] = True
@@ -750,6 +962,30 @@ class Monitor:
                 self.say(2, "#%d merged a tree no green run covered"
                          % m["pr"])
         self.seen_merges = len(w.merges)
+
+    def pushed_ahead(self, minute, since):
+        """Whether the Merger said this minute that one of its trains
+        lost a member to a push, and the scenario had pushed to it."""
+        for line in self.sim.lines:
+            if line.startswith(minute + " TRAIN-LEFT #") \
+                    and ": pushed " in line:
+                number = int(line.split("#", 1)[1].split(":", 1)[0])
+                if self.touched(number, since):
+                    return True
+        return False
+
+    def finish(self):
+        """Says the members that left a train and never merged at the
+        tree it tested."""
+        merged = {m["pr"]: m["tree"] for m in self.sim.world.merges}
+        for number, tree, text, prefix in self.pending:
+            if merged.get(number) == tree:
+                continue
+            self.left += 1
+            line = prefix + text
+            if line not in self.broken:
+                self.broken.append(line)
+        self.pending = []
 
     def prefix_green(self, tree):
         check = self.sim.check
@@ -765,13 +1001,18 @@ Result = collections.namedtuple("Result", [
 class Sim:
     """The Merger, the build check and a scenario, minute by minute."""
 
-    def __init__(self, merger, root, scenario, step=1, **check):
+    def __init__(self, merger, root, scenario, step=1, world=None,
+                 **check):
         self.m = merger
         self.root = root
-        self.world = World(root)
+        self.world = (world or World)(root)
+        # Called each minute after the scenario's events: authors and
+        # reviewers who answer what happens rather than a timetable.
+        self.each_minute = []
         self.github = SimGitHub(self.world)
         self.state = os.path.join(root, "merger")
         os.makedirs(self.state)
+        check.setdefault("first_pr", self.first_pr)
         self.check = SimCheck(self.world, self.state, **check)
         self.scenario = sorted(scenario, key=lambda e: e[0])
         self.step = step
@@ -779,20 +1020,56 @@ class Sim:
         self.lines = []
         self.monitor = Monitor(self)
 
+    def first_pr(self):
+        """The pull request the Merger acts on next, as its last tick
+        said."""
+        if not self.records:
+            return None
+        queue = self.records[-1].get("queue") or []
+        return queue[0] if queue else None
+
     def run_tools(self, args, cwd=None, env=None):
         return subprocess.run(args, cwd=cwd, env=dict(env or os.environ,
                                                       **git_env()),
                               capture_output=True, text=True)
 
-    def run(self, minutes):
+    def state_now(self):
+        """What a tick reads that can change from minute to minute
+        without the Merger: every pull request's state, head, base and
+        approvals, main, the build check's results, its runs and
+        statuses."""
+        w, check = self.world, self.check
+        return (w.main(), tuple(sorted(
+            (n, p["state"], p["head"], p["base"], len(p["reviews"]))
+            for n, p in w.prs.items())),
+            len(check.state["results"]), len(check.state["ahead_started"]),
+            tuple(sorted(r["sha"] for r in check.running)),
+            sum(len(v) for v in w.statuses.values()))
+
+    def run(self, minutes, whole=False, idle=0):
+        """Runs `minutes` minutes of the scenario. Unless `whole`, it
+        stops early once nothing is left to merge. With `idle`, a minute
+        in which nothing the Merger reads has changed since a tick that
+        did nothing is skipped, for at most `idle` minutes in a row: the
+        same Merger, faster, for long replays."""
         w = self.world
         events = list(self.scenario)
+        quiet, skipped = None, 0
+        self.ticks = 0
         for minute in range(0, minutes, self.step):
             w.now = START + datetime.timedelta(minutes=minute)
             while events and events[0][0] <= minute:
                 _, action, args = events.pop(0)
                 getattr(w, action)(*args)
+            for hook in self.each_minute:
+                hook()
             self.check.step()
+            if idle and quiet is not None and skipped < idle \
+                    and self.state_now() == quiet:
+                skipped += 1
+                continue
+            skipped = 0
+            self.ticks += 1
             record = self.m.tick(
                 self.world.work, self.state, self.github, self.run_tools,
                 lambda line: self.lines.append(
@@ -803,6 +1080,11 @@ class Sim:
             w.sync()
             self.check.step()
             self.monitor.check()
+            acted = any(d.get("action") != "WAIT"
+                        for d in record.get("decisions") or ())
+            quiet = None if acted else self.state_now()
+            if whole:
+                continue
             if not events and all(p["state"] != "OPEN" or p["red"]
                                   for p in w.prs.values()):
                 break
@@ -811,6 +1093,7 @@ class Sim:
                         tzinfo=datetime.timezone.utc) \
                     > datetime.timedelta(minutes=60):
                 break
+        self.monitor.finish()
         hours = max((w.now - START).total_seconds() / 3600, 1 / 60)
         return Result(self.monitor.broken, len(w.merges), hours,
                       self.check.runs, self.check.top_runs,
