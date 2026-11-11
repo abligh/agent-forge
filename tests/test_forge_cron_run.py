@@ -402,6 +402,36 @@ if flock -n -x "$LOCK" true; then echo lock=free; else echo lock=held; fi
         self.assertEqual(self.gens(), [sha])
 
 
+    def test_a_live_generation_survives_a_worktree_prune(self):
+        # Seen on 2026-11-11: a generation renamed into place was still
+        # recorded under `.new`, so a prune (the runner's own, making
+        # the next generation) left every job in it with no checkout.
+        self.run_tool("report")
+        first = self.sha()
+        self.hold(os.path.join(self.cron + ".gen", first + ".lock"),
+                  exclusive=False)
+        self.push("moved")
+        self.assertEqual(self.run_tool("report"), 0)
+        self.r.git(self.cron, "worktree", "prune")
+        path = os.path.join(self.cron + ".gen", first)
+        self.assertEqual(self.r.git(path, "rev-parse", "HEAD")
+                         .stdout.strip(), first)
+
+    def test_a_generation_git_lost_is_made_sound_again(self):
+        self.run_tool("report")
+        sha = self.sha()
+        path = os.path.join(self.cron + ".gen", sha)
+        # As one renamed into place before the fix, then pruned.
+        with open(os.path.join(path, ".git"), "w") as handle:
+            handle.write("gitdir: /nowhere/worktrees/%s.new\n" % sha)
+        self.r.git(self.cron, "worktree", "prune")
+        self.assertEqual(self.run_tool("report"), 0)
+        self.assertIn("at %s\n" % self.r.git(self.cron, "rev-parse",
+                                             "--short", sha).stdout.strip(),
+                      self.log())
+        self.assertEqual(self.r.git(path, "rev-parse", "HEAD")
+                         .stdout.strip(), sha)
+
     def test_a_worker_that_outlives_the_job_keeps_its_generation(self):
         # The tool leaves a child holding the generation's lock it was
         # handed, as pr-check's worker does.
