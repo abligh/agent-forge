@@ -1135,6 +1135,18 @@ class Tick(Decide):
         self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
                          [(6, "MERGE")])
 
+    def test_only_the_heads_an_instance_applies_to_are_prefetched(self):
+        # Fetching every candidate's statuses spent the App's hourly API
+        # allowance (2026-11-11): only #5 changes a path the instance runs.
+        m.configure(gated_project({"paths": ["f.*"]}))
+        self.addCleanup(m.configure, project())
+        asked = []
+        with mock.patch.object(FakeGitHub, "prefetch", autospec=True,
+                               side_effect=lambda gh, paths, workers=8:
+                               asked.extend(paths)):
+            self.tick([self.item(), self.other_pr()])
+        self.assertEqual(asked, [m.status_path(self.item()["headRefOid"])])
+
     def test_a_pull_request_not_yet_green_is_held_and_passed(self):
         # merge.own_head_green: the build check is the gate, even for an
         # approval given before it ran. #5 is pending on its head and
