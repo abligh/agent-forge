@@ -3388,12 +3388,16 @@ def layers_below(layer, prs):
 
 
 def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
-                 regenerated=None, rules=None, green=None):
+                 regenerated=None, rules=None, green=None, gated=None):
     """designs/0035: the layers stacked on `base`, climbing the stack,
     that would be eligible but for their base, each with an approval
     that covers its head, as [(pull request, approval)]. The first that
     isn't ready ends the climb, as does a layer with another beside it,
-    since which goes first is the author's to say."""
+    since which goes first is the author's to say. A layer is ready only
+    when it could merge as it is but for the batch's own check: with
+    `gated` (`instance_wait`), a layer still waiting for a gated
+    instance's context isn't, since the batch's run is not that
+    instance's, and it would leave the batch at its merge."""
     layers, below, numbers = [], base, {base["number"]}
     while True:
         above = [pr for pr in prs
@@ -3417,6 +3421,8 @@ def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
                                      regenerated):
             return layers
         if green is not None and green(layer, approval):
+            return layers
+        if gated is not None and gated(layer):
             return layers
         layers.append((layer, approval))
         below = layer
@@ -4660,7 +4666,38 @@ def unstable(records, recut_now):
     return count if count > UNSTABLE_AFTER else None
 
 
-def current_batch(state_dir, queue):
+def head_trees(repo, run=sh):
+    """A callable giving a pull request's head's tree, or None, fetching
+    the head first; each head is asked once. A member whose head moved
+    (the Merger's own update of it, a restack, a retarget) is still the
+    member it was predicted as when its head's tree is the one predicted
+    for its place: merging it lands exactly the tree the batch tested."""
+    cache = {}
+
+    def tree(pr):
+        head = pr["headRefOid"]
+        if head not in cache:
+            have_head(repo, pr, run)
+            got = git(repo, "rev-parse", head + "^{tree}", run=run)
+            cache[head] = got.stdout.strip() if got.returncode == 0 \
+                else None
+        return cache[head]
+    return tree
+
+
+def is_member(entry, pr, tree_of=None):
+    """Whether `pr` is still batch entry `entry`: at the head or merge
+    predicted for it, or (with `tree_of`, from `head_trees`) at a head
+    whose tree is the one predicted for its place."""
+    if pr is None:
+        return False
+    if pr["headRefOid"] in (entry.get("head"), entry.get("sha")):
+        return True
+    return (tree_of is not None and entry.get("tree") is not None
+            and tree_of(pr) == entry.get("tree"))
+
+
+def current_batch(state_dir, queue, tree_of=None):
     """(trees, members) of the batch the last tick (AHEAD_FILE) was
     merging: its batch while a member is still in `queue` at the head
     it was predicted at, else the first of its `later` batches while one
@@ -4674,7 +4711,7 @@ def current_batch(state_dir, queue):
     entries = last.get("entries")
     if not isinstance(entries, list):
         return [], set()
-    heads = {pr["number"]: pr["headRefOid"] for pr in queue}
+    prs = {pr["number"]: pr for pr in queue}
     batches = [last.get("batch")] + list((last.get("later") or [])[:1])
     for batch in batches:
         trees = batch.get("trees") if isinstance(batch, dict) else None
@@ -4682,25 +4719,25 @@ def current_batch(state_dir, queue):
             continue
         members = {e.get("pr") for e in entries
                    if isinstance(e, dict) and e.get("tree") in trees
-                   and heads.get(e.get("pr")) is not None
-                   and heads[e["pr"]] in (e.get("head"), e.get("sha"))}
+                   and is_member(e, prs.get(e.get("pr")), tree_of)}
         if members:
             return trees, members
     return [], set()
 
 
-def green_batch(state_dir, queue, check_state):
+def green_batch(state_dir, queue, check_state, tree_of=None):
     """Whether the batch being merged (current_batch) is green: its
     top's tree is. Between one member's merge and the next, no merge is
     in flight, but the batch is still merging: a layer that comes back
     then waits for the next batch, as it does while a merge is in
     flight, since joining in front would change every member's tree and
     spend the top's green."""
-    trees, members = current_batch(state_dir, queue)
+    trees, members = current_batch(state_dir, queue, tree_of)
     return bool(members) and tree_verdict(check_state, trees[-1]) is True
 
 
-def green_batch_first(state_dir, queue, check_state, in_flight, main_tip):
+def green_batch_first(state_dir, queue, check_state, in_flight, main_tip,
+                      tree_of=None):
     """designs/0047, amendment of 2026-11-10 (`green_batch_first`): the
     green batch that goes before `in_flight`, as (trees, members), or
     None. It does when the last tick predicted it on `main_tip`, the
@@ -4715,7 +4752,7 @@ def green_batch_first(state_dir, queue, check_state, in_flight, main_tip):
     last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
     if not isinstance(last, dict) or last.get("base") != main_tip:
         return None
-    trees, members = current_batch(state_dir, queue)
+    trees, members = current_batch(state_dir, queue, tree_of)
     if not members or in_flight in members \
             or tree_verdict(check_state, trees[-1]) is not True:
         return None
@@ -4734,10 +4771,10 @@ def green_batch_first(state_dir, queue, check_state, in_flight, main_tip):
     return trees, members
 
 
-def batch_members(state_dir, queue):
+def batch_members(state_dir, queue, tree_of=None):
     """The pull requests of the batch being merged (current_batch) still
     in `queue` at the head they were predicted at."""
-    return current_batch(state_dir, queue)[1]
+    return current_batch(state_dir, queue, tree_of)[1]
 
 
 def fixes_first(queue, in_flight, members):
@@ -4935,7 +4972,7 @@ def batch_line(entries, size, red, verdict):
     return None
 
 
-def batch_holds(last, pr, tree, queue, check_state):
+def batch_holds(last, pr, tree, queue, check_state, tree_of=None):
     """Whether the batch that covered pull request `pr`'s head (its
     tree `tree`) still holds (designs/0032): the last tick's ahead.json
     (`last`) names a batch with that tree, its top's tree is green, and
@@ -4951,8 +4988,8 @@ def batch_holds(last, pr, tree, queue, check_state):
           if e.get("pr") == pr and e.get("tree") == tree]
     if not at:
         return False
-    heads = {p["number"]: p["headRefOid"] for p in queue}
-    return (all(heads.get(e.get("pr")) == e.get("head")
+    prs = {p["number"]: p for p in queue}
+    return (all(is_member(e, prs.get(e.get("pr")), tree_of)
                 for e in entries[at[0] + 1:])
             and tree_verdict(check_state, entries[-1]["tree"]) is True)
 
@@ -5838,8 +5875,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         counts = hand_backs(records, not YIELD_IGNORES_CONFLICTS)
         spent = yields_spent(records, not YIELD_IGNORES_CONFLICTS)
         queue, yielded = yield_places(queue, prs, counts, in_flight, spent)
+    trees_of = head_trees(repo, run)
     first = green_batch_first(state_dir, queue, check_state, in_flight,
-                              main_tip) if GREEN_BATCH_FIRST else None
+                              main_tip, trees_of) \
+        if GREEN_BATCH_FIRST else None
     if first is not None:
         out("BATCH-FIRST #%s: the batch of %s is green on the tip; #%d's "
             "own run is still to come, so the batch merges first"
@@ -5927,8 +5966,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # a layer predicted 16th went in front of a green batch's six
         # members left to merge.
         merging = TEST_AHEAD and (in_flight is not None or green_batch(
-            state_dir, queue, check_state))
-        members = batch_members(state_dir, queue) if merging else set()
+            state_dir, queue, check_state, trees_of))
+        members = batch_members(state_dir, queue, trees_of) \
+            if merging else set()
         late = set(first) - members if merging else set()
         places = locked_order(state_dir, queue) if late else {}
         # An urgent pull request goes ahead of a layer that comes back,
@@ -5950,19 +5990,21 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # flight, urgent ones and a batch being merged, whose runs are
         # spent either way.
         merging = TEST_AHEAD and (in_flight is not None or green_batch(
-            state_dir, queue, check_state))
+            state_dir, queue, check_state, trees_of))
         queue, overdue = overdue_first(
             queue, since, when, in_flight,
-            batch_members(state_dir, queue) if merging else set(), fixed)
+            batch_members(state_dir, queue, trees_of) if merging else set(),
+            fixed)
         for number in overdue:
             yielded.pop(number, None)
     if MAIN_RED_FIXES & {pr["number"] for pr in queue}:
         # A red default branch's fix goes first, behind only the one in
         # flight and a green batch still merging, whose run is spent
         # either way (designs/0011, amendment).
-        merging = TEST_AHEAD and green_batch(state_dir, queue, check_state)
+        merging = TEST_AHEAD and green_batch(state_dir, queue, check_state,
+                                             trees_of)
         queue = fixes_first(queue, in_flight, batch_members(
-            state_dir, queue) if merging else set())
+            state_dir, queue, trees_of) if merging else set())
     saved = load_suspects(state_dir) \
         if TEST_AHEAD and AHEAD_BATCH > 1 else None
     if saved:
@@ -6080,7 +6122,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # its tree itself (a batch split down to it) is green.
         if tree and not batch_holds(
                 load_json(os.path.join(state_dir, AHEAD_FILE), {}),
-                pr["number"], tree, queue + batch_layers, check_state) \
+                pr["number"], tree, queue + batch_layers, check_state,
+                trees_of) \
                 and tree_verdict(check_state, tree) is not True:
             decision = {"action": "WAIT", "pr": pr["number"],
                         "head": pr["headRefOid"],
@@ -6359,11 +6402,15 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     os.remove(os.path.join(state_dir, SUSPECTS_FILE))
             searching = bool(saved and saved["suspects"])
             sizes, events = None, []
+            gated_files = {}
             layers_of = (lambda pr: ready_layers(
                 repo, pr, prs, open_numbers, when, said, run, regenerated,
                 rules, (lambda layer, approval: own_green_wait(
                     layer, approval, github, greens, repo, main_tip, run))
-                if OWN_HEAD_GREEN else None)) if AHEAD_STACKS else None
+                if OWN_HEAD_GREEN else None,
+                (lambda layer: instance_wait(repo, layer, main_tip, github,
+                                             gated_files, run))
+                if GATED else None)) if AHEAD_STACKS else None
             cut = lambda before: cut_trains(
                 repo, main_tip, train_carriages(ahead_queue, layers_of),
                 before, {pr["number"]: pr["headRefOid"] for pr in prs},

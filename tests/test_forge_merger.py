@@ -5859,6 +5859,20 @@ class Stacks(RepoCase):
                                                 "ok": True}}})
         self.assertEqual(record["decisions"][0]["action"], "MERGE")
 
+    def test_a_layer_waiting_for_an_instance_stays_out(self):
+        # A batch's run is not a gated instance's: a layer still waiting
+        # for vm/mac would leave the batch at its merge and spend it.
+        m.configure(gated_project({"paths": ["u.*"]}, stacks={},
+                                  test_ahead={"batch": 2, "stacks": True}))
+        record = self.merge_bottom()
+        self.assertEqual(record["ahead"], [5])
+        # Once it is green there, it joins as before.
+        m.configure(gated_project({"paths": ["nothing.*"]}, stacks={},
+                                  test_ahead={"batch": 2, "stacks": True}))
+        self.state = os.path.join(self.tmp.name, "ungated")
+        record, _ = self.tick([self.bottom(), self.layer()])
+        self.assertEqual(record["ahead"], [5, 6])
+
     def test_a_layer_not_yet_approved_stays_out(self):
         m.configure(project(stacks={},
                             test_ahead={"batch": 2, "stacks": True}))
