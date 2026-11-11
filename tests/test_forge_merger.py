@@ -4635,6 +4635,36 @@ class HoldConflicting(RepoCase):
                           record["decisions"]][0], (5, "HAND-BACK"))
         self.assertIn(6, [d["pr"] for d in record["decisions"]])
 
+    def test_a_pair_of_commits_is_asked_of_git_once(self):
+        # agent-forge #301: the same pairs, next tick, ask git nothing.
+        asked = []
+
+        def run(args, cwd=None, env=None):
+            if "merge-tree" in args:
+                asked.append(args[-2:])
+            return m.sh(args, cwd, env)
+        queue = [self.item(), self.rival()]
+        cache = {}
+        first = m.conflicts_ahead(self.repo.path, queue, run,
+                                  self.repo.main_tip(), cache)
+        self.assertEqual(first, {6: 5})
+        self.assertEqual(len(asked), 3)
+        kept = dict(cache["used"])
+        asked.clear()
+        again = m.conflicts_ahead(self.repo.path, queue, run,
+                                  self.repo.main_tip(), kept)
+        self.assertEqual(again, first)
+        self.assertEqual(asked, [])
+
+    def test_a_live_tick_keeps_only_the_pairs_it_asked(self):
+        self.tick([self.other_pr(7)], live=True)
+        path = os.path.join(self.state, m.PAIRS_FILE)
+        m.save_json(path, {"old new": 0})
+        self.tick([self.item(), self.rival()], live=True)
+        pairs = m.load_json(path, {})
+        self.assertNotIn("old new", pairs)
+        self.assertIn(1, pairs.values())
+
     def test_heads_git_cannot_compare_hold_nothing(self):
         def run(args, cwd=None, env=None):
             if "merge-tree" in args:

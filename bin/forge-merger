@@ -959,6 +959,9 @@ IN_FLIGHT = ("UPDATE", "RESOLVE", "UNION", "RESTACK", "STACK-UPDATE",
 # merge.hold_conflicting: hold one that conflicts with one ahead of it.
 HOLD_CONFLICTING = False
 HOLD_REASON = "conflicts with #%d, ahead of it in the queue"
+# merge.hold_conflicting's answers by pair of commits, kept from tick to
+# tick (agent-forge #301).
+PAIRS_FILE = "conflict-pairs.json"
 HOLD_FILE = "held-conflicting.json"
 # Which holds for a remark after the approval were said, per pull request.
 HELD_FILE = "held-said.json"
@@ -3438,25 +3441,40 @@ def have_head(repo, pr, run=sh):
         fetch_pr(repo, pr["number"], pr["headRefOid"], run)
 
 
-def conflicts_ahead(repo, queue, run=sh, main_ref=None):
+def conflicts_ahead(repo, queue, run=sh, main_ref=None, cache=None):
     """{P: Q} for each pull request P in `queue` whose head conflicts
     with the head of a Q ahead of it, Q not itself held this way. The
     first is never held. A comparison git can't make (anything but 0 or
     1) holds nothing. With `main_ref`, one whose head conflicts with it
     is going back to its author, so nothing waits behind it: it is
-    neither a Q nor held."""
+    neither a Q nor held.
+
+    `cache`, {"<a> <b>": 0 or 1}, remembers each pair of commits' answer:
+    two commits merge the same way every time, and asking git again for
+    every pair in the queue was most of a tick (agent-forge #301). The
+    pairs asked this time are left in it as `cache["used"]`'s keys, so
+    the caller can drop the rest."""
+    cache = {} if cache is None else cache
+    used = cache.setdefault("used", {})
+
+    def conflict(a, b):
+        key = "%s %s" % (a, b)
+        if key not in cache:
+            got = git(repo, "merge-tree", "--write-tree", "--name-only",
+                      "--no-messages", a, b, run=run).returncode
+            if got not in (0, 1):
+                return False
+            cache[key] = got
+        used[key] = cache[key]
+        return cache[key] == 1
+
     kept, held = [], {}
     for pr in queue:
         have_head(repo, pr, run)
-        if main_ref and git(repo, "merge-tree", "--write-tree",
-                            "--name-only", "--no-messages", main_ref,
-                            pr["headRefOid"], run=run).returncode == 1:
+        if main_ref and conflict(main_ref, pr["headRefOid"]):
             continue
         for q in kept:
-            merged = git(repo, "merge-tree", "--write-tree", "--name-only",
-                         "--no-messages", q["headRefOid"], pr["headRefOid"],
-                         run=run)
-            if merged.returncode == 1:
+            if conflict(q["headRefOid"], pr["headRefOid"]):
                 held[pr["number"]] = q["number"]
                 break
         if pr["number"] not in held:
@@ -5905,8 +5923,16 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         places = suspect_place(saved, queue)
         queue.sort(key=lambda pr: (pr["number"] != in_flight, places.get(
             pr["number"], len(places))))
-    held_by = (conflicts_ahead(repo, queue, run, main_tip)
-               if HOLD_CONFLICTING else {})
+    if HOLD_CONFLICTING:
+        pairs_path = os.path.join(state_dir, PAIRS_FILE)
+        pairs = {k: v for k, v in load_json(pairs_path, {}).items()
+                 if v in (0, 1)}
+        held_by = conflicts_ahead(repo, queue, run, main_tip, pairs)
+        if live:
+            os.makedirs(state_dir, exist_ok=True)
+            save_json(pairs_path, pairs.get("used", {}))
+    else:
+        held_by = {}
     for number, ahead in held_by.items():
         held[str(number)] = HOLD_REASON % ahead
     queue = [pr for pr in queue if pr["number"] not in held_by]
