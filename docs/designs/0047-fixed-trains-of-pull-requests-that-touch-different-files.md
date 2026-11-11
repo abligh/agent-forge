@@ -523,3 +523,45 @@ ones come next, then the rest. With nothing in flight, nothing changes.
 The Merger simulator gains a fifth rule: a train whose top has started
 merges in its own order, and no member merges while one before it in
 the train is unmerged.
+
+## Amendment (2026-11-11, third): a later green top merges the trains in front of it, and a green train goes in as one
+
+**What happened.** Three trains were tested side by side, each on the
+top of the one before. The second train's top went green a minute
+before the first's, and the Merger waited for the first's own verdict
+before merging anything, though the second top's tree contained the
+first train. Then each member took three ticks: an update (GitHub wants
+each head up to date), a tick waiting for the build check to post the
+batch's cover on the new head, and the merge. Fifteen green pull
+requests took about 45 minutes to land.
+
+**The rules.**
+
+1. A later train's green top covers that train and every train in
+   front of it: its tree contains them all, and its run took in every
+   step their changes touch (a run's scope is the diff from its merge
+   base with the default branch, and the labels of every pull request
+   in its tree). The Merger folds those trains into its first batch,
+   which starts merging at once. A red top in front of a green one is
+   overruled, as a flake would be; a running top in front of it is
+   spent, and with `stop_spent` the build check stops it
+   (`STOPPED-FOLDED`).
+2. With `merge.test_ahead.train_merge` (default off), a green batch
+   goes in as one pull request, in one tick, while the default branch
+   is still the tip it was predicted from. The Merger commits, for each
+   member in order, the tree its prediction tested, with the commit
+   before it and the member's head as parents, so every head is in the
+   train's history and the top's tree is the one that tested green. It
+   pushes that chain to `train_branch` + `<first>-<last>`, posts
+   `checks.context` green on its top, opens a pull request to the
+   default branch listing the members, and merges it as a merge commit
+   pinned to the top. GitHub marks each member merged, since its head
+   is now in the default branch, and closes what it says it fixes; a
+   layer based on another's branch is retargeted to the default branch
+   first, or GitHub wouldn't. The Merger asks GitHub whether each member
+   is merged; one that isn't, and every member of a train GitHub won't
+   take, merge one at a time as before.
+
+**A general rule.** A tick does all the ready work it can, not one
+operation: an operation that is fast (a merge, a status, a retarget)
+shouldn't wait a tick for the next.
