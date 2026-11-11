@@ -2234,6 +2234,52 @@ class Batch(unittest.TestCase):
         self.assertTrue(pc.is_front(self.dir, T0, SHA_Q, 8, ahead=True))
         self.assertFalse(pc.is_front(self.dir, T0, SHA_P, 7, ahead=True))
 
+    def test_a_top_whose_verdict_no_check_here_trusts_is_run(self):
+        # agent-forge #197: after a host move the top's old verdict
+        # didn't count (batch_heads held its heads for it) but still
+        # kept it from running: both waited for ever.
+        for stale in ({"host": "elsewhere"}, {"steps": "other"},
+                      {"finished": pc.iso(T0 - pc.MATCH_MAX_AGE
+                                          - datetime.timedelta(hours=1))}):
+            state = empty()
+            state["results"][SHA_Q] = dict(verdict(pr=8, tree=TREE_3),
+                                           ahead=True, **stale)
+            self.assertEqual(pc.next_ahead(state, self.entries, when=T0,
+                                           batch=self.entries[:2]),
+                             (SHA_Q, 8), stale)
+
+    def test_a_top_with_a_verdict_here_is_not_run_again(self):
+        state = empty()
+        state["results"][SHA_Q] = dict(verdict(pr=8, tree=TREE_3, ok=False),
+                                       ahead=True)
+        self.assertIsNone(pc.next_ahead(state, self.entries, when=T0,
+                                        batch=self.entries[:2]))
+
+    def test_a_held_head_says_so_once(self):
+        # agent-forge #285: its status said "queued for a check slot".
+        state = empty()
+        state["waiting"][SHA_A] = {"pr": 7, "since": pc.iso(T0)}
+        batch = self.entries[:2]
+        why = {SHA_A: "batch"}
+        said = pc.held_said(state, why, why, batch, T0)
+        self.assertEqual(said, [(SHA_A, "held for the Merger's batch #7..#8: "
+                                 "its top %s is checked for it"
+                                 % SHA_Q[:10])])
+        self.assertEqual(pc.held_said(state, why, why, batch, T0), [])
+        state["ahead_started"] = {SHA_Q: "2026-10-09T12:05:00Z"}
+        self.assertTrue(pc.held_said(state, why, why, batch, T0)[0][1]
+                        .endswith("checked for it, running since 12:05Z"))
+        self.assertEqual(pc.held_said(state, {}, {}, batch, T0), [])
+        self.assertNotIn("held_said", state["waiting"][SHA_A])
+        self.assertEqual(len(pc.held_said(state, why, why, batch, T0)), 1)
+
+    def test_a_head_held_for_its_twin_says_so(self):
+        state = empty()
+        state["waiting"][SHA_A] = {"pr": 7, "since": pc.iso(T0)}
+        said = pc.held_said(state, {SHA_A: "twin"}, {}, [], T0)
+        self.assertEqual(said[0][0], SHA_A)
+        self.assertIn("Merger's prediction", said[0][1])
+
     def test_only_the_top_is_run(self):
         state = empty()
         self.assertEqual(pc.next_ahead(state, self.entries, when=T0,
@@ -2689,6 +2735,21 @@ class TickAhead(Tick):
         self.assertEqual(self.spawned[0][1], SHA_P)
         self.assertIn("HELD #7 %s: %s" % (SHA_A[:10], why), self.lines)
 
+    def test_a_held_head_is_told_why_once(self):
+        # agent-forge #285: the held reason replaces "queued for a check
+        # slot", and isn't posted again while it stays the same.
+        self.write_state({"waiting": {SHA_A: {"pr": 7, "since": pc.iso(T0)}}})
+        posted = []
+        with mock.patch.object(pc, "batch_heads",
+                               lambda *a, **k: {SHA_A: "held"}):
+            for _ in range(2):
+                self.tick([(7, SHA_A, REPO, "false")],
+                          post=lambda *a: posted.append(a),
+                          merger_dir=self.merger())
+        held = [p for p in posted if p[0] == SHA_A and p[2].startswith("held")]
+        self.assertEqual(len(held), 1, posted)
+        self.assertEqual(held[0][1], "pending")
+
     def test_put_first(self):
         self.assertTrue(pc.put_first({"urgent": True}))
         self.assertFalse(pc.put_first({"urgent": True, "errors": 1}))
@@ -3049,7 +3110,10 @@ class SettledHeads(StateCase):
 
     def test_a_member_waits_while_its_top_is_run(self):
         posted = self.batched({})
-        self.assertEqual(posted, [])
+        # No verdict: only its status, saying why it waits (#285).
+        self.assertEqual(posted, [(SHA_A, "pending", "held for the Merger's "
+                                   "batch #7..#8: its top %s is checked for "
+                                   "it" % SHA_Q[:10])])
         self.assertIn(SHA_A, self.state()["waiting"])
         # The slot goes to the top, not to the member.
         self.assertEqual([a[1] for a in self.spawned], [SHA_Q])

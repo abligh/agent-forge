@@ -331,7 +331,9 @@ while the stall lasts, or on the next tick if nobody took it. It adds
 `stall_alert.owner_after_minutes`. When the stall ends, it comments
 how, takes that label off, and closes the issue. `stall-alert.json` in
 the state directory holds the open issue, its pull request and head,
-and when it was last told. The stall gets its own issue so that no
+and when it was last told. A pull request in the batch `ahead.json`
+names is said to wait on that batch's top, by its span and sha
+(agent-forge #285). The stall gets its own issue so that no
 wait recorded on another item can hide it. Without `stall_alert`
 nothing is opened or sent; a dry run never opens, labels, closes or
 sends anything either. Only `main` passes the relay sender, so a test
@@ -2845,10 +2847,34 @@ def refusal_hint(stalled):
     return "GitHub's answer says why"
 
 
-def stall_text(stalled, reason=None):
+def stall_batch(state_dir, pr):
+    """(span, top sha) of the batch in the last tick's AHEAD_FILE that
+    `pr` is a member of, or None. Its head's own check is then held for
+    the top's run, and its status says so (agent-forge #285)."""
+    last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+    if not isinstance(last, dict):
+        return None
+    entries = [e for e in last.get("entries") or [] if isinstance(e, dict)]
+    for batch in [last.get("batch")] + list(last.get("later") or []):
+        trees = batch.get("trees") if isinstance(batch, dict) else None
+        if not isinstance(trees, list) or not trees:
+            continue
+        members = [e for e in entries if e.get("tree") in trees]
+        if not members or pr not in {e.get("pr") for e in members}:
+            continue
+        top = members[-1]
+        if not isinstance(top.get("sha"), str):
+            return None
+        return "#%s..#%s" % (members[0].get("pr"), top.get("pr")), top["sha"]
+    return None
+
+
+def stall_text(stalled, reason=None, batch=None):
     """What a stall is, for the issue and the message: the pull request,
     the head, how long, and GitHub's own words when it refused. `reason`
-    is the WAIT decision's, when it is a wait."""
+    is the WAIT decision's, when it is a wait. `batch`, (span, top sha)
+    from stall_batch, names the batch whose top's run the head waits
+    on."""
     if "refused" in stalled:
         hint = refusal_hint(stalled)
         what = ("GitHub has refused the Merger's write for %d minutes, "
@@ -2856,9 +2882,11 @@ def stall_text(stalled, reason=None):
                     stalled["minutes"], stalled["refused"],
                     hint[0].upper() + hint[1:]))
     else:
-        what = ("it has waited %d minutes%s; look at %s."
+        what = ("it has waited %d minutes%s; %slook at %s."
                 % (stalled["minutes"], ": " + reason if reason else "",
-                   where_to_look()))
+                   "it is in the Merger's batch %s, whose top `%s` the "
+                   "build check runs for it: " % (batch[0], batch[1][:10])
+                   if batch else "", where_to_look()))
     if stalled.get("handed_back"):
         then = ("It has gone back to its author, and the queue moves past "
                 "it.")
@@ -2932,7 +2960,9 @@ def tell_stall(state_dir, github, stalled, decisions, when, send, out,
         if os.path.exists(path):
             os.remove(path)
         return
-    text = stall_text(stalled, reason)
+    text = stall_text(stalled, reason,
+                      None if "refused" in stalled
+                      else stall_batch(state_dir, stalled["pr"]))
     if not same:
         number, why = github.create(
             "repos/%s/issues" % REPO_SLUG,

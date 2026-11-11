@@ -615,8 +615,10 @@ minting its token with `forge-app-token`.
 
 **`--post` writes the status** as that App, which needs *Commit
 statuses: write*: `pending` when a head is queued (`queued at HH:MMZ
-for a check slot; N other heads waiting`, the count as it was then) and
-again when the steps start, then `success`, or `failure` naming the
+for a check slot; N other heads waiting`, the count as it was then),
+again when it is held for a prediction (`held for the Merger's batch
+#A..#B: its top <sha> is checked for it`, posted only when that reason
+changes, agent-forge #285) and when the steps start, then `success`, or `failure` naming the
 first failed step. A head refused or given up on
 gets `error`, saying why, since the Merger would otherwise wait on it
 for a status that never comes. The Merger counts only statuses that App
@@ -2677,6 +2679,25 @@ def verdict_age(record, when):
         return None
 
 
+def foreign(record, when):
+    """Whether a verdict `tested` would never trust: from another host
+    or step list, or older than MATCH_MAX_AGE (or after `when`). A
+    record that doesn't say is not foreign. next_ahead runs a
+    prediction again rather than skipping it for such a verdict: a
+    batch's heads wait for its top while the top has no verdict that
+    counts (batch_heads), so skipping it left both waiting for ever
+    (agent-forge #197, after a host move)."""
+    host = record.get("host")
+    steps = record.get("steps")
+    if host is not None and host != socket.gethostname():
+        return True
+    if steps is not None and steps != steps_digest():
+        return True
+    age = verdict_age(record, when)
+    return age is not None and not (
+        datetime.timedelta(0) <= age <= MATCH_MAX_AGE)
+
+
 def tested(state, tree, when, ok=None, accept=None):
     """The sha of the newest verdict on `tree` from this host and step
     list, green only when `ok`, and only one `accept(record)` takes when
@@ -2706,7 +2727,8 @@ def next_ahead(state, ahead, busy=(), when=None, busy_trees=(), batch=(),
     less than START_GRACE before `when`, not given up on, not the head's
     own tree, not a tree a slot is checking now (`busy_trees`: two
     predictions can differ only in their parents), and with no verdict
-    of its own or on its tree. Nothing
+    of its own or on its tree (a verdict `foreign` says no check here
+    would trust doesn't count). Nothing
     after an entry whose tree is red here (and not green too, as after a
     flake): each later prediction contains it, so it would be red too,
     and the Merger drops that pull request from the list on its next
@@ -2728,6 +2750,7 @@ def next_ahead(state, ahead, busy=(), when=None, busy_trees=(), batch=(),
         if (own or sha in busy
                 or entry["tree"] in busy_trees
                 or sha in state["results"]
+                and not foreign(state["results"][sha], when)
                 or just_started({"started": started.get(sha)}, when)
                 or state.get("ahead_errors", {}).get(sha, 0) >= MAX_ERRORS
                 or tested(state, entry["tree"], when) is not None):
@@ -3876,7 +3899,12 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             twins = twin_heads(state, fields.values(), checkout, run) \
                 if TEST_AHEAD else {}
             # And one in the Merger's batch waits for its top (designs/0032).
-            twins.update(batch_heads(state, batch, checkout, busy, when, run))
+            batched = batch_heads(state, batch, checkout, busy, when, run)
+            twins.update(batched)
+            if first_pass:
+                say_held = held_said(state, twins, batched, batch, when)
+                if say_held:
+                    save(state_dir, state)
             if fresh:
                 held = held_heads(state, head_of_main[0], busy, when, first_pr,
                                   cheap)
@@ -3957,6 +3985,9 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                     save(state_dir, state)
             starting = sum(1 for s, w in state["waiting"].items()
                            if s not in taken and just_started(w, when))
+        if first_pass and post is not None:
+            for sha, text in say_held:
+                post(sha, "pending", text)
         if first_pass:
             for sha in sorted(held, key=lambda s: order(state["waiting"], s)):
                 out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
@@ -5585,6 +5616,40 @@ def batch_heads(state, batch, checkout, busy=(), when=None, run=sh):
             for sha, entry in state["waiting"].items()
             if not entry.get("main") and sha not in busy
             and tree_of(checkout, sha, run) in trees}
+
+
+def held_said(state, twins, batched, batch, when):
+    """[(sha, description)] of the pending statuses to post for heads
+    held for a prediction (`twins`, `batched` those held for the
+    Merger's batch) whose held reason changed since it was last posted
+    (agent-forge #285). Without it a held head kept "queued for a check
+    slot" while later heads ran, and was taken for lost. Each head's
+    last text is kept in its entry as `held_said`, and dropped once it
+    is no longer held, so a hold that comes back is said again. Only the
+    wording: nothing here changes what runs."""
+    out = []
+    top = batch[-1] if batch else None
+    since = state.get("ahead_started", {}).get(top["sha"]) if top else None
+    for sha, entry in state["waiting"].items():
+        if sha not in twins:
+            entry.pop("held_said", None)
+            continue
+        if sha in batched and top is not None:
+            text = "held for the Merger's batch %s: its top %s is checked " \
+                "for it" % (batch_span(batch), top["sha"][:10])
+            if since:
+                try:
+                    text += ", running since %s" % parse(since).strftime(
+                        "%H:%MZ")
+                except (TypeError, ValueError):
+                    pass
+        else:
+            text = "held: its tree is being checked now as the Merger's " \
+                "prediction; matched to its verdict"
+        if entry.get("held_said") != text:
+            entry["held_said"] = text
+            out.append((sha, text))
+    return out
 
 
 def batch_span(batch):
