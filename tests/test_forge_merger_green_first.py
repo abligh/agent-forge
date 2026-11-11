@@ -78,3 +78,42 @@ class GreenBatchFirst(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MembersByTree(unittest.TestCase):
+    """A member whose head moved stays a member when its head's tree is
+    the one predicted for its place: the Merger's own update of it, a
+    restack or a retarget lands exactly the tree the batch tested."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.last = {"base": TIP, "entries": [
+            {"pr": 3, "head": HEAD_3, "sha": "a" * 40, "tree": "t3"},
+            {"pr": 4, "head": HEAD_4, "sha": "p" * 40, "tree": "t4"}],
+            "batch": {"size": 2, "trees": ["t3", "t4"]}}
+        with open(os.path.join(self.dir, m.AHEAD_FILE), "w") as handle:
+            json.dump(self.last, handle)
+        self.check = {"results": {"p" * 40: {"tree": "t4", "ok": True}}}
+        self.moved = "5" * 40
+
+    def trees(self, tree):
+        return lambda pull: tree if pull["headRefOid"] == self.moved \
+            else None
+
+    def test_a_moved_head_with_the_predicted_tree_stays_a_member(self):
+        queue = [pr(3, head=self.moved), pr(4, head=HEAD_4)]
+        self.assertEqual(
+            m.current_batch(self.dir, queue, self.trees("t3"))[1], {3, 4})
+        self.assertEqual(
+            m.current_batch(self.dir, queue, self.trees("tx"))[1], {4})
+
+    def test_the_batch_holds_for_a_later_member_at_its_predicted_tree(self):
+        queue = [pr(3, head=HEAD_3), pr(4, head=self.moved)]
+        self.assertTrue(m.batch_holds(self.last, 3, "t3", queue,
+                                      self.check, self.trees("t4")))
+        self.assertFalse(m.batch_holds(self.last, 3, "t3", queue,
+                                       self.check, self.trees("tx")))
+        self.assertFalse(m.batch_holds(self.last, 3, "t3", queue,
+                                       self.check))

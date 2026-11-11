@@ -572,3 +572,33 @@ That flake was there before the batch; the nightly and later runs keep
 testing it, and the retry is logged, so it can be found.
 
 **Switch.** `merge.test_ahead.retry_red`, default `false`.
+
+## Amendment (2026-11-11, eighth): a member is known by its tree, and a layer boards only when it could merge
+
+**Rule.** A member of a batch never leaves it, except when the batch is
+red and its suspects are searched. One project saw 13 members leave in
+14 hours without either, and each time the rest of the batch needed a
+new run.
+
+**1. Known by its tree.** A member stays a member, both for the batch
+being merged (`current_batch`) and for whether the batch still holds
+(`batch_holds`), in two cases:
+- its head is the head or the merge predicted for it;
+- its head is a commit whose tree is the tree predicted for its place.
+
+The second case covers three things that change a member's head without
+changing what merging it lands:
+- the Merger's own update of it onto the tip;
+- a layer's restack after the layer below merges;
+- a retarget.
+
+A head with any other tree, for example an author's push, still leaves
+the batch, as before.
+
+**2. A layer boards only when it could merge.** `ready_layers` already
+required an approval covering the layer's head, the code owners' and,
+with `own_head_green`, its own green check. Now a layer still waiting
+for a gated instance's context (`instance_wait`) ends the climb too, as
+a pull request on the default branch is held for one. The batch's run
+is not that instance's, so such a layer would leave the batch at its
+merge.
