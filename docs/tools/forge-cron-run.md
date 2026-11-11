@@ -48,13 +48,15 @@ exits 2.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `FORGE_CRON_CHECKOUT` | required | The project's cron checkout. The job runs with it as its working directory. Unset, it exits 2. |
+| `FORGE_CRON_CHECKOUT` | required | The project's cron checkout. The job runs in a generation of it (step 5), whose path it is given as `FORGE_CRON_CHECKOUT`. Unset, it exits 2. |
 | `FORGE_CRON_LOGDIR` | `~/cron-logs` | Where each tool's log and the lock files go. |
 | `FORGE_CRON_PATH` | none | Extra directories for `PATH`, colon-separated, such as a host's toolchains. They come after this release's `bin` and before `~/.local/bin` and the system directories. |
 | `FORGE_CRON_APP` | none | An agent or machinery App the job acts as. Its installation token is minted into `GH_TOKEN`. A mint that fails stops the job; there is no fallback to the host's own `gh` login. |
 | `FORGE_CRON_LOCK` | none | The lock file of another wrapper that runs jobs from the same checkout, while a project moves its crontab over. This one then takes that file instead of its own checkout lock. The other wrapper must use `flock`. |
 | `FORGE_CRON_LOCK_WAIT_S` | `300` | One budget, in seconds, for all the locks and the sync. Keep it shorter than any job's period. |
 | `FORGE_CRON_FETCH_RETRY_S` | `5` | How long to wait before the one retry of a fetch that lost a ref-lock race with another fetch. |
+| `FORGE_CRON_GENERATIONS` | `1` | `0` runs jobs in the checkout itself, reset in place under an exclusive lock, as before agent-forge #297. |
+| `FORGE_CRON_GEN_DIR` | `<checkout>.gen` | Where the generations go. |
 | `HOME` | the user's | The home directory the defaults are under. |
 
 The caller's `PATH` is discarded. The job's `PATH` is this release's
@@ -82,21 +84,39 @@ Each run, in order:
 1. Takes `.<TOOL>.lock` in the log directory, exclusively: one run of
    each tool at a time.
 2. Takes the checkout's lock, shared, so different jobs run side by
-   side. It takes it exclusively instead when a `sync-wanted` marker is
-   there (see below).
+   side. Without generations it takes it exclusively instead when a
+   `sync-wanted` marker is there (see below).
 3. Writes the header, `=== <time> <TOOL> <ARGS> ===`. The time is when
    the job was launched, before any lock.
 4. Checks the checkout is a git checkout (`NO-CHECKOUT` otherwise), and
    fetches the default branch from `origin`. A fetch that fails with
    `cannot lock ref` is retried once (`RETRY: …`). Any other failure is
    `SYNC-FAILED: fetch`.
-5. If the checkout isn't at `origin/<branch>`, or has an edited tracked
-   file, it leaves a `sync-wanted` marker, waits for the checkout's
-   lock exclusively, and runs `git reset --hard origin/<branch>`. The
-   marker makes later jobs queue for the exclusive lock rather than
-   slip past it, so a steady stream of short jobs can't starve the
-   reset. Whoever resets removes the marker. Then it goes back to a
-   shared lock for the run.
+5. Runs in the **generation** of `origin/<branch>`: a worktree of the
+   checkout at that commit, `<checkout>.gen/<sha>`, made by the first
+   job that wants it (`git worktree add --detach`, about a second) and
+   then shared by every job at that commit. Each job holds its
+   generation's lock (`<sha>.lock`) shared while it runs. So when the
+   branch moves, the next job starts at once on the new commit, beside
+   the jobs still running on the old one: nothing waits for a reset
+   (agent-forge #297). After its run, a job removes every generation
+   but the newest that no job holds, trying each one's lock and never
+   waiting for it. The checkout itself is reset to the branch too, for
+   what reads it outside a job (`forge-install`'s pin), but only when
+   no other job is doing so, and never waited for. The tool is told
+   its generation as `FORGE_CRON_CHECKOUT` (and `FORGE_CRON_GENERATION`,
+   with `FORGE_CRON_BASE` the checkout), and is handed the generation's
+   lock as `FORGE_CRON_GEN_LOCK_FD`, so a worker it leaves running keeps
+   the generation. A job started through `forge-cron-run` from inside a
+   generation runs from the checkout it was made from.
+
+   With `FORGE_CRON_GENERATIONS=0`, the old way: if the checkout isn't
+   at `origin/<branch>`, or has an edited tracked file, it leaves a
+   `sync-wanted` marker, waits for the checkout's lock exclusively,
+   and runs `git reset --hard origin/<branch>`. The marker makes later
+   jobs queue for the exclusive lock rather than slip past it. Whoever
+   resets removes the marker. Then it goes back to a shared lock for
+   the run. Every job then waits for the longest one running.
 6. Logs `at <short sha>`, the commit the job runs at.
 7. Refuses to start if `forge-install` has left
    `<install>.install-wanted` (`INSTALL-PENDING`). Otherwise it takes
@@ -110,7 +130,7 @@ Each run, in order:
 9. Finds the tool (`NO-SUCH-TOOL` if it isn't there and executable).
 10. With `FORGE_CRON_APP`, mints the token (`APP-TOKEN-FAILED` on
     failure) and logs `as <App>`.
-11. Logs `waited=<s>`, runs the tool in the checkout with its standard
+11. Logs `waited=<s>`, runs the tool in its generation with its standard
     input closed and its output in the log, then logs
     `ended <time> ran=<s>` and `exit=<status>`.
 
@@ -133,7 +153,12 @@ All in the log directory (`FORGE_CRON_LOGDIR`, default `~/cron-logs`):
 | `<TOOL>.log` | Every run of the tool, appended: header, `at`, `waited=`, the tool's output, `ended`, `exit=`. |
 | `.<TOOL>.lock` | One run of each tool at a time. |
 | `.forge-cron.<checkout>.lock` | The checkout's lock. `<checkout>` is its real path with `/` and other odd characters made `_`. `FORGE_CRON_LOCK` replaces it. |
-| `.forge-cron.<checkout>.sync-wanted` | Left while a job waits to reset the checkout. |
+| `.forge-cron.<checkout>.sync-wanted` | Without generations: left while a job waits to reset the checkout. |
+| `.forge-cron.<checkout>.base.lock` | Held while a job resets the checkout itself; a job that finds it held leaves the reset to that one. |
+
+Beside the checkout, `<checkout>.gen/` holds the generations: `<sha>/`
+(a worktree), `<sha>.lock` (held shared by each job in it), and
+`.make.lock` (held while one is made).
 
 Beside the installation it uses `<install>.lock` (shared for each job)
 and reads `<install>.install-wanted`, both `forge-install`'s.

@@ -83,7 +83,9 @@ class CronRun(unittest.TestCase):
         self.assertIn("at %s\n" % head, log)
         self.assertRegex(log, r"\nwaited=\d+s\n")
         self.assertRegex(log, r"\nended \S+ ran=\d+s\nexit=0\n$")
-        self.assertIn("cwd=%s\n" % self.cron, log)
+        # It runs in the generation of the checkout at that commit.
+        sha = self.r.git(self.cron, "rev-parse", "origin/trunk").stdout.strip()
+        self.assertIn("cwd=%s\n" % os.path.join(self.cron + ".gen", sha), log)
         self.assertIn("args=x y\n", log)
         self.assertIn("token=none\n", log)
         self.assertTrue(log.rstrip().endswith("exit=0"))
@@ -280,10 +282,12 @@ if flock -n -x "$LOCK" true; then echo lock=free; else echo lock=held; fi
         self.hold(self.checkout_lock(), exclusive=False)
         self.assertEqual(self.run_tool("report"), 0)
 
+    OLD = {"FORGE_CRON_GENERATIONS": "0"}
+
     def test_a_behind_checkout_waits_for_running_jobs_and_asks_its_turn(self):
         self.hold(self.checkout_lock(), exclusive=False)
         self.push("moved")
-        self.assertEqual(self.run_tool("report"), 2)
+        self.assertEqual(self.run_tool("report", env=self.OLD), 2)
         self.assertTrue(os.path.exists(self.checkout_lock("sync-wanted")))
 
     def test_an_old_wrappers_lock_held_for_a_job_is_waited_for(self):
@@ -324,10 +328,103 @@ if flock -n -x "$LOCK" true; then echo lock=free; else echo lock=held; fi
         self.run_tool("report")
         open(self.checkout_lock("sync-wanted"), "w").close()
         held = self.hold(self.checkout_lock(), exclusive=False)
-        self.assertEqual(self.run_tool("report"), 2)
+        self.assertEqual(self.run_tool("report", env=self.OLD), 2)
+        held.close()
+        self.assertEqual(self.run_tool("report", env=self.OLD), 0)
+        self.assertFalse(os.path.exists(self.checkout_lock("sync-wanted")))
+
+
+    # Generations (agent-forge #297): a moved branch never waits for
+    # the jobs running on the commit before it.
+
+    def gens(self):
+        path = self.cron + ".gen"
+        return sorted(n for n in os.listdir(path)
+                      if not n.startswith(".") and not n.endswith(".lock"))
+
+    def sha(self):
+        return self.r.git(self.cron, "rev-parse", "origin/trunk") \
+            .stdout.strip()
+
+    def test_a_moved_branch_runs_at_once_beside_a_running_job(self):
+        self.run_tool("report")
+        first = self.sha()
+        # A job still running on the first commit holds its generation
+        # and the checkout's lock, shared.
+        held = self.hold(os.path.join(self.cron + ".gen", first + ".lock"),
+                         exclusive=False)
+        self.hold(self.checkout_lock(), exclusive=False)
+        head = self.push("moved")
+        self.assertEqual(self.run_tool("report"), 0)
+        self.assertIn("at %s\n" % head, self.log())
+        self.assertFalse(os.path.exists(self.checkout_lock("sync-wanted")))
+        # Both generations stay while the first is held.
+        self.assertEqual(self.gens(), sorted([first, self.sha()]))
         held.close()
         self.assertEqual(self.run_tool("report"), 0)
-        self.assertFalse(os.path.exists(self.checkout_lock("sync-wanted")))
+        self.assertEqual(self.gens(), [self.sha()])
+
+    def test_a_generation_is_the_reviewed_copy_whatever_the_checkout_holds(
+            self):
+        self.run_tool("report")
+        with open(os.path.join(self.cron, "tools", "report"), "a") as h:
+            h.write("echo tampered\n")
+        self.push("moved")
+        self.run_tool("report")
+        self.assertNotIn("tampered", self.log())
+
+    def test_the_checkout_itself_follows_the_branch_when_it_can(self):
+        self.run_tool("report")
+        head = self.push("moved")
+        self.run_tool("report")
+        self.assertEqual(self.r.git(self.cron, "rev-parse", "--short",
+                                    "HEAD").stdout.strip(), head)
+        # But never waits for it: with its lock taken, the job runs and
+        # the checkout stays where it was.
+        self.hold(self.checkout_lock("base.lock"))
+        self.push("again")
+        self.assertEqual(self.run_tool("report"), 0)
+        self.assertEqual(self.r.git(self.cron, "rev-parse", "--short",
+                                    "HEAD").stdout.strip(), head)
+
+    def test_the_tool_is_told_its_generation_as_the_checkout(self):
+        self.add_tool("where", "#!/bin/sh\necho \"checkout=$FORGE_CRON_CHECKOUT\"\n")
+        self.push("where")
+        self.assertEqual(self.run_tool("where"), 0)
+        self.assertIn("checkout=%s\n" % os.path.join(self.cron + ".gen",
+                                                    self.sha()),
+                      self.log("where"))
+
+    def test_a_half_made_generation_is_made_again(self):
+        sha = self.sha()
+        os.makedirs(os.path.join(self.cron + ".gen", sha + ".new"))
+        self.assertEqual(self.run_tool("report"), 0)
+        self.assertEqual(self.gens(), [sha])
+
+
+    def test_a_worker_that_outlives_the_job_keeps_its_generation(self):
+        # The tool leaves a child holding the generation's lock it was
+        # handed, as pr-check's worker does.
+        self.add_tool("spawn", "#!/bin/sh\n"
+                      "( sleep 3 ) >/dev/null 2>&1 &\n"
+                      "echo fd=$FORGE_CRON_GEN_LOCK_FD\n")
+        self.push("spawn")
+        self.assertEqual(self.run_tool("spawn"), 0)
+        first = self.sha()
+        self.assertRegex(self.log("spawn"), r"fd=\d+\n")
+        self.push("moved")
+        self.assertEqual(self.run_tool("report"), 0)
+        self.assertIn(first, self.gens())
+
+    def test_a_job_chained_from_a_generation_runs_from_the_checkout(self):
+        self.run_tool("report")
+        gen = os.path.join(self.cron + ".gen", self.sha())
+        head = self.push("moved")
+        self.assertEqual(self.run_tool("report", env={
+            "FORGE_CRON_CHECKOUT": gen, "FORGE_CRON_GENERATION": gen,
+            "FORGE_CRON_BASE": self.cron}), 0)
+        self.assertIn("at %s\n" % head, self.log())
+        self.assertFalse(os.path.exists(gen + ".gen"))
 
 
 if __name__ == "__main__":

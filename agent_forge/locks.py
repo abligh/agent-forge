@@ -138,3 +138,25 @@ def inherited_install_lock(environ=None):
     except (ValueError, OSError):
         return None
     return fd
+
+
+# forge-cron-run's generation lock (agent-forge #297), handed to the tool
+# like the installation's, so a worker that outlives its tick keeps the
+# generation it runs from.
+GEN_LOCK_FD = "FORGE_CRON_GEN_LOCK_FD"
+
+
+def inherited_fds(environ=None):
+    """Every lock descriptor this process was handed to pass on to a
+    process it starts: the installation's and the generation's, those
+    that are open."""
+    environ = os.environ if environ is None else environ
+    fds = []
+    for name in (INSTALL_LOCK_FD, GEN_LOCK_FD):
+        try:
+            fd = int(environ.get(name, ""))
+            os.fstat(fd)
+        except (ValueError, OSError):
+            continue
+        fds.append(fd)
+    return tuple(fds)

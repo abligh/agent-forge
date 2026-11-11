@@ -141,7 +141,7 @@ TICKET_RE = re.compile(r"^([a-z0-9][a-z0-9-]*)-(\d{8}T\d{6}Z)-([0-9a-f]{4})$")
 WAITING = ("queued", "waiting")
 ENDED = ("done", "timed-out", "cancelled", "lost", "failed")
 # Not handed on to a job: they describe the submitting process.
-DROP_ENV = ("FORGE_INSTALL_LOCK_FD", "OLDPWD", "PWD", "FORGE_UNTIMED_SCOPE")
+DROP_ENV = ("FORGE_INSTALL_LOCK_FD", "FORGE_CRON_GEN_LOCK_FD", "OLDPWD", "PWD", "FORGE_UNTIMED_SCOPE")
 
 
 def now_utc():

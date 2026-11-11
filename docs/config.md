@@ -1279,7 +1279,7 @@ own.
 | `FORGE_BODY_DIR` | `forge-new-body` | Where body files are written (default `${TMPDIR:-/tmp}/agent-forge-bodies/<agent>`). |
 | `FORGE_GITHUB_API` | every tool that calls GitHub | The API's base URL (default `https://api.github.com`), for GitHub Enterprise Server or a test server. |
 | `FORGE_CRON_APP` | `forge-cron-run` | The App (an agent or machinery name) whose token the job gets as `GH_TOKEN`. |
-| `FORGE_CRON_LOGDIR`, `FORGE_CRON_PATH`, `FORGE_CRON_LOCK`, `FORGE_CRON_LOCK_WAIT_S`, `FORGE_CRON_FETCH_RETRY_S` | `forge-cron-run` | Where logs go, the job's `PATH`, its lock, how long to wait for it, and how long to retry a failed fetch ([tools/forge-cron-run.md](tools/forge-cron-run.md)). |
+| `FORGE_CRON_LOGDIR`, `FORGE_CRON_PATH`, `FORGE_CRON_LOCK`, `FORGE_CRON_LOCK_WAIT_S`, `FORGE_CRON_FETCH_RETRY_S`, `FORGE_CRON_GENERATIONS`, `FORGE_CRON_GEN_DIR` | `forge-cron-run` | Where logs go, the job's `PATH`, its lock, how long to wait for it, how long to retry a failed fetch, and whether jobs run in generations of the checkout (`0` turns them off) and where those go ([tools/forge-cron-run.md](tools/forge-cron-run.md)). |
 | `FORGE_PR_CHECK_SLOTS`, `FORGE_PR_CHECK_MEMORY_MAX`, `FORGE_PR_CHECK_INSTANCE` | `forge-pr-check` | `checks.slots`, `checks.memory_max` and `--instance`, for one host. |
 | `FORGE_ROUTER_RELAY`, `FORGE_ROUTER_REMIND` | `forge-router`, `forge-queue` | `relay.url` and `relay.remind_seconds`. |
 | `FORGE_RECEIVER_PORT`, `FORGE_RECEIVER_SECRET_FILE` | `forge-receiver` | `receiver.port` and `receiver.secret_file`. |
@@ -1292,6 +1292,9 @@ own.
 
 Tools set some for what they start, and nothing else should:
 `FORGE_INSTALL_LOCK_FD` (the installation lock a job hands on),
+`FORGE_CRON_GEN_LOCK_FD`, `FORGE_CRON_GENERATION` and `FORGE_CRON_BASE`
+(the generation a job runs in, its lock, and the checkout it was made
+from),
 `FORGE_QUEUE_TICKET` and `FORGE_QUEUE_SUMMARY` (a queued job's ticket,
 and a file whose last line is its end message), `FORGE_QUIET_HOLDER`,
 `FORGE_QUIET_MINUTES` and `FORGE_QUIET_UNTIL` (a quiet hold's command),
