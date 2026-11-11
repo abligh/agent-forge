@@ -425,6 +425,9 @@ keeps, `~/cron-logs/forge-merger.log` by default.
   Merger would make.
 * [forge-cron-run](forge-cron-run.md) and
   [forge-receiver](forge-receiver.md), which run it.
+* [merger-sim.md](../merger-sim.md), the simulation that runs it
+  tick after tick against real git and a model of GitHub and the
+  build check, and the rules it holds it to.
 * [designs/0001](../designs/0001-fewer-wasted-rounds-in-the-merge-queue.md),
   [designs/0026](../designs/0026-merger-settings-for-a-stricter-project.md)
   and [designs/0044](../designs/0044-a-quieter-merger-and-batches-that-keep-their-order.md).
