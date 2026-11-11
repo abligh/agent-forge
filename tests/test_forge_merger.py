@@ -7898,6 +7898,16 @@ class Trains(RepoCase):
         self.assertEqual(m.train_batches(entries, [2, 2, 1], red({"t2"})),
                          (2, 2, []))
 
+    def test_trains_longer_than_the_entries_left_are_dropped(self):
+        # A member handed back after the trains were cut: the sizes run
+        # past the entries. That raised IndexError and ended the tick.
+        entries = [{"pr": n, "tree": "t%d" % n} for n in (1, 2, 3, 4)]
+        none = lambda tree: None
+        self.assertEqual(m.train_batches(entries, [2, 3], none),
+                         (2, None, []))
+        self.assertEqual(m.train_batches(entries[:1], [2, 2], none),
+                         (0, None, []))
+
     def ahead_json(self):
         return m.load_json(os.path.join(self.state, m.AHEAD_FILE), None)
 
