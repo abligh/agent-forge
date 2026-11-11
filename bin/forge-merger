@@ -645,6 +645,7 @@ token, GitHub or git failed) or the head it waits on is `STALLED`.
 import argparse
 import base64
 import datetime
+import concurrent.futures
 import fnmatch
 import hashlib
 import importlib.machinery
@@ -2322,12 +2323,40 @@ class GitHub:
     def __init__(self, token, run=sh):
         self.env = dict(os.environ, GH_TOKEN=token)
         self.run = run
+        self.fetched = {}
 
     def api(self, *args):
+        if args in self.fetched:
+            return self.fetched.pop(args)
         got = self.run(["gh", "api"] + list(args), env=self.env)
         if got.returncode != 0:
             raise RuntimeError("gh api %s: %s" % (args[0], got.stderr.strip()))
         return parse_pages(got.stdout)
+
+    def prefetch(self, paths, workers=8):
+        """GET each of `paths` at once, side by side, for the next `api`
+        call that asks for it, which takes it (once: a second asks
+        GitHub again). Each `gh api` costs most of a second, nearly all
+        of it waiting, and a tick asked for the statuses of every gated
+        pull request's head one after another: about nine seconds of a
+        45-second tick on 2026-11-11 (#301). A GET that fails is left
+        for `api` to ask again and report."""
+        paths = [path for path in dict.fromkeys(paths)
+                 if (path,) not in self.fetched]
+        if not paths:
+            return
+
+        def get(path):
+            got = self.run(["gh", "api", path], env=self.env)
+            return path, got
+
+        with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+            for path, got in pool.map(get, paths):
+                if got.returncode == 0:
+                    try:
+                        self.fetched[(path,)] = parse_pages(got.stdout)
+                    except ValueError:
+                        pass
 
     def write(self, method, path, **fields):
         """(True, "") when GitHub took the write, else (False, why). Never
@@ -3665,6 +3694,12 @@ def newest_status(statuses, context, creator):
     return None, ""
 
 
+def status_path(commit):
+    """The API path of `commit`'s statuses, as `instance_verdict` asks
+    for them and the tick prefetches them."""
+    return "repos/%s/commits/%s/statuses?per_page=100" % (REPO_SLUG, commit)
+
+
 def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
     """(state, description, sha) of `context` for `pr`: on its head,
     or, while the head has none final, on the commit before each merge
@@ -3678,9 +3713,8 @@ def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
     commit, first, depth = pr["headRefOid"], None, 0
     while commit and depth < GATE_DEPTH:
         depth += 1
-        state, said = newest_status(github.api(
-            "repos/%s/commits/%s/statuses?per_page=100"
-            % (REPO_SLUG, commit)), context, creator)
+        state, said = newest_status(github.api(status_path(commit)),
+                                    context, creator)
         if state not in (None, "pending"):
             return state, said, commit
         if first is None:
@@ -5773,6 +5807,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     instance_held = []
     if GATED:
         files = {}
+        github.prefetch(status_path(pr["headRefOid"]) for pr in candidates)
         for pr in list(candidates):
             have_head(repo, pr, run)
             why = instance_wait(repo, pr, main_tip, github, files, run)

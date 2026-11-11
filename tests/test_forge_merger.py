@@ -781,6 +781,10 @@ class FakeGitHub:
         self.created = getattr(self, "created", 899) + 1
         return (self.created, "") if ok else (None, why)
 
+    def prefetch(self, paths, workers=8):
+        """Asks nothing ahead: `api` answers from the table."""
+        list(paths)
+
     def api(self, *args):
         """The answer whose prefix matches the first or second argument,
         the longest such prefix winning: a run's jobs are asked for
@@ -1065,6 +1069,30 @@ class GitHubApi(unittest.TestCase):
             args, 1, "", "nope")
         with self.assertRaisesRegex(RuntimeError, "gh api x: nope"):
             m.GitHub("tok", run).api("x")
+
+    def test_prefetched_paths_are_answered_once_without_asking_again(self):
+        asked = []
+
+        def run(args, cwd=None, env=None):
+            asked.append(args[-1])
+            return subprocess.CompletedProcess(
+                args, 0, '{"p": "%s"}' % args[-1], "")
+        github = m.GitHub("tok", run)
+        github.prefetch(["a", "b", "a"])
+        self.assertEqual(sorted(asked), ["a", "b"])
+        self.assertEqual(github.api("a"), {"p": "a"})
+        self.assertEqual(github.api("b"), {"p": "b"})
+        self.assertEqual(sorted(asked), ["a", "b"])
+        self.assertEqual(github.api("a"), {"p": "a"})
+        self.assertEqual(sorted(asked), ["a", "a", "b"])
+
+    def test_a_failed_prefetch_is_asked_again_and_reported(self):
+        def run(args, cwd=None, env=None):
+            return subprocess.CompletedProcess(args, 1, "", "nope")
+        github = m.GitHub("tok", run)
+        github.prefetch(["x"])
+        with self.assertRaisesRegex(RuntimeError, "gh api x: nope"):
+            github.api("x")
 
     def test_a_refused_write_is_returned_not_raised(self):
         run = lambda args, cwd=None, env=None: subprocess.CompletedProcess(
