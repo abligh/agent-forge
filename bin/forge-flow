@@ -79,6 +79,11 @@ target about 2).
    `merge.test_ahead.trains` is a dry run, the batch re-cuts a train
    would not have made and the trains' own changes.
 
+Between panels 2 and 3, the trains now (merger/ahead.json, each
+carriage a box) and the stacks now (the last Merger record's `stacked
+on #N` holds, each a tree rooted at its base, with where the base
+waits).
+
 Also for designs/0047: approvals an hour (the first tick that listed
 each pull request), and pull requests per green batch top or train.
 
@@ -158,6 +163,7 @@ STATES = (MERGING, SEARCH, BATCH_WAIT, HEAD_WAIT, HANDED, HELD, NOTHING,
           NO_TICKS)
 UPDATES = ("UPDATE", "STACK-UPDATE", "RESTACK", "RETARGET")
 
+STACKED_RE = re.compile(r"stacked on #(\d+)")
 HEADER_RE = re.compile(r"^=== (\S+) worker (?:#(\d+)|main) ([0-9a-f]+) "
                        r"(?:slot (\d+)|fast lane)( ahead)? ===")
 STOPPED_RE = re.compile(r"^(\S+) STOPPED (?:#(\d+)|main) ([0-9a-f]+) "
@@ -868,6 +874,118 @@ class Flow:
                 "overdue": len(last.get("overdue") or {}),
                 "searching": last["_state"] == SEARCH}
 
+    def stacks(self):
+        """The stacks waiting at the last tick, largest first: each a
+        tree from the Merger's `stacked on #N` holds, rooted at the
+        pull request at the bottom (based on the default branch), with
+        where that root waits now."""
+        if not self.records:
+            return []
+        last = self.records[-1]
+        held = {int(k): str(v) for k, v in (last.get("held") or {}).items()}
+        below = {}
+        for pr, reason in held.items():
+            got = STACKED_RE.search(reason)
+            if got:
+                below[pr] = int(got.group(1))
+        above = collections.defaultdict(list)
+        for pr, base in below.items():
+            above[base].append(pr)
+
+        def tree(pr, seen):
+            seen = seen | {pr}
+            kids = [tree(k, seen) for k in sorted(above.get(pr, ()))
+                    if k not in seen]
+            return {"pr": pr, "layers": kids,
+                    "count": sum(1 + k["count"] for k in kids),
+                    "depth": max((1 + k["depth"] for k in kids), default=0)}
+        snap = self.snapshot()
+        trains = {pr: t["train"] for t in self.trains() for pr in t["prs"]}
+        roots = []
+        for root in {pr for pr in above if pr not in below} | {
+                base for base in below.values() if base not in below}:
+            t = tree(root, frozenset())
+            if trains.get(root) is not None:
+                where = "in train %d" % trains[root]
+            elif root in trains:
+                where = "predicted, not yet in a train"
+            elif root in held:
+                where = "held: %s" % held[root]
+            elif root in snap.get("handed_back", ()):
+                where = "back with the author"
+            elif root in (last.get("queue") or ()):
+                where = "in the queue"
+            else:
+                where = "not a candidate (not approved, its own check " \
+                        "not green, or not open)"
+            t["root_where"] = where
+            roots.append(t)
+        roots.sort(key=lambda t: (-t["count"], t["pr"]))
+        return roots
+
+    def trains(self):
+        """The trains in ahead.json now, the first being merged or
+        tested: each with its carriages, its top (the commit tested for
+        it), whether its top's run is waiting, testing or done, and
+        whether it was cut for urgent pull requests."""
+        entries = []
+        for e in self.ahead.get("entries") or ():
+            try:
+                entries.append(dict(e, pr=int(e["pr"])))
+            except (TypeError, KeyError, ValueError):
+                continue
+        if not entries:
+            return []
+        urgent = set(self.ahead.get("urgent_cut") or ())
+        said = str((self.ahead.get("batch") or {}).get("said") or "")
+        groups = collections.OrderedDict()
+        if all("train" in e for e in entries):
+            for e in entries:
+                groups.setdefault(e["train"], []).append(e)
+        else:
+            # Without trains, the batch and the later batches, by size;
+            # the rest are predicted but not yet cut into one.
+            sizes = [(self.ahead.get("batch") or {}).get("size")] + [
+                (part or {}).get("size")
+                for part in self.ahead.get("later") or ()]
+            at = 0
+            for n, size in enumerate(sizes):
+                if not isinstance(size, int) or size < 1:
+                    break
+                if entries[at:at + size]:
+                    groups[n] = entries[at:at + size]
+                at += size
+            if entries[at:]:
+                groups[None] = entries[at:]
+        out = []
+        for n, (train, cars) in enumerate(groups.items()):
+            if train is None:
+                out.append({"train": None, "prs": [e["pr"] for e in cars],
+                            "top": None, "state": "predicted, not yet in "
+                            "a train", "since": None, "urgent": False})
+                continue
+            top = str(cars[-1].get("sha") or "")
+            run = None
+            for r in reversed(self.runs):
+                if r["kind"] == "ahead" and top and r["sha"] and \
+                        top.startswith(r["sha"][:10]):
+                    run = r
+                    break
+            if n == 0 and "green" in said:
+                state = "green, merging"
+            elif run is None:
+                state = "waiting for a slot"
+            elif run["end"] is None:
+                state = "testing"
+            else:
+                state = run["end"]["res"]
+            out.append({
+                "train": train, "prs": [e["pr"] for e in cars],
+                "top": top[:10], "state": state,
+                "since": stamp(run["t"]) if run else None,
+                "urgent": bool(urgent & {e["pr"] for e in cars})})
+        return out
+
     def hourly(self, hours=24):
         """The last `hours` clock hours, oldest first: each hour's
         states, merges and arrivals."""
@@ -1128,10 +1246,12 @@ WHAT = {
 CSS = """
 :root{color-scheme:light;--bg:#f9f9f7;--card:#fcfcfb;--ink:#0b0b0b;
 --ink2:#52514e;--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;
---ring:rgba(11,11,11,.10);--c1:#2a78d6;--c2:#eb6834;%s}
+--ring:rgba(11,11,11,.10);--c1:#2a78d6;--c2:#eb6834;--ok:#2f8f4e;
+--warn:#c2410c;%s}
 @media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#0d0d0d;
 --card:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--grid:#2c2c2a;--axis:#383835;
---ring:rgba(255,255,255,.10);--c1:#3987e5;--c2:#d95926;%s}}
+--ring:rgba(255,255,255,.10);--c1:#3987e5;--c2:#d95926;--ok:#3fae64;
+--warn:#ea7a3c;%s}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
 font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -1165,6 +1285,23 @@ svg .hit{fill:transparent}svg .hit:hover{fill:var(--ring)}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,
 minmax(280px,1fr));gap:12px;margin:10px 0}
 figure.chart{margin:0;min-width:0}
+.train{margin:0 0 10px}.train .lab{font-size:13px;color:var(--ink2);
+margin:0 0 4px}.cars{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+.car{display:inline-block;min-width:58px;padding:3px 6px;border-radius:4px;
+text-align:center;font-size:13px;font-variant-numeric:tabular-nums;
+border:2px solid var(--axis);color:var(--ink);text-decoration:none}
+.car.top{border-style:double;border-width:4px}
+.t-testing .car{border-color:var(--c1)}
+.t-green .car{border-color:var(--ok);background:var(--ok);color:var(--card)}
+.t-red .car{border-color:var(--c2)}
+.urgent{color:var(--warn);font-weight:600}
+ul.stack,ul.stack ul{list-style:none;margin:0;padding:0 0 0 16px}
+ul.stack{padding:0}ul.stack ul{border-left:1px solid var(--axis);
+margin-left:6px}ul.stack li{margin:1px 0}
+ul.stack li li:before{content:"";display:inline-block;width:10px;
+border-top:1px solid var(--axis);vertical-align:middle;margin:0 4px 0 -16px}
+details.stk{margin:0 0 6px}details.stk summary{cursor:pointer}
+a{color:var(--c1)}
 figcaption b{display:block;font-size:14px}
 figcaption .note{display:block;margin:2px 0 4px}
 .ln{width:14px;height:2px;border-radius:1px;display:inline-block}
@@ -1573,6 +1710,89 @@ def glance(w, names, head):
                table(head + ["target"], rows)))
 
 
+def pr_link(data, pr):
+    """#N, linked to the pull request when the repository is known."""
+    if data.get("repo"):
+        return '<a href="https://github.com/%s/pull/%d">#%d</a>' % (
+            esc(data["repo"]), pr, pr)
+    return "#%d" % pr
+
+
+def train_class(state):
+    return ("t-green" if state.startswith("green") else "t-testing"
+            if state == "testing" else "t-red" if state in ("red",)
+            else "t-wait")
+
+
+def trains_html(data):
+    trains = data.get("trains") or []
+    if not trains:
+        return ("<section><h2>Trains now</h2><p class=\"note\">No train: "
+                "the Merger is testing nothing ahead.</p></section>")
+    rows = []
+    for n, t in enumerate(trains):
+        cars = []
+        for i, pr in enumerate(t["prs"]):
+            top = i == len(t["prs"]) - 1
+            cars.append('<span class="car%s" title="%s">%s</span>' % (
+                " top" if top else "",
+                "the top, %s, is tested for the whole train" % esc(t["top"])
+                if top else "carriage %d" % (i + 1), pr_link(data, pr)))
+        if t["train"] is None:
+            rows.append('<div class="train t-wait"><p class="lab">Next in '
+                        "the queue, predicted but in no train yet</p>"
+                        '<div class="cars">%s</div></div>' % "".join(
+                            '<span class="car">%s</span>' % pr_link(data, pr)
+                            for pr in t["prs"]))
+            continue
+        label = "%s · %d PR%s · %s%s · top %s%s" % (
+            "Train %d (merging next)" % t["train"] if n == 0 else
+            "Train %d" % t["train"], len(t["prs"]),
+            "" if len(t["prs"]) == 1 else "s", esc(t["state"]),
+            " since %s" % esc(t["since"]) if t.get("since") else "",
+            esc(t["top"]),
+            ' · <span class="urgent">cut for urgent PRs</span>'
+            if t.get("urgent") else "")
+        rows.append('<div class="train %s"><p class="lab">%s</p>'
+                    '<div class="cars">%s</div></div>'
+                    % (train_class(t["state"]), label, "".join(cars)))
+    return ("<section><h2>Trains now</h2>%s<p class=\"note\">From "
+            "ahead.json at %s. Each train merges front to back once its "
+            "top (double border), tested with every carriage before it, "
+            "is green. Blue: testing; green: green, merging; grey: waiting "
+            "for a slot.</p></section>"
+            % ("".join(rows), esc(data.get("ahead_at"))))
+
+
+def stack_items(data, node):
+    inner = "".join(stack_items(data, k) for k in node["layers"])
+    return "<li>%s%s</li>" % (pr_link(data, node["pr"]),
+                              "<ul>%s</ul>" % inner if inner else "")
+
+
+def stacks_html(data):
+    stacks = data.get("stacks") or []
+    if not stacks:
+        return ("<section><h2>Stacks now</h2><p class=\"note\">No stacked "
+                "pull request is waiting.</p></section>")
+    layers = sum(t["count"] for t in stacks)
+    parts = []
+    for t in stacks:
+        parts.append(
+            '<details class="stk"%s><summary>%s: %d layer%s, %d deep · '
+            "%s</summary><ul class=\"stack\">%s</ul></details>"
+            % (" open" if t["count"] >= 3 else "", pr_link(data, t["pr"]),
+               t["count"], "" if t["count"] == 1 else "s", t["depth"],
+               esc(t["root_where"]), stack_items(data, t)))
+    return ("<section><h2>Stacks now</h2><p class=\"now\"><b>%d</b> "
+            "layers in <b>%d</b> stacks.</p>%s<p class=\"note\">Each tree "
+            "is rooted at the stack's base, the pull request on the "
+            "default branch; every layer above it waits (held as "
+            "<i>stacked on #N</i>) until the one below merges, so where "
+            "the base waits is where the whole stack waits.</p></section>"
+            % (layers, len(stacks), "".join(parts)))
+
+
 def page(data):
     w = data["windows"]
     names = [k for k, _ in WINDOWS] + [BASELINE[0]]
@@ -1647,6 +1867,8 @@ def page(data):
                   esc(snap.get("state")),
                   table(["where", "pull requests"],
                         [[esc(a), esc(b)] for a, b in where])))
+    out.append(trains_html(data))
+    out.append(stacks_html(data))
     # 3. Efficiency.
 
     def slots(f):
@@ -1805,7 +2027,7 @@ def write(path, text):
     os.replace(tmp, path)
 
 
-def compute(flow, project_name):
+def compute(flow, project_name, repo=None):
     windows = {k: flow.figures(flow.now - span, flow.now)
                for k, span in WINDOWS}
     start = flow.now - BASELINE[1]
@@ -1815,7 +2037,9 @@ def compute(flow, project_name):
     return {"project": project_name, "generated": stamp(flow.now),
             "windows": windows, "hours": flow.hourly(), "now":
             flow.snapshot(), "graph_hours": flow.graph_hours(),
-            "build_times": flow.build_times()}
+            "build_times": flow.build_times(), "stacks": flow.stacks(),
+            "trains": flow.trains(), "ahead_at": flow.ahead.get("at"),
+            "repo": repo}
 
 
 def main(argv=None, out=print, err=None, environ=None, now=None,
@@ -1874,7 +2098,7 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
             write(cache_path, json.dumps(approvals, sort_keys=True))
         except (RuntimeError, github.MintError, OSError) as error:
             err("%s: GitHub's approvals left out: %s" % (PROG, error))
-    data = compute(flow, name)
+    data = compute(flow, name, project.repo if project else None)
     write(os.path.join(args.out, "flow.json"),
           json.dumps(data, indent=1, sort_keys=True))
     write(os.path.join(args.out, "index.html"), page(data))

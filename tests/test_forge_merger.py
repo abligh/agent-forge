@@ -4675,6 +4675,19 @@ class HoldConflicting(RepoCase):
                           record["decisions"]][0], (5, "HAND-BACK"))
         self.assertIn(6, [d["pr"] for d in record["decisions"]])
 
+    def test_nothing_waits_behind_one_handed_back_at_its_head(self):
+        # 2026-11-11: #10570 was handed back (its head not the clean
+        # merge of its parents) and held 26 others as "ahead of them in
+        # the queue" until its author pushed again.
+        five = self.item()
+        state = os.path.join(self.tmp.name, "state")
+        os.makedirs(state, exist_ok=True)
+        m.save_json(os.path.join(state, "handed-back.json"),
+                    {"5": {"head": five["headRefOid"], "reason": "red",
+                           "approved": five["reviews"][0]["submittedAt"]}})
+        record, _ = self.tick([five, self.rival()], live=True)
+        self.assertEqual(record["held"], {})
+
     def test_a_pair_of_commits_is_asked_of_git_once(self):
         # agent-forge #301: the same pairs, next tick, ask git nothing.
         asked = []
