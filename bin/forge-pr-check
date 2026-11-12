@@ -496,7 +496,10 @@ time together as `scoped_seconds`.
 Its `OOMPolicy` is `continue`, so a test that runs out is killed alone:
 the step fails with that test's output, rather than systemd stopping
 the whole step without a word. A worker that can't start a user scope
-says so in `worker.log` and runs its steps without the limit.
+says so in `worker.log` and runs its steps without the limit. Each
+scope is named (`forgestep-<step>-<random>`), and when the step ends,
+anything left in it, which its process group didn't hold, is killed
+and the scope stopped (`SCOPE-LEFT`; agent-forge #263).
 
 **With `checks.reuse`, a step isn't run on inputs it has passed on**
 (designs/0009). Each step that applies to a pull request's head gets an
@@ -2794,6 +2797,40 @@ def is_front(merger_dir, when, sha, pr, ahead=False, repo=None):
     return pr is not None and merger_first(merger_dir, when) == pr
 
 
+def named_scope(prefix, step):
+    """(prefix, unit): a step's scope prefix (scope_prefix) with a unit
+    name of its own, `forgestep-<step>-<random>`, so the scope can be
+    found and stopped once the step ends (`stop_scope`). No prefix, no
+    scope: (prefix, None)."""
+    if not prefix or prefix[0] != "systemd-run" or "--" not in prefix:
+        return list(prefix), None
+    unit = "forgestep-%s-%s" % (
+        re.sub(r"[^A-Za-z0-9_]", "_", step)[:40], os.urandom(4).hex())
+    at = prefix.index("--")
+    return list(prefix[:at]) + ["--unit=" + unit] + list(prefix[at:]), unit
+
+
+def stop_scope(unit, env, run=sh):
+    """Stop a step's scope if anything is still in it after the step
+    ended, as {"tasks": n} (n None when systemd didn't say), else None.
+    Killing the step's process group misses what left it: on one host
+    (2026-11-09) a timed-out test step's scope held a GUI test and its
+    session bus helpers for 2.5 days (agent-forge #263)."""
+    got = run(["systemctl", "--user", "show", "-p", "ActiveState",
+               "-p", "TasksCurrent", unit + ".scope"], env=env, timeout=30)
+    props = dict(line.split("=", 1) for line in (got.stdout or "")
+                 .splitlines() if "=" in line)
+    if got.returncode != 0 or props.get("ActiveState") not in (
+            "active", "activating", "deactivating", "reloading"):
+        return None
+    tasks = props.get("TasksCurrent", "")
+    run(["systemctl", "--user", "kill", "--signal=SIGKILL",
+         unit + ".scope"], env=env, timeout=30)
+    run(["systemctl", "--user", "stop", unit + ".scope"], env=env,
+        timeout=60)
+    return {"tasks": int(tasks) if tasks.isdigit() else None}
+
+
 def weighted(prefix, weight):
     """A step's scope prefix (scope_prefix) with CPUWeight `weight`
     instead. No prefix, no scope: nothing to weight."""
@@ -5065,12 +5102,13 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
             shutil.rmtree(folder, ignore_errors=True)
             os.makedirs(folder)
             step_env_["CHECK_RESULTS"] = folder
+        step_prefix, unit = named_scope(step_prefix, name)
         step_args = step_prefix + args
         if wrap is not None:
             step_args, step_env_ = wrap(name, step_prefix, args, step_env_)
-        return step_args, step_env_, folder
+        return step_args, step_env_, folder, unit
 
-    def execute(name, step_args, step_env_, folder, usage=None,
+    def execute(name, step_args, step_env_, folder, unit=None, usage=None,
                 on_start=None):
         if name in refused:
             return {"name": name, "rc": 1, "seconds": 0, "wall": 0.0,
@@ -5100,6 +5138,12 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
         result = {"name": name, "rc": got.returncode,
                   "seconds": int(wall), "wall": round(wall, 2),
                   "tail": tail((got.stdout or "") + (got.stderr or ""))}
+        left = stop_scope(unit, step_env_, run) if unit else None
+        if left is not None:
+            result["scope_left"] = left["tasks"]
+            out("SCOPE-LEFT %s.scope %s tasks after step %s; stopped"
+                % (unit, "?" if left["tasks"] is None else left["tasks"],
+                   name))
         if budget and got.returncode == 124:
             result["over_budget"] = True
             result["tail"] = "stopped: over the scoped budget of %d " \

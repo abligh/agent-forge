@@ -134,7 +134,9 @@ class Check(unittest.TestCase):
         self.calls = []
 
     def run_(self, args, cwd=None, env=None, timeout=None):
-        self.calls.append((args, env))
+        if args[:2] != ["systemctl", "--user"]:
+            # Not a step: stop_scope asking after one (#263).
+            self.calls.append((args, env))
         return done(args)
 
     def check(self, answers, **patches):

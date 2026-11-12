@@ -201,6 +201,13 @@ less `keep_ignored`), merged with the default branch's tip under
   `CPUQuota` is that many CPUs, or the run's `CHECK_CPUS` share with
   `"share"`, set as each step starts; `UNCAPPED-CPU` if systemd refuses.
 * A step is stopped after `step_timeout_minutes` (default 30).
+* Each step's scope is named `forgestep-<step>-<random>.scope`. When
+  the step ends, by any route, anything still in its scope (a test
+  binary or session bus helper that left the step's process group) is
+  killed and the scope stopped, logged as `SCOPE-LEFT <unit> <n> tasks
+  after step <step>; stopped`, and the step's result has
+  `scope_left`. One such scope once outlived its timed-out step by 2.5
+  days (agent-forge #263).
 * A step with `env_file` gets that file's `KEY=VALUE` lines in its
   environment: secrets such as a test account's tokens, which the
   check can't take from CI. The file must be the check user's and mode

@@ -27,7 +27,8 @@ def recorder(rc=0):
 
 
 def quota_calls(calls):
-    return [c for c in calls if c[:2] == ["systemctl", "--user"]]
+    return [c for c in calls if c[:2] == ["systemctl", "--user"]
+            and c[2] not in ("show", "kill", "stop")]
 
 
 class Slice(unittest.TestCase):
@@ -127,7 +128,10 @@ class Check(unittest.TestCase):
         self.assertEqual([c[-1] for c in quota_calls(calls)],
                          ["CPUQuota=1300%", "CPUQuota=1600%"])
         # Set before the step that took the new share.
-        self.assertEqual(calls[-2][-1], "CPUQuota=1600%")
+        steps_and_quotas = [c for c in calls
+                            if c[:2] != ["systemctl", "--user"]
+                            or c[2] not in ("show", "kill", "stop")]
+        self.assertEqual(steps_and_quotas[-2][-1], "CPUQuota=1600%")
 
     def test_no_scope_no_quota(self):
         ok, calls = self.run_check(14, prefix=())
