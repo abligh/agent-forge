@@ -1011,6 +1011,99 @@ class Decide(RepoCase):
         self.assertIn("fetch failed", got["reason"])
 
 
+class MergedAnotherMember(unittest.TestCase):
+    """A train member whose author merged in another member's head
+    (amendment of 2026-11-12): kept when that member is ahead of it in
+    the train, since its tree in its place is then unchanged; out
+    otherwise."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Repo(tmp.name)
+        self.addCleanup(m.configure, project())
+        m.configure(project(test_ahead={
+            "batch": 3, "batches": 1, "depth": 3, "trains": "live"}))
+        self.heads = {}
+        for number in (5, 6, 7, 8):
+            self.repo.branch("b%d" % number, "origin/main")
+            self.heads[number] = self.repo.commit(
+                "f%d.txt" % number, "%d\n" % number, "#%d" % number)
+            self.repo.publish_pr(number, self.heads[number])
+        self.entries, sizes, _ = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), self.carriages(), None,
+            dict(self.heads), set(self.heads))
+        self.assertEqual(m.train_lists(self.entries, sizes)[0], [5, 6, 7])
+        self.last = {"base": self.repo.main_tip(), "trains": True,
+                     "entries": self.entries,
+                     "batch": {"size": sizes[0], "trees": [
+                         e["tree"] for e in self.entries[:sizes[0]]]}}
+
+    def carriages(self, **moved):
+        return [[pr(n, T1, head=moved.get("p%d" % n, self.heads[n]))]
+                for n in sorted(self.heads)]
+
+    def merged_into(self, number, other):
+        """#`number`'s boarded head with #`other`'s head merged in."""
+        self.repo.branch("m%d" % number, self.heads[number])
+        head = self.repo.merge(self.heads[other])
+        self.repo.publish_pr(number, head)
+        return head
+
+    def recut(self, number, head):
+        return m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            self.carriages(**{"p%d" % number: head}), self.last,
+            {**self.heads, number: head}, set(self.heads))
+
+    def test_merging_the_member_ahead_of_it_keeps_its_place(self):
+        # #7 merges #6, the member just ahead of it; #5 is ahead of both,
+        # so #7's own tree is not the one predicted for it.
+        head = self.merged_into(7, 6)
+        self.assertFalse(m.own_push(self.repo.path, self.heads[7], head,
+                                    self.repo.main_tip()))
+        self.assertNotEqual(run_git(self.repo.path, "rev-parse",
+                                    head + "^{tree}"), self.entries[2]["tree"])
+        got, sizes, events = self.recut(7, head)
+        self.assertEqual(events, [("kept", "KEPT #7: pushed %s, same tree "
+                                   "in its place" % head[:10])])
+        self.assertEqual(m.train_lists(got, sizes)[0], [5, 6, 7])
+        # The same predictions, so the same top and the same run.
+        self.assertEqual([e["sha"] for e in got[:3]],
+                         [e["sha"] for e in self.entries[:3]])
+        self.assertEqual(got[2]["head"], head)
+        # And with train_merge the train merges that head.
+        queue = [pr(n, T1, head=head if n == 7 else self.heads[n])
+                 for n in (5, 6, 7)]
+        green = {"results": {"r": {"ok": True,
+                                   "tree": self.entries[2]["tree"]}}}
+        ready = m.train_ready(self.last, queue, self.repo.main_tip(), green,
+                              self.repo.path)
+        self.assertEqual([e["head"] for e in ready],
+                         [self.heads[5], self.heads[6], head])
+
+    def test_merging_the_first_member_keeps_the_second_silently(self):
+        # Its own tree is then the prediction itself.
+        head = self.merged_into(6, 5)
+        got, sizes, events = self.recut(6, head)
+        self.assertEqual(events, [])
+        self.assertEqual([e["sha"] for e in got[:3]],
+                         [e["sha"] for e in self.entries[:3]])
+
+    def test_merging_a_member_behind_it_is_a_push(self):
+        head = self.merged_into(6, 7)
+        _, _, events = self.recut(6, head)
+        self.assertEqual(events[0][0], "left")
+        self.assertIn("LEFT #6: pushed %s mid-train" % head[:10],
+                      events[0][1])
+
+    def test_merging_one_not_in_the_train_is_a_push(self):
+        head = self.merged_into(6, 8)
+        _, _, events = self.recut(6, head)
+        self.assertEqual(events[0], ("left", "LEFT #6: pushed %s mid-train"
+                                     % head[:10]))
+
+
 class TrainMerge(RepoCase):
     """merge.test_ahead.train_merge (designs/0047, amendment of
     2026-11-11): a green train goes in as one pull request."""
@@ -3345,8 +3438,8 @@ class PredictRestacked(unittest.TestCase):
             self.repo.path, self.repo.main_tip(),
             [[pr(6, T1, head=upper)], [pr(7, T1, head=merged)]], last,
             {6: upper, 7: merged}, {6, 7}, restacks=self.restacks)
-        self.assertEqual(events, [("kept", "KEPT #7: pushed %s, merges "
-                                   "main only" % merged[:10])])
+        self.assertEqual(events, [("kept", "KEPT #7: pushed %s, same tree "
+                                   "in its place" % merged[:10])])
         self.assertEqual(m.train_lists(got, sizes), [[6, 7]])
         # The same predictions, so the top's run still counts.
         self.assertEqual([e["sha"] for e in got],

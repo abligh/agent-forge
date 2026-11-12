@@ -579,8 +579,13 @@ predicted again where it was. When that gives the tree its prediction
 had (the one the top tested, while the train up to it is unchanged;
 otherwise the tree its boarded head gives there), it changed nothing
 the train tests, and it keeps its place: `TRAIN-KEPT #n: pushed <sha>,
-merges main only`. Its prediction is the same commit, the same tree on
-the same parent, so the top and its run are unchanged. Anything else
+same tree in its place`. That also keeps a member whose author merged
+in the head of a member ahead of it in the train, which `own_push`
+refuses (the default branch doesn't have that head): the train
+already holds those changes below it. A merge of a member behind it,
+or of a pull request in no train, leaves. Its prediction is the same
+commit, the same tree on the same parent, so the top and its run are
+unchanged. Anything else
 still leaves as before, and a member out of the queue (its new head not
 covered by its approval, say) still leaves too.
 

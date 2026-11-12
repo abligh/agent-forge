@@ -532,8 +532,9 @@ clean merges of what the default branch already has, whichever stack
 the tick acts on), nor one whose prediction is unchanged: predicted
 where the boarded head was, it gives the same tree (`same_prediction`:
 an author's merge of the default branch made any other way, with the
-default branch as the first parent, say), said as `TRAIN-KEPT #n:
-pushed <sha>, merges main only`; its prediction is the same commit, so
+default branch as the first parent, say, or of the head of a member
+ahead of it in the train), said as `TRAIN-KEPT #n: pushed <sha>, same
+tree in its place`; its prediction is the same commit, so
 the top's run still counts, and a train merged as one (`train_merge`)
 merges its new head. A restacked layer stays a candidate meanwhile: its
 build check's and gated instances' verdicts on the head before the
@@ -4294,9 +4295,13 @@ def same_prediction(repo, parent, graph, before, pr, restacks=None,
     again, and None is returned when the checkout no longer has it.
 
     A push whose prediction is unchanged changes nothing the train
-    tests: in effect it only merges the default branch, whoever made
-    the merge and however (the default branch as the first parent, a
-    merge past `own_push`'s depth, or a rebase onto it). Such a member
+    tests: in effect it only merges what the train already has below
+    it, whoever made the merge and however (the default branch as the
+    first parent, a merge past `own_push`'s depth, a rebase onto it, or
+    the head of a member ahead of it in the train, which `own_push`
+    refuses, since the default branch lacks it). A merge of a member
+    behind it, or of a pull request in no train, brings changes the
+    train doesn't have there, and it leaves. Such a member
     keeps its place in its train (designs/0047, amendment of
     2026-11-12): taking it out cut every train behind it again and
     threw their running builds away. Its prediction is the same commit
@@ -4605,7 +4610,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
     graph = None
     # The commit each member was predicted on, last time: while the
     # train up to it is the same, its prediction is still what a push
-    # that only merges the default branch must give.
+    # that only merges what is below it must give.
     was, before = {}, (last or {}).get("base")
     for e in (e for t in prior for c in t for e in c):
         was[e.get("pr")], before = before, e.get("sha")
@@ -4643,9 +4648,8 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                                 % pr["headRefOid"][:10]
                         else:
                             events.append(("kept", "KEPT #%d: pushed %s, "
-                                           "merges %s only" % (
-                                               n, pr["headRefOid"][:10],
-                                               MAIN)))
+                                           "same tree in its place" % (
+                                               n, pr["headRefOid"][:10])))
                 if why is None and entry is None:
                     entry, failed = predict_one(repo, parent, pr, restacks,
                                                 run, graph)
