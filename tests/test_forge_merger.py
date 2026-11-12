@@ -5639,6 +5639,184 @@ class EarlyConflicts(RepoCase):
         self.assertEqual(self.comments(), [])
 
 
+class ResolveSlots(RepoCase):
+    """merge.resolve_slots (designs/0012, amendment of 2026-11-12): at
+    most N pull requests are back with their authors for a conflict
+    with main at once; the others that conflict are held, untold, until
+    a slot frees."""
+
+    item = Decide.item
+    tick = Tick.tick
+    other_pr = Tick.other_pr
+    rival = HoldConflicting.rival
+    comments = HoldConflicting.comments
+    WAIT = "conflicts with main; waits for a resolve slot (%d out: %s)"
+
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        self.addCleanup(m.configure, project())
+
+    def configure(self, slots=1, make=project, **merge):
+        m.configure(make(resolve_slots=slots, **merge))
+
+    def conflicting(self, *numbers):
+        """Approved pull requests made on main's g.txt, which main then
+        changes: each conflicts with main, the oldest first."""
+        made = [self.rival(n, "2026-10-07T1%d:00:00Z" % k,
+                           (("g.txt", "rival %d\n" % n),))
+                for k, n in enumerate(numbers)]
+        self.advance_main("g.txt", "main moved g\n")
+        return made
+
+    def told(self):
+        """The pull requests handed back this tick."""
+        return sorted(int(w.split("/")[-2]) for w, body in self.comments()
+                      if body.startswith("Not merging"))
+
+    def acted(self, record):
+        return [(d["pr"], d["action"]) for d in record["decisions"]]
+
+    def test_the_configuration(self):
+        self.assertEqual(m.RESOLVE_SLOTS, 1)
+        m.configure(project())
+        self.assertEqual(m.RESOLVE_SLOTS, 0)
+
+    def test_one_is_handed_back_and_the_others_wait_untold(self):
+        prs = self.conflicting(6, 7, 8)
+        record, lines = self.tick(prs, live=True)
+        self.assertEqual(self.acted(record), [(6, "HAND-BACK")])
+        self.assertEqual(self.told(), [6])
+        self.assertEqual({k: record["held"][k] for k in ("7", "8")},
+                         {"7": self.WAIT % (1, "#6"),
+                          "8": self.WAIT % (1, "#6")})
+        self.assertEqual((record["resolving"], record["resolve_waiting"]),
+                         ([6], [7, 8]))
+        self.assertEqual(record["queue"], [6])
+        self.assertIn("RESOLVE-WAIT #7 #8: conflict with main; 1 of 1 "
+                      "slots out (#6)", lines)
+        # Nothing is said about the waiting ones in handed-back.json.
+        with open(os.path.join(self.state, "handed-back.json")) as handle:
+            self.assertEqual(sorted(json.load(handle)), ["6"])
+        # The next tick: #6 is still out, so the others still wait, and
+        # nobody is told again.
+        record, _ = self.tick(prs, live=True, minutes=1)
+        self.assertEqual(record["resolve_waiting"], [7, 8])
+        self.assertEqual(self.told(), [])
+
+    def test_a_slot_frees_when_the_one_out_goes(self):
+        prs = self.conflicting(6, 7, 8)
+        self.tick(prs, live=True)
+        # #6 closes (or its author pushes: a head it wasn't told at).
+        record, _ = self.tick(prs[1:], live=True, minutes=1)
+        self.assertEqual(self.acted(record), [(7, "HAND-BACK")])
+        self.assertEqual(self.told(), [7])
+        self.assertEqual(record["held"]["8"], self.WAIT % (1, "#7"))
+
+    def test_a_new_head_frees_the_slot(self):
+        prs = self.conflicting(6, 7)
+        self.tick(prs, live=True)
+        with open(os.path.join(self.state, "handed-back.json")) as handle:
+            said = json.load(handle)
+        out = lambda six: m.out_for_resolving(
+            said, [six], self.repo.path, self.repo.main_tip(), tools_run())
+        self.assertEqual(out(prs[0]), [6])
+        self.assertEqual(out(dict(prs[0], headRefOid="9" * 40)), [])
+        self.assertEqual(out(dict(prs[0], isDraft=True)), [])
+
+    def test_one_no_longer_conflicting_frees_its_slot(self):
+        six, = self.conflicting(6)
+        said = {"6": m.hand_back_key(m.approval_of(six), six["headRefOid"],
+                                     m.CONFLICT_REASON)}
+        self.assertEqual(m.out_for_resolving(
+            said, [six], self.repo.path, self.repo.main_tip(), tools_run()),
+            [6])
+        # Main takes #6's g.txt: it merges cleanly again.
+        self.advance_main("g.txt", "rival 6\n")
+        self.assertEqual(m.out_for_resolving(
+            said, [six], self.repo.path, self.repo.main_tip(), tools_run()),
+            [])
+        # Told something else, or under another approval, isn't out.
+        self.advance_main("g.txt", "main moved again\n")
+        other = dict(said["6"], reason="the Merger's gate failed")
+        self.assertEqual(m.out_for_resolving(
+            {"6": other}, [six], self.repo.path, self.repo.main_tip(),
+            tools_run()), [])
+        older = dict(said["6"], approved="2026-01-01T00:00:00Z")
+        self.assertEqual(m.out_for_resolving(
+            {"6": older}, [six], self.repo.path, self.repo.main_tip(),
+            tools_run()), [])
+
+    def test_two_slots(self):
+        self.configure(2)
+        record, _ = self.tick(self.conflicting(6, 7, 8), live=True)
+        self.assertEqual(self.told(), [6, 7])
+        self.assertEqual(record["held"]["8"], self.WAIT % (2, "#6, #7"))
+
+    def test_without_slots_every_conflict_is_handed_back(self):
+        self.configure(0)
+        record, _ = self.tick(self.conflicting(6, 7, 8), live=True)
+        self.assertEqual(self.told(), [6, 7, 8])
+        self.assertNotIn("resolving", record)
+
+    def test_one_labelled_urgent_gets_the_slot_first(self):
+        self.configure(make=urgent_project)
+        prs = self.conflicting(6, 7, 8)
+        labelled(prs[2], "Priority:urgent")
+        record, _ = self.tick(prs, live=True)
+        self.assertEqual(self.told(), [8])
+        self.assertEqual(record["resolve_waiting"], [6, 7])
+
+    def test_those_behind_the_front_wait_too(self):
+        # merge.early_conflicts: the hand-backs behind the front are
+        # gated the same way, after the front's.
+        self.configure(early_conflicts=True)
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        prs = [self.item()] + self.conflicting(6, 7)
+        record, _ = self.tick(prs, conclusions=(None,), live=True)
+        self.assertEqual(self.told(), [6])
+        self.assertEqual([d.get("early") for d in record["decisions"]
+                          if d["pr"] == 6], [True])
+        self.assertEqual(record["held"]["7"], self.WAIT % (1, "#6"))
+
+    def test_a_dry_tick_says_nothing(self):
+        record, _ = self.tick(self.conflicting(6, 7))
+        self.assertEqual(self.acted(record), [(6, "HAND-BACK")])
+        self.assertEqual(record["resolve_waiting"], [7])
+
+    def test_a_layer_above_one_out_is_not_handed_back_itself(self):
+        # Held as stacked, as before: its base's resolution comes first.
+        self.configure(early_conflicts=True)
+        six, seven = self.conflicting(6, 7)
+        layer = pr(9, T2, base="b6", head=seven["headRefOid"],
+                   reviews=[review(REVIEWER, oid=seven["headRefOid"])])
+        record, _ = self.tick([six, layer], live=True)
+        self.assertEqual(self.told(), [6])
+        self.assertNotIn("resolve_waiting", record)
+        self.assertIn("9", record["held"])
+        self.assertNotIn("resolve slot", record["held"]["9"])
+
+    def test_the_order_slots_are_given_in(self):
+        base = pr(6, "2026-10-07T03:00:00Z")
+        layers = [pr(9, base="b6"), pr(10, base="b9", reviews=[])]
+        single = pr(7, "2026-10-07T01:00:00Z")
+        later = pr(8, "2026-10-07T02:00:00Z")
+        queue, everyone = [single, base, later], [single, base, later] + layers
+        order = lambda row=None: [p["number"] for p in m.resolve_slot_order(
+            [later, base, single], queue, everyone, row)]
+        self.assertEqual(order(), [7, 6, 8])
+        # Right of way comes first; unless it is idle.
+        self.assertEqual(order({"pr": 8}), [8, 7, 6])
+        self.assertEqual(order({"pr": 8, "idle": "drafted"}), [7, 6, 8])
+        # In batches of two, #7 and #6 would board together: the base
+        # with an approved layer above it goes first.
+        m.configure(project(resolve_slots=1, test_ahead={"batch": 2}))
+        self.assertEqual(order(), [6, 7, 8])
+        self.assertEqual(m.approved_above(6, everyone), 1)
+
+
 class YieldIgnoresConflicts(unittest.TestCase):
 
     def test_hand_backs_without_conflicts(self):

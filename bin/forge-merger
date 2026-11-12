@@ -75,6 +75,31 @@ everything queued behind it. Any other write GitHub refuses is
 recorded, not retried in the same tick: the next tick judges the pull
 request afresh.
 
+**With `merge.resolve_slots: N`, at most N are out for resolving at
+once** (default 0, no limit; designs/0012, amendment of 2026-11-12).
+One is out while it was handed back for a conflict with `main` (a
+restack's conflict too) at the head and under the approval it has
+now, isn't a draft, and still conflicts; its author's push, a new or
+lost approval, closing, merging, or `main` moving so that it merges
+cleanly frees the slot, and its re-review after the fix holds none.
+Every other conflict the tick finds, at the front, behind it with
+`early_conflicts`, or refused by GitHub, waits for the tick's end. Then
+the free slots go, in turn, to those labelled urgent, the other urgent
+ones, the one with right of way, then to those that would board
+soonest (their place in the queue, by `test_ahead.batch` when there
+are batches, and within that, a stack's base with more approved
+layers above it first), then the oldest; each gets its hand-back as
+before. The rest are held, untold, with nothing in `handed-back.json`:
+`held` says `conflicts with main; waits for a resolve slot (2 out:
+#a, #b)`, they leave the record's `queue` and every prediction, and
+one `RESOLVE-WAIT #c #d: ...` line is printed. The record says
+`resolving` (those out) and `resolve_waiting`. A resolution done while
+others merge is often undone by the next merge; a slot keeps the few
+being resolved near the front, where they board soon after. A stack's
+layers are held as stacked while their base is out, as before, and a
+pull request held behind another (`hold_conflicting`, right of way)
+isn't in the queue the slots are given from.
+
 **A head GitHub has lost is nudged once.** GitHub sometimes moves a
 pull request's branch (its own update's merge commit lands on it)
 without moving the pull request's head, and then refuses every update
@@ -1069,6 +1094,10 @@ YIELD_IGNORES_CONFLICTS = False
 # that conflicts with main is handed back now, not when it reaches the
 # front (designs/0012).
 EARLY_CONFLICTS = False
+# merge.resolve_slots: at most this many pull requests are back with
+# their authors for a conflict with main at once; the others that
+# conflict wait, held and not told, for a slot (0: no limit).
+RESOLVE_SLOTS = 0
 # merge.code_owners: hold one that changes a path CODEOWNERS gives an
 # owner until an owner has approved its head.
 CODE_OWNERS = False
@@ -1214,7 +1243,7 @@ def configure(project):
     global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
     global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS, URGENT_LABEL
     global STACKS, STACK_MAX_RUN, STACK_WAIT, RESOLVE, HOLD_LABELS, BLOCKED_BY
-    global UNION
+    global UNION, RESOLVE_SLOTS
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
@@ -1285,6 +1314,7 @@ def configure(project):
                                         False) is True
     CODE_OWNERS = merge.get("code_owners", False) is True
     EARLY_CONFLICTS = merge.get("early_conflicts", False) is True
+    RESOLVE_SLOTS = merge.get("resolve_slots", 0)
     row = merge.get("right_of_way")
     RIGHT_OF_WAY = row is not None
     ROW_AFTER = (row or {}).get("after_conflicts", 2)
@@ -3423,6 +3453,81 @@ def ci_rerun(decision, github, state_dir, when, live, out):
                 else "re-running it was refused: " + why))
         return None
     return None
+
+
+# merge.resolve_slots: why one that conflicts with main is held rather
+# than handed back (designs/0012, amendment of 2026-11-12).
+RESOLVE_WAIT_REASON = ("conflicts with %s; waits for a resolve slot "
+                       "(%d out: %s)")
+
+
+def out_for_resolving(said, prs, repo, main_tip, run=sh):
+    """merge.resolve_slots: the numbers of the open pull requests out for
+    resolving, sorted. One is out when `said` has it handed back for a
+    conflict with main (any reason that starts with CONFLICT_REASON, a
+    restack's too) at the head and under the approval it has now, it
+    isn't a draft, and it still conflicts. Its slot frees when its
+    author pushes (the head moves), it loses its approval or gets a
+    new one, it closes, merges or is drafted, or main moves so that it
+    no longer conflicts. A restack's conflict is with the layer below's
+    final head, which main alone doesn't settle, so it counts until
+    one of the others."""
+    out = []
+    for pr in prs:
+        before = said.get(str(pr["number"])) or {}
+        approval = approval_of(pr)
+        reason = before.get("reason") or ""
+        if (approval is None or pr.get("isDraft")
+                or not reason.startswith(CONFLICT_REASON)
+                or before.get("head") != pr["headRefOid"]
+                or before.get("approved") != approval.get("submittedAt")):
+            continue
+        if "'s final head" not in reason:
+            have_head(repo, pr, run)
+            if is_ancestor(repo, main_tip, pr["headRefOid"], run):
+                continue
+            merged = git(repo, "merge-tree", "--write-tree", "--name-only",
+                         "--no-messages", main_tip, pr["headRefOid"],
+                         run=run)
+            if merged.returncode == 0:
+                continue
+        out.append(pr["number"])
+    return sorted(out)
+
+
+def approved_above(number, prs):
+    """How many open pull requests stacked, at any depth, on `number`
+    have an approval (`approval_of`)."""
+    by_number = {pr["number"]: pr for pr in prs}
+    branches, count = {by_number[number]["headRefName"]}, 0
+    while branches:
+        above = [pr for pr in prs if pr.get("baseRefName") in branches]
+        count += sum(1 for pr in above if approval_of(pr) is not None)
+        branches = {pr["headRefName"] for pr in above}
+    return count
+
+
+def resolve_slot_order(waiting, queue, prs, row=None):
+    """merge.resolve_slots: `waiting`, pull requests that conflict with
+    main and aren't out for resolving, in the order they get a slot:
+    those labelled urgent, then the other urgent ones (`urgent`), then
+    the one with right of way (`row`, unless idle), then by how soon
+    they would board: their place in `queue`, the order the Merger takes
+    them in, grouped by `merge.test_ahead.batch` when there are
+    batches; within a group, a stack's base with more approved layers
+    above it (`approved_above`) first, then the queue's order; last,
+    one not in the queue (held for an instance), oldest first."""
+    places = {pr["number"]: at for at, pr in enumerate(queue)}
+    group = AHEAD_BATCH if TEST_AHEAD and AHEAD_BATCH > 1 else 1
+    holder = row.get("pr") if row and not row.get("idle") else None
+
+    def key(pr):
+        place = places.get(pr["number"], len(places))
+        return (not labelled_urgent(pr), not urgent(pr),
+                pr["number"] != holder, place // group,
+                -approved_above(pr["number"], prs), place,
+                pr.get("createdAt") or "", pr["number"])
+    return sorted(waiting, key=key)
 
 
 def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
@@ -7024,6 +7129,22 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 if STACKS and stack:
                     record["stack"] = [{"pr": e["pr"], "after": e["after"]}
                                        for e in stack["pending"]]
+    # merge.resolve_slots: a conflict with main is handed back only while
+    # a slot is free; the others wait in `pending` until the tick's end,
+    # when the free slots go to those first in `resolve_slot_order`.
+    resolving = out_for_resolving(said, prs, repo, main_tip, run) \
+        if RESOLVE_SLOTS else []
+    pending = []
+
+    def conflict_back(pr, approval, reason=CONFLICT_REASON, detail=None):
+        gated = RESOLVE_SLOTS and pr["number"] not in resolving
+        decision = conflict_hand_back(pr, approval, github, said,
+                                      live and not gated, reason, detail)
+        if gated:
+            pending.append((pr, approval, decision))
+        else:
+            record["decisions"].append(decision)
+
     for at, pr in enumerate([] if retarget is not None or trained
                             else queue):
         approval = approvals[pr["number"]]
@@ -7087,6 +7208,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         if suspected:
             decision = {"action": "WAIT", "pr": pr["number"],
                         "head": pr["headRefOid"], "reason": suspected}
+        if (RESOLVE_SLOTS and decision["action"] == "HAND-BACK"
+                and decision.get("to") == "author"
+                and decision.get("reason", "").startswith(CONFLICT_REASON)
+                and pr["number"] not in resolving):
+            # A slot is given, or not, at the tick's end; either way the
+            # queue moves past it.
+            pending.append((pr, approval, decision))
+            continue
         if (decision["action"] == "UPDATE"
                 and said.get(str(pr["number"])) == hand_back_key(
                     approval, pr["headRefOid"], CONFLICT_REASON)):
@@ -7180,13 +7309,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     pr["number"], "" if live else "would have ",
                     decision["after"], short(decision["below"])))
             else:
-                record["decisions"].append(conflict_hand_back(
-                    pr, approval, github, said, live,
+                conflict_back(
+                    pr, approval,
                     "%s, and the Merger could not merge #%d's final head "
                     "%s into it" % (CONFLICT_REASON, decision["after"],
                                     decision["below"][:10]),
                     RESTACK_DETAIL % (decision["after"],
-                                      decision["below"][:10], MAIN)))
+                                      decision["below"][:10], MAIN))
                 continue
         if decision["action"] == "STACK-UPDATE":
             if decision.get("result", "done") == "done":
@@ -7194,11 +7323,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     % (pr["number"], "" if live else "would have ", MAIN,
                        decision["after"], short(decision["below"])))
             elif not decision["result"].startswith("refused"):
-                record["decisions"].append(conflict_hand_back(
-                    pr, approval, github, said, live,
+                conflict_back(
+                    pr, approval,
                     "%s, and the Merger could not merge it in against "
                     "#%d's final head" % (CONFLICT_REASON,
-                                          decision["after"])))
+                                          decision["after"]))
                 continue
         if decision["action"] == "UNION":
             if decision.get("result", "done") == "done":
@@ -7208,10 +7337,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         ", ".join(sorted(decision["files"]))))
             elif not decision["result"].startswith("refused"):
                 step = decision["result"][len("failed: "):].split(": ")[0]
-                record["decisions"].append(conflict_hand_back(
-                    pr, approval, github, said, live,
-                    "%s, and the Merger could not resolve it (%s)"
-                    % (CONFLICT_REASON, step)))
+                conflict_back(pr, approval,
+                              "%s, and the Merger could not resolve it (%s)"
+                              % (CONFLICT_REASON, step))
                 continue
         if (decision["action"] == "RESOLVE"
                 and decision.get("result", "").startswith("failed")):
@@ -7220,10 +7348,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             # differ per tick, and the reason is half the key that says
             # a hand-back once.
             step = decision["result"][len("failed: "):].split(": ")[0]
-            record["decisions"].append(conflict_hand_back(
-                pr, approval, github, said, live,
-                "%s, and the Merger could not resolve it (%s)"
-                % (CONFLICT_REASON, step)))
+            conflict_back(pr, approval,
+                          "%s, and the Merger could not resolve it (%s)"
+                          % (CONFLICT_REASON, step))
             continue
         if (live and decision["action"] == "MERGE"
                 and decision.get("result") == "done"):
@@ -7239,8 +7366,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             # The backstop for a conflict git didn't see: GitHub's word
             # is final, and the pull request goes back to its author
             # like any other conflict, not round again next tick.
-            record["decisions"].append(
-                conflict_hand_back(pr, approval, github, said, live))
+            conflict_back(pr, approval)
             continue
         if (live and decision["action"] in ("UPDATE", "MERGE")
                 and LOST_HEAD_RE.search(decision.get("result") or "")):
@@ -7283,10 +7409,55 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             stopped = at + 1
             break
     if EARLY_CONFLICTS:
-        record["decisions"] += early_conflicts(
+        early = early_conflicts(
             repo, main_tip, queue[stopped:] + instance_held, approvals,
-            github, said, live, run, layers,
+            github, said, live and not RESOLVE_SLOTS, run, layers,
             restacks if PREDICT_RESTACKED else None)
+        by_number = {pr["number"]: pr for pr in queue + instance_held}
+        for decision in early:
+            if RESOLVE_SLOTS:
+                pr = by_number[decision["pr"]]
+                pending.append((pr, approvals[pr["number"]], decision))
+            else:
+                record["decisions"].append(decision)
+    slot_waiting = set()
+    if pending:
+        # merge.resolve_slots (designs/0012, amendment of 2026-11-12).
+        seen, first = set(), []
+        for entry in pending:
+            if entry[0]["number"] not in seen:
+                seen.add(entry[0]["number"])
+                first.append(entry)
+        entries = {entry[0]["number"]: entry for entry in first}
+        ranked = resolve_slot_order([entry[0] for entry in first],
+                                    queue + instance_held, prs, row)
+        free = max(0, RESOLVE_SLOTS - len(resolving))
+        for pr in ranked[:free]:
+            # Told now, while the others that wait still show as queued
+            # in the comment's list of the author's other pull requests.
+            _, approval, decision = entries[pr["number"]]
+            if live:
+                decision["result"] = carry_out(decision, approval, github,
+                                               said)
+            record["decisions"].append(decision)
+            resolving = resolving + [pr["number"]]
+        slot_waiting = {pr["number"] for pr in ranked[free:]}
+        for pr in ranked[free:]:
+            if str(pr["number"]) not in held:
+                held[str(pr["number"])] = RESOLVE_WAIT_REASON % (
+                    MAIN, len(resolving),
+                    ", ".join("#%d" % n for n in resolving))
+        if slot_waiting:
+            out("RESOLVE-WAIT %s: conflict with %s; %d of %d slots out (%s)"
+                % (" ".join("#%d" % pr["number"] for pr in ranked[free:]),
+                   MAIN, len(resolving), RESOLVE_SLOTS,
+                   ", ".join("#%d" % n for n in resolving)))
+            record["queue"] = [n for n in record["queue"]
+                               if n not in slot_waiting]
+    if RESOLVE_SLOTS:
+        record["resolving"] = sorted(resolving)
+        if slot_waiting:
+            record["resolve_waiting"] = sorted(slot_waiting)
     if live:
         minutes = stalled_for(state_dir, waiting, when, check_state, repo,
                               run)
@@ -7347,6 +7518,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                        "" if live else "would be "))
             rest = [pr for pr in queue if pr["number"] != waiting_on
                     and str(pr["number"]) not in reds
+                    and pr["number"] not in slot_waiting
                     and not handed_back(said, pr, approvals[pr["number"]],
                                         when)]
             ahead_queue = acting + rest if acting else []

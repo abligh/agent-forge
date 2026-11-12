@@ -815,6 +815,14 @@ class Check(unittest.TestCase):
                          ["merge.yield_cap needs "
                           "merge.yield_after_hand_back"])
 
+    def test_merge_resolve_slots(self):
+        self.assertEqual(self.problems(merge={"resolve_slots": 0}), [])
+        self.assertEqual(self.problems(merge={"resolve_slots": 3}), [])
+        self.assertEqual(self.problems(merge={"resolve_slots": -1}),
+                         ["merge.resolve_slots must be at least 0"])
+        self.assertEqual(self.problems(merge={"resolve_slots": "2"}),
+                         ["merge.resolve_slots must be an integer"])
+
     def test_merge_right_of_way(self):
         self.assertEqual(self.problems(merge={
             "yield_ignores_conflicts": True,

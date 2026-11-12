@@ -124,7 +124,7 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "update_once": bool, "ci_never_started": int,
          "queued_stall_minutes": int, "read_as": str, "age_first": dict,
          "hand_back_once_per_head": bool, "own_head_green": bool,
-         "stall_run_factor": (int, float)}
+         "stall_run_factor": (int, float), "resolve_slots": int}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
 # merge.resolve as an object: designs/0026's rules as `regenerate`, and
 # designs/0046's `union` globs.
@@ -705,6 +705,9 @@ def check(data):
                 problems.append("merge.%s must be at least 1" % key)
         if "yield_cap" in merge and "yield_after_hand_back" not in merge:
             problems.append("merge.yield_cap needs merge.yield_after_hand_back")
+        if _is(merge.get("resolve_slots"), int) and merge["resolve_slots"] < 0:
+            # 0 is no limit (designs/0012, amendment of 2026-11-12).
+            problems.append("merge.resolve_slots must be at least 0")
         if isinstance(merge.get("right_of_way"), dict):
             row = merge["right_of_way"]
             _fields("merge.right_of_way", row, RIGHT_OF_WAY, problems)
