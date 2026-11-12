@@ -3,8 +3,9 @@
 `forge-install` keeps a host's agent-forge installation at the commit
 the project pins in `.agent-forge/pin`. `forge-cron-run` refuses to run
 any tool from an installation at another commit (`PIN-MISMATCH`), so
-after a pin bump every scheduled job on the host stops until the
-installation moves. This tool moves it, between jobs or beside them, so
+after a pin bump every scheduled job on the host waits, up to
+`FORGE_CRON_PIN_WAIT_S` (10 minutes by default), and then stops, until
+the installation moves. This tool moves it, between jobs or beside them, so
 nobody has to log in to each host and check out the new release by
 hand.
 
