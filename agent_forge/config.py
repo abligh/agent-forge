@@ -124,7 +124,8 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "update_once": bool, "ci_never_started": int,
          "queued_stall_minutes": int, "read_as": str, "age_first": dict,
          "hand_back_once_per_head": bool, "own_head_green": bool,
-         "stall_run_factor": (int, float), "resolve_slots": int}
+         "stall_run_factor": (int, float), "resolve_slots": int,
+         "mode": str}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
 # merge.resolve as an object: designs/0026's rules as `regenerate`, and
 # designs/0046's `union` globs.
@@ -674,6 +675,9 @@ def check(data):
                     and all(isinstance(a, str) for a in argv)):
                 problems.append("merge.gate[%d] must be a non-empty list of "
                                 "strings" % i)
+        if isinstance(merge.get("mode"), str) and \
+                merge["mode"] not in ("auto", "manual"):
+            problems.append("merge.mode must be auto or manual")
         name = merge.get("merger")
         if isinstance(name, str) and name not in data.get("machinery", {}):
             problems.append("merge.merger %r is not in machinery" % name)

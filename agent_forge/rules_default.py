@@ -66,6 +66,11 @@ Then:
 4. the build check's status (`checks.context`) is `failure` or `error`
    on the head: the author's;
 5. it is `pending` or absent on the head: nobody's;
+23. with `merge.mode` `manual` (agent-forge #274), after rule 5: green,
+   and nothing it names holds it (a `Blocked-by:` item open, a
+   `Defer-until:` to come, a `Status:waiting-*` label): the author's,
+   "check it with forge-merger --ready N, then merge it, or say why
+   not"; held, nobody's. Rules 6 to 8 don't apply then;
 6. no request for changes stands, a reviewer's newest review is
    `APPROVED`, covers the head, and nothing has been said after it (by
    `forge-merger`'s own test): nobody's, it is the Merger's;
@@ -370,6 +375,8 @@ RED_FIRST = None
 DEFAULT_FALLBACK_HOURS = 2
 # `router.nightly_wake` (designs/0040), {"label"}, or None: off.
 NIGHTLY_WAKE = None
+# merge.mode manual (agent-forge #274): rule 23.
+MANUAL = False
 # `router.issue_blocked_by`: "body" (the default), or "agents": an
 # issue's `Blocked-by:` lines may be in a comment by the owner or an
 # agent (`issue_blocker_state`).
@@ -435,8 +442,9 @@ def configure(project, merger_tool):
     global MERGE_NOTICE, merged_window
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
     global UNREVIEWED, QUIET_LABELS, IN_PROGRESS, RED_FIRST, PROJECT
-    global NIGHTLY_WAKE, ISSUE_BLOCKED_BY, BLOCKER_WRITERS
+    global NIGHTLY_WAKE, ISSUE_BLOCKED_BY, BLOCKER_WRITERS, MANUAL
     merger = merger_tool
+    MANUAL = project.section("merge").get("mode") == "manual"
     PROJECT = project
     labels = project.section("labels")
     MERGER = merger.ACT_AS
@@ -812,6 +820,14 @@ def route_pr(pr, roster, when=None):
     # Rule 5.
     if state != "success":
         return nobody(n, 5, "%s is %s" % (STATUS_CONTEXT, state or "absent"))
+    # Rule 23 (agent-forge #274): with merge.mode manual, a green pull
+    # request nothing holds is its author's to merge.
+    if MANUAL:
+        if waits(pr, when or merger.now_utc()):
+            return nobody(n, 23, "green, and waits for what it names")
+        return turn(n, author, 23, status.get("createdAt") or head,
+                    "is green at %s: check it with forge-merger --ready %d, "
+                    "then merge it, or say why not" % (head[:7], n))
     # Rule 6.
     if (not standing and newest is not None
             and newest.get("state") == "APPROVED"
