@@ -200,6 +200,15 @@ class UnionText(unittest.TestCase):
             "H", "M"), (None, "a conflict where a line was changed or "
                               "removed"))
 
+    def test_a_pick_may_resolve_a_hunk_with_a_base(self):
+        text = self.text("<<<<<<< H", "h", "||||||| B", "b", "=======", "m",
+                         ">>>>>>> M")
+        got = union.union_text(text, "H", "M",
+                               pick=lambda base, head, main: head)
+        self.assertEqual(got, ("h\n", [(["h"], ["m"])]))
+        self.assertIsNone(union.union_text(text, "H", "M",
+                                           pick=lambda *sides: None)[0])
+
     def test_no_base_section_is_refused(self):
         self.assertEqual(union.union_text(self.text(
             "<<<<<<< H", "h", "=======", "m", ">>>>>>> M"), "H", "M")[0],

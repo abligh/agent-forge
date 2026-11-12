@@ -4,8 +4,9 @@
 directory is the working tree of one private repository, and
 `forge-memory-sync` keeps the hosts in step.** Each run commits what
 changed on the host, rebases onto what the other hosts pushed, and
-pushes. `MEMORY.md` merges as a union. Any other conflict stops that
-host's sync until a person or agent resolves it. Nothing is ever
+pushes. `MEMORY.md` merges as a union, and so does a conflict where
+both hosts only added lines to a memory file. Any other conflict stops
+that host's sync until a person or agent resolves it. Nothing is ever
 resolved by guessing.
 
 Two tools look after the index itself: `forge-memory-check` asserts it
@@ -41,7 +42,15 @@ A run:
 
 If the rebase conflicts, it is aborted. That restores the working tree
 exactly, and the local commit is kept, so nothing written on this host
-is lost. The run exits 1, and on every later run the host goes on
+is lost. **When every conflict is two hosts adding lines to a memory
+file** (`*.md`: two appends, two inserts after the same line), the run
+then merges the two as a union instead: the other hosts' lines, then
+this host's, in a merge commit, which it fast-forwards to (refusing if
+a file changed meanwhile) and pushes, `pushed (union of <files>)`. A
+front-matter `modified:` that each host set differently keeps the later
+time (agent-forge #157; Alex, 2026-11-12: a union only for memory files,
+whose entries are lines and whose order doesn't matter). Otherwise the
+run exits 1, and on every later run the host goes on
 committing locally and stopping at the same conflict until someone
 resolves it (see [When a sync stops](#when-a-sync-stops)).
 

@@ -87,12 +87,14 @@ def parse_merge_tree(output):
     return tree, stages, messages
 
 
-def union_text(text, head_label, main_label):
+def union_text(text, head_label, main_label, pick=None):
     """(resolved text, [(head_lines, main_lines), ...]) for one file as
     `merge-tree` wrote it, conflict markers and all, or (None, why). A
-    hunk resolves only when its base section is empty; markers must
-    carry the two labels, so a line of the file's own that only looks
-    like a marker is never taken for one."""
+    hunk resolves only when its base section is empty, or when `pick`,
+    given (base, head, main) lines, returns the lines to keep for it (a
+    caller's own rule, such as forge-memory-sync's later `modified:`);
+    markers must carry the two labels, so a line of the file's own that
+    only looks like a marker is never taken for one."""
     out, hunks = [], []
     lines = re.findall(r"[^\n]*\n|[^\n]+", text)
     at = 0
@@ -127,7 +129,13 @@ def union_text(text, head_label, main_label):
             at += 1
         at += 1
         if base:
-            return None, "a conflict where a line was changed or removed"
+            kept = pick(base, head, main) if pick is not None else None
+            if kept is None:
+                return None, "a conflict where a line was changed or removed"
+            out += kept
+            hunks.append(([l.rstrip("\r\n") for l in head],
+                          [l.rstrip("\r\n") for l in main]))
+            continue
         if not head or not main:
             return None, "a conflict that adds on one side only"
         out += head + main
@@ -142,11 +150,11 @@ def union_text(text, head_label, main_label):
     return "".join(out), hunks
 
 
-def resolve(repo, head, main, globs, run=sh):
+def resolve(repo, head, main, globs, run=sh, pick=None):
     """The Resolution of merging `main` into `head` (both commit ids in
-    `repo`) under `globs`. Writes the resolved files' blobs and the
-    tree to the object store, nothing else: no ref, index or worktree
-    of `repo` changes."""
+    `repo`) under `globs`, with `union_text`'s `pick`. Writes the
+    resolved files' blobs and the tree to the object store, nothing
+    else: no ref, index or worktree of `repo` changes."""
     merged = git(repo, "-c", "merge.conflictStyle=zdiff3", "merge-tree",
                  "--write-tree", "-z", "--messages", head, main, run=run)
     if merged.returncode == 0:
@@ -187,7 +195,7 @@ def resolve(repo, head, main, globs, run=sh):
             # Text output turns "\r\n" into "\n": a file with carriage
             # returns can't be read back as it is, so it isn't resolved.
             return Resolution(reason="%s has carriage returns" % path)
-        text, hunks = union_text(shown.stdout, head, main)
+        text, hunks = union_text(shown.stdout, head, main, pick)
         if text is None:
             return Resolution(reason="%s: %s" % (path, hunks))
         files.append((path, hunks))
