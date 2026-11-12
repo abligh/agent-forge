@@ -3856,6 +3856,17 @@ class Suspects(unittest.TestCase):
         self.assertEqual(line, "BATCH-FLAKE #5..#6: every suspect merged "
                          "green; the red top's tree t was a flake")
 
+    def test_a_suspect_only_brought_up_to_date_stays(self):
+        # 2026-11-12: an update of the first suspect took it out of the
+        # search, which then ended, and every train was cut again.
+        moved = lambda head, pr: pr["number"] == 6
+        saved, _ = m.suspects_left(
+            self.saved(5, 6, 7), self.queue(5, 6, 7, pushed=(6, 7)),
+            {"decisions": []}, {}, {}, moved)
+        self.assertEqual(saved["suspects"], [
+            {"pr": 5, "head": "h5"}, {"pr": 6, "head": "new"}])
+        self.assertEqual(saved["left"], [7])
+
     def test_none_left_after_a_change_is_no_flake(self):
         saved = self.saved(5)
         saved["merged"] = [4]
@@ -4107,6 +4118,126 @@ class TickAhead(RepoCase):
         record = self.behind_main_on_a_train()
         self.assertEqual([d["action"] for d in record["decisions"]
                           if d["pr"] == 5], ["UPDATE"])
+
+    def red_train(self, train_merge=True):
+        """#5 and #6 boarded on one train, then main moves on, so #5 is
+        behind it, and the train's top is found red: the second tick's
+        record."""
+        m.configure(project(test_ahead={"batch": 2, "trains": "live",
+                                        "train_merge": train_merge}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        self.advance_main("n.txt")
+        record, lines = self.tick(prs, live=True, minutes=1, check_state={
+            "results": {top["sha"]: {"tree": top["tree"], "ok": False}}})
+        return record, lines
+
+    def test_a_red_trains_members_are_not_updated(self):
+        # 2026-11-12: the tick that found a train's top red updated its
+        # first member, a suspect, whose new head then took it out of
+        # the search, and every train was cut again.
+        record, _ = self.red_train()
+        five = [d for d in record["decisions"] if d["pr"] == 5]
+        self.assertEqual([(d["action"], d.get("reason")) for d in five],
+                         [("WAIT", m.SUSPECT_WAIT_REASON % "#5..#6")])
+        self.assertNotIn("update-branch",
+                         " ".join(w[1] for w in self.github.writes))
+
+    def test_without_train_merge_a_red_trains_member_is_updated(self):
+        record, _ = self.red_train(train_merge=False)
+        self.assertEqual([d["action"] for d in record["decisions"]
+                          if d["pr"] == 5], ["UPDATE"])
+
+    def test_a_red_train_is_kept_through_its_search(self):
+        # 2026-11-12: a red train's search wrote batches of its own, so
+        # ahead.json held no trains when it ended, and the trains were
+        # cut afresh, with new pull requests in the middle of them.
+        m.configure(project(test_ahead={"batch": 2, "batches": 2,
+                                        "trains": "live",
+                                        "train_merge": True}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        red = {"results": {top["sha"]: {"tree": top["tree"], "ok": False}}}
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=1, check_state=red)
+        self.assertTrue(any(l.startswith("BATCH #5..#6: top red")
+                            for l in lines), lines)
+        kept = self.ahead_json()["kept_trains"]
+        self.assertEqual([e["pr"] for e in kept["entries"]], [5, 6])
+        # The search goes on: the trains are still kept.
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=2, check_state=red)
+        self.assertNotIn("trains", self.ahead_json())
+        self.assertEqual(self.ahead_json()["kept_trains"], kept)
+        # It ends (here, by hand), and a new pull request has come: the
+        # train is kept, and the new one goes behind it.
+        os.remove(os.path.join(self.state, m.SUSPECTS_FILE))
+        seven = self.other_pr(7)
+        seven["createdAt"] = "2026-10-07T09:00:00Z"
+        record, lines = self.tick(prs + [seven], conclusions=(None,),
+                                  live=True, minutes=3, check_state=red)
+        self.assertEqual(record["trains"], [[5, 6], [7]])
+        self.assertFalse(any(l.startswith("TRAIN-CUT 1") for l in lines),
+                         lines)
+
+    def test_trains_before(self):
+        trains = {"trains": True, "entries": []}
+        kept = {"trains": True, "entries": [{"pr": 5}]}
+        self.assertIs(m.trains_before(trains), trains)
+        searching = {"entries": [], "kept_trains": kept}
+        self.assertIs(m.trains_before(searching), kept)
+        self.assertEqual(m.trains_before({}), {})
+        self.assertIsNone(m.trains_before(None))
+        self.assertEqual(m.kept_trains("m", [{"pr": 5}, {"pr": 6}], [1, 1],
+                                       {"urgent_cut": [6]}), {
+            "trains": True, "base": "m", "entries": [{"pr": 5}, {"pr": 6}],
+            "batch": {"size": 1}, "later": [{"size": 1}],
+            "urgent_cut": [6]})
+
+    def test_suspect_wait(self):
+        entries = [{"pr": 5, "head": "a", "tree": "t5"},
+                   {"pr": 6, "head": "b", "tree": "t6"}]
+        last = {"trains": True, "entries": entries,
+                "batch": {"size": 2, "trees": ["t5", "t6"]}}
+        five = {"number": 5, "headRefOid": "a"}
+        red = {"results": {"x": {"tree": "t6", "ok": False}}}
+        wait = m.SUSPECT_WAIT_REASON % "#5..#6"
+        # The tick a train's top is red, before its search is saved.
+        self.assertEqual(m.suspect_wait(None, five, last, red), wait)
+        self.assertIsNone(m.suspect_wait(None, five, last, {}))
+        self.assertIsNone(m.suspect_wait(
+            None, dict(five, headRefOid="c"), last, red))
+        with mock.patch.object(m, "tree_base_red", return_value=["build"]):
+            self.assertIsNone(m.suspect_wait(None, five, last, red))
+        # While the search runs: a suspect at its head waits, unless the
+        # search found it green.
+        saved = {"suspects": [{"pr": 5, "head": "a"},
+                              {"pr": 6, "head": "b"}]}
+        searching = {"entries": entries, "batch": {
+            "size": 1, "trees": ["t5"], "suspects": True}}
+        self.assertEqual(m.suspect_wait(saved, five, searching, red), wait)
+        green = {"results": {"y": {"tree": "t5", "ok": True}}}
+        self.assertIsNone(m.suspect_wait(saved, five, searching, green))
+        self.assertEqual(m.suspect_wait(
+            saved, {"number": 6, "headRefOid": "b"}, searching, green), wait)
+        self.assertIsNone(m.suspect_wait(
+            saved, {"number": 7, "headRefOid": "b"}, searching, green))
+
+    def test_with_suspects(self):
+        five, six, layer = ({"number": n} for n in (5, 6, 9))
+        saved = {"suspects": [{"pr": 5}, {"pr": 9}, {"pr": 6}]}
+        # A layer held as stacked joins the search where it has it.
+        self.assertEqual(m.with_suspects([five, six], saved,
+                                         [five, six, layer]),
+                         [five, layer, six])
+        self.assertEqual(m.with_suspects([five, six], None, [layer]),
+                         [five, six])
+        self.assertEqual(m.with_suspects([], saved, [layer]), [])
+        # A layer gone (merged, closed) is left out.
+        self.assertEqual(m.with_suspects([five, six], saved, [five, six]),
+                         [five, six])
 
     def test_train_boarded(self):
         entries = [{"pr": 5, "head": "a", "tree": "t5"},

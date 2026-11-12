@@ -374,8 +374,9 @@ and `agent_forge/config.py`. Where it differs, and why:
   no dry train predicted on every merge. Its trains are predicted again
   on the new tip instead; a member that then conflicts leaves.
 * **A red train is searched as a red batch is** (designs/0035, second
-  amendment, and designs/0044 rule 4), and the trains are cut afresh
-  once the search ends.
+  amendment, and designs/0044 rule 4). The trains are kept through the
+  search and taken up again when it ends (seventh amendment of
+  2026-11-12; before it, they were cut afresh).
 * **`unstable_after_recuts` doesn't shrink trains.** Trains are cut
   again only for the causes above, each logged.
 * **`trains` needs `batch` above 1,** since a train of one is a
@@ -677,3 +678,58 @@ in as one merge of its tested top; the merge itself still needs only
 the top's green, as for any member. Each member's own merge on the
 usual path still waits for `checks.context` on the head it merges,
 which a batch's cover gives once its tree is the one predicted.
+
+## Amendment (2026-11-12, seventh): a red train keeps its suspects and its place
+
+**What happened.** On one project (`train_merge`, `trains: "live"`,
+batch 16, batches 2, `layers_need_own_green: false`) a train of 13 went
+red: two members clashed (a field one added, an initializer without it
+in the other), each green alone. Three things went wrong in the next
+ten minutes.
+
+1. The tick that found the top red updated its first member, a
+   suspect, as any member of a red train used to be updated. The new
+   head took it out of the search (`suspects_left`); the search then
+   found no suspect first in its predictions and ended without a word.
+2. ahead.json held the search's own batches, not trains, so the next
+   cut started afresh: bigger carriages first, two newer pull requests
+   went into the middle of the train, its tree was new, and the search
+   started again from nothing.
+3. A search predicts from the queue, and a stack's layers held as
+   stacked, members of the train once layers board without their own
+   green, aren't in it. They left the search the tick after it started;
+   the set it then tested was not the train, its whole tree had no
+   verdict, and the search said `red from none` and tested everything
+   again.
+
+**The rule.**
+
+* With `train_merge`, a member of a train whose top is red (not only
+  as the default branch is), and a suspect of a search at the head it
+  was suspected at, is not updated: `WAIT`, "a suspect of the red
+  train #a..#b; not updated while the search runs". The search's runs
+  test the trees predicted for those heads; a green prefix merges as
+  one train of its tested top, which needs no update. Only one the
+  search found green (in the batch it merges) may be updated: it merges
+  alone, or the train couldn't go in as one.
+* A suspect whose head is its suspected head brought up to date and
+  nothing else (`own_push`: an update by the Merger, or the author's own
+  clean merge of the default branch) stays a suspect at its new head,
+  which is predicted to the same tree.
+* The tick a train's top is found red keeps its trains in ahead.json
+  (`kept_trains`), carried on every tick of the search. When the search
+  ends, the next cut starts from them (`trains_before`) as from any
+  trains: the one found red leaves (`TRAIN-LEFT`), those merged are
+  gone, the rest keep their places and are predicted again, and newer
+  pull requests go into later trains.
+* A search's predictions include the suspects that aren't in the queue,
+  a stack's layers held as stacked, each where the search has it
+  (`with_suspects`), so the search tests the train it found red.
+
+**Evidence.** `tests/merger_sim.py`'s `red_stack_day`: a stack of three
+whose top layer clashes with another pull request in the same train.
+v0.4.185's Merger loses the layers from the search the tick after it
+starts, merges the base alone and breaks rule 1 (a member left a
+started train through nothing done to it); with this amendment the
+search finds the culprit with the layers in place and the train keeps
+its order.
