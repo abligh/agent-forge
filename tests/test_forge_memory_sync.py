@@ -354,6 +354,56 @@ class Sync(FleetCase):
         # And the next run, still conflicted, stops the same way.
         self.assertEqual(self.fleet.run("two")[0], 1)
 
+    def test_two_hosts_appending_to_a_topic_file_keep_both(self):
+        # agent-forge #157: three stops in three hours, each "keep both".
+        self.fleet.two_hosts()
+        for host in ("one", "two"):
+            path = self.fleet.memory(host) / "a.md"
+            path.write_text(path.read_text() + "from %s\n" % host)
+        self.assertEqual(self.fleet.run("one")[0], 0)
+        status, out, err = self.fleet.run("two")
+        self.assertEqual(status, 0, err)
+        self.assertEqual(out.strip(), "forge-memory-sync: pushed "
+                         "(union of a.md)")
+        self.assertEqual(self.fleet.remote_file("a.md"),
+                         "a\nfrom one\nfrom two\n")
+        self.assertEqual((self.fleet.memory("two") / "a.md").read_text(),
+                         "a\nfrom one\nfrom two\n")
+        # And the first host takes the merge as it is.
+        self.assertEqual(self.fleet.run("one")[0], 0)
+        self.assertEqual((self.fleet.memory("one") / "a.md").read_text(),
+                         "a\nfrom one\nfrom two\n")
+
+    def test_two_inserts_take_the_later_modified(self):
+        self.fleet.two_hosts()
+        front = "---\nname: a\nmodified: %s\n---\n\nfirst\nlast\n"
+        (self.fleet.memory("one") / "a.md").write_text(
+            front % "2026-11-01T00:00:00Z")
+        self.fleet.run("one")
+        self.fleet.run("two")
+        for host, when in (("one", "2026-11-02T10:00:00Z"),
+                           ("two", "2026-11-02T09:00:00Z")):
+            (self.fleet.memory(host) / "a.md").write_text(
+                (front % when).replace("first\n",
+                                       "first\nby %s\n" % host))
+        self.assertEqual(self.fleet.run("one")[0], 0)
+        status, out, err = self.fleet.run("two")
+        self.assertEqual(status, 0, err)
+        self.assertEqual(self.fleet.remote_file("a.md"),
+                         (front % "2026-11-02T10:00:00Z").replace(
+                             "first\n", "first\nby one\nby two\n"))
+
+    def test_a_line_changed_on_one_host_still_stops(self):
+        self.fleet.two_hosts()
+        (self.fleet.memory("one") / "a.md").write_text("a\nfrom one\n")
+        self.fleet.run("one")
+        (self.fleet.memory("two") / "a.md").write_text("A\nfrom two\n")
+        status, _, err = self.fleet.run("two")
+        self.assertEqual(status, 1)
+        self.assertIn("conflict with the other hosts in: a.md", err)
+        self.assertEqual((self.fleet.memory("two") / "a.md").read_text(),
+                         "A\nfrom two\n")
+
     def test_nothing_changed_commits_and_pushes_nothing(self):
         self.fleet.two_hosts()
         head, local = self.fleet.remote_head(), self.fleet.local_head("one")
