@@ -733,3 +733,33 @@ starts, merges the base alone and breaks rule 1 (a member left a
 started train through nothing done to it); with this amendment the
 search finds the culprit with the layers in place and the train keeps
 its order.
+
+## Amendment (2026-11-12, eighth): an old conflict's red doesn't keep a head off trains
+
+**What happened.** On one project (batch 16, batches 2, `trains_within:
+"clean"`) only one train was cut for an hour. Its first train had 15
+members, one place free, and four candidates behind it merged cleanly
+onto its top: three layers whose base had merged, and one that had
+conflicted with a pull request since merged. None boarded the free
+place, and no second train was cut. Nothing in the record said why.
+
+**The likely cause.** A head whose own build check is red doesn't
+board (`head_red`). forge-pr-check records a head that conflicts with
+the default branch's tip as red with no step run (`failed: ["merge"]`,
+`conflicts`), and that verdict stays on the head. When the default
+branch moves on so that it merges cleanly again (a layer restacked
+into shape by its base's merge, a conflict another merge undid), the
+red still kept it out of every train, until it reached the front of
+the queue, which the trains never let it do.
+
+**The rule.** A red that is only such a conflict doesn't count:
+whether the head merges now is the cut's own question (`predict_one`
+onto the train). A red from a step that ran still keeps it off. The
+record's `train_waits` says, for each candidate that didn't board, why:
+`its own head is red`, `no room in train k`, `touches a file train k
+touches`, `conflicts onto train k`, `git can't merge it onto train k`,
+`git can't list its files`, `a layer below it can't board`, or `every
+train is full`.
+
+The field's state wasn't read to confirm the first cause; `train_waits`
+will show it if it was another.

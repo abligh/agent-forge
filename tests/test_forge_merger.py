@@ -8694,6 +8694,49 @@ class Trains(RepoCase):
         entries, sizes, _ = self.cut([[six], [seven], [eight]])
         self.assertEqual(self.numbers(entries, sizes), [[6], [8]])
 
+    def test_a_red_only_for_an_old_conflict_boards(self):
+        # 2026-11-12: four heads the build check had found conflicting
+        # with an older tip of main merged cleanly onto the train's top,
+        # but their red kept them out of every train, and only one train
+        # was cut for an hour.
+        six = self.change(6, "x.txt", "x\n")
+        seven = self.change(7, "y.txt", "y\n")
+        conflicted = {"ok": False, "failed": ["merge"], "conflicts": ["a"],
+                      "base": "0" * 40}
+        broken = {"ok": False, "failed": ["test"], "base": "0" * 40}
+        check = {"results": {six["headRefOid"]: conflicted,
+                             seven["headRefOid"]: broken}}
+        self.assertFalse(m.head_red(check, six))
+        self.assertTrue(m.head_red(check, seven))
+        record, _ = self.tick([self.item(), six, seven], conclusions=(None,),
+                              live=True, check_state=check)
+        self.assertEqual(record["trains"], [[5, 6]])
+        self.assertEqual(record["train_waits"],
+                         {"7": "its own head is red"})
+
+    def test_why_each_left_out_waits(self):
+        self.configure(batch=3, batches=1)
+        six, seven = self.line(6, 1), self.line(7, 20)
+        clash = self.change(8, "shared.txt", "other\n")
+        nine = self.change(9, "z.txt", "z\n")
+        carriages = [[self.item()], [six], [clash], [seven], [nine]]
+        heads = {c[0]["number"]: c[0]["headRefOid"] for c in carriages}
+        note = {}
+        entries, sizes, _ = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), carriages, None, heads,
+            set(heads), note=note)
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6, 9]])
+        self.assertEqual(note["waits"], {
+            "7": "touches a file train 1 touches",
+            "8": "touches a file train 1 touches"})
+        self.configure(batch=3, batches=1, trains_within="clean")
+        entries, sizes, _ = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), carriages, None, heads,
+            set(heads), note=note)
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6, 7]])
+        self.assertEqual(note["waits"], {"8": "conflicts onto train 1",
+                                         "9": "every train is full"})
+
     def test_a_stack_is_one_carriage_and_never_split(self):
         six = self.change(6, "s.txt", "one\n")
         layer = self.change(9, "s2.txt", "two\n", start=six["headRefOid"])
@@ -9176,7 +9219,8 @@ class Trains(RepoCase):
             self.said(entries, sizes), heads, set(heads), red={8},
             note=note)
         self.assertEqual([c for c, _ in events][:1], ["urgent"])
-        self.assertEqual(note, {"urgent_cut": [8]})
+        self.assertEqual(note, {"urgent_cut": [8],
+                                "waits": {"8": "its own head is red"}})
         last = dict(self.said(got, sizes), urgent_cut=[8])
         again, sizes2, events = m.cut_trains(
             self.repo.path, self.repo.main_tip(),

@@ -571,7 +571,10 @@ contains them all, and its run took in every step their changes touch,
 so they are folded into the first batch and start merging at once,
 without waiting for the tops in front of it, whose runs are then spent;
 a red top in front of it is overruled, as a flake. A pull request whose
-own head is red doesn't board while the default branch is green. One that conflicts with the
+own head is red doesn't board while the default branch is green,
+unless it was red only for a conflict with an older tip (amendment of
+2026-11-12, eighth); the record's `train_waits` says why each that
+didn't board waits. One that conflicts with the
 default branch only where `merge.resolve` or its `union` would resolve
 it can't board as it stands, and train members stay ahead of it, so a
 live tick resolves the first such pull request ahead of its turn, and it
@@ -4786,6 +4789,9 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
         acting is None or c[0]["number"] != acting, not urgent(c[0]),
         -len(c)))
     behind = set()
+    # Why each carriage left out of the last train it was tried for
+    # waits, for the record (`note["waits"]`).
+    waits = {}
     while len(sizes) < trains:
         start, touched, kind = len(entries), set(), None
         for carriage in pool:
@@ -4800,16 +4806,21 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                     out_of |= {pr["number"]} | stacked_on(pr["number"],
                                                           bases)
             members = [pr for pr in members if pr["number"] not in out_of]
+            for n in out_of:
+                waits[n] = "its own head is red"
             if not members:
                 continue
             size = len(entries) - start
             if size and size + len(members) > AHEAD_BATCH:
+                waits[members[0]["number"]] = "no room in train %d" % (
+                    len(sizes) + 1)
                 continue
             changed = set()
             for pr in members:
                 got = changed_files(repo, main_tip, pr, files, run)
                 if got is None:
                     changed = None
+                    waits[members[0]["number"]] = "git can't list its files"
                     break
                 changed |= got
             # Urgent ones share a train whenever they merge cleanly in
@@ -4820,6 +4831,9 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             if changed is None or (size and TRAINS_WITHIN == "files"
                                    and not (kind and urgent(members[0]))
                                    and changed & touched):
+                if changed is not None:
+                    waits[members[0]["number"]] = \
+                        "touches a file train %d touches" % (len(sizes) + 1)
                 continue
             made, top, top_graph, failing = [], parent, graph, set()
             for pr in members:
@@ -4828,6 +4842,9 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                 entry, failed = predict_one(repo, top, pr, restacks, run,
                                             top_graph)
                 if entry is None:
+                    waits[pr["number"]] = "%s onto train %d" % (
+                        "conflicts" if failed == "conflict"
+                        else "git can't merge it", len(sizes) + 1)
                     # It stays behind with the layers on it; a layer
                     # beside it may still board.
                     failing |= {pr["number"]} | stacked_on(pr["number"],
@@ -4848,6 +4865,8 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                     and pr["number"] not in behind
                     and pr["number"] not in boarded]
             if left:
+                for n in left:
+                    waits.setdefault(n, "a layer below it can't board")
                 behind.update(left)
                 events.append(("left", "LEFT #%d: won't board with the "
                                "layers below it, which go without it%s" % (
@@ -4866,6 +4885,12 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             break
         sizes.append(len(entries) - start)
         cut.append(entries[start:])
+    if note is not None:
+        boarded = {e["pr"] for e in entries}
+        for n in by_number:
+            waits.setdefault(n, "every train is full")
+        note["waits"] = {str(n): why for n, why in sorted(waits.items())
+                         if n not in boarded and n in by_number}
     for train in cut:
         events.append(("cut", "CUT %d: %s" % (
             train[0]["train"] + 1, " ".join(
@@ -4917,12 +4942,19 @@ def head_red(check_state, pr):
     """Whether the build check's own run of `pr`'s head is red
     (designs/0047: it can't board a train): its verdict, not a batch's
     cover. Not while the default branch is red, when every head may be,
-    nor for an urgent one."""
+    nor for an urgent one. Nor when it was red only because it
+    conflicted with the default branch's tip of then (forge-pr-check's
+    `conflicted`: no step ran): whether it merges now is the cut's own
+    question, and that red stayed on the head after the default branch
+    moved on and it merged cleanly again, keeping it out of every train
+    (2026-11-12: four such heads, three of them layers whose base had
+    merged, and only one train was cut for an hour)."""
     if (check_state or {}).get("main_red", {}).get("issue") or urgent(pr):
         return False
     got = ((check_state or {}).get("results") or {}).get(pr["headRefOid"])
     return isinstance(got, dict) and got.get("ok") is False \
-        and not got.get("covered")
+        and not got.get("covered") and not got.get("conflicts") \
+        and got.get("failed") != ["merge"]
 
 
 def train_line(sizes, entries):
@@ -7352,6 +7384,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 if note.get("urgent_cut"):
                     said_ahead["urgent_cut"] = note["urgent_cut"]
                 record["trains"] = train_lists(entries, sizes)
+                if note.get("waits"):
+                    # Why each that didn't board waits (2026-11-12: four
+                    # waited an hour, and nothing said why).
+                    record["train_waits"] = note["waits"]
                 if events:
                     record["train_events"] = [c for c, _ in events]
                 for _, line in events:
