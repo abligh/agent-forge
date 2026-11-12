@@ -15,6 +15,7 @@ a run.
 
     forge-pr-check [--post] [--instance NAME] [--checkout DIR]
                    [--state-dir DIR] [--merger-dir DIR]
+    forge-pr-check --relabel-host OLD [--instance NAME] [--checkout DIR]
     forge-pr-check --worker SHA --pr N [--slot K] [--post]
                    [--ahead | --main [--warm]] [...]
 
@@ -66,6 +67,7 @@ for the memory limit and CPU weight, and, with
 | `--state-dir DIR` | `~/.local/state/agent-forge/<project>/pr-check` (`pr-check-<name>` for an instance) | Where the queue, the verdicts and the logs live. Passed on to workers and chained ticks. |
 | `--merger-dir DIR` | `~/.local/state/agent-forge/<project>/merger` | The Merger's state directory: its `next.json` names the pull request to check first and its `ahead.json` lists its predictions. Read with `checks.merger_first`, `merge.test_ahead`, `checks.merger_cpu_weight` or `checks.docker_slices`. |
 | `--instance NAME` | `$FORGE_PR_CHECK_INSTANCE`, else none | Run `checks.instances.NAME`, with its own context, steps, host and state directory. An unknown name is refused (`NO-INSTANCE`, exit 2). |
+| `--relabel-host OLD` | none | After moving the state to this host with the same toolchain: count every verdict recorded on host OLD as this host's, then exit (`RELABELLED: <n> verdict(s)`). A verdict otherwise counts only on the host that recorded it. |
 | `--checkout DIR` | `$FORGE_CRON_CHECKOUT` | The cron checkout, kept at the default branch. The steps and configuration come from it. With neither, `NO-REPO`, exit 2. |
 
 ## Environment
