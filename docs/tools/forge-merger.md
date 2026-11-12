@@ -287,7 +287,10 @@ goes on refusing for as long is `STALLED` too, quoting the refusal.
 With [`merge.queued_stall_minutes`](../config.md#mergequeued_stall_minutes),
 a head the build check still has queued stalls after that time
 instead. A batch member's wait is timed from when its batch's top
-started. With [`merge.stall_alert`](../config.md#mergestall_alert), a
+started, or a run of the top's tree at another commit did. A wait on
+checks stalls only after
+[`merge.stall_run_factor`](../config.md#mergestall_run_factor) times
+the build check's recent median run, when that is longer. With [`merge.stall_alert`](../config.md#mergestall_alert), a
 stall also opens an issue and messages agents through the relay
 (`STALL-ISSUE`, `STALL-TOLD`, `STALL-TO-OWNER`, `STALL-ENDED`).
 
@@ -363,7 +366,10 @@ Each tick ends with one line:
 there are no decisions), plus a `STALLED:` line when stalled. It
 appends one JSON record to `merger.jsonl`: the default branch's tip,
 `held` with reasons, the `queue`, the `decisions` (each with `pr`,
-`action`, `to`, `reason` and `result`), and, as settings apply,
+`action`, `to`, `reason` and `result`), `urgent` (every open pull
+request carrying `labels.urgent`, queued or held) and `elevated` (those
+urgent only as a red nightly's or default branch's fix), and, as
+settings apply,
 `yielded`, `overdue`, `right_of_way`, `stack`, `holds`, `fixed`,
 `later`, `trains` and `stalled`. Every live tick writes `next.json`
 (`{"at", "pr"}`, plus `action` with `test_ahead`), naming the pull
@@ -425,6 +431,9 @@ keeps, `~/cron-logs/forge-merger.log` by default.
   Merger would make.
 * [forge-cron-run](forge-cron-run.md) and
   [forge-receiver](forge-receiver.md), which run it.
+* [merger-sim.md](../merger-sim.md), the simulation that runs it
+  tick after tick against real git and a model of GitHub and the
+  build check, and the rules it holds it to.
 * [designs/0001](../designs/0001-fewer-wasted-rounds-in-the-merge-queue.md),
   [designs/0026](../designs/0026-merger-settings-for-a-stricter-project.md)
   and [designs/0044](../designs/0044-a-quieter-merger-and-batches-that-keep-their-order.md).

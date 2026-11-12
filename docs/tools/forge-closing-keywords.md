@@ -169,7 +169,7 @@ exactly like a clean branch.
 | 0 | Nothing closes that isn't declared, and nothing closes from a denial. |
 | 1 | Something does. |
 | 2 | The question could not be asked: no configuration, an unreadable range or file, a pull request whose commits, declaration, title or body could not be fetched, a number that could not be looked up, a range that isn't that pull request's branch, an empty range, a `--below` pull request that hasn't merged, `--include-subject` on a branch whose open pull request wasn't named, or a usage error. |
-| 3 | Every refused issue is declared in the body, and only `closingIssuesReferences` has yet to list it. A refusal for now: run it again in a few minutes. |
+| 3 | A refusal for now: run it again in a few minutes. Either every refused issue is declared in the body and only `closingIssuesReferences` has yet to list it, or GitHub failed to answer a read that would otherwise be exit 2 (unreachable, a 5xx, or a rate limit). |
 
 ## See also
 

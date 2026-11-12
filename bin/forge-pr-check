@@ -99,6 +99,25 @@ to it. Its run is stopped as a superseded head's is, logged
 `STOPPED-SPENT`, and its slot is freed. Nothing is stopped while
 `ahead.json` is stale, unreadable or empty.
 
+With it too, once the Merger has folded the trains in front of a later
+train's green top into its batch (amendment of 2026-11-11), a run of a
+prediction inside that batch, such as an earlier train's top, is
+stopped, logged `STOPPED-FOLDED`: the green top covers its tree.
+
+**With `stop_spent`, the Merger's batch top never waits for a slot**
+(amendment of 2026-11-11). When every slot is busy and the top of the
+Merger's batch (designs/0032; a red batch's suspects included) waits
+unstarted with no verdict, the ordinary pull request's head started
+last is stopped for it: not a prediction, not the default branch's
+run, not a head of the Merger's own pull request, nor one put first on
+purpose. It is logged `PREEMPTED`, keeps its place in the queue (its
+`since`) and starts again later; the freed slot goes to the top, before
+an overdue head or one put first. One at a time: no other run is
+stopped for it for PREEMPT_HOLD, while the top waits to start. Every
+merge waits on that top's verdict, and a culprit hunt's steps
+otherwise waited behind ordinary runs for a slot each (an hour's
+merges lost on one red batch).
+
 **With `merge.test_ahead.retry_red`, a prediction's red steps run once
 more** (designs/0035, amendment of 2026-11-10). In the same slot, on
 the same tree, only the steps that were red, except one stopped by
@@ -244,6 +263,19 @@ that has waited `max_wait_minutes`.
 When a head of the Merger's own pull request is held for its batch's
 top (below), that top goes first instead, before every other waiting
 head: its run is the one the next merge waits on.
+
+With `merge.test_ahead.train_slots` n (amendment of 2026-11-12, default
+0), n of the slots are the predictions' alone: the heads' own runs and
+the default branch's (its warm-ups too) start only while fewer than
+slots - n of them are running, and a prediction running in any slot
+counts against the n. Only as many are kept as there are predictions
+running or waiting to start (`next_ahead` would start them now; second
+amendment of 2026-11-12): with one train, its top running, nothing
+else is kept. Once the heads have their share, a free slot
+takes the next prediction even while the Merger's own head waits (it
+couldn't have the slot), or stays free, logged `RESERVED: k free slots
+kept for the Merger's predictions ...`. A prediction may still take any
+free slot, and nothing running is stopped for it.
 
 Nothing after an entry whose tree is red here is started: every later
 prediction contains that pull request, so it would only be red too.
@@ -616,8 +648,10 @@ minting its token with `forge-app-token`.
 
 **`--post` writes the status** as that App, which needs *Commit
 statuses: write*: `pending` when a head is queued (`queued at HH:MMZ
-for a check slot; N other heads waiting`, the count as it was then) and
-again when the steps start, then `success`, or `failure` naming the
+for a check slot; N other heads waiting`, the count as it was then),
+again when it is held for a prediction (`held for the Merger's batch
+#A..#B: its top <sha> is checked for it`, posted only when that reason
+changes, agent-forge #285) and when the steps start, then `success`, or `failure` naming the
 first failed step. A head refused or given up on
 gets `error`, saying why, since the Merger would otherwise wait on it
 for a status that never comes. The Merger counts only statuses that App
@@ -689,6 +723,7 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from agent_forge import (config, github, locks, nightly, quiet,  # noqa: E402
                          trace)
+from agent_forge.checkout import store as git_store  # noqa: E402
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 
@@ -904,6 +939,11 @@ MAIN_RED_FIXES = frozenset()
 APPROVED_FIRST = False
 REVIEWER_LOGINS = frozenset()
 APPROVED_PRS = frozenset()
+# labels.armed: a label a reviewer agent puts on a pull request it has
+# reviewed and will approve once its check is green (an approval
+# "armed"); with checks.approved_first it counts as approved, so the
+# review isn't left waiting behind unreviewed heads. None: off.
+ARMED_LABEL = None
 # How long a pull request's approval answer is kept in approved.json
 # before it is asked again, and the most pull requests asked in a tick.
 APPROVED_FRESH = datetime.timedelta(minutes=5)
@@ -931,9 +971,20 @@ TEST_AHEAD = False
 # merge.test_ahead.spare_slots_only (designs/0014): predictions only when
 # no ordinary head is waiting.
 SPARE_ONLY = False
+# merge.test_ahead.train_slots (amendment of 2026-11-12): how many slots
+# only the Merger's predictions may use; the pull requests' own heads
+# and the default branch's runs share the rest.
+TRAIN_SLOTS = 0
+# merge.test_ahead.later_first (designs/0035, amendment of 2026-11-11):
+# how many later batches' tops go before an ordinary head.
+LATER_FIRST = 0
 # merge.test_ahead.stop_spent (designs/0014, amendment of 2026-11-10): a
 # running prediction whose tree the Merger no longer predicts is stopped.
 STOP_SPENT = False
+# How long one run stopped for the Merger's batch top holds off another
+# (stop_spent, amendment of 2026-11-11): the stopped run's slot frees in
+# seconds, and the tick its worker chains starts the top in it.
+PREEMPT_HOLD = datetime.timedelta(minutes=5)
 # merge.test_ahead.retry_red (designs/0035, amendment of 2026-11-10): a
 # prediction's red steps are run once more on the same tree before the
 # red stands.
@@ -1066,7 +1117,7 @@ def configure(project, instance=None):
     global MERGER_CPU_WEIGHT, DOCKER_SLICES, CPU_QUOTA
     global STEP_CACHES, ENV_FILES
     global FLAKE_ISSUE
-    global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
+    global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, LATER_FIRST, TRAIN_SLOTS, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT, WARM_PATHS, WARM_EVERY
     global RESULTS_MAX
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
@@ -1079,6 +1130,7 @@ def configure(project, instance=None):
     global CACHE_FAULT_TEXT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
     global PULL_REQUESTS, HOST_LOCK, APPROVED_FIRST, REVIEWER_LOGINS
+    global ARMED_LABEL
     global SCOPED, SCOPED_S
     INSTANCE = instance
     if instance is None:
@@ -1152,6 +1204,7 @@ def configure(project, instance=None):
     REVIEWER_LOGINS = frozenset(project.bot_login(name).lower()
                                 for name in project.reviewers())
     URGENT_LABEL = project.section("labels").get("urgent")
+    ARMED_LABEL = project.section("labels").get("armed")
     # Every instance acts on it, for its own red; one leaves the label
     # on while another context of the project is red on the head, so
     # that instance runs its red again too (OTHER_CONTEXTS).
@@ -1211,6 +1264,8 @@ def configure(project, instance=None):
     TEST_AHEAD = ahead is not None
     SPARE_ONLY = bool((ahead or {}).get("spare_slots_only"))
     STOP_SPENT = (ahead or {}).get("stop_spent") is True
+    LATER_FIRST = (ahead or {}).get("later_first", 0)
+    TRAIN_SLOTS = (ahead or {}).get("train_slots", 0)
     RETRY_RED = (ahead or {}).get("retry_red") is True
     FLAKE_ISSUE = None
     if instance is None and isinstance(checks.get("flake_issue"), dict):
@@ -1486,6 +1541,14 @@ def holder_fields(line):
             "ahead" in parts[3:] or "main" in parts[3:])
 
 
+def is_prediction(got):
+    """Whether a slot's run (`holder_fields`) is one of the Merger's
+    predictions, which merge.test_ahead.train_slots's slots are for: a
+    pull request's own head, the default branch's run (pr 0, which
+    `ahead` also marks) and a run its lock line doesn't name aren't."""
+    return bool(got and got[4] and got[0])
+
+
 def stop_worker(pid):
     """SIGTERM to worker pid's process group, which it leads when it was
     started by a tick, else to pid alone; the worker then ends its
@@ -1632,6 +1695,13 @@ def approved_prs(state_dir, state, heads, token, when, run=sh):
         pass
     return frozenset(int(k) for k, v in known.items()
                      if isinstance(v, dict) and v.get("approved"))
+
+
+def armed_prs(heads):
+    """labels.armed: the pull requests among `heads` (`open_heads`'
+    tuples) that carry it, for checks.approved_first."""
+    return frozenset(head[0] for head in heads
+                     if ARMED_LABEL in (head[5] if len(head) > 5 else ()))
 
 
 def open_heads(token, run=sh, why=None):
@@ -2521,8 +2591,8 @@ def merger_ahead(merger_dir, when, repo=None):
             said = json.load(handle)
         if when - parse(said["at"]) > MERGER_FRESH:
             return []
-        if repo is not None and os.path.realpath(said["repo"]) \
-                != os.path.realpath(repo):
+        if repo is not None and git_store(said["repo"]) \
+                != git_store(repo):
             return []
         return [e for e in said["entries"]
                 if isinstance(e.get("pr"), int)
@@ -2557,6 +2627,22 @@ def merger_batch(merger_dir, when, repo=None):
             or [e["tree"] for e in entries[:size]] != trees:
         return []
     return entries[:size]
+
+
+def later_tops(merger_dir, when, repo, pick):
+    """The later batches' tops this start may choose from: all of them
+    when no ordinary head waits (`pick` is None), else the first
+    `merge.test_ahead.later_first` (designs/0035, amendment of
+    2026-11-11). On a host whose slots are always full, a later top
+    otherwise never runs: each batch waits for the one before it to
+    merge before its own top starts, and the merge rate is one batch
+    per run. Seen on 2026-11-11: seven slots full of ordinary heads, a
+    batch of six whose top waited six minutes for a slot and ran
+    twenty, and about five merges an hour."""
+    if pick is not None and not LATER_FIRST:
+        return ()
+    tops = merger_later(merger_dir, when, repo)
+    return tops if pick is None else tops[:LATER_FIRST]
 
 
 def merger_later(merger_dir, when, repo=None):
@@ -2623,6 +2709,76 @@ def merger_spent(merger_dir, when, running, repo=None, run=sh):
     return spent
 
 
+def preempt_victim(state, fields, first_pr):
+    """(slot, holder fields) of the run to stop for the Merger's batch
+    top, or None: of the ordinary pull requests' heads running, the one
+    started last. Never a prediction, the default branch's run, the fast
+    lane's, a head of the Merger's own pull request (`first_pr`), one put
+    first on purpose, or one this host's queue doesn't list."""
+    best = None
+    for slot, got in fields.items():
+        if slot == LANE or not got or got[4] or not got[0] or not got[3]:
+            continue
+        entry = state["waiting"].get(got[1])
+        if got[0] == first_pr or entry is None or put_first(entry):
+            continue
+        try:
+            since = parse(got[2])
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if best is None or since > best[0]:
+            best = (since, slot, got)
+    return best[1:] if best else None
+
+
+def preempt_front(state_dir, fields, batch, busy, when, checkout, run,
+                  merger_dir, stop, out):
+    """stop_spent, amendment of 2026-11-11: with every slot busy, stop
+    the last-started ordinary run for the Merger's batch top, if it
+    waits unstarted with no verdict (see the module docstring). Forgets
+    a preemption once its top has started or isn't the top any more."""
+    top = batch[-1] if batch else None
+    trees = busy_trees(busy, checkout, run) if top else frozenset()
+    with state_lock(state_dir):
+        state = load(state_dir)
+        pre = state.get("preempting")
+        if pre is not None and pre.get("victim") not in busy and (
+                top is None or pre.get("for") != top["sha"]
+                or pre.get("for") in state.get("ahead_started", {})):
+            del state["preempting"]
+            save(state_dir, state)
+            pre = None
+        if top is None:
+            return
+        if pre is not None and pre.get("for") == top["sha"]:
+            try:
+                if when - parse(pre["at"]) < PREEMPT_HOLD:
+                    return
+            except (KeyError, TypeError, ValueError):
+                pass
+        if next_ahead(state, [], busy, when, trees, batch) is None:
+            return
+        victim = preempt_victim(state, fields, merger_first(merger_dir, when))
+        if victim is None:
+            return
+        slot, (pr, sha, since, pid, _) = victim
+        state["preempting"] = {"for": top["sha"], "victim": sha,
+                               "at": iso(when)}
+        save(state_dir, state)
+    sent = stop(pid)
+    if not sent:
+        with state_lock(state_dir):
+            state = load(state_dir)
+            if (state.get("preempting") or {}).get("victim") == sha:
+                del state["preempting"]
+                save(state_dir, state)
+    log(state_dir, "PREEMPTED #%d %s: the Merger's batch top %s waits for a "
+        "slot; %s the run in %s (pid %d), since %s"
+        % (pr, sha[:10], top["sha"][:10],
+           "stopping" if sent else "could not stop", slot_label(slot), pid,
+           since), when, out)
+
+
 def is_front(merger_dir, when, sha, pr, ahead=False, repo=None):
     """designs/0031: whether sha's run is one the next merge waits on,
     as the Merger's files say at `when`: with `ahead`, the first of its
@@ -2679,6 +2835,25 @@ def verdict_age(record, when):
         return None
 
 
+def foreign(record, when):
+    """Whether a verdict `tested` would never trust: from another host
+    or step list, or older than MATCH_MAX_AGE (or after `when`). A
+    record that doesn't say is not foreign. next_ahead runs a
+    prediction again rather than skipping it for such a verdict: a
+    batch's heads wait for its top while the top has no verdict that
+    counts (batch_heads), so skipping it left both waiting for ever
+    (agent-forge #197, after a host move)."""
+    host = record.get("host")
+    steps = record.get("steps")
+    if host is not None and host != socket.gethostname():
+        return True
+    if steps is not None and steps != steps_digest():
+        return True
+    age = verdict_age(record, when)
+    return age is not None and not (
+        datetime.timedelta(0) <= age <= MATCH_MAX_AGE)
+
+
 def tested(state, tree, when, ok=None, accept=None):
     """The sha of the newest verdict on `tree` from this host and step
     list, green only when `ok`, and only one `accept(record)` takes when
@@ -2708,7 +2883,8 @@ def next_ahead(state, ahead, busy=(), when=None, busy_trees=(), batch=(),
     less than START_GRACE before `when`, not given up on, not the head's
     own tree, not a tree a slot is checking now (`busy_trees`: two
     predictions can differ only in their parents), and with no verdict
-    of its own or on its tree. Nothing
+    of its own or on its tree (a verdict `foreign` says no check here
+    would trust doesn't count). Nothing
     after an entry whose tree is red here (and not green too, as after a
     flake): each later prediction contains it, so it would be red too,
     and the Merger drops that pull request from the list on its next
@@ -2730,12 +2906,28 @@ def next_ahead(state, ahead, busy=(), when=None, busy_trees=(), batch=(),
         if (own or sha in busy
                 or entry["tree"] in busy_trees
                 or sha in state["results"]
+                and not foreign(state["results"][sha], when)
                 or just_started({"started": started.get(sha)}, when)
                 or state.get("ahead_errors", {}).get(sha, 0) >= MAX_ERRORS
                 or tested(state, entry["tree"], when) is not None):
             continue
         return sha, entry["pr"]
     return None
+
+
+def waiting_predictions(state, ahead, busy=(), when=None, batch=(),
+                        later=()):
+    """How many of the Merger's predictions `next_ahead` would start
+    one after another now, `busy` running: what
+    merge.test_ahead.train_slots keeps slots for, with the ones
+    running."""
+    taken, count = set(busy), 0
+    while True:
+        got = next_ahead(state, ahead, taken, when, (), batch, later)
+        if got is None or got[0] in taken:
+            return count
+        taken.add(got[0])
+        count += 1
 
 
 def forget_ahead(state, ahead):
@@ -3653,9 +3845,10 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
                   "fast lane" if slot == LANE else "slot %d" % slot,
                   " ahead" if ahead else " warm" if warm else ""))
     wlog.flush()
-    # The installation lock forge-cron-run handed this tick goes on to
-    # the worker, which outlives it: the release can't move under a run.
-    held = locks.inherited_install_lock()
+    # The installation's and the generation's locks forge-cron-run
+    # handed this tick go on to the worker, which outlives it: neither
+    # the release nor the checkout it runs from goes under a run.
+    held = locks.inherited_fds()
     subprocess.Popen(
         [sys.executable, os.path.realpath(__file__), "--worker", sha,
          "--pr", str(pr), "--state-dir", state_dir, "--slot", str(slot)]
@@ -3668,7 +3861,7 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
         + (["--instance", INSTANCE] if INSTANCE is not None else []),
         cwd=state_dir, stdin=subprocess.DEVNULL, stdout=wlog,
         stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
-        pass_fds=() if held is None else (held,))
+        pass_fds=held)
     wlog.close()
 
 
@@ -3731,6 +3924,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     global APPROVED_PRS
     APPROVED_PRS = approved_prs(state_dir, seen, heads, token, when, run) \
         if APPROVED_FIRST else frozenset()
+    if APPROVED_FIRST and ARMED_LABEL:
+        APPROVED_PRS = APPROVED_PRS | armed_prs(heads)
     todo = []
     with state_lock(state_dir):
         state = load(state_dir)
@@ -3770,10 +3965,20 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         if TEST_AHEAD and merger_dir else set()
     spent = merger_spent(merger_dir, when, {
         got[1]: checkout for got in fields.values()
-        if got and got[4] and got[3]}, checkout, run) \
+        if got and got[4] and got[0] and got[3]}, checkout, run) \
         if TEST_AHEAD and STOP_SPENT and merger_dir else set()
     batch = merger_batch(merger_dir, when, checkout) \
         if TEST_AHEAD and merger_dir else []
+    # A later train's green top folded the trains in front of it into the
+    # Merger's batch (amendment of 2026-11-11): a member's prediction
+    # still running is spent, since the green top covers its tree.
+    if STOP_SPENT and len(batch) > 1 and tested(
+            state, batch[-1]["tree"], when, ok=True) is not None:
+        inner = {e["sha"] for e in batch[:-1]}
+        folded = {got[1] for got in fields.values()
+                  if got and got[4] and got[0] and got[1] in inner}
+    else:
+        folded = set()
     # A head a slot is running that its batch's green top now covers:
     # the Merger updated it to its predicted tree, and a free slot took
     # it before the cover could. Its run is stopped and it is matched.
@@ -3785,6 +3990,14 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         covering = {got[0]: got for got in settled_heads(
             unstarted, checkout, (), when, run, state_dir, batch)
             if got[4] and got[0] in busy}
+    # Whether this tick stopped a run already: its slot frees by itself.
+    stopped_now = []
+
+    def stop(pid, _stop=stop):
+        sent = _stop(pid)
+        stopped_now.append(sent)
+        return sent
+
     for slot, holder in holders.items():
         if holder is None:
             continue
@@ -3816,7 +4029,18 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 "%s" % (pr, sha[:10], "stopping" if sent else
                         "could not stop", slot_label(slot), pid, since),
                 when, out)
-        elif got and got[4] and got[1] in spent and got[3]:
+        elif got and got[4] and got[1] in folded and got[3]:
+            pr, sha, since, pid, _ = got
+            sent = stop(pid)
+            log(state_dir, "STOPPED-FOLDED #%d %s: the Merger's batch top %s "
+                "is green and covers its tree; %s the run in %s (pid %d), "
+                "since %s" % (pr, sha[:10], batch[-1]["sha"][:10],
+                              "stopping" if sent else "could not stop",
+                              slot_label(slot), pid, since), when, out)
+        elif got and got[4] and got[0] and got[1] in spent and got[3]:
+            # got[0] is 0 for the default branch's run, which `ahead`
+            # also marks (holder_fields): it is never a prediction, so
+            # it is never spent (agent-forge #294).
             pr, sha, since, pid, _ = got
             sent = stop(pid)
             log(state_dir, "STOPPED-SPENT #%d %s: the Merger no longer "
@@ -3842,6 +4066,11 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     free = [slot for slot, holder in holders.items()
             if holder is None and slot != LANE]
     lane_free = lane and holders[LANE] is None
+    if TEST_AHEAD and STOP_SPENT and merger_dir and not free \
+            and not any(stopped_now) \
+            and not (QUIET_DIR and quiet.live(QUIET_DIR, when)):
+        preempt_front(state_dir, fields, batch, busy, when, checkout, run,
+                      merger_dir, stop, out)
     if not free and not lane_free:
         return 0
     holds = quiet.live(QUIET_DIR, when) if QUIET_DIR else []
@@ -3863,6 +4092,18 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     # before them.
     blocked = merger_blocked(merger_dir, when) if APPROVED_FIRST else set()
     predicted_prs = {e["pr"] for e in ahead} if APPROVED_FIRST else set()
+    # merge.test_ahead.train_slots (amendment of 2026-11-12): only the
+    # Merger's predictions may run in the reserved slots, so the heads'
+    # own runs and the default branch's fill at most the rest. Only as
+    # many are kept as there are predictions running or waiting to
+    # start (second amendment of 2026-11-12): a slot kept for a train
+    # that doesn't exist sat idle. Nothing running is stopped for it.
+    reserve = min(TRAIN_SLOTS, slots - 1) if TEST_AHEAD and merger_dir \
+        else 0
+    later_all = merger_later(merger_dir, when, checkout) if reserve else []
+    own_running = sum(1 for slot, holder in holders.items()
+                      if slot != LANE and holder is not None
+                      and not is_prediction(fields[slot]))
     # Fill every free slot, not one per tick: a tick's start rate was the
     # queue's ceiling (see the module docstring). What a pass starts is
     # as good as running to the next pass; the listing above isn't redone.
@@ -3878,7 +4119,12 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             twins = twin_heads(state, fields.values(), checkout, run) \
                 if TEST_AHEAD else {}
             # And one in the Merger's batch waits for its top (designs/0032).
-            twins.update(batch_heads(state, batch, checkout, busy, when, run))
+            batched = batch_heads(state, batch, checkout, busy, when, run)
+            twins.update(batched)
+            if first_pass:
+                say_held = held_said(state, twins, batched, batch, when)
+                if say_held:
+                    save(state_dir, state)
             if fresh:
                 held = held_heads(state, head_of_main[0], busy, when, first_pr,
                                   cheap)
@@ -3911,12 +4157,19 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 state["waiting"].get(s, {}).get("pr") == first_pr
                 and not state["waiting"].get(s, {}).get("main")
                 for s in twins)
-            if free:
+            kept = min(reserve, sum(
+                1 for slot, got in fields.items()
+                if slot != LANE and is_prediction(got))
+                + waiting_predictions(state, ahead, taken, when, batch,
+                                      later_all)) if reserve else 0
+            own_full = own_running >= slots - kept
+            if free and not own_full:
                 pick = next_head(state, taken | set(held), first_pr, when,
                                  cheap, urgent, blocked, predicted_prs) \
                     if fresh else next_head(state, taken, first_pr, when,
                                             cheap, blocked=blocked,
                                             queued=predicted_prs)
+            if free:
                 if TEST_AHEAD:
                     forget_ahead(state, ahead)
                     # The Merger's predictions go before an ordinary pick,
@@ -3931,7 +4184,15 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                     # own verdict, and a pick put before it would otherwise
                     # let predictions starve both. With spare_slots_only
                     # (designs/0014), never before an ordinary pick.
-                    if front_held or not merger_head_waits(
+                    # A run was stopped for the batch's top: its slot
+                    # is the top's, before an overdue head or one put
+                    # first. And a slot only predictions may use
+                    # (train_slots) is a prediction's: no head can
+                    # have it, the Merger's own included.
+                    preferring = bool(batch) and (state.get(
+                        "preempting") or {}).get("for") == batch[-1]["sha"]
+                    if front_held or preferring or own_full \
+                            or not merger_head_waits(
                             state, first_pr, taken, when) and (
                             pick is None or not SPARE_ONLY and not (
                             pick[1] == first_pr
@@ -3946,8 +4207,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                         predicted = next_ahead(
                             state, ahead, taken, when,
                             busy_trees(taken - set(twins), checkout, run), batch,
-                            merger_later(merger_dir, when, checkout)
-                            if pick is None else ())
+                            later_tops(merger_dir, when, checkout, pick))
                 if predicted is not None:
                     state.setdefault("ahead_started", {})[predicted[0]] = \
                         iso(when)
@@ -3959,6 +4219,9 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                     save(state_dir, state)
             starting = sum(1 for s, w in state["waiting"].items()
                            if s not in taken and just_started(w, when))
+        if first_pass and post is not None:
+            for sha, text in say_held:
+                post(sha, "pending", text)
         if first_pass:
             for sha in sorted(held, key=lambda s: order(state["waiting"], s)):
                 out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
@@ -3987,9 +4250,16 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             fields[free.pop(0)] = (pr, sha, iso(when), None, True)
             continue
         if pick is None:
+            if own_full and fast is None and live_heads(state, taken, when):
+                out("RESERVED: %d free slot%s kept for the Merger's "
+                    "predictions (%d of merge.test_ahead.train_slots %d "
+                    "kept, for the predictions running or waiting); %d "
+                    "waiting" % (len(free), "" if len(free) == 1 else "s",
+                                 kept, TRAIN_SLOTS, len(queued - taken)))
+                return 0
             warming = warm_slot(state, free, head_of_main, checkout, when, run) \
-                if fast is None and not starting and not live_heads(
-                    state, taken, when) else None
+                if fast is None and not starting and not own_full \
+                and not live_heads(state, taken, when) else None
             if warming is not None:
                 slot, cached, changed = warming
                 with state_lock(state_dir):
@@ -4027,6 +4297,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                    len(queued - taken) - 1))
             busy.add(sha)
             free.pop(0)
+            own_running += 1
             continue
         if checkout:
             spawn(state_dir, sha, pr, post is not None, free[0], checkout)
@@ -4043,6 +4314,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                if overdue(state["waiting"].get(sha, {}), when) else ""))
         busy.add(sha)
         free.pop(0)
+        own_running += 1
     return 0
 
 
@@ -5589,6 +5861,40 @@ def batch_heads(state, batch, checkout, busy=(), when=None, run=sh):
             and tree_of(checkout, sha, run) in trees}
 
 
+def held_said(state, twins, batched, batch, when):
+    """[(sha, description)] of the pending statuses to post for heads
+    held for a prediction (`twins`, `batched` those held for the
+    Merger's batch) whose held reason changed since it was last posted
+    (agent-forge #285). Without it a held head kept "queued for a check
+    slot" while later heads ran, and was taken for lost. Each head's
+    last text is kept in its entry as `held_said`, and dropped once it
+    is no longer held, so a hold that comes back is said again. Only the
+    wording: nothing here changes what runs."""
+    out = []
+    top = batch[-1] if batch else None
+    since = state.get("ahead_started", {}).get(top["sha"]) if top else None
+    for sha, entry in state["waiting"].items():
+        if sha not in twins:
+            entry.pop("held_said", None)
+            continue
+        if sha in batched and top is not None:
+            text = "held for the Merger's batch %s: its top %s is checked " \
+                "for it" % (batch_span(batch), top["sha"][:10])
+            if since:
+                try:
+                    text += ", running since %s" % parse(since).strftime(
+                        "%H:%MZ")
+                except (TypeError, ValueError):
+                    pass
+        else:
+            text = "held: its tree is being checked now as the Merger's " \
+                "prediction; matched to its verdict"
+        if entry.get("held_said") != text:
+            entry["held_said"] = text
+            out.append((sha, text))
+    return out
+
+
 def batch_span(batch):
     return "#%d..#%d" % (batch[0]["pr"], batch[-1]["pr"])
 
@@ -6892,11 +7198,20 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     except Stopped:
         with state_lock(state_dir):
             state = load(state_dir)
-            state["waiting"].pop(sha, None)
+            # Stopped for the Merger's batch top (stop_spent): it keeps
+            # its place and starts again later.
+            kept = (state.get("preempting") or {}).get("victim") == sha \
+                and sha in state["waiting"]
+            if kept:
+                state["waiting"][sha].pop("started", None)
+            else:
+                state["waiting"].pop(sha, None)
             save(state_dir, state)
         stopped = clock()
-        log(state_dir, "STOPPED %s %s after %ds: superseded; no verdict"
-            % (name, sha[:10], (stopped - started).total_seconds()),
+        log(state_dir, "STOPPED %s %s after %ds: %s"
+            % (name, sha[:10], (stopped - started).total_seconds(),
+               "preempted for the Merger's batch top; back in the queue"
+               if kept else "superseded; no verdict"),
             stopped, out)
         settled = True
         return 3

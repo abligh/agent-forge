@@ -46,6 +46,54 @@ class Check(unittest.TestCase):
                 data[key] = value
         return config.check(data)
 
+    def test_test_ahead_later_first_is_not_negative(self):
+        data = example()
+        data.setdefault("merge", {})["test_ahead"] = {"later_first": 1}
+        self.assertEqual(config.check(data), [])
+        data["merge"]["test_ahead"] = {"later_first": -1}
+        self.assertEqual(len(config.check(data)), 1)
+
+    def test_test_ahead_train_slots_leaves_a_slot_for_the_heads(self):
+        data = example()
+        data["checks"]["slots"] = 4
+        for n in (0, 1, 3):
+            data.setdefault("merge", {})["test_ahead"] = {"train_slots": n}
+            self.assertEqual(config.check(data), [], n)
+        for bad in (-1, 4, 5):
+            data["merge"]["test_ahead"] = {"train_slots": bad}
+            self.assertEqual(config.check(data), [
+                "merge.test_ahead.train_slots must be at least 0 and less "
+                "than checks.slots (4)"], bad)
+        data["merge"]["test_ahead"] = {"train_slots": "1"}
+        self.assertEqual(len(config.check(data)), 1)
+        # checks.slots defaults to 2.
+        del data["checks"]["slots"]
+        data["merge"]["test_ahead"] = {"train_slots": 2}
+        self.assertEqual(len(config.check(data)), 1)
+
+    def test_test_ahead_layers_need_own_green_false_needs_stacks(self):
+        data = example()
+        data.setdefault("merge", {})["test_ahead"] = {
+            "layers_need_own_green": False}
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.layers_need_own_green false needs stacks: "
+            "only a stack's layers board with their base"])
+        data["merge"]["test_ahead"]["layers_need_own_green"] = True
+        self.assertEqual(config.check(data), [])
+
+    def test_test_ahead_own_green_to_board(self):
+        data = example()
+        data.setdefault("merge", {})["test_ahead"] = {
+            "batch": 2, "trains": "live", "own_green_to_board": False}
+        self.assertEqual(config.check(data), [])
+        data["merge"]["test_ahead"]["trains"] = "off"
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.own_green_to_board false needs trains "
+            "\"live\": only a cut train is boarded"])
+        data["merge"]["test_ahead"]["own_green_to_board"] = "no"
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.own_green_to_board must be true or false"])
+
     def test_test_ahead_spare_slots_only_is_a_boolean(self):
         data = example()
         data.setdefault("merge", {})["test_ahead"] = {"spare_slots_only": True}
@@ -557,6 +605,14 @@ class Check(unittest.TestCase):
             "merge.queued_stall_minutes must be at least 1",
             "merge.read_as 'Nobody' is not an agent or machinery"])
 
+    def test_merge_stall_run_factor(self):
+        self.assertEqual(self.problems(merge={"stall_run_factor": 1.5}), [])
+        self.assertEqual(self.problems(merge={"stall_run_factor": 0}), [])
+        self.assertEqual(self.problems(merge={"stall_run_factor": -1}),
+                         ["merge.stall_run_factor must be 0 or more"])
+        self.assertEqual(len(self.problems(merge={
+            "stall_run_factor": "x"})), 1)
+
     def test_merge_resolve_union_of_design_0046(self):
         self.assertEqual(self.problems(merge={"resolve": {
             "union": ["CHANGELOG.md", "docs/*.md"],
@@ -758,6 +814,14 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"yield_cap": 2}),
                          ["merge.yield_cap needs "
                           "merge.yield_after_hand_back"])
+
+    def test_merge_resolve_slots(self):
+        self.assertEqual(self.problems(merge={"resolve_slots": 0}), [])
+        self.assertEqual(self.problems(merge={"resolve_slots": 3}), [])
+        self.assertEqual(self.problems(merge={"resolve_slots": -1}),
+                         ["merge.resolve_slots must be at least 0"])
+        self.assertEqual(self.problems(merge={"resolve_slots": "2"}),
+                         ["merge.resolve_slots must be an integer"])
 
     def test_merge_right_of_way(self):
         self.assertEqual(self.problems(merge={

@@ -225,6 +225,138 @@ def check_pin(repo, install):
                    % (head[:12], PIN_NAME, pin[:12]))
 
 
+
+GEN_LOCK = ".lock"
+# What a tool is told about the generation it runs in, beside
+# FORGE_CRON_CHECKOUT (which names the generation itself).
+GENERATION = "FORGE_CRON_GENERATION"
+BASE = "FORGE_CRON_BASE"
+
+
+def generation(repo, gens, sha, deadline, clock=time.monotonic,
+               nap=time.sleep):
+    """(path, handle): the generation of `repo` at commit `sha`, a
+    worktree of it at `gens`/<sha>, made the first time any job wants
+    it, with its lock held shared for the caller's run. Raises Stop when
+    it can't be made or locked in time."""
+    os.makedirs(gens, exist_ok=True)
+    path = os.path.join(gens, sha)
+    while True:
+        if not os.path.isdir(path):
+            maker = open(os.path.join(gens, ".make" + GEN_LOCK), "a")
+            try:
+                if not lock(maker, True, deadline, clock, nap):
+                    raise Stop("LOCK-TIMEOUT: another job was making a "
+                               "generation")
+                if not os.path.isdir(path):
+                    temp = path + ".new"
+                    if os.path.exists(temp):
+                        git(repo, "worktree", "remove", "--force", temp)
+                        subprocess.run(["rm", "-rf", temp])
+                    git(repo, "worktree", "prune")
+                    got = git(repo, "worktree", "add", "-q", "--detach",
+                              temp, sha)
+                    if got.returncode != 0:
+                        raise Stop("SYNC-FAILED: worktree add: %s"
+                                   % got.stderr.strip())
+                    # Moved by git, not renamed behind its back: git's
+                    # record of a renamed worktree still names `.new`,
+                    # so the next `worktree prune` (this function's own,
+                    # above, when the next generation is made) deleted
+                    # the record of the live one, and every job in it ran
+                    # with no checkout (2026-11-11, 44 runs).
+                    got = git(repo, "worktree", "move", temp, path)
+                    if got.returncode != 0:
+                        raise Stop("SYNC-FAILED: worktree move: %s"
+                                   % got.stderr.strip())
+                elif not sound(path, sha):
+                    remake(repo, path, sha)
+            finally:
+                maker.close()
+        elif not sound(path, sha):
+            maker = open(os.path.join(gens, ".make" + GEN_LOCK), "a")
+            try:
+                if not lock(maker, True, deadline, clock, nap):
+                    raise Stop("LOCK-TIMEOUT: another job was making a "
+                               "generation")
+                if os.path.isdir(path) and not sound(path, sha):
+                    remake(repo, path, sha)
+            finally:
+                maker.close()
+        handle = open(path + GEN_LOCK, "a")
+        if not lock(handle, False, deadline, clock, nap):
+            handle.close()
+            raise Stop("LOCK-TIMEOUT: generation %s was being removed"
+                       % sha[:10])
+        if os.path.isdir(path):
+            return path, handle
+        # Removed between the look and the lock: make it again.
+        handle.close()
+
+
+def sound(path, sha):
+    """Whether git sees the generation at `path` as a checkout of `sha`."""
+    got = subprocess.run(["git", "-C", path, "rev-parse", "HEAD"],
+                         capture_output=True, text=True)
+    return got.returncode == 0 and got.stdout.strip() == sha
+
+
+def remake(repo, path, sha):
+    """Make a generation git has lost track of sound again: `worktree
+    repair` when only its record's path is wrong (one renamed into
+    place before agent-forge #305), else it is made afresh. Under the
+    make lock."""
+    git(repo, "worktree", "repair", path)
+    if sound(path, sha):
+        return
+    subprocess.run(["rm", "-rf", path])
+    git(repo, "worktree", "prune")
+    got = git(repo, "worktree", "add", "-q", "--detach", path, sha)
+    if got.returncode != 0:
+        raise Stop("SYNC-FAILED: worktree add: %s" % got.stderr.strip())
+
+
+def prune_generations(repo, gens, keep):
+    """Remove every generation but `keep` that no job holds: each one's
+    lock is tried exclusively, never waited for."""
+    try:
+        names = os.listdir(gens)
+    except FileNotFoundError:
+        return
+    for name in names:
+        path = os.path.join(gens, name)
+        if name == keep or name.endswith(GEN_LOCK) or name.startswith(".") \
+                or name.endswith(".new") or not os.path.isdir(path):
+            continue
+        with open(path + GEN_LOCK, "a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue
+            got = git(repo, "worktree", "remove", "--force", path)
+            if got.returncode != 0 and os.path.isdir(path):
+                subprocess.run(["rm", "-rf", path])
+                git(repo, "worktree", "prune")
+            try:
+                os.unlink(path + GEN_LOCK)
+            except FileNotFoundError:
+                pass
+
+
+def refresh_base(repo, branch, logdir, key):
+    """Bring the checkout itself up to date when no other job is doing
+    it, for what reads it outside a job (forge-install's pin). Never
+    waited for: the jobs run in generations, not here."""
+    with open(os.path.join(logdir, ".forge-cron.%s.base.lock" % key),
+              "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        if not current(repo, branch):
+            git(repo, "reset", "-q", "--hard", "origin/" + branch)
+
+
 def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
          nap=time.sleep, err=None, install=INSTALL):
     argv = sys.argv[1:] if argv is None else argv
@@ -237,6 +369,10 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
     env = cron_env(environ)
     GIT_ENV[0] = env
     repo = os.path.expanduser(environ.get("FORGE_CRON_CHECKOUT", ""))
+    if repo and environ.get(BASE) and environ.get(GENERATION) == repo:
+        # Started from a job in a generation: the checkout is the one
+        # that generation was made from.
+        repo = environ[BASE]
     if not repo:
         err("forge-cron-run: set FORGE_CRON_CHECKOUT to the project's cron "
             "checkout")
@@ -250,6 +386,10 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
     log_path = os.path.join(logdir, name + ".log")
     key = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.realpath(repo).strip("/"))
     wanted = os.path.join(logdir, ".forge-cron.%s.sync-wanted" % key)
+    gens = None if environ.get("FORGE_CRON_GENERATIONS", "1") == "0" else \
+        os.path.expanduser(environ.get("FORGE_CRON_GEN_DIR")
+                           or os.path.realpath(repo).rstrip("/") + ".gen")
+    here = repo
     begun = clock()
     deadline = begun + wait
     header = "=== %s %s ===" % (now(), " ".join([tool] + args))
@@ -276,7 +416,7 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
     try:
         if not lock(tool_lock, True, deadline, clock, nap):
             return give_up("another %s run held its own lock" % name)
-        exclusive = os.path.exists(wanted)
+        exclusive = not gens and os.path.exists(wanted)
         if not lock(repo_lock, exclusive, deadline, clock, nap):
             return give_up("another job held the checkout's lock")
         write(header)
@@ -288,14 +428,23 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
                            % repo)
             branch = branch_of(repo)
             fetch(repo, branch, write, retry_s, nap)
-            if not exclusive and not current(repo, branch):
+            if gens:
+                sha = git(repo, "rev-parse", "origin/" + branch) \
+                    .stdout.strip()
+                if not SHA_RE.match(sha):
+                    raise Stop("SYNC-FAILED: no origin/%s" % branch)
+                refresh_base(repo, branch, logdir, key)
+                here, gen_lock = generation(repo, gens, sha, deadline,
+                                            clock, nap)
+                handles.append(gen_lock)
+            elif not exclusive and not current(repo, branch):
                 open(wanted, "w").close()
                 fcntl.flock(repo_lock, fcntl.LOCK_UN)
                 exclusive = True
                 if not lock(repo_lock, True, deadline, clock, nap):
                     return give_up("another job held the checkout's lock")
                 fetch(repo, branch, write, retry_s, nap)
-            if exclusive:
+            if exclusive and not gens:
                 got = git(repo, "reset", "-q", "--hard", "origin/" + branch)
                 if got.returncode != 0:
                     write(got.stderr.strip())
@@ -308,7 +457,7 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
                 fcntl.flock(repo_lock, fcntl.LOCK_UN)
                 if not lock(repo_lock, False, deadline, clock, nap):
                     return give_up("another job held the checkout's lock")
-            write("at %s" % git(repo, "rev-parse", "--short",
+            write("at %s" % git(here, "rev-parse", "--short",
                                 "HEAD").stdout.strip())
             if locks.install_wanted(install):
                 raise Stop("INSTALL-PENDING: forge-install is waiting to "
@@ -318,11 +467,11 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
             handles.append(install_lock)
             if not lock(install_lock, False, deadline, clock, nap):
                 return give_up("forge-install held the installation's lock")
-            check_pin(repo, install)
-            path = tool_path(repo, tool)
+            check_pin(here, install)
+            path = tool_path(here, tool)
             app = environ.get("FORGE_CRON_APP")
             if app:
-                mint_into(env, app, repo, mint)
+                mint_into(env, app, here, mint)
                 write("as %s" % app)
         except Stop as e:
             write(str(e))
@@ -336,13 +485,30 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
         env[locks.INSTALL_LOCK_FD] = str(install_lock.fileno())
         ready = clock()
         write("waited=%ds" % (ready - begun))
-        rc = subprocess.call([path] + args, cwd=repo, env=env, stdout=log,
+        fds = (install_lock.fileno(),)
+        if gens:
+            # The tool reads its checkout as this generation; a job it
+            # chains through forge-cron-run (pr-check's next tick) is
+            # mapped back to the checkout itself, and the generation's
+            # lock goes with the tool to anything that outlives it.
+            env["FORGE_CRON_CHECKOUT"] = here
+            env[GENERATION] = here
+            env[BASE] = repo
+            env[locks.GEN_LOCK_FD] = str(gen_lock.fileno())
+            fds += (gen_lock.fileno(),)
+        rc = subprocess.call([path] + args, cwd=here, env=env, stdout=log,
                              stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                             close_fds=True, pass_fds=(install_lock.fileno(),))
+                             close_fds=True, pass_fds=fds)
         if rc < 0:
             rc = 128 - rc   # killed by a signal, as a shell reports it
         write("ended %s ran=%ds" % (now(), clock() - ready))
         write("exit=%d" % rc)
+        if gens:
+            for handle in handles:
+                handle.close()
+            handles.clear()
+            newest = git(repo, "rev-parse", "origin/" + branch).stdout.strip()
+            prune_generations(repo, gens, newest)
         return rc
     finally:
         for handle in handles + [repo_lock, tool_lock, log]:

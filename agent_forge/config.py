@@ -123,7 +123,8 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "hold_labels": list, "blocked_by": str, "said_since": dict,
          "update_once": bool, "ci_never_started": int,
          "queued_stall_minutes": int, "read_as": str, "age_first": dict,
-         "hand_back_once_per_head": bool, "own_head_green": bool}
+         "hand_back_once_per_head": bool, "own_head_green": bool,
+         "stall_run_factor": (int, float), "resolve_slots": int}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
 # merge.resolve as an object: designs/0026's rules as `regenerate`, and
 # designs/0046's `union` globs.
@@ -139,12 +140,17 @@ TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "unstable_after_recuts": int, "batches_when_unstable": int,
               "trains": str, "trains_within": str, "stop_spent": bool,
               "green_batch_first": bool, "retry_red": bool,
-              "tell_boarded": bool}
+              "tell_boarded": bool, "later_first": int,
+              "train_merge": bool, "train_branch": str,
+              "train_slots": int, "layers_need_own_green": bool,
+              "own_green_to_board": bool}
 TRAINS = ("dry-run", "live", "off")
 # designs/0050: what testing ahead is when the project says nothing.
 # Trains of up to 4, two in flight, predicted 7 deep; batches x batch
 # is then depth + 1.
 DEFAULT_AHEAD_DEPTH = 7
+# forge-pr-check's checks.slots when the project gives none.
+DEFAULT_CHECK_SLOTS = 2
 DEFAULT_AHEAD_BATCH = 4
 DEFAULT_AHEAD_BATCHES = 2
 DEFAULT_TRAINS = "live"
@@ -243,7 +249,7 @@ TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.
 LABELS = {"owner_prefix": str, "status_prefix": str,
           "waiting_on_owner": str, "waiting_external": str, "urgent": str,
-          "rerun": str}
+          "rerun": str, "armed": str, "keep_trains": str}
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
@@ -357,8 +363,9 @@ def _is(value, kinds):
 
 def _type_name(kinds):
     kinds = kinds if isinstance(kinds, tuple) else (kinds,)
-    names = {str: "a string", int: "an integer", bool: "true or false",
-             dict: "an object", list: "a list", type(None): "null"}
+    names = {str: "a string", int: "an integer", float: "a number",
+             bool: "true or false", dict: "an object", list: "a list",
+             type(None): "null"}
     return " or ".join(names[k] for k in kinds)
 
 
@@ -698,6 +705,9 @@ def check(data):
                 problems.append("merge.%s must be at least 1" % key)
         if "yield_cap" in merge and "yield_after_hand_back" not in merge:
             problems.append("merge.yield_cap needs merge.yield_after_hand_back")
+        if _is(merge.get("resolve_slots"), int) and merge["resolve_slots"] < 0:
+            # 0 is no limit (designs/0012, amendment of 2026-11-12).
+            problems.append("merge.resolve_slots must be at least 0")
         if isinstance(merge.get("right_of_way"), dict):
             row = merge["right_of_way"]
             _fields("merge.right_of_way", row, RIGHT_OF_WAY, problems)
@@ -928,6 +938,10 @@ def _check_merge_0026(merge, data, problems):
     for key in ("ci_never_started", "queued_stall_minutes"):
         if _is(merge.get(key), int) and merge[key] < 1:
             problems.append("merge.%s must be at least 1" % key)
+    factor = merge.get("stall_run_factor")
+    if _is(factor, (int, float)) and not (math.isfinite(factor)
+                                          and factor >= 0):
+        problems.append("merge.stall_run_factor must be 0 or more")
     if isinstance(merge.get("read_as"), str) and merge["read_as"] not in names:
         problems.append("merge.read_as %r is not an agent or machinery"
                         % merge["read_as"])
@@ -1418,6 +1432,24 @@ def _check_test_ahead(ahead, checks, problems):
         elif ahead["batches"] * batch > depth + 1:
             problems.append("%s.batches x batch must be at most depth + 1 "
                             "(%d)" % (where, depth + 1))
+    if _is(ahead.get("later_first"), int) and ahead["later_first"] < 0:
+        problems.append("%s.later_first must be at least 0" % where)
+    if ahead.get("layers_need_own_green") is False \
+            and ahead.get("stacks") is not True:
+        problems.append("%s.layers_need_own_green false needs stacks: only "
+                        "a stack's layers board with their base" % where)
+    if ahead.get("own_green_to_board") is False \
+            and ahead.get("trains") != "live":
+        problems.append("%s.own_green_to_board false needs trains \"live\": "
+                        "only a cut train is boarded" % where)
+    if _is(ahead.get("train_slots"), int):
+        # Amendment of 2026-11-12: slots only the Merger's predictions
+        # may use; at least one must be left for the heads' own runs.
+        slots = checks.get("slots") if isinstance(checks, dict) else None
+        slots = slots if _is(slots, int) else DEFAULT_CHECK_SLOTS
+        if not 0 <= ahead["train_slots"] < slots:
+            problems.append("%s.train_slots must be at least 0 and less "
+                            "than checks.slots (%d)" % (where, slots))
     if _is(ahead.get("unstable_after_recuts"), int) and \
             ahead["unstable_after_recuts"] < 1:
         problems.append("%s.unstable_after_recuts must be at least 1" % where)

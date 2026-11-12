@@ -181,10 +181,6 @@ query($o: String!, $r: String!, $n: Int!) {
           source { ... on Issue { number } } } }
       }
     }
-    open: pullRequests(states: OPEN, first: 100,
-                       orderBy: {field: CREATED_AT, direction: ASC}) {
-      nodes { ...closes }
-    }
     merged: pullRequests(states: MERGED, first: 30,
                          orderBy: {field: UPDATED_AT, direction: DESC}) {
       nodes { ...closes mergedAt }
@@ -194,9 +190,53 @@ query($o: String!, $r: String!, $n: Int!) {
 fragment closes on PullRequest {
   number title body
   closingIssuesReferences(first: 50) { nodes { number } }
-  commits(last: 100) { nodes { commit { message } } }
+  commits(last: 100) { nodes { commit {
+    message parents { totalCount }
+    associatedPullRequests(first: 5) { nodes { number } } } } }
 }
 """
+
+# The open pull requests, a page at a time: with a hundred open, each
+# with its commits and their pull requests, one query took GitHub past
+# its time limit and every tick ended on a 502.
+OPEN_PAGE = 20
+OPEN_PRS_PAGE_QUERY = """
+query($o: String!, $r: String!, $first: Int!, $after: String) {
+  repository(owner: $o, name: $r) {
+    open: pullRequests(states: OPEN, first: $first, after: $after,
+                       orderBy: {field: CREATED_AT, direction: ASC}) {
+      nodes { ...closes }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+""" + OPEN_PRS_QUERY[OPEN_PRS_QUERY.index("fragment closes"):]
+# At most this many pages of open pull requests (OPEN_PAGE each).
+OPEN_PAGES = 10
+
+
+def own_messages(pr):
+    """The messages of pull request `pr`'s own commits (GraphQL): not a
+    merge, and in no earlier pull request. A stack's upper layer lists
+    every commit of the layers below it, and once they merge (as
+    squashes) the default branch's as well, so their "Fixes #N" lines
+    made the layer look like a fix of whatever they named: on one
+    project a layer high in a stack counted as the red nightly's fix,
+    went first as urgent and cut the trains again."""
+    number = pr.get("number")
+    out = []
+    for c in (pr.get("commits") or {}).get("nodes") or ():
+        commit = (c or {}).get("commit") or {}
+        if ((commit.get("parents") or {}).get("totalCount") or 0) > 1:
+            continue
+        others = [(n or {}).get("number") for n in (
+            (commit.get("associatedPullRequests") or {}).get("nodes")
+            or ())]
+        if any(isinstance(n, int) and isinstance(number, int)
+               and n < number for n in others):
+            continue
+        out.append(commit.get("message") or "")
+    return out
 
 
 def iso(when):
@@ -895,9 +935,8 @@ class Tick:
         refs = self.closing.refs
         found |= set(refs(self.closing.blank_code(pr.get("body") or "")))
         found |= set(refs(pr.get("title") or ""))
-        for c in (pr.get("commits") or {}).get("nodes") or ():
-            found |= set(refs(((c or {}).get("commit") or {}).get(
-                "message") or ""))
+        for message in own_messages(pr):
+            found |= set(refs(message))
         found.discard(None)
         return found
 
@@ -912,8 +951,7 @@ class Tick:
         pattern = re.compile(r"(?:#|/issues/)%d(?![0-9])" % number)
         texts = [pr.get("title") or "",
                  self.closing.blank_code(pr.get("body") or "")]
-        texts += [((c or {}).get("commit") or {}).get("message") or ""
-                  for c in (pr.get("commits") or {}).get("nodes") or ()]
+        texts += own_messages(pr)
         return any(pattern.search(t) for t in texts)
 
     def linked(self, issue, number):
@@ -960,6 +998,26 @@ class Tick:
             return "closes #%d, linked with #%d" % (both[0], number)
         return None
 
+    def open_prs(self, owner, name, number):
+        """The open pull requests (GraphQL nodes), OPEN_PAGE at a time."""
+        found, after = [], None
+        for _ in range(OPEN_PAGES):
+            status, doc = github.graphql(self.token, OPEN_PRS_PAGE_QUERY, {
+                "o": owner, "r": name, "first": OPEN_PAGE, "after": after},
+                call=self.call)
+            try:
+                page = doc["data"]["repository"]["open"]
+                found.extend(page["nodes"])
+                more = page["pageInfo"]["hasNextPage"]
+                after = page["pageInfo"]["endCursor"]
+            except (KeyError, TypeError):
+                raise RuntimeError(
+                    "GitHub answered %s for the open pull requests that "
+                    "close #%d" % (status, number)) from None
+            if not more:
+                break
+        return found
+
     def fixes(self, number, steps=()):
         """(whether the issue is open, the open pull requests that fix
         it, [(number, mergedAt, how)] of those merged that fix it)."""
@@ -970,11 +1028,11 @@ class Tick:
             repo = doc["data"]["repository"]
             issue = repo["issue"] or {}
             is_open = issue.get("state") == "OPEN"
-            open_prs = repo["open"]["nodes"]
             merged = repo["merged"]["nodes"]
         except (KeyError, TypeError):
             raise RuntimeError("GitHub answered %s for the pull requests "
                                "that close #%d" % (status, number)) from None
+        open_prs = self.open_prs(owner, name, number)
         linked = self.linked(issue, number) if self.cfg["fixes_named"] \
             else set()
         done = []
@@ -1249,6 +1307,11 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
             if newest is not None and newest["id"] != saved.get("judged"):
                 if tick.judge(saved, newest):
                     saved["judged"] = newest["id"]
+                    # Keep the judgement even if a later read this tick
+                    # fails: its comment is posted, and a tick skipped
+                    # after it would judge, and post, the same run again.
+                    if not args.dry_run:
+                        state.save(path, dict(saved, at=iso(now)))
             tick.announce(saved)
             merged = []
             if saved.get("issue") is not None:

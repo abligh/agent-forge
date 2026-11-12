@@ -87,6 +87,33 @@ def pr(number, title="", body="", messages=(), declared=(), merged=None):
     return node
 
 
+class OwnMessages(unittest.TestCase):
+    """Only a pull request's own commits name or close issues: not a
+    merge, and not a commit an earlier pull request holds (a stack's
+    lower layers, merged or not)."""
+
+    def commit(self, message, parents=1, prs=()):
+        return {"commit": {"message": message,
+                           "parents": {"totalCount": parents},
+                           "associatedPullRequests": {"nodes": [
+                               {"number": n} for n in prs]}}}
+
+    def test_a_layer_skips_the_commits_of_the_layers_below(self):
+        layer = {"number": 784, "commits": {"nodes": [
+            self.commit("Fixes #517", prs=[538, 762, 784]),
+            self.commit("Merge branch 'main'", parents=2, prs=[784]),
+            self.commit("Fixes #207", prs=[784])]}}
+        self.assertEqual(tool.own_messages(layer), ["Fixes #207"])
+
+    def test_the_lowest_pull_request_keeps_its_commits(self):
+        lower = {"number": 538, "commits": {"nodes": [
+            self.commit("Fixes #517", prs=[538, 762, 784])]}}
+        self.assertEqual(tool.own_messages(lower), ["Fixes #517"])
+
+    def test_a_commit_without_its_pull_requests_is_its_own(self):
+        self.assertEqual(tool.own_messages(pr(5, messages=["x"])), ["x"])
+
+
 class FakeGitHub:
     """The REST and GraphQL endpoints forge-nightly reads and writes.
     `fail` names a (method, path start) that answers 500."""
@@ -100,6 +127,7 @@ class FakeGitHub:
         self.workflow = WORKFLOW
         self.fail = None
         self.writes = []
+        self.pages = []
 
     def __call__(self, url, token, scheme="Bearer", method="GET", body=None):
         assert token == "tok", token
@@ -108,6 +136,16 @@ class FakeGitHub:
                 path.startswith(self.fail[1]):
             return 500, {"message": "down"}
         repo = "/repos/example/widget"
+        if path == "/graphql" and "after" in body["variables"]:
+            self.pages.append(body["variables"]["after"])
+            size = body["variables"]["first"]
+            start = int(body["variables"]["after"] or 0)
+            nodes = self.open_prs[start:start + size]
+            more = start + size < len(self.open_prs)
+            return 200, {"data": {"repository": {"open": {
+                "nodes": nodes, "pageInfo": {
+                    "hasNextPage": more,
+                    "endCursor": str(start + size) if more else None}}}}}
         if path == "/graphql":
             assert body["variables"]["n"] == 101, body
             issue = next((i for i in self.issues if i["number"] == 101),
@@ -118,7 +156,6 @@ class FakeGitHub:
                           "timelineItems": {"nodes": [
                               {"source": {"number": n}}
                               for n in self.referenced_by]}},
-                "open": {"nodes": self.open_prs},
                 "merged": {"nodes": self.merged_prs}}}}
         assert path.startswith(repo), path
         path = path[len(repo):]
@@ -395,6 +432,18 @@ class Main(unittest.TestCase):
         self.assertEqual(self.writes("POST", "/issues"), [])
         self.assertEqual(len(self.writes("POST", "/issues/101/comments")), 1)
 
+    def test_open_pull_requests_are_read_a_page_at_a_time(self):
+        # One query for a hundred open pull requests with their commits
+        # took GitHub past its time limit: a 502 on every tick.
+        self.red_night()
+        self.main()
+        self.gh.open_prs = [pr(n, body="Unrelated") for n in range(1, 45)]
+        self.gh.open_prs.append(pr(45, body="Fixes #101"))
+        self.gh.pages.clear()
+        self.main(now=NOW + datetime.timedelta(minutes=5))
+        self.assertEqual(self.saved()["fixes"], [45])
+        self.assertEqual(self.gh.pages, [None, "20", "40"])
+
     def test_the_pull_requests_that_close_it_are_its_fixes(self):
         self.red_night()
         self.main()
@@ -619,6 +668,21 @@ class Main(unittest.TestCase):
         self.assertEqual(self.main(), 2)
         self.assertIn("skipping this tick", self.err[0])
         self.assertFalse(os.path.exists(self.state))
+
+    def test_a_run_is_commented_on_once_when_a_later_read_fails(self):
+        # A comment posted, then a failed read of the fixes skipped the
+        # tick unsaved: every tick posted "Red again." for the same run.
+        self.red_night()
+        self.main()
+        self.gh.writes.clear()
+        self.gh.runs.insert(0, run(3, NEXT_SHA, ended=NOW - HOUR / 2))
+        self.gh.jobs[3] = red_jobs(("vet-advisories",))
+        self.gh.fail = ("POST", "/graphql")
+        for minutes in (0, 5, 10):
+            self.assertEqual(self.main(
+                now=NOW + datetime.timedelta(minutes=minutes)), 2)
+        self.assertEqual(len(self.writes("POST", "/comments")), 1)
+        self.assertEqual(self.saved()["judged"], 3)
 
     def test_a_refused_write_is_exit_2_and_judged_again(self):
         self.red_night()
