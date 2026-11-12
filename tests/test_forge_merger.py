@@ -4119,6 +4119,59 @@ class TickAhead(RepoCase):
         self.assertEqual([d["action"] for d in record["decisions"]
                           if d["pr"] == 5], ["UPDATE"])
 
+    def unproven(self, board):
+        """#5 and #6, approved, their own build checks still pending:
+        the first tick's record and lines, with own_green_to_board
+        `board`."""
+        m.configure(project(own_head_green=True, test_ahead={
+            "batch": 2, "trains": "live", "own_green_to_board": board}))
+        self.prs = [self.item(), self.other_pr()]
+        pending = [status("pending")]
+        self.pending = {SLUG + "/commits/" + p["headRefOid"]: pending
+                        for p in self.prs}
+        self.pending[SLUG + "/commits/" + self.approved] = pending
+        return self.tick(self.prs, conclusions=(None,), live=True,
+                         extra=self.pending)
+
+    def test_with_own_green_to_board_false_they_board_without_it(self):
+        # 2026-11-12: four approved pull requests whose own checks were
+        # queued behind a hundred others waited an hour, held, while
+        # the one train ran; the train's top tests them anyway.
+        self.assertIs(m.OWN_GREEN_TO_BOARD, True)
+        record, lines = self.unproven(False)
+        self.assertIs(m.OWN_GREEN_TO_BOARD, False)
+        self.assertEqual((record["queue"], sorted(record["held"])),
+                         ([], ["5", "6"]))
+        self.assertEqual(record["trains"], [[5, 6]])
+        self.assertIn("TRAIN-CUT 1: #5 #6", lines)
+        # Boarded, they are candidates at the heads they boarded with.
+        record, _ = self.tick(self.prs, conclusions=(None,), live=True,
+                              minutes=1, extra=self.pending)
+        self.assertEqual(record["held"], {})
+        self.assertEqual(record["queue"], [5, 6])
+        self.assertEqual(record["trains"], [[5, 6]])
+
+    def test_by_default_they_wait_for_their_own_green(self):
+        record, lines = self.unproven(True)
+        self.assertEqual(sorted(record["held"]), ["5", "6"])
+        self.assertNotIn("trains", record)
+        self.assertFalse([l for l in lines if l.startswith("TRAIN-CUT")])
+
+    def test_one_red_on_its_own_head_does_not_board(self):
+        m.configure(project(own_head_green=True, test_ahead={
+            "batch": 2, "trains": "live", "own_green_to_board": False}))
+        prs = [self.item(), self.other_pr()]
+        failed = [status("failure")]
+        extra = {SLUG + "/commits/" + p["headRefOid"]: failed for p in prs}
+        extra[SLUG + "/commits/" + self.approved] = failed
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              extra=extra, check_state={"results": {
+                                  prs[1]["headRefOid"]: {
+                                      "ok": False, "failed": ["test"]}}})
+        self.assertEqual(record["trains"], [[5]])
+        self.assertEqual(record["train_waits"],
+                         {"6": "its own head is red"})
+
     def red_train(self, train_merge=True):
         """#5 and #6 boarded on one train, then main moves on, so #5 is
         behind it, and the train's top is found red: the second tick's
@@ -6506,8 +6559,9 @@ class Stacks(RepoCase):
                   reviews=[
             review(REVIEWER, oid=self.upper)] if reviews is None else reviews)
 
-    def tick(self, prs, live=True, minutes=0, check_state=None):
-        github = FakeGitHub(answers(prs=prs))
+    def tick(self, prs, live=True, minutes=0, check_state=None,
+             conclusions=("success",)):
+        github = FakeGitHub(answers(conclusions, prs=prs))
         self.github = github
         lines = []
         start = datetime.datetime(2026, 10, 7, 12, 0, 0,
@@ -6719,6 +6773,19 @@ class Stacks(RepoCase):
         self.assertEqual(m.boarded_layers(last), {6: "b", 8: "d"})
         self.assertEqual(m.boarded_layers(dict(last, trains=False)), {})
         self.assertEqual(m.boarded_layers(None), {})
+
+    def test_boarded_members(self):
+        last = {"trains": True, "entries": [
+            {"pr": 5, "head": "a"}, {"pr": 6, "head": "b"}]}
+        self.assertEqual(m.boarded_members(last), {5: "a", 6: "b"})
+        self.assertEqual(m.boarded_members(dict(last, trains=False)), {})
+        self.assertEqual(m.boarded_members(None), {})
+        # A red train's search: its batch and the trains it keeps, or
+        # the members flip between held and not every other tick and
+        # the search starts over each time (a sim, 2026-11-12).
+        searching = {"entries": [{"pr": 5, "head": "a"}],
+                     "kept_trains": last}
+        self.assertEqual(m.boarded_members(searching), {5: "a", 6: "b"})
 
     def hand_tick(self, pulls, minutes=1):
         """A live tick with only #6 open, and GitHub answering the
@@ -7134,6 +7201,20 @@ class Stacks(RepoCase):
         record, _ = self.tick([self.layer("main", head=head)], minutes=3)
         self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
                          [(6, "UPDATE")])
+
+    def test_a_layer_waiting_for_its_own_green_keeps_its_restack(self):
+        # own_green_to_board false: a layer on main held only for its own
+        # green may board a train, so the stack keeps it and #5's final
+        # head to restack onto (a sim, 2026-11-12: dropped, it was
+        # handed back for a conflict the restack would have resolved).
+        self.lower_moves_on(self.lines(l8="U"), self.lines(l3="Y"))
+        m.configure(project(stacks={}, own_head_green=True, test_ahead={
+            "batch": 2, "trains": "live", "own_green_to_board": False}))
+        record, _ = self.tick([self.layer("main")], minutes=2,
+                              conclusions=(None,))
+        self.assertIn("6", record["held"])
+        self.assertEqual([(e["pr"], e["head"]) for e in
+                          self.stack_file()["pending"]], [(6, self.lower)])
 
     def test_a_restack_is_tried_once_per_head(self):
         self.lower_moves_on(self.lines(l8="U"), self.lines(l3="Y"))

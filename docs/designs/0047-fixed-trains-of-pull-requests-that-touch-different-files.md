@@ -743,8 +743,8 @@ onto its top: three layers whose base had merged, and one that had
 conflicted with a pull request since merged. None boarded the free
 place, and no second train was cut. Nothing in the record said why.
 
-**The likely cause.** A head whose own build check is red doesn't
-board (`head_red`). forge-pr-check records a head that conflicts with
+**A first guess, wrong for this case.** A head whose own build check
+is red doesn't board (`head_red`). forge-pr-check records a head that conflicts with
 the default branch's tip as red with no step run (`failed: ["merge"]`,
 `conflicts`), and that verdict stays on the head. When the default
 branch moves on so that it merges cleanly again (a layer restacked
@@ -761,5 +761,39 @@ touches`, `conflicts onto train k`, `git can't merge it onto train k`,
 `git can't list its files`, `a layer below it can't board`, or `every
 train is full`.
 
-The field's state wasn't read to confirm the first cause; `train_waits`
-will show it if it was another.
+The field's state then showed none of the four had a red: two had no
+result at all (their own runs queued behind about a hundred others) and
+two went green after the cut. They were held by `merge.own_head_green`
+(`own_green_wait`: no green on the approved commit, the head, or the
+commits before the head's merges of the default branch), so they were
+not candidates and were never tried for a train. The change above is
+kept as right in itself, and `train_waits` for the next case; the
+ninth amendment is the fix for this one.
+
+## Amendment (2026-11-12, ninth): boarding without an own green
+
+**The rule.** `merge.test_ahead.own_green_to_board: false` (default
+true; needs `trains: "live"`, and acts with `merge.own_head_green`)
+generalises `layers_need_own_green` to every pull request on the
+default branch. One held only for its own green, pending or absent, is
+tried for a train after the candidates (`boarding`), its gated
+instances passing, if its head is the approved commit or that one
+brought up to date (a later push waits for its review); one whose own
+head is red is not. Once aboard it is a candidate while its head is
+the one it boarded with, or that one brought up to date
+(`boarded_members`, `own_green_wait`'s `boarded`), during a red
+train's search too (its batches and `kept_trains`), so it merges
+with its train, by `train_merge` or by the usual path, whose merge
+still waits for `checks.context` on the head it merges (a member's
+cover from its green top). A stack's layer held so keeps its place in
+the stack, and the final head below it to restack onto. A red train is searched for its
+culprit as any, which the seventh amendment made safe.
+
+**Why.** A build check's own runs queue behind every head pushed; the
+train's top tests the same change merged with everything ahead of it,
+so waiting for the own run first only delays boarding, by an hour on
+the project above.
+
+A member found red on its own leaves, and the trains with it or
+behind it change; with the key true that can't happen, as its own run
+was green before it boarded.

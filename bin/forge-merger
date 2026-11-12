@@ -520,7 +520,14 @@ build check's green, its train's top testing it; once its base has
 merged it stays a candidate without one while its head is the one it
 boarded with, or that one brought up to date (`own_green_wait`'s
 `boarded`), and `train_merge` takes the layers held as stacked as
-members, so the train goes in as one.
+members, so the train goes in as one. With `own_green_to_board` false
+(default true; with `merge.own_head_green` and `trains: "live"`), so
+does any pull request on the default branch held only for its own
+green: it is tried for a train after the candidates, and once aboard
+it is a candidate while its head is the one it boarded with, or that
+one brought up to date (`boarded_members`). One whose own head is red
+still doesn't board, and a red train is searched as any (amendment of
+2026-11-12, ninth).
 
 **With `merge.test_ahead.trains`, batches are trains** (designs/0047;
 default off). `"live"`: each batch is a train of carriages, a stack's
@@ -1015,6 +1022,10 @@ BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
 # merge.test_ahead.layers_need_own_green: whether a stack's layer needs
 # its own build check's green to board its base's train.
 LAYERS_OWN_GREEN = True
+# merge.test_ahead.own_green_to_board: whether any pull request needs
+# its own build check's green to board a train (false: its approval is
+# enough, and the train's top tests it; amendment of 2026-11-12, ninth).
+OWN_GREEN_TO_BOARD = True
 TRAIN_WAIT_REASON = ("in a train of %d that merges as one; not updated, "
                      "it waits for the train's top")
 # merge.test_ahead.train_merge: a suspect of a red train is not updated
@@ -1211,6 +1222,7 @@ def configure(project):
     global UNSTABLE_BATCHES, TELL_BOARDED
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
     global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR, LAYERS_OWN_GREEN
+    global OWN_GREEN_TO_BOARD
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -1262,6 +1274,8 @@ def configure(project):
     TRAINS_WITHIN = (ahead or {}).get("trains_within", "files")
     TRAIN_MERGE = (ahead or {}).get("train_merge") is True
     LAYERS_OWN_GREEN = (ahead or {}).get("layers_need_own_green") \
+        is not False
+    OWN_GREEN_TO_BOARD = (ahead or {}).get("own_green_to_board") \
         is not False
     TRAIN_BRANCH = (ahead or {}).get("train_branch", "forge/train-")
     HOLD_CONFLICTING = merge.get("hold_conflicting", False) is True
@@ -5576,6 +5590,23 @@ def boarded_layers(last):
                  and e.get("carriage") != e["pr"])}
 
 
+def boarded_members(last):
+    """{number: head} of every member of the trains in `last`
+    (ahead.json), for merge.test_ahead.own_green_to_board false: one
+    that boarded without its own green stays a candidate while its head
+    is the one it boarded with, or that one brought up to date. A red
+    train's search writes no trains, but the trains it keeps
+    (`kept_trains`) and the batches it checks still hold them."""
+    if not isinstance(last, dict):
+        return {}
+    lists = [last] if last.get("trains") else [
+        last, last["kept_trains"]] if isinstance(
+            last.get("kept_trains"), dict) else []
+    return {e["pr"]: e.get("head") for one in lists
+            for e in one.get("entries") or ()
+            if isinstance(e, dict) and isinstance(e.get("pr"), int)}
+
+
 def train_boarded(last, pr, check_state):
     """merge.test_ahead.train_merge: the size of the first train in
     `last` (ahead.json) when `pr` is boarded on it at the head it has,
@@ -6649,12 +6680,19 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
     greens = load_greens(state_dir) if OWN_HEAD_GREEN else {}
+    # merge.test_ahead.own_green_to_board false: held only for their own
+    # green, they may still board a train when one is cut.
+    unproven = []
     if OWN_HEAD_GREEN:
         # merge.test_ahead.layers_need_own_green false: a layer that
         # boarded a train is tested by its top, and stays a candidate
         # without a green of its own once its base has merged.
-        aboard = {} if LAYERS_OWN_GREEN else boarded_layers(load_json(
-            os.path.join(state_dir, AHEAD_FILE), {}))
+        said_trains = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+        aboard = {} if LAYERS_OWN_GREEN else boarded_layers(said_trains)
+        if not OWN_GREEN_TO_BOARD:
+            # merge.test_ahead.own_green_to_board false: so does any
+            # pull request that boarded without its own green.
+            aboard = dict(boarded_members(said_trains), **aboard)
         for pr in list(candidates):
             if pr["number"] in aboard:
                 # The walk back to the head it boarded with reads the
@@ -6667,6 +6705,17 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
+                approved = ((approvals[pr["number"]] or {}).get("commit")
+                            or {}).get("oid")
+                if not OWN_GREEN_TO_BOARD \
+                        and pr.get("baseRefName", MAIN) == MAIN \
+                        and approved and own_push(repo, approved,
+                                                  pr["headRefOid"], main_tip,
+                                                  run):
+                    # Only at the head approved, or that one brought up
+                    # to date: a later push of the author's waits for
+                    # its review, as at the front.
+                    unproven.append(pr)
         save_greens(state_dir, greens)
     # Held for an instance, so outside the queue, but a conflict with
     # main won't go away by waiting for it: told like one in the queue.
@@ -6687,6 +6736,12 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 candidates.remove(pr)
                 if pr.get("baseRefName", MAIN) == MAIN:
                     instance_held.append(pr)
+        # One held for its own green boards only once its gated
+        # instances pass, as any candidate.
+        for pr in list(unproven):
+            have_head(repo, pr, run)
+            if instance_wait(repo, pr, main_tip, github, files, run):
+                unproven.remove(pr)
     queue = order(candidates, prs)
     in_flight = None
     if TEST_AHEAD:
@@ -6777,7 +6832,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         stack = merged_elsewhere(state_dir, github, stack, prs, when)
     expired = []
     if stack:
-        stack, retarget, expired = next_layer(stack, prs, candidates,
+        # One held only for its own green may board a train
+        # (own_green_to_board false): it keeps its place in the stack,
+        # and the final head below it to restack onto.
+        stack, retarget, expired = next_layer(stack, prs,
+                                              candidates + unproven,
                                               open_numbers, when, held)
     if STACKS and live:
         save_stack(state_dir, stack)
@@ -7323,10 +7382,17 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 (lambda layer: instance_wait(repo, layer, main_tip, github,
                                              gated_files, run))
                 if GATED else None)) if AHEAD_STACKS else None
+            # merge.test_ahead.own_green_to_board false: those held only
+            # for their own green board too, behind the candidates; the
+            # train's top tests them (amendment of 2026-11-12, ninth).
+            boarding = ahead_queue + [
+                pr for pr in order(unproven, prs)
+                if str(pr["number"]) not in reds
+                and not handed_back(said, pr, approval_of(pr) or {}, when)]
             cut = lambda before: cut_trains(
-                repo, main_tip, train_carriages(ahead_queue, layers_of),
+                repo, main_tip, train_carriages(boarding, layers_of),
                 before, {pr["number"]: pr["headRefOid"] for pr in prs},
-                open_numbers, red={pr["number"] for pr in ahead_queue
+                open_numbers, red={pr["number"] for pr in boarding
                                    if head_red(check_state, pr)},
                 restacks=restacks if PREDICT_RESTACKED else None, run=run,
                 files=files, note=note, force_merges=TRAINS == "live",
@@ -7334,7 +7400,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                                                         tree),
                 acting=waiting_on if acting else None)
             files, note = {}, {}
-            if TRAINS == "live" and not searching and ahead_queue:
+            if TRAINS == "live" and not searching and boarding:
                 # designs/0047: trains, cut once and kept.
                 entries, sizes, events = cut(trains_before(last))
                 write_ahead_refs(repo, entries, run)

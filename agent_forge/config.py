@@ -142,7 +142,8 @@ TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "green_batch_first": bool, "retry_red": bool,
               "tell_boarded": bool, "later_first": int,
               "train_merge": bool, "train_branch": str,
-              "train_slots": int, "layers_need_own_green": bool}
+              "train_slots": int, "layers_need_own_green": bool,
+              "own_green_to_board": bool}
 TRAINS = ("dry-run", "live", "off")
 # designs/0050: what testing ahead is when the project says nothing.
 # Trains of up to 4, two in flight, predicted 7 deep; batches x batch
@@ -1434,6 +1435,10 @@ def _check_test_ahead(ahead, checks, problems):
             and ahead.get("stacks") is not True:
         problems.append("%s.layers_need_own_green false needs stacks: only "
                         "a stack's layers board with their base" % where)
+    if ahead.get("own_green_to_board") is False \
+            and ahead.get("trains") != "live":
+        problems.append("%s.own_green_to_board false needs trains \"live\": "
+                        "only a cut train is boarded" % where)
     if _is(ahead.get("train_slots"), int):
         # Amendment of 2026-11-12: slots only the Merger's predictions
         # may use; at least one must be left for the heads' own runs.

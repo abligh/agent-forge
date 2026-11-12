@@ -81,6 +81,19 @@ class Check(unittest.TestCase):
         data["merge"]["test_ahead"]["layers_need_own_green"] = True
         self.assertEqual(config.check(data), [])
 
+    def test_test_ahead_own_green_to_board(self):
+        data = example()
+        data.setdefault("merge", {})["test_ahead"] = {
+            "batch": 2, "trains": "live", "own_green_to_board": False}
+        self.assertEqual(config.check(data), [])
+        data["merge"]["test_ahead"]["trains"] = "off"
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.own_green_to_board false needs trains "
+            "\"live\": only a cut train is boarded"])
+        data["merge"]["test_ahead"]["own_green_to_board"] = "no"
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.own_green_to_board must be true or false"])
+
     def test_test_ahead_spare_slots_only_is_a_boolean(self):
         data = example()
         data.setdefault("merge", {})["test_ahead"] = {"spare_slots_only": True}
