@@ -77,9 +77,10 @@ def merger_source(tag):
     return got.stdout if got.returncode == 0 else None
 
 
-def project(**ahead):
+def project(merge=None, **ahead):
     """The configuration the simulation runs the Merger with: batches,
-    trains, stacks and a gated instance, as a busy project has them."""
+    trains, stacks and a gated instance, as a busy project has them.
+    `merge` adds or replaces other `merge` keys."""
     data = example()
     data["merge"] = {
         "merger": "Merger", "ci_workflow": "", "stall_minutes": 600,
@@ -90,6 +91,7 @@ def project(**ahead):
             "retry_red": True, "max_age_hours": 24}, **ahead),
         "stacks": {"wait_hours": 24, "predict_restacked": True},
     }
+    data["merge"].update(merge or {})
     data.setdefault("labels", {})["urgent"] = URGENT
     data["checks"]["instances"] = {"mac": {
         "context": GATED, "poster": "Merger", "gate": True,
@@ -161,6 +163,9 @@ class World:
         self.events = []
         self.merges = []
         self.auto_retarget = True
+        # authors_resolve: who answers a hand-back, and how fast.
+        self.resolver = None
+        self.scheduled = []
 
     # git plumbing in origin
 
@@ -263,18 +268,22 @@ class World:
         self.note("approve", pr=number)
 
     def open(self, number, base=None, mac=False, red=False, urgent=False,
-             approve=True, clash=None):
+             approve=True, clash=None, hot=False):
         """Opens #`number`, on main or on the pull request `base`, with a
         change of its own (a file of its own, so nothing conflicts).
         `clash`, a name: it is green alone, but red with the other pull
         request of that name, as two changes that each build and break
         the build together (a field one adds, an initializer without it
-        in the other)."""
+        in the other). `hot`: it also writes `hot.txt`, as every other
+        hot one does, so each that merges makes the others conflict with
+        main."""
         branch = "b%d" % number
         start = self.main() if base is None else self.prs[base]["head"]
         files = {"p%d.txt" % number: "v1\n"}
         if clash:
             files["clash-%s-%d.txt" % (clash, number)] = "v1\n"
+        if hot:
+            files["hot.txt"] = "#%d\n" % number
         if mac:
             files["mac/p%d.txt" % number] = "v1\n"
         if red:
@@ -285,6 +294,7 @@ class World:
             "base": "main" if base is None else self.prs[base]["branch"],
             "branch": branch, "head": sha, "version": 1, "approved": None,
             "mac": mac, "red": red, "state": "OPEN", "reviews": [],
+            "files": dict(files),
             "labels": [URGENT] if urgent else [], "comments": []}
         self.set_head(number, sha)
         self.note("open", pr=number, base=base, mac=mac, red=red,
@@ -296,10 +306,59 @@ class World:
         """The author pushes a change of their own to #`number`."""
         pr = self.prs[number]
         pr["version"] += 1
+        pr["files"]["p%d.txt" % number] = "v%d\n" % pr["version"]
         sha = self.commit(pr["head"], {"p%d.txt" % number: "v%d\n"
                                        % pr["version"]}, "push")
         self.set_head(number, sha)
         self.note("push", pr=number)
+
+    def authors_resolve(self, seed=0, author=(10, 40), reviewer=(5, 20)):
+        """From now on authors and the reviewer answer the Merger's
+        hand-backs, as agents do: an author handed back a conflict with
+        main merges main into the branch by hand some `author` minutes
+        later (`resolve`), and the reviewer handed back a head approves
+        it some `reviewer` minutes later."""
+        import random
+        self.resolver = (random.Random(seed), author, reviewer)
+
+    def handed_back(self, number, body):
+        """The Merger commented `body` on #`number`."""
+        if self.resolver is None or number not in self.prs:
+            return
+        rng, author, reviewer = self.resolver
+        head = self.prs[number]["head"]
+        if body.startswith("Not merging") and "conflicts with main" in body:
+            self.note("conflict-hand-back", pr=number)
+            self.scheduled.append((self.minute() + rng.randint(*author),
+                                   "resolve", (number, head)))
+        elif body.startswith("Not-a-review"):
+            self.note("reviewer-hand-back", pr=number)
+            self.scheduled.append((self.minute() + rng.randint(*reviewer),
+                                   "review_if", (number, head)))
+
+    def minute(self):
+        return int((self.now - START).total_seconds() // 60)
+
+    def resolve(self, number, head):
+        """The author resolves #`number`'s conflict with main by hand,
+        keeping their own lines: a merge of main whose tree is main's
+        with the author's files. Not if it has moved on since."""
+        pr = self.prs[number]
+        if pr["state"] != "OPEN" or pr["head"] != head:
+            return
+        main = self.main()
+        pr["version"] += 1
+        tree = self.write_tree(self.tree(main), pr["files"])
+        sha = self.og("commit-tree", tree, "-p", pr["head"], "-p", main,
+                      "-m", "Merge main, resolving by hand")
+        self.set_head(number, sha)
+        self.note("resolve", pr=number)
+
+    def review_if(self, number, head):
+        """The reviewer approves #`number`, if it is still at `head`."""
+        pr = self.prs[number]
+        if pr["state"] == "OPEN" and pr["head"] == head:
+            self.review(number)
 
     def sync(self):
         """GitHub follows a branch pushed to: a pull request's head is
@@ -386,6 +445,8 @@ class SimGitHub:
         w = self.world
         rest = path[len("repos/%s/" % SLUG):]
         parts = rest.split("/")
+        if parts[0] == "issues" and parts[2:] == ["comments"]:
+            w.handed_back(int(parts[1]), fields.get("body") or "")
         if parts[0] == "pulls" and len(parts) == 3:
             number, pr = int(parts[1]), w.prs[int(parts[1])]
             if parts[2] == "update-branch":
@@ -857,6 +918,9 @@ class Sim:
                 now=lambda: w.now, sleep=lambda s: None, live=True,
                 check_state=self.check.state)
             self.records.append(record)
+            if w.scheduled:
+                events = sorted(events + w.scheduled, key=lambda e: e[0])
+                w.scheduled = []
             w.sync()
             self.check.step()
             self.monitor.check()
@@ -931,6 +995,23 @@ def red_stack_day():
          (0, "open", (3, None, False, False, False, True, "f"))]
     s += [(1, "open", (n,)) for n in range(1, 11) if n != 3]
     s += [(4 + 2 * k, "open", (n,)) for k, n in enumerate(range(11, 25))]
+    return s
+
+
+def hot(prs=30, seed=1, share=0.7, minutes=240):
+    """A scenario where most pull requests (`share`) write the same
+    file, so each merge makes the others conflict with main, and authors
+    and the reviewer answer hand-backs (`World.authors_resolve`): the
+    conflict hand-backs, resolutions by hand and re-reviews of a busy
+    queue whose changes meet in one place. Pull requests arrive over
+    `minutes`."""
+    import random
+    rng = random.Random(seed)
+    s, at = [(0, "authors_resolve", (seed,))], 0
+    for number in range(1, prs + 1):
+        at += rng.randint(1, max(2, minutes // prs * 2))
+        s.append((at, "open", (number, None, False, False, False, True,
+                               None, rng.random() < share)))
     return s
 
 
