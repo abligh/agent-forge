@@ -10121,3 +10121,127 @@ class OwnGreenWaitAfterUpdates(RepoCase):
         self.head = self.repo.commit("f.txt", "more\n", "more")
         self.assertIsNotNone(self.wait({self.approved: [], self.head: [],
                                         self.first: [status()]}))
+
+
+class CodeOwnerAsk(unittest.TestCase):
+    """agent-forge #153: a pull request held for a code owner opens an
+    ask issue, closed when the hold ends at that head."""
+
+    def setUp(self):
+        m.configure(project(code_owners=True, code_owner_ask={
+            "labels": ["Status:waiting-owner"]}))
+        self.addCleanup(m.configure, project())
+        self.dir = tempfile.mkdtemp()
+        self.lines = []
+        self.github = FakeGitHub({})
+
+    def asks(self, waits, open_heads):
+        m.code_owner_asks(self.dir, self.github, waits, open_heads,
+                          self.lines.append)
+        return m.load_json(os.path.join(self.dir, m.CODE_OWNER_ASK_NAME), {})
+
+    def test_a_hold_opens_one_labelled_issue(self):
+        why = "waits for code owner @alex: .github/CODEOWNERS"
+        asks = self.asks({5: ("a" * 40, why), 6: ("b" * 40, None)},
+                         {5: "a" * 40, 6: "b" * 40})
+        self.assertEqual(asks, {"5": {"head": "a" * 40, "issue": 900,
+                                      "labeled": ["Status:waiting-owner"]}})
+        (method, path, fields), label = self.github.writes
+        self.assertEqual(fields["title"], "#5 waits for a code owner's approval")
+        self.assertIn(why, fields["body"])
+        self.assertEqual(label[2], {"labels[]": "Status:waiting-owner"})
+        # Once per head: the next tick opens nothing more.
+        self.asks({5: ("a" * 40, why)}, {5: "a" * 40})
+        self.assertEqual(len(self.github.writes), 2)
+
+    def test_an_unjudged_pr_keeps_its_ask(self):
+        self.asks({5: ("a" * 40, "waits")}, {5: "a" * 40})
+        self.assertEqual(set(self.asks({}, {5: "a" * 40})), {"5"})
+
+    def test_approval_new_head_or_close_ends_it(self):
+        for waits, heads, said in (
+                ({5: ("a" * 40, None)}, {5: "a" * 40}, "no longer waits"),
+                ({}, {5: "c" * 40}, "has a new head"),
+                ({}, {}, "was closed")):
+            self.github = FakeGitHub({})
+            m.save_json(os.path.join(self.dir, m.CODE_OWNER_ASK_NAME),
+                        {"5": {"head": "a" * 40, "issue": 9,
+                               "labeled": ["Status:waiting-owner"]}})
+            self.assertEqual(self.asks(waits, heads), {})
+            comment, close = self.github.writes
+            self.assertIn(said, comment[2]["body"])
+            self.assertEqual(close[:2], ("PATCH", "repos/example/widget/issues/9"))
+
+    def test_a_refused_create_is_tried_again(self):
+        self.github.refuse = "nope"
+        self.assertEqual(self.asks({5: ("a" * 40, "waits")}, {5: "a" * 40}),
+                         {})
+        self.assertIn("CODE-OWNER-ASK refused", self.lines[0])
+
+    def test_config(self):
+        data = example()
+        data["merge"] = {"code_owner_ask": {"title": "x", "labels": [""]}}
+        problems = config.check(data)
+        for said in ("needs merge.code_owners", "must name the pull request",
+                     "must be a list of label names"):
+            self.assertTrue(any(said in p for p in problems), problems)
+class InstanceMainRed(unittest.TestCase):
+    """agent-forge #154: an instance's own main-red issue puts the pull
+    requests that close it first, as the main context's does."""
+
+    def setUp(self):
+        data = example()
+        data["merge"] = {"gate": GATE, "own_head_green": False,
+                         "test_ahead": False}
+        data["checks"] = dict(data.get("checks", {}), instances={
+            "mac": {"context": "vm/mac", "poster": "Helper",
+                    "main_red_issue": {"labels": ["bug"]}},
+            "quiet": {"context": "vm/quiet"}})
+        self.project = config.Project(data, None)
+        m.configure(self.project)
+        self.addCleanup(m.configure, project())
+        self.addCleanup(setattr, m, "MAIN_RED_FIXES", frozenset())
+
+    def github(self, nodes):
+        github = mock.Mock()
+        github.api.return_value = {"data": {"repository": {"issues": {
+            "nodes": nodes}}}}
+        return github
+
+    def test_only_an_instance_with_an_issue_has_a_rule(self):
+        (title, labels, poster), = m.INSTANCE_RED
+        self.assertEqual(labels, ("bug",))
+        self.assertEqual(poster, self.project.bot_login("Helper"))
+        self.assertTrue(title.match(
+            "The default branch is red for vm/mac at 0123abcdef"))
+        self.assertFalse(title.match(
+            "The default branch is red for vm/quiet at 0123abcdef"))
+        self.assertFalse(title.match(
+            "The default branch is red for vm/mac at 0123abcdef!"))
+
+    def test_the_issues_are_the_posters_with_the_title(self):
+        login = self.project.slug("Helper")
+        github = self.github([
+            {"number": 7, "title": "The default branch is red for vm/mac "
+             "at 0123abcdef", "author": {"login": login}},
+            {"number": 8, "title": "The default branch is red for vm/mac "
+             "at 0123abcdef", "author": {"login": "someoneelse"}},
+            {"number": 9, "title": "Something else",
+             "author": {"login": login}}])
+        self.assertEqual(m.instance_red_issues(github), {7})
+        args = github.api.call_args[0]
+        self.assertIn("labels[]=bug", args)
+        self.assertIn("owner=example", args)
+
+    def test_github_unread_means_none(self):
+        github = mock.Mock()
+        github.api.side_effect = RuntimeError("down")
+        self.assertEqual(m.instance_red_issues(github), set())
+
+    def test_a_pr_that_closes_it_outside_code_is_a_fix(self):
+        prs = [{"number": 1, "title": "Fix the Mac", "body": "Fixes #7"},
+               {"number": 2, "title": "x", "body": "`Fixes #7`"},
+               {"number": 3, "title": "Closes #7", "body": None},
+               {"number": 4, "title": "y", "body": "Fixes #70"}]
+        self.assertEqual(m.red_fixes_of(prs, {7}), frozenset({1, 3}))
+        self.assertEqual(m.red_fixes_of(prs, set()), frozenset())

@@ -889,6 +889,33 @@ class GreenNightly(unittest.TestCase):
             "builds published at 11:10Z) includes its fixes: check it on "
             "that build now.", reminder=router.ONCE)])
 
+    def test_rule_22_says_what_was_red(self):
+        # agent-forge #241: a red run's wake names what was red.
+        written = datetime.datetime.now(datetime.timezone.utc)
+        red = {"run": 80, "sha": "beef123" + "0" * 33,
+               "started": "2026-10-09T09:48:00Z",
+               "ended": "2026-10-09T11:10:00Z",
+               "red": ["build-and-test (test-slow)", "lint"]}
+        self.write({"at": written.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "published": red})
+        rules.configure(self.project, merger)
+        self.addCleanup(rules.configure, PROJECT, merger)
+        old = rules.ENVIRON
+        rules.ENVIRON = self.env
+        self.addCleanup(setattr, rules, "ENVIRON", old)
+        waiting = waiting_issue(green=None, labelled="2026-10-09T01:38:00Z")
+        rules.attach_published_nightly(None, "example/widget", [], [waiting])
+        (got,) = [d for d in rules.decide(waiting, context(waiting))
+                  if d.rule == 22]
+        self.assertIn("includes its fixes; the run is red: build-and-test "
+                      "(test-slow); lint, so check it was not what this "
+                      "issue fixes: check it on that build now.", got.line)
+        # A malformed `red` is left out, not fatal.
+        self.write({"at": written.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "published": dict(red, red="lint")})
+        self.assertNotIn("red", rules.published_nightly(
+            self.project, self.env))
+
 
 if __name__ == "__main__":
     unittest.main()
