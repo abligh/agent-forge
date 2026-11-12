@@ -5656,7 +5656,7 @@ def train_commits(repo, main_tip, entries, prs, run=sh):
 
 
 def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
-                github, run=sh, sleep=time.sleep, out=print):
+                github, run=sh, sleep=time.sleep, out=print, note=None):
     """merge.test_ahead.train_merge (designs/0047, amendment of
     2026-11-11): merge a green train with one pull request. The chain
     of `train_commits` is pushed to TRAIN_BRANCH<first>-<last>, given
@@ -5667,7 +5667,8 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
     another's branch is retargeted to the default branch first, or
     GitHub wouldn't. Returns (merged, unmerged): the members GitHub says
     are merged, and the rest, left to the usual path; ([], members)
-    when the train didn't go in, with the reason said."""
+    when the train didn't go in, with the reason said. `note`, a dict,
+    is given `pr`, the train's own pull request, once it is opened."""
     prs = {pr["number"]: pr for pr in queue}
     numbers = [e["pr"] for e in entries]
     span = "#%d..#%d" % (numbers[0], numbers[-1])
@@ -5721,6 +5722,8 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
         github.write("DELETE", "repos/%s/git/refs/heads/%s"
                      % (REPO_SLUG, branch))
         return fail("could not open its pull request: " + why)
+    if note is not None:
+        note["pr"] = number
     ok, why = github.write("PUT", "repos/%s/pulls/%d/merge"
                            % (REPO_SLUG, number), sha=top,
                            merge_method="merge",
@@ -6994,9 +6997,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                               repo, run,
                               restacks if PREDICT_RESTACKED else None)
         if entries:
+            opened = {}
             merged, _ = train_merge(repo, state_dir, entries, members,
                                     main_tip, check_state, github, run,
-                                    sleep, out)
+                                    sleep, out, opened)
             # GitHub wouldn't take the train: its members merge one at
             # a time this tick, updated as before.
             train_failed = not merged
@@ -7005,10 +7009,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 heads = {e["pr"]: e["head"] for e in entries}
                 prs_by = {pr["number"]: pr for pr in members}
                 for number in merged:
-                    record["decisions"].append({
+                    # train_pr: the pull request the train merged as,
+                    # for forge-flow ("merged as #N").
+                    record["decisions"].append(dict({
                         "action": "MERGE", "pr": number,
                         "head": heads[number], "result": "done",
-                        "train": True})
+                        "train": True}, **({"train_pr": opened["pr"]}
+                                           if "pr" in opened else {})))
                     note_closing(state_dir, number, when)
                     if STACKS:
                         stack = note_merge(state_dir, stack or {}, dict(

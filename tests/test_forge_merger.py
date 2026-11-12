@@ -4066,8 +4066,12 @@ class TickAhead(RepoCase):
         self.assertEqual([(d["pr"], d["action"], d.get("train"))
                           for d in record["decisions"]],
                          [(5, "MERGE", True), (6, "MERGE", True)])
-        self.assertTrue(any(line.startswith("TRAIN-MERGE #5..#6: merged 2")
-                            for line in lines))
+        # The pull request the train merged as, for forge-flow.
+        self.assertEqual([d.get("train_pr") for d in record["decisions"]],
+                         [900, 900])
+        self.assertTrue(any(line.startswith("TRAIN-MERGE #5..#6: merged 2 "
+                                            "as #900")
+                            for line in lines), lines)
         self.assertTrue(m.moved_a_stack(record))
 
     def behind_main_on_a_train(self, **ahead):
