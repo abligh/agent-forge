@@ -395,7 +395,9 @@ class Main(unittest.TestCase):
         self.assertEqual(saved["newest"], "red")
         self.assertEqual(saved["published"], {
             "run": 2, "sha": RED_SHA, "started": stamp(NOW - 3 * HOUR),
-            "ended": stamp(NOW - 2 * HOUR)})
+            "ended": stamp(NOW - 2 * HOUR),
+            # What was red, for rule 22's wake (agent-forge #241).
+            "red": ["build-and-test (test-slow)"]})
         self.assertIn("PUBLISHED run 2 at bbbbbbbbbb", self.out)
 
     def test_a_failed_or_missing_release_job_publishes_nothing(self):

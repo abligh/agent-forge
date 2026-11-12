@@ -160,7 +160,9 @@ key):
     among the last 30 label events fetched; none found wakes nobody)
     before the newest nightly run that published its builds started,
     red or green: the owner's, "check it on that build now", naming the
-    run, its commit and when it ended. A label that old means the fixes
+    run, its commit and when it ended, and on a red run what was red
+    ("the run is red: build-and-test (test-slow)", from forge-nightly's
+    record; agent-forge #241). A label that old means the fixes
     were in the build. It
     applies whatever the issue's `Defer-until:` says: no rule above
     reads one on an issue (only rule 15's offer does). The event is the
@@ -1676,7 +1678,12 @@ def published_nightly(project, environ=None, now=None):
     if not (isinstance(run, int) and not isinstance(run, bool)
             and isinstance(sha, str) and sha and started and ended):
         return None
-    return {"run": run, "sha": sha, "started": started, "ended": ended}
+    found = {"run": run, "sha": sha, "started": started, "ended": ended}
+    red = built.get("red")
+    if isinstance(red, list) and red and all(
+            isinstance(r, str) for r in red):
+        found["red"] = red
+    return found
 
 
 def attach_published_nightly(github, repo, prs, issues):
@@ -1734,12 +1741,15 @@ def nightly_turn(issue, roster, ctx):
     if labelled is None or labelled >= built["started"]:
         return None
     n = issue["number"]
+    red = built.get("red")
     return turn(n, owner, 22, built["ended"],
                 "waits for a nightly check, and nightly run %s (%s, builds "
-                "published at %s) includes its fixes: check it on that "
+                "published at %s) includes its fixes%s: check it on that "
                 "build now." % (
                     built["run"], built["sha"][:7],
-                    since_text(built["ended"], ctx.when)),
+                    since_text(built["ended"], ctx.when),
+                    "; the run is red: %s, so check it was not what this "
+                    "issue fixes" % "; ".join(red) if red else ""),
                 reminder=ONCE)
 
 
