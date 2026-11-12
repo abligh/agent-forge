@@ -79,10 +79,15 @@ target about 2).
    `merge.test_ahead.trains` is a dry run, the batch re-cuts a train
    would not have made and the trains' own changes.
 
-Between panels 2 and 3, the trains now (merger/ahead.json, each
-carriage a box) and the stacks now (the last Merger record's `stacked
-on #N` holds, each a tree rooted at its base, with where the base
-waits).
+Between panels 2 and 3, the trains now (merger/ahead.json, drawn as
+trains: an engine, then each carriage, a base and the stacked layers
+boarding with it, a box) and the stacks now (the last Merger record's
+`stacked on #N` holds, each a tree rooted at its base, with where the
+base waits and a status dot for each layer: green can merge, orange
+testing underway, red cannot merge). Pull requests the Merger puts
+first are marked urgent (labels.urgent) or elevated (a red nightly's
+or default branch's fix, from nightly/nightly.json and
+pr-check/state.json, or right of way).
 
 Also for designs/0047: approvals an hour (the first tick that listed
 each pull request), and pull requests per green batch top or train.
@@ -112,10 +117,11 @@ import math
 import os
 import re
 import sys
+import urllib.parse
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(BIN))
-from agent_forge import config, github, locks  # noqa: E402
+from agent_forge import config, github, locks, nightly  # noqa: E402
 
 PROG = "forge-flow"
 
@@ -164,6 +170,18 @@ STATES = (MERGING, SEARCH, BATCH_WAIT, HEAD_WAIT, HANDED, HELD, NOTHING,
 UPDATES = ("UPDATE", "STACK-UPDATE", "RESTACK", "RETARGET")
 
 STACKED_RE = re.compile(r"stacked on #(\d+)")
+# A layer whose base merged.
+MERGED_BELOW_RE = re.compile(r"stacked on #(\d+), which merged")
+# A layer held for the one below it and nothing of its own.
+STACKED_ONLY_RE = re.compile(r"^stacked on #(\d+)$")
+# Words in a hold that say a check or a train's run is still to come:
+# testing is underway, rather than the pull request being unable to
+# merge.
+UNDERWAY = ("pending", "expected", "(absent)", "waits for the new batch",
+            "in a train of")
+# A layer's status dot on the page, and a pull request's priority.
+GREEN, ORANGE, RED = "green", "orange", "red"
+URGENT, ELEVATED = "urgent", "elevated"
 HEADER_RE = re.compile(r"^=== (\S+) worker (?:#(\d+)|main) ([0-9a-f]+) "
                        r"(?:slot (\d+)|fast lane)( ahead)? ===")
 STOPPED_RE = re.compile(r"^(\S+) STOPPED (?:#(\d+)|main) ([0-9a-f]+) "
@@ -481,12 +499,34 @@ def hold_kind(reason):
     return "other"
 
 
+def carriages_of(entries, below):
+    """A train's entries (ahead.json's, in order) as carriages, lists of
+    pull request numbers: a base and the stacked layers that board with
+    it. ahead.json names each entry's carriage by its first pull
+    request (`carriage`); without that, a pull request held as stacked
+    on the one before it (`below`, {pr: the pr under it}) rides in that
+    one's carriage."""
+    named = all(e.get("carriage") is not None for e in entries)
+    out = []
+    for e in entries:
+        if out and (e["carriage"] == out[-1][0]["carriage"] if named
+                    else below.get(e["pr"]) == out[-1][-1]["pr"]):
+            out[-1].append(e)
+        else:
+            out.append([e])
+    return [[e["pr"] for e in car] for car in out]
+
+
 class Flow:
     """Every record, parsed once and indexed by time."""
 
     def __init__(self, state_dir, now, slots=None, reviewers=(),
-                 approvals=None):
+                 approvals=None, labelled=None):
         self.now = now
+        self.state_dir = state_dir
+        # The open pull requests carrying labels.urgent, from GitHub
+        # (--github), or None to infer them from ahead.json.
+        self.labelled = labelled
         self.start = now - BASELINE[1] - DAY
         pr_dir = os.path.join(state_dir, "pr-check")
         merger_dir = os.path.join(state_dir, "merger")
@@ -901,7 +941,13 @@ class Flow:
                     "count": sum(1 + k["count"] for k in kids),
                     "depth": max((1 + k["depth"] for k in kids), default=0)}
         snap = self.snapshot()
-        trains = {pr: t["train"] for t in self.trains() for pr in t["prs"]}
+        cut = self.trains()
+        trains = {pr: t["train"] for t in cut for pr in t["prs"]}
+
+        def mark(node):
+            node["status"], node["why"] = self.status(node["pr"], cut, snap)
+            for k in node["layers"]:
+                mark(k)
         roots = []
         for root in {pr for pr in above if pr not in below} | {
                 base for base in below.values() if base not in below}:
@@ -920,6 +966,7 @@ class Flow:
                 where = "not a candidate (not approved, its own check " \
                         "not green, or not open)"
             t["root_where"] = where
+            mark(t)
             roots.append(t)
         roots.sort(key=lambda t: (-t["count"], t["pr"]))
         return roots
@@ -959,9 +1006,16 @@ class Flow:
             if entries[at:]:
                 groups[None] = entries[at:]
         out = []
+        below = {}
+        if self.records:
+            for pr, reason in (self.records[-1].get("held") or {}).items():
+                got = STACKED_RE.search(str(reason))
+                if got and str(pr).isdigit():
+                    below[int(pr)] = int(got.group(1))
         for n, (train, cars) in enumerate(groups.items()):
             if train is None:
                 out.append({"train": None, "prs": [e["pr"] for e in cars],
+                            "carriages": [[e["pr"]] for e in cars],
                             "top": None, "state": "predicted, not yet in "
                             "a train", "since": None, "urgent": False})
                 continue
@@ -982,10 +1036,144 @@ class Flow:
                 state = run["end"]["res"]
             out.append({
                 "train": train, "prs": [e["pr"] for e in cars],
+                "carriages": carriages_of(cars, below),
                 "top": top[:10], "state": state,
                 "since": stamp(run["t"]) if run else None,
                 "urgent": bool(urgent & {e["pr"] for e in cars})})
         return out
+
+    # ------------------------------------------------- status, priority
+
+    def own_check(self, pr):
+        """What the build check last said of `pr`'s own head: "running",
+        a run's result ("green", "red", "red(merge)", "stopped"), or None
+        when it has run nothing for it. A green it posted without a
+        run (MATCHED, COVERED) counts. The head is the last one it ran,
+        which may since have been pushed over."""
+        said = []
+        for run in self.runs:
+            if run["pr"] == pr and run["kind"] in ("head", LANE):
+                said.append((run["end"]["t"], run["end"]["res"])
+                            if run["end"] else (run["t"], "running"))
+        for (number, _), greens in self.events.items():
+            if number == pr:
+                said.extend((at, "green") for at, _ in greens)
+        return max(said, key=lambda s: s[0])[1] if said else None
+
+    def _fixes(self):
+        """(nightly, main_red): the open pull requests that fix a red
+        nightly (forge-nightly's file, while fresh and its issue is
+        open) and a red default branch (the build check's state.json,
+        while its issue is open), as the Merger reads them."""
+        got = load_json(os.path.join(self.state_dir, "nightly",
+                                     nightly.NIGHTLY_FILE), {})
+        night = set()
+        try:
+            fresh = self.now - nightly.parse_time(got["at"]) <= nightly.FRESH
+        except (KeyError, TypeError, ValueError, AttributeError):
+            fresh = False
+        if fresh and got.get("issue_open") and isinstance(
+                got.get("fixes"), list):
+            night = {n for n in got["fixes"] if isinstance(n, int)
+                     and not isinstance(n, bool)}
+        red = (load_json(os.path.join(self.state_dir, "pr-check",
+                                      "state.json"), {}) or {}).get(
+            "main_red")
+        main = set()
+        if isinstance(red, dict) and red.get("issue") and isinstance(
+                red.get("fixes"), list):
+            main = {n for n in red["fixes"] if isinstance(n, int)
+                    and not isinstance(n, bool)}
+        return night, main
+
+    def priorities(self):
+        """{str(pr): {"level", "why"}} for the pull requests the Merger
+        puts ahead of the rest: `urgent` for those carrying
+        labels.urgent, `elevated` for the others it treats as urgent
+        (a red nightly's or default branch's fix) and for the one with
+        right of way. Normal ones are left out.
+
+        The labels come from GitHub with --github; otherwise they are
+        inferred: ahead.json's `urgent_cut` lists every queued pull
+        request the Merger found urgent, so one there that fixes
+        nothing red carries the label."""
+        night, main = self._fixes()
+        labelled = self.labelled
+        inferred = labelled is None
+        if inferred:
+            labelled = {n for n in self.ahead.get("urgent_cut") or ()
+                        if isinstance(n, int)} - night - main
+        out = {}
+
+        def put(pr, level, why):
+            out.setdefault(str(pr), {"level": level, "why": why})
+        for pr in sorted(labelled):
+            put(pr, URGENT, "urgent: carries the urgent label%s" % (
+                " (the Merger cut a train for it and it fixes nothing "
+                "red)" if inferred else ""))
+        for pr in sorted(main):
+            put(pr, ELEVATED, "elevated: fixes the red default branch")
+        for pr in sorted(night):
+            put(pr, ELEVATED, "elevated: fixes the red nightly")
+        row = ((self.records[-1].get("right_of_way") or {})
+               if self.records else {}).get("pr")
+        if isinstance(row, int):
+            put(row, ELEVATED, "elevated: has right of way")
+        return out
+
+    def status(self, pr, trains=None, snap=None):
+        """(colour, why) for `pr` at the last tick, for a stack's status
+        dot: green, it can merge (eligible, or a layer whose own check
+        is green, waiting only for the one below; or a member of a
+        green train); orange, testing is underway (its own check, or
+        the train it is in, is running or waiting for a slot, or its
+        hold waits on a check); red, it cannot merge as it is (any
+        other hold, handed back, red, or not a candidate). The
+        Merger's last record decides first, then the build check."""
+        if not self.records:
+            return RED, "no Merger record"
+        last = self.records[-1]
+        trains = self.trains() if trains is None else trains
+        snap = self.snapshot() if snap is None else snap
+        held = {int(k): str(v) for k, v in (last.get("held") or {}).items()}
+        queue = set(last.get("queue") or ())
+        for t in trains:
+            if pr not in t["prs"] or t["train"] is None:
+                continue
+            state = t["state"]
+            if state.startswith("green"):
+                return GREEN, "in train %d, green: merging" % t["train"]
+            if state == "red":
+                return RED, "in train %d, whose top is red" % t["train"]
+            return ORANGE, "in train %d: %s" % (t["train"], state)
+        if pr in snap.get("handed_back", ()):
+            return RED, "handed back to its author"
+        gone = {int(g.group(1)) for g in (MERGED_BELOW_RE.search(r)
+                                          for r in held.values()) if g}
+        if pr not in held and pr not in queue and (pr in gone or any(
+                m["pr"] == pr for m in self.merges)):
+            return GREEN, "merged"
+        own = self.own_check(pr)
+        if pr in held:
+            reason = held[pr]
+            got = STACKED_ONLY_RE.match(reason)
+            if got:
+                below = "waits for #%s below it" % got.group(1)
+                if own == "green":
+                    return GREEN, "approved, its own check green; %s" % below
+                if own in (None, "running", "stopped"):
+                    return ORANGE, "approved, its own check %s; %s" % (
+                        "not run yet" if own is None else own, below)
+                return RED, "its own check is %s; %s" % (own, below)
+            if any(w in reason for w in UNDERWAY):
+                return ORANGE, "held: %s" % reason
+            return RED, "held: %s" % reason
+        if pr in queue:
+            if own == "running":
+                return ORANGE, "eligible, its own check running"
+            return GREEN, "eligible: in the Merger's queue"
+        return RED, ("not a candidate (not approved, its own check not "
+                     "green, or not open)")
 
     def hourly(self, hours=24):
         """The last `hours` clock hours, oldest first: each hour's
@@ -1218,6 +1406,19 @@ def first_approvals(token, repo, numbers, cache, call=github.api_call):
     return cache
 
 
+def labelled_open(token, repo, label, call=github.api_call):
+    """The open pull requests carrying `label`, a set of numbers, from
+    GitHub's issue list (one request a hundred)."""
+    status, items = github.paged(
+        token, "/repos/%s/issues?state=open&labels=%s"
+        % (repo, urllib.parse.quote(label, safe="")), call=call)
+    if status != 200:
+        raise RuntimeError("GitHub answered %s for the %s label"
+                           % (status, label))
+    return {i["number"] for i in items if isinstance(i, dict)
+            and "pull_request" in i and isinstance(i.get("number"), int)}
+
+
 # ---------------------------------------------------------------- page
 
 # The categorical slots, in their fixed order, one for each state.
@@ -1248,11 +1449,11 @@ CSS = """
 :root{color-scheme:light;--bg:#f9f9f7;--card:#fcfcfb;--ink:#0b0b0b;
 --ink2:#52514e;--muted:#898781;--grid:#e1e0d9;--axis:#c3c2b7;
 --ring:rgba(11,11,11,.10);--c1:#2a78d6;--c2:#eb6834;--ok:#2f8f4e;
---warn:#c2410c;%s}
+--warn:#c2410c;--bad:#c62828;--amber:#b45309;--onc:#fff;%s}
 @media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#0d0d0d;
 --card:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--grid:#2c2c2a;--axis:#383835;
 --ring:rgba(255,255,255,.10);--c1:#3987e5;--c2:#d95926;--ok:#3fae64;
---warn:#ea7a3c;%s}}
+--warn:#ea7a3c;--bad:#ef6b6b;--amber:#f0a33a;--onc:#111;%s}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
 font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -1296,6 +1497,59 @@ border:2px solid var(--axis);color:var(--ink);text-decoration:none}
 .t-green .car{border-color:var(--ok);background:var(--ok);color:var(--card)}
 .t-red .car{border-color:var(--c2)}
 .urgent{color:var(--warn);font-weight:600}
+.cars{row-gap:12px}
+.carriage{position:relative;display:inline-flex;flex-wrap:wrap;gap:3px;
+align-items:center;padding:4px 5px 8px;margin:0 0 6px;border:2px solid
+var(--axis);border-radius:9px;background:var(--card)}
+.carriage:before,.carriage:after{content:"";position:absolute;bottom:-7px;
+width:10px;height:10px;border-radius:50%%;background:var(--ink2);
+border:2px solid var(--card)}
+.carriage:before{left:8px}.carriage:after{right:8px}
+.carriage.van{border-style:dashed}
+.carriage .tail{position:absolute;right:-5px;top:5px;width:7px;height:7px;
+border-radius:50%%;background:var(--bad)}
+.coupling{display:inline-block;width:10px;height:3px;border-radius:2px;
+background:var(--ink2);margin:0 -4px 6px}
+.carriage.mini{padding:1px 3px 6px;margin:0 2px 0 0}
+.carriage.mini .car{min-width:22px;padding:0 3px}
+.carriage.mini:before,.carriage.mini:after{width:7px;height:7px;bottom:-5px}
+.engine{flex:none;overflow:visible;margin:0 0 4px}
+.engine .body{fill:var(--ink2)}.engine .roof{fill:var(--ink)}
+.engine .win{fill:var(--card)}.engine .wheel{fill:var(--ink);
+stroke:var(--card);stroke-width:1.5}
+.engine .lamp{fill:var(--axis);stroke:var(--ink);stroke-width:.8}
+.engine .puff{fill:var(--muted);opacity:.45}
+.engine .pole{stroke:var(--ink);stroke-width:1.2}
+.engine .flag,.engine .pole{display:none}
+.t-green .engine .flag,.t-green .engine .pole{display:inline}
+.t-green .engine .flag{fill:var(--ok)}.t-green .engine .lamp{fill:var(--ok)}
+.t-red .engine .lamp{fill:var(--bad)}
+.t-testing .engine .lamp{fill:var(--amber)}
+.t-testing .engine .puff{transform-box:fill-box;transform-origin:center;
+animation:puff 2.4s ease-out infinite}
+.t-testing .engine .p2{animation-delay:.8s}
+.t-testing .engine .p3{animation-delay:1.6s}
+@keyframes puff{0%%{opacity:.7;transform:translate(3px,5px) scale(.6)}
+100%%{opacity:0;transform:translate(-4px,-4px) scale(1.5)}}
+@media (prefers-reduced-motion:reduce){.engine .puff{animation:none
+!important}}
+.train.legend{display:inline-flex;align-items:center;gap:4px;margin:0}
+.train.legend .engine{width:40px;height:26px;margin:0}
+.siding .cars{opacity:.85}
+.pri{display:inline-block;margin:0 0 0 3px;padding:0 4px;border-radius:4px;
+font-size:11px;font-weight:700;line-height:15px;vertical-align:1px}
+.pri.p-urgent{background:var(--bad);color:var(--onc)}
+.pri.p-elevated{background:var(--amber);color:var(--onc)}
+.t-green .car .pri{outline:1px solid var(--card)}
+.dot{display:inline-block;width:10px;height:10px;margin:0 6px 0 0;
+vertical-align:0}
+.dot.d-green{background:var(--ok);border-radius:50%%}
+.dot.d-orange{border:2px solid var(--amber);border-radius:50%%;
+background:linear-gradient(90deg,var(--amber) 50%%,transparent 50%%)}
+.dot.d-red{background:var(--bad);border-radius:2px;
+transform:rotate(45deg) scale(.85)}
+.vh{position:absolute;width:1px;height:1px;overflow:hidden;
+clip:rect(0 0 0 0);white-space:nowrap}
 ul.stack,ul.stack ul{list-style:none;margin:0;padding:0 0 0 16px}
 ul.stack{padding:0}ul.stack ul{border-left:1px solid var(--axis);
 margin-left:6px}ul.stack li{margin:1px 0}
@@ -1725,6 +1979,83 @@ def train_class(state):
             else "t-wait")
 
 
+# What a train's engine shows, by its class.
+ENGINE_SAYS = {"t-green": "green: merging, flag out",
+               "t-testing": "testing: steaming",
+               "t-red": "red: lamp lit red",
+               "t-wait": "waiting for a slot: standing"}
+# What a stack's status dot means, by its colour.
+DOT_SAYS = {GREEN: "can merge", ORANGE: "testing underway",
+            RED: "cannot merge"}
+PRI_MARK = {URGENT: "!!", ELEVATED: "!"}
+
+
+def engine_svg(cls):
+    """A small locomotive facing left, the way the train goes: puffs of
+    steam (moving only while it tests), a lamp at the front and a flag
+    on the cab once it is green. Colours come from the train's class."""
+    return (
+        '<svg class="engine" viewBox="0 0 66 42" width="66" height="42" '
+        'role="img" aria-label="engine, %s"><title>engine, %s</title>'
+        '<circle class="puff p1" cx="13" cy="9" r="3"/>'
+        '<circle class="puff p2" cx="9" cy="5" r="3.5"/>'
+        '<circle class="puff p3" cx="15" cy="2.5" r="2.5"/>'
+        '<rect class="body" x="10" y="11" width="7" height="8" rx="1"/>'
+        '<rect class="body" x="4" y="18" width="36" height="13" rx="4"/>'
+        '<rect class="body" x="38" y="9" width="20" height="22" rx="2"/>'
+        '<rect class="roof" x="36" y="7" width="24" height="3" rx="1"/>'
+        '<rect class="win" x="43" y="13" width="10" height="7" rx="1"/>'
+        '<path class="body" d="M0 35 L5 28 L7 35 Z"/>'
+        '<circle class="lamp" cx="5" cy="22" r="3"/>'
+        '<line class="pole" x1="57" y1="7" x2="57" y2="0"/>'
+        '<path class="flag" d="M57 0 L65 2.5 L57 5 Z"/>'
+        '<circle class="wheel" cx="14" cy="35" r="5"/>'
+        '<circle class="wheel" cx="29" cy="35" r="5"/>'
+        '<circle class="wheel" cx="49" cy="36" r="4"/></svg>'
+        % ((esc(ENGINE_SAYS[cls]),) * 2))
+
+
+def pri_html(data, pr):
+    """A priority badge for `pr`: "!!" urgent, "!" elevated, or
+    nothing."""
+    got = (data.get("priority") or {}).get(str(pr))
+    if not got or got.get("level") not in PRI_MARK:
+        return ""
+    return ('<span class="pri p-%s" title="%s"><span aria-hidden="true">'
+            '%s</span><span class="vh"> (%s)</span></span>'
+            % (got["level"], esc(got.get("why")), PRI_MARK[got["level"]],
+               esc(got["level"])))
+
+
+def dot_html(colour, why):
+    if colour not in DOT_SAYS:
+        return ""
+    said = DOT_SAYS[colour] + (": %s" % why if why else "")
+    return ('<i class="dot d-%s" role="img" aria-label="%s" title="%s">'
+            "</i>" % (colour, esc(said), esc(said)))
+
+
+def train_legend():
+    return ('<div class="key">%s<span><span class="carriage mini">'
+            '<span class="car">#</span></span>a carriage: a pull request '
+            "and the stacked layers that board with it</span>"
+            '<span><span class="carriage mini van"><span class="car lg top">'
+            "#</span></span>the guard's van: the top's carriage</span>"
+            "%s</div>" % ("".join(
+                '<span class="train %s legend">%s%s</span>'
+                % (cls, engine_svg(cls), esc(ENGINE_SAYS[cls]))
+                for cls in ("t-testing", "t-wait", "t-green", "t-red")),
+                pri_legend()))
+
+
+def pri_legend():
+    return ('<span><span class="pri p-urgent">!!</span> urgent: carries '
+            'the urgent label</span><span><span class="pri p-elevated">!'
+            "</span> elevated: the Merger puts it first all the same (it "
+            "fixes a red nightly or default branch) or it has right of "
+            "way</span>")
+
+
 def trains_html(data):
     trains = data.get("trains") or []
     if not trains:
@@ -1732,43 +2063,72 @@ def trains_html(data):
                 "the Merger is testing nothing ahead.</p></section>")
     rows = []
     for n, t in enumerate(trains):
-        cars = []
-        for i, pr in enumerate(t["prs"]):
-            top = i == len(t["prs"]) - 1
-            cars.append('<span class="car%s" title="%s">%s</span>' % (
-                " top" if top else "",
-                "the top, %s, is tested for the whole train" % esc(t["top"])
-                if top else "carriage %d" % (i + 1), pr_link(data, pr)))
+        carriages = t.get("carriages") or [[pr] for pr in t["prs"]]
+        top_pr = t["prs"][-1]
+        boxes = []
+        for c, car in enumerate(carriages):
+            van = top_pr in car and t["train"] is not None
+            inner = "".join(
+                '<span class="car%s" title="%s">%s%s</span>' % (
+                    " top" if pr == top_pr and t["train"] is not None
+                    else "",
+                    "the top, %s, is tested for the whole train"
+                    % esc(t["top"]) if pr == top_pr and t["train"]
+                    is not None else "carriage %d of %d"
+                    % (c + 1, len(carriages)),
+                    pr_link(data, pr), pri_html(data, pr)) for pr in car)
+            boxes.append('<span class="carriage%s" title="%s">%s%s</span>'
+                         % (" van" if van else "",
+                            "the guard's van, carriage %d" % (c + 1)
+                            if van else "carriage %d: %s" % (
+                                c + 1, ", ".join("#%d" % p for p in car)),
+                            inner, '<i class="tail" aria-hidden="true"></i>'
+                            if van else ""))
+        couple = '<i class="coupling" aria-hidden="true"></i>'
+        count = "%d PR%s in %d carriage%s" % (
+            len(t["prs"]), "" if len(t["prs"]) == 1 else "s",
+            len(carriages), "" if len(carriages) == 1 else "s")
         if t["train"] is None:
-            rows.append('<div class="train t-wait"><p class="lab">Next in '
-                        "the queue, predicted but in no train yet</p>"
-                        '<div class="cars">%s</div></div>' % "".join(
-                            '<span class="car">%s</span>' % pr_link(data, pr)
-                            for pr in t["prs"]))
+            rows.append('<div class="train t-wait siding"><p class="lab">'
+                        "Next in the queue, predicted but in no train yet "
+                        '· %s</p><div class="cars">%s</div></div>'
+                        % (count, couple.join(boxes)))
             continue
-        label = "%s · %d PR%s · %s%s · top %s%s" % (
+        cls = train_class(t["state"])
+        label = "%s · %s · %s%s · top %s%s" % (
             "Train %d (merging next)" % t["train"] if n == 0 else
-            "Train %d" % t["train"], len(t["prs"]),
-            "" if len(t["prs"]) == 1 else "s", esc(t["state"]),
+            "Train %d" % t["train"], count, esc(t["state"]),
             " since %s" % esc(t["since"]) if t.get("since") else "",
             esc(t["top"]),
             ' · <span class="urgent">cut for urgent PRs</span>'
             if t.get("urgent") else "")
         rows.append('<div class="train %s"><p class="lab">%s</p>'
-                    '<div class="cars">%s</div></div>'
-                    % (train_class(t["state"]), label, "".join(cars)))
-    return ("<section><h2>Trains now</h2>%s<p class=\"note\">From "
-            "ahead.json at %s. Each train merges front to back once its "
-            "top (double border), tested with every carriage before it, "
-            "is green. Blue: testing; green: green, merging; grey: waiting "
-            "for a slot.</p></section>"
-            % ("".join(rows), esc(data.get("ahead_at"))))
+                    '<div class="cars">%s%s%s</div></div>'
+                    % (cls, label, engine_svg(cls), couple,
+                       couple.join(boxes)))
+    return ("<section><h2>Trains now</h2>%s%s<p class=\"note\">From "
+            "ahead.json at %s. Each train leaves engine first and merges "
+            "front to back once its top (the double border, in the guard's "
+            "van at the back), tested with every pull request before it, "
+            "is green. A carriage is a pull request with the stacked "
+            "layers that board with it (ahead.json's <i>carriage</i>, or "
+            "a layer held as stacked on the one before it). Priority: "
+            "<b>!!</b> urgent, carrying the urgent label (read from GitHub "
+            "with --github; otherwise inferred, as one the Merger cut a "
+            "train for, ahead.json's <i>urgent_cut</i>, that fixes nothing "
+            "red); <b>!</b> elevated, a fix of a red nightly "
+            "(forge-nightly's file) or default branch (the build check's "
+            "state.json), or the holder of right of way (the last Merger "
+            "record).</p></section>"
+            % ("".join(rows), train_legend(), esc(data.get("ahead_at"))))
 
 
 def stack_items(data, node):
     inner = "".join(stack_items(data, k) for k in node["layers"])
-    return "<li>%s%s</li>" % (pr_link(data, node["pr"]),
-                              "<ul>%s</ul>" % inner if inner else "")
+    return "<li>%s%s%s%s</li>" % (
+        dot_html(node.get("status"), node.get("why")),
+        pr_link(data, node["pr"]), pri_html(data, node["pr"]),
+        "<ul>%s</ul>" % inner if inner else "")
 
 
 def stacks_html(data):
@@ -1785,13 +2145,31 @@ def stacks_html(data):
             % (" open" if t["count"] >= 3 else "", pr_link(data, t["pr"]),
                t["count"], "" if t["count"] == 1 else "s", t["depth"],
                esc(t["root_where"]), stack_items(data, t)))
+    key = '<div class="key">%s%s</div>' % ("".join(
+        "<span>%s%s</span>" % (dot_html(c, None), esc(DOT_SAYS[c]))
+        for c in (GREEN, ORANGE, RED)), pri_legend())
     return ("<section><h2>Stacks now</h2><p class=\"now\"><b>%d</b> "
-            "layers in <b>%d</b> stacks.</p>%s<p class=\"note\">Each tree "
-            "is rooted at the stack's base, the pull request on the "
+            "layers in <b>%d</b> stacks.</p>%s%s<p class=\"note\">Each "
+            "tree is rooted at the stack's base, the pull request on the "
             "default branch; every layer above it waits (held as "
             "<i>stacked on #N</i>) until the one below merges, so where "
-            "the base waits is where the whole stack waits.</p></section>"
-            % (layers, len(stacks), "".join(parts)))
+            "the base waits is where the whole stack waits. Each dot is "
+            "the Merger's last record first, then the build check; hover "
+            "it for why. <b>Green</b>, can merge: in a green train, in "
+            "the Merger's queue (eligible), merged, or a layer held only "
+            "as stacked whose own check last said green. <b>Orange</b>, "
+            "testing underway: in a train testing or waiting for a slot, "
+            "its own check running or not yet run while only stacked, a "
+            "queued one whose check is running, or held for a check "
+            "still pending. <b>Red</b>, cannot merge: in a red train, "
+            "handed back, held for anything else (a conflict, a review "
+            "after the approval, Blocked-by, a draft, a label, a red "
+            "check), its own check red, or not a candidate at all (not "
+            "approved or not open). The own check is the last one the "
+            "build check ran for the pull request, which a push since "
+            "may have made stale. Priority marks as in the trains."
+            "</p></section>"
+            % (layers, len(stacks), "".join(parts), key))
 
 
 def page(data):
@@ -2040,6 +2418,7 @@ def compute(flow, project_name, repo=None):
             flow.snapshot(), "graph_hours": flow.graph_hours(),
             "build_times": flow.build_times(), "stacks": flow.stacks(),
             "trains": flow.trains(), "ahead_at": flow.ahead.get("at"),
+            "priority": flow.priorities(),
             "repo": repo}
 
 
@@ -2099,6 +2478,15 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
             write(cache_path, json.dumps(approvals, sort_keys=True))
         except (RuntimeError, github.MintError, OSError) as error:
             err("%s: GitHub's approvals left out: %s" % (PROG, error))
+        label = project.section("labels").get("urgent")
+        if label:
+            try:
+                token = token or github.read_token(project, environ)
+                flow.labelled = labelled_open(token, project.repo, label,
+                                              call)
+            except (RuntimeError, github.MintError, OSError) as error:
+                err("%s: urgent labels inferred, not read: %s"
+                    % (PROG, error))
     data = compute(flow, name, project.repo if project else None)
     write(os.path.join(args.out, "flow.json"),
           json.dumps(data, indent=1, sort_keys=True))
