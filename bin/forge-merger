@@ -567,7 +567,12 @@ as a parent and the tree its prediction tested, is pushed to
 `train_branch` + `<first>-<last>`, given `checks.context`'s green, and
 merged by one pull request as a merge commit pinned to its top
 (`TRAIN-MERGE`). GitHub then marks each member merged; any it doesn't,
-and any train it refuses, merge one at a time as before.
+and any train it refuses, merge one at a time as before. A member of
+the first train behind the default branch is not updated meanwhile
+(amendment of 2026-11-12): the update would change nothing the train
+merges and only start a build of its new head, so it waits for the
+top (`WAIT`, "in a train of N that merges as one"). A train of one, a
+red top, and a train GitHub refused this tick are updated as before.
 With `tell_boarded` (agent-forge #286), each pull request that boards a
 live train is told once, in a `Not-a-review` comment, not to push to it
 unless it is handed back (`TOLD-BOARDED #<pr> <sha>`, the record's
@@ -980,6 +985,10 @@ BASE_RED_REASON = ("%s is red only in %s, as %s is at %s; waits for it to "
                    "be fixed")
 BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
                      "waits for the new batch's top")
+# merge.test_ahead.train_merge: a train's member behind the default
+# branch waits for its train rather than being updated.
+TRAIN_WAIT_REASON = ("in a train of %d that merges as one; not updated, "
+                     "it waits for the train's top")
 # The most ticks one run makes: it ticks again straight after a merge.
 TICKS_PER_RUN = 10
 # merge.test_ahead.train_merge (designs/0047, amendment of 2026-11-11):
@@ -5369,6 +5378,28 @@ def train_ready(last, queue, main_tip, check_state, repo=None, run=sh,
     return ready
 
 
+def train_boarded(last, pr, check_state):
+    """merge.test_ahead.train_merge: the size of the first train in
+    `last` (ahead.json) when `pr` is boarded on it at the head it has,
+    the train has two or more members and its top isn't red, else None.
+    Such a train goes in as one merge of its tested top (`train_merge`),
+    so `pr` needs no UPDATE of its own: GitHub's merge of the default
+    branch into it changes nothing the train merges and only starts a
+    build of the new head (amendment of 2026-11-12)."""
+    if not (last or {}).get("trains"):
+        return None
+    batch = (last or {}).get("batch") or {}
+    entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
+    if len(entries) < 2 or [e.get("tree") for e in entries] \
+            != batch.get("trees") \
+            or tree_verdict(check_state, entries[-1].get("tree")) is False:
+        return None
+    if not any(e.get("pr") == pr["number"]
+               and e.get("head") == pr["headRefOid"] for e in entries):
+        return None
+    return len(entries)
+
+
 def train_commits(repo, main_tip, entries, prs, run=sh):
     """The chain of merge commits for a green train: for each member, in
     order, a commit of the tree its prediction tested, whose parents are
@@ -6593,9 +6624,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                                  when, any_base=True)[0] is not None]
     # merge.test_ahead.train_merge: a green train goes in as one. Every
     # ready member merges this tick, not one a tick.
-    trained = None
-    if TRAIN_MERGE and live and retarget is None and AHEAD_BATCH > 1:
+    trained, train_failed, last_ahead = None, False, None
+    if TRAIN_MERGE and retarget is None and AHEAD_BATCH > 1:
         last_ahead = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+    if TRAIN_MERGE and live and retarget is None and AHEAD_BATCH > 1:
         entries = train_ready(last_ahead, queue, main_tip, check_state,
                               repo, run, restacks if PREDICT_RESTACKED
                               else None)
@@ -6603,6 +6635,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             merged, _ = train_merge(repo, state_dir, entries, queue,
                                     main_tip, check_state, github, run,
                                     sleep, out)
+            # GitHub wouldn't take the train: its members merge one at
+            # a time this tick, updated as before.
+            train_failed = not merged
             if merged:
                 trained = set(merged)
                 heads = {e["pr"]: e["head"] for e in entries}
@@ -6665,6 +6700,17 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             decision = {"action": "WAIT", "pr": pr["number"],
                         "head": pr["headRefOid"],
                         "reason": BATCH_WAIT_REASON}
+        boarded = train_boarded(last_ahead, pr, check_state) \
+            if decision["action"] == "UPDATE" and last_ahead \
+            and not train_failed else None
+        if boarded:
+            # merge.test_ahead.train_merge: its train goes in as one
+            # merge of the tested top, which needs no update of the
+            # member's own; an update would only start a build of the
+            # new head (amendment of 2026-11-12).
+            decision = {"action": "WAIT", "pr": pr["number"],
+                        "head": pr["headRefOid"],
+                        "reason": TRAIN_WAIT_REASON % boarded}
         if (decision["action"] == "UPDATE"
                 and said.get(str(pr["number"])) == hand_back_key(
                     approval, pr["headRefOid"], CONFLICT_REASON)):

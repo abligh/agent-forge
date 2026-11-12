@@ -3951,6 +3951,77 @@ class TickAhead(RepoCase):
                             for line in lines))
         self.assertTrue(m.moved_a_stack(record))
 
+    def behind_main_on_a_train(self, **ahead):
+        """#5 and #6 boarded on one train, then main moves on, so #5,
+        first in the queue, is behind it: the second tick's record."""
+        m.configure(project(test_ahead=dict({"batch": 2, "trains": "live"},
+                                            **ahead)))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        self.assertEqual(self.ahead_json()["batch"]["size"], 2)
+        self.advance_main("n.txt")
+        record, _ = self.tick(prs, live=True, minutes=1)
+        return record
+
+    def test_a_train_that_merges_as_one_is_not_updated_member_by_member(self):
+        # Amendment of 2026-11-12: with train_merge, the first member's
+        # update only started a build of its new head; the train goes in
+        # as one merge of its tested top.
+        record = self.behind_main_on_a_train(train_merge=True)
+        five = [d for d in record["decisions"] if d["pr"] == 5]
+        self.assertEqual([(d["action"], d.get("reason")) for d in five],
+                         [("WAIT", m.TRAIN_WAIT_REASON % 2)])
+        self.assertNotIn("update-branch",
+                         " ".join(w[1] for w in self.github.writes))
+
+    def test_a_train_github_would_not_take_is_updated_as_before(self):
+        m.configure(project(test_ahead={"batch": 2, "trains": "live",
+                                        "train_merge": True}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        self.advance_main("n.txt")
+        # The default branch moved to a tree the train predicted (as
+        # when the train ahead merged): here, by pretending its base.
+        said = self.ahead_json()
+        said["base"] = self.repo.main_tip()
+        m.save_json(os.path.join(self.state, m.AHEAD_FILE), said)
+        with mock.patch.object(m, "CI_WORKFLOW", "ci.yml"):
+            record, lines = self.tick(
+                prs, live=True, minutes=1, check_state={"results": {
+                    top["sha"]: {"tree": top["tree"], "ok": True}}})
+        self.assertTrue(any("each member merges on its own" in line
+                            for line in lines), lines)
+        self.assertEqual([d["action"] for d in record["decisions"]
+                          if d["pr"] == 5], ["UPDATE"])
+
+    def test_without_train_merge_the_first_member_is_updated(self):
+        record = self.behind_main_on_a_train()
+        self.assertEqual([d["action"] for d in record["decisions"]
+                          if d["pr"] == 5], ["UPDATE"])
+
+    def test_train_boarded(self):
+        entries = [{"pr": 5, "head": "a", "tree": "t5"},
+                   {"pr": 6, "head": "b", "tree": "t6"}]
+        last = {"trains": True, "entries": entries,
+                "batch": {"size": 2, "trees": ["t5", "t6"]}}
+        five = {"number": 5, "headRefOid": "a"}
+        self.assertEqual(m.train_boarded(last, five, {}), 2)
+        # At another head, or not on the first train, it is updated.
+        self.assertIsNone(m.train_boarded(last, dict(five, headRefOid="c"),
+                                          {}))
+        self.assertIsNone(m.train_boarded(last, {"number": 7,
+                                                 "headRefOid": "a"}, {}))
+        # Nor on a train of one, which merges on its own, nor batches
+        # that aren't trains, nor a train whose top is red.
+        one = dict(last, entries=entries[:1],
+                   batch={"size": 1, "trees": ["t5"]})
+        self.assertIsNone(m.train_boarded(one, five, {}))
+        self.assertIsNone(m.train_boarded(dict(last, trains=False), five,
+                                          {}))
+        red = {"results": {"x": {"tree": "t6", "ok": False}}}
+        self.assertIsNone(m.train_boarded(last, five, red))
+
     def test_later_batches_are_written_and_fixed_once_started(self):
         # designs/0035 part 2.
         m.configure(project(test_ahead={"batch": 2, "batches": 2,

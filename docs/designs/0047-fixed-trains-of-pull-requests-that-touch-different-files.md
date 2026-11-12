@@ -590,3 +590,20 @@ merge commits has each member's head as a parent, so the Merger
 re-checks a member whose head moved since the train was predicted,
 by the same rule, and gives the chain its new head. The tree each
 commit carries is still the one its prediction tested.
+
+## Amendment (2026-11-12, second): no update of a train's first member with `train_merge`
+
+**What happened.** With `train_merge` on, a green train goes in as one
+merge of its tested top, whose chain of merge commits doesn't need any
+member to be up to date. But the Merger still updated the first member
+when it was behind the default branch, as it would to merge it on its
+own. The update changed nothing the train would merge; it only gave
+the member a new head, whose build the build check then ran.
+
+**The rule.** With `train_merge`, a pull request on the first train
+(two or more members, at the head it boarded with, its top not red) is
+not updated: the Merger waits for the train's top instead (`WAIT`, "in
+a train of N that merges as one; not updated"). A train of one, a red
+top, and a train GitHub refused this tick (`TRAIN-MERGE ...; each
+member merges on its own`) are updated as before, as is anything not
+on a train.
