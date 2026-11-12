@@ -200,7 +200,8 @@ class World:
     def gate_verdict(self, number):
         """The gated instance's verdict for #`number` as the Merger reads
         it: on the head, or, while that has none final, on the commit
-        before each merge of the default branch into it."""
+        before each merge of the default branch, or of a merged layer's
+        final head (RESTACK: its tree is a squash on main), into it."""
         sha, first = self.prs[number]["head"], None
         for _ in range(20):
             state = next((s["state"] for s in self.statuses.get(sha, ())
@@ -215,7 +216,9 @@ class World:
             got = subprocess.run(
                 ["git", "-C", self.origin, "merge-base", "--is-ancestor",
                  parents[2], self.main()], env=git_env())
-            if got.returncode != 0:
+            if got.returncode != 0 and self.tree(parents[2]) not in self.og(
+                    "log", "--first-parent", "--format=%T",
+                    self.main()).split():
                 break
             sha = parents[1]
         return first
@@ -855,6 +858,15 @@ def day(prs=14, seed=0):
     s += [(14, "push", (7,)), (18, "review", (7,))]
     s += [(20 + 2 * k, "open", (n,)) for k, n in enumerate(range(11, prs))]
     return s
+
+
+def restacked_day():
+    """`day`, with the stack's bottom layer pushed to (and approved
+    again) after the layer above it was opened: once it merges, the
+    middle layer, which needs the gated instance, conflicts with main
+    and the Merger restacks it."""
+    return sorted(day() + [(2, "push", (20,)), (3, "review", (20,))],
+                  key=lambda event: event[0])
 
 
 def busy(prs=40, seed=1, minutes=360):

@@ -564,6 +564,14 @@ class Check(unittest.TestCase):
             "merge.queued_stall_minutes must be at least 1",
             "merge.read_as 'Nobody' is not an agent or machinery"])
 
+    def test_merge_stall_run_factor(self):
+        self.assertEqual(self.problems(merge={"stall_run_factor": 1.5}), [])
+        self.assertEqual(self.problems(merge={"stall_run_factor": 0}), [])
+        self.assertEqual(self.problems(merge={"stall_run_factor": -1}),
+                         ["merge.stall_run_factor must be 0 or more"])
+        self.assertEqual(len(self.problems(merge={
+            "stall_run_factor": "x"})), 1)
+
     def test_merge_resolve_union_of_design_0046(self):
         self.assertEqual(self.problems(merge={"resolve": {
             "union": ["CHANGELOG.md", "docs/*.md"],

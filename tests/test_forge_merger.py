@@ -19,7 +19,7 @@ import unittest
 import urllib.error
 from unittest import mock
 
-from agent_forge import checkout, config
+from agent_forge import checkout, config, locks
 from tests.helpers import example, load_tool
 
 m = load_tool("forge-merger")
@@ -3289,6 +3289,64 @@ class PredictRestacked(unittest.TestCase):
         _, _, events = self.recut(seven, last, more)
         self.assertEqual(events[0], ("left", "LEFT #6: pushed %s mid-train"
                                      % more[:10]))
+
+    def test_a_restack_onto_a_main_that_changed_the_lower_lines(self):
+        # 2026-11-12: main changed #5's line 2 again after its squash, so
+        # #5's final head no longer merges into main as nothing: the
+        # restack is still the Merger's own, its second parent a squash
+        # on main.
+        self.stack(self.lines(l3="Y"))
+        self.repo.branch("main", "origin/main")
+        self.repo.commit("l.txt", self.lines(l2="Z", l3="Y"), "main l2")
+        self.repo.push("main")
+        head = self.restacked_by_hand()
+        self.assertTrue(m.own_push(self.repo.path, self.upper, head,
+                                   self.repo.main_tip()))
+        # A branch main has no squash of is still a push.
+        self.repo.branch("side", self.upper)
+        self.repo.branch("elsewhere", self.base)
+        self.repo.commit("e.txt", "e\n", "elsewhere")
+        run_git(self.repo.path, "checkout", "-q", "side")
+        merged = self.repo.merge("elsewhere")
+        self.assertFalse(m.own_push(self.repo.path, self.upper, merged,
+                                    self.repo.main_tip()))
+
+    def test_a_verdict_before_the_restack_counts(self):
+        # 2026-11-12: the restacked layer's gated instance had passed on
+        # the head before the restack, but the walk back stopped at the
+        # restack, so the layer was held and left its train as a push.
+        self.addCleanup(m.configure, project())
+        self.stack(self.lines(l3="Y"))
+        head = self.restacked_by_hand()
+        self.repo.publish_pr(6, head)
+        mac = [status(context="vm/mac")]
+        layer = pr(6, T1, head=head,
+                   reviews=[review(REVIEWER, oid="b" * 40)])
+        layer["labels"] = {"nodes": []}
+
+        def wait(statuses):
+            m.configure(gated_project())
+            github = FakeGitHub({SLUG + "/commits/" + sha: value
+                                 for sha, value in statuses.items()})
+            return m.instance_wait(self.repo.path, layer,
+                                   self.repo.main_tip(), github, {})
+
+        self.assertIsNone(wait({head: [], self.upper: mac}))
+        # So does the build check's green, for merge.own_head_green.
+        github = FakeGitHub({SLUG + "/commits/" + sha: value for sha, value
+                             in {head: [], "b" * 40: [],
+                                 self.upper: [status()]}.items()})
+        self.assertIsNone(m.own_green_wait(
+            layer, m.approval_of(layer), github, {}, self.repo.path,
+            self.repo.main_tip()))
+        # A merge of a branch main lacks stops the walk.
+        self.repo.branch("elsewhere", self.base)
+        self.repo.commit("e.txt", "e\n", "elsewhere")
+        self.repo.branch("side", head)
+        other = self.repo.merge("elsewhere")
+        layer["headRefOid"] = other
+        self.assertEqual(wait({other: [], head: [], self.upper: mac}),
+                         "waiting for vm/mac (absent)")
 
     def test_without_the_option_the_layer_is_left_out(self):
         layer = self.stack(self.lines(l3="Y"))
@@ -7025,6 +7083,92 @@ class QueuedStall(unittest.TestCase):
         self.assertEqual(self.stalled(30, {}), 30)
 
 
+class StallFromRecentRuns(unittest.TestCase):
+    """merge.stall_run_factor: a wait is a stall only once it is longer
+    than the build check's recent runs take, by the factor, with
+    stall_minutes as the floor."""
+
+    START = QueuedStall.START
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = tmp.name
+        self.addCleanup(m.configure, project())
+
+    def runs(self, *minutes, **extra):
+        results = {}
+        for k, took in enumerate(minutes):
+            start = self.START - datetime.timedelta(hours=10 - k)
+            results["%040d" % k] = dict({
+                "started": m.iso(start), "seconds": took * 60,
+                "finished": m.iso(start + datetime.timedelta(minutes=took))},
+                **extra)
+        return {"results": results}
+
+    def stalled(self, minutes, check, action="WAIT"):
+        waiting = {"pr": 5, "head": "h" * 40, "action": action}
+        m.stalled_for(self.state, waiting, self.START, check)
+        return m.stalled_for(
+            self.state, waiting,
+            self.START + datetime.timedelta(minutes=minutes), check)
+
+    def test_the_limit_follows_the_median_run(self):
+        m.configure(project())
+        check = self.runs(40, 20, 44, 40, 60)
+        self.assertEqual(m.stall_limit(check),
+                         datetime.timedelta(minutes=60))
+        self.assertIsNone(self.stalled(59, check))
+        self.assertEqual(self.stalled(60, check), 60)
+
+    def test_stall_minutes_is_the_floor(self):
+        m.configure(project())
+        check = self.runs(5, 6, 7)
+        self.assertEqual(m.stall_limit(check),
+                         datetime.timedelta(minutes=30))
+        self.assertEqual(self.stalled(30, check), 30)
+
+    def test_only_the_recent_runs_count(self):
+        m.configure(project())
+        check = self.runs(*([100] * 5 + [20] * m.STALL_RUNS))
+        self.assertEqual(m.stall_limit(check),
+                         datetime.timedelta(minutes=30))
+
+    def test_copied_results_and_no_results_are_not_runs(self):
+        m.configure(project())
+        self.assertEqual(m.stall_limit(self.runs(60, 60, covered=True)),
+                         datetime.timedelta(minutes=30))
+        self.assertEqual(m.stall_limit(self.runs(60, 60, seconds=0)),
+                         datetime.timedelta(minutes=30))
+        self.assertEqual(m.stall_limit(None), datetime.timedelta(minutes=30))
+
+    def test_a_refused_write_keeps_stall_minutes(self):
+        m.configure(project())
+        self.assertEqual(self.stalled(30, self.runs(60, 60, 60),
+                                      action="UPDATE"), 30)
+
+    def test_the_factor_and_off(self):
+        m.configure(project(stall_run_factor=2))
+        self.assertEqual(m.stall_limit(self.runs(40, 40, 40)),
+                         datetime.timedelta(minutes=80))
+        m.configure(project(stall_run_factor=0))
+        self.assertEqual(m.stall_limit(self.runs(40, 40, 40)),
+                         datetime.timedelta(minutes=30))
+
+    def test_the_check_state_lists_the_running_slots(self):
+        with open(os.path.join(self.state, "state.json"), "w") as out:
+            out.write('{"results": {}}')
+        held = locks.try_lock(os.path.join(self.state, "worker-2.lock"),
+                              "#6 %s 2026-10-07T12:16:00Z pid=1 ahead"
+                              % ("s" * 40))
+        self.addCleanup(held.close)
+        idle = locks.try_lock(os.path.join(self.state, "worker.lock"), "#7 x y")
+        idle.close()
+        got = m.load_check_state(self.state)
+        self.assertEqual(got["running"], [{
+            "pr": 6, "sha": "s" * 40, "started": "2026-10-07T12:16:00Z"}])
+
+
 class BatchTopStall(unittest.TestCase):
     """A head first in the batch waits for its top's prediction: timed
     from when the build check started the top."""
@@ -7103,6 +7247,37 @@ class BatchTopStall(unittest.TestCase):
                         {"pr": 6, "sha": "q" * 40, "tree": "t2"},
                         {"pr": 7, "sha": "r" * 40, "tree": "t3"}]})
         self.assertEqual(m.stall_batch(self.state, 6), ("#6..#7", "r" * 40))
+
+    def test_a_run_of_the_tops_tree_at_another_commit_counts(self):
+        # 2026-11-12: the top wasn't started because an earlier
+        # prediction with the same tree was running, which covers it;
+        # the wait was called a stall at 30 minutes.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Repo(tmp.name)
+        tip = repo.main_tip()
+        tree = run_git(repo.path, "rev-parse", tip + "^{tree}")
+        top = run_git(repo.path, "commit-tree", tree, "-p", tip, "-m", "top")
+        earlier = run_git(repo.path, "commit-tree", tree, "-m", "earlier")
+        other = repo.commit("o.txt", "o\n", "another tree")
+        self.ahead({"size": 2}, [
+            {"pr": 5, "head": self.HEAD, "sha": "p" * 40, "tree": "t1"},
+            {"pr": 6, "head": "j" * 40, "sha": top, "tree": tree}])
+
+        def stalled(minutes, sha):
+            waiting = {"pr": 5, "head": self.HEAD, "action": "WAIT"}
+            check = {"waiting": {}, "ahead_started": {}, "running": [
+                {"pr": 6, "sha": sha, "started": "2026-10-07T12:16:00Z"}]}
+            m.stalled_for(self.state, waiting, self.START, check, repo.path)
+            return m.stalled_for(
+                self.state, waiting,
+                self.START + datetime.timedelta(minutes=minutes), check,
+                repo.path)
+
+        self.assertIsNone(stalled(31, earlier))
+        self.assertEqual(stalled(46, earlier), 46)
+        # A run of another tree is not the top's.
+        self.assertEqual(stalled(30, other), 30)
 
     def test_no_or_a_bad_ahead_file_is_as_before(self):
         self.ahead(None, None)
@@ -7803,7 +7978,9 @@ class Main0026(unittest.TestCase):
             json.dump({"waiting": {"h": {}}}, f)
         self.run_main({"queued_stall_minutes": 90},
                       ["--check-state", check])
-        self.assertEqual(self.ticks[0]["check_state"], {"waiting": {"h": {}}})
+        # With the build check's running slots, none here.
+        self.assertEqual(self.ticks[0]["check_state"],
+                         {"waiting": {"h": {}}, "running": []})
         # Without batches (designs/0050 makes them the default).
         self.run_main({"test_ahead": False}, ["--check-state", check])
         self.assertNotIn("check_state", self.ticks[0])
