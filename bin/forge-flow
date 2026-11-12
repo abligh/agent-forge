@@ -1517,7 +1517,7 @@ border:2px solid var(--card)}
 .carriage:before{left:8px}.carriage:after{right:8px}
 .carriage.van{border-style:dashed}
 .carriage .tail{position:absolute;right:-5px;top:5px;width:7px;height:7px;
-border-radius:50%%;background:var(--bad)}
+border-radius:50%%;background:var(--axis);border:1px solid var(--ink)}
 .coupling{display:inline-block;width:10px;height:3px;border-radius:2px;
 background:var(--ink2);margin:0 -4px 6px}
 .carriage.mini{padding:1px 3px 6px;margin:0 2px 0 0}
