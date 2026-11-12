@@ -1069,7 +1069,10 @@ class Flow:
             else:
                 state = run["end"]["res"]
             out.append({
-                "train": train, "prs": [e["pr"] for e in cars],
+                # Counted from 1, as the Merger's log counts them
+                # (TRAIN-CUT 1, 2, ...); entries count from 0.
+                "train": train + 1 if isinstance(train, int) else train,
+                "prs": [e["pr"] for e in cars],
                 "carriages": carriages_of(cars, below),
                 "top": top[:10], "state": state,
                 "since": stamp(run["t"]) if run else None,

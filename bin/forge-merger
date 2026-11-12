@@ -1074,6 +1074,10 @@ LAYERS_OWN_GREEN = True
 # its own build check's green to board a train (false: its approval is
 # enough, and the train's top tests it; amendment of 2026-11-12, ninth).
 OWN_GREEN_TO_BOARD = True
+# A pull request outside the first train, whose merge on its own would
+# move the default branch under that train's started run.
+TRAIN_AHEAD_REASON = ("train 1 (%s) is building; merged on its own, this "
+                      "would spend that run, so it waits for its train")
 TRAIN_WAIT_REASON = ("in a train of %d that merges as one; not updated, "
                      "it waits for the train's top")
 # merge.test_ahead.train_merge: a suspect of a red train is not updated
@@ -1675,6 +1679,13 @@ def labelled_urgent(pr):
     """Whether `pr` carries `labels.urgent`: someone marked it so by
     hand."""
     return bool(URGENT_LABEL) and URGENT_LABEL in [
+        (n or {}).get("name") for n in
+        ((pr.get("labels") or {}).get("nodes") or [])]
+
+
+def labelled_keep(pr):
+    """Whether `pr` carries labels.keep_trains."""
+    return bool(KEEP_LABEL) and KEEP_LABEL in [
         (n or {}).get("name") for n in
         ((pr.get("labels") or {}).get("nodes") or [])]
 
@@ -5842,6 +5853,28 @@ def boarded_members(last):
             if isinstance(e, dict) and isinstance(e.get("pr"), int)}
 
 
+def train_in_the_way(last, pr, check_state):
+    """merge.test_ahead.train_merge: the first train in `last`
+    (ahead.json) as its entries, when `pr` is not on it and merging
+    `pr` on its own now would spend that train's run: the build check
+    has started its top, and the top isn't red. Else None. On
+    2026-11-12 a pull request pushed out of the first train merged on
+    its own green 25 minutes into the train's run of eight, and every
+    train was cut again."""
+    if not (last or {}).get("trains"):
+        return None
+    batch = (last or {}).get("batch") or {}
+    entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
+    if not entries or any(e.get("pr") == pr["number"] for e in entries):
+        return None
+    top = entries[-1]
+    if tree_verdict(check_state, top.get("tree")) is False \
+            or not ahead_started(check_state, top.get("sha"),
+                                 top.get("tree")):
+        return None
+    return entries
+
+
 def train_boarded(last, pr, check_state):
     """merge.test_ahead.train_merge: the size of the first train in
     `last` (ahead.json) when `pr` is boarded on it at the head it has,
@@ -7388,6 +7421,22 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         if suspected:
             decision = {"action": "WAIT", "pr": pr["number"],
                         "head": pr["headRefOid"], "reason": suspected}
+        # Merged on its own, one outside the first train would move the
+        # default branch under that train's started run. An urgent one,
+        # or one the trains are kept through (labels.keep_trains), goes
+        # all the same.
+        ahead_of = train_in_the_way(
+            last_ahead if last_ahead is not None else load_json(
+                os.path.join(state_dir, AHEAD_FILE), {}), pr, check_state) \
+            if decision["action"] == "MERGE" and TRAINS == "live" \
+            and not train_failed and not urgent(pr) \
+            and not labelled_keep(pr) else None
+        if ahead_of:
+            decision = {"action": "WAIT", "pr": pr["number"],
+                        "head": pr["headRefOid"],
+                        "reason": TRAIN_AHEAD_REASON % (
+                            "#%d..#%d" % (ahead_of[0]["pr"],
+                                          ahead_of[-1]["pr"]))}
         if (RESOLVE_SLOTS and decision["action"] == "HAND-BACK"
                 and decision.get("to") == "author"
                 and decision.get("reason", "").startswith(CONFLICT_REASON)
@@ -7803,9 +7852,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 # Kept on it by labels.keep_trains (`carried_base`).
                 said_ahead.update(base=train_base, main=main_tip)
                 if (last or {}).get("main") != main_tip:
-                    out("TRAIN-KEPT: %s moved to %s by labels.keep_trains; "
-                        "the trains stay on %s" % (MAIN, main_tip[:10],
-                                                   train_base[:10]))
+                    out("TRAIN-KEPT: %s moved to %s; the trains stay on %s "
+                        "(labels.keep_trains)" % (MAIN, main_tip[:10],
+                                                  train_base[:10]))
             if sizes is None and isinstance(
                     (last or {}).get("kept_trains"), dict):
                 # A red train's search goes on: its trains are kept for

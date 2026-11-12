@@ -4089,6 +4089,32 @@ class TickAhead(RepoCase):
                             for line in lines), lines)
         self.assertTrue(m.moved_a_stack(record))
 
+    def test_one_outside_a_building_first_train_waits_for_its_train(self):
+        # 2026-11-12: #10784, pushed out of the first train, merged on
+        # its own green 25 minutes into that train's run, and every
+        # train was cut again.
+        m.configure(project(test_ahead={"batch": 1, "batches": 2,
+                                        "trains": "live",
+                                        "train_merge": True}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        said = self.ahead_json()
+        self.assertEqual([e["pr"] for e in said["entries"]], [5, 6])
+        # As if #5 had left the first train and boarded the next.
+        said["entries"].reverse()
+        said["batch"] = {"size": 1, "trees": [said["entries"][0]["tree"]]}
+        said["later"] = [{"size": 1, "trees": [said["entries"][1]["tree"]],
+                          "fixed": True}]
+        with open(os.path.join(self.state, m.AHEAD_FILE), "w") as handle:
+            json.dump(said, handle)
+        top = said["entries"][0]
+        record, _ = self.tick(prs, live=True, minutes=1, check_state={
+            "results": {}, "ahead_started": {top["sha"]: "x"}})
+        five = [d for d in record["decisions"] if d["pr"] == 5]
+        self.assertEqual([(d["action"], d.get("reason")) for d in five],
+                         [("WAIT", m.TRAIN_AHEAD_REASON % "#6..#6")])
+        self.assertNotIn("/merge", " ".join(w[1] for w in self.github.writes))
+
     def behind_main_on_a_train(self, **ahead):
         """#5 and #6 boarded on one train, then main moves on, so #5,
         first in the queue, is behind it: the second tick's record."""
@@ -8847,6 +8873,39 @@ class RedMain(unittest.TestCase):
 
 
 SHARED = "".join("line %d\n" % k for k in range(1, 21))
+
+
+class TrainInTheWay(TrainSetup):
+    """A pull request outside the first train doesn't merge on its own
+    under that train's started run (2026-11-12: #10784 did, 25 minutes
+    into a train of eight, and every train was cut again)."""
+
+    def setUp(self):
+        super().setUp()
+        self.last = dict(self.last, trains=True,
+                         batch={"size": 1, "trees": [
+                             self.entries[0]["tree"]]},
+                         later=[{"size": 1, "trees": [
+                             self.entries[1]["tree"]]}])
+        self.started = {"results": {}, "ahead_started": {
+            self.entries[0]["sha"]: "2026-11-12T16:40:00Z"}}
+
+    def test_one_outside_the_started_first_train_waits(self):
+        got = m.train_in_the_way(self.last, self.queue[1], self.started)
+        self.assertEqual([e["pr"] for e in got], [5])
+
+    def test_a_member_of_the_first_train_is_not_in_its_way(self):
+        self.assertIsNone(m.train_in_the_way(self.last, self.queue[0],
+                                             self.started))
+
+    def test_a_train_not_started_or_red_is_no_reason_to_wait(self):
+        self.assertIsNone(m.train_in_the_way(self.last, self.queue[1],
+                                             {"results": {}}))
+        red = dict(self.started, results={"r": {
+            "ok": False, "tree": self.entries[0]["tree"]}})
+        self.assertIsNone(m.train_in_the_way(self.last, self.queue[1], red))
+        self.assertIsNone(m.train_in_the_way({}, self.queue[1],
+                                             self.started))
 
 
 class KeepTrains(TrainSetup):

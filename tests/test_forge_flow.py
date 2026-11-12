@@ -570,7 +570,7 @@ class StacksAndTrains(Base):
         self.assertEqual([k["pr"] for k in twenty["layers"]], [21])
         self.assertEqual([k["pr"] for k in twenty["layers"][0]["layers"]],
                          [22, 24])
-        self.assertEqual(twenty["root_where"], "in train 1")
+        self.assertEqual(twenty["root_where"], "in train 2")
         self.assertEqual(got[1]["root_where"],
                          "held: conflicts with #20, ahead of it in the queue")
         self.assertTrue(got[2]["root_where"].startswith("not a candidate"))
@@ -607,9 +607,9 @@ class StacksAndTrains(Base):
         got = self.flow(worker=worker, ahead=ahead).trains()
         self.assertEqual([(t["train"], t["prs"], t["top"], t["state"],
                            t["urgent"]) for t in got], [
-            (0, [11, 12], "b" * 10, "green, merging", False),
-            (1, [21], "8" * 10, "waiting for a slot", True),
-            (2, [31, 33], "9" * 10, "testing", False)])
+            (1, [11, 12], "b" * 10, "green, merging", False),
+            (2, [21], "8" * 10, "waiting for a slot", True),
+            (3, [31, 33], "9" * 10, "testing", False)])
         self.assertEqual(got[2]["since"], "2026-11-04T10:45Z")
 
     def test_without_trains_the_batch_sizes_cut_them(self):
@@ -618,7 +618,7 @@ class StacksAndTrains(Base):
                              ((11, "a"), (12, "b"), (13, "c"), (14, "d"))]}
         got = self.flow(ahead=ahead).trains()
         self.assertEqual([(t["train"], t["prs"]) for t in got],
-                         [(0, [11, 12]), (1, [13]), (None, [14])])
+                         [(1, [11, 12]), (2, [13]), (None, [14])])
         self.assertEqual(got[2]["state"], "predicted, not yet in a train")
         self.assertIn("in no train yet", tool.trains_html({"trains": got}))
 
