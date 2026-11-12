@@ -6582,8 +6582,10 @@ class Stacks(RepoCase):
         last = {"trains": True, "entries": [
             {"pr": 5, "head": "a", "carriage": 5},
             {"pr": 6, "head": "b", "carriage": 5, "on": 5},
-            {"pr": 7, "head": "c", "carriage": 7}]}
-        self.assertEqual(m.boarded_layers(last), {6: "b"})
+            {"pr": 7, "head": "c", "carriage": 7},
+            # Its base merged since: it heads its carriage, still a layer.
+            {"pr": 8, "head": "d", "carriage": 8, "on": 4}]}
+        self.assertEqual(m.boarded_layers(last), {6: "b", 8: "d"})
         self.assertEqual(m.boarded_layers(dict(last, trains=False)), {})
         self.assertEqual(m.boarded_layers(None), {})
 
@@ -8723,6 +8725,17 @@ class Trains(RepoCase):
         self.assertIn(("left", "LEFT #10: won't board with the layers below "
                        "it, which go without it; also held back: #14"),
                       events)
+
+    def test_a_layer_recut_after_its_base_merged_keeps_its_mark(self):
+        # layers_need_own_green: the base #6 merged, and #9 heads its
+        # carriage in a train cut afresh; it boarded as a layer.
+        six, nine, ten, eleven = self.siblings()
+        self.configure(batch=4, batches=1, depth=3)
+        last = {"entries": [{"pr": 9, "head": nine["headRefOid"], "on": 6}]}
+        entries, sizes, _ = self.cut([[nine, eleven]], last=dict(
+            last, base="0" * 40))
+        self.assertEqual([(e["pr"], e["on"]) for e in entries],
+                         [(9, 6), (11, 9)])
 
     def test_one_that_leaves_takes_only_the_layers_on_it(self):
         six, nine, ten, eleven = self.siblings()

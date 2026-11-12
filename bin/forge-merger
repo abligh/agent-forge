@@ -4687,6 +4687,11 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
     # train up to it is the same, its prediction is still what a push
     # that only merges what is below it must give.
     was, before = {}, (last or {}).get("base")
+    # A layer whose base has merged since it boarded still boarded as a
+    # layer (`boarded_layers`), though it heads its carriage now.
+    was_on = {e.get("pr"): e.get("on") for e in (last or {}).get(
+        "entries") or () if isinstance(e, dict)
+        and e.get("on") is not None}
     for e in (e for t in prior for c in t for e in c):
         was[e.get("pr")], before = before, e.get("sha")
     for k, train in enumerate(prior[:trains]):
@@ -4818,9 +4823,11 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                     failing |= {pr["number"]} | stacked_on(pr["number"],
                                                            bases)
                     continue
+                on = bases.get(pr["number"])
                 entry.update(train=len(sizes),
                              carriage=members[0]["number"],
-                             on=bases.get(pr["number"]))
+                             on=on if on is not None
+                             else was_on.get(pr["number"]))
                 made.append(entry)
                 top, top_graph = entry["sha"], entry.get("graph")
             if not made:
@@ -5486,13 +5493,16 @@ def train_ready(last, queue, main_tip, check_state, repo=None, run=sh,
 
 def boarded_layers(last):
     """{number: head} of the stack's layers on the trains in `last`
-    (ahead.json): members that aren't the first of their carriage."""
+    (ahead.json): members that boarded on a pull request below them,
+    which `on` names (kept when that one has merged and the layer heads
+    its carriage), or that aren't the first of their carriage."""
     if not isinstance(last, dict) or not last.get("trains"):
         return {}
     return {e["pr"]: e.get("head") for e in last.get("entries") or ()
             if isinstance(e, dict) and isinstance(e.get("pr"), int)
-            and e.get("carriage") is not None
-            and e.get("carriage") != e["pr"]}
+            and (e.get("on") is not None
+                 or e.get("carriage") is not None
+                 and e.get("carriage") != e["pr"])}
 
 
 def train_boarded(last, pr, check_state):
@@ -6492,6 +6502,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         aboard = {} if LAYERS_OWN_GREEN else boarded_layers(load_json(
             os.path.join(state_dir, AHEAD_FILE), {}))
         for pr in list(candidates):
+            if pr["number"] in aboard:
+                # The walk back to the head it boarded with reads the
+                # new head's parents, which only the pull requests a
+                # tick decided on were fetched for.
+                have_head(repo, pr, run)
             why = own_green_wait(pr, approvals[pr["number"]], github, greens,
                                  repo, main_tip, run,
                                  aboard.get(pr["number"]))
