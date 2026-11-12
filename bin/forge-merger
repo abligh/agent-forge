@@ -558,8 +558,14 @@ places, and the train's top, now a new tree, is run again. A pull
 request that is urgent or fixes a red default branch and is in no train
 cuts every train after the first again, and the default branch moving to
 a tree no train predicted cuts them all (`TRAIN-RECUT: ...`). A red
-top's members are the suspects, as a red batch's, and the trains are cut
-again once the search ends. A later train's green top covers that
+top's members are the suspects, as a red batch's, a stack's layers held
+as stacked among them, each where its train had it (`with_suspects`).
+The trains are kept through the search (ahead.json's `kept_trains`) and
+taken up again when it ends: the one found red leaves, those merged are
+gone, the rest keep their places, and new pull requests go into later
+trains (`trains_before`; amendment of 2026-11-12, seventh). A suspect
+brought up to date and nothing else stays a suspect at its new head
+(`suspects_left`). A later train's green top covers that
 train and every one in front of it (amendment of 2026-11-11): its tree
 contains them all, and its run took in every step their changes touch,
 so they are folded into the first batch and start merging at once,
@@ -1008,6 +1014,10 @@ BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
 LAYERS_OWN_GREEN = True
 TRAIN_WAIT_REASON = ("in a train of %d that merges as one; not updated, "
                      "it waits for the train's top")
+# merge.test_ahead.train_merge: a suspect of a red train is not updated
+# while the search runs (amendment of 2026-11-12, second).
+SUSPECT_WAIT_REASON = ("a suspect of the red train %s; not updated while "
+                       "the search runs")
 # The most ticks one run makes: it ticks again straight after a merge.
 TICKS_PER_RUN = 10
 # merge.test_ahead.train_merge (designs/0047, amendment of 2026-11-11):
@@ -4934,6 +4944,35 @@ def train_lists(entries, sizes):
     return out
 
 
+def kept_trains(main_tip, entries, sizes, note=None):
+    """The trains this tick cut, `entries` in `sizes`, as an ahead.json
+    `cut_trains` reads them (`last_trains`), for a red train's search
+    to keep (`trains_before`)."""
+    kept = {"trains": True, "base": main_tip,
+            "entries": [dict(e) for e in entries],
+            "batch": {"size": sizes[0]} if sizes else {},
+            "later": [{"size": n} for n in sizes[1:]]}
+    if (note or {}).get("urgent_cut"):
+        kept["urgent_cut"] = note["urgent_cut"]
+    return kept
+
+
+def trains_before(last):
+    """The trains a tick cuts its own from: `last` (ahead.json) when it
+    cut trains, else the trains a red train's search keeps in it
+    (`kept_trains`), else `last`. A red top's members are searched with
+    batches of their own, and ahead.json then holds no trains; cut
+    afresh when the search ended, every train took new pull requests in
+    the middle (bigger carriages go first in a new cut), and the runs
+    of the trains behind it were thrown away (2026-11-12). Kept, a
+    member the search found red leaves, those merged are gone, and the
+    rest keep their places, as after any other train."""
+    if not isinstance(last, dict) or last.get("trains") \
+            or not isinstance(last.get("kept_trains"), dict):
+        return last
+    return last["kept_trains"]
+
+
 def dry_trains(state_dir, cut, main_tip, repo, record, out, when,
                note=None):
     """merge.test_ahead.trains "dry-run" (designs/0047): cut the trains
@@ -5724,18 +5763,27 @@ def suspects_line(entries, n, green, red, cuts):
         ", ".join(span(0, c) for c in cuts) or "nothing")
 
 
-def suspects_left(saved, queue, record, approvals, said):
+def suspects_left(saved, queue, record, approvals, said, moved=None):
     """(saved, line): the search `saved` with the suspects that merged
     this tick (`record`'s decisions) moved to `merged`, and those no
     longer in `queue` at their head, or handed back, moved to `left`.
-    With none left, the search is over: `line` says BATCH-FLAKE when
-    every suspect merged, and the saved search is None."""
+    `moved(head, pr)` says whether `pr`'s head is `head` brought up to
+    date and nothing else (`own_push`): such a suspect stays, at its
+    new head, which is predicted to the same tree. Without it, an
+    update of the first suspect took it out of the search, the search
+    found no suspect first in the predictions and ended, and every
+    train was cut again (2026-11-12). With none left, the search is
+    over: `line` says BATCH-FLAKE when every suspect merged, and the
+    saved search is None."""
     done = {d["pr"] for d in record["decisions"]
             if d.get("action") == "MERGE" and d.get("result") == "done"}
     heads = {pr["number"]: pr for pr in queue}
     kept = []
     for e in saved["suspects"]:
         pr = heads.get(e["pr"])
+        if pr is not None and pr["headRefOid"] != e["head"] \
+                and moved is not None and moved(e["head"], pr):
+            e = dict(e, head=pr["headRefOid"])
         if e["pr"] in done:
             saved["merged"].append(e["pr"])
         elif pr is None or pr["headRefOid"] != e["head"] or handed_back(
@@ -5753,6 +5801,79 @@ def suspects_left(saved, queue, record, approvals, said):
                 "top's tree %s was a flake" % (every[0], every[-1],
                                                saved.get("tree")))
     return None, line
+
+
+def with_suspects(queue, saved, prs):
+    """`queue` with the suspects of the search `saved` that are open
+    (`prs`) but not in it, a stack's layers held as stacked, each
+    where the search has it: all of them at the first suspect's place,
+    in the search's order. A red train's layers are members of it
+    (`layers_need_own_green` false), and its suspects; missing from the
+    queue, they left the search the tick after it started, which then
+    tested the prefixes of a set the train never was, and found its
+    whole red tree no longer among them (2026-11-12: "red from none")."""
+    if not saved or not queue:
+        return queue
+    by_number = {pr["number"]: pr for pr in prs}
+    order = [by_number[e["pr"]] for e in saved.get("suspects") or ()
+             if e["pr"] in by_number]
+    numbers = {pr["number"] for pr in order}
+    if not numbers - {pr["number"] for pr in queue}:
+        return queue
+    out, placed = [], False
+    for pr in queue:
+        if pr["number"] in numbers:
+            if not placed:
+                out += order
+                placed = True
+            continue
+        out.append(pr)
+    return out if placed else order + out
+
+
+def suspect_wait(saved, pr, last, check_state, main_tip=None):
+    """merge.test_ahead.train_merge: SUSPECT_WAIT_REASON when `pr` is a
+    suspect of the search `saved` at the head it has and isn't in the
+    batch of `last` (ahead.json) the search found green, or, with no
+    search yet, a member of one of `last`'s trains, at the head it has,
+    whose top is red (not only as `main_tip` is: `tree_base_red`), else
+    None. The
+    search's runs test the trees predicted for the suspects' heads, and
+    a green prefix merges as one train of its tested top; an update of
+    a suspect only makes it a new head, and on 2026-11-12 one took the
+    first suspect out of the search, which ended, and every train was
+    cut again with new pull requests in it. One the search found green
+    may be updated: it merges, alone or because the train couldn't."""
+    batch = (last or {}).get("batch") or {}
+    entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
+    if not saved:
+        # The tick a train's top is found red: its members become the
+        # suspects once this tick has decided, and on 2026-11-12 the
+        # first was updated before that.
+        for train in last_trains(last):
+            members = [e for c in train for e in c]
+            if not any(e.get("pr") == pr["number"]
+                       and e.get("head") == pr["headRefOid"]
+                       for e in members):
+                continue
+            top = members[-1].get("tree")
+            if len(members) < 2 or tree_verdict(check_state, top) \
+                    is not False \
+                    or tree_base_red(check_state, top, main_tip):
+                return None
+            return SUSPECT_WAIT_REASON % ("#%d..#%d" % (
+                members[0]["pr"], members[-1]["pr"]))
+        return None
+    if not any(e["pr"] == pr["number"] and e["head"] == pr["headRefOid"]
+               for e in saved.get("suspects") or ()):
+        return None
+    if entries and batch.get("suspects") is True \
+            and [e.get("tree") for e in entries] == batch.get("trees") \
+            and tree_verdict(check_state, entries[-1].get("tree")) is True \
+            and any(e.get("pr") == pr["number"] for e in entries):
+        return None
+    numbers = [e["pr"] for e in saved["suspects"]]
+    return SUSPECT_WAIT_REASON % ("#%d..#%d" % (numbers[0], numbers[-1]))
 
 
 def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
@@ -6069,7 +6190,8 @@ def hand_back_red_suspect(state_dir, entry, green, queue, approvals, reds,
         return
     reason = RED_SUSPECT_REASON % (STATUS_CONTEXT, MAIN)
     decision = conflict_hand_back(
-        pr[0], approvals[entry["pr"]], github, said, live, reason,
+        pr[0], approvals.get(entry["pr"]) or approval_of(pr[0]), github,
+        said, live, reason,
         RED_SUSPECT_DETAIL % (entry["sha"][:10], MAIN, (
             " and the %d pull requests ahead of it in the batch" % green
             if green > 1 else " and the one ahead of it in the batch"
@@ -6860,6 +6982,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             decision = {"action": "WAIT", "pr": pr["number"],
                         "head": pr["headRefOid"],
                         "reason": TRAIN_WAIT_REASON % boarded}
+        suspected = suspect_wait(saved, pr, last_ahead, check_state,
+                                 main_tip) \
+            if decision["action"] == "UPDATE" and TRAIN_MERGE \
+            and last_ahead is not None else None
+        if suspected:
+            decision = {"action": "WAIT", "pr": pr["number"],
+                        "head": pr["headRefOid"], "reason": suspected}
         if (decision["action"] == "UPDATE"
                 and said.get(str(pr["number"])) == hand_back_key(
                     approval, pr["headRefOid"], CONFLICT_REASON)):
@@ -7126,8 +7255,26 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
             owed = None
             if saved:
+                ahead_queue = with_suspects(ahead_queue, saved, [
+                    pr for pr in prs if str(pr["number"]) not in reds])
+                added = set()
+                for pr in ahead_queue:
+                    if pr["number"] not in approvals:
+                        # A layer held as stacked: its approval, as the
+                        # train boarded it with (`ready_layers`).
+                        approvals[pr["number"]] = approval_of(pr) or {}
+                        added.add(pr["number"])
+
+                def updated(head, pr):
+                    have_head(repo, pr, run)
+                    return own_push(repo, head, pr["headRefOid"], main_tip,
+                                    run)
                 saved, ended = suspects_left(saved, ahead_queue, record,
-                                             approvals, said)
+                                             approvals, said, updated)
+                still = {e["pr"] for e in (saved or {}).get("suspects")
+                         or ()}
+                ahead_queue = [pr for pr in ahead_queue
+                               if pr["number"] not in added - still]
                 if ended:
                     out(ended)
                 if saved is None and os.path.exists(os.path.join(
@@ -7157,7 +7304,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             files, note = {}, {}
             if TRAINS == "live" and not searching and ahead_queue:
                 # designs/0047: trains, cut once and kept.
-                entries, sizes, events = cut(last)
+                entries, sizes, events = cut(trains_before(last))
                 write_ahead_refs(repo, entries, run)
                 if TELL_BOARDED:
                     told = tell_boarded(
@@ -7195,6 +7342,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             said_ahead = {"at": record["at"], "base": main_tip,
                           "repo": git_store(repo),
                           "entries": entries}
+            if sizes is None and isinstance(
+                    (last or {}).get("kept_trains"), dict):
+                # A red train's search goes on: its trains are kept for
+                # when it ends.
+                said_ahead["kept_trains"] = last["kept_trains"]
             if sizes is not None:
                 said_ahead["trains"] = True
                 if note.get("urgent_cut"):
@@ -7251,6 +7403,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         "suspects" % (entries[0]["pr"], entries[red - 1]["pr"],
                                       red))
                     searching = True
+                    if sizes is not None:
+                        said_ahead["kept_trains"] = kept_trains(
+                            main_tip, entries, sizes, note)
             if searching and entries:
                 # A suspect merged this tick is still predicted first,
                 # from the tip before it: the rest are predicted on it,

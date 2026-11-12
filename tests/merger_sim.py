@@ -263,12 +263,18 @@ class World:
         self.note("approve", pr=number)
 
     def open(self, number, base=None, mac=False, red=False, urgent=False,
-             approve=True):
+             approve=True, clash=None):
         """Opens #`number`, on main or on the pull request `base`, with a
-        change of its own (a file of its own, so nothing conflicts)."""
+        change of its own (a file of its own, so nothing conflicts).
+        `clash`, a name: it is green alone, but red with the other pull
+        request of that name, as two changes that each build and break
+        the build together (a field one adds, an initializer without it
+        in the other)."""
         branch = "b%d" % number
         start = self.main() if base is None else self.prs[base]["head"]
         files = {"p%d.txt" % number: "v1\n"}
+        if clash:
+            files["clash-%s-%d.txt" % (clash, number)] = "v1\n"
         if mac:
             files["mac/p%d.txt" % number] = "v1\n"
         if red:
@@ -523,8 +529,11 @@ class SimCheck:
         return entries, batches
 
     def verdict(self, tree):
-        return not any(name.startswith("red-")
-                       for name in self.world.files(tree))
+        names = self.world.files(tree)
+        clashes = collections.Counter(name.split("-")[1] for name in names
+                                      if name.startswith("clash-"))
+        return not any(name.startswith("red-") for name in names) \
+            and all(n < 2 for n in clashes.values())
 
     def green(self, tree):
         return any(r.get("ok") is True and r.get("tree") == tree
@@ -715,9 +724,12 @@ class Monitor:
                     self.say(3, "#%d boarded with %s not yet green on its "
                              "change" % (e["pr"], GATED))
         # Every batch the Merger predicted: a green top covers its
-        # prefixes, whoever's run found its tree green.
+        # prefixes, whoever's run found its tree green. Every prefix any
+        # batch with that top had: a later, shorter batch with the same
+        # top (its first members merged) doesn't uncover them.
         for batch in batches:
-            self.batches[batch[-1]["tree"]] = [e["tree"] for e in batch]
+            self.batches.setdefault(batch[-1]["tree"], set()).update(
+                e["tree"] for e in batch)
         # Trains are tracked from the minute their top starts.
         for batch in batches:
             top = batch[-1]
@@ -884,6 +896,30 @@ def siblings_day():
     s += [(5, "open", (30,)), (6, "open", (31, 30)), (6, "open", (32, 30)),
           (6, "open", (33, 30)), (7, "open", (34, 32))]
     return sorted(s, key=lambda event: event[0])
+
+
+def red_train_day():
+    """A long train with two members that clash (each green alone, red
+    together), so its top is red and its members are searched, while
+    new pull requests keep arriving. Run with `train_merge`, a batch of
+    eight and `layers_need_own_green` false, as a busy project has."""
+    s = [(0, "open", (n,)) for n in range(1, 11) if n not in (3, 7)]
+    s += [(0, "open", (3, None, False, False, False, True, "f")),
+          (0, "open", (7, None, False, False, False, True, "f"))]
+    s += [(4 + 2 * k, "open", (n,)) for k, n in enumerate(range(11, 25))]
+    return sorted(s, key=lambda event: event[0])
+
+
+def red_stack_day():
+    """`red_train_day`, with a stack of three in the red train: its
+    layers are members that are held as stacked, not candidates, and the
+    search must predict them where the train had them."""
+    s = [(0, "open", (30,)), (0, "open", (31, 30)),
+         (0, "open", (32, 31, False, False, False, True, "f")),
+         (0, "open", (3, None, False, False, False, True, "f"))]
+    s += [(1, "open", (n,)) for n in range(1, 11) if n != 3]
+    s += [(4 + 2 * k, "open", (n,)) for k, n in enumerate(range(11, 25))]
+    return s
 
 
 def busy(prs=40, seed=1, minutes=360):

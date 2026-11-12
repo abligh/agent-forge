@@ -29,7 +29,9 @@ Merger's writes, GitHub's answers and the build check's verdicts meet.
   - it notices a new head `notice` minutes after it appears;
   - it runs the gated instance (`vm/mac`, for paths under `mac/`) in a
     queue of its own, `mac_slots` slots taking `mac_minutes`;
-  - a tree with a `red-*` file is red.
+  - a tree with a `red-*` file is red, and so is one with two
+    `clash-<name>-*` files of the same name (two changes each green
+    alone, red together).
 
 ## The rules
 
@@ -63,9 +65,16 @@ A scenario is a list of `(minute, World method, args)`:
 - `push(number)` is its author pushing a change of their own;
 - `review(number)` approves its head again.
 
+`open` also takes `clash`, a name: two pull requests opened with the
+same one are each green alone and red together.
+
 `day()` is the short scenario the normal suite runs;
 `restacked_day()` adds a push to a stack's bottom layer, and
-`siblings_day()` a base with three layers side by side on it. `busy()`
+`siblings_day()` a base with three layers side by side on it.
+`red_train_day()` has a long train with two clashing members, and
+`red_stack_day()` a stack of three in a train whose top layer clashes
+with another member; the normal suite runs the latter with
+`train_merge`. `busy()`
 builds a
 longer one from a seeded random source, and
 `AGENT_FORGE_SIM_LONG=1` runs it. Run an older Merger by passing
