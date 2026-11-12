@@ -781,6 +781,24 @@ class StatusPriorityCarriages(Base):
         flow = self.flow(records=self.last(held=held))
         self.assertEqual(flow.status(49), ("green", "merged"))
 
+    def test_a_hand_back_at_an_earlier_tick_stays_red_until_a_new_head(self):
+        # 2026-11-12: #10608, handed back for a conflict at 16:06, was
+        # still in the queue at 17:00 and showed green.
+        records = [
+            rec("10:00:00", [70, 71], [
+                d("HAND-BACK", 70, head="a" * 40, result="done",
+                  reason="it conflicts with main, so it can't be updated"),
+                d("HAND-BACK", 71, head="b" * 40, result="done",
+                  reason="red")]),
+            rec("10:05:00", [70, 71], [d("WAIT", 71, head="c" * 40)]),
+        ]
+        flow = self.flow(records=records)
+        colour, why = flow.status(70)
+        self.assertEqual(colour, "red")
+        self.assertIn("handed back at 2026-11-04T10:00Z: it conflicts", why)
+        # A new head since: the hand-back no longer stands.
+        self.assertEqual(flow.status(71)[0], "green")
+
     def test_the_page_marks_priority_and_status(self):
         data = {"priority": {"21": {"level": "urgent", "why": "u"},
                              "22": {"level": "elevated", "why": "e"}},
