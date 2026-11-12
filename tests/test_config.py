@@ -985,12 +985,12 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(checks={"fast_lane": 60}), [
             "checks.fast_lane must be an object"])
 
-    def test_fast_lane_is_refused_without_depends(self):
+    def test_fast_lane_without_depends(self):
+        # agent-forge #261: a head's chosen steps are then every step
+        # that applies, scoped ones by their scope.
         for checks in ({"fast_lane": {"max_seconds": 60}},
                        {"depends": False, "fast_lane": {}}):
-            self.assertEqual(self.problems(checks=checks), [
-                "checks.fast_lane needs checks.depends: without it every "
-                "head runs every step, and none is cheap"])
+            self.assertEqual(self.problems(checks=checks), [])
 
     def test_labels_and_relay(self):
         self.assertEqual(self.problems(

@@ -88,14 +88,20 @@ class Validation(unittest.TestCase):
             "checks.instances.mac.poster 'Nobody' is no App in the "
             "configuration"])
 
-    def test_the_tracers_keys_need_the_blocks_own_depends(self):
-        # checks.depends is true, but a block doesn't inherit it.
+    def test_a_blocks_fast_lane_needs_no_depends(self):
+        # agent-forge #261: without depends a head's chosen steps are
+        # every step that applies, so a block's lane needs none either.
         self.assertEqual(config.check(with_mac(fast_lane={"max_seconds": 9})),
-                         ["checks.instances.mac.fast_lane needs "
-                          "checks.instances.mac.depends: without it every "
-                          "head runs every step, and none is cheap"])
+                         [])
         self.assertEqual(config.check(with_mac(
             depends=True, fast_lane={"max_seconds": 9})), [])
+
+    def test_the_tracers_keys_need_the_blocks_own_depends(self):
+        # checks.depends is true, but a block doesn't inherit it.
+        self.assertEqual(config.check(with_mac(reuse={"max_age_days": 7})),
+                         ["checks.instances.mac.reuse needs "
+                          "checks.instances.mac.depends: a step's inputs are "
+                          "what its dependency record says it read"])
 
     def test_a_name_fit_for_a_directory(self):
         data = with_mac()

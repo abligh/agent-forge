@@ -1487,16 +1487,14 @@ def _check_test_ahead(ahead, checks, problems):
 
 def _check_fast_lane(checks, problems, section="checks"):
     """checks.fast_lane: a slot of its own for heads whose chosen steps
-    have taken at most max_seconds here. Only `depends` chooses steps,
-    so without it nothing could be cheap."""
+    have taken at most max_seconds here. Without `depends` a head's
+    chosen steps are every step that applies, scoped steps by their
+    scope (agent-forge #261)."""
     where = section + ".fast_lane"
     lane = checks["fast_lane"]
     _fields(where, lane, FAST_LANE, problems)
     if _is(lane.get("max_seconds"), int) and lane["max_seconds"] < 1:
         problems.append("%s.max_seconds must be at least 1" % where)
-    if checks.get("depends") is not True:
-        problems.append("%s needs %s.depends: without it every head "
-                        "runs every step, and none is cheap" % (where, section))
 
 
 def _check_warm(checks, problems, section="checks"):

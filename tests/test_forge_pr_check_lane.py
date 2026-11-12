@@ -362,9 +362,9 @@ class Tick(StateCase):
         self.assertEqual(self.spawned[0][1:5], (SHA_B, 8, False, pc.LANE))
 
 
-class Estimate(StateCase):
-    """lane_steps and estimate with real git: the head is only in the
-    origin, as a pull request's ref, until the checkout fetches it."""
+class GitHeads(StateCase):
+    """A real origin and cron checkout: the head is only in the origin,
+    as a pull request's ref, until the checkout fetches it."""
 
     def setUp(self):
         super().setUp()
@@ -409,6 +409,10 @@ class Estimate(StateCase):
         return subprocess.run(
             ["git", "-C", self.checkout, "cat-file", "-e", sha + "^{commit}"],
             capture_output=True).returncode == 0
+
+
+class Estimate(GitHeads):
+    """lane_steps and estimate with real git."""
 
     def test_the_head_is_fetched_and_its_steps_worked_out(self):
         head = self.pull_request({"README": "changed"})
@@ -480,6 +484,80 @@ class Estimate(StateCase):
         run = FakeRun()
         pc.estimate(self.state_dir, self.checkout, busy={SHA_A}, run=run)
         self.assertEqual(run.calls, [])
+
+
+class WithoutDepends(GitHeads):
+    """agent-forge #261: without checks.depends, a head's chosen steps
+    are every step that applies, scoped steps by their scope."""
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(pc, "DEPENDS", False)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_every_step_that_applies_is_chosen(self):
+        head = self.pull_request({"README": "changed"})
+        got = pc.lane_steps(self.checkout, head, 7, self.state_dir)
+        self.assertEqual(sorted(got["ran"]), ["code", "docs"])
+        self.assertNotIn("every", got)
+
+    def test_a_step_applies_as_its_only_if_says(self):
+        head = self.pull_request({"web/package.json": "{}"})
+        got = pc.lane_steps(self.checkout, head, 7, self.state_dir)
+        self.assertEqual(sorted(got["ran"]), ["code", "docs", "web"])
+
+    def test_a_fetch_that_fails_still_works_nothing_out(self):
+        self.pull_request({"README": "changed"})
+        got = pc.lane_steps(self.checkout, SHA_D, 99, self.state_dir)
+        self.assertIn("every", got)
+
+    def test_no_record_is_needed(self):
+        for path, _ in trace.load_records(self.state_dir):
+            os.unlink(path)
+        head = self.pull_request({"README": "changed"})
+        self.write_state({"waiting": {head: waits(7, 5)}})
+        pc.estimate(self.state_dir, self.checkout)
+        self.assertEqual(self.state()["waiting"][head]["lane_steps"],
+                         ["code", "docs"])
+
+    def test_a_scoped_step_out_of_scope_is_left_out(self):
+        head = self.pull_request({"README": "changed"})
+        self.write_state({"waiting": {head: waits(7, 5)}})
+        with mock.patch.object(pc, "SCOPED", {"code": (["src/*"], None)}):
+            pc.estimate(self.state_dir, self.checkout)
+        entry = self.state()["waiting"][head]
+        self.assertEqual(entry["lane_steps"], ["docs"])
+        self.assertEqual(entry["lane_scoped"], [])
+        self.assertEqual(pc.lane_cost(entry, {"docs": 5}), 5)
+
+    def test_a_scoped_step_in_scope_keeps_the_head_out_of_the_lane(self):
+        head = self.pull_request({"src/a": "b"})
+        self.write_state({"waiting": {head: waits(7, 5)}})
+        with mock.patch.object(pc, "SCOPED", {"code": (["src/*"], None)}):
+            pc.estimate(self.state_dir, self.checkout)
+        entry = self.state()["waiting"][head]
+        self.assertEqual(entry["lane_scoped"], ["code"])
+        # Never cheap, however cheap its steps have been.
+        self.assertIsNone(pc.lane_cost(entry, {"docs": 1, "code": 1}))
+
+    def test_an_unscoped_expensive_step_keeps_every_head_out(self):
+        head = self.pull_request({"README": "changed"})
+        self.write_state({"waiting": {head: waits(7, 5)}})
+        pc.estimate(self.state_dir, self.checkout)
+        entry = self.state()["waiting"][head]
+        self.assertIsNone(pc.lane_cost(entry, {"docs": 5}))
+        self.assertEqual(pc.lane_cost(entry, {"docs": 5, "code": 300}), 305)
+
+
+class TickWithoutDepends(Tick):
+    """The lane is a slot without checks.depends too (agent-forge #261)."""
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(pc, "DEPENDS", False)
+        patch.start()
+        self.addCleanup(patch.stop)
 
 
 class Worker(StateCase):
