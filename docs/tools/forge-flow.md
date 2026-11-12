@@ -36,7 +36,7 @@ To read old records as they stood at some time, run it by hand with
 | `--out DIR` | required | Where `index.html`, `flow.json` and `flow-history.jsonl` are written (and `approvals.json` with `--github`). Created if missing. |
 | `--state-dir DIR` | `~/.local/state/agent-forge/<project>/` | The project's state directory, the parent of `pr-check/`, `merger/` and `router/`. With it, the page can be made without a configuration (the project's name is then the directory's). |
 | `--now TIME` | now | Read the records as at this time, ISO 8601 in UTC, such as `2026-10-12T09:00Z`. |
-| `--github` | off | Also ask GitHub for each merged pull request's first approving review, for the latency panel. Needs the configuration. |
+| `--github` | off | Also ask GitHub for each merged pull request's first approving review, for the latency panel, and for the open pull requests carrying `labels.urgent`, for the priority marks. Needs the configuration. |
 | `--checkout DIR` | `$FORGE_CRON_CHECKOUT`, else the current directory | Where the configuration is found. |
 
 ## Environment
@@ -71,6 +71,8 @@ reviewers were. A configuration that can't be read is an error unless
 | `merger/merger.jsonl` | One record per Merger tick. |
 | `merger/ahead.json`, `merger/handed-back.json` | The batch being tested ahead, and the hand-backs, now. |
 | `router/presence.jsonl` | Who was busy and idle, if the router recorded it. |
+| `nightly/nightly.json` | The pull requests fixing a red nightly, while forge-nightly's file is fresh and its issue open. |
+| `pr-check/state.json` | The pull requests fixing a red default branch (`main_red.fixes`), while its issue is open. |
 
 **The page.** One static HTML file, with no scripts: inline SVG and CSS
 bars, light and dark, readable on a phone. Its hourly graphs cover the
@@ -110,21 +112,55 @@ with no script (each pull request linked to GitHub when the
 configuration names the repository):
 
 * **Trains now**, from `merger/ahead.json`: one row per train, the
-  one merging next first, each carriage a box and the top (the commit
-  tested for the whole train) double-bordered. A train's colour says
-  where its top's run is: waiting for a slot (no run in `worker.log`),
-  testing, green (merging) or red. A train cut for urgent pull
-  requests (`urgent_cut`) says so. An `ahead.json` without trains is
-  cut by its batch's and later batches' sizes, and what is left is
+  one merging next first, drawn as a train: an engine at the front,
+  then its carriages, each a box on wheels coupled to the next, and
+  the top (the commit tested for the whole train) double-bordered in
+  the guard's van at the back. A carriage is a pull request and the
+  stacked layers that board with it: ahead.json's `carriage` (the
+  carriage's first pull request), or, without it, a pull request held
+  as stacked on the one before it. Each train says "N PRs in M
+  carriages". The engine says where its top's run is: standing, waiting
+  for a slot (no run in `worker.log`); steaming, testing (the steam
+  moves unless the reader asks for reduced motion); flag out and a
+  green lamp, green (merging); a red lamp, red. A train cut for urgent
+  pull requests (`urgent_cut`) says so. An `ahead.json` without trains
+  is cut by its batch's and later batches' sizes, and what is left is
   shown as predicted but in no train yet. In `flow.json` as `trains`
-  (`train`, `prs`, `top`, `state`, `since`, `urgent`) and `ahead_at`.
+  (`train`, `prs`, `carriages`, `top`, `state`, `since`, `urgent`) and
+  `ahead_at`.
 * **Stacks now**, from the last Merger record's `stacked on #N` holds:
   each stack a tree rooted at its base (the pull request on the
   default branch), largest first, with its layers, depth, and where
   the base waits (in a train, in the queue, held and why, back with
   its author, or not a candidate), since the whole stack waits there.
+  Each layer has a status dot, from the last Merger record first,
+  then the build check (the last run of the pull request's own head,
+  or a green it posted without a run):
+  * green, can merge: in a train whose top is green, in the Merger's
+    queue (eligible), merged (a layer above is held as `stacked on #N,
+    which merged`), or held only as `stacked on #N` with its own check
+    green, so it boards when the one below does;
+  * orange, testing underway: in a train testing or waiting for a
+    slot, held only as stacked with its own check running or not run
+    yet, queued with its own check running, or held for a check still
+    to come (a hold that says `pending`, `expected`, `(absent)`,
+    waits for a new batch's top, or waits for its train);
+  * red, cannot merge: in a train whose top is red, handed back at the
+    last tick, held for anything else (a conflict, a review after the
+    approval, `Blocked-by:`, a draft, a hold label, a red check, a
+    layer waiting for something of its own), its own check red, or not
+    a candidate at all (not approved, or not open).
   In `flow.json` as `stacks` (`pr`, `layers`, `count`, `depth`,
-  `root_where`).
+  `root_where`, and each node's `status` and `why`).
+
+In both, a pull request the Merger puts first has a mark: **!!**
+urgent, carrying `labels.urgent` (with `--github`, read from GitHub;
+otherwise inferred: one in ahead.json's `urgent_cut`, the queued pull
+requests the Merger found urgent, that fixes nothing red); **!**
+elevated, one the Merger treats as urgent without the label (a fix of
+a red nightly or default branch, as above) or the holder of right of
+way in the last Merger record. In `flow.json` as `priority`
+(`{"<pr>": {"level", "why"}}`).
 
 `forge-stats-watch` reads three of these figures in its own process
 (`hand_backs_per_merge`, `prs_per_slot`, `reviewer_busy`).
@@ -134,8 +170,8 @@ A run ends with one line on standard output:
     forge-flow: wrote /home/agent/flow/widget (merging; 4 merges in the last hour; 1 history lines)
 
 With `--github`, a failure to read GitHub is reported on standard error
-(`forge-flow: GitHub's approvals left out: …`) and the page is written
-without them.
+(`forge-flow: GitHub's approvals left out: …`, `forge-flow: urgent
+labels inferred, not read: …`) and the page is written without them.
 
 ## State and logs
 
