@@ -99,7 +99,8 @@ every `FORGE_` variable and `checks.drop_env`, plus the variables in
   [Keeping the records fresh](../config.md#keeping-the-records-fresh).
 * **`merge`**: `merger` (the default poster) and
   [`merge.test_ahead`](../config.md#mergetest_ahead)
-  (`max_age_hours`, `spare_slots_only`; it turns on `merger_first`).
+  (`max_age_hours`, `spare_slots_only`, `train_slots`; it turns on
+  `merger_first`).
 * **Keys**: `repo`, `default_branch`, `host` (named in descriptions),
   `agents` (reviewers, for `approved_first`; names for
   `first_authors`), `machinery`, `key_dir` ([Keys](../config.md#keys)).
@@ -166,7 +167,12 @@ While a head of the Merger's own pull request waits, overdue heads and
 `first_authors` go behind it, and no prediction goes before it.
 `spare_slots_only` runs predictions only when no ordinary head waits.
 A head that failed to prepare always goes behind. It only orders: a
-free slot is never kept empty. `STARTED` lines end with why a head
+free slot is never kept empty, except under `train_slots`, which keeps
+that many slots for predictions alone: heads' own runs and the default
+branch's start only while fewer than the other slots are running them,
+a free slot past that takes the next prediction even before the
+Merger's own head, or stays free (`RESERVED: ...`), and nothing running
+is stopped for it. `STARTED` lines end with why a head
 went first (`, first: the Merger waits on it`, `, first: it is
 approved`, `, first: it has waited N minutes`). The
 [`checks`](../config.md#checks) table gives each key's detail.

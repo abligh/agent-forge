@@ -141,12 +141,15 @@ TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "trains": str, "trains_within": str, "stop_spent": bool,
               "green_batch_first": bool, "retry_red": bool,
               "tell_boarded": bool, "later_first": int,
-              "train_merge": bool, "train_branch": str}
+              "train_merge": bool, "train_branch": str,
+              "train_slots": int}
 TRAINS = ("dry-run", "live", "off")
 # designs/0050: what testing ahead is when the project says nothing.
 # Trains of up to 4, two in flight, predicted 7 deep; batches x batch
 # is then depth + 1.
 DEFAULT_AHEAD_DEPTH = 7
+# forge-pr-check's checks.slots when the project gives none.
+DEFAULT_CHECK_SLOTS = 2
 DEFAULT_AHEAD_BATCH = 4
 DEFAULT_AHEAD_BATCHES = 2
 DEFAULT_TRAINS = "live"
@@ -1427,6 +1430,14 @@ def _check_test_ahead(ahead, checks, problems):
                             "(%d)" % (where, depth + 1))
     if _is(ahead.get("later_first"), int) and ahead["later_first"] < 0:
         problems.append("%s.later_first must be at least 0" % where)
+    if _is(ahead.get("train_slots"), int):
+        # Amendment of 2026-11-12: slots only the Merger's predictions
+        # may use; at least one must be left for the heads' own runs.
+        slots = checks.get("slots") if isinstance(checks, dict) else None
+        slots = slots if _is(slots, int) else DEFAULT_CHECK_SLOTS
+        if not 0 <= ahead["train_slots"] < slots:
+            problems.append("%s.train_slots must be at least 0 and less "
+                            "than checks.slots (%d)" % (where, slots))
     if _is(ahead.get("unstable_after_recuts"), int) and \
             ahead["unstable_after_recuts"] < 1:
         problems.append("%s.unstable_after_recuts must be at least 1" % where)

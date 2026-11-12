@@ -607,3 +607,19 @@ a train of N that merges as one; not updated"). A train of one, a red
 top, and a train GitHub refused this tick (`TRAIN-MERGE ...; each
 member merges on its own`) are updated as before, as is anything not
 on a train.
+
+## Amendment (2026-11-12, third): slots kept for the trains' tops
+
+**What happened.** On a host whose slots are always full, a train's top
+waits for a slot like any head: the Merger's own head, overdue heads,
+heads put first and the default branch's run all go before it, so the
+next merge waited a whole run behind pull requests that weren't next.
+
+**The rule.** `merge.test_ahead.train_slots` n (default 0, at most
+`checks.slots` - 1) keeps n of the build check's slots for the
+Merger's predictions. The heads' own runs and the default branch's
+start only while fewer than `slots` - n are running; a prediction may
+take any free slot, and one running counts against the n. A slot kept
+this way takes the next prediction even while the Merger's own head
+waits, since that head couldn't have it. Running checks are never
+stopped for it; a slot frees as its run ends.

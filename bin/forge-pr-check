@@ -264,6 +264,16 @@ When a head of the Merger's own pull request is held for its batch's
 top (below), that top goes first instead, before every other waiting
 head: its run is the one the next merge waits on.
 
+With `merge.test_ahead.train_slots` n (amendment of 2026-11-12, default
+0), n of the slots are the predictions' alone: the heads' own runs and
+the default branch's (its warm-ups too) start only while fewer than
+slots - n of them are running, and a prediction running in any slot
+counts against the n. Once the heads have their share, a free slot
+takes the next prediction even while the Merger's own head waits (it
+couldn't have the slot), or stays free, logged `RESERVED: k free slots
+kept for the Merger's predictions ...`. A prediction may still take any
+free slot, and nothing running is stopped for it.
+
 Nothing after an entry whose tree is red here is started: every later
 prediction contains that pull request, so it would only be red too.
 
@@ -952,6 +962,10 @@ TEST_AHEAD = False
 # merge.test_ahead.spare_slots_only (designs/0014): predictions only when
 # no ordinary head is waiting.
 SPARE_ONLY = False
+# merge.test_ahead.train_slots (amendment of 2026-11-12): how many slots
+# only the Merger's predictions may use; the pull requests' own heads
+# and the default branch's runs share the rest.
+TRAIN_SLOTS = 0
 # merge.test_ahead.later_first (designs/0035, amendment of 2026-11-11):
 # how many later batches' tops go before an ordinary head.
 LATER_FIRST = 0
@@ -1094,7 +1108,7 @@ def configure(project, instance=None):
     global MERGER_CPU_WEIGHT, DOCKER_SLICES, CPU_QUOTA
     global STEP_CACHES, ENV_FILES
     global FLAKE_ISSUE
-    global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, LATER_FIRST, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
+    global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, LATER_FIRST, TRAIN_SLOTS, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT, WARM_PATHS, WARM_EVERY
     global RESULTS_MAX
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
@@ -1239,6 +1253,7 @@ def configure(project, instance=None):
     SPARE_ONLY = bool((ahead or {}).get("spare_slots_only"))
     STOP_SPENT = (ahead or {}).get("stop_spent") is True
     LATER_FIRST = (ahead or {}).get("later_first", 0)
+    TRAIN_SLOTS = (ahead or {}).get("train_slots", 0)
     RETRY_RED = (ahead or {}).get("retry_red") is True
     FLAKE_ISSUE = None
     if instance is None and isinstance(checks.get("flake_issue"), dict):
@@ -1512,6 +1527,14 @@ def holder_fields(line):
             pid = int(part[4:])
     return (int(parts[0][1:]), parts[1], parts[2], pid,
             "ahead" in parts[3:] or "main" in parts[3:])
+
+
+def is_prediction(got):
+    """Whether a slot's run (`holder_fields`) is one of the Merger's
+    predictions, which merge.test_ahead.train_slots's slots are for: a
+    pull request's own head, the default branch's run (pr 0, which
+    `ahead` also marks) and a run its lock line doesn't name aren't."""
+    return bool(got and got[4] and got[0])
 
 
 def stop_worker(pid):
@@ -4033,12 +4056,22 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     # before them.
     blocked = merger_blocked(merger_dir, when) if APPROVED_FIRST else set()
     predicted_prs = {e["pr"] for e in ahead} if APPROVED_FIRST else set()
+    # merge.test_ahead.train_slots (amendment of 2026-11-12): only the
+    # Merger's predictions may run in the reserved slots, so the heads'
+    # own runs and the default branch's fill at most the rest. Nothing
+    # running is stopped for it.
+    own_cap = slots - min(TRAIN_SLOTS, slots - 1) \
+        if TEST_AHEAD and merger_dir else slots
+    own_running = sum(1 for slot, holder in holders.items()
+                      if slot != LANE and holder is not None
+                      and not is_prediction(fields[slot]))
     # Fill every free slot, not one per tick: a tick's start rate was the
     # queue's ceiling (see the module docstring). What a pass starts is
     # as good as running to the next pass; the listing above isn't redone.
     first_pass = True
     while free or lane_free:
         predicted = pick = fast = None
+        own_full = own_running >= own_cap
         held = {}
         with state_lock(state_dir):
             state = load(state_dir)
@@ -4086,12 +4119,13 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 state["waiting"].get(s, {}).get("pr") == first_pr
                 and not state["waiting"].get(s, {}).get("main")
                 for s in twins)
-            if free:
+            if free and not own_full:
                 pick = next_head(state, taken | set(held), first_pr, when,
                                  cheap, urgent, blocked, predicted_prs) \
                     if fresh else next_head(state, taken, first_pr, when,
                                             cheap, blocked=blocked,
                                             queued=predicted_prs)
+            if free:
                 if TEST_AHEAD:
                     forget_ahead(state, ahead)
                     # The Merger's predictions go before an ordinary pick,
@@ -4108,10 +4142,13 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                     # (designs/0014), never before an ordinary pick.
                     # A run was stopped for the batch's top: its slot
                     # is the top's, before an overdue head or one put
-                    # first.
+                    # first. And a slot only predictions may use
+                    # (train_slots) is a prediction's: no head can
+                    # have it, the Merger's own included.
                     preferring = bool(batch) and (state.get(
                         "preempting") or {}).get("for") == batch[-1]["sha"]
-                    if front_held or preferring or not merger_head_waits(
+                    if front_held or preferring or own_full \
+                            or not merger_head_waits(
                             state, first_pr, taken, when) and (
                             pick is None or not SPARE_ONLY and not (
                             pick[1] == first_pr
@@ -4169,9 +4206,15 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             fields[free.pop(0)] = (pr, sha, iso(when), None, True)
             continue
         if pick is None:
+            if own_full and fast is None and live_heads(state, taken, when):
+                out("RESERVED: %d free slot%s kept for the Merger's "
+                    "predictions (merge.test_ahead.train_slots %d); %d "
+                    "waiting" % (len(free), "" if len(free) == 1 else "s",
+                                 TRAIN_SLOTS, len(queued - taken)))
+                return 0
             warming = warm_slot(state, free, head_of_main, checkout, when, run) \
-                if fast is None and not starting and not live_heads(
-                    state, taken, when) else None
+                if fast is None and not starting and not own_full \
+                and not live_heads(state, taken, when) else None
             if warming is not None:
                 slot, cached, changed = warming
                 with state_lock(state_dir):
@@ -4209,6 +4252,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                    len(queued - taken) - 1))
             busy.add(sha)
             free.pop(0)
+            own_running += 1
             continue
         if checkout:
             spawn(state_dir, sha, pr, post is not None, free[0], checkout)
@@ -4225,6 +4269,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                if overdue(state["waiting"].get(sha, {}), when) else ""))
         busy.add(sha)
         free.pop(0)
+        own_running += 1
     return 0
 
 

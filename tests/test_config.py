@@ -53,6 +53,24 @@ class Check(unittest.TestCase):
         data["merge"]["test_ahead"] = {"later_first": -1}
         self.assertEqual(len(config.check(data)), 1)
 
+    def test_test_ahead_train_slots_leaves_a_slot_for_the_heads(self):
+        data = example()
+        data["checks"]["slots"] = 4
+        for n in (0, 1, 3):
+            data.setdefault("merge", {})["test_ahead"] = {"train_slots": n}
+            self.assertEqual(config.check(data), [], n)
+        for bad in (-1, 4, 5):
+            data["merge"]["test_ahead"] = {"train_slots": bad}
+            self.assertEqual(config.check(data), [
+                "merge.test_ahead.train_slots must be at least 0 and less "
+                "than checks.slots (4)"], bad)
+        data["merge"]["test_ahead"] = {"train_slots": "1"}
+        self.assertEqual(len(config.check(data)), 1)
+        # checks.slots defaults to 2.
+        del data["checks"]["slots"]
+        data["merge"]["test_ahead"] = {"train_slots": 2}
+        self.assertEqual(len(config.check(data)), 1)
+
     def test_test_ahead_spare_slots_only_is_a_boolean(self):
         data = example()
         data.setdefault("merge", {})["test_ahead"] = {"spare_slots_only": True}

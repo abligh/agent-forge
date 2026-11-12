@@ -2860,6 +2860,62 @@ class TickAhead(Tick):
             pc.STOP_SPENT = old
         self.assertNotIn(4242, stopped)
 
+    def reserve(self, n=1):
+        """merge.test_ahead.train_slots (amendment of 2026-11-12)."""
+        patch = mock.patch.object(pc, "TRAIN_SLOTS", n)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_a_train_slot_is_kept_from_the_heads_own_runs(self):
+        self.reserve()
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
+                  merger_dir=self.merger(entries=()))
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_A, 7, False, 1)])
+        self.assertEqual(self.lines[-1], "RESERVED: 1 free slot kept for the "
+                         "Merger's predictions (merge.test_ahead.train_slots "
+                         "1); 1 waiting")
+
+    def test_a_train_slot_takes_a_prediction_before_the_mergers_head(self):
+        # The head can't have the slot, so a prediction waiting for it
+        # to start would leave the slot idle.
+        self.reserve()
+        self.hold(1, "#5 %s %s" % (SHA_C, pc.iso(T0)))
+        self.tick([(5, SHA_C, REPO, "false"), (7, SHA_A, REPO, "false")],
+                  merger_dir=self.merger())
+        self.assertEqual(self.spawned,
+                         [(self.state_dir, SHA_P, 2, False, 2, None, True)])
+
+    def test_a_prediction_running_uses_the_train_slot(self):
+        self.reserve()
+        self.hold(1, "#2 %s %s ahead" % (SHA_P, pc.iso(T0)))
+        self.tick([(7, SHA_A, REPO, "false")], merger_dir=self.merger())
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_A, 7, False, 2)])
+
+    def test_the_default_branchs_run_is_not_a_prediction(self):
+        self.assertFalse(pc.is_prediction((0, SHA_C, pc.iso(T0), None, True)))
+        self.assertTrue(pc.is_prediction((2, SHA_P, pc.iso(T0), None, True)))
+        self.assertFalse(pc.is_prediction((7, SHA_A, pc.iso(T0), None,
+                                           False)))
+        self.assertFalse(pc.is_prediction(None))
+
+    def test_no_running_head_is_stopped_for_a_train_slot(self):
+        self.reserve()
+        self.hold(1, "#5 %s %s pid=4242" % (SHA_C, pc.iso(T0)))
+        self.hold(2, "#7 %s %s pid=4343" % (SHA_A, pc.iso(T0)))
+        stopped = []
+        run = FakeRun((is_pulls, done([], 0, heads_tsv(
+            (5, SHA_C, REPO, "false"), (7, SHA_A, REPO, "false")))))
+        pc.tick(self.state_dir, "tok", run, lambda *a: None,
+                self.lines.append, when=T0, slots=2,
+                merger_dir=self.merger(),
+                stop=lambda pid: stopped.append(pid) or True)
+        self.assertEqual(stopped, [])
+
+    def test_without_test_ahead_nothing_is_reserved(self):
+        self.reserve()
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")])
+        self.assertEqual(len(self.spawned), 2)
+
     def test_a_prediction_runs_while_the_mergers_head_is_not_waiting(self):
         self.slots = 1  # which goes first, not how many start
         self.write_state({"waiting": {SHA_B: {
