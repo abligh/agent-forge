@@ -260,6 +260,14 @@ none can merge anything before it has its verdict), nor before a head
 put first on purpose (`labels.urgent`, `checks.first_authors`) or one
 that has waited `max_wait_minutes`.
 
+**Moving the check to another host keeps its verdicts only on purpose.**
+A verdict counts only on the host it was recorded on (the toolchain may
+differ elsewhere), so after the state is moved to a new host or
+container every earlier one is run again. When the move keeps the same
+toolchain, `forge-pr-check --relabel-host OLD` on the new host makes
+every verdict recorded on OLD count as this host's (agent-forge #197).
+The steps digest and the age limit still apply.
+
 When a head of the Merger's own pull request is held for its batch's
 top (below), that top goes first instead, before every other waiting
 head: its run is the one the next merge waits on.
@@ -2852,6 +2860,26 @@ def foreign(record, when):
     age = verdict_age(record, when)
     return age is not None and not (
         datetime.timedelta(0) <= age <= MATCH_MAX_AGE)
+
+
+def relabel_host(state_dir, old, new=None):
+    """Give every verdict recorded on host `old` this host's name (or
+    `new`), under the state lock, for a deliberate move of the check's
+    state to another host or container (agent-forge #197): `tested`
+    trusts only this host's verdicts, so a move made every earlier one
+    count for nothing, and every head and batch ran again. The steps
+    digest and the age limit still apply. Returns how many changed."""
+    new = new or socket.gethostname()
+    with state_lock(state_dir):
+        state = load(state_dir)
+        changed = 0
+        for record in state["results"].values():
+            if isinstance(record, dict) and record.get("host") == old:
+                record["host"] = new
+                changed += 1
+        if changed:
+            save(state_dir, state)
+    return changed
 
 
 def tested(state, tree, when, ok=None, accept=None):
@@ -7262,6 +7290,10 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
                         "--slot only to bring the slot's caches up to it "
                         "(checks.warm): untraced, posted nowhere, and kept "
                         "apart from its verdict")
+    parser.add_argument("--relabel-host", metavar="OLD",
+                        help="after moving the state to this host: count "
+                        "every verdict recorded on host OLD as this "
+                        "host's, then exit")
     parser.add_argument("--state-dir", default=None,
                         help="where the queue, the verdicts and the logs "
                         "live (default ~/.local/state/agent-forge/"
@@ -7315,6 +7347,11 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
         project.name, "pr-check" if args.instance is None
         else "pr-check-" + args.instance, environ)
     os.makedirs(state_dir, exist_ok=True)
+    if args.relabel_host:
+        changed = relabel_host(state_dir, args.relabel_host)
+        out("RELABELLED: %d verdict(s) from host %s are now %s's"
+            % (changed, args.relabel_host, socket.gethostname()))
+        return 0
     post = make_poster(run, out, project) if args.post and not args.warm \
         else None
     if args.worker:
