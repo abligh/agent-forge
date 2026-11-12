@@ -4497,8 +4497,8 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
        all of them when the queue has put it in front of the first; and
        the default branch moving to a tree no train predicted, a force
        merge, cuts them all.
-    3. New trains are cut from what is left, in the queue's order, urgent
-       ones first: the first carriage that merges cleanly, then each
+    3. New trains are cut from what is left, urgent ones first, then
+       the biggest carriages, then in the queue's order: the first carriage that merges cleanly, then each
        next one that touches no file the train touches (or, with
        TRAINS_WITHIN "clean", merges cleanly) and keeps it within
        AHEAD_BATCH. Urgent ones board first and share a train whenever
@@ -4609,8 +4609,13 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
     # on 2026-11-11 a nightly's fix headed a train while the Merger
     # waited on another member's own run, merged that member on its own
     # green, and the green train's prediction no longer held.
+    # Then the biggest carriages: a stack of nine is nine merges for one
+    # build, and oldest-first gave the trains to single pull requests
+    # while long stacks, ready and touching nothing of theirs, waited
+    # for a train (2026-11-12). Equal sizes keep the queue's order.
     pool = sorted(carriages, key=lambda c: (
-        acting is None or c[0]["number"] != acting, not urgent(c[0])))
+        acting is None or c[0]["number"] != acting, not urgent(c[0]),
+        -len(c)))
     behind = set()
     while len(sizes) < trains:
         start, touched, kind = len(entries), set(), None

@@ -8227,10 +8227,11 @@ class Trains(RepoCase):
         seven = self.change(7, "y.txt", "y\n")
         eight = self.change(8, "z.txt", "z\n")
         self.configure(batch=2, batches=2, depth=3)
-        # [#6, #9] doesn't fit beside #7: it goes next, whole.
+        # The biggest carriage, [#6, #9], has the first train, whole;
+        # #7 and #8 the next.
         entries, sizes, _ = self.cut([[seven], [six, layer], [eight]])
-        self.assertEqual(self.numbers(entries, sizes), [[7, 8], [6, 9]])
-        self.assertEqual([e["carriage"] for e in entries], [7, 8, 6, 6])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 9], [7, 8]])
+        self.assertEqual([e["carriage"] for e in entries], [6, 6, 7, 8])
 
     def test_a_layer_that_conflicts_stays_and_the_one_below_boards(self):
         six = self.change(6, "s.txt", "one\n")
@@ -8310,7 +8311,7 @@ class Trains(RepoCase):
         self.configure(batch=4, batches=1)
         entries, sizes, _ = self.cut([[self.item()], [six, layer],
                                       [seven]])
-        self.assertEqual(self.numbers(entries, sizes), [[5, 6, 9, 7]])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 9, 5, 7]])
         got, sizes, events = m.cut_trains(
             self.repo.path, self.repo.main_tip(),
             [[self.item()], [seven]], self.said(entries, sizes),
