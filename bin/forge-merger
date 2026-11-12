@@ -930,6 +930,29 @@ STALL_LABELS = ()
 WAITING_OWNER = DEFAULT_WAITING_OWNER
 # labels.urgent: the label that puts a pull request first, or None.
 URGENT_LABEL = None
+# labels.keep_trains: a pull request whose merge moves the default
+# branch without cutting the trains again (a pin, a configuration
+# change). Their commits are looked up once and kept in KEEP_FILE.
+KEEP_LABEL = None
+KEEP_FILE = "keep.json"
+# At most this many such commits under one set of trains; more, and
+# they are cut again as before.
+KEEP_MOST = 10
+KEEP_QUERY = """
+query($owner: String!, $name: String!, $oid: GitObjectID!) {
+  repository(owner: $owner, name: $name) {
+    object(oid: $oid) {
+      ... on Commit {
+        associatedPullRequests(first: 5) {
+          nodes {
+            number merged mergeCommit { oid }
+            labels(first: 30) { nodes { name } }
+          }
+        }
+      }
+    }
+  }
+}"""
 # labels.rerun: the label that has the build check run a red head
 # again (designs/0022), or None; named in RED_SUSPECT_DETAIL.
 RERUN_LABEL = None
@@ -1242,6 +1265,7 @@ def configure(project):
     global TEST_AHEAD, AHEAD_DEPTH, AHEAD_BATCH, HOLD_CONFLICTING, YIELD_PLACES
     global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
     global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS, URGENT_LABEL
+    global KEEP_LABEL
     global STACKS, STACK_MAX_RUN, STACK_WAIT, RESOLVE, HOLD_LABELS, BLOCKED_BY
     global UNION, RESOLVE_SLOTS
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
@@ -1286,6 +1310,7 @@ def configure(project):
     WAITING_OWNER = project.section("labels").get("waiting_on_owner",
                                                   DEFAULT_WAITING_OWNER)
     URGENT_LABEL = project.section("labels").get("urgent")
+    KEEP_LABEL = project.section("labels").get("keep_trains")
     RERUN_LABEL = project.section("labels").get("rerun")
     ahead = config.test_ahead(project.data)   # designs/0050
     TEST_AHEAD = ahead is not None
@@ -4691,6 +4716,101 @@ def stacked_on(number, bases):
     return out
 
 
+def kept_by_label(sha, github, cache):
+    """labels.keep_trains: the pull request carrying KEEP_LABEL that
+    `sha`, a commit on the default branch, merged, or None. Answers are
+    kept in `cache` ({sha: number, or 0}); one GitHub can't give isn't
+    kept, and counts as None."""
+    if sha in cache:
+        return cache[sha] or None
+    owner, name = REPO_SLUG.split("/")
+    try:
+        got = github.api("graphql", "-f", "query=" + KEEP_QUERY,
+                         "-F", "owner=" + owner, "-F", "name=" + name,
+                         "-f", "oid=" + sha)
+        nodes = got["data"]["repository"]["object"][
+            "associatedPullRequests"]["nodes"]
+    except (RuntimeError, KeyError, TypeError, ValueError):
+        return None
+    found = 0
+    for node in nodes or ():
+        if not isinstance(node, dict) or node.get("merged") is not True \
+                or (node.get("mergeCommit") or {}).get("oid") != sha:
+            continue
+        if KEEP_LABEL in [(n or {}).get("name") for n in
+                          ((node.get("labels") or {}).get("nodes") or ())]:
+            found = node.get("number") or 0
+    cache[sha] = found
+    return found or None
+
+
+def carried_base(repo, state_dir, last, main_tip, github, run=sh,
+                 out=print):
+    """labels.keep_trains (amendment of 2026-11-12, tenth): the commit
+    the trains in `last` (ahead.json, `trains_before`) stay predicted
+    on, and `main_tip` when they don't. They stay on their base when
+    the default branch has moved since only by merges of pull requests
+    carrying KEEP_LABEL (at most KEEP_MOST of them, each followed back
+    by its first parent), and the last train's top still merges with
+    `main_tip` cleanly: their runs go on, and a green train merges its
+    tested chain with one more merge, of the default branch, on top
+    (`train_merge`). Anything else moving it cuts them all again, as
+    before."""
+    last = trains_before(last)
+    base = (last or {}).get("base")
+    if not KEEP_LABEL or not last_trains(last) or not isinstance(base, str) \
+            or base == main_tip or len(base) != 40:
+        return main_tip
+    # Kept before, the trains' base is no longer the default branch's
+    # tip it was on (`main`): only what has moved it since is asked.
+    since = (last or {}).get("main") or base
+    if not isinstance(since, str) or since == main_tip or git(
+            repo, "merge-base", "--is-ancestor", since, main_tip,
+            run=run).returncode != 0:
+        return base if since == main_tip else main_tip
+    revs = git(repo, "rev-list", "--first-parent",
+               "%s..%s" % (since, main_tip), run=run)
+    shas = revs.stdout.split() if revs.returncode == 0 else []
+    if not shas or len(shas) > KEEP_MOST:
+        return main_tip
+    path = os.path.join(state_dir, KEEP_FILE)
+    cache = load_json(path, {})
+    cache = cache if isinstance(cache, dict) else {}
+    before = dict(cache)
+    entries = [e for e in (last or {}).get("entries") or ()
+               if isinstance(e, dict)]
+    by = []
+    for sha in reversed(shas):
+        # A kept train's own merge (`train_onto`): the trains behind it
+        # were predicted on its chain, which is their base now.
+        second = git(repo, "rev-parse", "-q", "--verify", sha + "^2",
+                     run=run)
+        chain = cache.get("train:" + second.stdout.strip()) \
+            if second.returncode == 0 else None
+        if isinstance(chain, str):
+            at = next((k for k, e in enumerate(entries)
+                       if e.get("sha") == chain), None)
+            if at is None or at + 1 >= len(entries):
+                by.append(None)
+                break
+            base = chain
+            continue
+        by.append(kept_by_label(sha, github, cache))
+    if cache != before:
+        # The newest few hundred answers are plenty.
+        save_json(path, dict(list(cache.items())[-300:]))
+    if not all(by):
+        return main_tip
+    top = (entries or [{}])[-1].get("sha")
+    if not top or git(repo, "merge-tree", "--write-tree", top, main_tip,
+                      run=run).returncode != 0:
+        out("TRAIN-KEEP: %s moved by %s, but the trains' last top doesn't "
+            "merge with it cleanly; every train is cut again"
+            % (MAIN, ", ".join("#%d" % n for n in by)))
+        return main_tip
+    return base
+
+
 def last_trains(last):
     """The trains of `last`, an ahead.json (or the dry run's file) that
     cut trains, as lists of carriages, each a list of its entries; []
@@ -5772,8 +5892,30 @@ def train_commits(repo, main_tip, entries, prs, run=sh):
     return parent
 
 
+def train_onto(repo, top, main, run=sh):
+    """labels.keep_trains: a merge commit of `main` into `top`, a
+    train's chain, as the Merger, or None when they don't merge
+    cleanly or git fails."""
+    if RESOLVE_IDENTITY is None:
+        return None
+    merged = git(repo, "merge-tree", "--write-tree", top, main, run=run)
+    tree = (merged.stdout or "").split("\n")[0].strip()
+    if merged.returncode != 0 or len(tree) != 40:
+        return None
+    name, email = RESOLVE_IDENTITY
+    env = dict(os.environ, GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
+               GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
+    made = run(["git", "-C", repo, "commit-tree", "--no-gpg-sign", tree,
+                "-p", top, "-p", main, "-m",
+                "Merge %s into the train (labels.keep_trains)" % MAIN],
+               env=env)
+    sha = (made.stdout or "").strip()
+    return sha if made.returncode == 0 and len(sha) == 40 else None
+
+
 def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
-                github, run=sh, sleep=time.sleep, out=print, note=None):
+                github, run=sh, sleep=time.sleep, out=print, note=None,
+                main=None):
     """merge.test_ahead.train_merge (designs/0047, amendment of
     2026-11-11): merge a green train with one pull request. The chain
     of `train_commits` is pushed to TRAIN_BRANCH<first>-<last>, given
@@ -5785,7 +5927,11 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
     GitHub wouldn't. Returns (merged, unmerged): the members GitHub says
     are merged, and the rest, left to the usual path; ([], members)
     when the train didn't go in, with the reason said. `note`, a dict,
-    is given `pr`, the train's own pull request, once it is opened."""
+    is given `pr`, the train's own pull request, once it is opened.
+    `main`, the default branch's tip when the train was kept on
+    `main_tip`, an older base (`carried_base`), is merged on top of the
+    chain, cleanly or not at all: the tree that goes in is the tested
+    one plus only the commits of labels.keep_trains."""
     prs = {pr["number"]: pr for pr in queue}
     numbers = [e["pr"] for e in entries]
     span = "#%d..#%d" % (numbers[0], numbers[-1])
@@ -5799,6 +5945,18 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
     top = train_commits(repo, main_tip, entries, prs, run)
     if top is None:
         return fail("git could not make the train's commits")
+    if main and main != main_tip:
+        top = train_onto(repo, top, main, run)
+        if top is None:
+            return fail("its chain doesn't merge cleanly with %s at %s"
+                        % (MAIN, main[:10]))
+        # Its merge moves the default branch off the chain the trains
+        # behind it were predicted on: `carried_base` keeps them on it.
+        path = os.path.join(state_dir, KEEP_FILE)
+        cache = load_json(path, {})
+        cache = cache if isinstance(cache, dict) else {}
+        cache["train:" + top] = entries[-1]["sha"]
+        save_json(path, dict(list(cache.items())[-300:]))
     branch = "%s%d-%d" % (TRAIN_BRANCH, numbers[0], numbers[-1])
     pushed = run(["git", "-C", repo, "push", "-q", "-f",
                   "https://github.com/%s.git" % REPO_SLUG,
@@ -5814,8 +5972,10 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
     ok, why = github.write(
         "POST", "repos/%s/statuses/%s" % (REPO_SLUG, top), state="success",
         context=STATUS_CONTEXT, description=(
-            "green: the Merger's train %s, its tree tested as %s"
-            % (span, short(tested[0]) if tested else "its top"))[:140])
+            "green: the Merger's train %s, its tree tested as %s%s"
+            % (span, short(tested[0]) if tested else "its top",
+               ", %s's kept commits merged on top" % MAIN
+               if main and main != main_tip else ""))[:140])
     if not ok:
         github.write("DELETE", "repos/%s/git/refs/heads/%s"
                      % (REPO_SLUG, branch))
@@ -7103,6 +7263,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     # merge.test_ahead.train_merge: a green train goes in as one. Every
     # ready member merges this tick, not one a tick.
     trained, train_failed, last_ahead = None, False, None
+    # labels.keep_trains: the commit the trains stay predicted on.
+    train_base = main_tip
+    if TRAINS == "live" and KEEP_LABEL and retarget is None:
+        train_base = carried_base(
+            repo, state_dir, load_json(os.path.join(state_dir, AHEAD_FILE),
+                                       {}), main_tip, github, run, out)
+        if train_base != main_tip:
+            record["train_base"] = train_base
     if TRAIN_MERGE and retarget is None and AHEAD_BATCH > 1:
         last_ahead = load_json(os.path.join(state_dir, AHEAD_FILE), {})
     if TRAIN_MERGE and live and retarget is None and AHEAD_BATCH > 1:
@@ -7110,14 +7278,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # greens (layers_need_own_green false), the train's top is what
         # tested them.
         members = queue if LAYERS_OWN_GREEN else queue + batch_layers
-        entries = train_ready(last_ahead, members, main_tip, check_state,
+        entries = train_ready(last_ahead, members, train_base, check_state,
                               repo, run,
                               restacks if PREDICT_RESTACKED else None)
         if entries:
             opened = {}
             merged, _ = train_merge(repo, state_dir, entries, members,
-                                    main_tip, check_state, github, run,
-                                    sleep, out, opened)
+                                    train_base, check_state, github, run,
+                                    sleep, out, opened, main=main_tip)
             # GitHub wouldn't take the train: its members merge one at
             # a time this tick, updated as before.
             train_failed = not merged
@@ -7581,7 +7749,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 if str(pr["number"]) not in reds
                 and not handed_back(said, pr, approval_of(pr) or {}, when)]
             cut = lambda before: cut_trains(
-                repo, main_tip, train_carriages(boarding, layers_of),
+                repo, train_base, train_carriages(boarding, layers_of),
                 before, {pr["number"]: pr["headRefOid"] for pr in prs},
                 open_numbers, red={pr["number"] for pr in boarding
                                    if head_red(check_state, pr)},
@@ -7631,6 +7799,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             said_ahead = {"at": record["at"], "base": main_tip,
                           "repo": git_store(repo),
                           "entries": entries}
+            if sizes is not None and train_base != main_tip:
+                # Kept on it by labels.keep_trains (`carried_base`).
+                said_ahead.update(base=train_base, main=main_tip)
+                if (last or {}).get("main") != main_tip:
+                    out("TRAIN-KEPT: %s moved to %s by labels.keep_trains; "
+                        "the trains stay on %s" % (MAIN, main_tip[:10],
+                                                   train_base[:10]))
             if sizes is None and isinstance(
                     (last or {}).get("kept_trains"), dict):
                 # A red train's search goes on: its trains are kept for
@@ -7698,7 +7873,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     searching = True
                     if sizes is not None:
                         said_ahead["kept_trains"] = kept_trains(
-                            main_tip, entries, sizes, note)
+                            train_base, entries, sizes, note)
+                        if train_base != main_tip:
+                            said_ahead["kept_trains"]["main"] = main_tip
             if searching and entries:
                 # A suspect merged this tick is still predicted first,
                 # from the tip before it: the rest are predicted on it,

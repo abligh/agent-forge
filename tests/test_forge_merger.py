@@ -1104,9 +1104,8 @@ class MergedAnotherMember(unittest.TestCase):
                                      % head[:10]))
 
 
-class TrainMerge(RepoCase):
-    """merge.test_ahead.train_merge (designs/0047, amendment of
-    2026-11-11): a green train goes in as one pull request."""
+class TrainSetup(RepoCase):
+    """A green train of #5 and #6, predicted on main's tip."""
 
     def setUp(self):
         super().setUp()
@@ -1151,6 +1150,11 @@ class TrainMerge(RepoCase):
         return m.train_merge(self.repo.path, "/nonexistent", self.entries,
                              self.queue, self.tip, self.check, self.github,
                              self.git, lambda s: None, self.lines.append)
+
+
+class TrainMerge(TrainSetup):
+    """merge.test_ahead.train_merge (designs/0047, amendment of
+    2026-11-11): a green train goes in as one pull request."""
 
     def test_a_green_train_merges_as_one_pull_request(self):
         self.assertEqual(self.merge(), ([5, 6], []))
@@ -8845,6 +8849,123 @@ class RedMain(unittest.TestCase):
 SHARED = "".join("line %d\n" % k for k in range(1, 21))
 
 
+class KeepTrains(TrainSetup):
+    """labels.keep_trains (amendment of 2026-11-12, tenth): the default
+    branch moving only by labelled merges keeps the trains on their
+    base, and a green train merges its chain with the default branch
+    merged on top."""
+
+    def setUp(self):
+        super().setUp()
+        self.state = tempfile.mkdtemp(dir=self.tmp.name)
+        patch = mock.patch.object(m, "KEEP_LABEL", "Merge:keep-trains")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.last = dict(self.last, trains=True,
+                         batch={"size": 1, "trees": [
+                             self.entries[0]["tree"]]},
+                         later=[{"size": 1, "trees": [
+                             self.entries[1]["tree"]]}])
+        self.labelled = {}
+
+    def move_main(self, name="pin.txt", text="pin\n"):
+        self.advance_main(name, text)
+        return self.repo.main_tip()
+
+    def carried(self, last=None, tip=None):
+        with mock.patch.object(m, "kept_by_label",
+                               lambda sha, github, cache:
+                               self.labelled.get(sha)):
+            return m.carried_base(self.repo.path, self.state,
+                                  last or self.last, tip, None,
+                                  out=self.lines.append)
+
+    def test_a_labelled_merge_keeps_the_trains_on_their_base(self):
+        tip = self.move_main()
+        self.labelled[tip] = 11009
+        self.assertEqual(self.carried(tip=tip), self.tip)
+
+    def test_any_other_commit_cuts_them_again(self):
+        tip = self.move_main()
+        self.assertEqual(self.carried(tip=tip), tip)
+        with mock.patch.object(m, "KEEP_LABEL", None):
+            self.labelled[tip] = 11009
+            self.assertEqual(self.carried(tip=tip), tip)
+
+    def test_a_kept_commit_that_conflicts_cuts_them_again(self):
+        tip = self.move_main("g.txt", "not the other\n")
+        self.labelled[tip] = 11009
+        self.assertEqual(self.carried(tip=tip), tip)
+        self.assertIn("TRAIN-KEEP", self.lines[-1])
+
+    def test_only_what_moved_main_since_is_asked(self):
+        first = self.move_main()
+        self.labelled[first] = 11009
+        tip = self.move_main("pin2.txt", "pin 2\n")
+        self.labelled[tip] = 11010
+        last = dict(self.last, main=first)
+        self.labelled.pop(first)
+        self.assertEqual(self.carried(last, tip), self.tip)
+
+    def test_a_kept_train_merges_with_main_on_top(self):
+        tip = self.move_main()
+        self.entries = self.entries[:1]
+        self.github = FakeGitHub({SLUG + "/pulls/5": {"merged": True}})
+        got = m.train_merge(self.repo.path, self.state, self.entries,
+                            self.queue, self.tip, {"results": {"r": {
+                                "ok": True,
+                                "tree": self.entries[0]["tree"]}}},
+                            self.github, self.git, lambda s: None,
+                            self.lines.append, main=tip)
+        self.assertEqual(got, ([5], []))
+        top = self.github.writes[0][1].rsplit("/", 1)[1]
+        run_git(self.repo.path, "fetch", "-q", "origin", "forge/train-5-5")
+        self.assertEqual(run_git(self.repo.path, "rev-parse", top + "^2"),
+                         tip)
+        files = run_git(self.repo.path, "ls-tree", "--name-only", top)
+        self.assertIn("pin.txt", files.split())
+        self.assertIn("f.txt", files.split())
+        self.assertIn("kept commits merged on top",
+                      self.github.writes[0][2]["description"])
+        # The trains behind it stay on its chain once it has merged.
+        merge = run_git(self.repo.path, "commit-tree", top + "^{tree}",
+                        "-p", tip, "-p", top, "-m", "Merge train")
+        last = dict(self.last, entries=self.last["entries"], main=tip)
+        self.assertEqual(self.carried(last, merge),
+                         self.last["entries"][0]["sha"])
+
+    def test_a_train_that_conflicts_with_main_goes_on_its_own(self):
+        tip = self.move_main("g.txt", "not the other\n")
+        self.github = FakeGitHub({})
+        got = m.train_merge(self.repo.path, self.state, self.entries,
+                            self.queue, self.tip, self.check, self.github,
+                            self.git, lambda s: None, self.lines.append,
+                            main=tip)
+        self.assertEqual(got, ([], [5, 6]))
+        self.assertIn("doesn't merge cleanly", self.lines[-1])
+        self.assertEqual(self.github.writes, [])
+
+    def test_the_label_is_read_from_the_commits_pull_request(self):
+        sha = "a" * 40
+        github = mock.Mock()
+        github.api.return_value = {"data": {"repository": {"object": {
+            "associatedPullRequests": {"nodes": [
+                {"number": 3, "merged": True, "mergeCommit": {"oid": "b" * 40},
+                 "labels": {"nodes": [{"name": "Merge:keep-trains"}]}},
+                {"number": 4, "merged": True, "mergeCommit": {"oid": sha},
+                 "labels": {"nodes": [{"name": "Merge:keep-trains"}]}}]}}}}}
+        cache = {}
+        self.assertEqual(m.kept_by_label(sha, github, cache), 4)
+        self.assertEqual(cache, {sha: 4})
+        github.api.return_value["data"]["repository"]["object"][
+            "associatedPullRequests"]["nodes"][1]["labels"]["nodes"] = []
+        self.assertIsNone(m.kept_by_label("c" * 40, github, {}))
+        github.api.side_effect = RuntimeError("down")
+        cache = {}
+        self.assertIsNone(m.kept_by_label("d" * 40, github, cache))
+        self.assertEqual(cache, {})
+
+
 class Trains(RepoCase):
     """designs/0047: trains of carriages that touch different files, cut
     once and kept."""
@@ -9236,6 +9357,32 @@ class Trains(RepoCase):
                                       last)
         self.assertEqual(events[0][0], "main moved")
         self.assertEqual(self.numbers(got, sizes), [[7], [5], [6]])
+
+    def test_a_kept_commit_keeps_every_train_and_its_trees(self):
+        # labels.keep_trains: the tick cuts on the base `carried_base`
+        # gives, the trains' own, though main has moved.
+        six, seven = self.change(6, "y.txt", "y\n"), self.change(
+            7, "z.txt", "z\n")
+        self.configure(batch=1, batches=3)
+        entries, sizes, _ = self.cut([[self.item()], [six], [seven]])
+        last = self.said(entries, sizes)
+        base = self.repo.main_tip()
+        self.advance_main("pin.txt", "pin\n")
+        tip = self.repo.main_tip()
+        with mock.patch.object(m, "KEEP_LABEL", "Merge:keep-trains"), \
+                mock.patch.object(m, "kept_by_label",
+                                  lambda sha, github, cache: 11009):
+            carried = m.carried_base(self.repo.path, self.tmp.name, last,
+                                     tip, None)
+        self.assertEqual(carried, base)
+        heads = {p["number"]: p["headRefOid"]
+                 for p in (self.item(), six, seven)}
+        got, sizes, events = m.cut_trains(
+            self.repo.path, carried, [[self.item()], [six], [seven]], last,
+            heads, set(heads), red=frozenset())
+        self.assertEqual(events, [])
+        self.assertEqual([e["tree"] for e in got],
+                         [e["tree"] for e in entries])
 
     def test_an_urgent_one_cuts_the_trains_behind_the_first(self):
         six, seven = self.change(6, "y.txt", "y\n"), self.change(
