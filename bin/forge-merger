@@ -511,7 +511,13 @@ a layer, the layers on it, then the next one beside it; one that isn't
 ready, or in a train won't merge onto what is ahead of it, holds back
 the layers on it and no others, and a train member that leaves takes
 only the layers on it with it (ahead.json's entries say `on`, the
-member each is stacked on).
+member each is stacked on). With `layers_need_own_green` false (default
+true; with `merge.own_head_green`), a layer boards without its own
+build check's green, its train's top testing it; once its base has
+merged it stays a candidate without one while its head is the one it
+boarded with, or that one brought up to date (`own_green_wait`'s
+`boarded`), and `train_merge` takes the layers held as stacked as
+members, so the train goes in as one.
 
 **With `merge.test_ahead.trains`, batches are trains** (designs/0047;
 default off). `"live"`: each batch is a train of carriages, a stack's
@@ -994,6 +1000,9 @@ BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
                      "waits for the new batch's top")
 # merge.test_ahead.train_merge: a train's member behind the default
 # branch waits for its train rather than being updated.
+# merge.test_ahead.layers_need_own_green: whether a stack's layer needs
+# its own build check's green to board its base's train.
+LAYERS_OWN_GREEN = True
 TRAIN_WAIT_REASON = ("in a train of %d that merges as one; not updated, "
                      "it waits for the train's top")
 # The most ticks one run makes: it ticks again straight after a merge.
@@ -1185,7 +1194,7 @@ def configure(project):
     global FIXED_ORDER, GREEN_BATCH_FIRST, RED_SUSPECT_OUT, UNSTABLE_AFTER
     global UNSTABLE_BATCHES, TELL_BOARDED
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
-    global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR
+    global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR, LAYERS_OWN_GREEN
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -1236,6 +1245,8 @@ def configure(project):
     TRAINS = (ahead or {}).get("trains")
     TRAINS_WITHIN = (ahead or {}).get("trains_within", "files")
     TRAIN_MERGE = (ahead or {}).get("train_merge") is True
+    LAYERS_OWN_GREEN = (ahead or {}).get("layers_need_own_green") \
+        is not False
     TRAIN_BRANCH = (ahead or {}).get("train_branch", "forge/train-")
     HOLD_CONFLICTING = merge.get("hold_conflicting", False) is True
     YIELD_PLACES = merge.get("yield_after_hand_back", 0)
@@ -3916,7 +3927,7 @@ def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
 
 
 def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
-                   run=sh):
+                   run=sh, boarded=None):
     """Why `pr` isn't a candidate yet under merge.own_head_green, or
     None: checks.context isn't green (success) on the commit its
     approval names, nor on its head, nor (given `repo` and `main_tip`)
@@ -3933,7 +3944,12 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
     once a tick per commit, through `cache`, which keeps a green across
     ticks (`load_greens`). A pending, red or absent
     context holds the pull request: nothing merges, boards a batch or a
-    train, or is predicted until the build check has passed on it."""
+    train, or is predicted until the build check has passed on it.
+
+    `boarded` (merge.test_ahead.layers_need_own_green false) is the head
+    a stack's layer boarded a train with: while the head is that one, or
+    that one brought up to date as above, it needs no green of its own,
+    since the train's top tests it."""
     approved = ((approval or {}).get("commit") or {}).get("oid")
     head = pr.get("headRefOid")
     shas = [approved, head]
@@ -3948,6 +3964,8 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
                 break
             commit = parents[1]
             shas.append(commit)
+    if boarded and boarded in shas[1:]:
+        return None
     seen = []
     for sha in dict.fromkeys(s for s in shas if s):
         if sha not in cache:
@@ -5463,6 +5481,17 @@ def train_ready(last, queue, main_tip, check_state, repo=None, run=sh,
     return ready
 
 
+def boarded_layers(last):
+    """{number: head} of the stack's layers on the trains in `last`
+    (ahead.json): members that aren't the first of their carriage."""
+    if not isinstance(last, dict) or not last.get("trains"):
+        return {}
+    return {e["pr"]: e.get("head") for e in last.get("entries") or ()
+            if isinstance(e, dict) and isinstance(e.get("pr"), int)
+            and e.get("carriage") is not None
+            and e.get("carriage") != e["pr"]}
+
+
 def train_boarded(last, pr, check_state):
     """merge.test_ahead.train_merge: the size of the first train in
     `last` (ahead.json) when `pr` is boarded on it at the head it has,
@@ -6454,9 +6483,15 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 candidates.remove(pr)
     greens = load_greens(state_dir) if OWN_HEAD_GREEN else {}
     if OWN_HEAD_GREEN:
+        # merge.test_ahead.layers_need_own_green false: a layer that
+        # boarded a train is tested by its top, and stays a candidate
+        # without a green of its own once its base has merged.
+        aboard = {} if LAYERS_OWN_GREEN else boarded_layers(load_json(
+            os.path.join(state_dir, AHEAD_FILE), {}))
         for pr in list(candidates):
             why = own_green_wait(pr, approvals[pr["number"]], github, greens,
-                                 repo, main_tip, run)
+                                 repo, main_tip, run,
+                                 aboard.get(pr["number"]))
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
@@ -6713,11 +6748,15 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     if TRAIN_MERGE and retarget is None and AHEAD_BATCH > 1:
         last_ahead = load_json(os.path.join(state_dir, AHEAD_FILE), {})
     if TRAIN_MERGE and live and retarget is None and AHEAD_BATCH > 1:
-        entries = train_ready(last_ahead, queue, main_tip, check_state,
-                              repo, run, restacks if PREDICT_RESTACKED
-                              else None)
+        # Layers held as stacked are members too: without their own
+        # greens (layers_need_own_green false), the train's top is what
+        # tested them.
+        members = queue if LAYERS_OWN_GREEN else queue + batch_layers
+        entries = train_ready(last_ahead, members, main_tip, check_state,
+                              repo, run,
+                              restacks if PREDICT_RESTACKED else None)
         if entries:
-            merged, _ = train_merge(repo, state_dir, entries, queue,
+            merged, _ = train_merge(repo, state_dir, entries, members,
                                     main_tip, check_state, github, run,
                                     sleep, out)
             # GitHub wouldn't take the train: its members merge one at
@@ -6726,7 +6765,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if merged:
                 trained = set(merged)
                 heads = {e["pr"]: e["head"] for e in entries}
-                prs_by = {pr["number"]: pr for pr in queue}
+                prs_by = {pr["number"]: pr for pr in members}
                 for number in merged:
                     record["decisions"].append({
                         "action": "MERGE", "pr": number,
@@ -7076,7 +7115,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 repo, pr, prs, open_numbers, when, said, run, regenerated,
                 rules, (lambda layer, approval: own_green_wait(
                     layer, approval, github, greens, repo, main_tip, run))
-                if OWN_HEAD_GREEN else None,
+                if OWN_HEAD_GREEN and LAYERS_OWN_GREEN else None,
                 (lambda layer: instance_wait(repo, layer, main_tip, github,
                                              gated_files, run))
                 if GATED else None)) if AHEAD_STACKS else None

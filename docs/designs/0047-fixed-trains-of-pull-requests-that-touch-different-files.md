@@ -657,3 +657,23 @@ back the layers on it and no others; a member that leaves a cut train
 takes only the layers on it with it. Each entry in `ahead.json` says
 `on`, the member it is stacked on; entries from before say nothing,
 and one of those that leaves takes everything after it, as before.
+
+## Amendment (2026-11-12, sixth): layers board without their own green
+
+**What happened.** With `merge.own_head_green`, a stack's layer
+boarded its base's train only once its own build check was green, so
+layers waited for runs of their own while their base's train went
+without them, though the train's top tests their changes anyway.
+
+**The rule.** `merge.test_ahead.layers_need_own_green: false` (default
+true, needs `stacks`) lets a layer board on everything else:
+its approval covering its head, code owners, gated instances, and no
+hand-back. Once its base merges, it stays a candidate without a green
+of its own while its head is the head it boarded with, or that head
+brought up to date by merges of the default branch or of the base's
+final head (`own_green_wait`'s walk back). With `train_merge`, the
+layers held as stacked count as the train's members, so the train goes
+in as one merge of its tested top; the merge itself still needs only
+the top's green, as for any member. Each member's own merge on the
+usual path still waits for `checks.context` on the head it merges,
+which a batch's cover gives once its tree is the one predicted.

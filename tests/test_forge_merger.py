@@ -6500,6 +6500,78 @@ class Stacks(RepoCase):
         record, _ = self.tick([self.bottom(), self.layer()])
         self.assertEqual(record["ahead"], [5])
 
+    def own_green_tick(self, layers_need_own_green, minutes=0,
+                       check_state=None, **ahead):
+        """A live tick with merge.own_head_green on, #5 green on its own
+        and #6, its layer, with no run of its own yet."""
+        m.configure(project(stacks={}, own_head_green=True, test_ahead=dict(
+            {"batch": 2, "stacks": True, "trains": "live",
+             "layers_need_own_green": layers_need_own_green}, **ahead)))
+        table = dict(answers(prs=[self.bottom(), self.layer()]), **{
+            SLUG + "/commits/": [],
+            SLUG + "/commits/" + self.lower: [status()],
+            SLUG + "/pulls/5": {"merged": True},
+            SLUG + "/pulls/6": {"merged": True}})
+        self.github = FakeGitHub(table)
+        base = tools_run()
+
+        def run(args, cwd=None, env=None):
+            if "push" in args:
+                args = [self.repo.origin if a.startswith("https://github.com/")
+                        else a for a in args]
+            return base(args, cwd, env)
+        lines = []
+        start = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                                  tzinfo=datetime.timezone.utc)
+        with mock.patch.object(m, "RESOLVE_IDENTITY", ("Merger", "m@x")), \
+                mock.patch.object(m, "CI_WORKFLOW", ""):
+            record = m.tick(self.repo.path, self.state, self.github, run,
+                            lines.append, now=lambda: start
+                            + datetime.timedelta(minutes=minutes),
+                            live=True, check_state=check_state)
+        return record, lines
+
+    def test_a_layer_boards_without_its_own_green_when_told(self):
+        # Amendment of 2026-11-12: the train's top tests it.
+        record, _ = self.own_green_tick(True)
+        self.assertEqual(record["ahead"], [5])
+        self.state = os.path.join(self.tmp.name, "without")
+        record, _ = self.own_green_tick(False)
+        self.assertEqual(record["ahead"], [5, 6])
+
+    def test_its_train_merges_as_one_on_the_tops_green(self):
+        # Main moves on, so #5 isn't merged on its own at once.
+        self.advance_main("n.txt")
+        record, _ = self.own_green_tick(False, train_merge=True)
+        self.assertEqual(record["ahead"], [5, 6])
+        top = m.load_json(os.path.join(self.state, m.AHEAD_FILE),
+                          None)["entries"][1]
+        record, lines = self.own_green_tick(
+            False, minutes=1, train_merge=True, check_state={"results": {
+                top["sha"]: {"tree": top["tree"], "ok": True}}})
+        self.assertEqual([(d["pr"], d["action"], d.get("train"))
+                          for d in record["decisions"]],
+                         [(5, "MERGE", True), (6, "MERGE", True)])
+
+    def test_a_boarded_layer_needs_no_green_of_its_own(self):
+        github = FakeGitHub({SLUG + "/commits/": []})
+        layer = self.layer()
+        approval = m.approval_of(layer)
+        self.assertIsNotNone(m.own_green_wait(layer, approval, github, {}))
+        self.assertIsNone(m.own_green_wait(layer, approval, github, {},
+                                           boarded=self.upper))
+        self.assertIsNotNone(m.own_green_wait(layer, approval, github, {},
+                                              boarded="f" * 40))
+
+    def test_boarded_layers(self):
+        last = {"trains": True, "entries": [
+            {"pr": 5, "head": "a", "carriage": 5},
+            {"pr": 6, "head": "b", "carriage": 5, "on": 5},
+            {"pr": 7, "head": "c", "carriage": 7}]}
+        self.assertEqual(m.boarded_layers(last), {6: "b"})
+        self.assertEqual(m.boarded_layers(dict(last, trains=False)), {})
+        self.assertEqual(m.boarded_layers(None), {})
+
     def hand_tick(self, pulls, minutes=1):
         """A live tick with only #6 open, and GitHub answering the
         closed pull requests from b5 with `pulls`."""

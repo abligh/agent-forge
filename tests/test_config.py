@@ -71,6 +71,16 @@ class Check(unittest.TestCase):
         data["merge"]["test_ahead"] = {"train_slots": 2}
         self.assertEqual(len(config.check(data)), 1)
 
+    def test_test_ahead_layers_need_own_green_false_needs_stacks(self):
+        data = example()
+        data.setdefault("merge", {})["test_ahead"] = {
+            "layers_need_own_green": False}
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.layers_need_own_green false needs stacks: "
+            "only a stack's layers board with their base"])
+        data["merge"]["test_ahead"]["layers_need_own_green"] = True
+        self.assertEqual(config.check(data), [])
+
     def test_test_ahead_spare_slots_only_is_a_boolean(self):
         data = example()
         data.setdefault("merge", {})["test_ahead"] = {"spare_slots_only": True}

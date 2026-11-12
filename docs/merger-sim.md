@@ -21,8 +21,9 @@ Merger's writes, GitHub's answers and the build check's verdicts meet.
   - statuses are kept per commit.
 - **`SimCheck`.** A model of `forge-pr-check`:
   - it runs the Merger's batch tops first, then the heads no batch
-    covers, in `slots` slots, each taking `minutes` (a head's own run
-    takes `head_minutes` when given, to show what waits for those);
+    covers, in `slots` slots, each taking `minutes` (a stack's layer's
+    own run takes `layer_minutes` when given, to show what waits for
+    those);
   - it matches a head to a green run of its tree, covers a batch
     member once its top is green, and holds one while the top runs;
   - it notices a new head `notice` minutes after it appears;
