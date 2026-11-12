@@ -464,15 +464,19 @@ class SimCheck:
     of its own with `mac_slots` slots taking `mac_minutes`. A stack's
     layer's own run (one based on another pull request's branch when it
     starts) takes `layer_minutes` (default `minutes`): longer, it shows
-    what waits for layers' own runs."""
+    what waits for layers' own runs. Any other pull request's own run
+    takes `own_minutes` (default `minutes`): longer, it shows what waits
+    for own runs queued behind many others."""
 
     def __init__(self, world, merger_dir, slots=4, minutes=8,
-                 mac_slots=1, mac_minutes=12, notice=2, layer_minutes=None):
+                 mac_slots=1, mac_minutes=12, notice=2, layer_minutes=None,
+                 own_minutes=None):
         self.world = world
         self.merger_dir = merger_dir
         self.slots, self.minutes = slots, minutes
         self.layer_minutes = minutes if layer_minutes is None \
             else layer_minutes
+        self.own_minutes = minutes if own_minutes is None else own_minutes
         self.mac_slots, self.mac_minutes = mac_slots, mac_minutes
         self.state = {"results": {}, "ahead_started": {}}
         self.running = []
@@ -569,7 +573,8 @@ class SimCheck:
             layer = not run["top"] and w.prs.get(
                 run["pr"], {}).get("base", "main") != "main"
             run["done"] = now + datetime.timedelta(
-                minutes=self.layer_minutes if layer else self.minutes)
+                minutes=self.layer_minutes if layer
+                else self.minutes if run["top"] else self.own_minutes)
             self.running.append(run)
             self.runs += 1
             if run["top"]:
@@ -772,6 +777,13 @@ class Monitor:
                               for n, _ in train["members"][:at + 1]):
                     break
                 minute = iso(w.now)[11:16]
+                if any(l.startswith(minute + " SUSPECT-RED")
+                       for l in self.sim.lines):
+                    # One found red on its own leaves, and the trains
+                    # with or behind it change: with own_green_to_board
+                    # false, a pull request boards before its own run
+                    # says so.
+                    break
                 if any(l.startswith(minute + " TRAIN-RECUT")
                        for l in self.sim.lines):
                     # An urgent pull request goes first by design, and
