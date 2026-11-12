@@ -1093,12 +1093,20 @@ class Flow:
         (a red nightly's or default branch's fix) and for the one with
         right of way. Normal ones are left out.
 
-        The labels come from GitHub with --github; otherwise they are
-        inferred: ahead.json's `urgent_cut` lists every queued pull
+        The labels come from GitHub with --github; otherwise from the
+        Merger's last record (`urgent`, `elevated`) when it has them;
+        otherwise they are inferred: ahead.json's `urgent_cut` lists every queued pull
         request the Merger found urgent, so one there that fixes
         nothing red carries the label."""
         night, main = self._fixes()
         labelled = self.labelled
+        last = self.records[-1] if self.records else {}
+        if labelled is None and isinstance(last.get("urgent"), list):
+            # forge-merger records each tick's labelled and elevated pull
+            # requests, held ones and layers too: its view is the one.
+            labelled = {n for n in last["urgent"] if isinstance(n, int)}
+        raised = ({n for n in last["elevated"] if isinstance(n, int)}
+                  if isinstance(last.get("elevated"), list) else set())
         inferred = labelled is None
         if inferred:
             labelled = {n for n in self.ahead.get("urgent_cut") or ()
@@ -1115,6 +1123,8 @@ class Flow:
             put(pr, ELEVATED, "elevated: fixes the red default branch")
         for pr in sorted(night):
             put(pr, ELEVATED, "elevated: fixes the red nightly")
+        for pr in sorted(raised - main - night):
+            put(pr, ELEVATED, "elevated: the Merger treats it as urgent")
         row = ((self.records[-1].get("right_of_way") or {})
                if self.records else {}).get("pr")
         if isinstance(row, int):

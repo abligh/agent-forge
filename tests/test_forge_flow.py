@@ -701,6 +701,17 @@ class StatusPriorityCarriages(Base):
         self.assertIn("fixes nothing red", flow.priorities()["40"]["why"])
         self.assertIn("right of way", flow.priorities()["43"]["why"])
 
+    def test_priority_from_the_merger_record(self):
+        # forge-merger names every labelled and elevated pull request it
+        # saw, held ones and layers too; that beats inferring.
+        flow = self.flow(records=self.last(urgent=[50, 51], elevated=[52]),
+                         ahead={"urgent_cut": [40]})
+        self.assertEqual({k: v["level"] for k, v in
+                          flow.priorities().items()},
+                         {"50": "urgent", "51": "urgent",
+                          "52": "elevated"})
+        self.assertNotIn("fixes nothing red", flow.priorities()["50"]["why"])
+
     def test_priority_from_github_labels_and_stale_fixes(self):
         self.write_json("nightly", "nightly.json", {
             "at": "2026-11-04T09:00:00Z", "issue_open": True,
