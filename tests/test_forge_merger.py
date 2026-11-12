@@ -1300,6 +1300,16 @@ class FetchPrs(unittest.TestCase):
         self.assertEqual(m.fetch_open_issues(FakeGitHub({"--paginate": None})),
                          set())
 
+    def test_open_issues_ask_graphql_for_numbers_only(self):
+        github = FakeGitHub({"--paginate": [4]})
+        m.fetch_open_issues(github)
+        args = github.calls[0]
+        self.assertEqual(args[:2], ("--paginate", "graphql"))
+        query = next(a for a in args if a.startswith("query="))
+        self.assertIn("issues(states:OPEN", query)
+        self.assertIn("$endCursor", query)
+        self.assertNotIn("body", query)
+
 
 class GitHubApi(unittest.TestCase):
 

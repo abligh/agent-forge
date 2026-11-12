@@ -396,6 +396,8 @@ class SimGitHub:
     def api(self, *args):
         w = self.world
         path = args[1] if args[0] == "--paginate" else args[0]
+        if path == "graphql" and any("issues(states:OPEN" in a for a in args):
+            return sorted(w.issues)
         if path == "graphql":
             if any("closingIssuesReferences" in a for a in args):
                 return {"data": {"repository": {"pullRequest": {

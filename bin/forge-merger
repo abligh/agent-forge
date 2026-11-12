@@ -2599,11 +2599,22 @@ def fetch_prs(github):
         cursor = page["pageInfo"]["endCursor"]
 
 
+ISSUES_QUERY = (
+    "query($owner:String!,$name:String!,$endCursor:String){"
+    "repository(owner:$owner,name:$name){issues(states:OPEN,first:100,"
+    "after:$endCursor){nodes{number}pageInfo{hasNextPage endCursor}}}}")
+
+
 def fetch_open_issues(github):
     """Numbers of every open issue, for `Blocked-by:` lines that name
-    one rather than a pull request."""
-    got = github.api("--paginate", "repos/%s/issues?state=open&per_page=100"
-                     % REPO_SLUG, "--jq", "[.[].number]")
+    one rather than a pull request. GraphQL, numbers only: REST's issue
+    list carries every issue's and pull request's whole body, and paging
+    through it was about 4 s of a 13 s tick (agent-forge #301).
+    `--paginate` comes first, as `gh` allows, so it pages by `endCursor`."""
+    owner, name = REPO_SLUG.split("/")
+    got = github.api("--paginate", "graphql", "-f", "query=" + ISSUES_QUERY,
+                     "-F", "owner=" + owner, "-F", "name=" + name,
+                     "--jq", "[.data.repository.issues.nodes[].number]")
     return set(got or [])
 
 
