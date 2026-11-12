@@ -1626,12 +1626,57 @@ class Worker(StateCase):
         pc.worker("/repo", self.state_dir, SHA_A, 7, run, self.lines.append,
                   lambda: next(clock), memory_max="12G")
         prefix = pc.scope_prefix("12G")
-        steps = [c["args"][len(prefix):] for c in run.calls
-                 if c["args"][:len(prefix)] == prefix]
+        unnamed = [[a for a in c["args"] if not a.startswith("--unit=")]
+                   for c in run.calls]
+        steps = [a[len(prefix):] for a in unnamed
+                 if a[:len(prefix)] == prefix]
         self.assertEqual(steps, [["true"], ["make", "fmt-check"],
                                  ["make", "vet"], ["make", "test"],
                                  ["make", "doc-check"]])
         self.assertIn("  each step limited to 12G", self.lines)
+        # agent-forge #263: each step's scope is named, and asked about
+        # once the step ends.
+        units = [a[len("--unit="):] for c in run.calls for a in c["args"]
+                 if a.startswith("--unit=")]
+        self.assertEqual(len(units), 4)
+        self.assertTrue(all(u.startswith("forgestep-make_") or
+                            u.startswith("forgestep-") for u in units))
+        shown = [c["args"][-1] for c in run.calls
+                 if c["args"][:3] == ["systemctl", "--user", "show"]]
+        self.assertEqual(shown, [u + ".scope" for u in units])
+
+    def test_a_scope_left_running_after_its_step_is_stopped(self):
+        calls = []
+
+        def run(args, env=None, timeout=None, **kw):
+            calls.append(args)
+            if args[2] == "show":
+                return subprocess.CompletedProcess(
+                    args, 0, "ActiveState=active\nTasksCurrent=23\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        self.assertEqual(pc.stop_scope("forgestep-x-1", {}, run),
+                         {"tasks": 23})
+        self.assertEqual([a[2] for a in calls], ["show", "kill", "stop"])
+        self.assertIn("--signal=SIGKILL", calls[1])
+
+    def test_a_scope_gone_with_its_step_is_left_alone(self):
+        calls = []
+
+        def run(args, env=None, timeout=None, **kw):
+            calls.append(args)
+            return subprocess.CompletedProcess(
+                args, 0, "ActiveState=inactive\nTasksCurrent=[not set]\n",
+                "")
+        self.assertIsNone(pc.stop_scope("forgestep-x-1", {}, run))
+        self.assertEqual(len(calls), 1)
+
+    def test_a_named_scope_keeps_the_prefix_and_adds_a_unit(self):
+        prefix = pc.scope_prefix("12G")
+        named, unit = pc.named_scope(prefix, "make test/rust")
+        self.assertTrue(unit.startswith("forgestep-make_test_rust-"))
+        self.assertEqual([a for a in named if a != "--unit=" + unit], prefix)
+        self.assertEqual(named[named.index("--unit=" + unit) + 1], "--")
+        self.assertEqual(pc.named_scope([], "x"), ([], None))
 
     def test_no_memory_limit_runs_the_steps_bare(self):
         self.queue()
