@@ -874,6 +874,24 @@ class RecentTrains(Base):
                           self.flow_of().recent_trains(2)], [[7, 8], [6]])
         self.assertEqual(self.flow(records=RECORDS).recent_trains(), [])
 
+    def test_a_tick_that_merges_a_train_does_not_cut_it_again(self):
+        # A record's trains are as cut before its own merges: on
+        # 2026-11-12 #10777 merged and showed as cut a second time.
+        records = [
+            rec("10:22:00", [1, 2], [], trains=[[1], [2]],
+                train_events=["cut"]),
+            rec("10:34:00", [1, 2], [d("MERGE", 1, result="done",
+                                       train=True)], trains=[[1], [2]]),
+            rec("10:34:30", [2, 3], [], trains=[[2], [3]],
+                train_events=["cut"]),
+            rec("10:36:30", [2, 3], [d("MERGE", 2, result="done",
+                                       train=True)], trains=[[2], [3]]),
+            rec("10:37:00", [3], [], trains=[[3]]),
+        ]
+        got = self.flow(records=records).recent_trains()
+        self.assertEqual([(t["prs"], t["outcome"]) for t in got], [
+            ([3], "running"), ([2], "merged"), ([1], "merged")])
+
     def test_the_page_tells_them(self):
         data = {"recent_trains": self.flow_of().recent_trains()}
         html = tool.recent_html(data)
