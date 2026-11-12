@@ -44,6 +44,20 @@ class Morning(unittest.TestCase):
         self.assertEqual(got.merged, 15, figures(got))
         self.assertLessEqual(got.runs / got.merged, 3.0, figures(got))
 
+    def test_a_restacked_layer_keeps_its_train(self):
+        # 2026-11-12: the Merger restacked a train's layer, and the next
+        # tick held it for its gated instance's verdict on the new head
+        # (the walk back to an earlier verdict stopped at the restack),
+        # so it left its train as a push and every train was cut again.
+        m = ms.load_merger()
+        m.configure(ms.project())
+        got = simulate(m, ms.restacked_day())
+        self.assertTrue(any("RESTACK (done)" in l for l in got.lines))
+        self.assertEqual(got.broken, [], figures(got))
+        self.assertFalse(any("TRAIN-LEFT" in l for l in got.lines),
+                         figures(got))
+        self.assertEqual(got.merged, 15, figures(got))
+
     def test_it_finds_the_faults_of_v0_4_173(self):
         # v0.4.173 is the last release without agent-forge #306 and #307.
         # Its trains were spent by its own updates (BATCH-FIRST, then

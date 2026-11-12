@@ -123,7 +123,8 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "hold_labels": list, "blocked_by": str, "said_since": dict,
          "update_once": bool, "ci_never_started": int,
          "queued_stall_minutes": int, "read_as": str, "age_first": dict,
-         "hand_back_once_per_head": bool, "own_head_green": bool}
+         "hand_back_once_per_head": bool, "own_head_green": bool,
+         "stall_run_factor": (int, float)}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
 # merge.resolve as an object: designs/0026's rules as `regenerate`, and
 # designs/0046's `union` globs.
@@ -358,8 +359,9 @@ def _is(value, kinds):
 
 def _type_name(kinds):
     kinds = kinds if isinstance(kinds, tuple) else (kinds,)
-    names = {str: "a string", int: "an integer", bool: "true or false",
-             dict: "an object", list: "a list", type(None): "null"}
+    names = {str: "a string", int: "an integer", float: "a number",
+             bool: "true or false", dict: "an object", list: "a list",
+             type(None): "null"}
     return " or ".join(names[k] for k in kinds)
 
 
@@ -929,6 +931,10 @@ def _check_merge_0026(merge, data, problems):
     for key in ("ci_never_started", "queued_stall_minutes"):
         if _is(merge.get(key), int) and merge[key] < 1:
             problems.append("merge.%s must be at least 1" % key)
+    factor = merge.get("stall_run_factor")
+    if _is(factor, (int, float)) and not (math.isfinite(factor)
+                                          and factor >= 0):
+        problems.append("merge.stall_run_factor must be 0 or more")
     if isinstance(merge.get("read_as"), str) and merge["read_as"] not in names:
         problems.append("merge.read_as %r is not an agent or machinery"
                         % merge["read_as"])

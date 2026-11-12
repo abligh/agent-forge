@@ -305,7 +305,12 @@ its own: it waits for the batch top's prediction, whose tree includes
 it. Once the build check has started that top (its `ahead_started`),
 the wait is timed from the later of the top's start and the wait's, so
 a top that is running isn't called a stall, and one that hangs still
-is, `STALL_AFTER` after it started.
+is, `STALL_AFTER` after it started. A slot running the top's tree at
+another commit (an earlier prediction, which keeps the check from
+starting the top) counts as the top's start. With
+`merge.stall_run_factor` (default 1.5), a wait on checks is timed
+against that many times the median of the build check's recent runs
+when that is longer than `STALL_AFTER`, which stays the floor.
 
 **`next.json` names the pull request the tick stopped at**: `{"at":
 ..., "pr": N}`, the first in the queue it neither handed back nor
@@ -524,7 +529,9 @@ alone, with the layers of its stack above it: `TRAIN-LEFT #n: pushed
 with STACK-UPDATE still to come, it is in flight. Nor is any head that
 is the boarded one brought up to date and nothing else (`own_push`:
 clean merges of what the default branch already has, whichever stack
-the tick acts on). The rest keep their
+the tick acts on). A restacked layer stays a candidate meanwhile: its
+build check's and gated instances' verdicts on the head before the
+restack still count (`on_main`). The rest keep their
 places, and the train's top, now a new tree, is run again. A pull
 request that is urgent or fixes a red default branch and is in no train
 cuts every train after the first again, and the default branch moving to
@@ -1110,6 +1117,13 @@ CI_NEVER_STARTED = None
 QUEUED_STALL_AFTER = None
 # merge.read_as: the App a dry run reads with, or None for the Merger.
 READ_AS = None
+# merge.stall_run_factor: a head waiting on its checks stalls only once
+# it has waited this many times the median of the build check's recent
+# runs (STALL_RUNS of them), when that is longer than STALL_AFTER; 0
+# for STALL_AFTER alone. Under load a run takes 30 to 50 minutes, and a
+# fixed 30 called every one of them a stall (2026-11-12).
+STALL_RUN_FACTOR = 1.5
+STALL_RUNS = 20
 
 
 def configure(project):
@@ -1149,7 +1163,7 @@ def configure(project):
     global FIXED_ORDER, GREEN_BATCH_FIRST, RED_SUSPECT_OUT, UNSTABLE_AFTER
     global UNSTABLE_BATCHES, TELL_BOARDED
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
-    global TRAIN_MERGE, TRAIN_BRANCH
+    global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -1249,6 +1263,7 @@ def configure(project):
     QUEUED_STALL_AFTER = (datetime.timedelta(minutes=queued)
                           if queued is not None else None)
     READ_AS = merge.get("read_as")
+    STALL_RUN_FACTOR = merge.get("stall_run_factor", 1.5)
 
 NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
 BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
@@ -1538,21 +1553,28 @@ def eligible(pr, open_numbers, now=None, stacked=None, any_base=False):
     return approval, None
 
 
-def urgent(pr):
-    """Whether `pr` carries `labels.urgent`, or fixes a red nightly or
-    a red default branch."""
-    if pr.get("number") in NIGHTLY_FIXES | MAIN_RED_FIXES:
-        return True
+def labelled_urgent(pr):
+    """Whether `pr` carries `labels.urgent`: someone marked it so by
+    hand."""
     return bool(URGENT_LABEL) and URGENT_LABEL in [
         (n or {}).get("name") for n in
         ((pr.get("labels") or {}).get("nodes") or [])]
 
 
+def urgent(pr):
+    """Whether `pr` carries `labels.urgent`, or fixes a red nightly or
+    a red default branch."""
+    return labelled_urgent(pr) \
+        or pr.get("number") in NIGHTLY_FIXES | MAIN_RED_FIXES
+
+
 def order(candidates, everyone=None):
     """`candidates` in the order the Merger takes them. First come those
-    carrying `labels.urgent`, then those that another open pull request
-    is blocked by, then the rest, each group oldest first by
-    `createdAt`, then by number.
+    carrying `labels.urgent`, which a person put there; then the other
+    urgent ones, a red nightly's or default branch's fixes, which a
+    tool found; then those that another open pull request is blocked
+    by; then the rest, each group oldest first by `createdAt`, then by
+    number.
 
     `everyone` is every open pull request, candidates or not, and
     defaults to `candidates`. It has to include the ineligible ones: a
@@ -1561,7 +1583,8 @@ def order(candidates, everyone=None):
     named = set()
     for pr in candidates if everyone is None else everyone:
         named |= blockers_of(pr)
-    key = lambda pr: (not urgent(pr), pr["number"] not in named,
+    key = lambda pr: (not labelled_urgent(pr), not urgent(pr),
+                      pr["number"] not in named,
                       pr["createdAt"], pr["number"])
     return sorted(candidates, key=key)
 
@@ -1792,6 +1815,19 @@ def squashed(repo, lower, main_ref, run=sh):
                 "-n", str(SQUASH_DEPTH), main_ref, run=run)
     return (trees.returncode == 0
             and tree.stdout.strip() in trees.stdout.split())
+
+
+def on_main(repo, sha, main_tip, run=sh):
+    """Whether `sha` brings nothing the default branch at `main_tip`
+    lacks: it is in its history, or it is a merged layer's final head,
+    whose tree a squash on its first-parent history has (`squashed`).
+    A merge of either into a pull request (an update, the Merger's
+    RESTACK) changes nothing of the pull request's own. On 2026-11-12 a
+    layer the Merger had just restacked was held for its gated
+    instance's verdict on the new head, which the walk back past such
+    merges didn't reach, and it left its train as a push."""
+    return is_ancestor(repo, sha, main_tip, run) or \
+        squashed(repo, sha, main_tip, run)
 
 
 def based_merge(repo, main_side, layer, lower, run=sh):
@@ -2791,7 +2827,8 @@ def save_json(path, value):
     os.replace(path + ".tmp", path)
 
 
-def stalled_for(state_dir, waiting, when, check_state=None):
+def stalled_for(state_dir, waiting, when, check_state=None, repo=None,
+                run=sh):
     """Whole minutes the Merger has waited on `waiting`'s head, once that
     is `STALL_AFTER` or more, else None. `waiting` is the tick's WAIT
     decision or a write GitHub refused, or None when the tick is held up
@@ -2804,7 +2841,15 @@ def stalled_for(state_dir, waiting, when, check_state=None):
     queued (waiting, not started), a stall only after
     QUEUED_STALL_AFTER; running, a stall once STALL_AFTER has passed
     since the later of the wait's start and the run's; neither, as
-    without it."""
+    without it.
+
+    A WAIT's STALL_AFTER is stretched to STALL_RUN_FACTOR times the
+    median of the build check's recent runs, when that is longer
+    (`stall_limit`). A head first in a batch is timed from when the
+    build check started a run of the batch's top, or of any commit with
+    the top's tree (`batch_top_started`, given `repo`): the check runs a
+    tree once, and a later prediction with the same tree waits for it.
+    Neither started, it is timed as before."""
     path = os.path.join(state_dir, "waiting.json")
     if waiting is None:
         if os.path.exists(path):
@@ -2825,6 +2870,8 @@ def stalled_for(state_dir, waiting, when, check_state=None):
                          "since": iso(when)})
     waited = when - began
     limit, since = STALL_AFTER, began
+    if waiting.get("action") == "WAIT":
+        limit = stall_limit(check_state)
     queue = (check_state or {}).get("waiting")
     entry = queue.get(waiting["head"]) if isinstance(queue, dict) else None
     if (QUEUED_STALL_AFTER is not None and waiting.get("action") == "WAIT"
@@ -2838,23 +2885,61 @@ def stalled_for(state_dir, waiting, when, check_state=None):
         else:
             since = max(began, started)
     if waiting.get("action") == "WAIT":
-        top = batch_top_started(state_dir, waiting, check_state)
+        top = batch_top_started(state_dir, waiting, check_state, repo, run)
         if top is not None:
-            limit, since = STALL_AFTER, max(since, top)
+            limit, since = stall_limit(check_state), max(since, top)
     if when - since < limit:
         return None
     return int(waited.total_seconds() // 60)
 
 
-def batch_top_started(state_dir, waiting, check_state):
+def stall_limit(check_state):
+    """How long a WAIT may last before it is a stall: STALL_AFTER, or
+    STALL_RUN_FACTOR times the median length of the build check's
+    STALL_RUNS most recently finished runs in `check_state` when that is
+    longer. A result copied from another run (a match, a batch's cover)
+    took no time of its own and isn't counted."""
+    if not STALL_RUN_FACTOR:
+        return STALL_AFTER
+    took = []
+    results = (check_state or {}).get("results")
+    for result in (results.values() if isinstance(results, dict) else ()):
+        if not isinstance(result, dict) or result.get("covered") \
+                or not result.get("seconds"):
+            continue
+        try:
+            took.append((parse_time(result["finished"]),
+                         parse_time(result["finished"])
+                         - parse_time(result["started"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    recent = sorted(t for _, t in sorted(took)[-STALL_RUNS:])
+    if not recent:
+        return STALL_AFTER
+    middle = len(recent) // 2
+    median = recent[middle] if len(recent) % 2 else \
+        (recent[middle - 1] + recent[middle]) / 2
+    return max(STALL_AFTER, median * STALL_RUN_FACTOR)
+
+
+def batch_top_started(state_dir, waiting, check_state, repo=None, run=sh):
     """When the build check started the top of the batch `waiting`'s
     head is first in, by the last tick's AHEAD_FILE and the check's
     `ahead_started`, or None: not first in a batch, or its top not
     started. Such a head is never checked on its own: it waits for the
     top, whose tree includes it (designs/0032), so its wait is timed
-    from the top's start, as a head the check runs is from its own."""
+    from the top's start, as a head the check runs is from its own.
+    Given `repo`, a run in progress of any commit with the top's tree
+    (the check's `running` slots) counts as the top's: the check never
+    runs a tree a slot is already running, so a top whose earlier
+    prediction, the same tree at another commit, is running isn't
+    started until that run ends, and its green covers the top
+    (2026-11-12: such waits were called stalls)."""
     started = (check_state or {}).get("ahead_started")
+    running = (check_state or {}).get("running")
     if not isinstance(started, dict):
+        started = {}
+    if not started and not running:
         return None
     last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
     entries = last.get("entries") if isinstance(last, dict) else None
@@ -2865,9 +2950,24 @@ def batch_top_started(state_dir, waiting, check_state):
         if size < 1 or (first["pr"], first["head"]) != (waiting["pr"],
                                                          waiting["head"]):
             return None
-        return parse_time(started.get(top["sha"]))
+        if top["sha"] in started:
+            return parse_time(started[top["sha"]])
     except (AttributeError, IndexError, KeyError, TypeError, ValueError):
         return None
+    if repo is None or not isinstance(running, list):
+        return None
+    for slot in running:
+        try:
+            sha, at = slot["sha"], parse_time(slot["started"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if sha == top["sha"]:
+            return at
+        tree = git(repo, "rev-parse", "--verify", "-q", sha + "^{tree}",
+                   run=run)
+        if tree.returncode == 0 and tree.stdout.strip() == top.get("tree"):
+            return at
+    return None
 
 
 def where_to_look():
@@ -3748,8 +3848,9 @@ def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
     """(state, description, sha) of `context` for `pr`: on its head,
     or, while the head has none final, on the commit before each merge
     of the default branch into it (the Merger's own `update-branch`, or
-    the author's), back to the first commit that isn't one. A merge of
-    the default branch changes nothing of the pull request's own, and
+    the author's), or of a merged layer's final head (the Merger's
+    RESTACK: `on_main`), back to the first commit that isn't one. A
+    merge of either changes nothing of the pull request's own, and
     an instance whose verdicts take an hour would otherwise never
     catch up with a head the Merger updates whenever the default
     branch moves. A head's own pending verdict is the answer when no
@@ -3765,8 +3866,8 @@ def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
             first = (state, said, commit)
         parents = git(repo, "rev-list", "--parents", "-n", "1", commit,
                       run=run).stdout.split()
-        if len(parents) != 3 or not is_ancestor(repo, parents[2],
-                                                main_tip, run):
+        if len(parents) != 3 or not on_main(repo, parents[2], main_tip,
+                                            run):
             break
         commit = parents[1]
     return first or (None, "", pr["headRefOid"])
@@ -3777,9 +3878,10 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
     """Why `pr` isn't a candidate yet under merge.own_head_green, or
     None: checks.context isn't green (success) on the commit its
     approval names, nor on its head, nor (given `repo` and `main_tip`)
-    on the commit before each merge of the default branch into the
-    head, back to the first commit that isn't one, as for an instance
-    (`instance_verdict`). A merge of the default branch changes nothing
+    on the commit before each merge of the default branch (or of a
+    merged layer's final head) into the head, back to the first commit
+    that isn't one, as for an instance (`instance_verdict`). A merge of
+    the default branch changes nothing
     of the pull request's own: without that, a head the Merger has just
     updated, whose build check hasn't yet posted (a batch member's
     `covered by batch` green comes a minute later), would be held for
@@ -3799,8 +3901,8 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
             depth += 1
             parents = git(repo, "rev-list", "--parents", "-n", "1", commit,
                           run=run).stdout.split()
-            if len(parents) != 3 or not is_ancestor(repo, parents[2],
-                                                    main_tip, run):
+            if len(parents) != 3 or not on_main(repo, parents[2],
+                                                main_tip, run):
                 break
             commit = parents[1]
             shas.append(commit)
@@ -4122,7 +4224,11 @@ def own_push(repo, before, head, main_tip, run=sh, depth=OWN_PUSH_DEPTH):
     """Whether `head` is `before` brought up to date and nothing else:
     each commit from `head` back along first parents to `before` is a
     clean merge (its tree is what git merges its two parents to) whose
-    second parent adds nothing `main_tip` lacks. That is what the
+    second parent adds nothing `main_tip` lacks: merged into it, it
+    gives `main_tip`'s tree, or it is a merged layer's final head, whose
+    tree is a squash on the default branch (`squashed`; merged into a
+    tip that has since changed that layer's lines, it would conflict).
+    That is what the
     Merger's own pushes make, an update (GitHub merges the default
     branch in), a RESTACK (the layer below's final head, which the
     default branch has as one squash) and a STACK-UPDATE, in any
@@ -4155,8 +4261,9 @@ def own_push(repo, before, head, main_tip, run=sh, depth=OWN_PUSH_DEPTH):
             return False
         into = git(repo, "merge-tree", "--write-tree", "--no-messages",
                    main_tip, second, run=run)
-        if into.returncode != 0 or \
-                into.stdout.split()[:1] != main_tree.stdout.split():
+        if (into.returncode != 0
+                or into.stdout.split()[:1] != main_tree.stdout.split()) \
+                and not squashed(repo, second, main_tip, run):
             return False
         head = first
     return head == before
@@ -4944,12 +5051,14 @@ def batch_members(state_dir, queue, tree_of=None):
 
 
 def fixes_first(queue, in_flight, members):
-    """`queue` with MAIN_RED_FIXES first, behind only `in_flight` and a
-    green batch's `members` (designs/0011, amendment); the rest keep
-    their order, and so do the members, among which a fix doesn't move
-    up (see overdue_first)."""
+    """`queue` with MAIN_RED_FIXES first, behind only `in_flight`, a
+    green batch's `members` (designs/0011, amendment) and those carrying
+    `labels.urgent`, which always go first; the rest keep their order,
+    and so do the members, among which a fix doesn't move up (see
+    overdue_first)."""
     return sorted(queue, key=lambda pr: (
         pr["number"] != in_flight, pr["number"] not in members,
+        pr["number"] not in members and not labelled_urgent(pr),
         pr["number"] not in members
         and pr["number"] not in MAIN_RED_FIXES))
 
@@ -6674,7 +6783,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             github, said, live, run, layers,
             restacks if PREDICT_RESTACKED else None)
     if live:
-        minutes = stalled_for(state_dir, waiting, when, check_state)
+        minutes = stalled_for(state_dir, waiting, when, check_state, repo,
+                              run)
         if minutes is not None and "stalled" not in record:
             record["stalled"] = {"pr": waiting["pr"], "head": waiting["head"],
                                  "minutes": minutes}
@@ -6978,13 +7088,31 @@ def commit_identity(project, name):
 
 def load_check_state(state_dir):
     """The build check's state.json in `state_dir`, or None when it can't
-    be read: every wait is then judged as without it."""
+    be read: every wait is then judged as without it. Its `running` is
+    added here, not read from the file: [{pr, sha, started}] for each
+    slot whose worker lock is held now, from the lock's line
+    (`#<pr> <sha> <started> ...`)."""
     try:
         with open(os.path.join(state_dir, "state.json")) as handle:
             got = json.load(handle)
     except (OSError, ValueError):
         return None
-    return got if isinstance(got, dict) else None
+    if not isinstance(got, dict):
+        return None
+    running = []
+    try:
+        names = sorted(os.listdir(state_dir))
+    except OSError:
+        names = []
+    for name in names:
+        if not (name.startswith("worker") and name.endswith(".lock")):
+            continue
+        parts = (locks.holder(os.path.join(state_dir, name)) or "").split()
+        if len(parts) >= 3 and parts[0][:1] == "#" and parts[0][1:].isdigit():
+            running.append({"pr": int(parts[0][1:]), "sha": parts[1],
+                            "started": parts[2]})
+    got["running"] = running
+    return got
 
 
 def main(argv=None, run=sh, out=print, environ=None, mint=mint,

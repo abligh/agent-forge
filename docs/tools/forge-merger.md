@@ -287,7 +287,10 @@ goes on refusing for as long is `STALLED` too, quoting the refusal.
 With [`merge.queued_stall_minutes`](../config.md#mergequeued_stall_minutes),
 a head the build check still has queued stalls after that time
 instead. A batch member's wait is timed from when its batch's top
-started. With [`merge.stall_alert`](../config.md#mergestall_alert), a
+started, or a run of the top's tree at another commit did. A wait on
+checks stalls only after
+[`merge.stall_run_factor`](../config.md#mergestall_run_factor) times
+the build check's recent median run, when that is longer. With [`merge.stall_alert`](../config.md#mergestall_alert), a
 stall also opens an issue and messages agents through the relay
 (`STALL-ISSUE`, `STALL-TOLD`, `STALL-TO-OWNER`, `STALL-ENDED`).
 
