@@ -565,3 +565,66 @@ requests took about 45 minutes to land.
 **A general rule.** A tick does all the ready work it can, not one
 operation: an operation that is fast (a merge, a status, a retarget)
 shouldn't wait a tick for the next.
+
+## Amendment (2026-11-12): a push that only merges the default branch keeps its place
+
+**What happened.** A member whose author merged the default branch in
+a way `own_push` doesn't follow still left its train as a push: with
+the default branch as the merge's first parent, for one, or past
+`own_push`'s depth. Its train's top was cut again, and so was every
+train behind it, with their running builds.
+
+**The rule.** A member whose new head isn't the Merger's own is
+predicted again where it was. When that gives the tree its prediction
+had (the one the top tested, while the train up to it is unchanged;
+otherwise the tree its boarded head gives there), it changed nothing
+the train tests, and it keeps its place: `TRAIN-KEPT #n: pushed <sha>,
+same tree in its place`. That also keeps a member whose author merged
+in the head of a member ahead of it in the train, which `own_push`
+refuses (the default branch doesn't have that head): the train
+already holds those changes below it. A merge of a member behind it,
+or of a pull request in no train, leaves. Its prediction is the same
+commit, the same tree on the same parent, so the top and its run are
+unchanged. Anything else
+still leaves as before, and a member out of the queue (its new head not
+covered by its approval, say) still leaves too.
+
+**With `train_merge`.** GitHub marks a pull request merged when its
+current head is in the default branch's history. The train's chain of
+merge commits has each member's head as a parent, so the Merger
+re-checks a member whose head moved since the train was predicted,
+by the same rule, and gives the chain its new head. The tree each
+commit carries is still the one its prediction tested.
+
+## Amendment (2026-11-12, second): no update of a train's first member with `train_merge`
+
+**What happened.** With `train_merge` on, a green train goes in as one
+merge of its tested top, whose chain of merge commits doesn't need any
+member to be up to date. But the Merger still updated the first member
+when it was behind the default branch, as it would to merge it on its
+own. The update changed nothing the train would merge; it only gave
+the member a new head, whose build the build check then ran.
+
+**The rule.** With `train_merge`, a pull request on the first train
+(two or more members, at the head it boarded with, its top not red) is
+not updated: the Merger waits for the train's top instead (`WAIT`, "in
+a train of N that merges as one; not updated"). A train of one, a red
+top, and a train GitHub refused this tick (`TRAIN-MERGE ...; each
+member merges on its own`) are updated as before, as is anything not
+on a train.
+
+## Amendment (2026-11-12, third): slots kept for the trains' tops
+
+**What happened.** On a host whose slots are always full, a train's top
+waits for a slot like any head: the Merger's own head, overdue heads,
+heads put first and the default branch's run all go before it, so the
+next merge waited a whole run behind pull requests that weren't next.
+
+**The rule.** `merge.test_ahead.train_slots` n (default 0, at most
+`checks.slots` - 1) keeps n of the build check's slots for the
+Merger's predictions. The heads' own runs and the default branch's
+start only while fewer than `slots` - n are running; a prediction may
+take any free slot, and one running counts against the n. A slot kept
+this way takes the next prediction even while the Merger's own head
+waits, since that head couldn't have it. Running checks are never
+stopped for it; a slot frees as its run ends.

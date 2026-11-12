@@ -820,7 +820,8 @@ class Flow:
         # trains would not have made.
         causes, dry = collections.Counter(), collections.Counter()
         for r in ticks:
-            said = [c for c in r.get("train_events") or () if c != "cut"]
+            said = [c for c in r.get("train_events") or ()
+                    if c not in ("cut", "kept")]
             if r.get("trains_dry"):
                 dry.update(said)
                 said = []
