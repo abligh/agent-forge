@@ -552,6 +552,7 @@ class Flow:
         # A worker that posted without building ran nothing.
         self.runs = [r for r in self.runs
                      if not (r["end"] and r["end"]["res"] == "matched")]
+        self._backs = None
         self.records = read_records(os.path.join(
             merger_dir, "merger.jsonl"), self.start, now)
         self.ahead = load_json(os.path.join(merger_dir, "ahead.json"), {})
@@ -1168,6 +1169,29 @@ class Flow:
             put(row, ELEVATED, "elevated: has right of way")
         return out
 
+    def handed_back_at(self, pr):
+        """(when, why) of the Merger's hand-back of `pr` at the head
+        its last decision names, or None: a hand-back at an earlier
+        tick, which a later record's queue doesn't undo, holds until a
+        new head (2026-11-12: #10608, handed back at 16:06, showed green
+        an hour later)."""
+        if self._backs is None:
+            backs, heads = {}, {}
+            for r in self.records:
+                for d in r.get("decisions") or ():
+                    n, head = d.get("pr"), d.get("head")
+                    if not isinstance(n, int) or not head:
+                        continue
+                    heads[n] = head
+                    if d.get("action") == "HAND-BACK" and d.get(
+                            "result") in ("done", "already said"):
+                        backs[n] = (head, stamp(r["_t"]),
+                                    str(d.get("reason") or "no reason "
+                                        "given"))
+            self._backs = {n: b[1:] for n, b in backs.items()
+                           if heads.get(n) == b[0]}
+        return self._backs.get(pr)
+
     def status(self, pr, trains=None, snap=None):
         """(colour, why) for `pr` at the last tick, for a stack's status
         dot: green, it can merge (eligible, or a layer whose own check
@@ -1195,6 +1219,9 @@ class Flow:
             return ORANGE, "in train %d: %s" % (t["train"], state)
         if pr in snap.get("handed_back", ()):
             return RED, "handed back to its author"
+        back = self.handed_back_at(pr)
+        if back:
+            return RED, "handed back at %s: %s" % back
         gone = {int(g.group(1)) for g in (MERGED_BELOW_RE.search(r)
                                           for r in held.values()) if g}
         if pr not in held and pr not in queue and (pr in gone or any(
