@@ -1238,6 +1238,10 @@ class Flow:
         approval or a close). A record without `trains` (a search going
         on, say) only settles members by its decisions."""
         cut, active = [], []
+        # A record's `trains` are as cut before its own merges: a member
+        # merged is never a train again (#10777 on 2026-11-12 showed as
+        # cut a second time, the tick it merged).
+        merged = set()
 
         def settle(t, pr, outcome, why, at):
             if pr in t["current"]:
@@ -1251,6 +1255,9 @@ class Flow:
             held = {str(k): str(v) for k, v in (r.get("held") or {}).items()}
             for d in r.get("decisions") or ():
                 pr = d.get("pr")
+                if d.get("action") == "MERGE" \
+                        and d.get("result", "done") == "done":
+                    merged.add(pr)
                 owner = next((t for t in active if pr in t["current"]), None)
                 if owner is None:
                     continue
@@ -1272,8 +1279,10 @@ class Flow:
             if r.get("trains_dry") or "trains" not in r:
                 continue
             events = [str(e) for e in r.get("train_events") or ()]
-            lists = [[n for n in part if isinstance(n, int)]
+            lists = [[n for n in part if isinstance(n, int)
+                      and n not in merged]
                      for part in r.get("trains") or () if part]
+            lists = [part for part in lists if part]
             fresh, going = [], {}
             for part in lists:
                 t = None
