@@ -204,6 +204,12 @@ DEFAULT_REMIND_S = 7200
 REMIND_S = DEFAULT_REMIND_S
 # `router.forget_minutes`: how long a turn no run decides is kept.
 FORGET_MINUTES = 0
+# router.escalate (designs/0049): {"after_reminders", "undelivered_minutes",
+# "label", "to"}, or None: off. ESCALATE_OWNER is labels.owner_prefix.
+ESCALATE = None
+ESCALATE_OWNER = "Owner:"
+ESCALATE_NAME = "escalate.json"
+RELAY_KEY = "-relay"
 POST_TIMEOUT_S = 15
 # The longest Retry-After a 503 may ask for and still be tried again in
 # the same run; a longer one waits for the next run.
@@ -241,7 +247,7 @@ def configure(project, rules=True):
     names no rules module. The Merger borrows only the poster, so it
     loads no rules: a project's rules file is no business of its."""
     global REPO_SLUG, ACT_AS, RULES, RELAY, TOKEN_FILE, REMIND_S
-    global FORGET_MINUTES
+    global FORGET_MINUTES, ESCALATE, ESCALATE_OWNER
     merger.configure(project)
     relay = project.section("relay")
     REPO_SLUG = project.repo
@@ -251,6 +257,12 @@ def configure(project, rules=True):
                                               DEFAULT_TOKEN_FILE))
     REMIND_S = relay.get("remind_seconds", DEFAULT_REMIND_S)
     FORGET_MINUTES = project.section("router").get("forget_minutes", 0)
+    labels = project.section("labels")
+    ESCALATE_OWNER = labels.get("owner_prefix", "Owner:")
+    escalate = project.section("router").get("escalate")
+    ESCALATE = None if escalate is None else dict(
+        escalate, label=escalate.get("label", labels.get(
+            "waiting_on_owner", merger.DEFAULT_WAITING_OWNER)))
     if not rules:
         return
     module = router.load_rules(project.section("router").get(
@@ -1068,6 +1080,8 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
     for w in wakes:
         batches.setdefault(w["d"].agent, []).append(w)
     failed, down = 0, None
+    # Per agent with a wake due: (took it, why not), for router.escalate.
+    reached = {}
     for who in sorted(batches):
         numbers = ", ".join(label(w["d"]) for w in batches[who])
         text = message(*[[w["line"] for w in batches[who]
@@ -1098,6 +1112,7 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
                 took.append(name)
         session = ", ".join(took or sessions_of(roster, who))
         problem = None if took else "; ".join(problems)
+        reached[who] = (bool(took), problem)
         if took and problems:
             out("NOT TAKEN by %s; %s took it" % ("; ".join(problems), session))
         if problem:
@@ -1145,6 +1160,13 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
         write_previous(state_dir, decisions, only, when)
     else:
         record_dry_run(state_dir, decisions, would, only, when)
+    # designs/0049: after delivery and recording, before each_run.
+    if ESCALATE and not only and not seed:
+        failures = escalate(github, roster, state_dir, decisions, items,
+                            reached, down, send, out, when)
+        if send:
+            append_records(os.path.join(state_dir, "wakes.jsonl"),
+                           failures, when)
     # Once a run, after delivery and recording, under the same lock.
     if not only and not seed:
         failures = run_each(github, ctx, send, out)
@@ -1154,6 +1176,207 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
     if not stayed:
         return 0
     return 1 if delivered else 2
+
+
+def escalate_triggers(roster, state, decisions, items, reached, down, when):
+    """designs/0049: update `state` (escalate.json) from this run and
+    return {key: [(trigger, text), ...]} for what is escalated now, key
+    an agent or RELAY_KEY. A trigger is "a:<turn id>" for a turn
+    reminded `after_reminders` times, "b" for an agent whose wakes have
+    all gone undelivered for `undelivered_minutes`, "relay" for a relay
+    that answers nobody that long."""
+    after = ESCALATE.get("after_reminders")
+    minutes = ESCALATE.get("undelivered_minutes")
+    agents = state.setdefault("agents", {})
+    now = merger.iso(when)
+    refused = {who for who, (took, _why) in reached.items() if not took}
+    # A relay that didn't answer, or refused every one of two or more
+    # agents, is one fault, not one per agent (§3).
+    relay_fault = bool(down) or (len(reached) > 1 and refused == set(
+        reached))
+    if relay_fault:
+        state.setdefault("relay_down_since", now)
+        state["relay_why"] = down or "every agent's wake was refused"
+    elif any(took for took, _why in reached.values()):
+        state.pop("relay_down_since", None)
+        state.pop("relay_why", None)
+    for who, (took, why) in sorted(reached.items()):
+        if took:
+            agents.pop(who, None)
+        elif not relay_fault:
+            entry = agents.setdefault(who, {"undelivered_since": now})
+            entry["why"] = why
+    found = {}
+    if after:
+        for d in decisions:
+            if d.kind != "turn" or d.agent is None:
+                continue
+            entry = find(items, d)
+            if entry is not None and reminders_sent(entry) >= after:
+                found.setdefault(d.agent, []).append((
+                    "a:" + turn_id(d),
+                    "%s has had %d reminders and is still her turn: %s"
+                    % (label(d), reminders_sent(entry), d.line)))
+    if minutes:
+        limit = datetime.timedelta(minutes=minutes)
+        for who, entry in sorted(agents.items()):
+            since = entry.get("undelivered_since")
+            try:
+                old = when - parse_time(since) >= limit
+            except (TypeError, ValueError):
+                continue
+            if old and getattr(roster, "stand_in", lambda n: n)(who) == who:
+                found.setdefault(who, []).append((
+                    "b", "no session of hers has taken a wake since %s "
+                    "(the relay said: %s)" % (since, entry.get("why"))))
+        since = state.get("relay_down_since")
+        try:
+            if since and when - parse_time(since) >= limit:
+                found[RELAY_KEY] = [("relay", "the relay has delivered no "
+                                   "wake since %s (%s)" % (
+                                       since, state.get("relay_why")))]
+        except (TypeError, ValueError):
+            pass
+    return found
+
+
+def escalate_title(key, triggers):
+    if key == RELAY_KEY:
+        return "forge-router: the relay delivers no wakes"
+    trigger, text = triggers[0]
+    if trigger == "b":
+        return "forge-router: %s can't be reached" % key
+    return "forge-router: %s hasn't taken up %s" % (key, text.split(" ")[0])
+
+
+def escalate_body(key, triggers):
+    to = ESCALATE.get("to")
+    lines = ["%s: %s." % ("The relay" if key == RELAY_KEY else key, text)
+             for _trigger, text in triggers]
+    return "%s%s\n\n%s\n\nforge-router closes this when %s.\n\n%s" % (
+        "@%s: " % to if to else "", "\n".join(lines),
+        "A person might look at the relay and the room." if key == RELAY_KEY
+        else "A person might look at her session, restart it, or give the "
+        "item to someone else.",
+        "a wake is delivered" if key == RELAY_KEY else
+        "she takes a wake and no turn of hers is reminded past the limit",
+        merger.SIGNATURE)
+
+
+def escalate(github, roster, state_dir, decisions, items, reached, down,
+             send, out, when):
+    """router.escalate (designs/0049): open, comment on and close one
+    issue per agent (and one for the relay) that can't be reached or
+    doesn't take up a turn. Returns `run` journal records for GitHub
+    writes that failed; a dry run prints WOULD ESCALATE and writes
+    nothing."""
+    path = os.path.join(state_dir, ESCALATE_NAME)
+    state = merger.load_json(path, {})
+    if not isinstance(state, dict):
+        state = {}
+    now = escalate_triggers(roster, state, decisions, items, reached, down,
+                            when)
+    issues = state.setdefault("issues", {})
+    answered = state.setdefault("answered", {})
+    failed = []
+
+    def fail(what, why):
+        out("ESCALATE FAILED: %s: %s" % (what, why))
+        failed.append({"kind": "run", "outcome": "failed: escalate: %s: %s"
+                       % (what, why)})
+    if not send:
+        for key, triggers in sorted(now.items()):
+            new = [t for t in triggers if t[0] not in (
+                issues.get(key) or {}).get("triggers", []) and t[0] not in
+                answered.get(key, [])]
+            for _trigger, text in new:
+                out("WOULD ESCALATE %s: %s" % (key, text))
+        return failed
+    # Forget an answer once its trigger has ended.
+    for key in list(answered):
+        answered[key] = [t for t in answered[key]
+                         if t in {t2 for t2, _ in now.get(key, [])}]
+        if not answered[key]:
+            del answered[key]
+    for key in sorted(set(issues) | set(now)):
+        triggers = now.get(key, [])
+        open_ = issues.get(key)
+        if open_:
+            try:
+                got = github.api("repos/%s/issues/%d" % (REPO_SLUG,
+                                                         open_["issue"]))
+                closed = isinstance(got, dict) and got.get("state") == "closed"
+            except (RuntimeError, TypeError, ValueError):
+                closed = False
+            if closed:
+                # Closed by a person: answered; the same trigger doesn't
+                # reopen it.
+                out("ESCALATE-ANSWERED: #%d for %s" % (open_["issue"], key))
+                answered[key] = sorted(set(answered.get(key, []))
+                                       | set(open_.get("triggers", [])))
+                del issues[key]
+                open_ = None
+        if open_ and not triggers:
+            number = open_["issue"]
+            github.write("POST", "repos/%s/issues/%d/comments"
+                         % (REPO_SLUG, number),
+                         body="%s; closing.\n\n%s" % (
+                             "The relay delivers again" if key == RELAY_KEY
+                             else "%s is reachable and has no turn left "
+                             "unanswered" % key, merger.SIGNATURE))
+            github.write("DELETE", merger.label_path(number,
+                                                     ESCALATE["label"]))
+            ok, why = github.write("PATCH", "repos/%s/issues/%d"
+                                   % (REPO_SLUG, number), state="closed")
+            if ok:
+                out("ESCALATE-CLOSED: #%d for %s" % (number, key))
+            else:
+                fail("closing #%d" % number, why)
+            del issues[key]
+            continue
+        fresh = [t for t in triggers if t[0] not in answered.get(key, [])
+                 and t[0] not in (open_ or {}).get("triggers", [])]
+        if not fresh:
+            continue
+        if open_ is None:
+            number, why = github.create(
+                "repos/%s/issues" % REPO_SLUG,
+                title=escalate_title(key, fresh),
+                body=escalate_body(key, fresh))
+            if number is None:
+                fail("opening for %s" % key, why)
+                continue
+            out("ESCALATE: opened #%d for %s" % (number, key))
+            issues[key] = {"issue": number,
+                           "triggers": [t for t, _ in fresh], "labeled": []}
+        else:
+            number = open_["issue"]
+            ok, why = github.write(
+                "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG, number),
+                body="%s\n\n%s" % ("\n".join(
+                    "%s: %s." % (key, text) for _t, text in fresh),
+                    merger.SIGNATURE))
+            if not ok:
+                fail("commenting on #%d" % number, why)
+                continue
+            out("ESCALATE: commented on #%d for %s" % (number, key))
+            open_["triggers"] = open_["triggers"] + [t for t, _ in fresh]
+    for key, open_ in sorted(issues.items()):
+        wanted = [ESCALATE["label"]] + (
+            [] if key == RELAY_KEY else [ESCALATE_OWNER + key])
+        labeled = open_.setdefault("labeled", [])
+        for name in wanted:
+            if name in labeled:
+                continue
+            ok, why = github.write("POST", merger.label_path(open_["issue"]),
+                                   **{"labels[]": name})
+            if ok:
+                labeled.append(name)
+            else:
+                fail("labelling #%d %s" % (open_["issue"], name), why)
+    os.makedirs(state_dir, exist_ok=True)
+    merger.save_json(path, state)
+    return failed
 
 
 def run_each(github, ctx, send, out):
