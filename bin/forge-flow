@@ -2,7 +2,7 @@
 """Write a web page that says why merging is slow, from local records.
 
     forge-flow [--state-dir DIR] --out DIR [--now TIME] [--github]
-               [--checkout DIR]
+               [--recent-trains N] [--checkout DIR]
 
 designs/0045. Reads what forge-pr-check, forge-merger and forge-router
 already write in a project's state directory (`--state-dir`, default
@@ -79,7 +79,11 @@ target about 2).
    `merge.test_ahead.trains` is a dry run, the batch re-cuts a train
    would not have made and the trains' own changes.
 
-Between panels 2 and 3, the trains now (merger/ahead.json, drawn as
+Between panels 2 and 3, the recent trains (the last
+`--recent-trains`, default 8, from merger.jsonl: when each was cut, its
+carriages, what became of each member, merged, left, the culprit or
+re-cut, and of the train, merged, partly merged, red or re-cut, and how
+long it took), the trains now (merger/ahead.json, drawn as
 trains: an engine, then each carriage, a base and the stacked layers
 boarding with it, a box) and the stacks now (the last Merger record's
 `stacked on #N` holds, each a tree rooted at its base, with where the
@@ -179,6 +183,12 @@ STACKED_ONLY_RE = re.compile(r"^stacked on #(\d+)$")
 # merge.
 UNDERWAY = ("pending", "expected", "(absent)", "waits for the new batch",
             "in a train of")
+# How many recent trains the page tells the story of (--recent-trains).
+RECENT_TRAINS = 8
+# What a train event in merger.jsonl says, when a train was cut again.
+RECUT_SAYS = {"main moved": "the default branch moved to a tree no train "
+              "predicted", "urgent": "an urgent pull request went first",
+              "left": "a member left"}
 # A layer's status dot on the page, and a pull request's priority.
 GREEN, ORANGE, RED = "green", "orange", "red"
 URGENT, ELEVATED = "urgent", "elevated"
@@ -1185,6 +1195,160 @@ class Flow:
         return RED, ("not a candidate (not approved, its own check not "
                      "green, or not open)")
 
+    # ------------------------------------------------- recent trains
+
+    def recent_trains(self, limit=RECENT_TRAINS):
+        """The last `limit` trains the Merger cut, newest first, and
+        what became of each and of each member, from merger.jsonl alone
+        (and the build check's runs of their tops).
+
+        A record's `trains` (live, not `trains_dry`) lists each train's
+        pull requests. A train there that is a subset of what is left of
+        one before goes on as that train; any other was cut that tick,
+        and so was every train when `train_events` says the default
+        branch moved. A member leaves its train by a MERGE (`train`:
+        true is the train's own merge), a hand-back (`suspect`: true is
+        the culprit a red train's search found red on its own), by
+        boarding a train cut later (re-cut), or by going missing from
+        the trains (left: its hold says why, else a push, a lost
+        approval or a close). A record without `trains` (a search going
+        on, say) only settles members by its decisions."""
+        cut, active = [], []
+
+        def settle(t, pr, outcome, why, at):
+            if pr in t["current"]:
+                t["current"].remove(pr)
+            t["out"][str(pr)] = {"outcome": outcome, "why": why,
+                                 "at": stamp(at)}
+            t["last"] = at
+
+        for r in self.records:
+            at = r["_t"]
+            held = {str(k): str(v) for k, v in (r.get("held") or {}).items()}
+            for d in r.get("decisions") or ():
+                pr = d.get("pr")
+                owner = next((t for t in active if pr in t["current"]), None)
+                if owner is None:
+                    continue
+                action = d.get("action")
+                if action == "MERGE" and d.get("result", "done") == "done":
+                    settle(owner, pr, "merged", "merged in the train's own "
+                           "merge" if d.get("train") else "merged on its own",
+                           at)
+                elif action == "HAND-BACK" and d.get("suspect"):
+                    settle(owner, pr, "culprit", "red on its own, found by "
+                           "the red train's search; handed back", at)
+                elif action == "HAND-BACK" and d.get("result") in (
+                        "done", "already said"):
+                    settle(owner, pr, "left", "handed back: %s" % (
+                        d.get("reason") or "no reason given"), at)
+            for t in [t for t in active if not t["current"]]:
+                active.remove(t)
+                t["end"] = t["last"]
+            if r.get("trains_dry") or "trains" not in r:
+                continue
+            events = [str(e) for e in r.get("train_events") or ()]
+            lists = [[n for n in part if isinstance(n, int)]
+                     for part in r.get("trains") or () if part]
+            fresh, going = [], {}
+            for part in lists:
+                t = None
+                if "main moved" not in events:
+                    t = next((a for a in active if id(a) not in going
+                              and set(part) <= set(a["current"])), None)
+                if t is None:
+                    below = {}
+                    for pr, reason in held.items():
+                        got = STACKED_RE.search(reason)
+                        if got and pr.isdigit():
+                            below[int(pr)] = int(got.group(1))
+                    t = {"cut_t": at, "prs": list(part),
+                         "carriages": carriages_of(
+                             [{"pr": n} for n in part], below),
+                         "current": list(part), "out": {}, "end": None,
+                         "last": at, "events": events}
+                    fresh.append(t)
+                going[id(t)] = part
+            on_new = {pr: t for t in fresh for pr in t["prs"]}
+            why_recut = "; ".join(RECUT_SAYS.get(e, e) for e in events
+                                  if e not in ("cut", "kept")) or \
+                "cut again"
+            for t in list(active):
+                keep = going.get(id(t), ())
+                for pr in [p for p in t["current"] if p not in keep]:
+                    if pr in on_new:
+                        settle(t, pr, "recut", "re-cut into the train cut "
+                               "at %s (%s)" % (stamp(at), why_recut), at)
+                    else:
+                        settle(t, pr, "left", "left the trains: %s" % (
+                            held.get(str(pr)) or "a push, a lost approval "
+                            "or a close took it out of the queue"), at)
+                if not t["current"]:
+                    active.remove(t)
+                    t["end"] = at
+                    t["ended_by"] = why_recut
+            active.extend(fresh)
+            cut.extend(fresh)
+        out = []
+        for t in cut[-limit:][::-1] if limit > 0 else ():
+            out.append(self._train_story(t))
+        return out
+
+    def _train_story(self, t):
+        """One train of `recent_trains`, as the page shows it."""
+        end = t["end"]
+        until = end or self.now
+        runs = [r for r in self.runs if r["kind"] == "ahead"
+                and r["pr"] in t["prs"] and t["cut_t"] <= r["t"] <= until]
+        tops = [{"pr": r["pr"], "sha": r["sha"][:10],
+                 "res": r["end"]["res"] if r["end"] else "running",
+                 "ran": r["end"]["ran"] if r["end"] else None,
+                 "at": stamp(r["t"])} for r in runs]
+        red = any(x["res"].startswith("red") for x in tops)
+        searched = any(r.get("_state") == SEARCH for r in self.records
+                       if t["cut_t"] <= r["_t"] <= until)
+        members = {}
+        for pr in t["prs"]:
+            members[str(pr)] = t["out"].get(str(pr)) or {
+                "outcome": "waiting", "why": "still in this train",
+                "at": None}
+        kinds = collections.Counter(m["outcome"] for m in members.values())
+        merged = kinds["merged"]
+        culprits = sorted(int(k) for k, m in members.items()
+                          if m["outcome"] == "culprit")
+        if end is None:
+            outcome = "running"
+            why = "still on its way"
+        elif merged == len(t["prs"]):
+            outcome = "merged"
+            why = "all %d merged%s" % (merged, " in one train merge" if all(
+                "own merge" in m["why"] for m in members.values()) else "")
+        elif merged:
+            outcome = "partly merged"
+            why = "%d of %d merged" % (merged, len(t["prs"]))
+        elif red or culprits:
+            outcome = "red"
+            why = "its top went red"
+        else:
+            outcome = "re-cut"
+            why = "every member left" if kinds["left"] == len(
+                t["prs"]) else t.get("ended_by") or "cut again"
+        if outcome != "running" and (red or culprits):
+            why += "; red%s%s" % (
+                ", searched" if searched else "",
+                "; culprit %s" % ", ".join("#%d" % n for n in culprits)
+                if culprits else "")
+        if outcome in ("merged", "partly merged", "running") and \
+                kinds["recut"]:
+            why += "; %d re-cut into a later train" % kinds["recut"]
+        if kinds["left"] and outcome != "re-cut":
+            why += "; %d left" % kinds["left"]
+        return {"cut": stamp(t["cut_t"]), "end": stamp(end) if end else None,
+                "minutes": int((until - t["cut_t"]).total_seconds() // 60),
+                "prs": t["prs"], "carriages": t["carriages"],
+                "outcome": outcome, "why": why, "members": members,
+                "tops": tops, "searched": searched}
+
     def hourly(self, hours=24):
         """The last `hours` clock hours, oldest first: each hour's
         states, merges and arrivals."""
@@ -1546,6 +1710,26 @@ animation:puff 2.4s ease-out infinite}
 .train.legend{display:inline-flex;align-items:center;gap:4px;margin:0}
 .train.legend .engine{width:40px;height:26px;margin:0}
 .siding .cars{opacity:.85}
+.rtrain{margin:0 0 8px}.rtrain .lab{font-size:13px;color:var(--ink2);
+margin:0 0 3px}.rtrain .cars{row-gap:6px}
+.rtrain .carriage.mini{margin-bottom:5px}
+.ob{display:inline-block;padding:0 6px;border-radius:9px;font-size:12px;
+font-weight:600;line-height:18px;border:1px solid var(--axis);
+color:var(--ink)}
+.ob.o-merged{background:var(--ok);border-color:var(--ok);color:var(--onc)}
+.ob.o-partly-merged{border-color:var(--ok);color:var(--ok)}
+.ob.o-red{background:var(--bad);border-color:var(--bad);color:var(--onc)}
+.ob.o-re-cut{border-color:var(--amber);color:var(--amber)}
+.ob.o-running{border-color:var(--c1);color:var(--c1)}
+.car.m-merged{background:var(--ok);border-color:var(--ok)}
+.car.m-merged,.car.m-merged a,.car.m-culprit,.car.m-culprit a{
+color:var(--onc)}
+.car.m-culprit{background:var(--bad);border-color:var(--bad)}
+.car.m-left{border-style:dashed;color:var(--muted)}
+.car.m-left a{color:var(--muted)}
+.car.m-recut{border-color:var(--amber)}
+.car.m-waiting{border-color:var(--c1)}
+.car.lg{min-width:20px;padding:0 3px;margin:0 4px 0 0}
 .pri{display:inline-block;margin:0 0 0 3px;padding:0 4px;border-radius:4px;
 font-size:11px;font-weight:700;line-height:15px;vertical-align:1px}
 .pri.p-urgent{background:var(--bad);color:var(--onc)}
@@ -2066,6 +2250,81 @@ def pri_legend():
             "way</span>")
 
 
+# A member's outcome in a recent train: its colour class and its name.
+MEMBER_SAYS = (("merged", "merged"), ("culprit", "the culprit: red on its "
+               "own, handed back"), ("left", "left the train"),
+               ("recut", "re-cut into a later train"),
+               ("waiting", "still in the train"))
+TRAIN_OUTCOMES = ("merged", "partly merged", "red", "re-cut", "running")
+
+
+def duration_text(minutes):
+    return "%d min" % minutes if minutes < 120 else "%.1f h" % (
+        minutes / 60)
+
+
+def recent_html(data):
+    """The last trains, newest first: one row each, its outcome, when
+    it was cut and how long it ran, and its carriages with each member
+    coloured by what became of it."""
+    recent = data.get("recent_trains") or []
+    if not recent:
+        return ("<section><h2>Recent trains</h2><p class=\"note\">No "
+                "train in the Merger's records.</p></section>")
+    rows = []
+    for t in recent:
+        boxes = []
+        for car in t["carriages"]:
+            inner = []
+            for pr in car:
+                m = t["members"].get(str(pr)) or {}
+                kind = m.get("outcome", "waiting")
+                inner.append('<span class="car m-%s" title="%s%s">%s%s'
+                             '<span class="vh"> (%s)</span></span>' % (
+                                 kind, esc(m.get("why")),
+                                 " at %s" % esc(m["at"]) if m.get("at")
+                                 else "", pr_link(data, pr),
+                                 pri_html(data, pr), esc(kind)))
+            boxes.append('<span class="carriage mini">%s</span>'
+                         % "".join(inner))
+        tops = t.get("tops") or []
+        last = tops[-1] if tops else None
+        top = ""
+        if last:
+            top = " · top run %s%s" % (esc(last["res"]), " after %s"
+                                       % duration_text(last["ran"] // 60)
+                                       if last.get("ran") else "")
+        n, c = len(t["prs"]), len(t["carriages"])
+        rows.append(
+            '<div class="rtrain"><p class="lab"><span class="ob o-%s">%s'
+            "</span> cut %s · %d PR%s in %d carriage%s · %s%s%s · %s</p>"
+            '<div class="cars">%s</div></div>' % (
+                t["outcome"].replace(" ", "-"), esc(t["outcome"]),
+                esc(t["cut"]), n, "" if n == 1 else "s", c,
+                "" if c == 1 else "s", duration_text(t["minutes"]),
+                " to %s" % esc(t["end"][11:]) if t.get("end") else
+                " so far", top, esc(t["why"]),
+                '<i class="coupling" aria-hidden="true"></i>'.join(boxes)))
+    key = '<div class="key">%s%s</div>' % ("".join(
+        '<span><span class="ob o-%s">%s</span></span>'
+        % (o.replace(" ", "-"), esc(o)) for o in TRAIN_OUTCOMES), "".join(
+        '<span><span class="car m-%s lg">#</span>%s</span>' % (k, esc(w))
+        for k, w in MEMBER_SAYS))
+    return ("<section><h2>Recent trains</h2>%s%s<p class=\"note\">The "
+            "last %d trains the Merger cut, newest first, from "
+            "merger.jsonl: each record's <i>trains</i> (a train that is "
+            "what is left of one before goes on as it; any other was cut "
+            "that tick, and every one when the default branch moved), its "
+            "MERGE decisions (<i>train</i>: the train's own merge) and "
+            "hand-backs (<i>suspect</i>: the culprit a red train's search "
+            "found), and the build check's runs of the tops. A member that "
+            "boards a train cut later was re-cut; one that drops out of "
+            "the trains otherwise left (its hold says why). Hover a "
+            "member for what became of it. The time is from the cut to "
+            "the train's last member leaving it.</p></section>"
+            % ("".join(rows), key, len(recent)))
+
+
 def trains_html(data):
     trains = data.get("trains") or []
     if not trains:
@@ -2256,6 +2515,7 @@ def page(data):
                   esc(snap.get("state")),
                   table(["where", "pull requests"],
                         [[esc(a), esc(b)] for a, b in where])))
+    out.append(recent_html(data))
     out.append(trains_html(data))
     out.append(stacks_html(data))
     # 3. Efficiency.
@@ -2416,7 +2676,7 @@ def write(path, text):
     os.replace(tmp, path)
 
 
-def compute(flow, project_name, repo=None):
+def compute(flow, project_name, repo=None, recent=RECENT_TRAINS):
     windows = {k: flow.figures(flow.now - span, flow.now)
                for k, span in WINDOWS}
     start = flow.now - BASELINE[1]
@@ -2428,6 +2688,7 @@ def compute(flow, project_name, repo=None):
             flow.snapshot(), "graph_hours": flow.graph_hours(),
             "build_times": flow.build_times(), "stacks": flow.stacks(),
             "trains": flow.trains(), "ahead_at": flow.ahead.get("at"),
+            "recent_trains": flow.recent_trains(recent),
             "priority": flow.priorities(),
             "repo": repo}
 
@@ -2445,6 +2706,9 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
                         "flow-history.jsonl go")
     parser.add_argument("--now", help="read the records as at this time "
                         "(UTC; default now)")
+    parser.add_argument("--recent-trains", type=int, default=RECENT_TRAINS,
+                        metavar="N", help="how many of the last trains "
+                        "\"Recent trains\" tells of (default %(default)s)")
     parser.add_argument("--github", action="store_true",
                         help="also ask GitHub for each merged pull "
                         "request's first approval")
@@ -2497,7 +2761,8 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
             except (RuntimeError, github.MintError, OSError) as error:
                 err("%s: urgent labels inferred, not read: %s"
                     % (PROG, error))
-    data = compute(flow, name, project.repo if project else None)
+    data = compute(flow, name, project.repo if project else None,
+                   args.recent_trains)
     write(os.path.join(args.out, "flow.json"),
           json.dumps(data, indent=1, sort_keys=True))
     write(os.path.join(args.out, "index.html"), page(data))
