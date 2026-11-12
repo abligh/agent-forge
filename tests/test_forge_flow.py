@@ -865,11 +865,23 @@ class RecentTrains(Base):
     def test_the_page_tells_them(self):
         data = {"recent_trains": self.flow_of().recent_trains()}
         html = tool.recent_html(data)
-        self.assertEqual(html.count('<div class="rtrain">'), 5)
+        self.assertEqual(html.count('<div class="rtrain '), 5)
+        # Each a train: an engine lit by its outcome, coupled carriages
+        # with the top in the guard's van.
+        self.assertEqual(html.count('<svg class="engine"'), 5)
+        self.assertEqual(html.count('class="carriage van"'), 5)
+        for cls, says in (("t-green", "merged: green lamp"),
+                          ("t-partly", "partly merged: amber lamp"),
+                          ("t-wait", "re-cut: lamp unlit"),
+                          ("t-testing", "still running")):
+            self.assertIn('<div class="rtrain %s">' % cls, html)
+            self.assertIn('aria-label="engine, %s' % says, html)
+        self.assertIn(".rtrain .engine .puff{animation:none", tool.css_vars())
         self.assertIn('<span class="ob o-partly-merged">partly merged'
                       "</span> cut 2026-11-04T10:00Z", html)
         self.assertIn("3 PRs in 2 carriages · 10 min to 10:10Z", html)
-        self.assertIn('class="car m-culprit" title="red on its own', html)
+        self.assertIn('class="car m-culprit top" title="red on its own',
+                      html)
         self.assertIn("top run red after 3 min", html)
         self.assertIn("so far", html)
         for kind in ("merged", "culprit", "left", "recut", "waiting"):

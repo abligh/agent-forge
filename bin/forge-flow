@@ -1711,8 +1711,11 @@ animation:puff 2.4s ease-out infinite}
 .train.legend .engine{width:40px;height:26px;margin:0}
 .siding .cars{opacity:.85}
 .rtrain{margin:0 0 8px}.rtrain .lab{font-size:13px;color:var(--ink2);
-margin:0 0 3px}.rtrain .cars{row-gap:6px}
-.rtrain .carriage.mini{margin-bottom:5px}
+margin:0 0 3px}.rtrain .cars{row-gap:12px}
+.rtrain .engine .puff{animation:none!important;opacity:.3}
+.t-partly .engine .lamp{fill:var(--amber)}
+.rtrain .car.m-left,.rtrain .car.m-recut,.rtrain .car.m-waiting{
+background:none}.rtrain .car.m-left{border-color:var(--axis)}
 .ob{display:inline-block;padding:0 6px;border-radius:9px;font-size:12px;
 font-weight:600;line-height:18px;border:1px solid var(--axis);
 color:var(--ink)}
@@ -2184,7 +2187,7 @@ DOT_SAYS = {GREEN: "can merge", ORANGE: "testing underway",
 PRI_MARK = {URGENT: "!!", ELEVATED: "!"}
 
 
-def engine_svg(cls):
+def engine_svg(cls, says=None):
     """A small locomotive facing left, the way the train goes: puffs of
     steam (moving only while it tests), a lamp at the front and a flag
     on the cab once it is green. Colours come from the train's class."""
@@ -2206,7 +2209,7 @@ def engine_svg(cls):
         '<circle class="wheel" cx="14" cy="35" r="5"/>'
         '<circle class="wheel" cx="29" cy="35" r="5"/>'
         '<circle class="wheel" cx="49" cy="36" r="4"/></svg>'
-        % ((esc(ENGINE_SAYS[cls]),) * 2))
+        % ((esc(says or ENGINE_SAYS[cls]),) * 2))
 
 
 def pri_html(data, pr):
@@ -2250,6 +2253,13 @@ def pri_legend():
             "way</span>")
 
 
+# A recent train's engine, by its outcome: the class that lights its
+# lamp, and what it says. It never steams: the train is gone.
+OUTCOME_ENGINE = {"merged": ("t-green", "merged: green lamp, flag out"),
+                  "partly merged": ("t-partly", "partly merged: amber lamp"),
+                  "red": ("t-red", "red: red lamp"),
+                  "re-cut": ("t-wait", "re-cut: lamp unlit"),
+                  "running": ("t-testing", "still running: amber lamp")}
 # A member's outcome in a recent train: its colour class and its name.
 MEMBER_SAYS = (("merged", "merged"), ("culprit", "the culprit: red on its "
                "own, handed back"), ("left", "left the train"),
@@ -2274,19 +2284,29 @@ def recent_html(data):
     rows = []
     for t in recent:
         boxes = []
-        for car in t["carriages"]:
+        top_pr = t["prs"][-1]
+        for c, car in enumerate(t["carriages"]):
             inner = []
             for pr in car:
                 m = t["members"].get(str(pr)) or {}
                 kind = m.get("outcome", "waiting")
-                inner.append('<span class="car m-%s" title="%s%s">%s%s'
+                inner.append('<span class="car m-%s%s" title="%s%s">%s%s'
                              '<span class="vh"> (%s)</span></span>' % (
-                                 kind, esc(m.get("why")),
+                                 kind, " top" if pr == top_pr else "",
+                                 esc(m.get("why")),
                                  " at %s" % esc(m["at"]) if m.get("at")
                                  else "", pr_link(data, pr),
                                  pri_html(data, pr), esc(kind)))
-            boxes.append('<span class="carriage mini">%s</span>'
-                         % "".join(inner))
+            van = top_pr in car
+            boxes.append('<span class="carriage%s" title="%s">%s%s</span>'
+                         % (" van" if van else "",
+                            "the guard's van, carriage %d" % (c + 1)
+                            if van else "carriage %d: %s" % (
+                                c + 1, ", ".join("#%d" % p for p in car)),
+                            "".join(inner),
+                            '<i class="tail" aria-hidden="true"></i>'
+                            if van else ""))
+        cls, says = OUTCOME_ENGINE.get(t["outcome"], ("t-wait", None))
         tops = t.get("tops") or []
         last = tops[-1] if tops else None
         top = ""
@@ -2296,14 +2316,15 @@ def recent_html(data):
                                        if last.get("ran") else "")
         n, c = len(t["prs"]), len(t["carriages"])
         rows.append(
-            '<div class="rtrain"><p class="lab"><span class="ob o-%s">%s'
+            '<div class="rtrain %s"><p class="lab"><span class="ob o-%s">%s'
             "</span> cut %s · %d PR%s in %d carriage%s · %s%s%s · %s</p>"
-            '<div class="cars">%s</div></div>' % (
+            '<div class="cars">%s%s%s</div></div>' % (cls,
                 t["outcome"].replace(" ", "-"), esc(t["outcome"]),
                 esc(t["cut"]), n, "" if n == 1 else "s", c,
                 "" if c == 1 else "s", duration_text(t["minutes"]),
                 " to %s" % esc(t["end"][11:]) if t.get("end") else
-                " so far", top, esc(t["why"]),
+                " so far", top, esc(t["why"]), engine_svg(cls, says),
+                '<i class="coupling" aria-hidden="true"></i>',
                 '<i class="coupling" aria-hidden="true"></i>'.join(boxes)))
     key = '<div class="key">%s%s</div>' % ("".join(
         '<span><span class="ob o-%s">%s</span></span>'
