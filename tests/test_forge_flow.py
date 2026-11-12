@@ -575,6 +575,18 @@ class StacksAndTrains(Base):
                          "held: conflicts with #20, ahead of it in the queue")
         self.assertTrue(got[2]["root_where"].startswith("not a candidate"))
 
+    def test_candidates_in_no_stack_are_listed_on_one_line(self):
+        # Queue 20, 30 (20 a stack's base); 60 queued too, 50 held.
+        held = {"21": "stacked on #20", "50": "draft"}
+        records = RECORDS[:-1] + [rec("10:40:00", [20, 60], [d("WAIT", 20)],
+                                      held=held)]
+        flow = self.flow(records=records)
+        got = flow.singles()
+        self.assertEqual([o["pr"] for o in got], [60, 50])
+        self.assertEqual(got[1]["status"], tool.RED)
+        html = tool.stacks_html({"stacks": flow.stacks(), "singles": got})
+        self.assertIn("Not stacked</b> (2)", html)
+
     def test_a_loop_in_the_holds_does_not_hang(self):
         held = {"21": "stacked on #20", "20": "stacked on #21"}
         self.assertEqual(self.flow(records=self.last(held=held)).stacks(),

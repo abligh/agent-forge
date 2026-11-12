@@ -7869,6 +7869,17 @@ class StallFromRecentRuns(unittest.TestCase):
         self.assertIsNone(self.stalled(59, check))
         self.assertEqual(self.stalled(60, check), 60)
 
+    def test_a_batch_tops_limit_follows_the_long_runs(self):
+        # A top runs every step its members touch: as long as the
+        # longest heads, not the median (2026-11-12: 17-minute median,
+        # 40-minute train tops, every train called a stall).
+        m.configure(project())
+        check = self.runs(*([1] * 4 + [16] * 12 + [41, 47, 44, 40]))
+        self.assertEqual(m.stall_limit(check),
+                         datetime.timedelta(minutes=30))
+        self.assertEqual(m.stall_limit(check, top=True),
+                         datetime.timedelta(minutes=44 * 1.5))
+
     def test_stall_minutes_is_the_floor(self):
         m.configure(project())
         check = self.runs(5, 6, 7)
