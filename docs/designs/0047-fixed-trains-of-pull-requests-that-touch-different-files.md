@@ -640,3 +640,20 @@ those waiting to start (the ones the build check would start now, one
 after another): min(`train_slots`, running + waiting). A running top
 fills its own reservation, and with no prediction waiting the heads may
 use every other slot.
+
+## Amendment (2026-11-12, fifth): layers side by side board
+
+**What happened.** A base had three layers based directly on it, all
+approved and green, and none boarded: the climb up a stack stopped at
+a fork, since which layer went first was left to the author.
+
+**The rule.** Layers side by side on one base are taken in number
+order, depth first: a layer, the layers on it, then the next layer
+beside it. Each is after the layer it is on, and the train predicts
+them one on another, as any carriage. A carriage is then a tree, not
+a chain, and is still never split across trains. A layer that isn't
+ready, is red, or doesn't merge cleanly onto the train so far holds
+back the layers on it and no others; a member that leaves a cut train
+takes only the layers on it with it. Each entry in `ahead.json` says
+`on`, the member it is stacked on; entries from before say nothing,
+and one of those that leaves takes everything after it, as before.

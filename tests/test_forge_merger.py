@@ -8574,6 +8574,82 @@ class Trains(RepoCase):
         self.assertEqual(events, [("left", "LEFT #6: left the queue; its "
                                    "stack's layers #9 leave with it")])
 
+    def sibling(self, number, base, name, text="x\n", reviews=True):
+        """A layer on #`base`'s branch writing `text` to `name`."""
+        got = self.change(number, name, text, start=base["headRefOid"])
+        got["baseRefName"] = base["headRefName"]
+        if not reviews:
+            got["reviews"] = []
+        return got
+
+    def siblings(self):
+        """#6 on main; #9 and #10 side by side on it, #11 on #9."""
+        six = self.change(6, "s.txt", "one\n")
+        nine = self.sibling(9, six, "s9.txt")
+        ten = self.sibling(10, six, "s10.txt")
+        eleven = self.sibling(11, nine, "s11.txt")
+        return six, nine, ten, eleven
+
+    def test_layers_side_by_side_are_ready_depth_first(self):
+        # Amendment of 2026-11-12: three layers on one base, all
+        # approved and green, and none boarded.
+        six, nine, ten, eleven = self.siblings()
+        twelve = self.sibling(12, six, "s12.txt", reviews=False)
+        thirteen = self.sibling(13, twelve, "s13.txt")
+        prs = [six, nine, ten, eleven, twelve, thirteen]
+        got = m.ready_layers(self.repo.path, six, prs,
+                             {p["number"] for p in prs},
+                             datetime.datetime.now(datetime.timezone.utc),
+                             {})
+        # #12 isn't approved: it and #13 on it stay out, the rest board.
+        self.assertEqual([p["number"] for p, _ in got], [9, 11, 10])
+
+    def test_a_carriage_that_is_a_tree_boards_whole(self):
+        six, nine, ten, eleven = self.siblings()
+        self.configure(batch=4, batches=1, depth=3)
+        entries, sizes, _ = self.cut([[six, nine, eleven, ten]])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 9, 11, 10]])
+        self.assertEqual([e["on"] for e in entries], [None, 6, 9, 6])
+        # Each is predicted on all before it: #10's holds #9 and #11.
+        files = m.git(self.repo.path, "ls-tree", "--name-only",
+                      entries[3]["tree"]).stdout.split()
+        for name in ("s.txt", "s9.txt", "s10.txt", "s11.txt"):
+            self.assertIn(name, files)
+
+    def test_a_red_layer_holds_back_only_its_own_branch(self):
+        six, nine, ten, eleven = self.siblings()
+        self.configure(batch=4, batches=1, depth=3)
+        entries, sizes, events = self.cut([[six, nine, eleven, ten]],
+                                          check={9})
+        self.assertEqual(self.numbers(entries, sizes), [[6, 10]])
+
+    def test_a_sibling_that_conflicts_stops_only_its_own_branch(self):
+        six = self.change(6, "s.txt", "one\n")
+        nine = self.sibling(9, six, "c.txt", "nine\n")
+        ten = self.sibling(10, six, "c.txt", "ten\n")
+        fourteen = self.sibling(14, ten, "s14.txt")
+        eleven = self.sibling(11, nine, "s11.txt")
+        self.configure(batch=5, batches=1, depth=4)
+        entries, sizes, events = self.cut(
+            [[six, nine, eleven, ten, fourteen]])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 9, 11]])
+        self.assertIn(("left", "LEFT #10: won't board with the layers below "
+                       "it, which go without it; also held back: #14"),
+                      events)
+
+    def test_one_that_leaves_takes_only_the_layers_on_it(self):
+        six, nine, ten, eleven = self.siblings()
+        self.configure(batch=4, batches=1, depth=3)
+        entries, sizes, _ = self.cut([[six, nine, eleven, ten]])
+        heads = {p["number"]: p["headRefOid"]
+                 for p in (six, nine, ten, eleven)}
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), [[six, ten]],
+            self.said(entries, sizes), heads, set(heads))
+        self.assertEqual(events, [("left", "LEFT #9: left the queue; its "
+                                   "stack's layers #11 leave with it")])
+        self.assertEqual(self.numbers(got, sizes), [[6, 10]])
+
     def test_a_merged_member_just_goes(self):
         six = self.change(6, "y.txt", "y\n")
         entries, sizes, _ = self.cut([[self.item()], [six]])
