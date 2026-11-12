@@ -23,7 +23,8 @@ Merger's writes, GitHub's answers and the build check's verdicts meet.
   - it runs the Merger's batch tops first, then the heads no batch
     covers, in `slots` slots, each taking `minutes` (a stack's layer's
     own run takes `layer_minutes` when given, to show what waits for
-    those);
+    those, and any other pull request's own run `own_minutes`, to show
+    what waits for own runs queued behind many others);
   - it matches a head to a green run of its tree, covers a batch
     member once its top is green, and holds one while the top runs;
   - it notices a new head `notice` minutes after it appears;
@@ -40,8 +41,10 @@ Merger's writes, GitHub's answers and the build check's verdicts meet.
 
 1. A pull request leaves a started train only by merging at the tree
    predicted for its place. The exceptions are a red top (the search
-   for the culprit), and the scenario having pushed to or approved it
-   or one ahead of it. Never through the Merger's own doing.
+   for the culprit), one found red on its own that minute (boarded
+   without its own green, `own_green_to_board` false), and the
+   scenario having pushed to or approved it or one ahead of it. Never
+   through the Merger's own doing.
 2. `main` only takes a tree a green run tested: its own, or a prefix
    of a train whose top was green.
 3. Nothing boards a train without an approval of its author's latest

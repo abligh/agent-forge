@@ -14,7 +14,7 @@ fix; this page says which one it is.
 ## Usage
 
     forge-flow [--state-dir DIR] --out DIR [--now TIME] [--github]
-               [--checkout DIR]
+               [--recent-trains N] [--checkout DIR]
 
 Run it every five minutes from the build-check host's crontab, through
 `forge-cron-run`:
@@ -37,6 +37,7 @@ To read old records as they stood at some time, run it by hand with
 | `--state-dir DIR` | `~/.local/state/agent-forge/<project>/` | The project's state directory, the parent of `pr-check/`, `merger/` and `router/`. With it, the page can be made without a configuration (the project's name is then the directory's). |
 | `--now TIME` | now | Read the records as at this time, ISO 8601 in UTC, such as `2026-10-12T09:00Z`. |
 | `--github` | off | Also ask GitHub for each merged pull request's first approving review, for the latency panel, and for the open pull requests carrying `labels.urgent`, for the priority marks. Needs the configuration. |
+| `--recent-trains N` | 8 | How many of the last trains "Recent trains" tells of. |
 | `--checkout DIR` | `$FORGE_CRON_CHECKOUT`, else the current directory | Where the configuration is found. |
 
 ## Environment
@@ -107,10 +108,37 @@ build runs per merged pull request (target about 2). Then:
    requests, batch re-cuts and their causes, and, while
    `merge.test_ahead.trains` is a dry run, what trains would have done.
 
-Between panels 2 and 3, two pictures of now, drawn in HTML and CSS
-with no script (each pull request linked to GitHub when the
-configuration names the repository):
+Between panels 2 and 3, the recent trains and two pictures of now,
+drawn in HTML and CSS with no script (each pull request linked to
+GitHub when the configuration names the repository):
 
+* **Recent trains**, from `merger/merger.jsonl`: the last
+  `--recent-trains` trains the Merger cut, newest first, one row each:
+  an outcome badge, when it was cut, "N PRs in M carriages", how long
+  from the cut to its last member leaving it, the last run of its top
+  in `worker.log` and `verdicts.log` (result and run time), and its
+  carriages, each member coloured by what became of it. How it is read:
+  * a record's `trains` (a live one, not `trains_dry`) lists each
+    train's pull requests. A train that is a subset of what is left of
+    one before goes on as that train; any other was cut that tick, and
+    so was every train when `train_events` says `main moved`. A record
+    without `trains` (a red train's search) only settles members by
+    its decisions;
+  * a member is **merged** by a MERGE decision (`train: true` is the
+    train's own merge, else on its own), the **culprit** by a
+    hand-back with `suspect: true` (found red on its own by the
+    search), **left** by any other hand-back or by dropping out of the
+    trains without boarding another (its hold, if any, says why),
+    **re-cut** by boarding a train cut later (the record's
+    `train_events` say why), and **still in the train** otherwise;
+  * the train is **merged** when every member merged, **partly
+    merged** when some did, **red** when none did and its top's run was
+    red or a culprit was found, **re-cut** otherwise, and **running**
+    while it is still in the trains. A red one says whether the
+    Merger's culprit search ran in its time and who the culprit was.
+  In `flow.json` as `recent_trains` (`cut`, `end`, `minutes`, `prs`,
+  `carriages`, `outcome`, `why`, `members` by number with `outcome`,
+  `why`, `at`, `tops`, `searched`).
 * **Trains now**, from `merger/ahead.json`: one row per train, the
   one merging next first, drawn as a train: an engine at the front,
   then its carriages, each a box on wheels coupled to the next, and

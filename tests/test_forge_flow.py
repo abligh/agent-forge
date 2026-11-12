@@ -803,6 +803,96 @@ class StatusPriorityCarriages(Base):
         self.assertIn("@keyframes puff{0%{", css)
 
 
+class RecentTrains(Base):
+    """What became of the last trains, from merger.jsonl."""
+
+    RECORDS = [
+        rec("10:00:00", [1, 2, 3, 4, 5], [d("WAIT", 1)],
+            trains=[[1, 2, 3], [4, 5]], train_events=["cut"],
+            held={"2": "stacked on #1"}),
+        rec("10:05:00", [1, 2, 3, 4, 5], [d("WAIT", 1)],
+            trains=[[1, 2, 3], [4, 5]]),
+        rec("10:10:00", [4, 5], [d("MERGE", n, result="done", train=True)
+                                 for n in (1, 2, 3)], trains=[[4, 5]]),
+        # A red train's search: no trains in the record.
+        rec("10:15:00", [4, 5], [d("HAND-BACK", 5, result="done",
+                                   suspect=True, reason="red")]),
+        rec("10:20:00", [6, 7], [d("MERGE", 4, result="done")],
+            trains=[[6, 7]], train_events=["cut"]),
+        rec("10:25:00", [6, 7, 8], [], trains=[[6], [7, 8]],
+            train_events=["main moved", "cut"]),
+        rec("10:30:00", [7, 8], [], trains=[[7, 8]],
+            held={"6": "conflicts with #9, ahead of it in the queue"}),
+        rec("10:35:00", [7, 8], [], trains=[[9]], trains_dry=True),
+    ]
+
+    def flow_of(self):
+        worker = [header("10:11:00", 5, "5", 1, ahead=True)]
+        verdicts = ["2026-11-04T10:14:00Z VERDICT AHEAD #5 5555555555: "
+                    "red(test) waited=0s ran=180s"]
+        return self.flow(worker=worker, verdicts=verdicts,
+                         records=self.RECORDS)
+
+    def test_each_train_and_member(self):
+        got = self.flow_of().recent_trains()
+        self.assertEqual([(t["prs"], t["outcome"]) for t in got], [
+            ([7, 8], "running"), ([6], "re-cut"), ([6, 7], "re-cut"),
+            ([4, 5], "partly merged"), ([1, 2, 3], "merged")])
+        first = got[-1]
+        self.assertEqual(first["carriages"], [[1, 2], [3]])
+        self.assertEqual((first["cut"], first["end"], first["minutes"]),
+                         ("2026-11-04T10:00Z", "2026-11-04T10:10Z", 10))
+        self.assertEqual(first["why"], "all 3 merged in one train merge")
+        second = got[-2]
+        self.assertEqual({k: m["outcome"] for k, m in
+                          second["members"].items()},
+                         {"4": "merged", "5": "culprit"})
+        self.assertEqual(second["members"]["4"]["why"], "merged on its own")
+        self.assertIn("culprit #5", second["why"])
+        self.assertEqual(second["tops"][0]["res"], "red")
+        third = got[2]
+        self.assertEqual(third["members"]["6"]["outcome"], "recut")
+        self.assertIn("default branch moved", third["members"]["6"]["why"])
+        self.assertIn("default branch moved", third["why"])
+        self.assertEqual(got[1]["why"], "every member left")
+        self.assertIn("conflicts with #9", got[1]["members"]["6"]["why"])
+        self.assertEqual(got[0]["members"]["8"]["outcome"], "waiting")
+        self.assertIsNone(got[0]["end"])
+        self.assertEqual([t["prs"] for t in
+                          self.flow_of().recent_trains(2)], [[7, 8], [6]])
+        self.assertEqual(self.flow(records=RECORDS).recent_trains(), [])
+
+    def test_the_page_tells_them(self):
+        data = {"recent_trains": self.flow_of().recent_trains()}
+        html = tool.recent_html(data)
+        self.assertEqual(html.count('<div class="rtrain '), 5)
+        # Each a train: an engine lit by its outcome, coupled carriages
+        # with the top in the guard's van.
+        self.assertEqual(html.count('<svg class="engine"'), 5)
+        self.assertEqual(html.count('class="carriage van"'), 5)
+        for cls, says in (("t-green", "merged: green lamp"),
+                          ("t-partly", "partly merged: amber lamp"),
+                          ("t-wait", "re-cut: lamp unlit"),
+                          ("t-testing", "still running")):
+            self.assertIn('<div class="rtrain %s">' % cls, html)
+            self.assertIn('aria-label="engine, %s' % says, html)
+        self.assertIn(".rtrain .engine .puff{animation:none", tool.css_vars())
+        self.assertIn('<span class="ob o-partly-merged">partly merged'
+                      "</span> cut 2026-11-04T10:00Z", html)
+        self.assertIn("3 PRs in 2 carriages · 10 min to 10:10Z", html)
+        self.assertIn('class="car m-culprit top" title="red on its own',
+                      html)
+        self.assertIn("top run red after 3 min", html)
+        self.assertIn("so far", html)
+        for kind in ("merged", "culprit", "left", "recut", "waiting"):
+            self.assertIn('class="car m-%s lg"' % kind, html)
+        self.assertIn("No train", tool.recent_html({}))
+        page = tool.page(dict(tool.compute(self.flow_of(), "widget"),
+                              repo=None))
+        self.assertLess(page.index("Recent trains"),
+                        page.index("Trains now"))
+
+
 class Main(Base):
 
     def main(self, *argv, call=None, environ=None):
