@@ -366,7 +366,10 @@ Each tick ends with one line:
 there are no decisions), plus a `STALLED:` line when stalled. It
 appends one JSON record to `merger.jsonl`: the default branch's tip,
 `held` with reasons, the `queue`, the `decisions` (each with `pr`,
-`action`, `to`, `reason` and `result`), and, as settings apply,
+`action`, `to`, `reason` and `result`), `urgent` (every open pull
+request carrying `labels.urgent`, queued or held) and `elevated` (those
+urgent only as a red nightly's or default branch's fix), and, as
+settings apply,
 `yielded`, `overdue`, `right_of_way`, `stack`, `holds`, `fixed`,
 `later`, `trains` and `stalled`. Every live tick writes `next.json`
 (`{"at", "pr"}`, plus `action` with `test_ahead`), naming the pull

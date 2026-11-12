@@ -114,7 +114,10 @@ the pull request's own failure.
 Each tick appends one JSON record to `merger.jsonl` in the state
 directory (~/.local/state/agent-forge/<project>/merger, or
 `--state-dir`) (`dry-run.jsonl` under `--dry-run`). `held` names each pull
-request Reviewer approved that is not eligible, with the reason, and
+request Reviewer approved that is not eligible, with the reason;
+`urgent` lists every open pull request the tick saw that carries
+`labels.urgent`, and `elevated` those urgent only because a tool says
+so (a red nightly's or default branch's fix); and
 `handed-back.json` remembers what was already said.
 
 **With `merge.yield_after_hand_back: N`, a pull request handed back
@@ -6686,7 +6689,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         held[str(number)] = HOLD_REASON % ahead
     queue = [pr for pr in queue if pr["number"] not in held_by]
     record = {"at": iso(when), "main": main_tip, "held": held,
-              "queue": [pr["number"] for pr in queue], "decisions": []}
+              "queue": [pr["number"] for pr in queue], "decisions": [],
+              # Every open pull request the tick saw: those marked urgent
+              # by hand, and those a tool made urgent (a red nightly's
+              # or default branch's fix), for forge-flow.
+              "urgent": sorted(pr["number"] for pr in prs
+                               if labelled_urgent(pr)),
+              "elevated": sorted(pr["number"] for pr in prs
+                                 if urgent(pr) and not labelled_urgent(pr))}
     if live:
         closed = close_merged_issues(state_dir, github, when, out)
         if closed:

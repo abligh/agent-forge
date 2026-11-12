@@ -1373,6 +1373,21 @@ class Tick(Decide):
             self.assertEqual(github.writes, [])
         return record, lines
 
+    def test_the_record_names_urgent_and_elevated_pull_requests(self):
+        # For forge-flow: labelled by hand, or made urgent by a tool (a
+        # red nightly's fix), whether queued or held.
+        m.configure(urgent_project())
+        self.addCleanup(m.configure, project())
+        held = labelled(pr(7, T1, base="b6", reviews=[]), "Priority:urgent")
+        prs = [labelled(self.item(), "Priority:urgent"), self.other_pr(),
+               held, pr(8, T1, reviews=[])]
+        with mock.patch.object(m, "NIGHTLY_FIXES", frozenset({6, 8})):
+            record, _ = self.tick(prs)
+        self.assertEqual(record["urgent"], [5, 7])
+        self.assertEqual(record["elevated"], [6, 8])
+        record, _ = self.tick(prs[1:2])
+        self.assertEqual((record["urgent"], record["elevated"]), ([], []))
+
     def test_a_pull_request_waiting_for_an_instance_is_held_and_passed(self):
         # checks.instances.<name>.gate (agent-forge-next-bundle item 5).
         m.configure(gated_project({"paths": ["f.*"]}))
