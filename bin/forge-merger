@@ -2980,18 +2980,24 @@ def stalled_for(state_dir, waiting, when, check_state=None, repo=None,
     if waiting.get("action") == "WAIT":
         top = batch_top_started(state_dir, waiting, check_state, repo, run)
         if top is not None:
-            limit, since = stall_limit(check_state), max(since, top)
+            limit, since = stall_limit(check_state, top=True), \
+                max(since, top)
     if when - since < limit:
         return None
     return int(waited.total_seconds() // 60)
 
 
-def stall_limit(check_state):
+def stall_limit(check_state, top=False):
     """How long a WAIT may last before it is a stall: STALL_AFTER, or
     STALL_RUN_FACTOR times the median length of the build check's
     STALL_RUNS most recently finished runs in `check_state` when that is
     longer. A result copied from another run (a match, a batch's cover)
-    took no time of its own and isn't counted."""
+    took no time of its own and isn't counted. With `top`, a wait on a
+    batch's or train's top, the 90th percentile stands in for the
+    median: a top's tree holds every member's changes and runs the
+    steps any of them touches, so it takes as long as the longest
+    single heads, and timed against the median (most heads run few
+    steps) every train was called a stall (2026-11-12)."""
     if not STALL_RUN_FACTOR:
         return STALL_AFTER
     took = []
@@ -3009,6 +3015,9 @@ def stall_limit(check_state):
     recent = sorted(t for _, t in sorted(took)[-STALL_RUNS:])
     if not recent:
         return STALL_AFTER
+    if top:
+        typical = recent[min(len(recent) - 1, (len(recent) * 9) // 10)]
+        return max(STALL_AFTER, typical * STALL_RUN_FACTOR)
     middle = len(recent) // 2
     median = recent[middle] if len(recent) % 2 else \
         (recent[middle - 1] + recent[middle]) / 2

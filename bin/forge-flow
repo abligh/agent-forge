@@ -981,6 +981,30 @@ class Flow:
         roots.sort(key=lambda t: (-t["count"], t["pr"]))
         return roots
 
+    def singles(self):
+        """The candidates at the last tick that are in no stack (neither
+        a base nor a layer): the queue's and the held ones, in queue
+        order then by number, each with its status dot."""
+        if not self.records:
+            return []
+        last = self.records[-1]
+        held = {int(k): str(v) for k, v in (last.get("held") or {}).items()}
+        stacked = set()
+        for pr, reason in held.items():
+            got = STACKED_RE.search(reason)
+            if got:
+                stacked |= {pr, int(got.group(1))}
+        order = []
+        for pr in list(last.get("queue") or ()) + sorted(held):
+            if isinstance(pr, int) and pr not in stacked and pr not in order:
+                order.append(pr)
+        snap, cut = self.snapshot(), self.trains()
+        out = []
+        for pr in order:
+            status, why = self.status(pr, cut, snap)
+            out.append({"pr": pr, "status": status, "why": why})
+        return out
+
     def trains(self):
         """The trains in ahead.json now, the first being merged or
         tested: each with its carriages, its top (the commit tested for
@@ -1752,7 +1776,7 @@ ul.stack{padding:0}ul.stack ul{border-left:1px solid var(--axis);
 margin-left:6px}ul.stack li{margin:1px 0}
 ul.stack li li:before{content:"";display:inline-block;width:10px;
 border-top:1px solid var(--axis);vertical-align:middle;margin:0 4px 0 -16px}
-details.stk{margin:0 0 6px}details.stk summary{cursor:pointer}
+p.singles{line-height:1.9}p.singles .one{white-space:nowrap;margin-right:.6em}details.stk{margin:0 0 6px}details.stk summary{cursor:pointer}
 a{color:var(--c1)}
 figcaption b{display:block;font-size:14px}
 figcaption .note{display:block;margin:2px 0 4px}
@@ -2421,11 +2445,24 @@ def stack_items(data, node):
         "<ul>%s</ul>" % inner if inner else "")
 
 
+def singles_html(data):
+    """One line of the candidates in no stack, each with its dot."""
+    singles = data.get("singles") or []
+    if not singles:
+        return ""
+    return ('<p class="singles"><b>Not stacked</b> (%d): %s</p>'
+            % (len(singles), " ".join(
+                '<span class="one">%s%s%s</span>' % (
+                    dot_html(o.get("status"), o.get("why")),
+                    pr_link(data, o["pr"]), pri_html(data, o["pr"]))
+                for o in singles)))
+
+
 def stacks_html(data):
     stacks = data.get("stacks") or []
     if not stacks:
         return ("<section><h2>Stacks now</h2><p class=\"note\">No stacked "
-                "pull request is waiting.</p></section>")
+                "pull request is waiting.</p>%s</section>" % singles_html(data))
     layers = sum(t["count"] for t in stacks)
     parts = []
     for t in stacks:
@@ -2439,7 +2476,7 @@ def stacks_html(data):
         "<span>%s%s</span>" % (dot_html(c, None), esc(DOT_SAYS[c]))
         for c in (GREEN, ORANGE, RED)), pri_legend())
     return ("<section><h2>Stacks now</h2><p class=\"now\"><b>%d</b> "
-            "layers in <b>%d</b> stacks.</p>%s%s<p class=\"note\">Each "
+            "layers in <b>%d</b> stacks.</p>%s%s%s<p class=\"note\">Each "
             "tree is rooted at the stack's base, the pull request on the "
             "default branch; every layer above it waits (held as "
             "<i>stacked on #N</i>) until the one below merges, so where "
@@ -2457,9 +2494,11 @@ def stacks_html(data):
             "check), its own check red, or not a candidate at all (not "
             "approved or not open). The own check is the last one the "
             "build check ran for the pull request, which a push since "
-            "may have made stale. Priority marks as in the trains."
-            "</p></section>"
-            % (layers, len(stacks), "".join(parts), key))
+            "may have made stale. Priority marks as in the trains. "
+            "<b>Not stacked</b>: the other candidates, in the Merger's "
+            "queue order, then those it holds.</p></section>"
+            % (layers, len(stacks), "".join(parts), singles_html(data),
+               key))
 
 
 def page(data):
@@ -2708,6 +2747,7 @@ def compute(flow, project_name, repo=None, recent=RECENT_TRAINS):
             "windows": windows, "hours": flow.hourly(), "now":
             flow.snapshot(), "graph_hours": flow.graph_hours(),
             "build_times": flow.build_times(), "stacks": flow.stacks(),
+            "singles": flow.singles(),
             "trains": flow.trains(), "ahead_at": flow.ahead.get("at"),
             "recent_trains": flow.recent_trains(recent),
             "priority": flow.priorities(),

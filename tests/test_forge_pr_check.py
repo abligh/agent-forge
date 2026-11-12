@@ -3982,6 +3982,17 @@ class ApprovedFirst(StateCase):
             return done(args, 0, "".join(l + "\n" for l in by_pr[pr]))
         return FakeRun((is_reviews, answer))
 
+    def test_an_armed_label_counts_as_approved(self):
+        # A reviewer that approves only on green says so with
+        # labels.armed; its review shouldn't wait behind unreviewed heads.
+        heads = [(1, SHA_A, "o/r", False, "a", ["Review:armed"]),
+                 (2, SHA_B, "o/r", False, "b", ["other"]),
+                 (3, "c" * 40, "o/r", False, "c")]
+        with mock.patch.object(pc, "ARMED_LABEL", "Review:armed"):
+            self.assertEqual(pc.armed_prs(heads), frozenset({1}))
+        with mock.patch.object(pc, "ARMED_LABEL", None):
+            self.assertEqual(pc.armed_prs(heads), frozenset())
+
     def test_only_a_reviewer_agents_approval_counts(self):
         run = self.reviews({1: [self.REVIEWER], 2: ["someone"], 3: []})
         heads = [(1, SHA_A, REPO, False), (2, SHA_B, REPO, False),

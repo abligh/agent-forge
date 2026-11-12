@@ -938,6 +938,11 @@ MAIN_RED_FIXES = frozenset()
 APPROVED_FIRST = False
 REVIEWER_LOGINS = frozenset()
 APPROVED_PRS = frozenset()
+# labels.armed: a label a reviewer agent puts on a pull request it has
+# reviewed and will approve once its check is green (an approval
+# "armed"); with checks.approved_first it counts as approved, so the
+# review isn't left waiting behind unreviewed heads. None: off.
+ARMED_LABEL = None
 # How long a pull request's approval answer is kept in approved.json
 # before it is asked again, and the most pull requests asked in a tick.
 APPROVED_FRESH = datetime.timedelta(minutes=5)
@@ -1124,6 +1129,7 @@ def configure(project, instance=None):
     global CACHE_FAULT_TEXT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
     global PULL_REQUESTS, HOST_LOCK, APPROVED_FIRST, REVIEWER_LOGINS
+    global ARMED_LABEL
     global SCOPED, SCOPED_S
     INSTANCE = instance
     if instance is None:
@@ -1196,6 +1202,7 @@ def configure(project, instance=None):
     REVIEWER_LOGINS = frozenset(project.bot_login(name).lower()
                                 for name in project.reviewers())
     URGENT_LABEL = project.section("labels").get("urgent")
+    ARMED_LABEL = project.section("labels").get("armed")
     # Every instance acts on it, for its own red; one leaves the label
     # on while another context of the project is red on the head, so
     # that instance runs its red again too (OTHER_CONTEXTS).
@@ -1686,6 +1693,13 @@ def approved_prs(state_dir, state, heads, token, when, run=sh):
         pass
     return frozenset(int(k) for k, v in known.items()
                      if isinstance(v, dict) and v.get("approved"))
+
+
+def armed_prs(heads):
+    """labels.armed: the pull requests among `heads` (`open_heads`'
+    tuples) that carry it, for checks.approved_first."""
+    return frozenset(head[0] for head in heads
+                     if ARMED_LABEL in (head[5] if len(head) > 5 else ()))
 
 
 def open_heads(token, run=sh, why=None):
@@ -3908,6 +3922,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     global APPROVED_PRS
     APPROVED_PRS = approved_prs(state_dir, seen, heads, token, when, run) \
         if APPROVED_FIRST else frozenset()
+    if APPROVED_FIRST and ARMED_LABEL:
+        APPROVED_PRS = APPROVED_PRS | armed_prs(heads)
     todo = []
     with state_lock(state_dir):
         state = load(state_dir)
