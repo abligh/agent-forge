@@ -10121,3 +10121,67 @@ class OwnGreenWaitAfterUpdates(RepoCase):
         self.head = self.repo.commit("f.txt", "more\n", "more")
         self.assertIsNotNone(self.wait({self.approved: [], self.head: [],
                                         self.first: [status()]}))
+
+
+class CodeOwnerAsk(unittest.TestCase):
+    """agent-forge #153: a pull request held for a code owner opens an
+    ask issue, closed when the hold ends at that head."""
+
+    def setUp(self):
+        m.configure(project(code_owners=True, code_owner_ask={
+            "labels": ["Status:waiting-owner"]}))
+        self.addCleanup(m.configure, project())
+        self.dir = tempfile.mkdtemp()
+        self.lines = []
+        self.github = FakeGitHub({})
+
+    def asks(self, waits, open_heads):
+        m.code_owner_asks(self.dir, self.github, waits, open_heads,
+                          self.lines.append)
+        return m.load_json(os.path.join(self.dir, m.CODE_OWNER_ASK_NAME), {})
+
+    def test_a_hold_opens_one_labelled_issue(self):
+        why = "waits for code owner @alex: .github/CODEOWNERS"
+        asks = self.asks({5: ("a" * 40, why), 6: ("b" * 40, None)},
+                         {5: "a" * 40, 6: "b" * 40})
+        self.assertEqual(asks, {"5": {"head": "a" * 40, "issue": 900,
+                                      "labeled": ["Status:waiting-owner"]}})
+        (method, path, fields), label = self.github.writes
+        self.assertEqual(fields["title"], "#5 waits for a code owner's approval")
+        self.assertIn(why, fields["body"])
+        self.assertEqual(label[2], {"labels[]": "Status:waiting-owner"})
+        # Once per head: the next tick opens nothing more.
+        self.asks({5: ("a" * 40, why)}, {5: "a" * 40})
+        self.assertEqual(len(self.github.writes), 2)
+
+    def test_an_unjudged_pr_keeps_its_ask(self):
+        self.asks({5: ("a" * 40, "waits")}, {5: "a" * 40})
+        self.assertEqual(set(self.asks({}, {5: "a" * 40})), {"5"})
+
+    def test_approval_new_head_or_close_ends_it(self):
+        for waits, heads, said in (
+                ({5: ("a" * 40, None)}, {5: "a" * 40}, "no longer waits"),
+                ({}, {5: "c" * 40}, "has a new head"),
+                ({}, {}, "was closed")):
+            self.github = FakeGitHub({})
+            m.save_json(os.path.join(self.dir, m.CODE_OWNER_ASK_NAME),
+                        {"5": {"head": "a" * 40, "issue": 9,
+                               "labeled": ["Status:waiting-owner"]}})
+            self.assertEqual(self.asks(waits, heads), {})
+            comment, close = self.github.writes
+            self.assertIn(said, comment[2]["body"])
+            self.assertEqual(close[:2], ("PATCH", "repos/example/widget/issues/9"))
+
+    def test_a_refused_create_is_tried_again(self):
+        self.github.refuse = "nope"
+        self.assertEqual(self.asks({5: ("a" * 40, "waits")}, {5: "a" * 40}),
+                         {})
+        self.assertIn("CODE-OWNER-ASK refused", self.lines[0])
+
+    def test_config(self):
+        data = example()
+        data["merge"] = {"code_owner_ask": {"title": "x", "labels": [""]}}
+        problems = config.check(data)
+        for said in ("needs merge.code_owners", "must name the pull request",
+                     "must be a list of label names"):
+            self.assertTrue(any(said in p for p in problems), problems)
