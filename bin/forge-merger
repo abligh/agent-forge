@@ -5643,8 +5643,9 @@ def batch_holds(last, pr, tree, queue, check_state, tree_of=None):
 def train_ready(last, queue, main_tip, check_state, repo=None, run=sh,
                 restacks=None):
     """merge.test_ahead.train_merge: the members of the batch in `last`
-    (ahead.json) that can merge as one train now, or None: two or more,
-    its top's tree green, predicted from `main_tip` itself (the default
+    (ahead.json) that can merge as one train now, or None: one or more
+    (a train of one too, so the default branch lands where the next
+    train predicted it, not on an update's merge), its top's tree green, predicted from `main_tip` itself (the default
     branch hasn't moved since), and each member still in `queue` at the
     head it was predicted at. Given `repo`, a member whose head has
     moved since is still ready when its new head, predicted where it
@@ -5654,7 +5655,7 @@ def train_ready(last, queue, main_tip, check_state, repo=None, run=sh,
     has. The tree merged is still the one the top tested."""
     batch = (last or {}).get("batch") or {}
     entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
-    if len(entries) < 2 or [e.get("tree") for e in entries] \
+    if not entries or [e.get("tree") for e in entries] \
             != batch.get("trees") or (last or {}).get("base") != main_tip \
             or tree_verdict(check_state, entries[-1].get("tree")) is not True:
         return None
@@ -5715,7 +5716,9 @@ def boarded_members(last):
 def train_boarded(last, pr, check_state):
     """merge.test_ahead.train_merge: the size of the first train in
     `last` (ahead.json) when `pr` is boarded on it at the head it has,
-    the train has two or more members and its top isn't red, else None.
+    and its top isn't red, else None. A train of one counts: updating
+    it would move the default branch off the tree the next train was
+    predicted on, and that train would be cut again.
     Such a train goes in as one merge of its tested top (`train_merge`),
     so `pr` needs no UPDATE of its own: GitHub's merge of the default
     branch into it changes nothing the train merges and only starts a
@@ -5724,7 +5727,7 @@ def train_boarded(last, pr, check_state):
         return None
     batch = (last or {}).get("batch") or {}
     entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
-    if len(entries) < 2 or [e.get("tree") for e in entries] \
+    if not entries or [e.get("tree") for e in entries] \
             != batch.get("trees") \
             or tree_verdict(check_state, entries[-1].get("tree")) is False:
         return None

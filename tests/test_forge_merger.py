@@ -1203,6 +1203,17 @@ class TrainMerge(RepoCase):
         self.assertIsNone(m.train_ready(self.last, self.queue, "f" * 40,
                                         self.check))
 
+    def test_a_train_of_one_is_ready(self):
+        # Merged as a train, the default branch lands on the sha the
+        # next train was predicted on; an update and a merge of its own
+        # would move it elsewhere and that train would be cut again.
+        one = dict(self.last, entries=self.entries[:1],
+                   batch={"size": 1, "trees": [self.entries[0]["tree"]]})
+        green = {"results": {"r": {"ok": True,
+                                   "tree": self.entries[0]["tree"]}}}
+        self.assertEqual(m.train_ready(one, self.queue, self.tip, green),
+                         self.entries[:1])
+
     def test_ready_only_with_a_green_top(self):
         self.assertIsNone(m.train_ready(self.last, self.queue, self.tip,
                                         {"results": {}}))
@@ -4308,11 +4319,12 @@ class TickAhead(RepoCase):
                                           {}))
         self.assertIsNone(m.train_boarded(last, {"number": 7,
                                                  "headRefOid": "a"}, {}))
-        # Nor on a train of one, which merges on its own, nor batches
-        # that aren't trains, nor a train whose top is red.
+        # A train of one waits too: an update would move the default
+        # branch off the tree the next train was predicted on. Not
+        # batches that aren't trains, nor a train whose top is red.
         one = dict(last, entries=entries[:1],
                    batch={"size": 1, "trees": ["t5"]})
-        self.assertIsNone(m.train_boarded(one, five, {}))
+        self.assertEqual(m.train_boarded(one, five, {}), 1)
         self.assertIsNone(m.train_boarded(dict(last, trains=False), five,
                                           {}))
         red = {"results": {"x": {"tree": "t6", "ok": False}}}
