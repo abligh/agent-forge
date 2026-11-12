@@ -54,6 +54,7 @@ exits 2.
 | `FORGE_CRON_APP` | none | An agent or machinery App the job acts as. Its installation token is minted into `GH_TOKEN`. A mint that fails stops the job; there is no fallback to the host's own `gh` login. |
 | `FORGE_CRON_LOCK` | none | The lock file of another wrapper that runs jobs from the same checkout, while a project moves its crontab over. This one then takes that file instead of its own checkout lock. The other wrapper must use `flock`. |
 | `FORGE_CRON_LOCK_WAIT_S` | `300` | One budget, in seconds, for all the locks and the sync. Keep it shorter than any job's period. |
+| `FORGE_CRON_PIN_WAIT_S` | `600` | How long a job waits for `forge-install` when the installation isn't at the pin yet, or an install is pending (steps 7 and 8). `0`: it stops at once, as before. |
 | `FORGE_CRON_FETCH_RETRY_S` | `5` | How long to wait before the one retry of a fetch that lost a ref-lock race with another fetch. |
 | `FORGE_CRON_GENERATIONS` | `1` | `0` runs jobs in the checkout itself, reset in place under an exclusive lock, as before agent-forge #297. |
 | `FORGE_CRON_GEN_DIR` | `<checkout>.gen` | Where the generations go. |
@@ -118,14 +119,20 @@ Each run, in order:
    resets removes the marker. Then it goes back to a shared lock for
    the run. Every job then waits for the longest one running.
 6. Logs `at <short sha>`, the commit the job runs at.
-7. Refuses to start if `forge-install` has left
-   `<install>.install-wanted` (`INSTALL-PENDING`). Otherwise it takes
+7. Waits while `forge-install` has left `<install>.install-wanted`
+   (`INSTALL-PENDING`; see step 8 for the wait). Otherwise it takes
    the installation's lock, shared. That lock is handed to the tool,
    and on to anything the tool starts, so `forge-install` never moves
    the installation under a running job.
 8. Checks the pin. Without `.agent-forge/pin`, nothing is checked. With
-   it, the installation's `HEAD` must be the pinned commit, or the run
-   stops with `PIN-MISMATCH`. A pin file that doesn't start with a full
+   it, the installation's `HEAD` must be the pinned commit. If it isn't,
+   the job logs `PIN-WAIT: <why>` and waits for `forge-install` to move
+   it, looking again every 10 seconds and holding none of the
+   installation's lock meanwhile, then logs `PIN-WAITED <s>` and goes on.
+   Only after `FORGE_CRON_PIN_WAIT_S` does the run stop with
+   `PIN-MISMATCH` (or `INSTALL-PENDING`). After a pin bump, an hourly
+   job that fired before `forge-install`'s next run used to lose its
+   hour (agent-forge #262). A pin file that doesn't start with a full
    40-character SHA is `BAD-PIN`.
 9. Finds the tool (`NO-SUCH-TOOL` if it isn't there and executable).
 10. With `FORGE_CRON_APP`, mints the token (`APP-TOKEN-FAILED` on
