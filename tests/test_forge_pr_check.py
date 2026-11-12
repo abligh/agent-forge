@@ -2866,14 +2866,37 @@ class TickAhead(Tick):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def test_a_train_slot_is_kept_from_the_heads_own_runs(self):
+    def test_no_slot_is_kept_while_no_prediction_waits_or_runs(self):
+        # Second amendment of 2026-11-12: one train, its top running,
+        # and a slot sat idle for a train that didn't exist.
         self.reserve()
         self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
                   merger_dir=self.merger(entries=()))
-        self.assertEqual(self.spawned, [(self.state_dir, SHA_A, 7, False, 1)])
-        self.assertEqual(self.lines[-1], "RESERVED: 1 free slot kept for the "
-                         "Merger's predictions (merge.test_ahead.train_slots "
-                         "1); 1 waiting")
+        self.assertEqual(sorted(a[1] for a in self.spawned),
+                         sorted([SHA_A, SHA_B]))
+        self.assertFalse(any(l.startswith("RESERVED") for l in self.lines))
+
+    def test_a_running_top_is_the_slot_kept(self):
+        self.reserve()
+        self.slots = 3
+        self.hold(1, "#2 %s %s ahead" % (SHA_P, pc.iso(T0)))
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
+                  merger_dir=self.merger())
+        self.assertEqual(sorted(a[1] for a in self.spawned),
+                         sorted([SHA_A, SHA_B]))
+
+    def test_waiting_predictions(self):
+        state = empty()
+        ahead = [entry(2, SHA_P, TREE_1), entry(3, SHA_Q, TREE_2)]
+        self.assertEqual(pc.waiting_predictions(state, ahead, when=T0), 2)
+        self.assertEqual(pc.waiting_predictions(state, ahead, {SHA_P}, T0),
+                         1)
+        # With a batch, only its top, and the later tops.
+        self.assertEqual(pc.waiting_predictions(state, ahead, (), T0,
+                                                batch=ahead), 1)
+        self.assertEqual(pc.waiting_predictions(
+            state, ahead, (), T0, batch=ahead[:1], later=ahead[1:]), 2)
+        self.assertEqual(pc.waiting_predictions(state, [], (), T0), 0)
 
     def test_a_train_slot_takes_a_prediction_before_the_mergers_head(self):
         # The head can't have the slot, so a prediction waiting for it

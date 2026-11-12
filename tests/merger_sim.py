@@ -455,13 +455,18 @@ class SimCheck:
     """A model of the build check: a few slots, a verdict after
     `minutes`, the Merger's tops first, heads matched or covered by a
     green run as forge-pr-check does, and the gated instance in a queue
-    of its own with `mac_slots` slots taking `mac_minutes`."""
+    of its own with `mac_slots` slots taking `mac_minutes`. A stack's
+    layer's own run (one based on another pull request's branch when it
+    starts) takes `layer_minutes` (default `minutes`): longer, it shows
+    what waits for layers' own runs."""
 
     def __init__(self, world, merger_dir, slots=4, minutes=8,
-                 mac_slots=1, mac_minutes=12, notice=2):
+                 mac_slots=1, mac_minutes=12, notice=2, layer_minutes=None):
         self.world = world
         self.merger_dir = merger_dir
         self.slots, self.minutes = slots, minutes
+        self.layer_minutes = minutes if layer_minutes is None \
+            else layer_minutes
         self.mac_slots, self.mac_minutes = mac_slots, mac_minutes
         self.state = {"results": {}, "ahead_started": {}}
         self.running = []
@@ -552,7 +557,10 @@ class SimCheck:
         self.heads(batches)
         while self.queue and len(self.running) < self.slots:
             run = self.queue.pop(0)
-            run["done"] = now + datetime.timedelta(minutes=self.minutes)
+            layer = not run["top"] and w.prs.get(
+                run["pr"], {}).get("base", "main") != "main"
+            run["done"] = now + datetime.timedelta(
+                minutes=self.layer_minutes if layer else self.minutes)
             self.running.append(run)
             self.runs += 1
             if run["top"]:
@@ -867,6 +875,15 @@ def restacked_day():
     and the Merger restacks it."""
     return sorted(day() + [(2, "push", (20,)), (3, "review", (20,))],
                   key=lambda event: event[0])
+
+
+def siblings_day():
+    """`day`, with a base on main that has three layers on it, side by
+    side, and a layer on the second of those."""
+    s = day()
+    s += [(5, "open", (30,)), (6, "open", (31, 30)), (6, "open", (32, 30)),
+          (6, "open", (33, 30)), (7, "open", (34, 32))]
+    return sorted(s, key=lambda event: event[0])
 
 
 def busy(prs=40, seed=1, minutes=360):

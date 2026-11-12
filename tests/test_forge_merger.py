@@ -1373,6 +1373,21 @@ class Tick(Decide):
             self.assertEqual(github.writes, [])
         return record, lines
 
+    def test_the_record_names_urgent_and_elevated_pull_requests(self):
+        # For forge-flow: labelled by hand, or made urgent by a tool (a
+        # red nightly's fix), whether queued or held.
+        m.configure(urgent_project())
+        self.addCleanup(m.configure, project())
+        held = labelled(pr(7, T1, base="b6", reviews=[]), "Priority:urgent")
+        prs = [labelled(self.item(), "Priority:urgent"), self.other_pr(),
+               held, pr(8, T1, reviews=[])]
+        with mock.patch.object(m, "NIGHTLY_FIXES", frozenset({6, 8})):
+            record, _ = self.tick(prs)
+        self.assertEqual(record["urgent"], [5, 7])
+        self.assertEqual(record["elevated"], [6, 8])
+        record, _ = self.tick(prs[1:2])
+        self.assertEqual((record["urgent"], record["elevated"]), ([], []))
+
     def test_a_pull_request_waiting_for_an_instance_is_held_and_passed(self):
         # checks.instances.<name>.gate (agent-forge-next-bundle item 5).
         m.configure(gated_project({"paths": ["f.*"]}))
@@ -6500,6 +6515,80 @@ class Stacks(RepoCase):
         record, _ = self.tick([self.bottom(), self.layer()])
         self.assertEqual(record["ahead"], [5])
 
+    def own_green_tick(self, layers_need_own_green, minutes=0,
+                       check_state=None, **ahead):
+        """A live tick with merge.own_head_green on, #5 green on its own
+        and #6, its layer, with no run of its own yet."""
+        m.configure(project(stacks={}, own_head_green=True, test_ahead=dict(
+            {"batch": 2, "stacks": True, "trains": "live",
+             "layers_need_own_green": layers_need_own_green}, **ahead)))
+        table = dict(answers(prs=[self.bottom(), self.layer()]), **{
+            SLUG + "/commits/": [],
+            SLUG + "/commits/" + self.lower: [status()],
+            SLUG + "/pulls/5": {"merged": True},
+            SLUG + "/pulls/6": {"merged": True}})
+        self.github = FakeGitHub(table)
+        base = tools_run()
+
+        def run(args, cwd=None, env=None):
+            if "push" in args:
+                args = [self.repo.origin if a.startswith("https://github.com/")
+                        else a for a in args]
+            return base(args, cwd, env)
+        lines = []
+        start = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                                  tzinfo=datetime.timezone.utc)
+        with mock.patch.object(m, "RESOLVE_IDENTITY", ("Merger", "m@x")), \
+                mock.patch.object(m, "CI_WORKFLOW", ""):
+            record = m.tick(self.repo.path, self.state, self.github, run,
+                            lines.append, now=lambda: start
+                            + datetime.timedelta(minutes=minutes),
+                            live=True, check_state=check_state)
+        return record, lines
+
+    def test_a_layer_boards_without_its_own_green_when_told(self):
+        # Amendment of 2026-11-12: the train's top tests it.
+        record, _ = self.own_green_tick(True)
+        self.assertEqual(record["ahead"], [5])
+        self.state = os.path.join(self.tmp.name, "without")
+        record, _ = self.own_green_tick(False)
+        self.assertEqual(record["ahead"], [5, 6])
+
+    def test_its_train_merges_as_one_on_the_tops_green(self):
+        # Main moves on, so #5 isn't merged on its own at once.
+        self.advance_main("n.txt")
+        record, _ = self.own_green_tick(False, train_merge=True)
+        self.assertEqual(record["ahead"], [5, 6])
+        top = m.load_json(os.path.join(self.state, m.AHEAD_FILE),
+                          None)["entries"][1]
+        record, lines = self.own_green_tick(
+            False, minutes=1, train_merge=True, check_state={"results": {
+                top["sha"]: {"tree": top["tree"], "ok": True}}})
+        self.assertEqual([(d["pr"], d["action"], d.get("train"))
+                          for d in record["decisions"]],
+                         [(5, "MERGE", True), (6, "MERGE", True)])
+
+    def test_a_boarded_layer_needs_no_green_of_its_own(self):
+        github = FakeGitHub({SLUG + "/commits/": []})
+        layer = self.layer()
+        approval = m.approval_of(layer)
+        self.assertIsNotNone(m.own_green_wait(layer, approval, github, {}))
+        self.assertIsNone(m.own_green_wait(layer, approval, github, {},
+                                           boarded=self.upper))
+        self.assertIsNotNone(m.own_green_wait(layer, approval, github, {},
+                                              boarded="f" * 40))
+
+    def test_boarded_layers(self):
+        last = {"trains": True, "entries": [
+            {"pr": 5, "head": "a", "carriage": 5},
+            {"pr": 6, "head": "b", "carriage": 5, "on": 5},
+            {"pr": 7, "head": "c", "carriage": 7},
+            # Its base merged since: it heads its carriage, still a layer.
+            {"pr": 8, "head": "d", "carriage": 8, "on": 4}]}
+        self.assertEqual(m.boarded_layers(last), {6: "b", 8: "d"})
+        self.assertEqual(m.boarded_layers(dict(last, trains=False)), {})
+        self.assertEqual(m.boarded_layers(None), {})
+
     def hand_tick(self, pulls, minutes=1):
         """A live tick with only #6 open, and GitHub answering the
         closed pull requests from b5 with `pulls`."""
@@ -8573,6 +8662,93 @@ class Trains(RepoCase):
         self.assertEqual(self.numbers(got, sizes), [[5, 7]])
         self.assertEqual(events, [("left", "LEFT #6: left the queue; its "
                                    "stack's layers #9 leave with it")])
+
+    def sibling(self, number, base, name, text="x\n", reviews=True):
+        """A layer on #`base`'s branch writing `text` to `name`."""
+        got = self.change(number, name, text, start=base["headRefOid"])
+        got["baseRefName"] = base["headRefName"]
+        if not reviews:
+            got["reviews"] = []
+        return got
+
+    def siblings(self):
+        """#6 on main; #9 and #10 side by side on it, #11 on #9."""
+        six = self.change(6, "s.txt", "one\n")
+        nine = self.sibling(9, six, "s9.txt")
+        ten = self.sibling(10, six, "s10.txt")
+        eleven = self.sibling(11, nine, "s11.txt")
+        return six, nine, ten, eleven
+
+    def test_layers_side_by_side_are_ready_depth_first(self):
+        # Amendment of 2026-11-12: three layers on one base, all
+        # approved and green, and none boarded.
+        six, nine, ten, eleven = self.siblings()
+        twelve = self.sibling(12, six, "s12.txt", reviews=False)
+        thirteen = self.sibling(13, twelve, "s13.txt")
+        prs = [six, nine, ten, eleven, twelve, thirteen]
+        got = m.ready_layers(self.repo.path, six, prs,
+                             {p["number"] for p in prs},
+                             datetime.datetime.now(datetime.timezone.utc),
+                             {})
+        # #12 isn't approved: it and #13 on it stay out, the rest board.
+        self.assertEqual([p["number"] for p, _ in got], [9, 11, 10])
+
+    def test_a_carriage_that_is_a_tree_boards_whole(self):
+        six, nine, ten, eleven = self.siblings()
+        self.configure(batch=4, batches=1, depth=3)
+        entries, sizes, _ = self.cut([[six, nine, eleven, ten]])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 9, 11, 10]])
+        self.assertEqual([e["on"] for e in entries], [None, 6, 9, 6])
+        # Each is predicted on all before it: #10's holds #9 and #11.
+        files = m.git(self.repo.path, "ls-tree", "--name-only",
+                      entries[3]["tree"]).stdout.split()
+        for name in ("s.txt", "s9.txt", "s10.txt", "s11.txt"):
+            self.assertIn(name, files)
+
+    def test_a_red_layer_holds_back_only_its_own_branch(self):
+        six, nine, ten, eleven = self.siblings()
+        self.configure(batch=4, batches=1, depth=3)
+        entries, sizes, events = self.cut([[six, nine, eleven, ten]],
+                                          check={9})
+        self.assertEqual(self.numbers(entries, sizes), [[6, 10]])
+
+    def test_a_sibling_that_conflicts_stops_only_its_own_branch(self):
+        six = self.change(6, "s.txt", "one\n")
+        nine = self.sibling(9, six, "c.txt", "nine\n")
+        ten = self.sibling(10, six, "c.txt", "ten\n")
+        fourteen = self.sibling(14, ten, "s14.txt")
+        eleven = self.sibling(11, nine, "s11.txt")
+        self.configure(batch=5, batches=1, depth=4)
+        entries, sizes, events = self.cut(
+            [[six, nine, eleven, ten, fourteen]])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 9, 11]])
+        self.assertIn(("left", "LEFT #10: won't board with the layers below "
+                       "it, which go without it; also held back: #14"),
+                      events)
+
+    def test_a_layer_recut_after_its_base_merged_keeps_its_mark(self):
+        # layers_need_own_green: the base #6 merged, and #9 heads its
+        # carriage in a train cut afresh; it boarded as a layer.
+        six, nine, ten, eleven = self.siblings()
+        self.configure(batch=4, batches=1, depth=3)
+        last = {"entries": [{"pr": 9, "head": nine["headRefOid"], "on": 6}]}
+        entries, sizes, _ = self.cut([[nine, eleven]], last=dict(
+            last, base="0" * 40))
+        self.assertEqual([(e["pr"], e["on"]) for e in entries],
+                         [(9, 6), (11, 9)])
+
+    def test_one_that_leaves_takes_only_the_layers_on_it(self):
+        six, nine, ten, eleven = self.siblings()
+        self.configure(batch=4, batches=1, depth=3)
+        entries, sizes, _ = self.cut([[six, nine, eleven, ten]])
+        heads = {p["number"]: p["headRefOid"]
+                 for p in (six, nine, ten, eleven)}
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), [[six, ten]],
+            self.said(entries, sizes), heads, set(heads))
+        self.assertEqual(events, [("left", "LEFT #9: left the queue; its "
+                                   "stack's layers #11 leave with it")])
+        self.assertEqual(self.numbers(got, sizes), [[6, 10]])
 
     def test_a_merged_member_just_goes(self):
         six = self.change(6, "y.txt", "y\n")

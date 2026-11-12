@@ -628,3 +628,52 @@ take any free slot, and one running counts against the n. A slot kept
 this way takes the next prediction even while the Merger's own head
 waits, since that head couldn't have it. Running checks are never
 stopped for it; a slot frees as its run ends.
+
+## Amendment (2026-11-12, fourth): keep slots only for trains that exist
+
+**What happened.** With `train_slots` 1, one train cut and its top
+already running, the build check logged `RESERVED: 1 free slot kept`:
+a slot sat idle for a train top that didn't exist.
+
+**The rule.** The slots kept are at most the predictions running plus
+those waiting to start (the ones the build check would start now, one
+after another): min(`train_slots`, running + waiting). A running top
+fills its own reservation, and with no prediction waiting the heads may
+use every other slot.
+
+## Amendment (2026-11-12, fifth): layers side by side board
+
+**What happened.** A base had three layers based directly on it, all
+approved and green, and none boarded: the climb up a stack stopped at
+a fork, since which layer went first was left to the author.
+
+**The rule.** Layers side by side on one base are taken in number
+order, depth first: a layer, the layers on it, then the next layer
+beside it. Each is after the layer it is on, and the train predicts
+them one on another, as any carriage. A carriage is then a tree, not
+a chain, and is still never split across trains. A layer that isn't
+ready, is red, or doesn't merge cleanly onto the train so far holds
+back the layers on it and no others; a member that leaves a cut train
+takes only the layers on it with it. Each entry in `ahead.json` says
+`on`, the member it is stacked on; entries from before say nothing,
+and one of those that leaves takes everything after it, as before.
+
+## Amendment (2026-11-12, sixth): layers board without their own green
+
+**What happened.** With `merge.own_head_green`, a stack's layer
+boarded its base's train only once its own build check was green, so
+layers waited for runs of their own while their base's train went
+without them, though the train's top tests their changes anyway.
+
+**The rule.** `merge.test_ahead.layers_need_own_green: false` (default
+true, needs `stacks`) lets a layer board on everything else:
+its approval covering its head, code owners, gated instances, and no
+hand-back. Once its base merges, it stays a candidate without a green
+of its own while its head is the head it boarded with, or that head
+brought up to date by merges of the default branch or of the base's
+final head (`own_green_wait`'s walk back). With `train_merge`, the
+layers held as stacked count as the train's members, so the train goes
+in as one merge of its tested top; the merge itself still needs only
+the top's green, as for any member. Each member's own merge on the
+usual path still waits for `checks.context` on the head it merges,
+which a batch's cover gives once its tree is the one predicted.

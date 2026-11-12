@@ -114,7 +114,10 @@ the pull request's own failure.
 Each tick appends one JSON record to `merger.jsonl` in the state
 directory (~/.local/state/agent-forge/<project>/merger, or
 `--state-dir`) (`dry-run.jsonl` under `--dry-run`). `held` names each pull
-request Reviewer approved that is not eligible, with the reason, and
+request Reviewer approved that is not eligible, with the reason;
+`urgent` lists every open pull request the tick saw that carries
+`labels.urgent`, and `elevated` those urgent only because a tool says
+so (a red nightly's or default branch's fix); and
 `handed-back.json` remembers what was already said.
 
 **With `merge.yield_after_hand_back: N`, a pull request handed back
@@ -505,7 +508,19 @@ base and its approval covers its head. A layer joins only a batch not
 yet being run. The batch holds while the layer is still ready at the
 head predicted, held as stacked until the layer below merges. A queued
 pull request a layer pushed out of the batch is `owed` (ahead.json),
-and no layer pushes an owed one out again.
+and no layer pushes an owed one out again. Layers side by side on one
+base (amendment of 2026-11-12) are taken in number order, depth first:
+a layer, the layers on it, then the next one beside it; one that isn't
+ready, or in a train won't merge onto what is ahead of it, holds back
+the layers on it and no others, and a train member that leaves takes
+only the layers on it with it (ahead.json's entries say `on`, the
+member each is stacked on). With `layers_need_own_green` false (default
+true; with `merge.own_head_green`), a layer boards without its own
+build check's green, its train's top testing it; once its base has
+merged it stays a candidate without one while its head is the one it
+boarded with, or that one brought up to date (`own_green_wait`'s
+`boarded`), and `train_merge` takes the layers held as stacked as
+members, so the train goes in as one.
 
 **With `merge.test_ahead.trains`, batches are trains** (designs/0047;
 default off). `"live"`: each batch is a train of carriages, a stack's
@@ -988,6 +1003,9 @@ BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
                      "waits for the new batch's top")
 # merge.test_ahead.train_merge: a train's member behind the default
 # branch waits for its train rather than being updated.
+# merge.test_ahead.layers_need_own_green: whether a stack's layer needs
+# its own build check's green to board its base's train.
+LAYERS_OWN_GREEN = True
 TRAIN_WAIT_REASON = ("in a train of %d that merges as one; not updated, "
                      "it waits for the train's top")
 # The most ticks one run makes: it ticks again straight after a merge.
@@ -1179,7 +1197,7 @@ def configure(project):
     global FIXED_ORDER, GREEN_BATCH_FIRST, RED_SUSPECT_OUT, UNSTABLE_AFTER
     global UNSTABLE_BATCHES, TELL_BOARDED
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
-    global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR
+    global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR, LAYERS_OWN_GREEN
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -1230,6 +1248,8 @@ def configure(project):
     TRAINS = (ahead or {}).get("trains")
     TRAINS_WITHIN = (ahead or {}).get("trains_within", "files")
     TRAIN_MERGE = (ahead or {}).get("train_merge") is True
+    LAYERS_OWN_GREEN = (ahead or {}).get("layers_need_own_green") \
+        is not False
     TRAIN_BRANCH = (ahead or {}).get("train_branch", "forge/train-")
     HOLD_CONFLICTING = merge.get("hold_conflicting", False) is True
     YIELD_PLACES = merge.get("yield_after_hand_back", 0)
@@ -3539,42 +3559,62 @@ def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
                  regenerated=None, rules=None, green=None, gated=None):
     """designs/0035: the layers stacked on `base`, climbing the stack,
     that would be eligible but for their base, each with an approval
-    that covers its head, as [(pull request, approval)]. The first that
-    isn't ready ends the climb, as does a layer with another beside it,
-    since which goes first is the author's to say. A layer is ready only
-    when it could merge as it is but for the batch's own check: with
-    `gated` (`instance_wait`), a layer still waiting for a gated
-    instance's context isn't, since the batch's run is not that
-    instance's, and it would leave the batch at its merge."""
-    layers, below, numbers = [], base, {base["number"]}
-    while True:
-        above = [pr for pr in prs
-                 if pr.get("baseRefName") == below.get("headRefName")]
-        if len(above) != 1:
-            return layers
-        layer = above[0]
-        approval, _ = eligible(layer, open_numbers - numbers, when,
-                               any_base=True)
-        oid = ((approval or {}).get("commit") or {}).get("oid")
-        if not oid or handed_back(said, layer, approval, when):
-            return layers
-        have_head(repo, layer, run)
-        if git(repo, "cat-file", "-e", oid + "^{commit}",
-               run=run).returncode != 0 or not covers_head(
-                repo, oid, layer["headRefOid"], "refs/remotes/origin/" + MAIN,
-                run, (below["headRefOid"],), regenerated)[0]:
-            return layers
-        if rules and code_owner_wait(repo, layer, rules,
-                                     "refs/remotes/origin/" + MAIN, run,
-                                     regenerated):
-            return layers
-        if green is not None and green(layer, approval):
-            return layers
-        if gated is not None and gated(layer):
-            return layers
-        layers.append((layer, approval))
-        below = layer
-        numbers.add(layer["number"])
+    that covers its head, as [(pull request, approval)], each after the
+    layer it is on. Layers side by side on one base (amendment of
+    2026-11-12: three on one base, all approved and green, and none
+    boarded) are taken in number order, depth first: a layer, the
+    layers on it, then the next layer beside it. One that isn't ready
+    ends the climb on its own branch only. A layer is ready only when
+    it could merge as it is but for the batch's own check: with `gated`
+    (`instance_wait`), a layer still waiting for a gated instance's
+    context isn't, since the batch's run is not that instance's, and it
+    would leave the batch at its merge. With `green` (`own_green_wait`),
+    one waiting for its own build check isn't either; without it
+    (`layers_need_own_green` false), the train's top tests it."""
+    layers = []
+
+    def climb(below, numbers):
+        above = sorted((pr for pr in prs
+                        if pr.get("baseRefName") == below.get("headRefName")),
+                       key=lambda pr: pr["number"])
+        for layer in above:
+            approval = ready_layer(repo, layer, below, open_numbers,
+                                   numbers, when, said, run, regenerated,
+                                   rules, green, gated)
+            if approval is None:
+                continue
+            layers.append((layer, approval))
+            climb(layer, numbers | {layer["number"]})
+
+    climb(base, {base["number"]})
+    return layers
+
+
+def ready_layer(repo, layer, below, open_numbers, numbers, when, said,
+                run=sh, regenerated=None, rules=None, green=None,
+                gated=None):
+    """`ready_layers`' test of one `layer` on `below`: its approval when
+    it is ready, else None. `numbers` are the layers under it."""
+    approval, _ = eligible(layer, open_numbers - numbers, when,
+                           any_base=True)
+    oid = ((approval or {}).get("commit") or {}).get("oid")
+    if not oid or handed_back(said, layer, approval, when):
+        return None
+    have_head(repo, layer, run)
+    if git(repo, "cat-file", "-e", oid + "^{commit}",
+           run=run).returncode != 0 or not covers_head(
+            repo, oid, layer["headRefOid"], "refs/remotes/origin/" + MAIN,
+            run, (below["headRefOid"],), regenerated)[0]:
+        return None
+    if rules and code_owner_wait(repo, layer, rules,
+                                 "refs/remotes/origin/" + MAIN, run,
+                                 regenerated):
+        return None
+    if green is not None and green(layer, approval):
+        return None
+    if gated is not None and gated(layer):
+        return None
+    return approval
 
 
 def with_layers(queue, layers_of, last, size):
@@ -3890,7 +3930,7 @@ def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
 
 
 def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
-                   run=sh):
+                   run=sh, boarded=None):
     """Why `pr` isn't a candidate yet under merge.own_head_green, or
     None: checks.context isn't green (success) on the commit its
     approval names, nor on its head, nor (given `repo` and `main_tip`)
@@ -3907,7 +3947,12 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
     once a tick per commit, through `cache`, which keeps a green across
     ticks (`load_greens`). A pending, red or absent
     context holds the pull request: nothing merges, boards a batch or a
-    train, or is predicted until the build check has passed on it."""
+    train, or is predicted until the build check has passed on it.
+
+    `boarded` (merge.test_ahead.layers_need_own_green false) is the head
+    a stack's layer boarded a train with: while the head is that one, or
+    that one brought up to date as above, it needs no green of its own,
+    since the train's top tests it."""
     approved = ((approval or {}).get("commit") or {}).get("oid")
     head = pr.get("headRefOid")
     shas = [approved, head]
@@ -3922,6 +3967,8 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
                 break
             commit = parents[1]
             shas.append(commit)
+    if boarded and boarded in shas[1:]:
+        return None
     seen = []
     for sha in dict.fromkeys(s for s in shas if s):
         if sha not in cache:
@@ -4475,6 +4522,34 @@ def train_carriages(queue, layers_of=None):
     return out
 
 
+def carriage_bases(carriage):
+    """{number: the number of the member of `carriage` it is stacked
+    on, or None for the carriage's first}. A carriage is a stack: a
+    pull request and its ready layers, each after the one it is on,
+    and layers side by side on one base make it a tree, not a chain
+    (amendment of 2026-11-12). A member whose base isn't in the carriage
+    is taken to be on the one before it."""
+    by_branch = {pr.get("headRefName"): pr["number"] for pr in carriage}
+    # One whose base isn't in the carriage is taken to be on the one
+    # before it, as a chain.
+    return {pr["number"]: by_branch.get(pr.get("baseRefName"),
+                                        carriage[k - 1]["number"])
+            if k else None for k, pr in enumerate(carriage)}
+
+
+def stacked_on(number, bases):
+    """The members `bases` (`carriage_bases`, or a train's entries'
+    `on`) has stacked on `number`, directly or not."""
+    out, grew = set(), True
+    while grew:
+        grew = False
+        for n, on in bases.items():
+            if n not in out and (on == number or on in out):
+                out.add(n)
+                grew = True
+    return out
+
+
 def last_trains(last):
     """The trains of `last`, an ahead.json (or the dry run's file) that
     cut trains, as lists of carriages, each a list of its entries; []
@@ -4612,13 +4687,26 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
     # train up to it is the same, its prediction is still what a push
     # that only merges what is below it must give.
     was, before = {}, (last or {}).get("base")
+    # A layer whose base has merged since it boarded still boarded as a
+    # layer (`boarded_layers`), though it heads its carriage now.
+    was_on = {e.get("pr"): e.get("on") for e in (last or {}).get(
+        "entries") or () if isinstance(e, dict)
+        and e.get("on") is not None}
     for e in (e for t in prior for c in t for e in c):
         was[e.get("pr")], before = before, e.get("sha")
     for k, train in enumerate(prior[:trains]):
         start = len(entries)
         for carriage in train:
+            # What leaves takes the layers on it with it, and only them:
+            # a layer beside it, on the same base, stays (an entry from
+            # before entries said `on` takes everything after it).
+            bases = {x.get("pr"): x.get("on", -1) if j else None
+                     for j, x in enumerate(carriage)}
+            gone = set()
             for e in carriage:
                 n = e.get("pr")
+                if n in gone:
+                    continue
                 pr = by_number.get(n)
                 why, entry = None, None
                 if pr is None:
@@ -4657,14 +4745,19 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                         why = "no longer merges cleanly onto train %d's " \
                             "base" % (k + 1)
                 if why is not None:
-                    above = [x.get("pr") for x in carriage[
-                        carriage.index(e) + 1:]]
+                    later = carriage[carriage.index(e) + 1:]
+                    above = [x.get("pr") for x in later
+                             if x.get("on", -1) == -1
+                             or x.get("pr") in stacked_on(n, bases)]
                     events.append(("left", "LEFT #%d: %s%s" % (
                         n, why, "; its stack's layers %s leave with it"
                         % ", ".join("#%d" % a for a in above)
                         if above else "")))
-                    break
+                    gone.update([n] + above)
+                    continue
                 entry.update(train=k, carriage=carriage[0].get("pr"))
+                if "on" in e:
+                    entry["on"] = e["on"]
                 entries.append(entry)
                 used.add(n)
                 parent, graph = entry["sha"], entry.get("graph")
@@ -4686,12 +4779,17 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
     while len(sizes) < trains:
         start, touched, kind = len(entries), set(), None
         for carriage in pool:
+            bases = carriage_bases(carriage)
             members = [pr for pr in carriage if pr["number"] not in used
                        and pr["number"] not in behind]
-            for k, pr in enumerate(members):
-                if pr["number"] in red:
-                    members = members[:k]
-                    break
+            # A red layer stays behind with the layers on it; one beside
+            # it, on the same base, may still board.
+            out_of = set()
+            for pr in members:
+                if pr["number"] in red and pr["number"] not in out_of:
+                    out_of |= {pr["number"]} | stacked_on(pr["number"],
+                                                          bases)
+            members = [pr for pr in members if pr["number"] not in out_of]
             if not members:
                 continue
             size = len(entries) - start
@@ -4713,21 +4811,32 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                                    and not (kind and urgent(members[0]))
                                    and changed & touched):
                 continue
-            made, top, top_graph = [], parent, graph
+            made, top, top_graph, failing = [], parent, graph, set()
             for pr in members:
+                if pr["number"] in failing:
+                    continue
                 entry, failed = predict_one(repo, top, pr, restacks, run,
                                             top_graph)
                 if entry is None:
-                    break
+                    # It stays behind with the layers on it; a layer
+                    # beside it may still board.
+                    failing |= {pr["number"]} | stacked_on(pr["number"],
+                                                           bases)
+                    continue
+                on = bases.get(pr["number"])
                 entry.update(train=len(sizes),
-                             carriage=members[0]["number"])
+                             carriage=members[0]["number"],
+                             on=on if on is not None
+                             else was_on.get(pr["number"]))
                 made.append(entry)
                 top, top_graph = entry["sha"], entry.get("graph")
             if not made:
                 continue
+            boarded = {e["pr"] for e in made}
             left = [pr["number"] for pr in carriage
                     if pr["number"] not in used
-                    and pr["number"] not in behind][len(made):]
+                    and pr["number"] not in behind
+                    and pr["number"] not in boarded]
             if left:
                 behind.update(left)
                 events.append(("left", "LEFT #%d: won't board with the "
@@ -5380,6 +5489,20 @@ def train_ready(last, queue, main_tip, check_state, repo=None, run=sh,
         ready.append(e)
         parent, graph = e.get("sha"), e.get("graph")
     return ready
+
+
+def boarded_layers(last):
+    """{number: head} of the stack's layers on the trains in `last`
+    (ahead.json): members that boarded on a pull request below them,
+    which `on` names (kept when that one has merged and the layer heads
+    its carriage), or that aren't the first of their carriage."""
+    if not isinstance(last, dict) or not last.get("trains"):
+        return {}
+    return {e["pr"]: e.get("head") for e in last.get("entries") or ()
+            if isinstance(e, dict) and isinstance(e.get("pr"), int)
+            and (e.get("on") is not None
+                 or e.get("carriage") is not None
+                 and e.get("carriage") != e["pr"])}
 
 
 def train_boarded(last, pr, check_state):
@@ -6373,9 +6496,20 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 candidates.remove(pr)
     greens = load_greens(state_dir) if OWN_HEAD_GREEN else {}
     if OWN_HEAD_GREEN:
+        # merge.test_ahead.layers_need_own_green false: a layer that
+        # boarded a train is tested by its top, and stays a candidate
+        # without a green of its own once its base has merged.
+        aboard = {} if LAYERS_OWN_GREEN else boarded_layers(load_json(
+            os.path.join(state_dir, AHEAD_FILE), {}))
         for pr in list(candidates):
+            if pr["number"] in aboard:
+                # The walk back to the head it boarded with reads the
+                # new head's parents, which only the pull requests a
+                # tick decided on were fetched for.
+                have_head(repo, pr, run)
             why = own_green_wait(pr, approvals[pr["number"]], github, greens,
-                                 repo, main_tip, run)
+                                 repo, main_tip, run,
+                                 aboard.get(pr["number"]))
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
@@ -6570,7 +6704,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         held[str(number)] = HOLD_REASON % ahead
     queue = [pr for pr in queue if pr["number"] not in held_by]
     record = {"at": iso(when), "main": main_tip, "held": held,
-              "queue": [pr["number"] for pr in queue], "decisions": []}
+              "queue": [pr["number"] for pr in queue], "decisions": [],
+              # Every open pull request the tick saw: those marked urgent
+              # by hand, and those a tool made urgent (a red nightly's
+              # or default branch's fix), for forge-flow.
+              "urgent": sorted(pr["number"] for pr in prs
+                               if labelled_urgent(pr)),
+              "elevated": sorted(pr["number"] for pr in prs
+                                 if urgent(pr) and not labelled_urgent(pr))}
     if live:
         closed = close_merged_issues(state_dir, github, when, out)
         if closed:
@@ -6632,11 +6773,15 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     if TRAIN_MERGE and retarget is None and AHEAD_BATCH > 1:
         last_ahead = load_json(os.path.join(state_dir, AHEAD_FILE), {})
     if TRAIN_MERGE and live and retarget is None and AHEAD_BATCH > 1:
-        entries = train_ready(last_ahead, queue, main_tip, check_state,
-                              repo, run, restacks if PREDICT_RESTACKED
-                              else None)
+        # Layers held as stacked are members too: without their own
+        # greens (layers_need_own_green false), the train's top is what
+        # tested them.
+        members = queue if LAYERS_OWN_GREEN else queue + batch_layers
+        entries = train_ready(last_ahead, members, main_tip, check_state,
+                              repo, run,
+                              restacks if PREDICT_RESTACKED else None)
         if entries:
-            merged, _ = train_merge(repo, state_dir, entries, queue,
+            merged, _ = train_merge(repo, state_dir, entries, members,
                                     main_tip, check_state, github, run,
                                     sleep, out)
             # GitHub wouldn't take the train: its members merge one at
@@ -6645,7 +6790,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if merged:
                 trained = set(merged)
                 heads = {e["pr"]: e["head"] for e in entries}
-                prs_by = {pr["number"]: pr for pr in queue}
+                prs_by = {pr["number"]: pr for pr in members}
                 for number in merged:
                     record["decisions"].append({
                         "action": "MERGE", "pr": number,
@@ -6995,7 +7140,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 repo, pr, prs, open_numbers, when, said, run, regenerated,
                 rules, (lambda layer, approval: own_green_wait(
                     layer, approval, github, greens, repo, main_tip, run))
-                if OWN_HEAD_GREEN else None,
+                if OWN_HEAD_GREEN and LAYERS_OWN_GREEN else None,
                 (lambda layer: instance_wait(repo, layer, main_tip, github,
                                              gated_files, run))
                 if GATED else None)) if AHEAD_STACKS else None
