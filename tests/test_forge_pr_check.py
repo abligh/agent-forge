@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -2273,6 +2274,22 @@ class Batch(unittest.TestCase):
             self.assertEqual(pc.next_ahead(state, self.entries, when=T0,
                                            batch=self.entries[:2]),
                              (SHA_Q, 8), stale)
+
+    def test_relabel_host_makes_a_moved_states_verdicts_count(self):
+        # agent-forge #197: after a move to a new container every earlier
+        # verdict stopped counting, and everything ran again.
+        state_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state_dir)
+        state = empty()
+        state["results"][SHA_Q] = verdict(pr=8, tree=TREE_3, host="old-box")
+        state["results"][SHA_P] = verdict(pr=7, tree=TREE_2, host="other")
+        pc.save(state_dir, state)
+        self.assertIsNone(pc.tested(pc.load(state_dir), TREE_3, T0))
+        self.assertEqual(pc.relabel_host(state_dir, "old-box"), 1)
+        moved = pc.load(state_dir)
+        self.assertEqual(pc.tested(moved, TREE_3, T0), SHA_Q)
+        self.assertEqual(moved["results"][SHA_P]["host"], "other")
+        self.assertEqual(pc.relabel_host(state_dir, "old-box"), 0)
 
     def test_a_top_with_a_verdict_here_is_not_run_again(self):
         state = empty()
