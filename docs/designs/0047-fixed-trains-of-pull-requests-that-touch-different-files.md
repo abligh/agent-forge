@@ -628,3 +628,15 @@ take any free slot, and one running counts against the n. A slot kept
 this way takes the next prediction even while the Merger's own head
 waits, since that head couldn't have it. Running checks are never
 stopped for it; a slot frees as its run ends.
+
+## Amendment (2026-11-12, fourth): keep slots only for trains that exist
+
+**What happened.** With `train_slots` 1, one train cut and its top
+already running, the build check logged `RESERVED: 1 free slot kept`:
+a slot sat idle for a train top that didn't exist.
+
+**The rule.** The slots kept are at most the predictions running plus
+those waiting to start (the ones the build check would start now, one
+after another): min(`train_slots`, running + waiting). A running top
+fills its own reservation, and with no prediction waiting the heads may
+use every other slot.

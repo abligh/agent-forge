@@ -168,8 +168,10 @@ While a head of the Merger's own pull request waits, overdue heads and
 `spare_slots_only` runs predictions only when no ordinary head waits.
 A head that failed to prepare always goes behind. It only orders: a
 free slot is never kept empty, except under `train_slots`, which keeps
-that many slots for predictions alone: heads' own runs and the default
-branch's start only while fewer than the other slots are running them,
+that many slots for predictions alone, or as many as there are
+predictions running or waiting to start if fewer: heads' own runs and
+the default branch's start only while fewer than the other slots are
+running them,
 a free slot past that takes the next prediction even before the
 Merger's own head, or stays free (`RESERVED: ...`), and nothing running
 is stopped for it. `STARTED` lines end with why a head

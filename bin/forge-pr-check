@@ -268,7 +268,10 @@ With `merge.test_ahead.train_slots` n (amendment of 2026-11-12, default
 0), n of the slots are the predictions' alone: the heads' own runs and
 the default branch's (its warm-ups too) start only while fewer than
 slots - n of them are running, and a prediction running in any slot
-counts against the n. Once the heads have their share, a free slot
+counts against the n. Only as many are kept as there are predictions
+running or waiting to start (`next_ahead` would start them now; second
+amendment of 2026-11-12): with one train, its top running, nothing
+else is kept. Once the heads have their share, a free slot
 takes the next prediction even while the Merger's own head waits (it
 couldn't have the slot), or stays free, logged `RESERVED: k free slots
 kept for the Merger's predictions ...`. A prediction may still take any
@@ -2896,6 +2899,21 @@ def next_ahead(state, ahead, busy=(), when=None, busy_trees=(), batch=(),
     return None
 
 
+def waiting_predictions(state, ahead, busy=(), when=None, batch=(),
+                        later=()):
+    """How many of the Merger's predictions `next_ahead` would start
+    one after another now, `busy` running: what
+    merge.test_ahead.train_slots keeps slots for, with the ones
+    running."""
+    taken, count = set(busy), 0
+    while True:
+        got = next_ahead(state, ahead, taken, when, (), batch, later)
+        if got is None or got[0] in taken:
+            return count
+        taken.add(got[0])
+        count += 1
+
+
 def forget_ahead(state, ahead):
     """Drop the start stamps and error counts of predictions the Merger
     no longer lists, so they don't pile up."""
@@ -4058,10 +4076,13 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     predicted_prs = {e["pr"] for e in ahead} if APPROVED_FIRST else set()
     # merge.test_ahead.train_slots (amendment of 2026-11-12): only the
     # Merger's predictions may run in the reserved slots, so the heads'
-    # own runs and the default branch's fill at most the rest. Nothing
-    # running is stopped for it.
-    own_cap = slots - min(TRAIN_SLOTS, slots - 1) \
-        if TEST_AHEAD and merger_dir else slots
+    # own runs and the default branch's fill at most the rest. Only as
+    # many are kept as there are predictions running or waiting to
+    # start (second amendment of 2026-11-12): a slot kept for a train
+    # that doesn't exist sat idle. Nothing running is stopped for it.
+    reserve = min(TRAIN_SLOTS, slots - 1) if TEST_AHEAD and merger_dir \
+        else 0
+    later_all = merger_later(merger_dir, when, checkout) if reserve else []
     own_running = sum(1 for slot, holder in holders.items()
                       if slot != LANE and holder is not None
                       and not is_prediction(fields[slot]))
@@ -4071,7 +4092,6 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     first_pass = True
     while free or lane_free:
         predicted = pick = fast = None
-        own_full = own_running >= own_cap
         held = {}
         with state_lock(state_dir):
             state = load(state_dir)
@@ -4119,6 +4139,12 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 state["waiting"].get(s, {}).get("pr") == first_pr
                 and not state["waiting"].get(s, {}).get("main")
                 for s in twins)
+            kept = min(reserve, sum(
+                1 for slot, got in fields.items()
+                if slot != LANE and is_prediction(got))
+                + waiting_predictions(state, ahead, taken, when, batch,
+                                      later_all)) if reserve else 0
+            own_full = own_running >= slots - kept
             if free and not own_full:
                 pick = next_head(state, taken | set(held), first_pr, when,
                                  cheap, urgent, blocked, predicted_prs) \
@@ -4208,9 +4234,10 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         if pick is None:
             if own_full and fast is None and live_heads(state, taken, when):
                 out("RESERVED: %d free slot%s kept for the Merger's "
-                    "predictions (merge.test_ahead.train_slots %d); %d "
+                    "predictions (%d of merge.test_ahead.train_slots %d "
+                    "kept, for the predictions running or waiting); %d "
                     "waiting" % (len(free), "" if len(free) == 1 else "s",
-                                 TRAIN_SLOTS, len(queued - taken)))
+                                 kept, TRAIN_SLOTS, len(queued - taken)))
                 return 0
             warming = warm_slot(state, free, head_of_main, checkout, when, run) \
                 if fast is None and not starting and not own_full \
