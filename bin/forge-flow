@@ -1430,17 +1430,23 @@ class Flow:
 
     def graph_hours(self, hours=24):
         """The last `hours` whole clock hours, oldest first, with what
-        the page graphs (graph_row). An hour with no Merger record is a
-        gap: it has only its `hour`, and `records` false."""
+        the page graphs (graph_row), then the hour under way, to now,
+        with `partial` and its `until`. An hour with no Merger record
+        is a gap: it has only its `hour`, and `records` false."""
         top = self.now.replace(minute=0, second=0, microsecond=0)
         rows = []
-        for k in range(hours, 0, -1):
+        for k in range(hours, -1, -1):
             a = top - k * HOUR
-            ticks = (bisect.bisect_left(self.tick_times, a + HOUR)
+            b = min(a + HOUR, self.now)
+            if b <= a:
+                continue
+            ticks = (bisect.bisect_left(self.tick_times, b)
                      - bisect.bisect_left(self.tick_times, a))
             row = {"hour": stamp(a), "records": bool(ticks)}
+            if k == 0:
+                row.update(partial=True, until=stamp(b))
             if ticks:
-                row.update(graph_row(self.figures(a, a + HOUR)))
+                row.update(graph_row(self.figures(a, b)))
             rows.append(row)
         return rows
 
@@ -1720,6 +1726,7 @@ svg .line{fill:none;stroke-width:2;stroke-linejoin:round;
 stroke-linecap:round}
 svg .dot{stroke:var(--card);stroke-width:2}
 svg .zero{fill:var(--axis)}
+svg .partial{fill-opacity:.4}
 svg .hit{fill:transparent}svg .hit:hover{fill:var(--ring)}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,
 minmax(280px,1fr));gap:12px;margin:10px 0}
@@ -1928,13 +1935,14 @@ def tick_text(value):
 
 
 def chart(cid, title, desc, unit, slots, series, ticks_x, ref=None,
-          bars=False, x_label="hour (UTC)", gap="no value"):
+          bars=False, x_label="hour (UTC)", gap="no value", partial=()):
     """One small graph, as inline SVG: `slots` names each x position
     (for its tooltip), `series` is [(name, values)] with None for a
     gap, `ticks_x` is [(index, text)], `ref` an optional (value, text)
     reference line. Bars for one series, else lines. A gap draws
     nothing, and `gap` says why under a run of three or more; a zero
-    bar is a stub on the baseline."""
+    bar is a stub on the baseline. A bar whose slot is in `partial` (the
+    hour under way) is drawn lighter: so far, not a whole hour."""
     width, height = 360, 200
     left, right, top, bottom = 30, 10, 18, 30
     multi = len(series) > 1
@@ -1998,9 +2006,10 @@ def chart(cid, title, desc, unit, slots, series, ticks_x, ref=None,
                 rr = min(r, h)
                 parts.append(
                     '<path d="M%.1f %.1fV%.1fQ%.1f %.1f %.1f %.1fH%.1fQ%.1f '
-                    '%.1f %.1f %.1fV%.1fZ" style="fill:%s"/>'
+                    '%.1f %.1f %.1fV%.1fZ" style="fill:%s"%s/>'
                     % (x0, y(0), y0 + rr, x0, y0, x0 + rr, y0, x0 + w - rr,
-                       x0 + w, y0, x0 + w, y0 + rr, y(0), colour))
+                       x0 + w, y0, x0 + w, y0 + rr, y(0), colour,
+                       ' class="partial"' if i in partial else ""))
             continue
         runs, run = [], []
         for i, v in enumerate(vs):
@@ -2087,20 +2096,32 @@ def latency_scale(rows):
     return (60.0, "hours") if worst > 180 else (1.0, "minutes")
 
 
+def whole_hours(rows):
+    """`rows` without the hour under way: a ratio over part of an hour
+    says little."""
+    return [r for r in rows if not r.get("partial")]
+
+
 def flow_graphs(rows):
-    """Section 2's graph: merges each hour, against the bar."""
-    slots = [r["hour"][11:16] for r in rows]
+    """Section 2's graph: merges each hour, against the bar, and the
+    hour under way so far, lighter."""
+    slots = [r["hour"][11:16] + ("\u2013%s so far" % r["until"][11:16]
+                                 if r.get("partial") and r.get("until")
+                                 else "") for r in rows]
     return '<div class="charts">%s</div>' % chart(
         "merges", "Merges per hour, last 24 h",
         "Pull requests merged in each whole hour (UTC), against the bar "
-        "of %d an hour. A gap is an hour with no Merger record; a stub on "
-        "the baseline is an hour with none merged." % MERGE_BAR,
+        "of %d an hour, and, lighter at the right, the hour under way so "
+        "far. A gap is an hour with no Merger record; a stub on the "
+        "baseline is an hour with none merged." % MERGE_BAR,
         "merges/h", slots, [("merges", graph_values(rows, "merges"))],
         hour_ticks(rows), ref=(MERGE_BAR, "bar %d/h" % MERGE_BAR),
-        bars=True, gap="no records")
+        bars=True, gap="no records",
+        partial={i for i, r in enumerate(rows) if r.get("partial")})
 
 
 def efficiency_graphs(rows):
+    rows = whole_hours(rows)
     slots = [r["hour"][11:16] for r in rows]
     ticks = hour_ticks(rows)
     return '<div class="charts">%s%s%s</div>' % (
@@ -2132,6 +2153,7 @@ def efficiency_graphs(rows):
 
 
 def latency_graphs(rows):
+    rows = whole_hours(rows)
     scale, unit = latency_scale(rows)
     slots = [r["hour"][11:16] for r in rows]
     return '<div class="charts">%s</div>' % chart(
