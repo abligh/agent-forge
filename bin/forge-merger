@@ -1538,21 +1538,28 @@ def eligible(pr, open_numbers, now=None, stacked=None, any_base=False):
     return approval, None
 
 
-def urgent(pr):
-    """Whether `pr` carries `labels.urgent`, or fixes a red nightly or
-    a red default branch."""
-    if pr.get("number") in NIGHTLY_FIXES | MAIN_RED_FIXES:
-        return True
+def labelled_urgent(pr):
+    """Whether `pr` carries `labels.urgent`: someone marked it so by
+    hand."""
     return bool(URGENT_LABEL) and URGENT_LABEL in [
         (n or {}).get("name") for n in
         ((pr.get("labels") or {}).get("nodes") or [])]
 
 
+def urgent(pr):
+    """Whether `pr` carries `labels.urgent`, or fixes a red nightly or
+    a red default branch."""
+    return labelled_urgent(pr) \
+        or pr.get("number") in NIGHTLY_FIXES | MAIN_RED_FIXES
+
+
 def order(candidates, everyone=None):
     """`candidates` in the order the Merger takes them. First come those
-    carrying `labels.urgent`, then those that another open pull request
-    is blocked by, then the rest, each group oldest first by
-    `createdAt`, then by number.
+    carrying `labels.urgent`, which a person put there; then the other
+    urgent ones, a red nightly's or default branch's fixes, which a
+    tool found; then those that another open pull request is blocked
+    by; then the rest, each group oldest first by `createdAt`, then by
+    number.
 
     `everyone` is every open pull request, candidates or not, and
     defaults to `candidates`. It has to include the ineligible ones: a
@@ -1561,7 +1568,8 @@ def order(candidates, everyone=None):
     named = set()
     for pr in candidates if everyone is None else everyone:
         named |= blockers_of(pr)
-    key = lambda pr: (not urgent(pr), pr["number"] not in named,
+    key = lambda pr: (not labelled_urgent(pr), not urgent(pr),
+                      pr["number"] not in named,
                       pr["createdAt"], pr["number"])
     return sorted(candidates, key=key)
 
@@ -4944,12 +4952,14 @@ def batch_members(state_dir, queue, tree_of=None):
 
 
 def fixes_first(queue, in_flight, members):
-    """`queue` with MAIN_RED_FIXES first, behind only `in_flight` and a
-    green batch's `members` (designs/0011, amendment); the rest keep
-    their order, and so do the members, among which a fix doesn't move
-    up (see overdue_first)."""
+    """`queue` with MAIN_RED_FIXES first, behind only `in_flight`, a
+    green batch's `members` (designs/0011, amendment) and those carrying
+    `labels.urgent`, which always go first; the rest keep their order,
+    and so do the members, among which a fix doesn't move up (see
+    overdue_first)."""
     return sorted(queue, key=lambda pr: (
         pr["number"] != in_flight, pr["number"] not in members,
+        pr["number"] not in members and not labelled_urgent(pr),
         pr["number"] not in members
         and pr["number"] not in MAIN_RED_FIXES))
 

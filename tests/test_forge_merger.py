@@ -146,6 +146,19 @@ class Urgent(unittest.TestCase):
         self.assertTrue(m.urgent(pr(5, T3)))
         self.assertFalse(m.urgent(pr(3, T0)))
 
+    def test_labelled_ones_go_before_a_tools_fixes(self):
+        # A person's Urgent label always goes first; a fix a tool found
+        # (red nightly, red default branch) comes after, older or not.
+        self.addCleanup(setattr, m, "NIGHTLY_FIXES", frozenset())
+        self.addCleanup(setattr, m, "MAIN_RED_FIXES", frozenset())
+        m.NIGHTLY_FIXES = frozenset({5})
+        m.MAIN_RED_FIXES = frozenset({6})
+        hot = labelled(pr(7, T3), "Priority:urgent")
+        got = m.order([pr(3, T0), pr(5, T1), pr(6, T0), hot])
+        self.assertEqual([p["number"] for p in got], [7, 6, 5, 3])
+        got = m.fixes_first([pr(3, T0), pr(6, T0), hot], None, set())
+        self.assertEqual([p["number"] for p in got], [7, 6, 3])
+
 
 class LoginAndMarkers(unittest.TestCase):
 

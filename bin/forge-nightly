@@ -194,9 +194,35 @@ query($o: String!, $r: String!, $n: Int!) {
 fragment closes on PullRequest {
   number title body
   closingIssuesReferences(first: 50) { nodes { number } }
-  commits(last: 100) { nodes { commit { message } } }
+  commits(last: 100) { nodes { commit {
+    message parents { totalCount }
+    associatedPullRequests(first: 5) { nodes { number } } } } }
 }
 """
+
+
+def own_messages(pr):
+    """The messages of pull request `pr`'s own commits (GraphQL): not a
+    merge, and in no earlier pull request. A stack's upper layer lists
+    every commit of the layers below it, and once they merge (as
+    squashes) the default branch's as well, so their "Fixes #N" lines
+    made the layer look like a fix of whatever they named: on one
+    project a layer high in a stack counted as the red nightly's fix,
+    went first as urgent and cut the trains again."""
+    number = pr.get("number")
+    out = []
+    for c in (pr.get("commits") or {}).get("nodes") or ():
+        commit = (c or {}).get("commit") or {}
+        if ((commit.get("parents") or {}).get("totalCount") or 0) > 1:
+            continue
+        others = [(n or {}).get("number") for n in (
+            (commit.get("associatedPullRequests") or {}).get("nodes")
+            or ())]
+        if any(isinstance(n, int) and isinstance(number, int)
+               and n < number for n in others):
+            continue
+        out.append(commit.get("message") or "")
+    return out
 
 
 def iso(when):
@@ -895,9 +921,8 @@ class Tick:
         refs = self.closing.refs
         found |= set(refs(self.closing.blank_code(pr.get("body") or "")))
         found |= set(refs(pr.get("title") or ""))
-        for c in (pr.get("commits") or {}).get("nodes") or ():
-            found |= set(refs(((c or {}).get("commit") or {}).get(
-                "message") or ""))
+        for message in own_messages(pr):
+            found |= set(refs(message))
         found.discard(None)
         return found
 
@@ -912,8 +937,7 @@ class Tick:
         pattern = re.compile(r"(?:#|/issues/)%d(?![0-9])" % number)
         texts = [pr.get("title") or "",
                  self.closing.blank_code(pr.get("body") or "")]
-        texts += [((c or {}).get("commit") or {}).get("message") or ""
-                  for c in (pr.get("commits") or {}).get("nodes") or ()]
+        texts += own_messages(pr)
         return any(pattern.search(t) for t in texts)
 
     def linked(self, issue, number):

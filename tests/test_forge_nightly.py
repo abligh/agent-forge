@@ -87,6 +87,33 @@ def pr(number, title="", body="", messages=(), declared=(), merged=None):
     return node
 
 
+class OwnMessages(unittest.TestCase):
+    """Only a pull request's own commits name or close issues: not a
+    merge, and not a commit an earlier pull request holds (a stack's
+    lower layers, merged or not)."""
+
+    def commit(self, message, parents=1, prs=()):
+        return {"commit": {"message": message,
+                           "parents": {"totalCount": parents},
+                           "associatedPullRequests": {"nodes": [
+                               {"number": n} for n in prs]}}}
+
+    def test_a_layer_skips_the_commits_of_the_layers_below(self):
+        layer = {"number": 784, "commits": {"nodes": [
+            self.commit("Fixes #517", prs=[538, 762, 784]),
+            self.commit("Merge branch 'main'", parents=2, prs=[784]),
+            self.commit("Fixes #207", prs=[784])]}}
+        self.assertEqual(tool.own_messages(layer), ["Fixes #207"])
+
+    def test_the_lowest_pull_request_keeps_its_commits(self):
+        lower = {"number": 538, "commits": {"nodes": [
+            self.commit("Fixes #517", prs=[538, 762, 784])]}}
+        self.assertEqual(tool.own_messages(lower), ["Fixes #517"])
+
+    def test_a_commit_without_its_pull_requests_is_its_own(self):
+        self.assertEqual(tool.own_messages(pr(5, messages=["x"])), ["x"])
+
+
 class FakeGitHub:
     """The REST and GraphQL endpoints forge-nightly reads and writes.
     `fail` names a (method, path start) that answers 500."""
