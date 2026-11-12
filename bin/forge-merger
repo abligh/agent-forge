@@ -529,7 +529,13 @@ alone, with the layers of its stack above it: `TRAIN-LEFT #n: pushed
 with STACK-UPDATE still to come, it is in flight. Nor is any head that
 is the boarded one brought up to date and nothing else (`own_push`:
 clean merges of what the default branch already has, whichever stack
-the tick acts on). A restacked layer stays a candidate meanwhile: its
+the tick acts on), nor one whose prediction is unchanged: predicted
+where the boarded head was, it gives the same tree (`same_prediction`:
+an author's merge of the default branch made any other way, with the
+default branch as the first parent, say), said as `TRAIN-KEPT #n:
+pushed <sha>, merges main only`; its prediction is the same commit, so
+the top's run still counts, and a train merged as one (`train_merge`)
+merges its new head. A restacked layer stays a candidate meanwhile: its
 build check's and gated instances' verdicts on the head before the
 restack still count (`on_main`). The rest keep their
 places, and the train's top, now a new tree, is run again. A pull
@@ -4269,6 +4275,36 @@ def own_push(repo, before, head, main_tip, run=sh, depth=OWN_PUSH_DEPTH):
     return head == before
 
 
+def same_prediction(repo, parent, graph, before, pr, restacks=None,
+                    run=sh, tree=None):
+    """The prediction of `pr`'s head on `parent` (through `graph`, as
+    `predict_one`), when its tree is the one the head it boarded with,
+    `before`, gives there, or None. `tree` is that tree when the train
+    up to `parent` is the one it was predicted in (its prediction, which
+    is what the train's top tested); without it, `before` is predicted
+    again, and None is returned when the checkout no longer has it.
+
+    A push whose prediction is unchanged changes nothing the train
+    tests: in effect it only merges the default branch, whoever made
+    the merge and however (the default branch as the first parent, a
+    merge past `own_push`'s depth, or a rebase onto it). Such a member
+    keeps its place in its train (designs/0047, amendment of
+    2026-11-12): taking it out cut every train behind it again and
+    threw their running builds away. Its prediction is the same commit
+    (the same tree on the same parent), so the train's top is too."""
+    entry, _ = predict_one(repo, parent, pr, restacks, run, graph)
+    if entry is None or not before:
+        return None
+    if tree is None:
+        if git(repo, "cat-file", "-e", before + "^{commit}",
+               run=run).returncode != 0:
+            return None
+        old, _ = predict_one(repo, parent, dict(pr, headRefOid=before),
+                             restacks, run, graph)
+        tree = (old or {}).get("tree")
+    return entry if tree is not None and entry["tree"] == tree else None
+
+
 def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
                   overdue=(), restacks=None):
     """The commits the first `depth` + 1 pull requests in `queue`
@@ -4558,13 +4594,19 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             prior = prior[:keep]
     entries, sizes, used, parent = [], [], set(), main_tip
     graph = None
+    # The commit each member was predicted on, last time: while the
+    # train up to it is the same, its prediction is still what a push
+    # that only merges the default branch must give.
+    was, before = {}, (last or {}).get("base")
+    for e in (e for t in prior for c in t for e in c):
+        was[e.get("pr")], before = before, e.get("sha")
     for k, train in enumerate(prior[:trains]):
         start = len(entries)
         for carriage in train:
             for e in carriage:
                 n = e.get("pr")
                 pr = by_number.get(n)
-                why = None
+                why, entry = None, None
                 if pr is None:
                     if n not in open_numbers:
                         continue
@@ -4583,8 +4625,19 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                                                (restacks or {}).get(n), run) \
                             and not own_push(repo, e.get("head"),
                                              pr["headRefOid"], main_tip, run):
-                        why = "pushed %s mid-train" % pr["headRefOid"][:10]
-                if why is None:
+                        entry = same_prediction(
+                            repo, parent, graph, e.get("head"), pr,
+                            restacks, run, e.get("tree")
+                            if was.get(n) == parent else None)
+                        if entry is None:
+                            why = "pushed %s mid-train" \
+                                % pr["headRefOid"][:10]
+                        else:
+                            events.append(("kept", "KEPT #%d: pushed %s, "
+                                           "merges %s only" % (
+                                               n, pr["headRefOid"][:10],
+                                               MAIN)))
+                if why is None and entry is None:
                     entry, failed = predict_one(repo, parent, pr, restacks,
                                                 run, graph)
                     if entry is None:
@@ -4776,7 +4829,8 @@ def dry_trains(state_dir, cut, main_tip, repo, record, out, when,
     record["trains_dry"] = True
     if events:
         record["train_events"] = [c for c, _ in events]
-    if record.get("recut") and not any(c != "cut" for c, _ in events):
+    if record.get("recut") and not any(c not in ("cut", "kept")
+                                       for c, _ in events):
         record["recut_avoided"] = True
     for cause, line in events:
         if cause != "cut":
@@ -5274,12 +5328,18 @@ def batch_holds(last, pr, tree, queue, check_state, tree_of=None):
             and tree_verdict(check_state, entries[-1]["tree"]) is True)
 
 
-def train_ready(last, queue, main_tip, check_state):
+def train_ready(last, queue, main_tip, check_state, repo=None, run=sh,
+                restacks=None):
     """merge.test_ahead.train_merge: the members of the batch in `last`
     (ahead.json) that can merge as one train now, or None: two or more,
     its top's tree green, predicted from `main_tip` itself (the default
     branch hasn't moved since), and each member still in `queue` at the
-    head it was predicted at."""
+    head it was predicted at. Given `repo`, a member whose head has
+    moved since is still ready when its new head, predicted where it
+    was, gives the same tree (`same_prediction`: it only merged the
+    default branch); its entry then names the new head, which the train
+    merges, so GitHub marks the pull request merged at the head it
+    has. The tree merged is still the one the top tested."""
     batch = (last or {}).get("batch") or {}
     entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
     if len(entries) < 2 or [e.get("tree") for e in entries] \
@@ -5287,10 +5347,26 @@ def train_ready(last, queue, main_tip, check_state):
             or tree_verdict(check_state, entries[-1].get("tree")) is not True:
         return None
     prs = {pr["number"]: pr for pr in queue}
-    if not all(prs.get(e.get("pr"), {}).get("headRefOid") == e.get("head")
-               for e in entries):
-        return None
-    return entries
+    ready, parent, graph = [], main_tip, None
+    for e in entries:
+        pr = prs.get(e.get("pr"))
+        if pr is None:
+            return None
+        if pr["headRefOid"] != e.get("head"):
+            if repo is None:
+                return None
+            moved = same_prediction(repo, parent, graph, e.get("head"), pr,
+                                    restacks, run, e.get("tree"))
+            if moved is None or moved["sha"] != e.get("sha"):
+                return None
+            e = dict(e, head=pr["headRefOid"])
+            if "graph" in moved:
+                e["graph"] = moved["graph"]
+            else:
+                e.pop("graph", None)
+        ready.append(e)
+        parent, graph = e.get("sha"), e.get("graph")
+    return ready
 
 
 def train_commits(repo, main_tip, entries, prs, run=sh):
@@ -6520,7 +6596,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     trained = None
     if TRAIN_MERGE and live and retarget is None and AHEAD_BATCH > 1:
         last_ahead = load_json(os.path.join(state_dir, AHEAD_FILE), {})
-        entries = train_ready(last_ahead, queue, main_tip, check_state)
+        entries = train_ready(last_ahead, queue, main_tip, check_state,
+                              repo, run, restacks if PREDICT_RESTACKED
+                              else None)
         if entries:
             merged, _ = train_merge(repo, state_dir, entries, queue,
                                     main_tip, check_state, github, run,

@@ -1114,6 +1114,39 @@ class TrainMerge(RepoCase):
         self.assertIsNone(m.train_ready(self.last, self.queue, self.tip,
                                         {"results": {}}))
 
+    def test_a_member_that_only_merged_main_is_still_ready(self):
+        # Its new head, with main as the first parent, gives the tree
+        # its prediction tested: the train merges that head, so GitHub
+        # marks it merged, and the tree it tested.
+        merged = run_git(self.repo.path, "commit-tree",
+                         self.other + "^{tree}", "-p", self.tip, "-p",
+                         self.other, "-m", "merge main")
+        moved = [self.queue[0], dict(self.queue[1], headRefOid=merged)]
+        self.assertIsNone(m.train_ready(self.last, moved, self.tip,
+                                        self.check))
+        ready = m.train_ready(self.last, moved, self.tip, self.check,
+                              self.repo.path)
+        self.assertEqual([e["head"] for e in ready],
+                         [self.approved, merged])
+        self.assertEqual([e["tree"] for e in ready],
+                         [e["tree"] for e in self.entries])
+        self.entries, self.queue = ready, moved
+        self.assertEqual(self.merge(), ([5, 6], []))
+        top = run_git(self.repo.origin, "rev-parse", "forge/train-5-6")
+        run_git(self.repo.path, "fetch", "-q", "origin", "forge/train-5-6")
+        self.assertEqual(subprocess.run(
+            ["git", "-C", self.repo.path, "merge-base", "--is-ancestor",
+             merged, top]).returncode, 0)
+        self.assertEqual(run_git(self.repo.path, "rev-parse",
+                                 top + "^{tree}"), self.entries[-1]["tree"])
+
+    def test_a_member_with_a_change_of_its_own_is_not_ready(self):
+        self.repo.branch("more", self.other)
+        more = self.repo.commit("g.txt", "changed\n", "more")
+        moved = [self.queue[0], dict(self.queue[1], headRefOid=more)]
+        self.assertIsNone(m.train_ready(self.last, moved, self.tip,
+                                        self.check, self.repo.path))
+
     def test_ready_only_while_every_member_is_at_its_predicted_head(self):
         moved = [self.queue[0], dict(self.queue[1], headRefOid="9" * 40)]
         self.assertIsNone(m.train_ready(self.last, moved, self.tip,
@@ -3289,6 +3322,62 @@ class PredictRestacked(unittest.TestCase):
         _, _, events = self.recut(seven, last, more)
         self.assertEqual(events[0], ("left", "LEFT #6: pushed %s mid-train"
                                      % more[:10]))
+
+    def main_first(self, head):
+        """A merge of `head` and main with main as its first parent, as
+        an author's `git checkout main && git merge` makes it: no
+        `own_push`, whose walk follows first parents."""
+        tree = run_git(self.repo.path, "merge-tree", "--write-tree",
+                       self.repo.main_tip(), head).split()[0]
+        return run_git(self.repo.path, "commit-tree", tree, "-p",
+                       self.repo.main_tip(), "-p", head, "-m", "merge")
+
+    def test_a_push_that_only_merges_main_keeps_its_place(self):
+        # 2026-11-12: a train member whose author merged main left its
+        # train as a push, and every train behind it was cut again.
+        seven, last = self.boarded()
+        merged = self.main_first(seven["headRefOid"])
+        self.assertFalse(m.own_push(self.repo.path, seven["headRefOid"],
+                                    merged, self.repo.main_tip()))
+        self.repo.publish_pr(7, merged)
+        upper = last["entries"][0]["head"]
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            [[pr(6, T1, head=upper)], [pr(7, T1, head=merged)]], last,
+            {6: upper, 7: merged}, {6, 7}, restacks=self.restacks)
+        self.assertEqual(events, [("kept", "KEPT #7: pushed %s, merges "
+                                   "main only" % merged[:10])])
+        self.assertEqual(m.train_lists(got, sizes), [[6, 7]])
+        # The same predictions, so the top's run still counts.
+        self.assertEqual([e["sha"] for e in got],
+                         [e["sha"] for e in last["entries"]])
+        self.assertEqual(got[1]["head"], merged)
+        # A change of the author's on top of it still leaves.
+        self.repo.branch("more7", merged)
+        more = self.repo.commit("g.txt", "changed\n", "more")
+        self.repo.publish_pr(7, more)
+        _, _, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            [[pr(6, T1, head=upper)], [pr(7, T1, head=more)]], last,
+            {6: upper, 7: more}, {6, 7}, restacks=self.restacks)
+        self.assertEqual(events[0], ("left", "LEFT #7: pushed %s mid-train"
+                                     % more[:10]))
+
+    def test_behind_one_that_left_the_boarded_head_is_predicted_again(self):
+        # The member ahead left, so the train up to it is new: its new
+        # head is compared with its old one predicted there.
+        seven, last = self.boarded()
+        self.repo.branch("push6", last["entries"][0]["head"])
+        pushed = self.repo.commit("o.txt", "o\n", "a push")
+        self.repo.publish_pr(6, pushed)
+        merged = self.main_first(seven["headRefOid"])
+        self.repo.publish_pr(7, merged)
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            [[pr(6, T1, head=pushed)], [pr(7, T1, head=merged)]], last,
+            {6: pushed, 7: merged}, {6, 7}, restacks=self.restacks)
+        self.assertEqual([c for c, _ in events][:2], ["left", "kept"])
+        self.assertIn(7, m.train_lists(got, sizes)[0])
 
     def test_a_restack_onto_a_main_that_changed_the_lower_lines(self):
         # 2026-11-12: main changed #5's line 2 again after its squash, so

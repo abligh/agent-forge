@@ -565,3 +565,28 @@ requests took about 45 minutes to land.
 **A general rule.** A tick does all the ready work it can, not one
 operation: an operation that is fast (a merge, a status, a retarget)
 shouldn't wait a tick for the next.
+
+## Amendment (2026-11-12): a push that only merges the default branch keeps its place
+
+**What happened.** A member whose author merged the default branch in
+a way `own_push` doesn't follow still left its train as a push: with
+the default branch as the merge's first parent, for one, or past
+`own_push`'s depth. Its train's top was cut again, and so was every
+train behind it, with their running builds.
+
+**The rule.** A member whose new head isn't the Merger's own is
+predicted again where it was. When that gives the tree its prediction
+had (the one the top tested, while the train up to it is unchanged;
+otherwise the tree its boarded head gives there), it changed nothing
+the train tests, and it keeps its place: `TRAIN-KEPT #n: pushed <sha>,
+merges main only`. Its prediction is the same commit, the same tree on
+the same parent, so the top and its run are unchanged. Anything else
+still leaves as before, and a member out of the queue (its new head not
+covered by its approval, say) still leaves too.
+
+**With `train_merge`.** GitHub marks a pull request merged when its
+current head is in the default branch's history. The train's chain of
+merge commits has each member's head as a parent, so the Merger
+re-checks a member whose head moved since the train was predicted,
+by the same rule, and gives the chain its new head. The tree each
+commit carries is still the one its prediction tested.
