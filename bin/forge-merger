@@ -963,6 +963,15 @@ NIGHTLY_FIXES = frozenset()
 # default branch is red (designs/0011, amendment), taken as urgent and
 # put first; read from its state.json by `main`.
 MAIN_RED_FIXES = frozenset()
+# checks.instances.<name>.main_red_issue (agent-forge #154): each
+# instance's (title regex, labels, poster login), for its own open
+# issue saying the default branch is red for its context.
+INSTANCE_RED = ()
+INSTANCE_RED_TITLE = "The default branch is red for {context} at {sha}"
+INSTANCE_RED_QUERY = (
+    "query($owner:String!,$name:String!,$labels:[String!]){"
+    "repository(owner:$owner,name:$name){issues(states:OPEN,first:50,"
+    "labels:$labels){nodes{number title author{login}}}}}")
 STALL_ALERT_NAME = "stall-alert.json"
 # `merge.test_ahead`: whether the next pull requests' commits are
 # predicted for the build check to test ahead, and how many behind the
@@ -1297,6 +1306,8 @@ def configure(project):
         for _name, context, poster, scope
         in config.gated_instances(project.data))
     BUILD_HOST = project.host
+    global INSTANCE_RED
+    INSTANCE_RED = tuple(instance_red_rules(project))
     GATE = tuple(tuple(argv) for argv in merge.get("gate", DEFAULT_GATE))
     OWN_HEAD_GREEN = merge.get("own_head_green", True)
     CI_WORKFLOW = merge.get("ci_workflow", "ci")
@@ -3344,8 +3355,13 @@ def parse_time(stamp):
 def load_router():
     """bin/forge-router as a module, loaded when needed: it loads this
     file itself, so it can't be imported at the top."""
+    return load_tool("forge-router")
+
+
+def load_tool(name):
+    """bin/<name> as a module."""
     loader = importlib.machinery.SourceFileLoader(
-        "forge_router", os.path.join(BIN, "forge-router"))
+        name.replace("-", "_"), os.path.join(BIN, name))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -5629,6 +5645,71 @@ def main_red_fixes(check_state):
         if isinstance(fixes, list) else frozenset()
 
 
+def instance_red_rules(project):
+    """(title regex, labels, poster login) for each build-check instance
+    that files its own main-red issue (checks.instances.<name>.
+    main_red_issue), as forge-pr-check titles and posts it."""
+    instances = project.section("checks").get("instances") or {}
+    for name in sorted(instances):
+        block, _host = config.instance_checks(project.data, name)
+        issue = block.get("main_red_issue")
+        if not isinstance(issue, dict):
+            continue
+        context = block.get("context", DEFAULT_CONTEXT)
+        title = re.escape(issue.get("title", INSTANCE_RED_TITLE)) \
+            .replace(re.escape("{sha}"), "[0-9a-f]+") \
+            .replace(re.escape("{context}"), re.escape(context))
+        labels = list(issue.get("labels", [])) + (
+            [issue["label"]] if issue.get("label") else [])
+        poster = block.get("poster", project.section("merge").get(
+            "merger", "Merger"))
+        yield (re.compile("^%s$" % title), tuple(labels),
+               project.bot_login(poster))
+
+
+def instance_red_issues(github, rules=None):
+    """The numbers of the open issues an instance's check filed saying
+    the default branch is red for its context (agent-forge #154): its
+    labels, its title, by its poster. Empty when none is configured, or
+    GitHub can't be read: then they only don't go first."""
+    rules = INSTANCE_RED if rules is None else rules
+    owner, name = REPO_SLUG.split("/")
+    found = set()
+    for title, labels, poster in rules:
+        args = ["graphql", "-f", "query=" + INSTANCE_RED_QUERY,
+                "-F", "owner=" + owner, "-F", "name=" + name]
+        for label in labels:
+            args += ["-f", "labels[]=" + label]
+        try:
+            nodes = github.api(*args)["data"]["repository"]["issues"]["nodes"]
+        except (RuntimeError, KeyError, TypeError, ValueError):
+            continue
+        login = (poster or "").replace("[bot]", "").lower()
+        for node in nodes or ():
+            if title.match(node.get("title") or "") and (
+                    (node.get("author") or {}).get("login", "")
+                    .replace("[bot]", "").lower() == login):
+                found.add(node["number"])
+    return found
+
+
+def red_fixes_of(prs, issues):
+    """The pull requests among `prs` whose title or body (outside code)
+    closes one of `issues`, as forge-pr-check's red_fixes reads them."""
+    if not issues:
+        return frozenset()
+    keywords = load_tool("forge-closing-keywords")
+    pattern = keywords.closing_re(REPO_SLUG)
+    fixes = set()
+    for pr in prs:
+        text = keywords.blank_code("%s\n%s" % (pr.get("title") or "",
+                                               pr.get("body") or ""))
+        named = {int(next(g for g in m if g)) for m in pattern.findall(text)}
+        if named & set(issues):
+            fixes.add(pr["number"])
+    return frozenset(fixes)
+
+
 def base_red_only(check_state, records, base):
     """The steps, sorted, when every one of the red verdicts `records`
     failed only steps that the default branch's own run of `base` failed
@@ -6978,6 +7059,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                    run=run).stdout.strip()
     prs = fetch_prs(github)
     open_numbers = {pr["number"] for pr in prs} | fetch_open_issues(github)
+    if INSTANCE_RED:
+        # An instance's red default branch: its fixes go first too.
+        global MAIN_RED_FIXES
+        MAIN_RED_FIXES = MAIN_RED_FIXES | red_fixes_of(
+            prs, instance_red_issues(github))
     candidates, approvals, held, spoken = [], {}, {}, []
     when = now()
     heads = {pr["headRefName"]: pr["number"] for pr in prs

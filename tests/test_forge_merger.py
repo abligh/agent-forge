@@ -10121,3 +10121,65 @@ class OwnGreenWaitAfterUpdates(RepoCase):
         self.head = self.repo.commit("f.txt", "more\n", "more")
         self.assertIsNotNone(self.wait({self.approved: [], self.head: [],
                                         self.first: [status()]}))
+
+
+class InstanceMainRed(unittest.TestCase):
+    """agent-forge #154: an instance's own main-red issue puts the pull
+    requests that close it first, as the main context's does."""
+
+    def setUp(self):
+        data = example()
+        data["merge"] = {"gate": GATE, "own_head_green": False,
+                         "test_ahead": False}
+        data["checks"] = dict(data.get("checks", {}), instances={
+            "mac": {"context": "vm/mac", "poster": "Helper",
+                    "main_red_issue": {"labels": ["bug"]}},
+            "quiet": {"context": "vm/quiet"}})
+        self.project = config.Project(data, None)
+        m.configure(self.project)
+        self.addCleanup(m.configure, project())
+        self.addCleanup(setattr, m, "MAIN_RED_FIXES", frozenset())
+
+    def github(self, nodes):
+        github = mock.Mock()
+        github.api.return_value = {"data": {"repository": {"issues": {
+            "nodes": nodes}}}}
+        return github
+
+    def test_only_an_instance_with_an_issue_has_a_rule(self):
+        (title, labels, poster), = m.INSTANCE_RED
+        self.assertEqual(labels, ("bug",))
+        self.assertEqual(poster, self.project.bot_login("Helper"))
+        self.assertTrue(title.match(
+            "The default branch is red for vm/mac at 0123abcdef"))
+        self.assertFalse(title.match(
+            "The default branch is red for vm/quiet at 0123abcdef"))
+        self.assertFalse(title.match(
+            "The default branch is red for vm/mac at 0123abcdef!"))
+
+    def test_the_issues_are_the_posters_with_the_title(self):
+        login = self.project.slug("Helper")
+        github = self.github([
+            {"number": 7, "title": "The default branch is red for vm/mac "
+             "at 0123abcdef", "author": {"login": login}},
+            {"number": 8, "title": "The default branch is red for vm/mac "
+             "at 0123abcdef", "author": {"login": "someoneelse"}},
+            {"number": 9, "title": "Something else",
+             "author": {"login": login}}])
+        self.assertEqual(m.instance_red_issues(github), {7})
+        args = github.api.call_args[0]
+        self.assertIn("labels[]=bug", args)
+        self.assertIn("owner=example", args)
+
+    def test_github_unread_means_none(self):
+        github = mock.Mock()
+        github.api.side_effect = RuntimeError("down")
+        self.assertEqual(m.instance_red_issues(github), set())
+
+    def test_a_pr_that_closes_it_outside_code_is_a_fix(self):
+        prs = [{"number": 1, "title": "Fix the Mac", "body": "Fixes #7"},
+               {"number": 2, "title": "x", "body": "`Fixes #7`"},
+               {"number": 3, "title": "Closes #7", "body": None},
+               {"number": 4, "title": "y", "body": "Fixes #70"}]
+        self.assertEqual(m.red_fixes_of(prs, {7}), frozenset({1, 3}))
+        self.assertEqual(m.red_fixes_of(prs, set()), frozenset())
