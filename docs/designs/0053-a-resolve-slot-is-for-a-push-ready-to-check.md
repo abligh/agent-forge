@@ -1,7 +1,8 @@
 # 0053: A resolve slot is for a push ready to check
 
 * Status: approved (Alex, 2026-11-13), with one change: a resolution
-  may merge a train's head as well as the default branch (§1, §2)
+  merges the default branch or, better, the head the Merger suggests
+  (§1, §2)
 * Author: XMPPEngineer
 * Date: 2026-11-13
 
@@ -23,8 +24,8 @@ check host. This design moves the slot to the scarce thing:
   in a queue until a slot is free, and the slot then covers its check,
   its re-review and its boarding.
 
-Resolving is cheap: a merge of the default branch, or of a head
-already in a train, into the branch, without the full test. The test is the expensive part, and the slot is
+Resolving is cheap: a merge of the default branch, or of the head
+the Merger suggests, into the branch, without the full test. The test is the expensive part, and the slot is
 what pays for it.
 
 ## Evidence
@@ -59,22 +60,24 @@ held untold. The hand-back says that a slot is needed for the
 resolution's check, and that a merge, not a full local test run, is
 all the author needs to do before pushing.
 
-**What to merge.** The hand-back lists the viable heads, and so does
-`next.json` as `resolve_bases`: the default branch's tip, and the head
-of each train now being checked or about to merge (a train's own pull
-request, top first). Trains merge far more often than not, so a
-resolution on a train's head builds on what is about to be the
-default branch and is less likely to conflict again. Each listed head
-is one the author can fetch: a train's pull request branch.
+**What to merge.** The hand-back says: merge the default branch, or
+better, the head the Merger suggests. `next.json` carries the same
+suggestion as `resolve_base`. Which head to suggest is the Merger's
+choice, and it can change without a new design, so it can be tuned
+while it runs. The first rule is the top of the train most likely to
+merge next, when there is one, since trains merge far more often than
+not and a resolution on what is about to be the default branch is less
+likely to conflict again. A suggested head is always one the author
+can fetch, a train's pull request branch.
 
 ### 2. A resolution's push queues for a slot
 
 A **resolution** is a new head of a pull request that was handed back
 for a conflict with the default branch and that now merges cleanly
-with it, or that has one of the listed train heads as an ancestor and
-merges cleanly with that train's head. One on a train is stacked on
-it: it boards only after that train merges, and if the train fails
-and is cut, it is handed back again at once with the new list. The
+with it, or that has a head the Merger suggested as an ancestor and
+merges cleanly with that head. One on a train is stacked on it: it
+boards only after that train merges, and if the train fails and is
+cut, it is handed back again at once with a new suggestion. The
 Merger keeps the resolutions in its record:
 
 * `resolve_slots` of them hold a slot, given in `resolve_slot_order`
@@ -157,7 +160,7 @@ pull request had.
 
 ## Implementation plan
 
-1. forge-merger: tell at once with the viable heads (`resolve_bases`),
+1. forge-merger: tell at once with the suggested head (`resolve_base`),
    track resolutions, a resolution on a train boarding after it,
    `resolve_queue`, slot freeing.
 2. forge-pr-check: read the slotted and queued resolutions from
