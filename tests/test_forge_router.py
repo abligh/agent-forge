@@ -230,6 +230,19 @@ class PullRequestRules(unittest.TestCase):
         rules.MANUAL = False
         self.assertNotEqual(decide_pr(pr_node())["rule"], 23)
 
+    # Rule 6 with merge.approval green.
+    def test_6_with_green_approval_a_green_pr_is_the_mergers(self):
+        self.addCleanup(setattr, rules, "GREEN_APPROVES", False)
+        rules.GREEN_APPROVES = True
+        self.assertNobody(decide_pr(pr_node(author=REVIEWER)), 6)
+        # Red is still its author's.
+        self.assertTurn(decide_pr(pr_node(
+            author=REVIEWER, statuses=[status("FAILURE")])), "Reviewer", 4)
+        # The owner's remark after the push holds it: the author's.
+        d = decide_pr(pr_node(author=REVIEWER,
+                              comments=[comment(OWNER, T3)]))
+        self.assertNotEqual(d["rule"], 6)
+
     # Rule 2.
     def test_2_a_plain_hand_back_is_the_authors(self):
         body = "Not merging 5b257c8: it conflicts.\n\n— Merger"
@@ -401,8 +414,14 @@ class PullRequestRules(unittest.TestCase):
         self.assertTurn(d, "Reviewer", 8)
 
     # Rule 7.
-    def test_7_reviewers_own_green_pull_request_is_nobodys(self):
-        self.assertNobody(decide_pr(pr_node(author=REVIEWER)), 7)
+    def test_7_reviewers_own_green_pull_request_is_hers(self):
+        # agent-forge #374: with no second reviewer, it is the author's
+        # to merge, close, or ask about; a surface sat for days.
+        d = decide_pr(pr_node(author=REVIEWER))
+        self.assertTurn(d, "Reviewer", 7, T1)
+        self.assertEqual(d["line"], "#41 is green at 5b257c8, and nobody but "
+                         "you can review it: merge it, close it, or ask "
+                         "the owner")
 
     # Rule 8.
     def test_8_green_and_unreviewed_is_reviewers(self):
@@ -962,10 +981,11 @@ class Wakes(StateCase):
             [(5, OWNER, "withheld: not an agent")])
         self.assertTrue(self.state()["items"]["5"]["withheld"])
 
-    def test_rule_7_is_printed_even_when_sending(self):
+    def test_rule_7_wakes_the_author(self):
         self.run_router([pr_node(9, author=REVIEWER)])
-        self.assertIn("#9 nobody's (rule 7: green, and Reviewer's own: "
-                      "no second reviewer)", self.lines)
+        self.assertEqual([p[0] for p in self.posts], ["WidgetReviewer"])
+        self.assertIn("#9 is green at 5b257c8, and nobody but you can "
+                      "review it", self.posts[0][1])
 
     def test_a_turn_that_ends_is_forgotten(self):
         self.run_router([pr_node(41)])
@@ -1605,8 +1625,9 @@ class Escalate(StateCase):
         self.addCleanup(setattr, roster, "stand_in", roster.stand_in)
         roster.stand_in = lambda name: "LeadDev" if name == "Reviewer" \
             else name
+        prs = [pr_node(41, author=REVIEWER, statuses=[status("FAILURE")])]
         for minutes in (0, 61):
-            self.tick([pr_node(41)], minutes, refuse="404 unknown-name")
+            self.tick(prs, minutes, refuse="404 unknown-name")
         self.assertEqual(self.made(), [])
 
     def test_an_unreachable_relay_is_one_issue_not_one_per_agent(self):

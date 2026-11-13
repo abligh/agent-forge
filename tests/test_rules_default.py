@@ -49,7 +49,7 @@ class Interface(unittest.TestCase):
             router.Decision(23, None, 9, None, None,
                             suppressed="Status:waiting-external")])
 
-    def test_rule_7_is_a_surface(self):
+    def test_rule_7_is_the_authors_turn(self):
         head = "5b257c8" + "0" * 33
         pr = {"__typename": "PullRequest", "number": 9, "isDraft": False,
               "headRefOid": head, "author": {"login": "reviewerwidgetagent"},
@@ -64,8 +64,9 @@ class Interface(unittest.TestCase):
             "LeadDev": {}, "Reviewer": {"kind": "reviewer"}}), None)
         ctx = router.Context(rules.Roster(one), NOW, [pr], [])
         self.assertEqual(rules.decide(pr, ctx), [router.Decision(
-            9, None, 7, None, None, kind="surface",
-            suppressed="green, and Reviewer's own: no second reviewer")])
+            9, "Reviewer", 7, T1,
+            "#9 is green at 5b257c8, and nobody but you can review it: "
+            "merge it, close it, or ask the owner")])
 
     def test_no_sweep_and_recheck_decides_again(self):
         self.assertEqual(rules.sweep(context()), [])

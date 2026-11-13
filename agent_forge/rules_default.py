@@ -73,10 +73,12 @@ Then:
    not"; held, nobody's. Rules 6 to 8 don't apply then;
 6. no request for changes stands, a reviewer's newest review is
    `APPROVED`, covers the head, and nothing has been said after it (by
-   `forge-merger`'s own test): nobody's, it is the Merger's;
-7. green and authored by the only reviewer: nobody's, and surfaced
-   (printed on every run, sending or not: it is a problem in the
-   configuration, not anyone's turn);
+   `forge-merger`'s own test): nobody's, it is the Merger's (with
+   `merge.approval` "green": no request for changes
+   stands and nothing has been said since the head's commit);
+7. green, and no reviewer but its author exists: the author's, "merge
+   it, close it, or ask the owner" (agent-forge #374; it was a surface,
+   and such pull requests sat for days);
 8. green, and a request for changes stands that the author has
    answered: the reviewer's who asked, to review again (nobody's when
    the owner asked). Or green, a reviewer's newest review is an
@@ -377,6 +379,7 @@ DEFAULT_FALLBACK_HOURS = 2
 NIGHTLY_WAKE = None
 # merge.mode manual (agent-forge #274): rule 23.
 MANUAL = False
+GREEN_APPROVES = False
 # `router.issue_blocked_by`: "body" (the default), or "agents": an
 # issue's `Blocked-by:` lines may be in a comment by the owner or an
 # agent (`issue_blocker_state`).
@@ -443,8 +446,10 @@ def configure(project, merger_tool):
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
     global UNREVIEWED, QUIET_LABELS, IN_PROGRESS, RED_FIRST, PROJECT
     global NIGHTLY_WAKE, ISSUE_BLOCKED_BY, BLOCKER_WRITERS, MANUAL
+    global GREEN_APPROVES
     merger = merger_tool
     MANUAL = project.section("merge").get("mode") == "manual"
+    GREEN_APPROVES = project.section("merge").get("approval") == "green"
     PROJECT = project
     labels = project.section("labels")
     MERGER = merger.ACT_AS
@@ -828,18 +833,26 @@ def route_pr(pr, roster, when=None):
         return turn(n, author, 23, status.get("createdAt") or head,
                     "is green at %s: check it with forge-merger --ready %d, "
                     "then merge it, or say why not" % (head[:7], n))
-    # Rule 6.
+    # Rule 6. With merge.approval "green" (2026-11-13), the head
+    # approves itself, so a green one nothing holds is the Merger's.
+    if GREEN_APPROVES and not standing and not merger.said_since(
+            dict(pr, reviews=reviews, comments=comments),
+            merger.green_approval(pr)):
+        return nobody(n, 6, "the Merger's: green, and green is approval")
     if (not standing and newest is not None
             and newest.get("state") == "APPROVED"
             and covers_head(newest, pr)
             and not merger.said_since(dict(pr, reviews=reviews,
                                            comments=comments), newest)):
         return nobody(n, 6, "the Merger's: approved, nothing said since")
-    # Rule 7.
+    # Rule 7 (agent-forge #374). When no reviewer but its author
+    # exists, a green pull request is the author's: nobody else will
+    # ever pick it up, and a surface sat for days.
     reviewer = roster.reviewer_for(pr)
     if reviewer is None:
-        return nobody(n, 7, "green, and %s's own: no second reviewer"
-                      % author, kind="surface")
+        return turn(n, author, 7, status.get("createdAt") or head,
+                    "is green at %s, and nobody but you can review it: "
+                    "merge it, close it, or ask the owner" % head[:7])
     # Rule 8. A standing request the author has answered (a comment, or
     # a commit that isn't a merge) is its reviewer's to review again.
     if standing:
@@ -1073,7 +1086,7 @@ def owner_answered(n, issue, owner, comments, roster, rule):
 
 def as_decision(d):
     """A `turn` or `nobody` dict as the engine's Decision: nobody's
-    reason goes in `suppressed`, and rule 7 is a surface."""
+    reason goes in `suppressed`, with its kind (a surface, say)."""
     if d["who"] is None:
         return Decision(d["item"], None, d["rule"], None, None,
                         kind=d["kind"], suppressed=d["why"])

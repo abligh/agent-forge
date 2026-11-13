@@ -604,8 +604,10 @@ the members below it are kept with that top (ahead.json's `left_top`;
 tree held each of theirs as the new train does, and a prediction's run
 is never stopped, so once it is green they merge as one train
 (`TRAIN-UNDER-LEFT #a..#b`) without waiting for the new top's run. A
-pull request that is urgent or fixes a red default branch and is in no train
-cuts every train after the first again, and the default branch moving to
+pull request that fixes a red default branch and is in no train cuts
+every train after the first again (one labelled urgent heads the next
+train cut, behind those already cut, 2026-11-13), and the default
+branch moving to
 a tree no train predicted cuts them all (`TRAIN-RECUT: ...`). A red
 top's members are the suspects, as a red batch's, a stack's layers held
 as stacked among them, each where its train had it (`with_suspects`).
@@ -1264,6 +1266,10 @@ GATED = ()
 # head. A head the Merger's own merge of the default branch made is
 # judged by the approved commit, as `covers_head` judges the approval.
 OWN_HEAD_GREEN = True
+# merge.approval (2026-11-13): "reviewer", the default, needs a
+# reviewer agent's approval; "green", for a project with no second
+# reviewer, takes the head's own green check as the approval.
+APPROVAL = "reviewer"
 GREEN_WAIT_REASON = ("%s is %s on %s, and no approved commit is green; "
                      "waits for the build check to pass")
 # How far back through merges of the default branch an instance's
@@ -1339,7 +1345,7 @@ def configure(project):
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
     global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR, LAYERS_OWN_GREEN
     global LEFT_TOP_COVERS
-    global OWN_GREEN_TO_BOARD
+    global OWN_GREEN_TO_BOARD, APPROVAL
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -1361,6 +1367,7 @@ def configure(project):
     INSTANCE_RED = tuple(instance_red_rules(project))
     GATE = tuple(tuple(argv) for argv in merge.get("gate", DEFAULT_GATE))
     OWN_HEAD_GREEN = merge.get("own_head_green", True)
+    APPROVAL = merge.get("approval", "reviewer")
     CI_WORKFLOW = merge.get("ci_workflow", "ci")
     STALL_AFTER = datetime.timedelta(minutes=merge.get("stall_minutes", 30))
     alert = merge.get("stall_alert")
@@ -1480,6 +1487,7 @@ query($owner:String!, $name:String!, $cursor:String) {
         number title createdAt lastEditedAt isDraft baseRefName headRefName
         headRefOid body
         author { login }
+        commits(last:1) { nodes { commit { committedDate } } }
         labels(first:50) { nodes { name } }
         reviews(last:100) {
           nodes { databaseId author { login } authorCanPushToRepository
@@ -1526,7 +1534,12 @@ def markers_of(text):
 def approval_of(pr, approvers=None):
     """The newest `APPROVED` review by an APPROVERS App (or one of the
     logins `approvers` names) that is not the pull request's author, or
-    None."""
+    None. With `merge.approval` "green", the head approves itself: an
+    approval of the head, dated by its commit, so anything said after
+    the push holds it as an approval's remarks would, and the build
+    check's green (`own_head_green`) is what lets it merge."""
+    if approvers is None and APPROVAL == "green":
+        return green_approval(pr)
     approvers = APPROVERS if approvers is None else approvers
     best = None
     for review in pr["reviews"]:
@@ -1536,6 +1549,19 @@ def approval_of(pr, approvers=None):
             if best is None or review["submittedAt"] > best["submittedAt"]:
                 best = review
     return best
+
+
+def green_approval(pr):
+    """The approval `merge.approval` "green" gives `pr`'s head."""
+    when = None
+    for key in ("headCommit", "commits"):
+        nodes = (pr.get(key) or {}).get("nodes") or [{}]
+        when = when or ((nodes[-1] or {}).get("commit") or {}).get(
+            "committedDate")
+    return {"state": "APPROVED", "author": {"login": ""}, "body": "",
+            "databaseId": None,
+            "submittedAt": when or pr.get("createdAt") or "",
+            "commit": {"oid": pr.get("headRefOid")}, "green": True}
 
 
 def changes_requested(pr, changers=None):
@@ -1767,6 +1793,14 @@ def labelled_urgent(pr):
     return bool(URGENT_LABEL) and URGENT_LABEL in [
         (n or {}).get("name") for n in
         ((pr.get("labels") or {}).get("nodes") or [])]
+
+
+def cuts_trains(pr):
+    """Whether `pr` may cut trains already cut: a red nightly's or
+    default branch's fix. One labelled urgent may not: it heads the next
+    train cut, behind those already cut (Alex, 2026-11-13); only a
+    bypass merge goes in front of them."""
+    return pr.get("number") in NIGHTLY_FIXES | MAIN_RED_FIXES
 
 
 def labelled_keep(pr):
@@ -5381,8 +5415,9 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                            "again" % (MAIN, main_tip[:10])))
             prior = []
     first = carriages[0][0] if carriages and carriages[0] else None
-    if prior and first is not None and urgent(first) and first["number"] \
-            not in {e.get("pr") for c in prior[0] for e in c}:
+    if prior and first is not None and cuts_trains(first) and \
+            first["number"] not in {e.get("pr") for c in prior[0]
+                                    for e in c}:
         # The queue put it in front of the first train (a red default
         # branch's fix, say, while that train isn't merging yet): the
         # Merger acts on it first, so every train is cut again.
@@ -5390,7 +5425,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                        "train; every train is cut again" % first["number"]))
         prior = []
     in_prior = {e.get("pr") for t in prior for c in t for e in c}
-    hot = sorted(n for n, pr in by_number.items() if urgent(pr))
+    hot = sorted(n for n, pr in by_number.items() if cuts_trains(pr))
     had = set((last or {}).get("urgent_cut") or ()) if prior else set()
     jump = [n for n in hot if n not in in_prior and n not in had]
     if note is not None:
@@ -8068,14 +8103,15 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             decision = {"action": "WAIT", "pr": pr["number"],
                         "head": pr["headRefOid"], "reason": suspected}
         # Merged on its own, one outside the first train would move the
-        # default branch under that train's started run. An urgent one,
-        # or one the trains are kept through (labels.keep_trains), goes
-        # all the same.
+        # default branch under that train's started run. A red default
+        # branch's or nightly's fix, or one the trains are kept through
+        # (labels.keep_trains), goes all the same; one labelled urgent
+        # waits for its train like any other (2026-11-13).
         ahead_of = train_in_the_way(
             last_ahead if last_ahead is not None else load_json(
                 os.path.join(state_dir, AHEAD_FILE), {}), pr, check_state) \
             if decision["action"] == "MERGE" and TRAINS == "live" \
-            and not train_failed and not urgent(pr) \
+            and not train_failed and not cuts_trains(pr) \
             and not labelled_keep(pr) else None
         if ahead_of:
             decision = {"action": "WAIT", "pr": pr["number"],
