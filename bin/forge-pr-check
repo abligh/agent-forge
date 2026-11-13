@@ -460,7 +460,8 @@ maps an environment variable to a directory name, such as
 `{"CARGO_TARGET_DIR": "cargo-target"}`: each slot gets its own such
 directory in the state directory, outside the worktree, so a head isn't
 built from nothing each time. A variable the host already sets wins.
-A step is stopped after `checks.step_timeout_minutes` (default 30).
+A step is stopped after `checks.step_timeout_minutes` (default 30), or
+its own `timeout_minutes`.
 A step's `env_file`, a mode-0600 file of the check user's on the host,
 adds its `KEY=VALUE` lines to that step's environment: secrets the
 check can't take from CI. A file others can reach, or that can't be
@@ -847,6 +848,9 @@ CACHE_CEILING = 1.5
 SIZE_UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 DEFAULT_STEP_TIMEOUT_S = 30 * 60
 STEP_TIMEOUT_S = DEFAULT_STEP_TIMEOUT_S
+# checks.steps[].timeout_minutes, in seconds, by step name (agent-forge:
+# a step whose wall time follows the host's load may need longer).
+STEP_TIMEOUTS = {}
 # Each step's memory limit, in systemd's syntax; FORGE_PR_CHECK_MEMORY_MAX
 # overrides it, and "off" runs the steps without one.
 DEFAULT_MEMORY_MAX = "16G"
@@ -1124,6 +1128,7 @@ def configure(project, instance=None):
     the context the Merger requires."""
     global REPO_SLUG, MAIN, CONFIG_PATH, STATUS_CONTEXT, POSTER, HOST
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
+    global STEP_TIMEOUTS
     global CPU_WEIGHT, CPU_SHARE, SIDE_BY_SIDE, AFTER, ALONE, LIGHT
     global MERGER_CPU_WEIGHT, DOCKER_SLICES, CPU_QUOTA
     global STEP_CACHES, ENV_FILES
@@ -1160,6 +1165,9 @@ def configure(project, instance=None):
                        if s.get("always"))
     VERSIONS = {s["name"]: list(s["version"])
                 for s in checks.get("steps", []) if s.get("version")}
+    STEP_TIMEOUTS = {s["name"]: 60 * s["timeout_minutes"]
+                     for s in checks.get("steps", [])
+                     if s.get("timeout_minutes")}
     # Steps that say they never read CHECK_BASE: their digests leave the
     # base out, so they can be reused across the default branch moving.
     NO_BASE = frozenset(s["name"] for s in checks.get("steps", [])
@@ -5142,7 +5150,7 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
             return {"name": name, "rc": 1, "seconds": 0, "wall": 0.0,
                     "tail": "not run: " + refused[name]}
         started = time.monotonic()
-        timeout, budget = STEP_TIMEOUT_S, False
+        timeout, budget = STEP_TIMEOUTS.get(name, STEP_TIMEOUT_S), False
         if deadline is not None:
             left = deadline - started
             if left <= 0:
