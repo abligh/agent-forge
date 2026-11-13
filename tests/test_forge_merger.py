@@ -10452,3 +10452,13 @@ class TrainAheadStall(unittest.TestCase):
 
     def test_no_run_start_known_is_timed_as_before(self):
         self.assertEqual(self.stalled(30, None), 30)
+
+
+class Unblockers(unittest.TestCase):
+    """designs/0052: next.json's `unblocks`."""
+
+    def test_what_held_ones_wait_on(self):
+        self.assertEqual(m.unblockers({
+            "5": "Blocked-by: #9 is open", "6": "stacked on #7",
+            "8": "waits for code owner @x: y"}), [7, 9])
+

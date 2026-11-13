@@ -223,6 +223,21 @@ is never overdue, and the default branch's traced run still goes first
 when due or urgent. Without it, a queue kept busy by the Merger's head
 and predictions could leave an ordinary head waiting for hours.
 
+**A pull request keeps its place** (designs/0052 §1): a head's age,
+for `max_wait_minutes` and for oldest-first, counts from when the pull
+request's first head started waiting, kept in the state's `pr_since`
+by `keep_pr_places`, so a rebase or a red run doesn't send it to the
+back. A pull request's place is forgotten when it closes, or once no
+head of it has waited for PR_PLACE_KEPT.
+
+**With `checks.order: "merge"`, what can merge first goes first**
+(designs/0052 §2): among the heads no rule above puts first, overdue
+ones too, a head of a pull request an approved one is held for (the
+Merger's `next.json` `unblocks`, read by `merger_unblocks`) goes
+first, then the others oldest first, and those the Merger holds
+(`blocked`) last; the `STARTED` line ends `, first: approved pull
+requests wait on it`. The default, `"age"`, is oldest first alone.
+
 **With `checks.merger_first` on, the Merger's pull request goes first**
 (default off). The Merger writes `next.json` in its state directory
 each tick, naming the pull request it is waiting on (`--merger-dir`,
@@ -952,6 +967,12 @@ MAIN_RED_FIXES = frozenset()
 # agent has approved goes first, and those reviewers' bot logins, lower
 # case. APPROVED_PRS is this tick's answer, from `approved_prs`.
 APPROVED_FIRST = False
+# checks.order (designs/0052): "merge" starts what the Merger's held
+# pull requests wait on first among unapproved heads, and held ones last.
+ORDER = "age"
+# designs/0052 §1: how long a pull request keeps its place in the queue
+# after its last head stopped waiting.
+PR_PLACE_KEPT = datetime.timedelta(hours=24)
 REVIEWER_LOGINS = frozenset()
 APPROVED_PRS = frozenset()
 # labels.armed: a label a reviewer agent puts on a pull request it has
@@ -1145,7 +1166,7 @@ def configure(project, instance=None):
     global OTHER_CONTEXTS
     global CACHE_FAULT_TEXT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
-    global PULL_REQUESTS, HOST_LOCK, APPROVED_FIRST, REVIEWER_LOGINS
+    global PULL_REQUESTS, HOST_LOCK, APPROVED_FIRST, REVIEWER_LOGINS, ORDER
     global ARMED_LABEL
     global SCOPED, SCOPED_S
     INSTANCE = instance
@@ -1220,6 +1241,7 @@ def configure(project, instance=None):
     MAX_WAIT = datetime.timedelta(minutes=checks["max_wait_minutes"]) \
         if "max_wait_minutes" in checks else None
     APPROVED_FIRST = checks.get("approved_first", False) is True
+    ORDER = checks.get("order", "age")
     REVIEWER_LOGINS = frozenset(project.bot_login(name).lower()
                                 for name in project.reviewers())
     URGENT_LABEL = project.section("labels").get("urgent")
@@ -2021,11 +2043,46 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
         entry = state["waiting"][sha]
         if entry["pr"] in replaced and replaced[entry["pr"]] < entry["since"]:
             entry["since"] = replaced[entry["pr"]]
+    keep_pr_places(state, {h[0] for h in heads}, new, when)
     # A head waits unseen otherwise: pending is posted only when its
     # steps start, and a busy host can keep it waiting half an hour.
     if post is not None:
         for sha in new:
             post(sha, "pending", queued_description(state, sha, when))
+
+
+def keep_pr_places(state, open_prs, new, when):
+    """designs/0052 §1: a pull request keeps its place across heads. The
+    state's `pr_since` holds, per pull request, when any head of it first
+    waited (`since`) and when one last did (`last`). A new head takes its
+    pull request's `since` when that is older, so a rebase after a run,
+    which the head-to-head rule above can't see, keeps its place too. A
+    pull request is forgotten once closed, or PR_PLACE_KEPT after a head
+    of it last waited."""
+    places = state.setdefault("pr_since", {})
+    for sha, entry in state["waiting"].items():
+        if entry.get("main"):
+            continue
+        key = str(entry.get("pr"))
+        place = places.get(key)
+        if not isinstance(place, dict) or not kept_place(place, when):
+            place = places[key] = {"since": entry["since"]}
+        if sha in new and place["since"] < entry["since"]:
+            entry["since"] = place["since"]
+        place["since"] = min(place["since"], entry["since"])
+        place["last"] = iso(when)
+    for key in list(places):
+        if not key.isdigit() or int(key) not in open_prs \
+                or not kept_place(places[key], when):
+            del places[key]
+
+
+def kept_place(place, when):
+    """Whether a `pr_since` entry is still in force at `when`."""
+    try:
+        return when - parse(place["last"]) <= PR_PLACE_KEPT
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def queued_description(state, sha, when):
@@ -2477,7 +2534,7 @@ def lane_head(state, cheap, busy=(), when=None):
 
 
 def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
-              urgent=False, blocked=(), queued=()):
+              urgent=False, blocked=(), queued=(), unblocks=()):
     """(sha, pr) of the head that has waited longest, or None. A head
     that failed to prepare goes behind every head that has not; one
     whose run the host broke keeps its place, since the fault was not
@@ -2506,8 +2563,19 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
     own, those of pull requests in `queued` (the Merger's predictions)
     go first, and those in `blocked` (held by the Merger until another
     merges: next.json's `blocked`) last; they still run when nothing
-    better waits (agent-forge #256)."""
+    better waits (agent-forge #256).
+
+    With checks.order "merge" (designs/0052), among the other heads,
+    overdue ones and the rest alike, those of pull requests in
+    `unblocks` (what the Merger's held ones wait on) go first and those
+    in `blocked` last."""
     waiting = state["waiting"]
+
+    def merge_first(s):
+        if ORDER != "merge":
+            return ()
+        return (waiting[s]["pr"] not in unblocks,
+                waiting[s]["pr"] in blocked)
     live = live_heads(state, busy, when)
     if not live:
         return None
@@ -2551,13 +2619,15 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
     # a deep queue every head falls due and the cap would keep it last.
     late = [s for s in heads if overdue(waiting[s], when)]
     if late and not mine:
-        sha = min(late, key=lambda s: (waiting[s]["since"], s))
+        sha = min(late, key=lambda s: (merge_first(s), waiting[s]["since"],
+                                       s))
         return sha, waiting[sha]["pr"]
     # checks.first_authors go even before the Merger's pull request,
     # unless they failed to prepare.
     top = [s for s in heads
            if first(waiting[s]) and not waiting[s].get("errors")]
-    sha = min(top or mine or heads, key=lambda s: order(waiting, s))
+    sha = min(top or mine or heads, key=lambda s: (
+        () if top or mine else merge_first(s), order(waiting, s)))
     return sha, waiting[sha]["pr"]
 
 
@@ -2592,6 +2662,23 @@ def merger_blocked(merger_dir, when):
         if when - parse(said["at"]) > MERGER_FRESH:
             return set()
         return {pr for pr in said.get("blocked") or []
+                if isinstance(pr, int) and not isinstance(pr, bool)}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return set()
+
+
+def merger_unblocks(merger_dir, when):
+    """designs/0052: what the Merger's held pull requests wait on, from
+    its next.json's `unblocks`, or an empty set when there is none, it
+    can't be read, or it is older than MERGER_FRESH."""
+    if not merger_dir:
+        return set()
+    try:
+        with open(os.path.join(merger_dir, "next.json")) as handle:
+            said = json.load(handle)
+        if when - parse(said["at"]) > MERGER_FRESH:
+            return set()
+        return {pr for pr in said.get("unblocks") or []
                 if isinstance(pr, int) and not isinstance(pr, bool)}
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return set()
@@ -4163,7 +4250,10 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     # checks.approved_first: approved heads the Merger can't merge until
     # another merges go after other approved ones, and those it predicts
     # before them.
-    blocked = merger_blocked(merger_dir, when) if APPROVED_FIRST else set()
+    blocked = merger_blocked(merger_dir, when) \
+        if APPROVED_FIRST or ORDER == "merge" else set()
+    unblocks = merger_unblocks(merger_dir, when) if ORDER == "merge" \
+        else set()
     predicted_prs = {e["pr"] for e in ahead} if APPROVED_FIRST else set()
     # merge.test_ahead.train_slots (amendment of 2026-11-12): only the
     # Merger's predictions may run in the reserved slots, so the heads'
@@ -4238,10 +4328,12 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             own_full = own_running >= slots - kept
             if free and not own_full:
                 pick = next_head(state, taken | set(held), first_pr, when,
-                                 cheap, urgent, blocked, predicted_prs) \
+                                 cheap, urgent, blocked, predicted_prs,
+                                 unblocks) \
                     if fresh else next_head(state, taken, first_pr, when,
                                             cheap, blocked=blocked,
-                                            queued=predicted_prs)
+                                            queued=predicted_prs,
+                                            unblocks=unblocks)
             if free:
                 if TEST_AHEAD:
                     forget_ahead(state, ahead)
@@ -4382,6 +4474,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                ", first: the Merger waits on it" if pr == first_pr else
                ", first: it is approved"
                if state["waiting"].get(sha, {}).get("approved") else
+               ", first: approved pull requests wait on it"
+               if pr in unblocks else
                ", first: it has waited %d minutes"
                % (MAX_WAIT.total_seconds() // 60)
                if overdue(state["waiting"].get(sha, {}), when) else ""))

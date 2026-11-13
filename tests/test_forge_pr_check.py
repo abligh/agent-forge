@@ -3973,7 +3973,7 @@ class ApprovedFirst(StateCase):
         # isn't waiting yet; one it holds as Blocked-by or stacked must
         # not take the slot ahead of the rest.
         state = self.waiting(**{SHA_A: (1, 120), SHA_B: (2, 60),
-                                SHA_C: (3, 10)})
+                                SHA_C: (3, 40)})
         for sha in (SHA_A, SHA_B, SHA_C):
             state["waiting"][sha]["approved"] = True
         self.assertEqual(pc.next_head(state, when=T0, blocked={1}),
@@ -4001,6 +4001,58 @@ class ApprovedFirst(StateCase):
             json.dump({"at": pc.iso(T0), "pr": 5}, handle)
         self.assertEqual(pc.merger_blocked(merger, T0), set())
         self.assertEqual(pc.merger_blocked(None, T0), set())
+
+    def test_order_merge_puts_unblockers_first_and_held_last(self):
+        # designs/0052: among unapproved heads, overdue or not.
+        state = self.waiting(**{SHA_A: (1, 120), SHA_B: (2, 60),
+                                SHA_C: (3, 40)})
+        with mock.patch.object(pc, "MAX_WAIT",
+                               datetime.timedelta(minutes=30)):
+            self.assertEqual(pc.next_head(state, when=T0, blocked={1},
+                                          unblocks={3}), (SHA_A, 1))
+            with mock.patch.object(pc, "ORDER", "merge"):
+                self.assertEqual(pc.next_head(state, when=T0, blocked={1},
+                                              unblocks={3}), (SHA_C, 3))
+                self.assertEqual(pc.next_head(state, when=T0, blocked={1}),
+                                 (SHA_B, 2))
+                # Not overdue: the same order.
+                self.assertEqual(pc.next_head(
+                    state, when=T0 - datetime.timedelta(hours=3),
+                    blocked={1}, unblocks={3}), (SHA_C, 3))
+
+    def test_unblocks_is_read_from_a_fresh_next_json(self):
+        merger = os.path.join(self.state_dir, "merger")
+        os.makedirs(merger)
+        with open(os.path.join(merger, "next.json"), "w") as handle:
+            json.dump({"at": pc.iso(T0), "pr": 5, "blocked": [6],
+                       "unblocks": [4, True, "8"]}, handle)
+        self.assertEqual(pc.merger_unblocks(merger, T0), {4})
+        self.assertEqual(pc.merger_unblocks(
+            merger, T0 + pc.MERGER_FRESH + datetime.timedelta(seconds=1)),
+            set())
+        self.assertEqual(pc.merger_unblocks(None, T0), set())
+
+    def test_a_pull_request_keeps_its_place_across_a_run(self):
+        # designs/0052 §1: a head that ran (red at the merge, say) and
+        # its rebase keep the pull request's first place.
+        state = {"waiting": {SHA_A: {"pr": 1, "since": pc.iso(T0)}},
+                 "results": {}}
+        pc.keep_pr_places(state, {1}, [SHA_A], T0)
+        del state["waiting"][SHA_A]
+        later = T0 + datetime.timedelta(hours=2)
+        state["waiting"][SHA_B] = {"pr": 1, "since": pc.iso(later)}
+        pc.keep_pr_places(state, {1}, [SHA_B], later)
+        self.assertEqual(state["waiting"][SHA_B]["since"], pc.iso(T0))
+        # Forgotten once closed, or a day after a head of it last waited.
+        pc.keep_pr_places(state, set(), [], later)
+        self.assertEqual(state["pr_since"], {})
+        state["pr_since"] = {"1": {"since": pc.iso(T0), "last": pc.iso(T0)}}
+        state["waiting"] = {SHA_C: {"pr": 1, "since": pc.iso(
+            T0 + datetime.timedelta(days=2))}}
+        pc.keep_pr_places(state, {1}, [SHA_C],
+                          T0 + datetime.timedelta(days=2))
+        self.assertEqual(state["waiting"][SHA_C]["since"],
+                         pc.iso(T0 + datetime.timedelta(days=2)))
 
     def test_urgent_still_goes_before_approved(self):
         state = self.waiting(**{SHA_A: (1, 10), SHA_B: (2, 120)})
