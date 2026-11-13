@@ -74,9 +74,9 @@ Then:
 6. no request for changes stands, a reviewer's newest review is
    `APPROVED`, covers the head, and nothing has been said after it (by
    `forge-merger`'s own test): nobody's, it is the Merger's;
-7. green and authored by the only reviewer: nobody's, and surfaced
-   (printed on every run, sending or not: it is a problem in the
-   configuration, not anyone's turn);
+7. green, and no reviewer but its author exists: the author's, "merge
+   it, close it, or ask the owner" (agent-forge #374; it was a surface,
+   and such pull requests sat for days);
 8. green, and a request for changes stands that the author has
    answered: the reviewer's who asked, to review again (nobody's when
    the owner asked). Or green, a reviewer's newest review is an
@@ -835,11 +835,14 @@ def route_pr(pr, roster, when=None):
             and not merger.said_since(dict(pr, reviews=reviews,
                                            comments=comments), newest)):
         return nobody(n, 6, "the Merger's: approved, nothing said since")
-    # Rule 7.
+    # Rule 7 (agent-forge #374). When no reviewer but its author
+    # exists, a green pull request is the author's: nobody else will
+    # ever pick it up, and a surface sat for days.
     reviewer = roster.reviewer_for(pr)
     if reviewer is None:
-        return nobody(n, 7, "green, and %s's own: no second reviewer"
-                      % author, kind="surface")
+        return turn(n, author, 7, status.get("createdAt") or head,
+                    "is green at %s, and nobody but you can review it: "
+                    "merge it, close it, or ask the owner" % head[:7])
     # Rule 8. A standing request the author has answered (a comment, or
     # a commit that isn't a merge) is its reviewer's to review again.
     if standing:
@@ -1073,7 +1076,7 @@ def owner_answered(n, issue, owner, comments, roster, rule):
 
 def as_decision(d):
     """A `turn` or `nobody` dict as the engine's Decision: nobody's
-    reason goes in `suppressed`, and rule 7 is a surface."""
+    reason goes in `suppressed`, with its kind (a surface, say)."""
     if d["who"] is None:
         return Decision(d["item"], None, d["rule"], None, None,
                         kind=d["kind"], suppressed=d["why"])
