@@ -10462,3 +10462,19 @@ class Unblockers(unittest.TestCase):
             "5": "Blocked-by: #9 is open", "6": "stacked on #7",
             "8": "waits for code owner @x: y"}), [7, 9])
 
+
+class Boarded(unittest.TestCase):
+    """A stack layer and a member aboard together (the tick failed with
+    `keywords must be strings` once both were)."""
+
+    def test_layers_and_members_join(self):
+        with mock.patch.object(m, "LAYERS_OWN_GREEN", False), \
+                mock.patch.object(m, "OWN_GREEN_TO_BOARD", False), \
+                mock.patch.object(m, "boarded_layers",
+                                  return_value={10999: "b" * 40}), \
+                mock.patch.object(m, "boarded_members",
+                                  return_value={10990: "a" * 40,
+                                                10999: "c" * 40}):
+            self.assertEqual(m.boarded_now({}), {10990: "a" * 40,
+                                             10999: "b" * 40})
+
