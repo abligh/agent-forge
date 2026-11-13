@@ -866,6 +866,44 @@ class Tick(StateCase):
                                           False, run), ([1], None))
         self.assertEqual(run.calls, [])
 
+    # designs/0053: resolutions in the Merger's resolve slots.
+
+    def merger_resolves(self, slotted=(), queued=()):
+        merger = self.merger_says(None)
+        with open(os.path.join(merger, "next.json"), "w") as handle:
+            json.dump({"at": pc.iso(T0 - datetime.timedelta(minutes=1)),
+                       "pr": None,
+                       "resolve_slotted": [{"pr": p, "head": h}
+                                           for p, h in slotted],
+                       "resolve_queue": [{"pr": p, "head": h}
+                                         for p, h in queued]}, handle)
+        return merger
+
+    def test_a_slotted_resolution_runs_first_and_a_queued_one_not_at_all(self):
+        self.write_state({"waiting": {
+            SHA_A: {"pr": 7, "since": pc.iso(T0 - datetime.timedelta(hours=3))},
+            SHA_B: {"pr": 8, "since": pc.iso(T0 - datetime.timedelta(hours=2))},
+            SHA_C: {"pr": 9, "since": pc.iso(T0 - datetime.timedelta(hours=1))}}})
+        merger = self.merger_resolves(slotted=[(9, SHA_C)],
+                                      queued=[(7, SHA_A)])
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false"),
+                   (9, SHA_C, REPO, "false")], slots=2, merger_dir=merger)
+        self.assertEqual([a[1] for a in self.spawned], [SHA_C, SHA_B])
+        self.assertIn("HELD #7 aaaaaaaaaa: a resolution, waiting for a "
+                      "resolve slot", self.lines)
+        self.assertTrue(any(l.startswith("STARTED #9 cccccccccc")
+                            and "first: it holds a resolve slot" in l
+                            for l in self.lines), self.lines)
+
+    def test_resolutions_are_read_from_a_fresh_next_json(self):
+        merger = self.merger_resolves(slotted=[(9, SHA_C)],
+                                      queued=[(7, SHA_A)])
+        self.assertEqual(pc.merger_resolutions(merger, T0),
+                         ({SHA_C}, {SHA_A}))
+        self.assertEqual(pc.merger_resolutions(
+            merger, T0 + pc.MERGER_FRESH), (set(), set()))
+        self.assertEqual(pc.merger_resolutions(None, T0), (set(), set()))
+
     def test_every_slot_held_starts_nothing(self):
         self.hold(1, "#7 %s %s" % (SHA_A, pc.iso(T0)))
         self.hold(2, "#8 %s %s" % (SHA_B, pc.iso(T0)))

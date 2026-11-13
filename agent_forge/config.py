@@ -125,7 +125,7 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "queued_stall_minutes": int, "read_as": str, "age_first": dict,
          "hand_back_once_per_head": bool, "own_head_green": bool,
          "stall_run_factor": (int, float), "resolve_slots": int,
-         "resolve_slot_minutes": (int, float),
+         "resolve_slot_minutes": (int, float), "resolve_slot_on": str,
          "mode": str, "code_owner_ask": dict, "code_owner_sequence": bool}
 # merge.code_owner_ask (agent-forge #153).
 CODE_OWNER_ASK = {"labels": list, "title": str}
@@ -731,6 +731,11 @@ def check(data):
         if _is(merge.get("resolve_slot_minutes"), (int, float)) \
                 and merge["resolve_slot_minutes"] <= 0:
             problems.append("merge.resolve_slot_minutes must be above 0")
+        if merge.get("resolve_slot_on") not in (None, "hand-back", "push"):
+            problems.append('merge.resolve_slot_on must be "hand-back" or '
+                            '"push"')
+        if "resolve_slot_on" in merge and not merge.get("resolve_slots"):
+            problems.append("merge.resolve_slot_on needs merge.resolve_slots")
         if "resolve_slot_minutes" in merge and not merge.get("resolve_slots"):
             problems.append("merge.resolve_slot_minutes needs "
                             "merge.resolve_slots")

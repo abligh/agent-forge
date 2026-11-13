@@ -831,6 +831,16 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"resolve_slots": "2"}),
                          ["merge.resolve_slots must be an integer"])
 
+    def test_merge_resolve_slot_on(self):
+        for on in ("hand-back", "push"):
+            self.assertEqual(self.problems(merge={
+                "resolve_slots": 2, "resolve_slot_on": on}), [])
+        self.assertEqual(self.problems(merge={
+            "resolve_slots": 2, "resolve_slot_on": "never"}),
+            ['merge.resolve_slot_on must be "hand-back" or "push"'])
+        self.assertEqual(self.problems(merge={"resolve_slot_on": "push"}),
+                         ["merge.resolve_slot_on needs merge.resolve_slots"])
+
     def test_merge_resolve_slot_minutes(self):
         self.assertEqual(self.problems(merge={
             "resolve_slots": 2, "resolve_slot_minutes": 45}), [])

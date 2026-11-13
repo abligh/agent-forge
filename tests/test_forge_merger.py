@@ -5915,6 +5915,96 @@ class ResolveSlots(RepoCase):
         self.assertFalse(os.path.exists(os.path.join(self.state,
                                                      m.RESOLVE_FILE)))
 
+    # merge.resolve_slot_on "push" (designs/0053).
+
+    def resolved(self, number, created, approved=False):
+        """Pull request `number`'s resolution: a new head on main's tip
+        that keeps its own change, so it merges cleanly."""
+        self.repo.branch("rival%d" % number, "origin/main")
+        sha = self.repo.commit("r%d.txt" % number, "resolved\n",
+                               "resolve #%d" % number)
+        self.repo.publish_pr(number, sha)
+        self.repo.branch("feature", "feature")
+        return pr(number, created, head=sha,
+                  reviews=[review(REVIEWER, oid=sha)] if approved else [])
+
+    def next_json(self):
+        with open(os.path.join(self.state, "next.json")) as handle:
+            return json.load(handle)
+
+    def test_with_push_every_conflict_is_told_at_once(self):
+        self.configure(resolve_slot_on="push")
+        record, lines = self.tick(self.conflicting(6, 7, 8), live=True)
+        self.assertEqual(self.told(), [6, 7, 8])
+        self.assertNotIn("resolve_waiting", record)
+        self.assertFalse([l for l in lines if l.startswith("RESOLVE-WAIT")])
+        body = [b for _, b in self.comments() if b.startswith("Not merging")]
+        self.assertIn("your push queues for one of 1 resolve slots", body[0])
+        self.assertIn("Merge `main` (at %s)" % self.repo.main_tip()[:10],
+                      body[0])
+
+    def test_with_push_a_resolution_takes_a_slot_and_the_next_queues(self):
+        self.configure(resolve_slot_on="push")
+        prs = self.conflicting(6, 7, 8)
+        self.tick(prs, live=True)
+        six = self.resolved(6, "2026-10-07T10:00:00Z")
+        seven = self.resolved(7, "2026-10-07T11:00:00Z")
+        record, lines = self.tick([six, seven, prs[2]], live=True,
+                                  minutes=5)
+        self.assertEqual(record["resolving"], [6])
+        self.assertEqual(record["resolve_queue"], [7])
+        self.assertIn("RESOLVE-SLOTS: #6 checking; #7 queued", lines)
+        self.assertEqual(
+            record["held"]["7"],
+            "a resolution of a conflict with main; waits for a resolve "
+            "slot (1 out: #6)")
+        said = self.next_json()
+        self.assertEqual(said["resolve_slotted"],
+                         [{"pr": 6, "head": six["headRefOid"]}])
+        self.assertEqual(said["resolve_queue"],
+                         [{"pr": 7, "head": seven["headRefOid"]}])
+        self.assertEqual(said["resolve_base"],
+                         {"sha": self.repo.main_tip()})
+        # #6 keeps its slot while it waits for its review.
+        record, _ = self.tick([six, seven, prs[2]], live=True, minutes=10)
+        self.assertEqual((record["resolving"], record["resolve_queue"]),
+                         ([6], [7]))
+        # Approved, it is a candidate again: its slot goes to #7.
+        approved = self.resolved(6, "2026-10-07T10:00:00Z", approved=True)
+        record, _ = self.tick([approved, seven, prs[2]], live=True,
+                              minutes=15)
+        self.assertEqual(record["resolving"], [7])
+        self.assertNotIn("resolve_queue", record)
+
+    def test_with_push_a_slot_runs_out(self):
+        self.configure(resolve_slot_on="push", resolve_slot_minutes=30)
+        prs = self.conflicting(6, 7)
+        self.tick(prs, live=True)
+        six = self.resolved(6, "2026-10-07T10:00:00Z")
+        seven = self.resolved(7, "2026-10-07T11:00:00Z")
+        self.tick([six, seven], live=True, minutes=1)
+        record, lines = self.tick([six, seven], live=True, minutes=31)
+        self.assertIn("RESOLVE-EXPIRED #6: its resolution held a slot 30 "
+                      "minutes; the slot goes to the next", lines)
+        self.assertEqual((record["resolving"], record["resolve_queue"]),
+                         ([7], [6]))
+
+    def test_with_push_a_head_still_conflicting_is_no_resolution(self):
+        self.configure(resolve_slot_on="push")
+        six, = self.conflicting(6)
+        self.tick([six], live=True)
+        with open(os.path.join(self.state, "handed-back.json")) as handle:
+            said = json.load(handle)
+        # Pushed again, still on the old main: it conflicts as before.
+        self.repo.branch("rival6", "rival6")
+        again = self.repo.commit("x.txt", "more\n", "more")
+        self.repo.publish_pr(6, again)
+        self.repo.branch("feature", "feature")
+        found = m.resolutions(said, [dict(six, headRefOid=again)], [],
+                              self.repo.path, self.repo.main_tip(),
+                              tools_run())
+        self.assertEqual(found, [])
+
     def test_the_order_slots_are_given_in(self):
         base = pr(6, "2026-10-07T03:00:00Z")
         layers = [pr(9, base="b6"), pr(10, base="b9", reviews=[])]
