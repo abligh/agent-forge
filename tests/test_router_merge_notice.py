@@ -12,8 +12,8 @@ from agent_forge import config, router
 from agent_forge import rules_default as rules
 from tests.helpers import example
 from tests.test_forge_router import (LEADDEV, MERGER, NOW, OWNER, REVIEWER,
-                                     T0, T1, FakeGitHub, issue_node, r,
-                                     response)
+                                     T0, T1, FakeGitHub, comment, issue_node,
+                                     r, response)
 
 # Ten minutes before NOW: inside the default 30-minute window.
 MERGED_AT = "2026-10-09T13:50:00Z"
@@ -219,6 +219,17 @@ class Notice(unittest.TestCase):
         d, = self.notices(issues=issues, merges=[merged(50)])
         self.assertEqual(d.line, '#50 "change 50" merged at 13:50Z. Your '
                          'oldest item nothing blocks: #30 "the next one".')
+
+    def test_the_authors_turn_comes_before_its_next_issue(self):
+        # 2026-11-13: the notice named an old issue while a handed-back
+        # pull request waited on its author.
+        issues = [owned(30, title="the next one"),
+                  owned(31, created=T1)]
+        # Rule 12: someone else commented on #31.
+        issues[1]["comments"] = {"nodes": [comment(REVIEWER, T1)]}
+        d, = self.notices(issues=issues, merges=[merged(50)])
+        self.assertTrue(d.line.startswith(
+            '#50 "change 50" merged at 13:50Z. Your turn next: #31 '), d.line)
 
     def test_no_next_item_when_all_are_blocked(self):
         issues = [owned(30, body="Blocked-by: #61")]

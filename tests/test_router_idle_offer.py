@@ -68,12 +68,14 @@ def pr(number, author=LEADDEV, body="", closes=(), **more):
     return node
 
 
-def context(prs=(), issues=(), listing=None, only=None, when=NOW, pages=()):
+def context(prs=(), issues=(), listing=None, only=None, when=NOW, pages=(),
+            previous=None):
     """A Context as the engine builds it: through `fetch`."""
     got_prs, got_issues = r.fetch(FakeGitHub(
         response(list(prs), list(issues)), *pages))
     return router.Context(rules.Roster(project({})), when, got_prs,
-                          got_issues, only=only, directory=listing)
+                          got_issues, only=only, directory=listing,
+                          previous=previous)
 
 
 class Config(unittest.TestCase):
@@ -416,6 +418,31 @@ class Offer(unittest.TestCase):
         # Rule 12: someone else commented on its other issue.
         ctx = context(issues=[owned(30), owned(31, comments=[
             comment(REVIEWER, T2)])], listing=directory(entry("WidgetLeadDev")))
+        self.assertEqual(rules.sweep(ctx), [])
+
+    def test_an_idle_agent_is_reminded_of_a_turn_it_was_woken_for(self):
+        # 2026-11-13: a stack's base handed back for a conflict sat with
+        # its idle author, whose only nudge was a reminder hours away.
+        issues = [owned(30), owned(31, comments=[comment(REVIEWER, T2)])]
+        decided = rules.route_issue(context(issues=issues).issues[1],
+                                    rules.Roster(project({})))
+        previous = {"at": T2, "items": {"31": [{
+            "agent": "LeadDev", "rule": decided["rule"],
+            "event": decided["event"], "kind": "turn",
+            "suppressed": None}]}}
+        ctx = context(issues=issues, previous=previous,
+                      listing=directory(entry("WidgetLeadDev")))
+        [got] = rules.sweep(ctx)
+        self.assertEqual((got.agent, got.rule, got.event),
+                         ("LeadDev", 15, IDLE))
+        self.assertEqual(got.line, "You have been idle since 13:30Z, and it "
+                         "is your turn: %s. Act on it, or say on it why not."
+                         % decided["line"])
+
+    def test_no_reminder_of_a_turn_not_yet_woken_for(self):
+        issues = [owned(30), owned(31, comments=[comment(REVIEWER, T2)])]
+        ctx = context(issues=issues, previous={"at": T2, "items": {}},
+                      listing=directory(entry("WidgetLeadDev")))
         self.assertEqual(rules.sweep(ctx), [])
 
     def test_another_agents_turn_does_not_stop_it(self):
