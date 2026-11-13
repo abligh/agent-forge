@@ -64,7 +64,13 @@ The engine runs one pass:
    withheld or surfaced, once); the journal for every wake sent,
    failed, withheld, withdrawn or surfaced; and every decision the run
    made, for the next run's rules (`previous.json`, below).
-7. **Once a run.** The module's `each_run` actions, on a sending run
+7. **Escalate.** With `router.escalate` ([designs/0049](designs/0049-the-router-tells-a-person-when-an-agent-cannot-be-reached.md)),
+   on a sending run that isn't `--only`'s or `--seed`'s: one issue per
+   agent whose turn was reminded `after_reminders` times and is still
+   decided, or whose wakes have all gone undelivered for
+   `undelivered_minutes`, and one for a relay that delivers nothing
+   that long (docs/config.md, `router.escalate`).
+8. **Once a run.** The module's `each_run` actions, on a sending run
    that isn't `--only`'s (below).
 
 **Several decisions per item.** `decide` may return any number for
@@ -166,9 +172,9 @@ wake has always had (`Your turn:`, so a message of turns alone is the
 text it always was), then `For your information (not your turn):` and
 `Worth another look (not your turn):`, each only when it has lines. A
 `surface` is sent to nobody: it is printed on every run, sending or
-not, as nobody's turn is printed (`#9 nobody's (rule 7: …)`), and
-journalled once per key. The default rules' rule 7, a pull request
-nobody can review, is a surface.
+not, as nobody's turn is printed (`#9 nobody's (rule 18: …)`), and
+journalled once per key. The default rules' rule 18, an unowned issue
+with no `owners.triage`, is a surface.
 
 **Actions** are `Action`s on the decision, done before delivery as the
 Merger's App, through the engine's own GitHub client, when the

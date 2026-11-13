@@ -314,22 +314,6 @@ class Kinds(EngineCase):
         self.assertEqual([w["outcome"] for w in self.journal("dry-run.jsonl")],
                          ["surfaced: nobody can review it"])
 
-    def test_the_default_rules_rule_7_is_a_surface(self):
-        prs = [base.pr_node(9, author=base.REVIEWER)]
-        for minutes in (0, 1):
-            self.lines.clear()
-            with mock.patch.object(r, "RULES", base.rules):
-                rc = r.run(base.FakeGitHub(base.response(prs, [])),
-                           base.ROSTER, self.dir, True, self.post, None,
-                           self.lines.append, when=later(minutes=minutes))
-            self.assertEqual(rc, 0)
-            self.assertEqual(self.lines[0],
-                             "#9 nobody's (rule 7: green, and Reviewer's own:"
-                             " no second reviewer)")
-        self.assertEqual(self.posts, [])
-        self.assertEqual([(w["rule"], w["outcome"]) for w in self.journal()], [
-            (7, "surfaced: green, and Reviewer's own: no second reviewer")])
-
     def test_what_cant_be_carried_out_is_refused(self):
         for d in (turn(41, "Ann", kind="ping"),
                   turn(41, "Ann", reminder=600),

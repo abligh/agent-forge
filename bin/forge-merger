@@ -75,6 +75,38 @@ everything queued behind it. Any other write GitHub refuses is
 recorded, not retried in the same tick: the next tick judges the pull
 request afresh.
 
+**With `merge.resolve_slots: N`, at most N are out for resolving at
+once** (default 0, no limit; designs/0012, amendment of 2026-11-12).
+One is out while it was handed back for a conflict with `main` (a
+restack's conflict too) at the head and under the approval it has
+now, isn't a draft, and still conflicts; its author's push, a new or
+lost approval, closing, merging, or `main` moving so that it merges
+cleanly frees the slot, and its re-review after the fix holds none.
+Every other conflict the tick finds, at the front, behind it with
+`early_conflicts`, or refused by GitHub, waits for the tick's end. Then
+the free slots go, in turn, to those labelled urgent, the other urgent
+ones, the one with right of way, then to those that would board
+soonest (their place in the queue, by `test_ahead.batch` when there
+are batches, and within that, a stack's base with more approved
+layers above it first), then the oldest; each gets its hand-back as
+before. The rest are held, untold, with nothing in `handed-back.json`:
+`held` says `conflicts with main; waits for a resolve slot (2 out:
+#a, #b)`, they leave the record's `queue` and every prediction, and
+one `RESOLVE-WAIT #c #d: ...` line is printed. The record says
+`resolving` (those out) and `resolve_waiting`. With
+`merge.resolve_slot_minutes: M`, a slot held M minutes with no push runs
+out (`RESOLVE-EXPIRED`, `resolve_expired`): its pull request stays with
+its author and waits behind the others for another. With
+`merge.resolve_slot_on: "push"` (designs/0053), every conflict is told at
+once, and the slots go to resolutions pushed instead: `resolutions`,
+`push_slots`, and next.json's `resolve_slotted`, `resolve_queue` and
+`resolve_base`. A resolution done while
+others merge is often undone by the next merge; a slot keeps the few
+being resolved near the front, where they board soon after. A stack's
+layers are held as stacked while their base is out, as before, and a
+pull request held behind another (`hold_conflicting`, right of way)
+isn't in the queue the slots are given from.
+
 **A head GitHub has lost is nudged once.** GitHub sometimes moves a
 pull request's branch (its own update's merge commit lands on it)
 without moving the pull request's head, and then refuses every update
@@ -114,7 +146,10 @@ the pull request's own failure.
 Each tick appends one JSON record to `merger.jsonl` in the state
 directory (~/.local/state/agent-forge/<project>/merger, or
 `--state-dir`) (`dry-run.jsonl` under `--dry-run`). `held` names each pull
-request Reviewer approved that is not eligible, with the reason, and
+request Reviewer approved that is not eligible, with the reason;
+`urgent` lists every open pull request the tick saw that carries
+`labels.urgent`, and `elevated` those urgent only because a tool says
+so (a red nightly's or default branch's fix); and
 `handed-back.json` remembers what was already said.
 
 **With `merge.yield_after_hand_back: N`, a pull request handed back
@@ -326,7 +361,14 @@ its own: it waits for the batch top's prediction, whose tree includes
 it. Once the build check has started that top (its `ahead_started`),
 the wait is timed from the later of the top's start and the wait's, so
 a top that is running isn't called a stall, and one that hangs still
-is, `STALL_AFTER` after it started.
+is, `STALL_AFTER` after it started. A slot running the top's tree at
+another commit (an earlier prediction, which keeps the check from
+starting the top) counts as the top's start. A head kept off train 1
+while its run goes on (it would spend that run, "waits for its train")
+is timed from that run's start the same way. With
+`merge.stall_run_factor` (default 1.5), a wait on checks is timed
+against that many times the median of the build check's recent runs
+when that is longer than `STALL_AFTER`, which stays the floor.
 
 **`next.json` names the pull request the tick stopped at**: `{"at":
 ..., "pr": N}`, the first in the queue it neither handed back nor
@@ -335,7 +377,9 @@ when there is none. Every live tick writes it, and a dry run never
 does. It also lists, as `"blocked": [N, ...]`, the approved pull
 requests held for a reason only another merge clears (`Blocked-by:` an
 open one, or stacked on one), when there are any; the build check
-starts their heads after other approved ones. With `checks.merger_first` on, the build check (`forge-pr-check`)
+starts their heads after other approved ones. Then, as `"unblocks"`,
+the numbers those wait on, which the build check starts first among
+unapproved heads with `checks.order` "merge" (designs/0052). With `checks.merger_first` on, the build check (`forge-pr-check`)
 reads it and checks that pull request's head before any other, since
 the next merge waits on that verdict.
 
@@ -521,7 +565,26 @@ base and its approval covers its head. A layer joins only a batch not
 yet being run. The batch holds while the layer is still ready at the
 head predicted, held as stacked until the layer below merges. A queued
 pull request a layer pushed out of the batch is `owed` (ahead.json),
-and no layer pushes an owed one out again.
+and no layer pushes an owed one out again. Layers side by side on one
+base (amendment of 2026-11-12) are taken in number order, depth first:
+a layer, the layers on it, then the next one beside it; one that isn't
+ready, or in a train won't merge onto what is ahead of it, holds back
+the layers on it and no others, and a train member that leaves takes
+only the layers on it with it (ahead.json's entries say `on`, the
+member each is stacked on). With `layers_need_own_green` false (default
+true; with `merge.own_head_green`), a layer boards without its own
+build check's green, its train's top testing it; once its base has
+merged it stays a candidate without one while its head is the one it
+boarded with, or that one brought up to date (`own_green_wait`'s
+`boarded`), and `train_merge` takes the layers held as stacked as
+members, so the train goes in as one. With `own_green_to_board` false
+(default true; with `merge.own_head_green` and `trains: "live"`), so
+does any pull request on the default branch held only for its own
+green: it is tried for a train after the candidates, and once aboard
+it is a candidate while its head is the one it boarded with, or that
+one brought up to date (`boarded_members`). One whose own head is red
+still doesn't board, and a red train is searched as any (amendment of
+2026-11-12, ninth).
 
 **With `merge.test_ahead.trains`, batches are trains** (designs/0047;
 default off). `"live"`: each batch is a train of carriages, a stack's
@@ -545,14 +608,45 @@ alone, with the layers of its stack above it: `TRAIN-LEFT #n: pushed
 with STACK-UPDATE still to come, it is in flight. Nor is any head that
 is the boarded one brought up to date and nothing else (`own_push`:
 clean merges of what the default branch already has, whichever stack
-the tick acts on). The rest keep their
-places, and the train's top, now a new tree, is run again. A pull
-request that is urgent or fixes a red default branch and is in no train
-cuts every train after the first again, and the default branch moving to
+the tick acts on), nor one whose prediction is unchanged: predicted
+where the boarded head was, it gives the same tree (`same_prediction`:
+an author's merge of the default branch made any other way, with the
+default branch as the first parent, say, or of the head of a member
+ahead of it in the train), said as `TRAIN-KEPT #n: pushed <sha>, same
+tree in its place`; its prediction is the same commit, so
+the top's run still counts, and a train merged as one (`train_merge`)
+merges its new head. A restacked layer stays a candidate meanwhile: its
+build check's and gated instances' verdicts on the head before the
+restack still count (`on_main`). The rest keep their
+places, and the train's top, now a new tree, is run again. When one
+leaves the first train after its top's run has started (and isn't red),
+the members below it are kept with that top (ahead.json's `left_top`;
+`merge.test_ahead.left_top_covers`, agent-forge #296): the old top's
+tree held each of theirs as the new train does, and a prediction's run
+is never stopped, so once it is green they merge as one train
+(`TRAIN-UNDER-LEFT #a..#b`) without waiting for the new top's run. A
+pull request that fixes a red default branch and is in no train cuts
+every train after the first again (one labelled urgent heads the next
+train cut, behind those already cut, 2026-11-13), and the default
+branch moving to
 a tree no train predicted cuts them all (`TRAIN-RECUT: ...`). A red
-top's members are the suspects, as a red batch's, and the trains are cut
-again once the search ends. A pull request whose own head is red doesn't
-board while the default branch is green. One that conflicts with the
+top's members are the suspects, as a red batch's, a stack's layers held
+as stacked among them, each where its train had it (`with_suspects`).
+The trains are kept through the search (ahead.json's `kept_trains`) and
+taken up again when it ends: the one found red leaves, those merged are
+gone, the rest keep their places, and new pull requests go into later
+trains (`trains_before`; amendment of 2026-11-12, seventh). A suspect
+brought up to date and nothing else stays a suspect at its new head
+(`suspects_left`). A later train's green top covers that
+train and every one in front of it (amendment of 2026-11-11): its tree
+contains them all, and its run took in every step their changes touch,
+so they are folded into the first batch and start merging at once,
+without waiting for the tops in front of it, whose runs are then spent;
+a red top in front of it is overruled, as a flake. A pull request whose
+own head is red doesn't board while the default branch is green,
+unless it was red only for a conflict with an older tip (amendment of
+2026-11-12, eighth); the record's `train_waits` says why each that
+didn't board waits. One that conflicts with the
 default branch only where `merge.resolve` or its `union` would resolve
 it can't board as it stands, and train members stay ahead of it, so a
 live tick resolves the first such pull request ahead of its turn, and it
@@ -563,6 +657,19 @@ the dry run's own (`trains-dry.json`), are said as `TRAIN-DRY 1: #a #b |
 2: #c` when they change, each change as `TRAIN-DRY LEFT ...`, and kept
 in the record as `trains` with `"trains_dry": true`, with
 `recut_avoided` when the batches were cut again but no train was.
+With `train_merge` (amendment of 2026-11-11, default off), a green
+train goes in as one: while the default branch is still the tip it was
+predicted from, a chain of merge commits, one per member with its head
+as a parent and the tree its prediction tested, is pushed to
+`train_branch` + `<first>-<last>`, given `checks.context`'s green, and
+merged by one pull request as a merge commit pinned to its top
+(`TRAIN-MERGE`). GitHub then marks each member merged; any it doesn't,
+and any train it refuses, merge one at a time as before. A member of
+the first train behind the default branch is not updated meanwhile
+(amendment of 2026-11-12): the update would change nothing the train
+merges and only start a build of its new head, so it waits for the
+top (`WAIT`, "in a train of N that merges as one"). A train of one, a
+red top, and a train GitHub refused this tick are updated as before.
 With `tell_boarded` (agent-forge #286), each pull request that boards a
 live train is told once, in a `Not-a-review` comment, not to push to it
 unless it is handed back (`TOLD-BOARDED #<pr> <sha>`, the record's
@@ -599,6 +706,8 @@ the head as a reviewer's must. Owners are `@login`s; a team's or an
 email's path waits for good, since the Merger can't check it. A path
 whose changes can't be listed waits too. It is a hold, not a
 hand-back: nothing is said, and the author isn't asked to do anything.
+With `merge.code_owner_ask`, the hold opens an issue for the owner,
+once per pull request and head, closed when the hold ends.
 
 **With `merge.yield_ignores_conflicts`, a conflict with `main` doesn't
 count toward the yield** (default false). A conflict is mostly what
@@ -859,10 +968,49 @@ STALL_RETELL = datetime.timedelta(minutes=DEFAULT_STALL_RETELL_MINUTES)
 STALL_TO_OWNER = datetime.timedelta(
     minutes=DEFAULT_STALL_OWNER_AFTER_MINUTES)
 STALL_TITLE = DEFAULT_STALL_TITLE
+# merge.mode (agent-forge #274): "manual" merges nothing and records the
+# hand merges, so forge-stats and forge-flow count them.
+MANUAL = False
+HAND_MERGES_NAME = "hand-merges.json"
+# merge.code_owner_ask (agent-forge #153): (title, labels) of the issue
+# opened for a pull request held for a code owner, or None for none.
+CODE_OWNER_ASK = None
+DEFAULT_CODE_OWNER_ASK_TITLE = "#{pr} waits for a code owner's approval"
+CODE_OWNER_ASK_NAME = "code-owner-asks.json"
+# merge.code_owner_sequence (agent-forge #264): of the pull requests
+# held for a code owner that change the same lines of an owned path,
+# only the oldest is asked; the rest wait for it.
+CODE_OWNER_SEQUENCE = False
+SEQUENCE_REASON = "waits for #%d: both change %s lines %d-%d, which a " \
+    "code owner must approve; one at a time"
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@", re.M)
 STALL_LABELS = ()
 WAITING_OWNER = DEFAULT_WAITING_OWNER
 # labels.urgent: the label that puts a pull request first, or None.
 URGENT_LABEL = None
+# labels.keep_trains: a pull request whose merge moves the default
+# branch without cutting the trains again (a pin, a configuration
+# change). Their commits are looked up once and kept in KEEP_FILE.
+KEEP_LABEL = None
+KEEP_FILE = "keep.json"
+# At most this many such commits under one set of trains; more, and
+# they are cut again as before.
+KEEP_MOST = 10
+KEEP_QUERY = """
+query($owner: String!, $name: String!, $oid: GitObjectID!) {
+  repository(owner: $owner, name: $name) {
+    object(oid: $oid) {
+      ... on Commit {
+        associatedPullRequests(first: 5) {
+          nodes {
+            number merged mergeCommit { oid }
+            labels(first: 30) { nodes { name } }
+          }
+        }
+      }
+    }
+  }
+}"""
 # labels.rerun: the label that has the build check run a red head
 # again (designs/0022), or None; named in RED_SUSPECT_DETAIL.
 RERUN_LABEL = None
@@ -873,6 +1021,15 @@ NIGHTLY_FIXES = frozenset()
 # default branch is red (designs/0011, amendment), taken as urgent and
 # put first; read from its state.json by `main`.
 MAIN_RED_FIXES = frozenset()
+# checks.instances.<name>.main_red_issue (agent-forge #154): each
+# instance's (title regex, labels, poster login), for its own open
+# issue saying the default branch is red for its context.
+INSTANCE_RED = ()
+INSTANCE_RED_TITLE = "The default branch is red for {context} at {sha}"
+INSTANCE_RED_QUERY = (
+    "query($owner:String!,$name:String!,$labels:[String!]){"
+    "repository(owner:$owner,name:$name){issues(states:OPEN,first:50,"
+    "labels:$labels){nodes{number title author{login}}}}}")
 STALL_ALERT_NAME = "stall-alert.json"
 # `merge.test_ahead`: whether the next pull requests' commits are
 # predicted for the build check to test ahead, and how many behind the
@@ -912,7 +1069,9 @@ TOLD_BOARDED_FILE = "told-boarded.json"
 TOLD_BOARDED_NOTE = ("Not-a-review\n\nIn the Merger's train at %s: please "
                      "don't push to this branch unless it is handed back. "
                      "A push takes it out of the train and runs the check "
-                     "again for every pull request after it.\n\n%s")
+                     "again for every pull request after it. If it needs "
+                     "a fix, open a new pull request stacked on this "
+                     "branch; don't push here.\n\n%s")
 # merge.test_ahead.unstable_after_recuts and batches_when_unstable
 # (designs/0044, rule 5): when more than UNSTABLE_AFTER ticks in the
 # last UNSTABLE_WINDOW re-cut a batch whose top's run had started, only
@@ -975,8 +1134,41 @@ BASE_RED_REASON = ("%s is red only in %s, as %s is at %s; waits for it to "
                    "be fixed")
 BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
                      "waits for the new batch's top")
+# merge.test_ahead.train_merge: a train's member behind the default
+# branch waits for its train rather than being updated.
+# merge.test_ahead.layers_need_own_green: whether a stack's layer needs
+# its own build check's green to board its base's train.
+LAYERS_OWN_GREEN = True
+# merge.test_ahead.left_top_covers (agent-forge #296): when a member
+# leaves the first train mid-run, the members below it merge on the old
+# top's green rather than waiting for the new top's run.
+LEFT_TOP_COVERS = True
+# merge.test_ahead.own_green_to_board: whether any pull request needs
+# its own build check's green to board a train (false: its approval is
+# enough, and the train's top tests it; amendment of 2026-11-12, ninth).
+OWN_GREEN_TO_BOARD = True
+# A pull request outside the first train, whose merge on its own would
+# move the default branch under that train's started run.
+TRAIN_AHEAD_REASON = ("train 1 (%s) is building; merged on its own, this "
+                      "would spend that run, so it waits for its train")
+TRAIN_WAIT_REASON = ("in a train of %d that merges as one; not updated, "
+                     "it waits for the train's top")
+# merge.test_ahead.train_merge: a suspect of a red train is not updated
+# while the search runs (amendment of 2026-11-12, second).
+SUSPECT_WAIT_REASON = ("a suspect of the red train %s; not updated while "
+                       "the search runs")
 # The most ticks one run makes: it ticks again straight after a merge.
 TICKS_PER_RUN = 10
+# merge.test_ahead.train_merge (designs/0047, amendment of 2026-11-11):
+# a green train is merged as one: a chain of merge commits, one per
+# member's head, pushed to a branch named TRAIN_BRANCH + "<first>-<last>"
+# and merged by one pull request.
+TRAIN_MERGE = False
+TRAIN_BRANCH = "forge/train-"
+# How long GitHub is given to mark the members merged once the train
+# is in: TRAIN_POLLS times TRAIN_POLL_S seconds.
+TRAIN_POLLS = 10
+TRAIN_POLL_S = 2
 # The actions that leave a run in progress or about to start on the
 # pull request: with test_ahead, it keeps its place in the queue.
 IN_FLIGHT = ("UPDATE", "RESOLVE", "UNION", "RESTACK", "STACK-UPDATE",
@@ -1002,6 +1194,19 @@ YIELD_IGNORES_CONFLICTS = False
 # that conflicts with main is handed back now, not when it reaches the
 # front (designs/0012).
 EARLY_CONFLICTS = False
+# merge.resolve_slots: at most this many pull requests are back with
+# their authors for a conflict with main at once; the others that
+# conflict wait, held and not told, for a slot (0: no limit).
+RESOLVE_SLOTS = 0
+RESOLVE_SLOT_MINUTES = None
+# merge.resolve_slot_on (designs/0053): "hand-back", a slot is taken when
+# a conflict is handed back; "push", every conflict is told at once and a
+# slot is taken by a resolution's push.
+RESOLVE_SLOT_ON = "hand-back"
+# What a hand-back for a conflict suggests merging (designs/0053): set
+# by `tick` before it acts.
+RESOLVE_BASE = {}
+RESOLVE_FILE = "resolve-slots.json"
 # merge.code_owners: hold one that changes a path CODEOWNERS gives an
 # owner until an owner has approved its head.
 CODE_OWNERS = False
@@ -1082,6 +1287,10 @@ GATED = ()
 # head. A head the Merger's own merge of the default branch made is
 # judged by the approved commit, as `covers_head` judges the approval.
 OWN_HEAD_GREEN = True
+# merge.approval (2026-11-13): "reviewer", the default, needs a
+# reviewer agent's approval; "green", for a project with no second
+# reviewer, takes the head's own green check as the approval.
+APPROVAL = "reviewer"
 GREEN_WAIT_REASON = ("%s is %s on %s, and no approved commit is green; "
                      "waits for the build check to pass")
 # How far back through merges of the default branch an instance's
@@ -1108,6 +1317,13 @@ CI_NEVER_STARTED = None
 QUEUED_STALL_AFTER = None
 # merge.read_as: the App a dry run reads with, or None for the Merger.
 READ_AS = None
+# merge.stall_run_factor: a head waiting on its checks stalls only once
+# it has waited this many times the median of the build check's recent
+# runs (STALL_RUNS of them), when that is longer than STALL_AFTER; 0
+# for STALL_AFTER alone. Under load a run takes 30 to 50 minutes, and a
+# fixed 30 called every one of them a stall (2026-11-12).
+STALL_RUN_FACTOR = 1.5
+STALL_RUNS = 20
 
 
 def configure(project):
@@ -1139,14 +1355,18 @@ def configure(project):
     global TEST_AHEAD, AHEAD_DEPTH, AHEAD_BATCH, HOLD_CONFLICTING, YIELD_PLACES
     global YIELD_CAP, YIELD_IGNORES_CONFLICTS, RIGHT_OF_WAY, ROW_AFTER
     global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS, URGENT_LABEL
+    global KEEP_LABEL
     global STACKS, STACK_MAX_RUN, STACK_WAIT, RESOLVE, HOLD_LABELS, BLOCKED_BY
-    global UNION
+    global UNION, RESOLVE_SLOTS, RESOLVE_SLOT_MINUTES, RESOLVE_SLOT_ON
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
     global FIXED_ORDER, GREEN_BATCH_FIRST, RED_SUSPECT_OUT, UNSTABLE_AFTER
     global UNSTABLE_BATCHES, TELL_BOARDED
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
+    global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR, LAYERS_OWN_GREEN
+    global LEFT_TOP_COVERS
+    global OWN_GREEN_TO_BOARD, APPROVAL
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -1164,8 +1384,11 @@ def configure(project):
         for _name, context, poster, scope
         in config.gated_instances(project.data))
     BUILD_HOST = project.host
+    global INSTANCE_RED
+    INSTANCE_RED = tuple(instance_red_rules(project))
     GATE = tuple(tuple(argv) for argv in merge.get("gate", DEFAULT_GATE))
     OWN_HEAD_GREEN = merge.get("own_head_green", True)
+    APPROVAL = merge.get("approval", "reviewer")
     CI_WORKFLOW = merge.get("ci_workflow", "ci")
     STALL_AFTER = datetime.timedelta(minutes=merge.get("stall_minutes", 30))
     alert = merge.get("stall_alert")
@@ -1178,9 +1401,18 @@ def configure(project):
         "owner_after_minutes", DEFAULT_STALL_OWNER_AFTER_MINUTES))
     STALL_TITLE = alert.get("title", DEFAULT_STALL_TITLE)
     STALL_LABELS = tuple(alert.get("labels", ()))
+    global MANUAL
+    MANUAL = merge.get("mode", "auto") == "manual"
+    global CODE_OWNER_ASK, CODE_OWNER_SEQUENCE
+    CODE_OWNER_SEQUENCE = merge.get("code_owner_sequence", False) is True
+    ask = merge.get("code_owner_ask")
+    CODE_OWNER_ASK = None if ask is None else (
+        ask.get("title", DEFAULT_CODE_OWNER_ASK_TITLE),
+        tuple(ask.get("labels", ())))
     WAITING_OWNER = project.section("labels").get("waiting_on_owner",
                                                   DEFAULT_WAITING_OWNER)
     URGENT_LABEL = project.section("labels").get("urgent")
+    KEEP_LABEL = project.section("labels").get("keep_trains")
     RERUN_LABEL = project.section("labels").get("rerun")
     ahead = config.test_ahead(project.data)   # designs/0050
     TEST_AHEAD = ahead is not None
@@ -1196,6 +1428,13 @@ def configure(project):
     UNSTABLE_BATCHES = (ahead or {}).get("batches_when_unstable", 1)
     TRAINS = (ahead or {}).get("trains")
     TRAINS_WITHIN = (ahead or {}).get("trains_within", "files")
+    TRAIN_MERGE = (ahead or {}).get("train_merge") is True
+    LEFT_TOP_COVERS = (ahead or {}).get("left_top_covers") is not False
+    LAYERS_OWN_GREEN = (ahead or {}).get("layers_need_own_green") \
+        is not False
+    OWN_GREEN_TO_BOARD = (ahead or {}).get("own_green_to_board") \
+        is not False
+    TRAIN_BRANCH = (ahead or {}).get("train_branch", "forge/train-")
     HOLD_CONFLICTING = merge.get("hold_conflicting", False) is True
     YIELD_PLACES = merge.get("yield_after_hand_back", 0)
     YIELD_CAP = merge.get("yield_cap", 3)
@@ -1203,6 +1442,9 @@ def configure(project):
                                         False) is True
     CODE_OWNERS = merge.get("code_owners", False) is True
     EARLY_CONFLICTS = merge.get("early_conflicts", False) is True
+    RESOLVE_SLOTS = merge.get("resolve_slots", 0)
+    RESOLVE_SLOT_MINUTES = merge.get("resolve_slot_minutes")
+    RESOLVE_SLOT_ON = merge.get("resolve_slot_on", "hand-back")
     row = merge.get("right_of_way")
     RIGHT_OF_WAY = row is not None
     ROW_AFTER = (row or {}).get("after_conflicts", 2)
@@ -1244,6 +1486,7 @@ def configure(project):
     QUEUED_STALL_AFTER = (datetime.timedelta(minutes=queued)
                           if queued is not None else None)
     READ_AS = merge.get("read_as")
+    STALL_RUN_FACTOR = merge.get("stall_run_factor", 1.5)
 
 NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
 BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
@@ -1265,6 +1508,7 @@ query($owner:String!, $name:String!, $cursor:String) {
         number title createdAt lastEditedAt isDraft baseRefName headRefName
         headRefOid body
         author { login }
+        commits(last:1) { nodes { commit { committedDate } } }
         labels(first:50) { nodes { name } }
         reviews(last:100) {
           nodes { databaseId author { login } authorCanPushToRepository
@@ -1311,7 +1555,12 @@ def markers_of(text):
 def approval_of(pr, approvers=None):
     """The newest `APPROVED` review by an APPROVERS App (or one of the
     logins `approvers` names) that is not the pull request's author, or
-    None."""
+    None. With `merge.approval` "green", the head approves itself: an
+    approval of the head, dated by its commit, so anything said after
+    the push holds it as an approval's remarks would, and the build
+    check's green (`own_head_green`) is what lets it merge."""
+    if approvers is None and APPROVAL == "green":
+        return green_approval(pr)
     approvers = APPROVERS if approvers is None else approvers
     best = None
     for review in pr["reviews"]:
@@ -1321,6 +1570,19 @@ def approval_of(pr, approvers=None):
             if best is None or review["submittedAt"] > best["submittedAt"]:
                 best = review
     return best
+
+
+def green_approval(pr):
+    """The approval `merge.approval` "green" gives `pr`'s head."""
+    when = None
+    for key in ("headCommit", "commits"):
+        nodes = (pr.get(key) or {}).get("nodes") or [{}]
+        when = when or ((nodes[-1] or {}).get("commit") or {}).get(
+            "committedDate")
+    return {"state": "APPROVED", "author": {"login": ""}, "body": "",
+            "databaseId": None,
+            "submittedAt": when or pr.get("createdAt") or "",
+            "commit": {"oid": pr.get("headRefOid")}, "green": True}
 
 
 def changes_requested(pr, changers=None):
@@ -1491,6 +1753,19 @@ def blocked_prs(held):
                   if why.startswith(("Blocked-by: #", "stacked on #")))
 
 
+def unblockers(held):
+    """The numbers the pull requests in `blocked_prs(held)` wait on: the
+    `Blocked-by: #N` and `stacked on #N` they name. next.json lists them
+    as `unblocks`, and with checks.order "merge" the build check starts
+    their heads before other unapproved ones (designs/0052)."""
+    found = set()
+    for why in held.values():
+        m = re.match(r"(?:Blocked-by: |stacked on )#(\d+)", why)
+        if m:
+            found.add(int(m.group(1)))
+    return sorted(found)
+
+
 def eligible(pr, open_numbers, now=None, stacked=None, any_base=False):
     """(approval, None) when `pr` is the Merger's, so far as GitHub's
     records say, or (None, reason). Whether the approval covers the head
@@ -1533,21 +1808,43 @@ def eligible(pr, open_numbers, now=None, stacked=None, any_base=False):
     return approval, None
 
 
-def urgent(pr):
-    """Whether `pr` carries `labels.urgent`, or fixes a red nightly or
-    a red default branch."""
-    if pr.get("number") in NIGHTLY_FIXES | MAIN_RED_FIXES:
-        return True
+def labelled_urgent(pr):
+    """Whether `pr` carries `labels.urgent`: someone marked it so by
+    hand."""
     return bool(URGENT_LABEL) and URGENT_LABEL in [
         (n or {}).get("name") for n in
         ((pr.get("labels") or {}).get("nodes") or [])]
 
 
+def cuts_trains(pr):
+    """Whether `pr` may cut trains already cut: a red nightly's or
+    default branch's fix. One labelled urgent may not: it heads the next
+    train cut, behind those already cut (Alex, 2026-11-13); only a
+    bypass merge goes in front of them."""
+    return pr.get("number") in NIGHTLY_FIXES | MAIN_RED_FIXES
+
+
+def labelled_keep(pr):
+    """Whether `pr` carries labels.keep_trains."""
+    return bool(KEEP_LABEL) and KEEP_LABEL in [
+        (n or {}).get("name") for n in
+        ((pr.get("labels") or {}).get("nodes") or [])]
+
+
+def urgent(pr):
+    """Whether `pr` carries `labels.urgent`, or fixes a red nightly or
+    a red default branch."""
+    return labelled_urgent(pr) \
+        or pr.get("number") in NIGHTLY_FIXES | MAIN_RED_FIXES
+
+
 def order(candidates, everyone=None):
     """`candidates` in the order the Merger takes them. First come those
-    carrying `labels.urgent`, then those that another open pull request
-    is blocked by, then the rest, each group oldest first by
-    `createdAt`, then by number.
+    carrying `labels.urgent`, which a person put there; then the other
+    urgent ones, a red nightly's or default branch's fixes, which a
+    tool found; then those that another open pull request is blocked
+    by; then the rest, each group oldest first by `createdAt`, then by
+    number.
 
     `everyone` is every open pull request, candidates or not, and
     defaults to `candidates`. It has to include the ineligible ones: a
@@ -1556,7 +1853,8 @@ def order(candidates, everyone=None):
     named = set()
     for pr in candidates if everyone is None else everyone:
         named |= blockers_of(pr)
-    key = lambda pr: (not urgent(pr), pr["number"] not in named,
+    key = lambda pr: (not labelled_urgent(pr), not urgent(pr),
+                      pr["number"] not in named,
                       pr["createdAt"], pr["number"])
     return sorted(candidates, key=key)
 
@@ -1787,6 +2085,19 @@ def squashed(repo, lower, main_ref, run=sh):
                 "-n", str(SQUASH_DEPTH), main_ref, run=run)
     return (trees.returncode == 0
             and tree.stdout.strip() in trees.stdout.split())
+
+
+def on_main(repo, sha, main_tip, run=sh):
+    """Whether `sha` brings nothing the default branch at `main_tip`
+    lacks: it is in its history, or it is a merged layer's final head,
+    whose tree a squash on its first-parent history has (`squashed`).
+    A merge of either into a pull request (an update, the Merger's
+    RESTACK) changes nothing of the pull request's own. On 2026-11-12 a
+    layer the Merger had just restacked was held for its gated
+    instance's verdict on the new head, which the walk back past such
+    merges didn't reach, and it left its train as a push."""
+    return is_ancestor(repo, sha, main_tip, run) or \
+        squashed(repo, sha, main_tip, run)
 
 
 def based_merge(repo, main_side, layer, lower, run=sh):
@@ -2429,11 +2740,22 @@ def fetch_prs(github):
         cursor = page["pageInfo"]["endCursor"]
 
 
+ISSUES_QUERY = (
+    "query($owner:String!,$name:String!,$endCursor:String){"
+    "repository(owner:$owner,name:$name){issues(states:OPEN,first:100,"
+    "after:$endCursor){nodes{number}pageInfo{hasNextPage endCursor}}}}")
+
+
 def fetch_open_issues(github):
     """Numbers of every open issue, for `Blocked-by:` lines that name
-    one rather than a pull request."""
-    got = github.api("--paginate", "repos/%s/issues?state=open&per_page=100"
-                     % REPO_SLUG, "--jq", "[.[].number]")
+    one rather than a pull request. GraphQL, numbers only: REST's issue
+    list carries every issue's and pull request's whole body, and paging
+    through it was about 4 s of a 13 s tick (agent-forge #301).
+    `--paginate` comes first, as `gh` allows, so it pages by `endCursor`."""
+    owner, name = REPO_SLUG.split("/")
+    got = github.api("--paginate", "graphql", "-f", "query=" + ISSUES_QUERY,
+                     "-F", "owner=" + owner, "-F", "name=" + name,
+                     "--jq", "[.data.repository.issues.nodes[].number]")
     return set(got or [])
 
 
@@ -2581,6 +2903,31 @@ CONFLICT_ADVICE = (
     "needs no new approval: the approval of the head before it still "
     "covers it, and the Merger merges `main` in itself that way.")
 
+# designs/0053: with merge.resolve_slot_on "push", what to merge, and why
+# the full tests can wait for the slot.
+PUSH_ADVICE = (
+    "Merge %s into the branch rather than rebasing it, and push. You "
+    "needn't run the full tests first: your push queues for one of %d "
+    "resolve slots, and the build check in that slot is the test. Once "
+    "one reviewer approves the merge that resolves the conflict, the "
+    "Merger takes it again. A merge git makes cleanly, with nothing "
+    "resolved, needs no new approval.")
+
+
+def conflict_advice():
+    """What a conflict's hand-back tells the author to do: CONFLICT_ADVICE,
+    or with merge.resolve_slot_on "push" (designs/0053), PUSH_ADVICE with
+    the head the Merger suggests (RESOLVE_BASE)."""
+    if not (RESOLVE_SLOTS and RESOLVE_SLOT_ON == "push"):
+        return CONFLICT_ADVICE
+    base = RESOLVE_BASE.get("sha")
+    what = "`%s`" % MAIN if not base else (
+        "`%s` (at %s)" % (MAIN, base[:10]) if not RESOLVE_BASE.get("branch")
+        else "`%s` or, better, the head the Merger suggests: `%s` at %s"
+        % (MAIN, RESOLVE_BASE["branch"], base[:10]))
+    return PUSH_ADVICE % (what, RESOLVE_SLOTS)
+
+
 # The queue as the tick that posts a hand-back sees it, for
 # `others_text`: set by `tick` before it acts.
 QUEUE_VIEW = {}
@@ -2632,7 +2979,7 @@ def hand_back_text(decision, approver):
                     "author. %s\n\n%s%s" % (
                         decision["head"][:10], decision["reason"],
                         detail + "\n\n" if detail else "",
-                        CONFLICT_ADVICE,
+                        conflict_advice(),
                         others_text(decision["pr"]),
                         SIGNATURE))
         return ("Not merging %s: %s.\n\n%sThis is back with its author. "
@@ -2786,7 +3133,8 @@ def save_json(path, value):
     os.replace(path + ".tmp", path)
 
 
-def stalled_for(state_dir, waiting, when, check_state=None):
+def stalled_for(state_dir, waiting, when, check_state=None, repo=None,
+                run=sh):
     """Whole minutes the Merger has waited on `waiting`'s head, once that
     is `STALL_AFTER` or more, else None. `waiting` is the tick's WAIT
     decision or a write GitHub refused, or None when the tick is held up
@@ -2799,7 +3147,17 @@ def stalled_for(state_dir, waiting, when, check_state=None):
     queued (waiting, not started), a stall only after
     QUEUED_STALL_AFTER; running, a stall once STALL_AFTER has passed
     since the later of the wait's start and the run's; neither, as
-    without it."""
+    without it.
+
+    A WAIT's STALL_AFTER is stretched to STALL_RUN_FACTOR times the
+    median of the build check's recent runs, when that is longer
+    (`stall_limit`). A head first in a batch is timed from when the
+    build check started a run of the batch's top, or of any commit with
+    the top's tree (`batch_top_started`, given `repo`): the check runs a
+    tree once, and a later prediction with the same tree waits for it.
+    Neither started, it is timed as before. A head waiting for train 1's
+    run (TRAIN_AHEAD_REASON, `train_top`) is timed from that run's start
+    the same way."""
     path = os.path.join(state_dir, "waiting.json")
     if waiting is None:
         if os.path.exists(path):
@@ -2820,6 +3178,8 @@ def stalled_for(state_dir, waiting, when, check_state=None):
                          "since": iso(when)})
     waited = when - began
     limit, since = STALL_AFTER, began
+    if waiting.get("action") == "WAIT":
+        limit = stall_limit(check_state)
     queue = (check_state or {}).get("waiting")
     entry = queue.get(waiting["head"]) if isinstance(queue, dict) else None
     if (QUEUED_STALL_AFTER is not None and waiting.get("action") == "WAIT"
@@ -2832,24 +3192,83 @@ def stalled_for(state_dir, waiting, when, check_state=None):
             limit = QUEUED_STALL_AFTER
         else:
             since = max(began, started)
-    if waiting.get("action") == "WAIT":
-        top = batch_top_started(state_dir, waiting, check_state)
+    if waiting.get("action") == "WAIT" and waiting.get("train_top"):
+        # Waiting for train 1's run, not its own: timed from that run's
+        # start against a top's limit, as the train's own wait is.
+        started = (check_state or {}).get("ahead_started") or {}
+        try:
+            top = parse_time((started if isinstance(started, dict) else {})
+                             .get(waiting["train_top"]))
+        except (TypeError, ValueError):
+            top = None
         if top is not None:
-            limit, since = STALL_AFTER, max(since, top)
+            limit, since = stall_limit(check_state, top=True), \
+                max(since, top)
+    elif waiting.get("action") == "WAIT":
+        top = batch_top_started(state_dir, waiting, check_state, repo, run)
+        if top is not None:
+            limit, since = stall_limit(check_state, top=True), \
+                max(since, top)
     if when - since < limit:
         return None
     return int(waited.total_seconds() // 60)
 
 
-def batch_top_started(state_dir, waiting, check_state):
+def stall_limit(check_state, top=False):
+    """How long a WAIT may last before it is a stall: STALL_AFTER, or
+    STALL_RUN_FACTOR times the median length of the build check's
+    STALL_RUNS most recently finished runs in `check_state` when that is
+    longer. A result copied from another run (a match, a batch's cover)
+    took no time of its own and isn't counted. With `top`, a wait on a
+    batch's or train's top, the 90th percentile stands in for the
+    median: a top's tree holds every member's changes and runs the
+    steps any of them touches, so it takes as long as the longest
+    single heads, and timed against the median (most heads run few
+    steps) every train was called a stall (2026-11-12)."""
+    if not STALL_RUN_FACTOR:
+        return STALL_AFTER
+    took = []
+    results = (check_state or {}).get("results")
+    for result in (results.values() if isinstance(results, dict) else ()):
+        if not isinstance(result, dict) or result.get("covered") \
+                or not result.get("seconds"):
+            continue
+        try:
+            took.append((parse_time(result["finished"]),
+                         parse_time(result["finished"])
+                         - parse_time(result["started"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    recent = sorted(t for _, t in sorted(took)[-STALL_RUNS:])
+    if not recent:
+        return STALL_AFTER
+    if top:
+        typical = recent[min(len(recent) - 1, (len(recent) * 9) // 10)]
+        return max(STALL_AFTER, typical * STALL_RUN_FACTOR)
+    middle = len(recent) // 2
+    median = recent[middle] if len(recent) % 2 else \
+        (recent[middle - 1] + recent[middle]) / 2
+    return max(STALL_AFTER, median * STALL_RUN_FACTOR)
+
+
+def batch_top_started(state_dir, waiting, check_state, repo=None, run=sh):
     """When the build check started the top of the batch `waiting`'s
     head is first in, by the last tick's AHEAD_FILE and the check's
     `ahead_started`, or None: not first in a batch, or its top not
     started. Such a head is never checked on its own: it waits for the
     top, whose tree includes it (designs/0032), so its wait is timed
-    from the top's start, as a head the check runs is from its own."""
+    from the top's start, as a head the check runs is from its own.
+    Given `repo`, a run in progress of any commit with the top's tree
+    (the check's `running` slots) counts as the top's: the check never
+    runs a tree a slot is already running, so a top whose earlier
+    prediction, the same tree at another commit, is running isn't
+    started until that run ends, and its green covers the top
+    (2026-11-12: such waits were called stalls)."""
     started = (check_state or {}).get("ahead_started")
+    running = (check_state or {}).get("running")
     if not isinstance(started, dict):
+        started = {}
+    if not started and not running:
         return None
     last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
     entries = last.get("entries") if isinstance(last, dict) else None
@@ -2860,9 +3279,24 @@ def batch_top_started(state_dir, waiting, check_state):
         if size < 1 or (first["pr"], first["head"]) != (waiting["pr"],
                                                          waiting["head"]):
             return None
-        return parse_time(started.get(top["sha"]))
+        if top["sha"] in started:
+            return parse_time(started[top["sha"]])
     except (AttributeError, IndexError, KeyError, TypeError, ValueError):
         return None
+    if repo is None or not isinstance(running, list):
+        return None
+    for slot in running:
+        try:
+            sha, at = slot["sha"], parse_time(slot["started"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if sha == top["sha"]:
+            return at
+        tree = git(repo, "rev-parse", "--verify", "-q", sha + "^{tree}",
+                   run=run)
+        if tree.returncode == 0 and tree.stdout.strip() == top.get("tree"):
+            return at
+    return None
 
 
 def where_to_look():
@@ -2993,6 +3427,150 @@ def end_stall(state_dir, github, alert, decisions, out):
         os.remove(path)
 
 
+MERGED_PATH = ("repos/%s/pulls?state=closed&sort=updated&direction=desc"
+               "&per_page=50&base=%s")
+
+
+def record_hand_merges(state_dir, github, out, when):
+    """merge.mode manual (agent-forge #274): append a MERGE record to
+    merger.jsonl, at its merge time, for each pull request merged since
+    the last run, so what counts the Merger's merges counts these. The
+    first run only starts the clock: nothing before it is recorded."""
+    path = os.path.join(state_dir, HAND_MERGES_NAME)
+    seen = load_json(path, {})
+    since = seen.get("since") if isinstance(seen, dict) else None
+    if not since:
+        save_json(path, {"since": iso(when)})
+        out("MANUAL: merge.mode is manual; counting hand merges from now")
+        return []
+    merged = sorted(
+        (pr["merged_at"], pr["number"], (pr.get("merged_by") or {}).get(
+            "login") or (pr.get("user") or {}).get("login"))
+        for pr in github.api(MERGED_PATH % (REPO_SLUG, MAIN)) or []
+        if isinstance(pr, dict) and pr.get("merged_at")
+        and pr["merged_at"] > since)
+    records = [{"at": at, "queue": [], "held": {}, "manual": True,
+                "decisions": [{"pr": number, "action": "MERGE",
+                               "result": "done", "by": who}]}
+               for at, number, who in merged]
+    if records:
+        with open(os.path.join(state_dir, "merger.jsonl"), "a") as handle:
+            for record in records:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        save_json(path, {"since": merged[-1][0]})
+    out("MANUAL: merge.mode is manual; %d hand merge(s) recorded%s" % (
+        len(records), ": " + ", ".join("#%d" % n for _, n, _ in merged)
+        if merged else ""))
+    return records
+
+
+def merge_ready(repo, github, number, run=sh):
+    """Why pull request `number` isn't ready to merge by hand, as a
+    list, empty when it is (agent-forge #274): open and not a draft,
+    `checks.context` green (by its poster) and the CI workflow passed on
+    the head, the default branch's tip in its history, no `Blocked-by:`
+    item open, and, with merge.code_owners, an owner's word."""
+    prs = fetch_prs(github)
+    pr = next((p for p in prs if p["number"] == number), None)
+    if pr is None:
+        return ["#%d is not an open pull request" % number]
+    head, why = pr["headRefOid"], []
+    if pr.get("isDraft"):
+        why.append("it is a draft")
+    state, said = status_state(github.api(
+        "repos/%s/commits/%s/statuses?per_page=100" % (REPO_SLUG, head))
+        or [])
+    if state != "success":
+        why.append("%s is %s%s" % (STATUS_CONTEXT, state or "absent",
+                                   ": " + said if said else ""))
+    if CI_WORKFLOW:
+        problem = ci_problem(github.api(
+            "repos/%s/actions/runs?head_sha=%s&per_page=100"
+            % (REPO_SLUG, head)).get("workflow_runs") or [])
+        if problem:
+            why.append(problem)
+    git(repo, "fetch", "-q", "origin", MAIN, run=run)
+    main_ref = "refs/remotes/origin/" + MAIN
+    have_head(repo, pr, run)
+    if git(repo, "merge-base", "--is-ancestor", main_ref, head,
+           run=run).returncode != 0:
+        why.append("it is not current with %s: merge %s into it first"
+                   % (MAIN, MAIN))
+    open_numbers = {p["number"] for p in prs} | fetch_open_issues(github)
+    blocking = sorted(blockers_of(pr) & open_numbers)
+    if blocking:
+        why.append("Blocked-by %s, still open" % ", ".join(
+            "#%d" % n for n in blocking))
+    if CODE_OWNERS:
+        rules = codeowners_rules(repo, main_ref, run)
+        held = rules and code_owner_wait(repo, pr, rules, main_ref, run)
+        if held:
+            why.append(held)
+    return why
+def code_owner_asks(state_dir, github, waits, open_heads, out):
+    """merge.code_owner_ask (agent-forge #153): one issue for each pull
+    request held for a code owner at a head, so an owner working from a
+    list of asks sees it. `waits` maps the pull requests judged this tick
+    to (head, why held or None); `open_heads` maps every open pull
+    request to its head. An ask is closed when its pull request is no
+    longer open, has another head, or was judged and isn't held; one not
+    judged this tick (no longer a candidate for another reason) stays.
+    What GitHub refuses is tried again next tick."""
+    path = os.path.join(state_dir, CODE_OWNER_ASK_NAME)
+    asks = load_json(path, {})
+    title, labels = CODE_OWNER_ASK
+    for key, ask in sorted(asks.items()):
+        number = int(key)
+        head, why = waits.get(number, (ask["head"], "unjudged"))
+        if open_heads.get(number) == ask["head"] == head and why:
+            continue
+        ended = ("#%d was closed" % number if number not in open_heads
+                 else "#%d has a new head" % number
+                 if open_heads[number] != ask["head"]
+                 else "#%d no longer waits for a code owner" % number)
+        github.write("POST", "repos/%s/issues/%d/comments"
+                     % (REPO_SLUG, ask["issue"]),
+                     body="%s.\n\n%s" % (ended, SIGNATURE))
+        ok, refused = github.write(
+            "PATCH", "repos/%s/issues/%d" % (REPO_SLUG, ask["issue"]),
+            state="closed")
+        out("CODE-OWNER-ASK-CLOSED: #%d for #%d" % (ask["issue"], number)
+            if ok else "CODE-OWNER-ASK-CLOSED: #%d for #%d could not be "
+            "closed: %s" % (ask["issue"], number, refused))
+        # Forgotten even when refused, as a stall's issue is: a person
+        # can close it.
+        del asks[key]
+    for number, (head, why) in sorted(waits.items()):
+        if not why or str(number) in asks:
+            continue
+        body = {"title": title.replace("{pr}", str(number)),
+                "body": "The Merger holds #%d at %s: it %s.\n\nIt merges "
+                "once a code owner approves at this head, and closes this "
+                "issue then, or when the head changes.\n\n%s"
+                % (number, head, why, SIGNATURE)}
+        issue, refused = github.create("repos/%s/issues" % REPO_SLUG, **body)
+        if issue is None:
+            out("CODE-OWNER-ASK refused: #%d: %s" % (number, refused))
+            continue
+        out("CODE-OWNER-ASK: opened #%d for #%d at %s"
+            % (issue, number, head[:10]))
+        asks[str(number)] = {"head": head, "issue": issue, "labeled": []}
+    for key, ask in sorted(asks.items()):
+        labeled = ask.setdefault("labeled", list(labels))
+        for label in labels:
+            if label in labeled:
+                continue
+            ok, refused = github.write("POST", label_path(ask["issue"]),
+                                       **{"labels[]": label})
+            if ok:
+                labeled.append(label)
+            else:
+                out("CODE-OWNER-ASK-LABEL refused: %s on #%d: %s"
+                    % (label, ask["issue"], refused))
+    if asks or os.path.exists(path):
+        save_json(path, asks)
+
+
 def tell_stall(state_dir, github, stalled, decisions, when, send, out,
                reason=None):
     """A stall opens its own issue and messages STALL_TELL, again every
@@ -3090,8 +3668,13 @@ def parse_time(stamp):
 def load_router():
     """bin/forge-router as a module, loaded when needed: it loads this
     file itself, so it can't be imported at the top."""
+    return load_tool("forge-router")
+
+
+def load_tool(name):
+    """bin/<name> as a module."""
     loader = importlib.machinery.SourceFileLoader(
-        "forge_router", os.path.join(BIN, "forge-router"))
+        name.replace("-", "_"), os.path.join(BIN, name))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -3255,6 +3838,200 @@ def ci_rerun(decision, github, state_dir, when, live, out):
                 else "re-running it was refused: " + why))
         return None
     return None
+
+
+# merge.resolve_slots: why one that conflicts with main is held rather
+# than handed back (designs/0012, amendment of 2026-11-12).
+RESOLVE_WAIT_REASON = ("conflicts with %s; waits for a resolve slot "
+                       "(%d out: %s)")
+# merge.resolve_slot_minutes: why one whose slot ran out is held.
+RESOLVE_EXPIRED_REASON = ("conflicts with %s; its resolve slot ran out "
+                          "after %s minutes with no push, and it waits "
+                          "behind the others for another (%d out: %s)")
+
+
+def expire_resolving(path, resolving, prs, when):
+    """merge.resolve_slot_minutes: (kept, expired, slots), `resolving`
+    (`out_for_resolving`) split into those still holding their slot and
+    those whose slot ran out, and what `path` (RESOLVE_FILE) keeps: per
+    pull request out, its head and since when its slot has been held
+    at it. A slot runs out RESOLVE_SLOT_MINUTES after it was given with
+    no push, so one author's long resolution doesn't keep the others
+    from theirs; it is the author's push that frees a slot, and one
+    that ran out is still told and can still be pushed. Its pull request
+    is held like those that wait, behind them all (`resolve_slot_order`).
+    A pull request first seen out, or out at another head, counts from
+    now."""
+    before = load_json(path, {})
+    heads = {pr["number"]: pr["headRefOid"] for pr in prs}
+    slots, kept, expired = {}, [], []
+    for number in resolving:
+        entry = before.get(str(number))
+        if not isinstance(entry, dict) or entry.get("head") != heads[number]:
+            entry = {"head": heads[number], "since": iso(when)}
+        slots[str(number)] = entry
+        try:
+            held = when - parse_time(entry["since"])
+        except (KeyError, TypeError, ValueError):
+            entry["since"] = iso(when)
+            held = datetime.timedelta(0)
+        if RESOLVE_SLOT_MINUTES and held >= datetime.timedelta(
+                minutes=RESOLVE_SLOT_MINUTES):
+            expired.append(number)
+        else:
+            kept.append(number)
+    return kept, expired, slots
+
+
+def out_for_resolving(said, prs, repo, main_tip, run=sh):
+    """merge.resolve_slots: the numbers of the open pull requests out for
+    resolving, sorted. One is out when `said` has it handed back for a
+    conflict with main (any reason that starts with CONFLICT_REASON, a
+    restack's too) at the head and under the approval it has now, it
+    isn't a draft, and it still conflicts. Its slot frees when its
+    author pushes (the head moves), it loses its approval or gets a
+    new one, it closes, merges or is drafted, or main moves so that it
+    no longer conflicts. A restack's conflict is with the layer below's
+    final head, which main alone doesn't settle, so it counts until
+    one of the others."""
+    out = []
+    for pr in prs:
+        before = said.get(str(pr["number"])) or {}
+        approval = approval_of(pr)
+        reason = before.get("reason") or ""
+        if (approval is None or pr.get("isDraft")
+                or not reason.startswith(CONFLICT_REASON)
+                or before.get("head") != pr["headRefOid"]
+                or before.get("approved") != approval.get("submittedAt")):
+            continue
+        if "'s final head" not in reason:
+            have_head(repo, pr, run)
+            if is_ancestor(repo, main_tip, pr["headRefOid"], run):
+                continue
+            merged = git(repo, "merge-tree", "--write-tree", "--name-only",
+                         "--no-messages", main_tip, pr["headRefOid"],
+                         run=run)
+            if merged.returncode == 0:
+                continue
+        out.append(pr["number"])
+    return sorted(out)
+
+
+# designs/0053: why a resolution waiting for a slot isn't checked yet.
+RESOLVE_QUEUE_REASON = ("a resolution of a conflict with %s; waits for a "
+                        "resolve slot (%d out: %s)")
+
+
+def resolutions(said, prs, queue, repo, main_tip, run=sh, known=()):
+    """designs/0053: the open pull requests whose head resolves a conflict
+    they were handed back for. One is a resolution when `said` has it
+    handed back for a conflict with main (CONFLICT_REASON) at another
+    head, it isn't a draft, it isn't a candidate again (in `queue`), and
+    its head now merges cleanly with main. A restack's conflict is with
+    a layer, not main, and is left to the restack. One in `known` (a
+    resolution last tick) stays one whatever `said` now has, since a
+    resolution resolved by hand is soon handed to its reviewer."""
+    candidates = {pr["number"] for pr in queue}
+    found = []
+    for pr in prs:
+        told = said.get(str(pr["number"])) or {}
+        reason = str(told.get("reason") or "")
+        told_conflict = (reason.startswith(CONFLICT_REASON)
+                         and "'s final head" not in reason
+                         and told.get("head") not in (None,
+                                                      pr["headRefOid"]))
+        if (not (told_conflict or str(pr["number"]) in known)
+                or pr.get("isDraft") or pr["number"] in candidates):
+            continue
+        have_head(repo, pr, run)
+        if not is_ancestor(repo, main_tip, pr["headRefOid"], run):
+            merged = git(repo, "merge-tree", "--write-tree", "--name-only",
+                         "--no-messages", main_tip, pr["headRefOid"],
+                         run=run)
+            if merged.returncode != 0:
+                continue
+        found.append(pr)
+    return found
+
+
+def push_slots(path, found, queue, prs, when, row=None):
+    """designs/0053: (slotted, waiting, expired, slots), the resolutions
+    `found` (`resolutions`) split into those holding one of
+    RESOLVE_SLOTS, in the order given, and those waiting for one, in
+    `resolve_slot_order`; the numbers of those whose slot ran out this
+    tick; and what `path` keeps per resolution: its head, whether it
+    holds a slot, and since when. A slot is kept until its pull request
+    is no longer a resolution (a candidate again, merged, closed, or
+    conflicting again), or, with RESOLVE_SLOT_MINUTES, until that long
+    after it was given or its head last moved. One whose slot ran out
+    waits behind the others."""
+    before = load_json(path, {})
+    before = before if isinstance(before, dict) else {}
+    limit = datetime.timedelta(minutes=RESOLVE_SLOT_MINUTES) \
+        if RESOLVE_SLOT_MINUTES else None
+    slots, kept, expired = {}, [], []
+    for pr in found:
+        entry = before.get(str(pr["number"]))
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        if entry.get("head") != pr["headRefOid"]:
+            entry["since"] = iso(when)
+        entry["head"] = pr["headRefOid"]
+        if entry.get("slot"):
+            try:
+                held = when - parse_time(entry["since"])
+            except (KeyError, TypeError, ValueError):
+                held = datetime.timedelta(0)
+            if limit is not None and held >= limit:
+                entry.update(slot=False, expired=True)
+                expired.append(pr["number"])
+            else:
+                kept.append(pr)
+        slots[str(pr["number"])] = entry
+    waiting = resolve_slot_order(
+        [pr for pr in found if pr not in kept], queue, prs, row,
+        last={int(n) for n, e in slots.items() if e.get("expired")})
+    given = waiting[:max(0, RESOLVE_SLOTS - len(kept))]
+    for pr in given:
+        slots[str(pr["number"])].update(slot=True, since=iso(when))
+        slots[str(pr["number"])].pop("expired", None)
+    return kept + given, waiting[len(given):], expired, slots
+
+
+def approved_above(number, prs):
+    """How many open pull requests stacked, at any depth, on `number`
+    have an approval (`approval_of`)."""
+    by_number = {pr["number"]: pr for pr in prs}
+    branches, count = {by_number[number]["headRefName"]}, 0
+    while branches:
+        above = [pr for pr in prs if pr.get("baseRefName") in branches]
+        count += sum(1 for pr in above if approval_of(pr) is not None)
+        branches = {pr["headRefName"] for pr in above}
+    return count
+
+
+def resolve_slot_order(waiting, queue, prs, row=None, last=()):
+    """merge.resolve_slots: `waiting`, pull requests that conflict with
+    main and aren't out for resolving, in the order they get a slot:
+    those labelled urgent, then the other urgent ones (`urgent`), then
+    the one with right of way (`row`, unless idle), then by how soon
+    they would board: their place in `queue`, the order the Merger takes
+    them in, grouped by `merge.test_ahead.batch` when there are
+    batches; within a group, a stack's base with more approved layers
+    above it (`approved_above`) first, then the queue's order; last,
+    one not in the queue (held for an instance), oldest first. Those in
+    `last`, whose slot ran out (merge.resolve_slot_minutes), go after
+    all of them."""
+    places = {pr["number"]: at for at, pr in enumerate(queue)}
+    group = AHEAD_BATCH if TEST_AHEAD and AHEAD_BATCH > 1 else 1
+    holder = row.get("pr") if row and not row.get("idle") else None
+
+    def key(pr):
+        place = places.get(pr["number"], len(places))
+        return (pr["number"] in last, not labelled_urgent(pr), not urgent(pr),
+                pr["number"] != holder, place // group,
+                -approved_above(pr["number"], prs), place,
+                pr.get("createdAt") or "", pr["number"])
+    return sorted(waiting, key=key)
 
 
 def early_conflicts(repo, main_tip, rest, approvals, github, said, live,
@@ -3423,46 +4200,66 @@ def ready_layers(repo, base, prs, open_numbers, when, said, run=sh,
                  conflicted=()):
     """designs/0035: the layers stacked on `base`, climbing the stack,
     that would be eligible but for their base, each with an approval
-    that covers its head, as [(pull request, approval)]. The first that
-    isn't ready ends the climb, as does a layer with another beside it,
-    since which goes first is the author's to say. A layer is ready only
-    when it could merge as it is but for the batch's own check: with
-    `gated` (`instance_wait`), a layer still waiting for a gated
-    instance's context isn't, since the batch's run is not that
-    instance's, and it would leave the batch at its merge. Nor is one in
-    `conflicted`, whose base's head conflicts with it (designs/0025,
+    that covers its head, as [(pull request, approval)], each after the
+    layer it is on. Layers side by side on one base (amendment of
+    2026-11-12: three on one base, all approved and green, and none
+    boarded) are taken in number order, depth first: a layer, the
+    layers on it, then the next layer beside it. One that isn't ready
+    ends the climb on its own branch only. A layer is ready only when
+    it could merge as it is but for the batch's own check: with `gated`
+    (`instance_wait`), a layer still waiting for a gated instance's
+    context isn't, since the batch's run is not that instance's, and it
+    would leave the batch at its merge. With `green` (`own_green_wait`),
+    one waiting for its own build check isn't either; without it
+    (`layers_need_own_green` false), the train's top tests it. Nor is one
+    in `conflicted`, whose base's head conflicts with it (designs/0025,
     amendment of 2026-11-11): it could only be left behind."""
-    layers, below, numbers = [], base, {base["number"]}
-    while True:
-        above = [pr for pr in prs
-                 if pr.get("baseRefName") == below.get("headRefName")]
-        if len(above) != 1:
-            return layers
-        layer = above[0]
-        if layer["number"] in conflicted:
-            return layers
-        approval, _ = eligible(layer, open_numbers - numbers, when,
-                               any_base=True)
-        oid = ((approval or {}).get("commit") or {}).get("oid")
-        if not oid or handed_back(said, layer, approval, when):
-            return layers
-        have_head(repo, layer, run)
-        if git(repo, "cat-file", "-e", oid + "^{commit}",
-               run=run).returncode != 0 or not covers_head(
-                repo, oid, layer["headRefOid"], "refs/remotes/origin/" + MAIN,
-                run, (below["headRefOid"],), regenerated)[0]:
-            return layers
-        if rules and code_owner_wait(repo, layer, rules,
-                                     "refs/remotes/origin/" + MAIN, run,
-                                     regenerated):
-            return layers
-        if green is not None and green(layer, approval):
-            return layers
-        if gated is not None and gated(layer):
-            return layers
-        layers.append((layer, approval))
-        below = layer
-        numbers.add(layer["number"])
+    layers = []
+
+    def climb(below, numbers):
+        above = sorted((pr for pr in prs
+                        if pr.get("baseRefName") == below.get("headRefName")),
+                       key=lambda pr: pr["number"])
+        for layer in above:
+            if layer["number"] in conflicted:
+                continue
+            approval = ready_layer(repo, layer, below, open_numbers,
+                                   numbers, when, said, run, regenerated,
+                                   rules, green, gated)
+            if approval is None:
+                continue
+            layers.append((layer, approval))
+            climb(layer, numbers | {layer["number"]})
+
+    climb(base, {base["number"]})
+    return layers
+
+
+def ready_layer(repo, layer, below, open_numbers, numbers, when, said,
+                run=sh, regenerated=None, rules=None, green=None,
+                gated=None):
+    """`ready_layers`' test of one `layer` on `below`: its approval when
+    it is ready, else None. `numbers` are the layers under it."""
+    approval, _ = eligible(layer, open_numbers - numbers, when,
+                           any_base=True)
+    oid = ((approval or {}).get("commit") or {}).get("oid")
+    if not oid or handed_back(said, layer, approval, when):
+        return None
+    have_head(repo, layer, run)
+    if git(repo, "cat-file", "-e", oid + "^{commit}",
+           run=run).returncode != 0 or not covers_head(
+            repo, oid, layer["headRefOid"], "refs/remotes/origin/" + MAIN,
+            run, (below["headRefOid"],), regenerated)[0]:
+        return None
+    if rules and code_owner_wait(repo, layer, rules,
+                                 "refs/remotes/origin/" + MAIN, run,
+                                 regenerated):
+        return None
+    if green is not None and green(layer, approval):
+        return None
+    if gated is not None and gated(layer):
+        return None
+    return approval
 
 
 def with_layers(queue, layers_of, last, size):
@@ -3752,8 +4549,9 @@ def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
     """(state, description, sha) of `context` for `pr`: on its head,
     or, while the head has none final, on the commit before each merge
     of the default branch into it (the Merger's own `update-branch`, or
-    the author's), back to the first commit that isn't one. A merge of
-    the default branch changes nothing of the pull request's own, and
+    the author's), or of a merged layer's final head (the Merger's
+    RESTACK: `on_main`), back to the first commit that isn't one. A
+    merge of either changes nothing of the pull request's own, and
     an instance whose verdicts take an hour would otherwise never
     catch up with a head the Merger updates whenever the default
     branch moves. A head's own pending verdict is the answer when no
@@ -3769,21 +4567,22 @@ def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
             first = (state, said, commit)
         parents = git(repo, "rev-list", "--parents", "-n", "1", commit,
                       run=run).stdout.split()
-        if len(parents) != 3 or not is_ancestor(repo, parents[2],
-                                                main_tip, run):
+        if len(parents) != 3 or not on_main(repo, parents[2], main_tip,
+                                            run):
             break
         commit = parents[1]
     return first or (None, "", pr["headRefOid"])
 
 
 def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
-                   run=sh):
+                   run=sh, boarded=None):
     """Why `pr` isn't a candidate yet under merge.own_head_green, or
     None: checks.context isn't green (success) on the commit its
     approval names, nor on its head, nor (given `repo` and `main_tip`)
-    on the commit before each merge of the default branch into the
-    head, back to the first commit that isn't one, as for an instance
-    (`instance_verdict`). A merge of the default branch changes nothing
+    on the commit before each merge of the default branch (or of a
+    merged layer's final head) into the head, back to the first commit
+    that isn't one, as for an instance (`instance_verdict`). A merge of
+    the default branch changes nothing
     of the pull request's own: without that, a head the Merger has just
     updated, whose build check hasn't yet posted (a batch member's
     `covered by batch` green comes a minute later), would be held for
@@ -3793,7 +4592,12 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
     once a tick per commit, through `cache`, which keeps a green across
     ticks (`load_greens`). A pending, red or absent
     context holds the pull request: nothing merges, boards a batch or a
-    train, or is predicted until the build check has passed on it."""
+    train, or is predicted until the build check has passed on it.
+
+    `boarded` (merge.test_ahead.layers_need_own_green false) is the head
+    a stack's layer boarded a train with: while the head is that one, or
+    that one brought up to date as above, it needs no green of its own,
+    since the train's top tests it."""
     approved = ((approval or {}).get("commit") or {}).get("oid")
     head = pr.get("headRefOid")
     shas = [approved, head]
@@ -3803,11 +4607,13 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
             depth += 1
             parents = git(repo, "rev-list", "--parents", "-n", "1", commit,
                           run=run).stdout.split()
-            if len(parents) != 3 or not is_ancestor(repo, parents[2],
-                                                    main_tip, run):
+            if len(parents) != 3 or not on_main(repo, parents[2],
+                                                main_tip, run):
                 break
             commit = parents[1]
             shas.append(commit)
+    if boarded and boarded in shas[1:]:
+        return None
     seen = []
     for sha in dict.fromkeys(s for s in shas if s):
         if sha not in cache:
@@ -3940,6 +4746,60 @@ def code_owner_wait(repo, pr, rules, main_ref, run=sh, regenerated=None):
     more = sum(len(p) for p in waiting.values()) - 1
     return "waits for code owner %s: %s%s" % (
         who, paths[0], " and %d more" % more if more else "")
+
+
+def owned_lines(repo, pr, rules, main_ref, run=sh):
+    """{path: [(first, last), ...]}: the default branch's lines each
+    code-owned path `pr` changes since `main_ref` covers (a pure
+    insertion as the line it follows), or None if git can't say."""
+    got = git(repo, "diff", "-U0", "--no-color", "%s...%s"
+              % (main_ref, pr["headRefOid"]), run=run)
+    if got.returncode != 0:
+        return None
+    found, path = {}, None
+    for line in got.stdout.splitlines():
+        if line.startswith("--- "):
+            name = line[4:]
+            path = name[2:] if name.startswith("a/") else None
+        elif line.startswith("+++ ") and path is None:
+            name = line[4:]
+            path = name[2:] if name.startswith("b/") else None
+        elif line.startswith("@@") and path and owners_of(path, rules):
+            m = HUNK_RE.match(line)
+            if m:
+                start, count = int(m.group(1)), int(m.group(2) or 1)
+                found.setdefault(path, []).append(
+                    (start, start + max(count, 1) - 1))
+    return found
+
+
+def sequence_owned(repo, prs, waits, rules, main_ref, run=sh):
+    """merge.code_owner_sequence (agent-forge #264): {number: (head,
+    why)} for each pull request held for a code owner (`waits`) that
+    changes lines of an owned path an older such pull request also
+    changes. It waits for the oldest, so the owner is asked once."""
+    by_number = {pr["number"]: pr for pr in prs}
+    held = sorted(n for n, (_head, why) in waits.items() if why)
+    lines = {}
+    for number in held:
+        lines[number] = owned_lines(repo, by_number[number], rules,
+                                    main_ref, run) or {}
+    out = {}
+    for i, number in enumerate(held):
+        for older in held[:i]:
+            if older in out:
+                continue
+            clash = [(path, max(a, c), min(b, d))
+                     for path, ranges in sorted(lines[number].items())
+                     for a, b in ranges
+                     for c, d in lines[older].get(path, ())
+                     if a <= d and c <= b]
+            if clash:
+                path, first, last = clash[0]
+                out[number] = (waits[number][0],
+                               SEQUENCE_REASON % (older, path, first, last))
+                break
+    return out
 
 
 def conflicts_with(repo, head, queue, run=sh):
@@ -4126,7 +4986,11 @@ def own_push(repo, before, head, main_tip, run=sh, depth=OWN_PUSH_DEPTH):
     """Whether `head` is `before` brought up to date and nothing else:
     each commit from `head` back along first parents to `before` is a
     clean merge (its tree is what git merges its two parents to) whose
-    second parent adds nothing `main_tip` lacks. That is what the
+    second parent adds nothing `main_tip` lacks: merged into it, it
+    gives `main_tip`'s tree, or it is a merged layer's final head, whose
+    tree is a squash on the default branch (`squashed`; merged into a
+    tip that has since changed that layer's lines, it would conflict).
+    That is what the
     Merger's own pushes make, an update (GitHub merges the default
     branch in), a RESTACK (the layer below's final head, which the
     default branch has as one squash) and a STACK-UPDATE, in any
@@ -4159,11 +5023,46 @@ def own_push(repo, before, head, main_tip, run=sh, depth=OWN_PUSH_DEPTH):
             return False
         into = git(repo, "merge-tree", "--write-tree", "--no-messages",
                    main_tip, second, run=run)
-        if into.returncode != 0 or \
-                into.stdout.split()[:1] != main_tree.stdout.split():
+        if (into.returncode != 0
+                or into.stdout.split()[:1] != main_tree.stdout.split()) \
+                and not squashed(repo, second, main_tip, run):
             return False
         head = first
     return head == before
+
+
+def same_prediction(repo, parent, graph, before, pr, restacks=None,
+                    run=sh, tree=None):
+    """The prediction of `pr`'s head on `parent` (through `graph`, as
+    `predict_one`), when its tree is the one the head it boarded with,
+    `before`, gives there, or None. `tree` is that tree when the train
+    up to `parent` is the one it was predicted in (its prediction, which
+    is what the train's top tested); without it, `before` is predicted
+    again, and None is returned when the checkout no longer has it.
+
+    A push whose prediction is unchanged changes nothing the train
+    tests: in effect it only merges what the train already has below
+    it, whoever made the merge and however (the default branch as the
+    first parent, a merge past `own_push`'s depth, a rebase onto it, or
+    the head of a member ahead of it in the train, which `own_push`
+    refuses, since the default branch lacks it). A merge of a member
+    behind it, or of a pull request in no train, brings changes the
+    train doesn't have there, and it leaves. Such a member
+    keeps its place in its train (designs/0047, amendment of
+    2026-11-12): taking it out cut every train behind it again and
+    threw their running builds away. Its prediction is the same commit
+    (the same tree on the same parent), so the train's top is too."""
+    entry, _ = predict_one(repo, parent, pr, restacks, run, graph)
+    if entry is None or not before:
+        return None
+    if tree is None:
+        if git(repo, "cat-file", "-e", before + "^{commit}",
+               run=run).returncode != 0:
+            return None
+        old, _ = predict_one(repo, parent, dict(pr, headRefOid=before),
+                             restacks, run, graph)
+        tree = (old or {}).get("tree")
+    return entry if tree is not None and entry["tree"] == tree else None
 
 
 def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
@@ -4193,11 +5092,12 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
     it, as `decide` will once it is reached, and says `restacked`;
     only if that fails too is it a conflict."""
     depth = AHEAD_DEPTH if depth is None else depth
-    entries, parent = [], main_tip
+    entries, parent, graph = [], main_tip, None
     for pr in queue:
         if len(entries) > depth:
             break
-        entry, failed = predict_one(repo, parent, pr, restacks, run)
+        entry, failed = predict_one(repo, parent, pr, restacks, run,
+                                    graph)
         if failed == "conflict" and entries \
                 and pr["number"] not in overdue:
             # It conflicts with one predicted ahead of it: skip it,
@@ -4206,20 +5106,32 @@ def predict_ahead(repo, main_tip, queue, run=sh, depth=None,
         if entry is None:
             break
         entries.append(entry)
-        parent = entry["sha"]
+        parent, graph = entry["sha"], entry.get("graph")
     write_ahead_refs(repo, entries, run)
     return entries
 
 
-def predict_one(repo, parent, pr, restacks=None, run=sh):
+def predict_one(repo, parent, pr, restacks=None, run=sh, graph=None):
     """(entry, None) for `pr`'s head merged onto `parent`, as one of
     `predict_ahead`'s entries, its commit made (but no ref written); or
     (None, "conflict") when it conflicts, and (None, "git") when git
-    failed otherwise. `restacks` is `predict_ahead`'s."""
+    failed otherwise. `restacks` is `predict_ahead`'s.
+
+    `graph` is the previous entry's "graph": a commit with `parent`'s
+    tree whose history also holds every head predicted so far. The
+    head is merged onto that, so a stack's layer merges from its real
+    merge base, the lower layer's head, not from where the stack left
+    the default branch: from there, its copy of the lower layer's
+    changes met their predicted copy as a conflict wherever it changed
+    those lines again, and the layer was left out of its base's train.
+    The entry's own commit keeps `parent` as its only parent, so a
+    head the Merger updates (same tree) is still the same prediction
+    and isn't built again; the entry's "graph" is the next one's."""
     head = pr["headRefOid"]
     have_head(repo, pr, run)
+    graph = graph or parent
     merged = git(repo, "merge-tree", "--write-tree", "--no-messages",
-                 parent, head, run=run)
+                 graph, head, run=run)
     restacked = None
     if merged.returncode == 1 and pr["number"] in (restacks or {}):
         # A layer still holds the lower layer's own commits, which
@@ -4240,6 +5152,17 @@ def predict_one(repo, parent, pr, restacks=None, run=sh):
     if made.returncode != 0 or len(sha) != 40:
         return None, "git"
     entry = {"pr": pr["number"], "head": head, "sha": sha, "tree": tree}
+    if not is_ancestor(repo, head, graph, run):
+        made = run(["git", "-C", repo, "commit-tree", "--no-gpg-sign",
+                    tree, "-p", graph, "-p", head, "-m",
+                    "forge-merger: #%d ahead, with its head"
+                    % pr["number"]], env=ahead_env())
+        joined = (made.stdout or "").strip()
+        if made.returncode != 0 or len(joined) != 40:
+            return None, "git"
+        entry["graph"] = joined
+    elif graph != parent:
+        entry["graph"] = graph
     if restacked:
         # designs/0042: the tree the restack will give, which the
         # head's own check doesn't test.
@@ -4296,6 +5219,129 @@ def train_carriages(queue, layers_of=None):
             placed.add(layer["number"])
         out.append(carriage)
     return out
+
+
+def carriage_bases(carriage):
+    """{number: the number of the member of `carriage` it is stacked
+    on, or None for the carriage's first}. A carriage is a stack: a
+    pull request and its ready layers, each after the one it is on,
+    and layers side by side on one base make it a tree, not a chain
+    (amendment of 2026-11-12). A member whose base isn't in the carriage
+    is taken to be on the one before it."""
+    by_branch = {pr.get("headRefName"): pr["number"] for pr in carriage}
+    # One whose base isn't in the carriage is taken to be on the one
+    # before it, as a chain.
+    return {pr["number"]: by_branch.get(pr.get("baseRefName"),
+                                        carriage[k - 1]["number"])
+            if k else None for k, pr in enumerate(carriage)}
+
+
+def stacked_on(number, bases):
+    """The members `bases` (`carriage_bases`, or a train's entries'
+    `on`) has stacked on `number`, directly or not."""
+    out, grew = set(), True
+    while grew:
+        grew = False
+        for n, on in bases.items():
+            if n not in out and (on == number or on in out):
+                out.add(n)
+                grew = True
+    return out
+
+
+def kept_by_label(sha, github, cache):
+    """labels.keep_trains: the pull request carrying KEEP_LABEL that
+    `sha`, a commit on the default branch, merged, or None. Answers are
+    kept in `cache` ({sha: number, or 0}); one GitHub can't give isn't
+    kept, and counts as None."""
+    if sha in cache:
+        return cache[sha] or None
+    owner, name = REPO_SLUG.split("/")
+    try:
+        got = github.api("graphql", "-f", "query=" + KEEP_QUERY,
+                         "-F", "owner=" + owner, "-F", "name=" + name,
+                         "-f", "oid=" + sha)
+        nodes = got["data"]["repository"]["object"][
+            "associatedPullRequests"]["nodes"]
+    except (RuntimeError, KeyError, TypeError, ValueError):
+        return None
+    found = 0
+    for node in nodes or ():
+        if not isinstance(node, dict) or node.get("merged") is not True \
+                or (node.get("mergeCommit") or {}).get("oid") != sha:
+            continue
+        if KEEP_LABEL in [(n or {}).get("name") for n in
+                          ((node.get("labels") or {}).get("nodes") or ())]:
+            found = node.get("number") or 0
+    cache[sha] = found
+    return found or None
+
+
+def carried_base(repo, state_dir, last, main_tip, github, run=sh,
+                 out=print):
+    """labels.keep_trains (amendment of 2026-11-12, tenth): the commit
+    the trains in `last` (ahead.json, `trains_before`) stay predicted
+    on, and `main_tip` when they don't. They stay on their base when
+    the default branch has moved since only by merges of pull requests
+    carrying KEEP_LABEL (at most KEEP_MOST of them, each followed back
+    by its first parent), and the last train's top still merges with
+    `main_tip` cleanly: their runs go on, and a green train merges its
+    tested chain with one more merge, of the default branch, on top
+    (`train_merge`). Anything else moving it cuts them all again, as
+    before."""
+    last = trains_before(last)
+    base = (last or {}).get("base")
+    if not KEEP_LABEL or not last_trains(last) or not isinstance(base, str) \
+            or base == main_tip or len(base) != 40:
+        return main_tip
+    # Kept before, the trains' base is no longer the default branch's
+    # tip it was on (`main`): only what has moved it since is asked.
+    since = (last or {}).get("main") or base
+    if not isinstance(since, str) or since == main_tip or git(
+            repo, "merge-base", "--is-ancestor", since, main_tip,
+            run=run).returncode != 0:
+        return base if since == main_tip else main_tip
+    revs = git(repo, "rev-list", "--first-parent",
+               "%s..%s" % (since, main_tip), run=run)
+    shas = revs.stdout.split() if revs.returncode == 0 else []
+    if not shas or len(shas) > KEEP_MOST:
+        return main_tip
+    path = os.path.join(state_dir, KEEP_FILE)
+    cache = load_json(path, {})
+    cache = cache if isinstance(cache, dict) else {}
+    before = dict(cache)
+    entries = [e for e in (last or {}).get("entries") or ()
+               if isinstance(e, dict)]
+    by = []
+    for sha in reversed(shas):
+        # A kept train's own merge (`train_onto`): the trains behind it
+        # were predicted on its chain, which is their base now.
+        second = git(repo, "rev-parse", "-q", "--verify", sha + "^2",
+                     run=run)
+        chain = cache.get("train:" + second.stdout.strip()) \
+            if second.returncode == 0 else None
+        if isinstance(chain, str):
+            at = next((k for k, e in enumerate(entries)
+                       if e.get("sha") == chain), None)
+            if at is None or at + 1 >= len(entries):
+                by.append(None)
+                break
+            base = chain
+            continue
+        by.append(kept_by_label(sha, github, cache))
+    if cache != before:
+        # The newest few hundred answers are plenty.
+        save_json(path, dict(list(cache.items())[-300:]))
+    if not all(by):
+        return main_tip
+    top = (entries or [{}])[-1].get("sha")
+    if not top or git(repo, "merge-tree", "--write-tree", top, main_tip,
+                      run=run).returncode != 0:
+        out("TRAIN-KEEP: %s moved by %s, but the trains' last top doesn't "
+            "merge with it cleanly; every train is cut again"
+            % (MAIN, ", ".join("#%d" % n for n in by)))
+        return main_tip
+    return base
 
 
 def last_trains(last):
@@ -4370,8 +5416,8 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
        all of them when the queue has put it in front of the first; and
        the default branch moving to a tree no train predicted, a force
        merge, cuts them all.
-    3. New trains are cut from what is left, in the queue's order, urgent
-       ones first: the first carriage that merges cleanly, then each
+    3. New trains are cut from what is left, urgent ones first, then
+       the biggest carriages, then in the queue's order: the first carriage that merges cleanly, then each
        next one that touches no file the train touches (or, with
        TRAINS_WITHIN "clean", merges cleanly) and keeps it within
        AHEAD_BATCH. Urgent ones board first and share a train whenever
@@ -4399,8 +5445,9 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                            "again" % (MAIN, main_tip[:10])))
             prior = []
     first = carriages[0][0] if carriages and carriages[0] else None
-    if prior and first is not None and urgent(first) and first["number"] \
-            not in {e.get("pr") for c in prior[0] for e in c}:
+    if prior and first is not None and cuts_trains(first) and \
+            first["number"] not in {e.get("pr") for c in prior[0]
+                                    for e in c}:
         # The queue put it in front of the first train (a red default
         # branch's fix, say, while that train isn't merging yet): the
         # Merger acts on it first, so every train is cut again.
@@ -4408,7 +5455,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                        "train; every train is cut again" % first["number"]))
         prior = []
     in_prior = {e.get("pr") for t in prior for c in t for e in c}
-    hot = sorted(n for n, pr in by_number.items() if urgent(pr))
+    hot = sorted(n for n, pr in by_number.items() if cuts_trains(pr))
     had = set((last or {}).get("urgent_cut") or ()) if prior else set()
     jump = [n for n in hot if n not in in_prior and n not in had]
     if note is not None:
@@ -4430,13 +5477,33 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                            % (min(jump), keep)))
             prior = prior[:keep]
     entries, sizes, used, parent = [], [], set(), main_tip
+    graph = None
+    # The commit each member was predicted on, last time: while the
+    # train up to it is the same, its prediction is still what a push
+    # that only merges what is below it must give.
+    was, before = {}, (last or {}).get("base")
+    # A layer whose base has merged since it boarded still boarded as a
+    # layer (`boarded_layers`), though it heads its carriage now.
+    was_on = {e.get("pr"): e.get("on") for e in (last or {}).get(
+        "entries") or () if isinstance(e, dict)
+        and e.get("on") is not None}
+    for e in (e for t in prior for c in t for e in c):
+        was[e.get("pr")], before = before, e.get("sha")
     for k, train in enumerate(prior[:trains]):
         start = len(entries)
         for carriage in train:
+            # What leaves takes the layers on it with it, and only them:
+            # a layer beside it, on the same base, stays (an entry from
+            # before entries said `on` takes everything after it).
+            bases = {x.get("pr"): x.get("on", -1) if j else None
+                     for j, x in enumerate(carriage)}
+            gone = set()
             for e in carriage:
                 n = e.get("pr")
+                if n in gone:
+                    continue
                 pr = by_number.get(n)
-                why = None
+                why, entry = None, None
                 if pr is None:
                     if n not in open_numbers:
                         continue
@@ -4455,25 +5522,40 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                                                (restacks or {}).get(n), run) \
                             and not own_push(repo, e.get("head"),
                                              pr["headRefOid"], main_tip, run):
-                        why = "pushed %s mid-train" % pr["headRefOid"][:10]
-                if why is None:
+                        entry = same_prediction(
+                            repo, parent, graph, e.get("head"), pr,
+                            restacks, run, e.get("tree")
+                            if was.get(n) == parent else None)
+                        if entry is None:
+                            why = "pushed %s mid-train" \
+                                % pr["headRefOid"][:10]
+                        else:
+                            events.append(("kept", "KEPT #%d: pushed %s, "
+                                           "same tree in its place" % (
+                                               n, pr["headRefOid"][:10])))
+                if why is None and entry is None:
                     entry, failed = predict_one(repo, parent, pr, restacks,
-                                                run)
+                                                run, graph)
                     if entry is None:
                         why = "no longer merges cleanly onto train %d's " \
                             "base" % (k + 1)
                 if why is not None:
-                    above = [x.get("pr") for x in carriage[
-                        carriage.index(e) + 1:]]
+                    later = carriage[carriage.index(e) + 1:]
+                    above = [x.get("pr") for x in later
+                             if x.get("on", -1) == -1
+                             or x.get("pr") in stacked_on(n, bases)]
                     events.append(("left", "LEFT #%d: %s%s" % (
                         n, why, "; its stack's layers %s leave with it"
                         % ", ".join("#%d" % a for a in above)
                         if above else "")))
-                    break
+                    gone.update([n] + above)
+                    continue
                 entry.update(train=k, carriage=carriage[0].get("pr"))
+                if "on" in e:
+                    entry["on"] = e["on"]
                 entries.append(entry)
                 used.add(n)
-                parent = entry["sha"]
+                parent, graph = entry["sha"], entry.get("graph")
         if len(entries) > start:
             sizes.append(len(entries) - start)
     cut = []
@@ -4481,28 +5563,46 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
     # on 2026-11-11 a nightly's fix headed a train while the Merger
     # waited on another member's own run, merged that member on its own
     # green, and the green train's prediction no longer held.
+    # Then the biggest carriages: a stack of nine is nine merges for one
+    # build, and oldest-first gave the trains to single pull requests
+    # while long stacks, ready and touching nothing of theirs, waited
+    # for a train (2026-11-12). Equal sizes keep the queue's order.
     pool = sorted(carriages, key=lambda c: (
-        acting is None or c[0]["number"] != acting, not urgent(c[0])))
+        acting is None or c[0]["number"] != acting, not urgent(c[0]),
+        -len(c)))
     behind = set()
+    # Why each carriage left out of the last train it was tried for
+    # waits, for the record (`note["waits"]`).
+    waits = {}
     while len(sizes) < trains:
         start, touched, kind = len(entries), set(), None
         for carriage in pool:
+            bases = carriage_bases(carriage)
             members = [pr for pr in carriage if pr["number"] not in used
                        and pr["number"] not in behind]
-            for k, pr in enumerate(members):
-                if pr["number"] in red:
-                    members = members[:k]
-                    break
+            # A red layer stays behind with the layers on it; one beside
+            # it, on the same base, may still board.
+            out_of = set()
+            for pr in members:
+                if pr["number"] in red and pr["number"] not in out_of:
+                    out_of |= {pr["number"]} | stacked_on(pr["number"],
+                                                          bases)
+            members = [pr for pr in members if pr["number"] not in out_of]
+            for n in out_of:
+                waits[n] = "its own head is red"
             if not members:
                 continue
             size = len(entries) - start
             if size and size + len(members) > AHEAD_BATCH:
+                waits[members[0]["number"]] = "no room in train %d" % (
+                    len(sizes) + 1)
                 continue
             changed = set()
             for pr in members:
                 got = changed_files(repo, main_tip, pr, files, run)
                 if got is None:
                     changed = None
+                    waits[members[0]["number"]] = "git can't list its files"
                     break
                 changed |= got
             # Urgent ones share a train whenever they merge cleanly in
@@ -4513,22 +5613,42 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             if changed is None or (size and TRAINS_WITHIN == "files"
                                    and not (kind and urgent(members[0]))
                                    and changed & touched):
+                if changed is not None:
+                    waits[members[0]["number"]] = \
+                        "touches a file train %d touches" % (len(sizes) + 1)
                 continue
-            made, top = [], parent
+            made, top, top_graph, failing = [], parent, graph, set()
             for pr in members:
-                entry, failed = predict_one(repo, top, pr, restacks, run)
+                if pr["number"] in failing:
+                    continue
+                entry, failed = predict_one(repo, top, pr, restacks, run,
+                                            top_graph)
                 if entry is None:
-                    break
+                    waits[pr["number"]] = "%s onto train %d" % (
+                        "conflicts" if failed == "conflict"
+                        else "git can't merge it", len(sizes) + 1)
+                    # It stays behind with the layers on it; a layer
+                    # beside it may still board.
+                    failing |= {pr["number"]} | stacked_on(pr["number"],
+                                                           bases)
+                    continue
+                on = bases.get(pr["number"])
                 entry.update(train=len(sizes),
-                             carriage=members[0]["number"])
+                             carriage=members[0]["number"],
+                             on=on if on is not None
+                             else was_on.get(pr["number"]))
                 made.append(entry)
-                top = entry["sha"]
+                top, top_graph = entry["sha"], entry.get("graph")
             if not made:
                 continue
+            boarded = {e["pr"] for e in made}
             left = [pr["number"] for pr in carriage
                     if pr["number"] not in used
-                    and pr["number"] not in behind][len(made):]
+                    and pr["number"] not in behind
+                    and pr["number"] not in boarded]
             if left:
+                for n in left:
+                    waits.setdefault(n, "a layer below it can't board")
                 behind.update(left)
                 events.append(("left", "LEFT #%d: won't board with the "
                                "layers below it, which go without it%s" % (
@@ -4540,13 +5660,19 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             touched |= changed
             kind = urgent(members[0]) if not size else \
                 kind and urgent(members[0])
-            parent = top
+            parent, graph = top, top_graph
             if len(entries) - start >= AHEAD_BATCH:
                 break
         if len(entries) == start:
             break
         sizes.append(len(entries) - start)
         cut.append(entries[start:])
+    if note is not None:
+        boarded = {e["pr"] for e in entries}
+        for n in by_number:
+            waits.setdefault(n, "every train is full")
+        note["waits"] = {str(n): why for n, why in sorted(waits.items())
+                         if n not in boarded and n in by_number}
     for train in cut:
         events.append(("cut", "CUT %d: %s" % (
             train[0]["train"] + 1, " ".join(
@@ -4560,15 +5686,29 @@ def train_batches(entries, sizes, verdict):
     size again when its top is red (else None), and the trains after it
     as ahead.json's `later`, each fixed, since a train is fixed once
     cut. Nothing follows a red first train, nor a later one whose top is
-    red."""
+    red. A later train whose top is green is folded into the first with
+    every train in front of it: the first `size` is then theirs together,
+    whatever their own tops say."""
     if not sizes or sizes[0] > len(entries):
         # Fixed trains longer than what is left (a member handed back
         # since they were cut): none of them holds; the next cut says.
         return 0, None, []
-    size = sizes[0]
+    size, first = sizes[0], 1
+    # A later train's green top covers it and every train in front of
+    # it (amendment of 2026-11-11): its tree contains them all, and its
+    # run took in every step their changes touch. They are folded into
+    # the first, which merges at once, rather than waiting for their
+    # own tops' verdicts.
+    at = 0
+    for k, n in enumerate(sizes):
+        if at + n > len(entries):
+            break
+        at += n
+        if k and verdict(entries[at - 1]["tree"]) is True:
+            size, first = at, k + 1
     red = size if verdict(entries[size - 1]["tree"]) is False else None
     later, at = [], size
-    for n in sizes[1:] if red is None else ():
+    for n in sizes[first:] if red is None else ():
         if at + n > len(entries):
             break
         later.append({"size": n, "trees": [e["tree"] for e in
@@ -4584,12 +5724,19 @@ def head_red(check_state, pr):
     """Whether the build check's own run of `pr`'s head is red
     (designs/0047: it can't board a train): its verdict, not a batch's
     cover. Not while the default branch is red, when every head may be,
-    nor for an urgent one."""
+    nor for an urgent one. Nor when it was red only because it
+    conflicted with the default branch's tip of then (forge-pr-check's
+    `conflicted`: no step ran): whether it merges now is the cut's own
+    question, and that red stayed on the head after the default branch
+    moved on and it merged cleanly again, keeping it out of every train
+    (2026-11-12: four such heads, three of them layers whose base had
+    merged, and only one train was cut for an hour)."""
     if (check_state or {}).get("main_red", {}).get("issue") or urgent(pr):
         return False
     got = ((check_state or {}).get("results") or {}).get(pr["headRefOid"])
     return isinstance(got, dict) and got.get("ok") is False \
-        and not got.get("covered")
+        and not got.get("covered") and not got.get("conflicts") \
+        and got.get("failed") != ["merge"]
 
 
 def train_line(sizes, entries):
@@ -4611,6 +5758,35 @@ def train_lists(entries, sizes):
     return out
 
 
+def kept_trains(main_tip, entries, sizes, note=None):
+    """The trains this tick cut, `entries` in `sizes`, as an ahead.json
+    `cut_trains` reads them (`last_trains`), for a red train's search
+    to keep (`trains_before`)."""
+    kept = {"trains": True, "base": main_tip,
+            "entries": [dict(e) for e in entries],
+            "batch": {"size": sizes[0]} if sizes else {},
+            "later": [{"size": n} for n in sizes[1:]]}
+    if (note or {}).get("urgent_cut"):
+        kept["urgent_cut"] = note["urgent_cut"]
+    return kept
+
+
+def trains_before(last):
+    """The trains a tick cuts its own from: `last` (ahead.json) when it
+    cut trains, else the trains a red train's search keeps in it
+    (`kept_trains`), else `last`. A red top's members are searched with
+    batches of their own, and ahead.json then holds no trains; cut
+    afresh when the search ended, every train took new pull requests in
+    the middle (bigger carriages go first in a new cut), and the runs
+    of the trains behind it were thrown away (2026-11-12). Kept, a
+    member the search found red leaves, those merged are gone, and the
+    rest keep their places, as after any other train."""
+    if not isinstance(last, dict) or last.get("trains") \
+            or not isinstance(last.get("kept_trains"), dict):
+        return last
+    return last["kept_trains"]
+
+
 def dry_trains(state_dir, cut, main_tip, repo, record, out, when,
                note=None):
     """merge.test_ahead.trains "dry-run" (designs/0047): cut the trains
@@ -4628,7 +5804,8 @@ def dry_trains(state_dir, cut, main_tip, repo, record, out, when,
     record["trains_dry"] = True
     if events:
         record["train_events"] = [c for c, _ in events]
-    if record.get("recut") and not any(c != "cut" for c, _ in events):
+    if record.get("recut") and not any(c not in ("cut", "kept")
+                                       for c, _ in events):
         record["recut_avoided"] = True
     for cause, line in events:
         if cause != "cut":
@@ -4908,12 +6085,14 @@ def batch_members(state_dir, queue, tree_of=None):
 
 
 def fixes_first(queue, in_flight, members):
-    """`queue` with MAIN_RED_FIXES first, behind only `in_flight` and a
-    green batch's `members` (designs/0011, amendment); the rest keep
-    their order, and so do the members, among which a fix doesn't move
-    up (see overdue_first)."""
+    """`queue` with MAIN_RED_FIXES first, behind only `in_flight`, a
+    green batch's `members` (designs/0011, amendment) and those carrying
+    `labels.urgent`, which always go first; the rest keep their order,
+    and so do the members, among which a fix doesn't move up (see
+    overdue_first)."""
     return sorted(queue, key=lambda pr: (
         pr["number"] != in_flight, pr["number"] not in members,
+        pr["number"] not in members and not labelled_urgent(pr),
         pr["number"] not in members
         and pr["number"] not in MAIN_RED_FIXES))
 
@@ -4960,6 +6139,71 @@ def main_red_fixes(check_state):
     return frozenset(n for n in fixes if isinstance(n, int)
                      and not isinstance(n, bool)) \
         if isinstance(fixes, list) else frozenset()
+
+
+def instance_red_rules(project):
+    """(title regex, labels, poster login) for each build-check instance
+    that files its own main-red issue (checks.instances.<name>.
+    main_red_issue), as forge-pr-check titles and posts it."""
+    instances = project.section("checks").get("instances") or {}
+    for name in sorted(instances):
+        block, _host = config.instance_checks(project.data, name)
+        issue = block.get("main_red_issue")
+        if not isinstance(issue, dict):
+            continue
+        context = block.get("context", DEFAULT_CONTEXT)
+        title = re.escape(issue.get("title", INSTANCE_RED_TITLE)) \
+            .replace(re.escape("{sha}"), "[0-9a-f]+") \
+            .replace(re.escape("{context}"), re.escape(context))
+        labels = list(issue.get("labels", [])) + (
+            [issue["label"]] if issue.get("label") else [])
+        poster = block.get("poster", project.section("merge").get(
+            "merger", "Merger"))
+        yield (re.compile("^%s$" % title), tuple(labels),
+               project.bot_login(poster))
+
+
+def instance_red_issues(github, rules=None):
+    """The numbers of the open issues an instance's check filed saying
+    the default branch is red for its context (agent-forge #154): its
+    labels, its title, by its poster. Empty when none is configured, or
+    GitHub can't be read: then they only don't go first."""
+    rules = INSTANCE_RED if rules is None else rules
+    owner, name = REPO_SLUG.split("/")
+    found = set()
+    for title, labels, poster in rules:
+        args = ["graphql", "-f", "query=" + INSTANCE_RED_QUERY,
+                "-F", "owner=" + owner, "-F", "name=" + name]
+        for label in labels:
+            args += ["-f", "labels[]=" + label]
+        try:
+            nodes = github.api(*args)["data"]["repository"]["issues"]["nodes"]
+        except (RuntimeError, KeyError, TypeError, ValueError):
+            continue
+        login = (poster or "").replace("[bot]", "").lower()
+        for node in nodes or ():
+            if title.match(node.get("title") or "") and (
+                    (node.get("author") or {}).get("login", "")
+                    .replace("[bot]", "").lower() == login):
+                found.add(node["number"])
+    return found
+
+
+def red_fixes_of(prs, issues):
+    """The pull requests among `prs` whose title or body (outside code)
+    closes one of `issues`, as forge-pr-check's red_fixes reads them."""
+    if not issues:
+        return frozenset()
+    keywords = load_tool("forge-closing-keywords")
+    pattern = keywords.closing_re(REPO_SLUG)
+    fixes = set()
+    for pr in prs:
+        text = keywords.blank_code("%s\n%s" % (pr.get("title") or "",
+                                               pr.get("body") or ""))
+        named = {int(next(g for g in m if g)) for m in pattern.findall(text)}
+        if named & set(issues):
+            fixes.add(pr["number"])
+    return frozenset(fixes)
 
 
 def base_red_only(check_state, records, base):
@@ -5124,6 +6368,373 @@ def batch_holds(last, pr, tree, queue, check_state, tree_of=None):
             and tree_verdict(check_state, entries[-1]["tree"]) is True)
 
 
+def train_ready(last, queue, main_tip, check_state, repo=None, run=sh,
+                restacks=None):
+    """merge.test_ahead.train_merge: the members of the batch in `last`
+    (ahead.json) that can merge as one train now, or None: one or more
+    (a train of one too, so the default branch lands where the next
+    train predicted it, not on an update's merge), its top's tree green, predicted from `main_tip` itself (the default
+    branch hasn't moved since), and each member still in `queue` at the
+    head it was predicted at. Given `repo`, a member whose head has
+    moved since is still ready when its new head, predicted where it
+    was, gives the same tree (`same_prediction`: it only merged the
+    default branch); its entry then names the new head, which the train
+    merges, so GitHub marks the pull request merged at the head it
+    has. The tree merged is still the one the top tested."""
+    batch = (last or {}).get("batch") or {}
+    entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
+    if not entries or [e.get("tree") for e in entries] \
+            != batch.get("trees") or (last or {}).get("base") != main_tip \
+            or tree_verdict(check_state, entries[-1].get("tree")) is not True:
+        return None
+    prs = {pr["number"]: pr for pr in queue}
+    ready, parent, graph = [], main_tip, None
+    for e in entries:
+        pr = prs.get(e.get("pr"))
+        if pr is None:
+            return None
+        if pr["headRefOid"] != e.get("head"):
+            if repo is None:
+                return None
+            moved = same_prediction(repo, parent, graph, e.get("head"), pr,
+                                    restacks, run, e.get("tree"))
+            if moved is None or moved["sha"] != e.get("sha"):
+                return None
+            e = dict(e, head=pr["headRefOid"])
+            if "graph" in moved:
+                e["graph"] = moved["graph"]
+            else:
+                e.pop("graph", None)
+        ready.append(e)
+        parent, graph = e.get("sha"), e.get("graph")
+    return ready
+
+
+def left_top(last, entries, sizes, base, check_state):
+    """merge.test_ahead.left_top_covers (agent-forge #296): the first
+    train as `last` (ahead.json) cut it, cut back to the members below
+    the first to leave it, when its top's run has started and isn't red,
+    as {"tree": that top's tree, "sha", "entries": those members}; or
+    the one `last` kept, while it is still the start of the new first
+    train. None otherwise. The old top's tree held every one of those
+    members' trees as the new train does, so its green covers them, as
+    a green top covers every member under it; a prediction's run is
+    never stopped for another (forge-pr-check `preempt_victim`), so it
+    finishes. On one project (2026-11-11) a push to the fourth member of
+    six made the third wait 24 minutes for the new top's run."""
+    if not LEFT_TOP_COVERS or not isinstance(last, dict) \
+            or not last.get("trains") or not sizes or not entries \
+            or last.get("base") != base:
+        return None
+    old = (last.get("entries") or [])[
+        :((last.get("batch") or {}).get("size") or 0)]
+    new = entries[:sizes[0]]
+    kept = last.get("left_top") if isinstance(last.get("left_top"),
+                                              dict) else None
+
+    def same(a, b):
+        return all(a.get(k) == b.get(k) for k in ("pr", "head", "tree",
+                                                  "sha"))
+    if old and old[-1].get("tree") != new[-1].get("tree") \
+            and ahead_started(check_state, old[-1].get("sha"),
+                              old[-1].get("tree")) \
+            and tree_verdict(check_state, old[-1].get("tree")) is not False:
+        k = 0
+        while k < min(len(old), len(new)) and same(old[k], new[k]):
+            k += 1
+        if 0 < k < len(old):
+            kept = {"tree": old[-1]["tree"], "sha": old[-1].get("sha"),
+                    "entries": old[:k]}
+    if kept is None:
+        return None
+    members = kept.get("entries") or []
+    if not members or len(members) > len(new) \
+            or tree_verdict(check_state, kept.get("tree")) is False \
+            or not all(same(a, b) for a, b in zip(members, new)):
+        return None
+    return kept
+
+
+def left_ready(last, queue, base, check_state):
+    """The members of `last`'s `left_top` (ahead.json) that merge now,
+    on its top's green, as one train: when that top is green, the trains
+    are still predicted on `base`, and each member is in `queue` at the
+    head it boarded with. None otherwise."""
+    kept = (last or {}).get("left_top")
+    if not LEFT_TOP_COVERS or not isinstance(kept, dict) \
+            or last.get("base") != base \
+            or tree_verdict(check_state, kept.get("tree")) is not True:
+        return None
+    members = kept.get("entries") or []
+    heads = {pr["number"]: pr["headRefOid"] for pr in queue}
+    if not members or any(heads.get(e.get("pr")) != e.get("head")
+                          for e in members):
+        return None
+    return members
+
+
+def boarded_layers(last):
+    """{number: head} of the stack's layers on the trains in `last`
+    (ahead.json): members that boarded on a pull request below them,
+    which `on` names (kept when that one has merged and the layer heads
+    its carriage), or that aren't the first of their carriage."""
+    if not isinstance(last, dict) or not last.get("trains"):
+        return {}
+    return {e["pr"]: e.get("head") for e in last.get("entries") or ()
+            if isinstance(e, dict) and isinstance(e.get("pr"), int)
+            and (e.get("on") is not None
+                 or e.get("carriage") is not None
+                 and e.get("carriage") != e["pr"])}
+
+
+def boarded_now(said_trains):
+    """{number: head} of the pull requests aboard a train that stay
+    candidates without a green of their own: stack layers, unless
+    merge.test_ahead.layers_need_own_green, and with own_green_to_board
+    false any member. The keys are numbers, so the two are joined with
+    `|`, not `dict(..., **aboard)`, which takes only string keys."""
+    aboard = {} if LAYERS_OWN_GREEN else boarded_layers(said_trains)
+    if not OWN_GREEN_TO_BOARD:
+        # merge.test_ahead.own_green_to_board false: so does any pull
+        # request that boarded without its own green.
+        aboard = boarded_members(said_trains) | aboard
+    return aboard
+
+
+def boarded_members(last):
+    """{number: head} of every member of the trains in `last`
+    (ahead.json), for merge.test_ahead.own_green_to_board false: one
+    that boarded without its own green stays a candidate while its head
+    is the one it boarded with, or that one brought up to date. A red
+    train's search writes no trains, but the trains it keeps
+    (`kept_trains`) and the batches it checks still hold them."""
+    if not isinstance(last, dict):
+        return {}
+    lists = [last] if last.get("trains") else [
+        last, last["kept_trains"]] if isinstance(
+            last.get("kept_trains"), dict) else []
+    return {e["pr"]: e.get("head") for one in lists
+            for e in one.get("entries") or ()
+            if isinstance(e, dict) and isinstance(e.get("pr"), int)}
+
+
+def train_in_the_way(last, pr, check_state):
+    """merge.test_ahead.train_merge: the first train in `last`
+    (ahead.json) as its entries, when `pr` is not on it and merging
+    `pr` on its own now would spend that train's run: the build check
+    has started its top, and the top isn't red. Else None. On
+    2026-11-12 a pull request pushed out of the first train merged on
+    its own green 25 minutes into the train's run of eight, and every
+    train was cut again."""
+    if not (last or {}).get("trains"):
+        return None
+    batch = (last or {}).get("batch") or {}
+    entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
+    if not entries or any(e.get("pr") == pr["number"] for e in entries):
+        return None
+    top = entries[-1]
+    if tree_verdict(check_state, top.get("tree")) is False \
+            or not ahead_started(check_state, top.get("sha"),
+                                 top.get("tree")):
+        return None
+    return entries
+
+
+def train_boarded(last, pr, check_state):
+    """merge.test_ahead.train_merge: the size of the first train in
+    `last` (ahead.json) when `pr` is boarded on it at the head it has,
+    and its top isn't red, else None. A train of one counts: updating
+    it would move the default branch off the tree the next train was
+    predicted on, and that train would be cut again.
+    Such a train goes in as one merge of its tested top (`train_merge`),
+    so `pr` needs no UPDATE of its own: GitHub's merge of the default
+    branch into it changes nothing the train merges and only starts a
+    build of the new head (amendment of 2026-11-12)."""
+    if not (last or {}).get("trains"):
+        return None
+    batch = (last or {}).get("batch") or {}
+    entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
+    if not entries or [e.get("tree") for e in entries] \
+            != batch.get("trees") \
+            or tree_verdict(check_state, entries[-1].get("tree")) is False:
+        return None
+    if not any(e.get("pr") == pr["number"]
+               and e.get("head") == pr["headRefOid"] for e in entries):
+        return None
+    return len(entries)
+
+
+def train_commits(repo, main_tip, entries, prs, run=sh):
+    """The chain of merge commits for a green train: for each member, in
+    order, a commit of the tree its prediction tested, whose parents are
+    the commit before it (the default branch's tip first) and the
+    member's head, so every head is in the train's history. As the
+    Merger (RESOLVE_IDENTITY). The top's sha, or None when git fails."""
+    if RESOLVE_IDENTITY is None:
+        return None
+    name, email = RESOLVE_IDENTITY
+    env = dict(os.environ, GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
+               GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
+    parent = main_tip
+    for entry in entries:
+        pr = prs[entry["pr"]]
+        have_head(repo, pr, run)
+        made = run(["git", "-C", repo, "commit-tree", "--no-gpg-sign",
+                    entry["tree"], "-p", parent, "-p", entry["head"], "-m",
+                    "Merge #%d: %s" % (entry["pr"], pr.get("title", ""))],
+                   env=env)
+        sha = (made.stdout or "").strip()
+        if made.returncode != 0 or len(sha) != 40:
+            return None
+        parent = sha
+    return parent
+
+
+def train_onto(repo, top, main, run=sh):
+    """labels.keep_trains: a merge commit of `main` into `top`, a
+    train's chain, as the Merger, or None when they don't merge
+    cleanly or git fails."""
+    if RESOLVE_IDENTITY is None:
+        return None
+    merged = git(repo, "merge-tree", "--write-tree", top, main, run=run)
+    tree = (merged.stdout or "").split("\n")[0].strip()
+    if merged.returncode != 0 or len(tree) != 40:
+        return None
+    name, email = RESOLVE_IDENTITY
+    env = dict(os.environ, GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
+               GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
+    made = run(["git", "-C", repo, "commit-tree", "--no-gpg-sign", tree,
+                "-p", top, "-p", main, "-m",
+                "Merge %s into the train (labels.keep_trains)" % MAIN],
+               env=env)
+    sha = (made.stdout or "").strip()
+    return sha if made.returncode == 0 and len(sha) == 40 else None
+
+
+def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
+                github, run=sh, sleep=time.sleep, out=print, note=None,
+                main=None, tested_tree=None):
+    """merge.test_ahead.train_merge (designs/0047, amendment of
+    2026-11-11): merge a green train with one pull request. The chain
+    of `train_commits` is pushed to TRAIN_BRANCH<first>-<last>, given
+    checks.context's green (its tree is the green top's), opened as a
+    pull request to the default branch listing the members, and merged
+    as a merge commit pinned to its top. Each member's head is then in
+    the default branch, so GitHub marks it merged. A member based on
+    another's branch is retargeted to the default branch first, or
+    GitHub wouldn't. Returns (merged, unmerged): the members GitHub says
+    are merged, and the rest, left to the usual path; ([], members)
+    when the train didn't go in, with the reason said. `note`, a dict,
+    is given `pr`, the train's own pull request, once it is opened.
+    `main`, the default branch's tip when the train was kept on
+    `main_tip`, an older base (`carried_base`), is merged on top of the
+    chain, cleanly or not at all: the tree that goes in is the tested
+    one plus only the commits of labels.keep_trains. `tested_tree`,
+    when the train is the members below a left member (`left_ready`), is
+    the old top's tree, whose green covers them."""
+    prs = {pr["number"]: pr for pr in queue}
+    numbers = [e["pr"] for e in entries]
+    span = "#%d..#%d" % (numbers[0], numbers[-1])
+
+    def fail(why):
+        out("TRAIN-MERGE %s: %s; each member merges on its own" % (span, why))
+        return [], numbers
+    if CI_WORKFLOW:
+        return fail("merge.ci_workflow is set, and the train's commits "
+                    "have no runs of it")
+    top = train_commits(repo, main_tip, entries, prs, run)
+    if top is None:
+        return fail("git could not make the train's commits")
+    if main and main != main_tip:
+        top = train_onto(repo, top, main, run)
+        if top is None:
+            return fail("its chain doesn't merge cleanly with %s at %s"
+                        % (MAIN, main[:10]))
+        # Its merge moves the default branch off the chain the trains
+        # behind it were predicted on: `carried_base` keeps them on it.
+        path = os.path.join(state_dir, KEEP_FILE)
+        cache = load_json(path, {})
+        cache = cache if isinstance(cache, dict) else {}
+        cache["train:" + top] = entries[-1]["sha"]
+        save_json(path, dict(list(cache.items())[-300:]))
+    branch = "%s%d-%d" % (TRAIN_BRANCH, numbers[0], numbers[-1])
+    pushed = run(["git", "-C", repo, "push", "-q", "-f",
+                  "https://github.com/%s.git" % REPO_SLUG,
+                  "%s:refs/heads/%s" % (top, branch)], env=push_env(github))
+    if pushed.returncode != 0:
+        return fail("push refused: " + tail(pushed.stderr + "\n"
+                                            + pushed.stdout, 1))
+    tested = [sha for sha, r in ((check_state or {}).get("results")
+                                 or {}).items()
+              if isinstance(r, dict) and r.get("ok") is True
+              and r.get("tree") == (tested_tree or entries[-1]["tree"])
+              and not r.get("covered")]
+    ok, why = github.write(
+        "POST", "repos/%s/statuses/%s" % (REPO_SLUG, top), state="success",
+        context=STATUS_CONTEXT, description=(
+            "green: the Merger's train %s, %s %s%s"
+            % (span, "under a top tested green as" if tested_tree
+               else "its tree tested as",
+               short(tested[0]) if tested else "its top",
+               ", %s's kept commits merged on top" % MAIN
+               if main and main != main_tip else ""))[:140])
+    if not ok:
+        github.write("DELETE", "repos/%s/git/refs/heads/%s"
+                     % (REPO_SLUG, branch))
+        return fail("could not post %s: %s" % (STATUS_CONTEXT, why))
+    for number in numbers:
+        if prs[number].get("baseRefName", MAIN) != MAIN:
+            ok, why = github.write("PATCH", "repos/%s/pulls/%d"
+                                   % (REPO_SLUG, number), base=MAIN)
+            if not ok:
+                github.write("DELETE", "repos/%s/git/refs/heads/%s"
+                             % (REPO_SLUG, branch))
+                return fail("could not retarget #%d: %s" % (number, why))
+    body = ("The Merger's train %s, tested green as one tree. Each "
+            "member's head is merged here as it was approved:\n\n%s\n\n%s"
+            % (span, "\n".join("* #%d at %s" % (e["pr"], e["head"][:10])
+                               for e in entries), SIGNATURE))
+    number, why = github.create("repos/%s/pulls" % REPO_SLUG,
+                                title="Merge train %s" % span, head=branch,
+                                base=MAIN, body=body)
+    if number is None:
+        github.write("DELETE", "repos/%s/git/refs/heads/%s"
+                     % (REPO_SLUG, branch))
+        return fail("could not open its pull request: " + why)
+    if note is not None:
+        note["pr"] = number
+    ok, why = github.write("PUT", "repos/%s/pulls/%d/merge"
+                           % (REPO_SLUG, number), sha=top,
+                           merge_method="merge",
+                           commit_title="Merge train %s (#%d)" % (span, number))
+    if not ok:
+        github.write("PATCH", "repos/%s/pulls/%d" % (REPO_SLUG, number),
+                     state="closed")
+        github.write("DELETE", "repos/%s/git/refs/heads/%s"
+                     % (REPO_SLUG, branch))
+        return fail("GitHub refused to merge #%d: %s" % (number, why))
+    github.write("DELETE", "repos/%s/git/refs/heads/%s" % (REPO_SLUG, branch))
+    unmerged = list(numbers)
+    for k in range(TRAIN_POLLS):
+        for n in list(unmerged):
+            try:
+                got = github.api("repos/%s/pulls/%d" % (REPO_SLUG, n))
+            except RuntimeError:
+                continue
+            if isinstance(got, dict) and got.get("merged") is True:
+                unmerged.remove(n)
+        if not unmerged:
+            break
+        if k + 1 < TRAIN_POLLS:
+            sleep(TRAIN_POLL_S)
+    merged = [n for n in numbers if n not in unmerged]
+    out("TRAIN-MERGE %s: merged %d as #%d (%s)%s" % (
+        span, len(merged), number, short(top),
+        "; GitHub doesn't say %s merged: each goes on its own" % ", ".join(
+            "#%d" % n for n in unmerged) if unmerged else ""))
+    return merged, unmerged
+
+
 def load_suspects(state_dir):
     """designs/0035, second amendment: the search in progress, from
     SUSPECTS_FILE, as {suspects: [{pr, head}], tree, merged, left,
@@ -5197,18 +6808,27 @@ def suspects_line(entries, n, green, red, cuts):
         ", ".join(span(0, c) for c in cuts) or "nothing")
 
 
-def suspects_left(saved, queue, record, approvals, said):
+def suspects_left(saved, queue, record, approvals, said, moved=None):
     """(saved, line): the search `saved` with the suspects that merged
     this tick (`record`'s decisions) moved to `merged`, and those no
     longer in `queue` at their head, or handed back, moved to `left`.
-    With none left, the search is over: `line` says BATCH-FLAKE when
-    every suspect merged, and the saved search is None."""
+    `moved(head, pr)` says whether `pr`'s head is `head` brought up to
+    date and nothing else (`own_push`): such a suspect stays, at its
+    new head, which is predicted to the same tree. Without it, an
+    update of the first suspect took it out of the search, the search
+    found no suspect first in the predictions and ended, and every
+    train was cut again (2026-11-12). With none left, the search is
+    over: `line` says BATCH-FLAKE when every suspect merged, and the
+    saved search is None."""
     done = {d["pr"] for d in record["decisions"]
             if d.get("action") == "MERGE" and d.get("result") == "done"}
     heads = {pr["number"]: pr for pr in queue}
     kept = []
     for e in saved["suspects"]:
         pr = heads.get(e["pr"])
+        if pr is not None and pr["headRefOid"] != e["head"] \
+                and moved is not None and moved(e["head"], pr):
+            e = dict(e, head=pr["headRefOid"])
         if e["pr"] in done:
             saved["merged"].append(e["pr"])
         elif pr is None or pr["headRefOid"] != e["head"] or handed_back(
@@ -5226,6 +6846,79 @@ def suspects_left(saved, queue, record, approvals, said):
                 "top's tree %s was a flake" % (every[0], every[-1],
                                                saved.get("tree")))
     return None, line
+
+
+def with_suspects(queue, saved, prs):
+    """`queue` with the suspects of the search `saved` that are open
+    (`prs`) but not in it, a stack's layers held as stacked, each
+    where the search has it: all of them at the first suspect's place,
+    in the search's order. A red train's layers are members of it
+    (`layers_need_own_green` false), and its suspects; missing from the
+    queue, they left the search the tick after it started, which then
+    tested the prefixes of a set the train never was, and found its
+    whole red tree no longer among them (2026-11-12: "red from none")."""
+    if not saved or not queue:
+        return queue
+    by_number = {pr["number"]: pr for pr in prs}
+    order = [by_number[e["pr"]] for e in saved.get("suspects") or ()
+             if e["pr"] in by_number]
+    numbers = {pr["number"] for pr in order}
+    if not numbers - {pr["number"] for pr in queue}:
+        return queue
+    out, placed = [], False
+    for pr in queue:
+        if pr["number"] in numbers:
+            if not placed:
+                out += order
+                placed = True
+            continue
+        out.append(pr)
+    return out if placed else order + out
+
+
+def suspect_wait(saved, pr, last, check_state, main_tip=None):
+    """merge.test_ahead.train_merge: SUSPECT_WAIT_REASON when `pr` is a
+    suspect of the search `saved` at the head it has and isn't in the
+    batch of `last` (ahead.json) the search found green, or, with no
+    search yet, a member of one of `last`'s trains, at the head it has,
+    whose top is red (not only as `main_tip` is: `tree_base_red`), else
+    None. The
+    search's runs test the trees predicted for the suspects' heads, and
+    a green prefix merges as one train of its tested top; an update of
+    a suspect only makes it a new head, and on 2026-11-12 one took the
+    first suspect out of the search, which ended, and every train was
+    cut again with new pull requests in it. One the search found green
+    may be updated: it merges, alone or because the train couldn't."""
+    batch = (last or {}).get("batch") or {}
+    entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
+    if not saved:
+        # The tick a train's top is found red: its members become the
+        # suspects once this tick has decided, and on 2026-11-12 the
+        # first was updated before that.
+        for train in last_trains(last):
+            members = [e for c in train for e in c]
+            if not any(e.get("pr") == pr["number"]
+                       and e.get("head") == pr["headRefOid"]
+                       for e in members):
+                continue
+            top = members[-1].get("tree")
+            if len(members) < 2 or tree_verdict(check_state, top) \
+                    is not False \
+                    or tree_base_red(check_state, top, main_tip):
+                return None
+            return SUSPECT_WAIT_REASON % ("#%d..#%d" % (
+                members[0]["pr"], members[-1]["pr"]))
+        return None
+    if not any(e["pr"] == pr["number"] and e["head"] == pr["headRefOid"]
+               for e in saved.get("suspects") or ()):
+        return None
+    if entries and batch.get("suspects") is True \
+            and [e.get("tree") for e in entries] == batch.get("trees") \
+            and tree_verdict(check_state, entries[-1].get("tree")) is True \
+            and any(e.get("pr") == pr["number"] for e in entries):
+        return None
+    numbers = [e["pr"] for e in saved["suspects"]]
+    return SUSPECT_WAIT_REASON % ("#%d..#%d" % (numbers[0], numbers[-1]))
 
 
 def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
@@ -5542,7 +7235,8 @@ def hand_back_red_suspect(state_dir, entry, green, queue, approvals, reds,
         return
     reason = RED_SUSPECT_REASON % (STATUS_CONTEXT, MAIN)
     decision = conflict_hand_back(
-        pr[0], approvals[entry["pr"]], github, said, live, reason,
+        pr[0], approvals.get(entry["pr"]) or approval_of(pr[0]), github,
+        said, live, reason,
         RED_SUSPECT_DETAIL % (entry["sha"][:10], MAIN, (
             " and the %d pull requests ahead of it in the batch" % green
             if green > 1 else " and the one ahead of it in the batch"
@@ -6259,6 +7953,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         differ = apply_graph(prs, graph)
     conflicted = {n for n, node in graph.items() if node["conflicts"]}
     open_numbers = {pr["number"] for pr in prs} | fetch_open_issues(github)
+    if INSTANCE_RED:
+        # An instance's red default branch: its fixes go first too.
+        global MAIN_RED_FIXES
+        MAIN_RED_FIXES = MAIN_RED_FIXES | red_fixes_of(
+            prs, instance_red_issues(github))
     candidates, approvals, held, spoken = [], {}, {}, []
     when = now()
     heads = {pr["headRefName"]: pr["number"] for pr in prs
@@ -6278,20 +7977,55 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     rules = None
     if CODE_OWNERS:
         rules = codeowners_rules(repo, "refs/remotes/origin/" + MAIN, run)
+        owner_waits = {}
         for pr in list(candidates):
             why = rules and code_owner_wait(repo, pr, rules, main_tip, run,
                                             regenerated)
+            owner_waits[pr["number"]] = (pr["headRefOid"], why or None)
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
+        if CODE_OWNER_SEQUENCE:
+            for number, (head, why) in sequence_owned(
+                    repo, prs, owner_waits, rules, main_tip, run).items():
+                held[str(number)] = why
+                owner_waits[number] = (head, None)
+        if live and CODE_OWNER_ASK:
+            code_owner_asks(state_dir, github, owner_waits,
+                            {p["number"]: p["headRefOid"] for p in prs}, out)
     greens = load_greens(state_dir) if OWN_HEAD_GREEN else {}
+    # merge.test_ahead.own_green_to_board false: held only for their own
+    # green, they may still board a train when one is cut.
+    unproven = []
     if OWN_HEAD_GREEN:
+        # merge.test_ahead.layers_need_own_green false: a layer that
+        # boarded a train is tested by its top, and stays a candidate
+        # without a green of its own once its base has merged.
+        said_trains = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+        aboard = boarded_now(said_trains)
         for pr in list(candidates):
+            if pr["number"] in aboard:
+                # The walk back to the head it boarded with reads the
+                # new head's parents, which only the pull requests a
+                # tick decided on were fetched for.
+                have_head(repo, pr, run)
             why = own_green_wait(pr, approvals[pr["number"]], github, greens,
-                                 repo, main_tip, run)
+                                 repo, main_tip, run,
+                                 aboard.get(pr["number"]))
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
+                approved = ((approvals[pr["number"]] or {}).get("commit")
+                            or {}).get("oid")
+                if not OWN_GREEN_TO_BOARD \
+                        and pr.get("baseRefName", MAIN) == MAIN \
+                        and approved and own_push(repo, approved,
+                                                  pr["headRefOid"], main_tip,
+                                                  run):
+                    # Only at the head approved, or that one brought up
+                    # to date: a later push of the author's waits for
+                    # its review, as at the front.
+                    unproven.append(pr)
         save_greens(state_dir, greens)
     # Held for an instance, so outside the queue, but a conflict with
     # main won't go away by waiting for it: told like one in the queue.
@@ -6312,6 +8046,12 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 candidates.remove(pr)
                 if pr.get("baseRefName", MAIN) == MAIN:
                     instance_held.append(pr)
+        # One held for its own green boards only once its gated
+        # instances pass, as any candidate.
+        for pr in list(unproven):
+            have_head(repo, pr, run)
+            if instance_wait(repo, pr, main_tip, github, files, run):
+                unproven.remove(pr)
     queue = order(candidates, prs)
     in_flight = None
     if TEST_AHEAD:
@@ -6410,7 +8150,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         stack = merged_elsewhere(state_dir, github, stack, prs, when)
     expired = []
     if stack:
-        stack, retarget, expired = next_layer(stack, prs, candidates,
+        # One held only for its own green may board a train
+        # (own_green_to_board false): it keeps its place in the stack,
+        # and the final head below it to restack onto.
+        stack, retarget, expired = next_layer(stack, prs,
+                                              candidates + unproven,
                                               open_numbers, when, held)
     if STACKS and live:
         save_stack(state_dir, stack)
@@ -6491,7 +8235,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         held[str(number)] = HOLD_REASON % ahead
     queue = [pr for pr in queue if pr["number"] not in held_by]
     record = {"at": iso(when), "main": main_tip, "held": held,
-              "queue": [pr["number"] for pr in queue], "decisions": []}
+              "queue": [pr["number"] for pr in queue], "decisions": [],
+              # Every open pull request the tick saw: those marked urgent
+              # by hand, and those a tool made urgent (a red nightly's
+              # or default branch's fix), for forge-flow.
+              "urgent": sorted(pr["number"] for pr in prs
+                               if labelled_urgent(pr)),
+              "elevated": sorted(pr["number"] for pr in prs
+                                 if urgent(pr) and not labelled_urgent(pr))}
     if graph:
         record["stack_graph"] = {str(n): node for n, node in sorted(
             graph.items()) if node["base"] is not None}
@@ -6505,6 +8256,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         record["suspects_cleared"] = cleared
     QUEUE_VIEW.clear()
     QUEUE_VIEW.update(queue=record["queue"], held=held, prs=prs)
+    # designs/0053: what a conflict's hand-back suggests merging. The
+    # first rule is the default branch's tip.
+    RESOLVE_BASE.clear()
+    RESOLVE_BASE.update(sha=main_tip)
     if YIELD_PLACES:
         record["yielded"] = {str(n): p for n, p in sorted(yielded.items())}
     if RIGHT_OF_WAY:
@@ -6552,7 +8307,100 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     and str(pr["number"]) in held
                     and eligible(pr, open_numbers - layers_below(pr, prs),
                                  when, any_base=True)[0] is not None]
-    for at, pr in enumerate([] if retarget is not None else queue):
+    # merge.test_ahead.train_merge: a green train goes in as one. Every
+    # ready member merges this tick, not one a tick.
+    trained, train_failed, last_ahead = None, False, None
+    # labels.keep_trains: the commit the trains stay predicted on.
+    train_base = main_tip
+    if TRAINS == "live" and KEEP_LABEL and retarget is None:
+        train_base = carried_base(
+            repo, state_dir, load_json(os.path.join(state_dir, AHEAD_FILE),
+                                       {}), main_tip, github, run, out)
+        if train_base != main_tip:
+            record["train_base"] = train_base
+    if TRAIN_MERGE and retarget is None and AHEAD_BATCH > 1:
+        last_ahead = load_json(os.path.join(state_dir, AHEAD_FILE), {})
+    if TRAIN_MERGE and live and retarget is None and AHEAD_BATCH > 1:
+        # Layers held as stacked are members too: without their own
+        # greens (layers_need_own_green false), the train's top is what
+        # tested them.
+        members = queue if LAYERS_OWN_GREEN else queue + batch_layers
+        entries = train_ready(last_ahead, members, train_base, check_state,
+                              repo, run,
+                              restacks if PREDICT_RESTACKED else None)
+        tested_tree = None
+        if not entries:
+            entries = left_ready(last_ahead, members, train_base,
+                                 check_state)
+            if entries:
+                tested_tree = last_ahead["left_top"]["tree"]
+                out("TRAIN-UNDER-LEFT #%d..#%d: merge on the green of the "
+                    "top they were cut under, %s" % (
+                        entries[0]["pr"], entries[-1]["pr"],
+                        short(last_ahead["left_top"].get("sha") or "")))
+        if entries:
+            opened = {}
+            merged, _ = train_merge(repo, state_dir, entries, members,
+                                    train_base, check_state, github, run,
+                                    sleep, out, opened, main=main_tip,
+                                    tested_tree=tested_tree)
+            # GitHub wouldn't take the train: its members merge one at
+            # a time this tick, updated as before.
+            train_failed = not merged
+            if merged:
+                trained = set(merged)
+                heads = {e["pr"]: e["head"] for e in entries}
+                prs_by = {pr["number"]: pr for pr in members}
+                for number in merged:
+                    # train_pr: the pull request the train merged as,
+                    # for forge-flow ("merged as #N").
+                    record["decisions"].append(dict({
+                        "action": "MERGE", "pr": number,
+                        "head": heads[number], "result": "done",
+                        "train": True}, **({"train_pr": opened["pr"]}
+                                           if "pr" in opened else {})))
+                    note_closing(state_dir, number, when)
+                    if STACKS:
+                        stack = note_merge(state_dir, stack or {}, dict(
+                            prs_by[number], headRefOid=heads[number]),
+                            prs, when)
+                if STACKS and stack:
+                    record["stack"] = [{"pr": e["pr"], "after": e["after"]}
+                                       for e in stack["pending"]]
+    # merge.resolve_slots: a conflict with main is handed back only while
+    # a slot is free; the others wait in `pending` until the tick's end,
+    # when the free slots go to those first in `resolve_slot_order`.
+    # designs/0053: with merge.resolve_slot_on "push" nothing is held for
+    # a slot; every conflict is told at once, as with no slots.
+    gate = RESOLVE_SLOTS if RESOLVE_SLOT_ON != "push" else 0
+    resolving = out_for_resolving(said, prs, repo, main_tip, run) \
+        if gate else []
+    # merge.resolve_slot_minutes: a slot held that long with no push runs
+    # out; its pull request waits behind the others for another.
+    expired, slots, slots_path = [], {}, os.path.join(
+        state_dir, RESOLVE_FILE if live else "dry-run-" + RESOLVE_FILE)
+    if gate and RESOLVE_SLOT_MINUTES:
+        resolving, expired, slots = expire_resolving(slots_path, resolving,
+                                                     prs, when)
+        for number in expired:
+            if not slots[str(number)].get("expired"):
+                slots[str(number)]["expired"] = True
+                out("RESOLVE-EXPIRED #%d: out for resolving %s minutes "
+                    "with no push; its slot goes to the next"
+                    % (number, "%g" % RESOLVE_SLOT_MINUTES))
+    pending = []
+
+    def conflict_back(pr, approval, reason=CONFLICT_REASON, detail=None):
+        gated = gate and pr["number"] not in resolving
+        decision = conflict_hand_back(pr, approval, github, said,
+                                      live and not gated, reason, detail)
+        if gated:
+            pending.append((pr, approval, decision))
+        else:
+            record["decisions"].append(decision)
+
+    for at, pr in enumerate([] if retarget is not None or trained
+                            else queue):
         approval = approvals[pr["number"]]
         found_red = reds.get(str(pr["number"]))
         if found_red:
@@ -6596,6 +8444,51 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             decision = {"action": "WAIT", "pr": pr["number"],
                         "head": pr["headRefOid"],
                         "reason": BATCH_WAIT_REASON}
+        boarded = train_boarded(last_ahead, pr, check_state) \
+            if decision["action"] == "UPDATE" and last_ahead \
+            and not train_failed else None
+        if boarded:
+            # merge.test_ahead.train_merge: its train goes in as one
+            # merge of the tested top, which needs no update of the
+            # member's own; an update would only start a build of the
+            # new head (amendment of 2026-11-12).
+            decision = {"action": "WAIT", "pr": pr["number"],
+                        "head": pr["headRefOid"],
+                        "reason": TRAIN_WAIT_REASON % boarded}
+        suspected = suspect_wait(saved, pr, last_ahead, check_state,
+                                 main_tip) \
+            if decision["action"] == "UPDATE" and TRAIN_MERGE \
+            and last_ahead is not None else None
+        if suspected:
+            decision = {"action": "WAIT", "pr": pr["number"],
+                        "head": pr["headRefOid"], "reason": suspected}
+        # Merged on its own, one outside the first train would move the
+        # default branch under that train's started run. A red default
+        # branch's or nightly's fix, or one the trains are kept through
+        # (labels.keep_trains), goes all the same; one labelled urgent
+        # waits for its train like any other (2026-11-13).
+        ahead_of = train_in_the_way(
+            last_ahead if last_ahead is not None else load_json(
+                os.path.join(state_dir, AHEAD_FILE), {}), pr, check_state) \
+            if decision["action"] == "MERGE" and TRAINS == "live" \
+            and not train_failed and not cuts_trains(pr) \
+            and not labelled_keep(pr) else None
+        if ahead_of:
+            decision = {"action": "WAIT", "pr": pr["number"],
+                        "head": pr["headRefOid"],
+                        "reason": TRAIN_AHEAD_REASON % (
+                            "#%d..#%d" % (ahead_of[0]["pr"],
+                                          ahead_of[-1]["pr"])),
+                        # Timed as the train's top's run (stalled_for).
+                        "train_top": ahead_of[-1].get("sha")}
+        if (gate and decision["action"] == "HAND-BACK"
+                and decision.get("to") == "author"
+                and decision.get("reason", "").startswith(CONFLICT_REASON)
+                and pr["number"] not in resolving):
+            # A slot is given, or not, at the tick's end; either way the
+            # queue moves past it.
+            pending.append((pr, approval, decision))
+            continue
         if (decision["action"] == "UPDATE"
                 and said.get(str(pr["number"])) == hand_back_key(
                     approval, pr["headRefOid"], CONFLICT_REASON)):
@@ -6689,13 +8582,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     pr["number"], "" if live else "would have ",
                     decision["after"], short(decision["below"])))
             else:
-                record["decisions"].append(conflict_hand_back(
-                    pr, approval, github, said, live,
+                conflict_back(
+                    pr, approval,
                     "%s, and the Merger could not merge #%d's final head "
                     "%s into it" % (CONFLICT_REASON, decision["after"],
                                     decision["below"][:10]),
                     RESTACK_DETAIL % (decision["after"],
-                                      decision["below"][:10], MAIN)))
+                                      decision["below"][:10], MAIN))
                 continue
         if decision["action"] == "STACK-UPDATE":
             if decision.get("result", "done") == "done":
@@ -6703,11 +8596,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     % (pr["number"], "" if live else "would have ", MAIN,
                        decision["after"], short(decision["below"])))
             elif not decision["result"].startswith("refused"):
-                record["decisions"].append(conflict_hand_back(
-                    pr, approval, github, said, live,
+                conflict_back(
+                    pr, approval,
                     "%s, and the Merger could not merge it in against "
                     "#%d's final head" % (CONFLICT_REASON,
-                                          decision["after"])))
+                                          decision["after"]))
                 continue
         if decision["action"] == "UNION":
             if decision.get("result", "done") == "done":
@@ -6717,10 +8610,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         ", ".join(sorted(decision["files"]))))
             elif not decision["result"].startswith("refused"):
                 step = decision["result"][len("failed: "):].split(": ")[0]
-                record["decisions"].append(conflict_hand_back(
-                    pr, approval, github, said, live,
-                    "%s, and the Merger could not resolve it (%s)"
-                    % (CONFLICT_REASON, step)))
+                conflict_back(pr, approval,
+                              "%s, and the Merger could not resolve it (%s)"
+                              % (CONFLICT_REASON, step))
                 continue
         if (decision["action"] == "RESOLVE"
                 and decision.get("result", "").startswith("failed")):
@@ -6729,10 +8621,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             # differ per tick, and the reason is half the key that says
             # a hand-back once.
             step = decision["result"][len("failed: "):].split(": ")[0]
-            record["decisions"].append(conflict_hand_back(
-                pr, approval, github, said, live,
-                "%s, and the Merger could not resolve it (%s)"
-                % (CONFLICT_REASON, step)))
+            conflict_back(pr, approval,
+                          "%s, and the Merger could not resolve it (%s)"
+                          % (CONFLICT_REASON, step))
             continue
         if (live and decision["action"] == "MERGE"
                 and decision.get("result") == "done"):
@@ -6748,8 +8639,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             # The backstop for a conflict git didn't see: GitHub's word
             # is final, and the pull request goes back to its author
             # like any other conflict, not round again next tick.
-            record["decisions"].append(
-                conflict_hand_back(pr, approval, github, said, live))
+            conflict_back(pr, approval)
             continue
         if (live and decision["action"] in ("UPDATE", "MERGE")
                 and LOST_HEAD_RE.search(decision.get("result") or "")):
@@ -6792,12 +8682,101 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             stopped = at + 1
             break
     if EARLY_CONFLICTS:
-        record["decisions"] += early_conflicts(
+        early = early_conflicts(
             repo, main_tip, queue[stopped:] + instance_held, approvals,
-            github, said, live, run, layers,
+            github, said, live and not gate, run, layers,
             restacks if PREDICT_RESTACKED else None)
+        by_number = {pr["number"]: pr for pr in queue + instance_held}
+        for decision in early:
+            if gate:
+                pr = by_number[decision["pr"]]
+                pending.append((pr, approvals[pr["number"]], decision))
+            else:
+                record["decisions"].append(decision)
+    slot_waiting = set()
+    if expired:
+        # Already told: if one gets a slot again there is nothing to say.
+        by_number = {pr["number"]: pr for pr in prs}
+        pending = pending + [(by_number[n], approvals.get(n), None)
+                             for n in expired]
+    if pending:
+        # merge.resolve_slots (designs/0012, amendment of 2026-11-12).
+        seen, first = set(), []
+        for entry in pending:
+            if entry[0]["number"] not in seen:
+                seen.add(entry[0]["number"])
+                first.append(entry)
+        entries = {entry[0]["number"]: entry for entry in first}
+        ranked = resolve_slot_order([entry[0] for entry in first],
+                                    queue + instance_held, prs, row,
+                                    last=set(expired))
+        free = max(0, RESOLVE_SLOTS - len(resolving))
+        for pr in ranked[:free]:
+            # Told now, while the others that wait still show as queued
+            # in the comment's list of the author's other pull requests.
+            _, approval, decision = entries[pr["number"]]
+            if decision is not None:
+                if live:
+                    decision["result"] = carry_out(decision, approval,
+                                                   github, said)
+                record["decisions"].append(decision)
+            resolving = resolving + [pr["number"]]
+            # A slot given, or given again, counts from now.
+            slots[str(pr["number"])] = {"head": pr["headRefOid"],
+                                        "since": iso(when)}
+        slot_waiting = {pr["number"] for pr in ranked[free:]}
+        for pr in ranked[free:]:
+            if str(pr["number"]) not in held:
+                held[str(pr["number"])] = (
+                    RESOLVE_EXPIRED_REASON % (
+                        MAIN, "%g" % RESOLVE_SLOT_MINUTES, len(resolving),
+                        ", ".join("#%d" % n for n in resolving))
+                    if pr["number"] in expired else RESOLVE_WAIT_REASON % (
+                        MAIN, len(resolving),
+                        ", ".join("#%d" % n for n in resolving)))
+        if slot_waiting:
+            out("RESOLVE-WAIT %s: conflict with %s; %d of %d slots out (%s)"
+                % (" ".join("#%d" % pr["number"] for pr in ranked[free:]),
+                   MAIN, len(resolving), RESOLVE_SLOTS,
+                   ", ".join("#%d" % n for n in resolving)))
+            record["queue"] = [n for n in record["queue"]
+                               if n not in slot_waiting]
+    pushed = None
+    if RESOLVE_SLOTS and RESOLVE_SLOT_ON == "push":
+        # designs/0053: the resolutions pushed, slotted or queued.
+        found = resolutions(said, prs, queue + instance_held, repo,
+                            main_tip, run, known=load_json(slots_path, {}))
+        slotted, queued, expired, slots = push_slots(
+            slots_path, found, queue + instance_held, prs, when, row)
+        resolving = [pr["number"] for pr in slotted]
+        pushed = (slotted, queued)
+        for number in expired:
+            out("RESOLVE-EXPIRED #%d: its resolution held a slot %s "
+                "minutes; the slot goes to the next"
+                % (number, "%g" % RESOLVE_SLOT_MINUTES))
+        for pr in queued:
+            held.setdefault(str(pr["number"]), RESOLVE_QUEUE_REASON % (
+                MAIN, len(resolving),
+                ", ".join("#%d" % n for n in resolving) or "none"))
+        if slotted or queued:
+            out("RESOLVE-SLOTS: %s checking; %s queued"
+                % (" ".join("#%d" % n for n in resolving) or "none",
+                   " ".join("#%d" % pr["number"] for pr in queued)
+                   or "none"))
+        if queued:
+            record["resolve_queue"] = [pr["number"] for pr in queued]
+    if RESOLVE_SLOTS and (RESOLVE_SLOT_MINUTES
+                          or RESOLVE_SLOT_ON == "push"):
+        save_json(slots_path, slots)
+        if expired:
+            record["resolve_expired"] = sorted(expired)
+    if RESOLVE_SLOTS:
+        record["resolving"] = sorted(resolving)
+        if slot_waiting:
+            record["resolve_waiting"] = sorted(slot_waiting)
     if live:
-        minutes = stalled_for(state_dir, waiting, when, check_state)
+        minutes = stalled_for(state_dir, waiting, when, check_state, repo,
+                              run)
         if minutes is not None and "stalled" not in record:
             record["stalled"] = {"pr": waiting["pr"], "head": waiting["head"],
                                  "minutes": minutes}
@@ -6811,6 +8790,17 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         blocked = blocked_prs(held)
         if blocked:
             said_next["blocked"] = blocked
+            said_next["unblocks"] = unblockers(held)
+        if pushed is not None:
+            # designs/0053: the build check runs the slotted resolutions
+            # with the approved heads, and none of the queued ones.
+            said_next["resolve_slotted"] = [
+                {"pr": pr["number"], "head": pr["headRefOid"]}
+                for pr in pushed[0]]
+            said_next["resolve_queue"] = [
+                {"pr": pr["number"], "head": pr["headRefOid"]}
+                for pr in pushed[1]]
+            said_next["resolve_base"] = dict(RESOLVE_BASE)
         if TEST_AHEAD:
             acted = [d["action"] for d in record["decisions"]
                      if d["pr"] == waiting_on]
@@ -6820,7 +8810,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # predicts nothing. It leaves ahead.json as the last tick wrote
         # it: written empty, the batch the queue is merging was forgotten,
         # and its members waited for a new run of their own.
-        if TEST_AHEAD and retarget is None:
+        if TEST_AHEAD and retarget is None and not trained:
             acting = [pr for pr in queue if pr["number"] == waiting_on]
             for pr in [pr for pr in queue if pr["number"] != waiting_on
                        and pr.get("baseRefName", MAIN) == MAIN
@@ -6856,14 +8846,33 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                        "" if live else "would be "))
             rest = [pr for pr in queue if pr["number"] != waiting_on
                     and str(pr["number"]) not in reds
+                    and pr["number"] not in slot_waiting
                     and not handed_back(said, pr, approvals[pr["number"]],
                                         when)]
             ahead_queue = acting + rest if acting else []
             last = load_json(os.path.join(state_dir, AHEAD_FILE), {})
             owed = None
             if saved:
+                ahead_queue = with_suspects(ahead_queue, saved, [
+                    pr for pr in prs if str(pr["number"]) not in reds])
+                added = set()
+                for pr in ahead_queue:
+                    if pr["number"] not in approvals:
+                        # A layer held as stacked: its approval, as the
+                        # train boarded it with (`ready_layers`).
+                        approvals[pr["number"]] = approval_of(pr) or {}
+                        added.add(pr["number"])
+
+                def updated(head, pr):
+                    have_head(repo, pr, run)
+                    return own_push(repo, head, pr["headRefOid"], main_tip,
+                                    run)
                 saved, ended = suspects_left(saved, ahead_queue, record,
-                                             approvals, said)
+                                             approvals, said, updated)
+                still = {e["pr"] for e in (saved or {}).get("suspects")
+                         or ()}
+                ahead_queue = [pr for pr in ahead_queue
+                               if pr["number"] not in added - still]
                 if ended:
                     out(ended)
                 if saved is None and os.path.exists(os.path.join(
@@ -6876,14 +8885,21 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 repo, pr, prs, open_numbers, when, said, run, regenerated,
                 rules, (lambda layer, approval: own_green_wait(
                     layer, approval, github, greens, repo, main_tip, run))
-                if OWN_HEAD_GREEN else None,
+                if OWN_HEAD_GREEN and LAYERS_OWN_GREEN else None,
                 (lambda layer: instance_wait(repo, layer, main_tip, github,
                                              gated_files, run))
                 if GATED else None, conflicted)) if AHEAD_STACKS else None
+            # merge.test_ahead.own_green_to_board false: those held only
+            # for their own green board too, behind the candidates; the
+            # train's top tests them (amendment of 2026-11-12, ninth).
+            boarding = ahead_queue + [
+                pr for pr in order(unproven, prs)
+                if str(pr["number"]) not in reds
+                and not handed_back(said, pr, approval_of(pr) or {}, when)]
             cut = lambda before: cut_trains(
-                repo, main_tip, train_carriages(ahead_queue, layers_of),
+                repo, train_base, train_carriages(boarding, layers_of),
                 before, {pr["number"]: pr["headRefOid"] for pr in prs},
-                open_numbers, red={pr["number"] for pr in ahead_queue
+                open_numbers, red={pr["number"] for pr in boarding
                                    if head_red(check_state, pr)},
                 restacks=restacks if PREDICT_RESTACKED else None, run=run,
                 files=files, note=note, force_merges=TRAINS == "live",
@@ -6891,9 +8907,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                                                         tree),
                 acting=waiting_on if acting else None)
             files, note = {}, {}
-            if TRAINS == "live" and not searching and ahead_queue:
+            if TRAINS == "live" and not searching and boarding:
                 # designs/0047: trains, cut once and kept.
-                entries, sizes, events = cut(last)
+                entries, sizes, events = cut(trains_before(last))
                 write_ahead_refs(repo, entries, run)
                 if TELL_BOARDED:
                     told = tell_boarded(
@@ -6931,11 +8947,31 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             said_ahead = {"at": record["at"], "base": main_tip,
                           "repo": git_store(repo),
                           "entries": entries}
+            if sizes is not None and train_base != main_tip:
+                # Kept on it by labels.keep_trains (`carried_base`).
+                said_ahead.update(base=train_base, main=main_tip)
+                if (last or {}).get("main") != main_tip:
+                    out("TRAIN-KEPT: %s moved to %s; the trains stay on %s "
+                        "(labels.keep_trains)" % (MAIN, main_tip[:10],
+                                                  train_base[:10]))
+            if sizes is None and isinstance(
+                    (last or {}).get("kept_trains"), dict):
+                # A red train's search goes on: its trains are kept for
+                # when it ends.
+                said_ahead["kept_trains"] = last["kept_trains"]
             if sizes is not None:
                 said_ahead["trains"] = True
+                under = left_top(last, entries, sizes,
+                                 said_ahead["base"], check_state)
+                if under is not None:
+                    said_ahead["left_top"] = under
                 if note.get("urgent_cut"):
                     said_ahead["urgent_cut"] = note["urgent_cut"]
                 record["trains"] = train_lists(entries, sizes)
+                if note.get("waits"):
+                    # Why each that didn't board waits (2026-11-12: four
+                    # waited an hour, and nothing said why).
+                    record["train_waits"] = note["waits"]
                 if events:
                     record["train_events"] = [c for c, _ in events]
                 for _, line in events:
@@ -6987,6 +9023,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         "suspects" % (entries[0]["pr"], entries[red - 1]["pr"],
                                       red))
                     searching = True
+                    if sizes is not None:
+                        said_ahead["kept_trains"] = kept_trains(
+                            train_base, entries, sizes, note)
+                        if train_base != main_tip:
+                            said_ahead["kept_trains"]["main"] = main_tip
             if searching and entries:
                 # A suspect merged this tick is still predicted first,
                 # from the tip before it: the rest are predicted on it,
@@ -7102,13 +9143,31 @@ def commit_identity(project, name):
 
 def load_check_state(state_dir):
     """The build check's state.json in `state_dir`, or None when it can't
-    be read: every wait is then judged as without it."""
+    be read: every wait is then judged as without it. Its `running` is
+    added here, not read from the file: [{pr, sha, started}] for each
+    slot whose worker lock is held now, from the lock's line
+    (`#<pr> <sha> <started> ...`)."""
     try:
         with open(os.path.join(state_dir, "state.json")) as handle:
             got = json.load(handle)
     except (OSError, ValueError):
         return None
-    return got if isinstance(got, dict) else None
+    if not isinstance(got, dict):
+        return None
+    running = []
+    try:
+        names = sorted(os.listdir(state_dir))
+    except OSError:
+        names = []
+    for name in names:
+        if not (name.startswith("worker") and name.endswith(".lock")):
+            continue
+        parts = (locks.holder(os.path.join(state_dir, name)) or "").split()
+        if len(parts) >= 3 and parts[0][:1] == "#" and parts[0][1:].isdigit():
+            running.append({"pr": int(parts[0][1:]), "sha": parts[1],
+                            "started": parts[2]})
+    got["running"] = running
+    return got
 
 
 def main(argv=None, run=sh, out=print, environ=None, mint=mint,
@@ -7125,6 +9184,10 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
     parser.add_argument("--checkout", default=environ.get(
         "FORGE_CRON_CHECKOUT"), help="the checkout kept at the default "
         "branch (default $FORGE_CRON_CHECKOUT)")
+    parser.add_argument("--ready", type=int, metavar="PR", default=None,
+                        help="say whether pull request PR may be merged by "
+                        "hand now, and exit 0 if so, 1 if not (merge.mode "
+                        "manual; agent-forge #274)")
     parser.add_argument("--check-state", default=None,
                         help="the build check's state directory, read for "
                         "merge.queued_stall_minutes (default "
@@ -7145,6 +9208,20 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
         out("NO-CONFIG: %s" % err)
         return 2
     configure(project)
+    if args.ready is not None:
+        token = environ.get("GH_TOKEN") or mint(project, READ_AS or ACT_AS)
+        if not token:
+            out("NO-TOKEN: no GH_TOKEN, and no token could be minted")
+            return 2
+        try:
+            why = merge_ready(repo, GitHub(token, run), args.ready, run)
+        except (RuntimeError, KeyError, TypeError, ValueError) as err:
+            out("FAILED: %s" % err)
+            return 2
+        out("NOT READY #%d: %s" % (args.ready, "; ".join(why)) if why
+            else "READY #%d: merge it with gh pr merge %d --match-head-commit"
+            " <its head>" % (args.ready, args.ready))
+        return 1 if why else 0
     NIGHTLY_FIXES = nightly.fixes(project, environ)
     state_dir = args.state_dir or locks.state_dir(project.name, "merger",
                                                   environ)
@@ -7160,7 +9237,7 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
         if token is None:
             out("NO-TOKEN: could not mint %s's token" % reader)
             return 2
-        if (RESOLVE or UNION or STACKS) and not args.dry_run:
+        if (RESOLVE or UNION or STACKS or TRAIN_MERGE) and not args.dry_run:
             RESOLVE_IDENTITY = identity(project, ACT_AS)
         check_state = None
         if QUEUED_STALL_AFTER is not None or AHEAD_BATCH > 1:
@@ -7168,6 +9245,17 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
                 os.path.expanduser(args.check_state) if args.check_state
                 else locks.state_dir(project.name, "pr-check", environ))
         MAIN_RED_FIXES = main_red_fixes(check_state)
+        if MANUAL:
+            if args.dry_run:
+                out("MANUAL: merge.mode is manual; nothing to merge")
+                return 0
+            try:
+                record_hand_merges(state_dir, GitHub(token, run), out,
+                                   now_utc())
+            except (RuntimeError, KeyError, TypeError, ValueError) as err:
+                out("FAILED: %s" % err)
+                return 2
+            return 0
         # Only a live tick, and only with a stall alert, is given the
         # relay: a dry run messages nobody.
         send = ((sender or relay_sender)(project, environ)

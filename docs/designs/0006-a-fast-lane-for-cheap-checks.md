@@ -121,3 +121,29 @@ agent-forge's tests cover:
 
 * **`max_seconds`.** 60 suggested: the text checks and dependency
   installs, but no compile.
+
+## Amendment (2026-11-11): a lane without `depends`
+
+Proposed in agent-forge #261; this amendment records the change for
+review with its pull request.
+
+**What happened.** A project without the tracer had no fast lane at
+all, so its documentation-only heads queued for a full slot behind
+every code head: on one evening, approved documentation-only heads
+waited more than 4 hours behind about 40 queued heads in 3 slots,
+though the steps they would run took about a minute.
+
+**The change.** The non-goal above assumed that without `depends`
+every head runs every step. Since designs/0048, scoped steps
+(`pull_requests`) run only when a head's paths or labels take them in.
+So without `depends`, a head's chosen steps are every step that
+applies (`only_if`), with scoped steps by their scope, worked out the
+same way a run does, and `fast_lane` is no longer refused without
+`depends`. The cost rule and `max_seconds` are unchanged, and a head
+that would run a scoped step is still never cheap, so only a project
+whose unscoped steps are light gets any use from the lane. With
+`depends`, nothing changes.
+
+**Why it is safe.** The estimate only decides which slot takes a
+head. The lane run chooses its own steps exactly as an ordinary slot
+does, so no head skips a step because it went through the lane.

@@ -33,7 +33,17 @@ the sync, so it is the reviewed default branch's. A host left at the
 old commit after a pin bump, or moved ahead of one, stops rather than
 runs code the project didn't approve. Without the file nothing is
 checked. The receiver's ticks run through here, so they are held to
-the pin too.
+the pin too. A job that finds the installation not at the pin, or
+forge-install about to move it (`INSTALL-PENDING`), waits for it
+first, holding none of the installation's lock: `PIN-WAIT: <why>`, then
+`PIN-WAITED <s>` once it is there. Only after `$FORGE_CRON_PIN_WAIT_S`
+(default 600; 0, no wait) does it stop. After a pin bump an hourly or
+daily job that fired before forge-install's next run lost its run
+(agent-forge #262). A job started from a release (`forge-install
+--versions`) that forge-install has since moved the installation off
+can't see the move itself, so it runs the new release's forge-cron-run
+from the start instead (`PIN-MOVED`), dropping its locks: waiting held
+its tool's lock, and every run of that tool, for the whole bound.
 
 **Locks.** Two kinds, taken in this order so no two jobs can each hold
 what the other waits for:
@@ -93,6 +103,15 @@ from agent_forge import config, github, locks  # noqa: E402
 
 class Stop(Exception):
     """The tool won't run; the message is the log line."""
+
+
+class NotYet(Stop):
+    """The installation isn't at the pin yet, or forge-install is about to
+    move it: worth waiting for (agent-forge #262)."""
+
+
+# How often a job waiting for forge-install looks again.
+PIN_POLL_S = 10
 
 
 def now():
@@ -199,6 +218,22 @@ PIN_NAME = os.path.join(config.CONFIG_DIR, "pin")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
+def moved_release(install):
+    """With `forge-install --versions` (designs/0015), the release the
+    installation's link now names, when it isn't `install`, the release
+    this run started from; else None. A run started from a release just
+    before forge-install moved the link can never see the move itself:
+    its own release never changes."""
+    parent = os.path.dirname(os.path.realpath(install))
+    if not parent.endswith(".d"):
+        return None
+    link = parent[:-len(".d")]
+    if not os.path.islink(link):
+        return None
+    now = os.path.realpath(link)
+    return now if now != os.path.realpath(install) else None
+
+
 def check_pin(repo, install):
     """Raise Stop unless `install` is at the commit `repo`'s pin names;
     nothing to check when it has no pin."""
@@ -220,7 +255,7 @@ def check_pin(repo, install):
         raise Stop("PIN-MISMATCH: %s isn't a git checkout, so its commit "
                    "can't be held to the pin %s" % (install, pin[:12]))
     if head != pin:
-        raise Stop("PIN-MISMATCH: agent-forge here is at %s, and %s pins %s;"
+        raise NotYet("PIN-MISMATCH: agent-forge here is at %s, and %s pins %s;"
                    " nothing runs until the installation is at the pin"
                    % (head[:12], PIN_NAME, pin[:12]))
 
@@ -358,7 +393,7 @@ def refresh_base(repo, branch, logdir, key):
 
 
 def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
-         nap=time.sleep, err=None, install=INSTALL):
+         nap=time.sleep, err=None, install=INSTALL, execute=os.execv):
     argv = sys.argv[1:] if argv is None else argv
     environ = os.environ if environ is None else environ
     err = err or (lambda line: print(line, file=sys.stderr))
@@ -381,6 +416,7 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
                                 or os.path.join(env["HOME"], "cron-logs"))
     wait = float(environ.get("FORGE_CRON_LOCK_WAIT_S", "300"))
     retry_s = float(environ.get("FORGE_CRON_FETCH_RETRY_S", "5"))
+    pin_wait = float(environ.get("FORGE_CRON_PIN_WAIT_S", "600"))
     os.makedirs(logdir, exist_ok=True)
     name = os.path.basename(tool)
     log_path = os.path.join(logdir, name + ".log")
@@ -459,15 +495,55 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
                     return give_up("another job held the checkout's lock")
             write("at %s" % git(here, "rev-parse", "--short",
                                 "HEAD").stdout.strip())
-            if locks.install_wanted(install):
-                raise Stop("INSTALL-PENDING: forge-install is waiting to "
-                           "move %s; nothing new starts until it has"
-                           % install)
-            install_lock = open(locks.install_lock_path(install), "a")
-            handles.append(install_lock)
-            if not lock(install_lock, False, deadline, clock, nap):
-                return give_up("forge-install held the installation's lock")
-            check_pin(here, install)
+            # A pin bump, or an install under way: wait for forge-install,
+            # holding neither the installation's lock nor anything it
+            # waits for, rather than lose this run (agent-forge #262).
+            pin_deadline = None
+            while True:
+                try:
+                    if locks.install_wanted(install):
+                        raise NotYet("INSTALL-PENDING: forge-install is "
+                                     "waiting to move %s; nothing new "
+                                     "starts until it has" % install)
+                    install_lock = open(locks.install_lock_path(install), "a")
+                    if not lock(install_lock, False,
+                                max(deadline, clock()) if pin_deadline
+                                else deadline, clock, nap):
+                        install_lock.close()
+                        return give_up("forge-install held the "
+                                       "installation's lock")
+                    try:
+                        check_pin(here, install)
+                    except Stop:
+                        install_lock.close()
+                        raise
+                    handles.append(install_lock)
+                    break
+                except NotYet as e:
+                    moved = moved_release(install)
+                    if moved is not None:
+                        # Run the release forge-install moved to, from the
+                        # start; this one's locks go with its descriptors
+                        # (none is inheritable), so nothing waits on it.
+                        write("PIN-MOVED: %s; running %s instead"
+                              % (e, moved))
+                        launcher = os.path.join(moved, "bin",
+                                                "forge-cron-run")
+                        log.close()
+                        execute(sys.executable,
+                                [sys.executable, launcher] + argv)
+                        return 0
+                    if pin_deadline is None:
+                        pin_deadline = clock() + pin_wait
+                        waiting_since = clock()
+                        if pin_wait > 0:
+                            write("PIN-WAIT: %s; waiting up to %gs for "
+                                  "forge-install" % (e, pin_wait))
+                    if clock() >= pin_deadline:
+                        raise
+                    nap(PIN_POLL_S)
+            if pin_deadline is not None:
+                write("PIN-WAITED %ds" % (clock() - waiting_since))
             path = tool_path(here, tool)
             app = environ.get("FORGE_CRON_APP")
             if app:

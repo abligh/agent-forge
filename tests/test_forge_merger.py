@@ -19,7 +19,7 @@ import unittest
 import urllib.error
 from unittest import mock
 
-from agent_forge import checkout, config
+from agent_forge import checkout, config, locks
 from tests.helpers import example, load_tool
 
 m = load_tool("forge-merger")
@@ -145,6 +145,19 @@ class Urgent(unittest.TestCase):
         self.assertEqual([p["number"] for p in got], [5, 3, 4])
         self.assertTrue(m.urgent(pr(5, T3)))
         self.assertFalse(m.urgent(pr(3, T0)))
+
+    def test_labelled_ones_go_before_a_tools_fixes(self):
+        # A person's Urgent label always goes first; a fix a tool found
+        # (red nightly, red default branch) comes after, older or not.
+        self.addCleanup(setattr, m, "NIGHTLY_FIXES", frozenset())
+        self.addCleanup(setattr, m, "MAIN_RED_FIXES", frozenset())
+        m.NIGHTLY_FIXES = frozenset({5})
+        m.MAIN_RED_FIXES = frozenset({6})
+        hot = labelled(pr(7, T3), "Priority:urgent")
+        got = m.order([pr(3, T0), pr(5, T1), pr(6, T0), hot])
+        self.assertEqual([p["number"] for p in got], [7, 6, 5, 3])
+        got = m.fixes_first([pr(3, T0), pr(6, T0), hot], None, set())
+        self.assertEqual([p["number"] for p in got], [7, 6, 3])
 
 
 class LoginAndMarkers(unittest.TestCase):
@@ -998,6 +1011,256 @@ class Decide(RepoCase):
         self.assertIn("fetch failed", got["reason"])
 
 
+class MergedAnotherMember(unittest.TestCase):
+    """A train member whose author merged in another member's head
+    (amendment of 2026-11-12): kept when that member is ahead of it in
+    the train, since its tree in its place is then unchanged; out
+    otherwise."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Repo(tmp.name)
+        self.addCleanup(m.configure, project())
+        m.configure(project(test_ahead={
+            "batch": 3, "batches": 1, "depth": 3, "trains": "live"}))
+        self.heads = {}
+        for number in (5, 6, 7, 8):
+            self.repo.branch("b%d" % number, "origin/main")
+            self.heads[number] = self.repo.commit(
+                "f%d.txt" % number, "%d\n" % number, "#%d" % number)
+            self.repo.publish_pr(number, self.heads[number])
+        self.entries, sizes, _ = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), self.carriages(), None,
+            dict(self.heads), set(self.heads))
+        self.assertEqual(m.train_lists(self.entries, sizes)[0], [5, 6, 7])
+        self.last = {"base": self.repo.main_tip(), "trains": True,
+                     "entries": self.entries,
+                     "batch": {"size": sizes[0], "trees": [
+                         e["tree"] for e in self.entries[:sizes[0]]]}}
+
+    def carriages(self, **moved):
+        return [[pr(n, T1, head=moved.get("p%d" % n, self.heads[n]))]
+                for n in sorted(self.heads)]
+
+    def merged_into(self, number, other):
+        """#`number`'s boarded head with #`other`'s head merged in."""
+        self.repo.branch("m%d" % number, self.heads[number])
+        head = self.repo.merge(self.heads[other])
+        self.repo.publish_pr(number, head)
+        return head
+
+    def recut(self, number, head):
+        return m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            self.carriages(**{"p%d" % number: head}), self.last,
+            {**self.heads, number: head}, set(self.heads))
+
+    def test_merging_the_member_ahead_of_it_keeps_its_place(self):
+        # #7 merges #6, the member just ahead of it; #5 is ahead of both,
+        # so #7's own tree is not the one predicted for it.
+        head = self.merged_into(7, 6)
+        self.assertFalse(m.own_push(self.repo.path, self.heads[7], head,
+                                    self.repo.main_tip()))
+        self.assertNotEqual(run_git(self.repo.path, "rev-parse",
+                                    head + "^{tree}"), self.entries[2]["tree"])
+        got, sizes, events = self.recut(7, head)
+        self.assertEqual(events, [("kept", "KEPT #7: pushed %s, same tree "
+                                   "in its place" % head[:10])])
+        self.assertEqual(m.train_lists(got, sizes)[0], [5, 6, 7])
+        # The same predictions, so the same top and the same run.
+        self.assertEqual([e["sha"] for e in got[:3]],
+                         [e["sha"] for e in self.entries[:3]])
+        self.assertEqual(got[2]["head"], head)
+        # And with train_merge the train merges that head.
+        queue = [pr(n, T1, head=head if n == 7 else self.heads[n])
+                 for n in (5, 6, 7)]
+        green = {"results": {"r": {"ok": True,
+                                   "tree": self.entries[2]["tree"]}}}
+        ready = m.train_ready(self.last, queue, self.repo.main_tip(), green,
+                              self.repo.path)
+        self.assertEqual([e["head"] for e in ready],
+                         [self.heads[5], self.heads[6], head])
+
+    def test_merging_the_first_member_keeps_the_second_silently(self):
+        # Its own tree is then the prediction itself.
+        head = self.merged_into(6, 5)
+        got, sizes, events = self.recut(6, head)
+        self.assertEqual(events, [])
+        self.assertEqual([e["sha"] for e in got[:3]],
+                         [e["sha"] for e in self.entries[:3]])
+
+    def test_merging_a_member_behind_it_is_a_push(self):
+        head = self.merged_into(6, 7)
+        _, _, events = self.recut(6, head)
+        self.assertEqual(events[0][0], "left")
+        self.assertIn("LEFT #6: pushed %s mid-train" % head[:10],
+                      events[0][1])
+
+    def test_merging_one_not_in_the_train_is_a_push(self):
+        head = self.merged_into(6, 8)
+        _, _, events = self.recut(6, head)
+        self.assertEqual(events[0], ("left", "LEFT #6: pushed %s mid-train"
+                                     % head[:10]))
+
+
+class TrainSetup(RepoCase):
+    """A green train of #5 and #6, predicted on main's tip."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.publish_pr(5, self.approved)
+        self.repo.branch("other", "main")
+        self.other = self.repo.commit("g.txt", "other\n", "other")
+        self.repo.publish_pr(6, self.other)
+        self.repo.branch("main", "main")
+        self.tip = self.repo.main_tip()
+        self.queue = [dict(pr(5, head=self.approved), title="five"),
+                      dict(pr(6, head=self.other), title="six")]
+        self.entries, parent = [], self.tip
+        for item in self.queue:
+            entry, failed = m.predict_one(self.repo.path, parent, item)
+            self.assertIsNone(failed)
+            self.entries.append(entry)
+            parent = entry["sha"]
+        self.last = {"base": self.tip, "entries": self.entries,
+                     "batch": {"size": 2, "trees": [
+                         e["tree"] for e in self.entries]}}
+        self.check = {"results": {"r": {"ok": True,
+                                        "tree": self.entries[-1]["tree"]}}}
+        self.lines = []
+        for name, value in (("RESOLVE_IDENTITY", ("Merger", "m@example")),
+                            ("CI_WORKFLOW", ""), ("REPO_SLUG",
+                                                  "example/widget")):
+            patch = mock.patch.object(m, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def git(self, args, cwd=None, env=None):
+        """git, with a push to GitHub sent to the test's origin."""
+        if "push" in args:
+            args = [self.repo.origin if a.startswith("https://github.com/")
+                    else a for a in args]
+        return m.sh(args, cwd, env)
+
+    def merge(self, merged=(5, 6), refuse=None):
+        self.github = FakeGitHub({
+            SLUG + "/pulls/%d" % n: {"merged": n in merged} for n in (5, 6)},
+            refuse)
+        return m.train_merge(self.repo.path, "/nonexistent", self.entries,
+                             self.queue, self.tip, self.check, self.github,
+                             self.git, lambda s: None, self.lines.append)
+
+
+class TrainMerge(TrainSetup):
+    """merge.test_ahead.train_merge (designs/0047, amendment of
+    2026-11-11): a green train goes in as one pull request."""
+
+    def test_a_green_train_merges_as_one_pull_request(self):
+        self.assertEqual(self.merge(), ([5, 6], []))
+        top = run_git(self.repo.origin, "rev-parse", "forge/train-5-6")
+        # Every member's head is in the train, and its tree is the one
+        # the green top tested.
+        for head in (self.approved, self.other):
+            run_git(self.repo.path, "fetch", "-q", "origin",
+                    "forge/train-5-6")
+            self.assertEqual(subprocess.run(
+                ["git", "-C", self.repo.path, "merge-base",
+                 "--is-ancestor", head, top]).returncode, 0)
+        self.assertEqual(run_git(self.repo.path, "rev-parse",
+                                 top + "^{tree}"), self.entries[-1]["tree"])
+        methods = [(w[0], w[1]) for w in self.github.writes]
+        self.assertEqual(methods, [
+            ("POST", SLUG + "/statuses/" + top),
+            ("POST", SLUG + "/pulls"),
+            ("PUT", SLUG + "/pulls/900/merge"),
+            ("DELETE", SLUG + "/git/refs/heads/forge/train-5-6")])
+        self.assertEqual(self.github.writes[0][2]["context"],
+                         m.STATUS_CONTEXT)
+        self.assertEqual(self.github.writes[2][2],
+                         {"sha": top, "merge_method": "merge",
+                          "commit_title": "Merge train #5..#6 (#900)"})
+        self.assertIn("* #5 at %s" % self.approved[:10],
+                      self.github.writes[1][2]["body"])
+
+    def test_a_member_github_does_not_mark_merged_goes_on_its_own(self):
+        self.assertEqual(self.merge(merged=(5,)), ([5], [6]))
+        self.assertIn("#6", self.lines[-1])
+
+    def test_a_refused_merge_closes_the_train_and_falls_back(self):
+        refuse = lambda method, path: "protected" \
+            if path.endswith("/merge") else None
+        self.assertEqual(self.merge(refuse=refuse), ([], [5, 6]))
+        self.assertIn(("PATCH", SLUG + "/pulls/900"),
+                      [(w[0], w[1]) for w in self.github.writes])
+        self.assertIn("each member merges on its own", self.lines[-1])
+
+    def test_a_layer_is_retargeted_to_main_first(self):
+        self.queue[1]["baseRefName"] = "b5"
+        self.merge()
+        self.assertIn(("PATCH", SLUG + "/pulls/6", {"base": "main"}),
+                      self.github.writes)
+
+    def test_ready_only_while_main_is_the_trains_base(self):
+        self.assertEqual(m.train_ready(self.last, self.queue, self.tip,
+                                       self.check), self.entries)
+        self.assertIsNone(m.train_ready(self.last, self.queue, "f" * 40,
+                                        self.check))
+
+    def test_a_train_of_one_is_ready(self):
+        # Merged as a train, the default branch lands on the sha the
+        # next train was predicted on; an update and a merge of its own
+        # would move it elsewhere and that train would be cut again.
+        one = dict(self.last, entries=self.entries[:1],
+                   batch={"size": 1, "trees": [self.entries[0]["tree"]]})
+        green = {"results": {"r": {"ok": True,
+                                   "tree": self.entries[0]["tree"]}}}
+        self.assertEqual(m.train_ready(one, self.queue, self.tip, green),
+                         self.entries[:1])
+
+    def test_ready_only_with_a_green_top(self):
+        self.assertIsNone(m.train_ready(self.last, self.queue, self.tip,
+                                        {"results": {}}))
+
+    def test_a_member_that_only_merged_main_is_still_ready(self):
+        # Its new head, with main as the first parent, gives the tree
+        # its prediction tested: the train merges that head, so GitHub
+        # marks it merged, and the tree it tested.
+        merged = run_git(self.repo.path, "commit-tree",
+                         self.other + "^{tree}", "-p", self.tip, "-p",
+                         self.other, "-m", "merge main")
+        moved = [self.queue[0], dict(self.queue[1], headRefOid=merged)]
+        self.assertIsNone(m.train_ready(self.last, moved, self.tip,
+                                        self.check))
+        ready = m.train_ready(self.last, moved, self.tip, self.check,
+                              self.repo.path)
+        self.assertEqual([e["head"] for e in ready],
+                         [self.approved, merged])
+        self.assertEqual([e["tree"] for e in ready],
+                         [e["tree"] for e in self.entries])
+        self.entries, self.queue = ready, moved
+        self.assertEqual(self.merge(), ([5, 6], []))
+        top = run_git(self.repo.origin, "rev-parse", "forge/train-5-6")
+        run_git(self.repo.path, "fetch", "-q", "origin", "forge/train-5-6")
+        self.assertEqual(subprocess.run(
+            ["git", "-C", self.repo.path, "merge-base", "--is-ancestor",
+             merged, top]).returncode, 0)
+        self.assertEqual(run_git(self.repo.path, "rev-parse",
+                                 top + "^{tree}"), self.entries[-1]["tree"])
+
+    def test_a_member_with_a_change_of_its_own_is_not_ready(self):
+        self.repo.branch("more", self.other)
+        more = self.repo.commit("g.txt", "changed\n", "more")
+        moved = [self.queue[0], dict(self.queue[1], headRefOid=more)]
+        self.assertIsNone(m.train_ready(self.last, moved, self.tip,
+                                        self.check, self.repo.path))
+
+    def test_ready_only_while_every_member_is_at_its_predicted_head(self):
+        moved = [self.queue[0], dict(self.queue[1], headRefOid="9" * 40)]
+        self.assertIsNone(m.train_ready(self.last, moved, self.tip,
+                                        self.check))
+
+
 def graphql_page(nodes, more=False, cursor="c1"):
     nodes = [dict(n, reviews={"nodes": n["reviews"]},
                   comments={"nodes": n["comments"]}) for n in nodes]
@@ -1036,6 +1299,16 @@ class FetchPrs(unittest.TestCase):
                                                          [4, 9]})), {4, 9})
         self.assertEqual(m.fetch_open_issues(FakeGitHub({"--paginate": None})),
                          set())
+
+    def test_open_issues_ask_graphql_for_numbers_only(self):
+        github = FakeGitHub({"--paginate": [4]})
+        m.fetch_open_issues(github)
+        args = github.calls[0]
+        self.assertEqual(args[:2], ("--paginate", "graphql"))
+        query = next(a for a in args if a.startswith("query="))
+        self.assertIn("issues(states:OPEN", query)
+        self.assertIn("$endCursor", query)
+        self.assertNotIn("body", query)
 
 
 class GitHubApi(unittest.TestCase):
@@ -1124,6 +1397,21 @@ class Tick(Decide):
         if not live:
             self.assertEqual(github.writes, [])
         return record, lines
+
+    def test_the_record_names_urgent_and_elevated_pull_requests(self):
+        # For forge-flow: labelled by hand, or made urgent by a tool (a
+        # red nightly's fix), whether queued or held.
+        m.configure(urgent_project())
+        self.addCleanup(m.configure, project())
+        held = labelled(pr(7, T1, base="b6", reviews=[]), "Priority:urgent")
+        prs = [labelled(self.item(), "Priority:urgent"), self.other_pr(),
+               held, pr(8, T1, reviews=[])]
+        with mock.patch.object(m, "NIGHTLY_FIXES", frozenset({6, 8})):
+            record, _ = self.tick(prs)
+        self.assertEqual(record["urgent"], [5, 7])
+        self.assertEqual(record["elevated"], [6, 8])
+        record, _ = self.tick(prs[1:2])
+        self.assertEqual((record["urgent"], record["elevated"]), ([], []))
 
     def test_a_pull_request_waiting_for_an_instance_is_held_and_passed(self):
         # checks.instances.<name>.gate (agent-forge-next-bundle item 5).
@@ -2900,6 +3188,54 @@ class PredictAhead(unittest.TestCase):
                          [".git", "a.txt", "b.txt", "base.txt", "shared.txt"])
 
 
+class PredictLayerOnItsBase(unittest.TestCase):
+    """A layer that changes its lower layer's lines again is predicted
+    right behind it: the lower layer's prediction has its head as a
+    second parent, so the layer merges from its real merge base (the
+    lower head), not from where the stack left the default branch."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Repo(tmp.name)
+        self.repo.branch("main", "main")
+        self.repo.commit("l.txt", "1\n2\n3\n", "main l.txt")
+        self.repo.push("main")
+        self.repo.branch("lower", "main")
+        self.lower = self.repo.commit("l.txt", "1\nA\n3\n", "lower")
+        self.repo.publish_pr(5, self.lower)
+        self.repo.branch("upper", self.lower)
+        self.upper = self.repo.commit("l.txt", "1\nB\n3\n", "upper")
+        self.repo.publish_pr(6, self.upper)
+
+    def test_the_layer_boards_behind_its_base(self):
+        got = m.predict_ahead(self.repo.path, self.repo.main_tip(),
+                              [pr(5, T1, head=self.lower),
+                               pr(6, T1, head=self.upper)])
+        self.assertEqual([e["pr"] for e in got], [5, 6])
+        self.assertEqual(got[1]["tree"],
+                         run_git(self.repo.path, "rev-parse",
+                                 self.upper + "^{tree}"))
+        # The tested commit keeps one parent, so an update of #5's head
+        # to the same tree is the same prediction; its graph holds #5.
+        def parents(sha):
+            return run_git(self.repo.path, "rev-list", "--parents", "-n",
+                           "1", sha).split()[1:]
+        self.assertEqual(parents(got[0]["sha"]), [self.repo.main_tip()])
+        self.assertEqual(parents(got[0]["graph"]),
+                         [self.repo.main_tip(), self.lower])
+        self.assertEqual(parents(got[1]["sha"]), [got[0]["sha"]])
+
+    def test_a_head_already_in_the_parent_is_not_a_parent_again(self):
+        entry, why = m.predict_one(self.repo.path, self.lower,
+                                   pr(5, T1, head=self.lower))
+        self.assertIsNone(why)
+        parents = run_git(self.repo.path, "rev-list", "--parents", "-n",
+                          "1", entry["sha"]).split()[1:]
+        self.assertEqual(parents, [self.lower])
+        self.assertNotIn("graph", entry)
+
+
 class PredictRestacked(unittest.TestCase):
     """merge.stacks.predict_restacked (designs/0042): a layer whose lower
     layer merged is predicted, and checked early, as the Merger will
@@ -3119,6 +3455,120 @@ class PredictRestacked(unittest.TestCase):
         _, _, events = self.recut(seven, last, more)
         self.assertEqual(events[0], ("left", "LEFT #6: pushed %s mid-train"
                                      % more[:10]))
+
+    def main_first(self, head):
+        """A merge of `head` and main with main as its first parent, as
+        an author's `git checkout main && git merge` makes it: no
+        `own_push`, whose walk follows first parents."""
+        tree = run_git(self.repo.path, "merge-tree", "--write-tree",
+                       self.repo.main_tip(), head).split()[0]
+        return run_git(self.repo.path, "commit-tree", tree, "-p",
+                       self.repo.main_tip(), "-p", head, "-m", "merge")
+
+    def test_a_push_that_only_merges_main_keeps_its_place(self):
+        # 2026-11-12: a train member whose author merged main left its
+        # train as a push, and every train behind it was cut again.
+        seven, last = self.boarded()
+        merged = self.main_first(seven["headRefOid"])
+        self.assertFalse(m.own_push(self.repo.path, seven["headRefOid"],
+                                    merged, self.repo.main_tip()))
+        self.repo.publish_pr(7, merged)
+        upper = last["entries"][0]["head"]
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            [[pr(6, T1, head=upper)], [pr(7, T1, head=merged)]], last,
+            {6: upper, 7: merged}, {6, 7}, restacks=self.restacks)
+        self.assertEqual(events, [("kept", "KEPT #7: pushed %s, same tree "
+                                   "in its place" % merged[:10])])
+        self.assertEqual(m.train_lists(got, sizes), [[6, 7]])
+        # The same predictions, so the top's run still counts.
+        self.assertEqual([e["sha"] for e in got],
+                         [e["sha"] for e in last["entries"]])
+        self.assertEqual(got[1]["head"], merged)
+        # A change of the author's on top of it still leaves.
+        self.repo.branch("more7", merged)
+        more = self.repo.commit("g.txt", "changed\n", "more")
+        self.repo.publish_pr(7, more)
+        _, _, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            [[pr(6, T1, head=upper)], [pr(7, T1, head=more)]], last,
+            {6: upper, 7: more}, {6, 7}, restacks=self.restacks)
+        self.assertEqual(events[0], ("left", "LEFT #7: pushed %s mid-train"
+                                     % more[:10]))
+
+    def test_behind_one_that_left_the_boarded_head_is_predicted_again(self):
+        # The member ahead left, so the train up to it is new: its new
+        # head is compared with its old one predicted there.
+        seven, last = self.boarded()
+        self.repo.branch("push6", last["entries"][0]["head"])
+        pushed = self.repo.commit("o.txt", "o\n", "a push")
+        self.repo.publish_pr(6, pushed)
+        merged = self.main_first(seven["headRefOid"])
+        self.repo.publish_pr(7, merged)
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(),
+            [[pr(6, T1, head=pushed)], [pr(7, T1, head=merged)]], last,
+            {6: pushed, 7: merged}, {6, 7}, restacks=self.restacks)
+        self.assertEqual([c for c, _ in events][:2], ["left", "kept"])
+        self.assertIn(7, m.train_lists(got, sizes)[0])
+
+    def test_a_restack_onto_a_main_that_changed_the_lower_lines(self):
+        # 2026-11-12: main changed #5's line 2 again after its squash, so
+        # #5's final head no longer merges into main as nothing: the
+        # restack is still the Merger's own, its second parent a squash
+        # on main.
+        self.stack(self.lines(l3="Y"))
+        self.repo.branch("main", "origin/main")
+        self.repo.commit("l.txt", self.lines(l2="Z", l3="Y"), "main l2")
+        self.repo.push("main")
+        head = self.restacked_by_hand()
+        self.assertTrue(m.own_push(self.repo.path, self.upper, head,
+                                   self.repo.main_tip()))
+        # A branch main has no squash of is still a push.
+        self.repo.branch("side", self.upper)
+        self.repo.branch("elsewhere", self.base)
+        self.repo.commit("e.txt", "e\n", "elsewhere")
+        run_git(self.repo.path, "checkout", "-q", "side")
+        merged = self.repo.merge("elsewhere")
+        self.assertFalse(m.own_push(self.repo.path, self.upper, merged,
+                                    self.repo.main_tip()))
+
+    def test_a_verdict_before_the_restack_counts(self):
+        # 2026-11-12: the restacked layer's gated instance had passed on
+        # the head before the restack, but the walk back stopped at the
+        # restack, so the layer was held and left its train as a push.
+        self.addCleanup(m.configure, project())
+        self.stack(self.lines(l3="Y"))
+        head = self.restacked_by_hand()
+        self.repo.publish_pr(6, head)
+        mac = [status(context="vm/mac")]
+        layer = pr(6, T1, head=head,
+                   reviews=[review(REVIEWER, oid="b" * 40)])
+        layer["labels"] = {"nodes": []}
+
+        def wait(statuses):
+            m.configure(gated_project())
+            github = FakeGitHub({SLUG + "/commits/" + sha: value
+                                 for sha, value in statuses.items()})
+            return m.instance_wait(self.repo.path, layer,
+                                   self.repo.main_tip(), github, {})
+
+        self.assertIsNone(wait({head: [], self.upper: mac}))
+        # So does the build check's green, for merge.own_head_green.
+        github = FakeGitHub({SLUG + "/commits/" + sha: value for sha, value
+                             in {head: [], "b" * 40: [],
+                                 self.upper: [status()]}.items()})
+        self.assertIsNone(m.own_green_wait(
+            layer, m.approval_of(layer), github, {}, self.repo.path,
+            self.repo.main_tip()))
+        # A merge of a branch main lacks stops the walk.
+        self.repo.branch("elsewhere", self.base)
+        self.repo.commit("e.txt", "e\n", "elsewhere")
+        self.repo.branch("side", head)
+        other = self.repo.merge("elsewhere")
+        layer["headRefOid"] = other
+        self.assertEqual(wait({other: [], head: [], self.upper: mac}),
+                         "waiting for vm/mac (absent)")
 
     def test_without_the_option_the_layer_is_left_out(self):
         layer = self.stack(self.lines(l3="Y"))
@@ -3431,6 +3881,17 @@ class Suspects(unittest.TestCase):
         self.assertEqual(line, "BATCH-FLAKE #5..#6: every suspect merged "
                          "green; the red top's tree t was a flake")
 
+    def test_a_suspect_only_brought_up_to_date_stays(self):
+        # 2026-11-12: an update of the first suspect took it out of the
+        # search, which then ended, and every train was cut again.
+        moved = lambda head, pr: pr["number"] == 6
+        saved, _ = m.suspects_left(
+            self.saved(5, 6, 7), self.queue(5, 6, 7, pushed=(6, 7)),
+            {"decisions": []}, {}, {}, moved)
+        self.assertEqual(saved["suspects"], [
+            {"pr": 5, "head": "h5"}, {"pr": 6, "head": "new"}])
+        self.assertEqual(saved["left"], [7])
+
     def test_none_left_after_a_change_is_no_flake(self):
         saved = self.saved(5)
         saved["merged"] = [4]
@@ -3603,6 +4064,335 @@ class TickAhead(RepoCase):
                              check_state={"results": {top["sha"]: {
                                  "tree": top["tree"], "ok": True}}})
         self.assertNotIn(line, lines)
+
+    def test_a_green_train_merges_whole_in_one_tick(self):
+        # merge.test_ahead.train_merge (designs/0047, amendment of
+        # 2026-11-11).
+        m.configure(project(test_ahead={"batch": 2, "train_merge": True}))
+        self.assertIs(m.TRAIN_MERGE, True)
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        origin = self.repo.origin
+
+        def run(args, cwd=None, env=None):
+            if "push" in args:
+                args = [origin if a.startswith("https://github.com/")
+                        else a for a in args]
+            return tools_run()(args, cwd, env)
+        with mock.patch.object(m, "RESOLVE_IDENTITY", ("Merger", "m@x")), \
+                mock.patch.object(m, "CI_WORKFLOW", ""):
+            record, lines = self.tick(
+                prs, conclusions=(None,), live=True, minutes=1, run=run,
+                check_state={"results": {top["sha"]: {
+                    "tree": top["tree"], "ok": True}}},
+                extra={SLUG + "/pulls/5": {"merged": True},
+                       SLUG + "/pulls/6": {"merged": True}})
+        self.assertEqual([(d["pr"], d["action"], d.get("train"))
+                          for d in record["decisions"]],
+                         [(5, "MERGE", True), (6, "MERGE", True)])
+        # The pull request the train merged as, for forge-flow.
+        self.assertEqual([d.get("train_pr") for d in record["decisions"]],
+                         [900, 900])
+        self.assertTrue(any(line.startswith("TRAIN-MERGE #5..#6: merged 2 "
+                                            "as #900")
+                            for line in lines), lines)
+        self.assertTrue(m.moved_a_stack(record))
+
+    def test_one_outside_a_building_first_train_waits_for_its_train(self):
+        # 2026-11-12: #10784, pushed out of the first train, merged on
+        # its own green 25 minutes into that train's run, and every
+        # train was cut again.
+        m.configure(project(test_ahead={"batch": 1, "batches": 2,
+                                        "trains": "live",
+                                        "train_merge": True}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        said = self.ahead_json()
+        self.assertEqual([e["pr"] for e in said["entries"]], [5, 6])
+        # As if #5 had left the first train and boarded the next.
+        said["entries"].reverse()
+        said["batch"] = {"size": 1, "trees": [said["entries"][0]["tree"]]}
+        said["later"] = [{"size": 1, "trees": [said["entries"][1]["tree"]],
+                          "fixed": True}]
+        with open(os.path.join(self.state, m.AHEAD_FILE), "w") as handle:
+            json.dump(said, handle)
+        top = said["entries"][0]
+        record, _ = self.tick(prs, live=True, minutes=1, check_state={
+            "results": {}, "ahead_started": {top["sha"]: "x"}})
+        five = [d for d in record["decisions"] if d["pr"] == 5]
+        self.assertEqual([(d["action"], d.get("reason")) for d in five],
+                         [("WAIT", m.TRAIN_AHEAD_REASON % "#6..#6")])
+        self.assertNotIn("/merge", " ".join(w[1] for w in self.github.writes))
+
+    def test_an_urgent_one_heads_the_next_train(self):
+        # 2026-11-13: an urgent pin (#11215) went in front of a train
+        # whose top was testing, cut every train again and spent that
+        # run. An urgent one heads the next train cut instead.
+        data = urgent_project(test_ahead={"batch": 1, "batches": 2,
+                                          "trains": "live",
+                                          "train_merge": True})
+        m.configure(data)
+        self.addCleanup(m.configure, project())
+        five = self.item()
+        self.tick([five], conclusions=(None,), live=True)
+        self.assertEqual([e["pr"] for e in self.ahead_json()["entries"]],
+                         [5])
+        top = self.ahead_json()["entries"][0]
+        hot = labelled(self.other_pr(), "Priority:urgent")
+        record, lines = self.tick([five, hot], live=True, minutes=1,
+                                  check_state={"results": {},
+                                               "ahead_started": {
+                                                   top["sha"]: "x"}})
+        self.assertFalse([l for l in lines if "RECUT" in l], lines)
+        # It heads the next train, behind #5's.
+        self.assertEqual(record["ahead"], [5, 6])
+        self.assertEqual(record["trains"], [[5], [6]])
+
+    def behind_main_on_a_train(self, **ahead):
+        """#5 and #6 boarded on one train, then main moves on, so #5,
+        first in the queue, is behind it: the second tick's record."""
+        m.configure(project(test_ahead=dict({"batch": 2, "trains": "live"},
+                                            **ahead)))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        self.assertEqual(self.ahead_json()["batch"]["size"], 2)
+        self.advance_main("n.txt")
+        record, _ = self.tick(prs, live=True, minutes=1)
+        return record
+
+    def test_a_train_that_merges_as_one_is_not_updated_member_by_member(self):
+        # Amendment of 2026-11-12: with train_merge, the first member's
+        # update only started a build of its new head; the train goes in
+        # as one merge of its tested top.
+        record = self.behind_main_on_a_train(train_merge=True)
+        five = [d for d in record["decisions"] if d["pr"] == 5]
+        self.assertEqual([(d["action"], d.get("reason")) for d in five],
+                         [("WAIT", m.TRAIN_WAIT_REASON % 2)])
+        self.assertNotIn("update-branch",
+                         " ".join(w[1] for w in self.github.writes))
+
+    def test_a_train_github_would_not_take_is_updated_as_before(self):
+        m.configure(project(test_ahead={"batch": 2, "trains": "live",
+                                        "train_merge": True}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        self.advance_main("n.txt")
+        # The default branch moved to a tree the train predicted (as
+        # when the train ahead merged): here, by pretending its base.
+        said = self.ahead_json()
+        said["base"] = self.repo.main_tip()
+        m.save_json(os.path.join(self.state, m.AHEAD_FILE), said)
+        with mock.patch.object(m, "CI_WORKFLOW", "ci.yml"):
+            record, lines = self.tick(
+                prs, live=True, minutes=1, check_state={"results": {
+                    top["sha"]: {"tree": top["tree"], "ok": True}}})
+        self.assertTrue(any("each member merges on its own" in line
+                            for line in lines), lines)
+        self.assertEqual([d["action"] for d in record["decisions"]
+                          if d["pr"] == 5], ["UPDATE"])
+
+    def test_without_train_merge_the_first_member_is_updated(self):
+        record = self.behind_main_on_a_train()
+        self.assertEqual([d["action"] for d in record["decisions"]
+                          if d["pr"] == 5], ["UPDATE"])
+
+    def unproven(self, board):
+        """#5 and #6, approved, their own build checks still pending:
+        the first tick's record and lines, with own_green_to_board
+        `board`."""
+        m.configure(project(own_head_green=True, test_ahead={
+            "batch": 2, "trains": "live", "own_green_to_board": board}))
+        self.prs = [self.item(), self.other_pr()]
+        pending = [status("pending")]
+        self.pending = {SLUG + "/commits/" + p["headRefOid"]: pending
+                        for p in self.prs}
+        self.pending[SLUG + "/commits/" + self.approved] = pending
+        return self.tick(self.prs, conclusions=(None,), live=True,
+                         extra=self.pending)
+
+    def test_with_own_green_to_board_false_they_board_without_it(self):
+        # 2026-11-12: four approved pull requests whose own checks were
+        # queued behind a hundred others waited an hour, held, while
+        # the one train ran; the train's top tests them anyway.
+        self.assertIs(m.OWN_GREEN_TO_BOARD, True)
+        record, lines = self.unproven(False)
+        self.assertIs(m.OWN_GREEN_TO_BOARD, False)
+        self.assertEqual((record["queue"], sorted(record["held"])),
+                         ([], ["5", "6"]))
+        self.assertEqual(record["trains"], [[5, 6]])
+        self.assertIn("TRAIN-CUT 1: #5 #6", lines)
+        # Boarded, they are candidates at the heads they boarded with.
+        record, _ = self.tick(self.prs, conclusions=(None,), live=True,
+                              minutes=1, extra=self.pending)
+        self.assertEqual(record["held"], {})
+        self.assertEqual(record["queue"], [5, 6])
+        self.assertEqual(record["trains"], [[5, 6]])
+
+    def test_by_default_they_wait_for_their_own_green(self):
+        record, lines = self.unproven(True)
+        self.assertEqual(sorted(record["held"]), ["5", "6"])
+        self.assertNotIn("trains", record)
+        self.assertFalse([l for l in lines if l.startswith("TRAIN-CUT")])
+
+    def test_one_red_on_its_own_head_does_not_board(self):
+        m.configure(project(own_head_green=True, test_ahead={
+            "batch": 2, "trains": "live", "own_green_to_board": False}))
+        prs = [self.item(), self.other_pr()]
+        failed = [status("failure")]
+        extra = {SLUG + "/commits/" + p["headRefOid"]: failed for p in prs}
+        extra[SLUG + "/commits/" + self.approved] = failed
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              extra=extra, check_state={"results": {
+                                  prs[1]["headRefOid"]: {
+                                      "ok": False, "failed": ["test"]}}})
+        self.assertEqual(record["trains"], [[5]])
+        self.assertEqual(record["train_waits"],
+                         {"6": "its own head is red"})
+
+    def red_train(self, train_merge=True):
+        """#5 and #6 boarded on one train, then main moves on, so #5 is
+        behind it, and the train's top is found red: the second tick's
+        record."""
+        m.configure(project(test_ahead={"batch": 2, "trains": "live",
+                                        "train_merge": train_merge}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        self.advance_main("n.txt")
+        record, lines = self.tick(prs, live=True, minutes=1, check_state={
+            "results": {top["sha"]: {"tree": top["tree"], "ok": False}}})
+        return record, lines
+
+    def test_a_red_trains_members_are_not_updated(self):
+        # 2026-11-12: the tick that found a train's top red updated its
+        # first member, a suspect, whose new head then took it out of
+        # the search, and every train was cut again.
+        record, _ = self.red_train()
+        five = [d for d in record["decisions"] if d["pr"] == 5]
+        self.assertEqual([(d["action"], d.get("reason")) for d in five],
+                         [("WAIT", m.SUSPECT_WAIT_REASON % "#5..#6")])
+        self.assertNotIn("update-branch",
+                         " ".join(w[1] for w in self.github.writes))
+
+    def test_without_train_merge_a_red_trains_member_is_updated(self):
+        record, _ = self.red_train(train_merge=False)
+        self.assertEqual([d["action"] for d in record["decisions"]
+                          if d["pr"] == 5], ["UPDATE"])
+
+    def test_a_red_train_is_kept_through_its_search(self):
+        # 2026-11-12: a red train's search wrote batches of its own, so
+        # ahead.json held no trains when it ended, and the trains were
+        # cut afresh, with new pull requests in the middle of them.
+        m.configure(project(test_ahead={"batch": 2, "batches": 2,
+                                        "trains": "live",
+                                        "train_merge": True}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        red = {"results": {top["sha"]: {"tree": top["tree"], "ok": False}}}
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=1, check_state=red)
+        self.assertTrue(any(l.startswith("BATCH #5..#6: top red")
+                            for l in lines), lines)
+        kept = self.ahead_json()["kept_trains"]
+        self.assertEqual([e["pr"] for e in kept["entries"]], [5, 6])
+        # The search goes on: the trains are still kept.
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=2, check_state=red)
+        self.assertNotIn("trains", self.ahead_json())
+        self.assertEqual(self.ahead_json()["kept_trains"], kept)
+        # It ends (here, by hand), and a new pull request has come: the
+        # train is kept, and the new one goes behind it.
+        os.remove(os.path.join(self.state, m.SUSPECTS_FILE))
+        seven = self.other_pr(7)
+        seven["createdAt"] = "2026-10-07T09:00:00Z"
+        record, lines = self.tick(prs + [seven], conclusions=(None,),
+                                  live=True, minutes=3, check_state=red)
+        self.assertEqual(record["trains"], [[5, 6], [7]])
+        self.assertFalse(any(l.startswith("TRAIN-CUT 1") for l in lines),
+                         lines)
+
+    def test_trains_before(self):
+        trains = {"trains": True, "entries": []}
+        kept = {"trains": True, "entries": [{"pr": 5}]}
+        self.assertIs(m.trains_before(trains), trains)
+        searching = {"entries": [], "kept_trains": kept}
+        self.assertIs(m.trains_before(searching), kept)
+        self.assertEqual(m.trains_before({}), {})
+        self.assertIsNone(m.trains_before(None))
+        self.assertEqual(m.kept_trains("m", [{"pr": 5}, {"pr": 6}], [1, 1],
+                                       {"urgent_cut": [6]}), {
+            "trains": True, "base": "m", "entries": [{"pr": 5}, {"pr": 6}],
+            "batch": {"size": 1}, "later": [{"size": 1}],
+            "urgent_cut": [6]})
+
+    def test_suspect_wait(self):
+        entries = [{"pr": 5, "head": "a", "tree": "t5"},
+                   {"pr": 6, "head": "b", "tree": "t6"}]
+        last = {"trains": True, "entries": entries,
+                "batch": {"size": 2, "trees": ["t5", "t6"]}}
+        five = {"number": 5, "headRefOid": "a"}
+        red = {"results": {"x": {"tree": "t6", "ok": False}}}
+        wait = m.SUSPECT_WAIT_REASON % "#5..#6"
+        # The tick a train's top is red, before its search is saved.
+        self.assertEqual(m.suspect_wait(None, five, last, red), wait)
+        self.assertIsNone(m.suspect_wait(None, five, last, {}))
+        self.assertIsNone(m.suspect_wait(
+            None, dict(five, headRefOid="c"), last, red))
+        with mock.patch.object(m, "tree_base_red", return_value=["build"]):
+            self.assertIsNone(m.suspect_wait(None, five, last, red))
+        # While the search runs: a suspect at its head waits, unless the
+        # search found it green.
+        saved = {"suspects": [{"pr": 5, "head": "a"},
+                              {"pr": 6, "head": "b"}]}
+        searching = {"entries": entries, "batch": {
+            "size": 1, "trees": ["t5"], "suspects": True}}
+        self.assertEqual(m.suspect_wait(saved, five, searching, red), wait)
+        green = {"results": {"y": {"tree": "t5", "ok": True}}}
+        self.assertIsNone(m.suspect_wait(saved, five, searching, green))
+        self.assertEqual(m.suspect_wait(
+            saved, {"number": 6, "headRefOid": "b"}, searching, green), wait)
+        self.assertIsNone(m.suspect_wait(
+            saved, {"number": 7, "headRefOid": "b"}, searching, green))
+
+    def test_with_suspects(self):
+        five, six, layer = ({"number": n} for n in (5, 6, 9))
+        saved = {"suspects": [{"pr": 5}, {"pr": 9}, {"pr": 6}]}
+        # A layer held as stacked joins the search where it has it.
+        self.assertEqual(m.with_suspects([five, six], saved,
+                                         [five, six, layer]),
+                         [five, layer, six])
+        self.assertEqual(m.with_suspects([five, six], None, [layer]),
+                         [five, six])
+        self.assertEqual(m.with_suspects([], saved, [layer]), [])
+        # A layer gone (merged, closed) is left out.
+        self.assertEqual(m.with_suspects([five, six], saved, [five, six]),
+                         [five, six])
+
+    def test_train_boarded(self):
+        entries = [{"pr": 5, "head": "a", "tree": "t5"},
+                   {"pr": 6, "head": "b", "tree": "t6"}]
+        last = {"trains": True, "entries": entries,
+                "batch": {"size": 2, "trees": ["t5", "t6"]}}
+        five = {"number": 5, "headRefOid": "a"}
+        self.assertEqual(m.train_boarded(last, five, {}), 2)
+        # At another head, or not on the first train, it is updated.
+        self.assertIsNone(m.train_boarded(last, dict(five, headRefOid="c"),
+                                          {}))
+        self.assertIsNone(m.train_boarded(last, {"number": 7,
+                                                 "headRefOid": "a"}, {}))
+        # A train of one waits too: an update would move the default
+        # branch off the tree the next train was predicted on. Not
+        # batches that aren't trains, nor a train whose top is red.
+        one = dict(last, entries=entries[:1],
+                   batch={"size": 1, "trees": ["t5"]})
+        self.assertEqual(m.train_boarded(one, five, {}), 1)
+        self.assertIsNone(m.train_boarded(dict(last, trains=False), five,
+                                          {}))
+        red = {"results": {"x": {"tree": "t6", "ok": False}}}
+        self.assertIsNone(m.train_boarded(last, five, red))
 
     def test_later_batches_are_written_and_fixed_once_started(self):
         # designs/0035 part 2.
@@ -4925,6 +5715,339 @@ class EarlyConflicts(RepoCase):
         self.assertEqual(self.comments(), [])
 
 
+class ResolveSlots(RepoCase):
+    """merge.resolve_slots (designs/0012, amendment of 2026-11-12): at
+    most N pull requests are back with their authors for a conflict
+    with main at once; the others that conflict are held, untold, until
+    a slot frees."""
+
+    item = Decide.item
+    tick = Tick.tick
+    other_pr = Tick.other_pr
+    rival = HoldConflicting.rival
+    comments = HoldConflicting.comments
+    WAIT = "conflicts with main; waits for a resolve slot (%d out: %s)"
+
+    def setUp(self):
+        super().setUp()
+        self.configure()
+        self.addCleanup(m.configure, project())
+
+    def configure(self, slots=1, make=project, **merge):
+        m.configure(make(resolve_slots=slots, **merge))
+
+    def conflicting(self, *numbers):
+        """Approved pull requests made on main's g.txt, which main then
+        changes: each conflicts with main, the oldest first."""
+        made = [self.rival(n, "2026-10-07T1%d:00:00Z" % k,
+                           (("g.txt", "rival %d\n" % n),))
+                for k, n in enumerate(numbers)]
+        self.advance_main("g.txt", "main moved g\n")
+        return made
+
+    def told(self):
+        """The pull requests handed back this tick."""
+        return sorted(int(w.split("/")[-2]) for w, body in self.comments()
+                      if body.startswith("Not merging"))
+
+    def acted(self, record):
+        return [(d["pr"], d["action"]) for d in record["decisions"]]
+
+    def test_the_configuration(self):
+        self.assertEqual(m.RESOLVE_SLOTS, 1)
+        m.configure(project())
+        self.assertEqual(m.RESOLVE_SLOTS, 0)
+
+    def test_one_is_handed_back_and_the_others_wait_untold(self):
+        prs = self.conflicting(6, 7, 8)
+        record, lines = self.tick(prs, live=True)
+        self.assertEqual(self.acted(record), [(6, "HAND-BACK")])
+        self.assertEqual(self.told(), [6])
+        self.assertEqual({k: record["held"][k] for k in ("7", "8")},
+                         {"7": self.WAIT % (1, "#6"),
+                          "8": self.WAIT % (1, "#6")})
+        self.assertEqual((record["resolving"], record["resolve_waiting"]),
+                         ([6], [7, 8]))
+        self.assertEqual(record["queue"], [6])
+        self.assertIn("RESOLVE-WAIT #7 #8: conflict with main; 1 of 1 "
+                      "slots out (#6)", lines)
+        # Nothing is said about the waiting ones in handed-back.json.
+        with open(os.path.join(self.state, "handed-back.json")) as handle:
+            self.assertEqual(sorted(json.load(handle)), ["6"])
+        # The next tick: #6 is still out, so the others still wait, and
+        # nobody is told again.
+        record, _ = self.tick(prs, live=True, minutes=1)
+        self.assertEqual(record["resolve_waiting"], [7, 8])
+        self.assertEqual(self.told(), [])
+
+    def test_a_slot_frees_when_the_one_out_goes(self):
+        prs = self.conflicting(6, 7, 8)
+        self.tick(prs, live=True)
+        # #6 closes (or its author pushes: a head it wasn't told at).
+        record, _ = self.tick(prs[1:], live=True, minutes=1)
+        self.assertEqual(self.acted(record), [(7, "HAND-BACK")])
+        self.assertEqual(self.told(), [7])
+        self.assertEqual(record["held"]["8"], self.WAIT % (1, "#7"))
+
+    def test_a_new_head_frees_the_slot(self):
+        prs = self.conflicting(6, 7)
+        self.tick(prs, live=True)
+        with open(os.path.join(self.state, "handed-back.json")) as handle:
+            said = json.load(handle)
+        out = lambda six: m.out_for_resolving(
+            said, [six], self.repo.path, self.repo.main_tip(), tools_run())
+        self.assertEqual(out(prs[0]), [6])
+        self.assertEqual(out(dict(prs[0], headRefOid="9" * 40)), [])
+        self.assertEqual(out(dict(prs[0], isDraft=True)), [])
+
+    def test_one_no_longer_conflicting_frees_its_slot(self):
+        six, = self.conflicting(6)
+        said = {"6": m.hand_back_key(m.approval_of(six), six["headRefOid"],
+                                     m.CONFLICT_REASON)}
+        self.assertEqual(m.out_for_resolving(
+            said, [six], self.repo.path, self.repo.main_tip(), tools_run()),
+            [6])
+        # Main takes #6's g.txt: it merges cleanly again.
+        self.advance_main("g.txt", "rival 6\n")
+        self.assertEqual(m.out_for_resolving(
+            said, [six], self.repo.path, self.repo.main_tip(), tools_run()),
+            [])
+        # Told something else, or under another approval, isn't out.
+        self.advance_main("g.txt", "main moved again\n")
+        other = dict(said["6"], reason="the Merger's gate failed")
+        self.assertEqual(m.out_for_resolving(
+            {"6": other}, [six], self.repo.path, self.repo.main_tip(),
+            tools_run()), [])
+        older = dict(said["6"], approved="2026-01-01T00:00:00Z")
+        self.assertEqual(m.out_for_resolving(
+            {"6": older}, [six], self.repo.path, self.repo.main_tip(),
+            tools_run()), [])
+
+    def test_two_slots(self):
+        self.configure(2)
+        record, _ = self.tick(self.conflicting(6, 7, 8), live=True)
+        self.assertEqual(self.told(), [6, 7])
+        self.assertEqual(record["held"]["8"], self.WAIT % (2, "#6, #7"))
+
+    def test_without_slots_every_conflict_is_handed_back(self):
+        self.configure(0)
+        record, _ = self.tick(self.conflicting(6, 7, 8), live=True)
+        self.assertEqual(self.told(), [6, 7, 8])
+        self.assertNotIn("resolving", record)
+
+    def test_one_labelled_urgent_gets_the_slot_first(self):
+        self.configure(make=urgent_project)
+        prs = self.conflicting(6, 7, 8)
+        labelled(prs[2], "Priority:urgent")
+        record, _ = self.tick(prs, live=True)
+        self.assertEqual(self.told(), [8])
+        self.assertEqual(record["resolve_waiting"], [6, 7])
+
+    def test_those_behind_the_front_wait_too(self):
+        # merge.early_conflicts: the hand-backs behind the front are
+        # gated the same way, after the front's.
+        self.configure(early_conflicts=True)
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        prs = [self.item()] + self.conflicting(6, 7)
+        record, _ = self.tick(prs, conclusions=(None,), live=True)
+        self.assertEqual(self.told(), [6])
+        self.assertEqual([d.get("early") for d in record["decisions"]
+                          if d["pr"] == 6], [True])
+        self.assertEqual(record["held"]["7"], self.WAIT % (1, "#6"))
+
+    def test_a_dry_tick_says_nothing(self):
+        record, _ = self.tick(self.conflicting(6, 7))
+        self.assertEqual(self.acted(record), [(6, "HAND-BACK")])
+        self.assertEqual(record["resolve_waiting"], [7])
+
+    def test_a_layer_above_one_out_is_not_handed_back_itself(self):
+        # Held as stacked, as before: its base's resolution comes first.
+        self.configure(early_conflicts=True)
+        six, seven = self.conflicting(6, 7)
+        layer = pr(9, T2, base="b6", head=seven["headRefOid"],
+                   reviews=[review(REVIEWER, oid=seven["headRefOid"])])
+        record, _ = self.tick([six, layer], live=True)
+        self.assertEqual(self.told(), [6])
+        self.assertNotIn("resolve_waiting", record)
+        self.assertIn("9", record["held"])
+        self.assertNotIn("resolve slot", record["held"]["9"])
+
+    # merge.resolve_slot_minutes: a slot held with no push runs out.
+
+    EXPIRED = ("conflicts with main; its resolve slot ran out after 30 "
+               "minutes with no push, and it waits behind the others for "
+               "another (%d out: %s)")
+
+    def test_a_slot_held_with_no_push_runs_out(self):
+        self.configure(resolve_slot_minutes=30)
+        prs = self.conflicting(6, 7, 8)
+        self.tick(prs, live=True)
+        self.assertEqual(self.told(), [6])
+        record, lines = self.tick(prs, live=True, minutes=29)
+        self.assertEqual((record["resolving"], self.told()), ([6], []))
+        record, lines = self.tick(prs, live=True, minutes=30)
+        self.assertIn("RESOLVE-EXPIRED #6: out for resolving 30 minutes "
+                      "with no push; its slot goes to the next", lines)
+        self.assertEqual(self.told(), [7])
+        self.assertEqual(record["resolving"], [7])
+        self.assertEqual(record["resolve_expired"], [6])
+        self.assertEqual(record["held"]["6"], self.EXPIRED % (1, "#7"))
+        self.assertEqual(record["held"]["8"], self.WAIT % (1, "#7"))
+        # Said once; #7's slot counts from when it was given.
+        record, lines = self.tick(prs, live=True, minutes=59)
+        self.assertFalse([l for l in lines if "RESOLVE-EXPIRED" in l])
+        self.assertEqual((record["resolving"], self.told()), ([7], []))
+
+    def test_one_whose_slot_ran_out_goes_after_those_waiting(self):
+        self.configure(resolve_slot_minutes=30)
+        prs = self.conflicting(6, 7, 8)
+        self.tick(prs, live=True)
+        self.tick(prs, live=True, minutes=30)
+        # #7 closes: #8 has waited, so it goes before #6 again.
+        record, _ = self.tick([prs[0], prs[2]], live=True, minutes=31)
+        self.assertEqual((record["resolving"], self.told()), ([8], [8]))
+        # #8 closes too: #6 has its slot back, untold, from now.
+        record, _ = self.tick(prs[:1], live=True, minutes=32)
+        self.assertEqual((record["resolving"], self.told()), ([6], []))
+        record, _ = self.tick(prs[:1], live=True, minutes=61)
+        self.assertEqual(record["resolving"], [6])
+        record, _ = self.tick(prs[:1], live=True, minutes=62)
+        self.assertEqual(record.get("resolve_expired"), [6])
+
+    def test_its_push_frees_one_whose_slot_ran_out(self):
+        self.configure(resolve_slot_minutes=30)
+        prs = self.conflicting(6, 7)
+        self.tick(prs, live=True)
+        self.tick(prs, live=True, minutes=30)
+        with open(os.path.join(self.state, m.RESOLVE_FILE)) as handle:
+            self.assertEqual(sorted(json.load(handle)), ["6", "7"])
+        # A head it wasn't told at is not out, whatever its slot did.
+        pushed = dict(prs[0], headRefOid="9" * 40)
+        kept, expired, slots = m.expire_resolving(
+            os.path.join(self.state, m.RESOLVE_FILE), [7], [pushed, prs[1]],
+            m.parse_time(T0))
+        self.assertEqual((kept, expired, sorted(slots)), ([7], [], ["7"]))
+
+    def test_without_minutes_a_slot_never_runs_out(self):
+        prs = self.conflicting(6, 7)
+        self.tick(prs, live=True)
+        record, _ = self.tick(prs, live=True, minutes=600)
+        self.assertEqual(record["resolving"], [6])
+        self.assertNotIn("resolve_expired", record)
+        self.assertFalse(os.path.exists(os.path.join(self.state,
+                                                     m.RESOLVE_FILE)))
+
+    # merge.resolve_slot_on "push" (designs/0053).
+
+    def resolved(self, number, created, approved=False):
+        """Pull request `number`'s resolution: a new head on main's tip
+        that keeps its own change, so it merges cleanly."""
+        self.repo.branch("rival%d" % number, "origin/main")
+        sha = self.repo.commit("r%d.txt" % number, "resolved\n",
+                               "resolve #%d" % number)
+        self.repo.publish_pr(number, sha)
+        self.repo.branch("feature", "feature")
+        return pr(number, created, head=sha,
+                  reviews=[review(REVIEWER, oid=sha)] if approved else [])
+
+    def next_json(self):
+        with open(os.path.join(self.state, "next.json")) as handle:
+            return json.load(handle)
+
+    def test_with_push_every_conflict_is_told_at_once(self):
+        self.configure(resolve_slot_on="push")
+        record, lines = self.tick(self.conflicting(6, 7, 8), live=True)
+        self.assertEqual(self.told(), [6, 7, 8])
+        self.assertNotIn("resolve_waiting", record)
+        self.assertFalse([l for l in lines if l.startswith("RESOLVE-WAIT")])
+        body = [b for _, b in self.comments() if b.startswith("Not merging")]
+        self.assertIn("your push queues for one of 1 resolve slots", body[0])
+        self.assertIn("Merge `main` (at %s)" % self.repo.main_tip()[:10],
+                      body[0])
+
+    def test_with_push_a_resolution_takes_a_slot_and_the_next_queues(self):
+        self.configure(resolve_slot_on="push")
+        prs = self.conflicting(6, 7, 8)
+        self.tick(prs, live=True)
+        six = self.resolved(6, "2026-10-07T10:00:00Z")
+        seven = self.resolved(7, "2026-10-07T11:00:00Z")
+        record, lines = self.tick([six, seven, prs[2]], live=True,
+                                  minutes=5)
+        self.assertEqual(record["resolving"], [6])
+        self.assertEqual(record["resolve_queue"], [7])
+        self.assertIn("RESOLVE-SLOTS: #6 checking; #7 queued", lines)
+        self.assertEqual(
+            record["held"]["7"],
+            "a resolution of a conflict with main; waits for a resolve "
+            "slot (1 out: #6)")
+        said = self.next_json()
+        self.assertEqual(said["resolve_slotted"],
+                         [{"pr": 6, "head": six["headRefOid"]}])
+        self.assertEqual(said["resolve_queue"],
+                         [{"pr": 7, "head": seven["headRefOid"]}])
+        self.assertEqual(said["resolve_base"],
+                         {"sha": self.repo.main_tip()})
+        # #6 keeps its slot while it waits for its review.
+        record, _ = self.tick([six, seven, prs[2]], live=True, minutes=10)
+        self.assertEqual((record["resolving"], record["resolve_queue"]),
+                         ([6], [7]))
+        # Approved, it is a candidate again: its slot goes to #7.
+        approved = self.resolved(6, "2026-10-07T10:00:00Z", approved=True)
+        record, _ = self.tick([approved, seven, prs[2]], live=True,
+                              minutes=15)
+        self.assertEqual(record["resolving"], [7])
+        self.assertNotIn("resolve_queue", record)
+
+    def test_with_push_a_slot_runs_out(self):
+        self.configure(resolve_slot_on="push", resolve_slot_minutes=30)
+        prs = self.conflicting(6, 7)
+        self.tick(prs, live=True)
+        six = self.resolved(6, "2026-10-07T10:00:00Z")
+        seven = self.resolved(7, "2026-10-07T11:00:00Z")
+        self.tick([six, seven], live=True, minutes=1)
+        record, lines = self.tick([six, seven], live=True, minutes=31)
+        self.assertIn("RESOLVE-EXPIRED #6: its resolution held a slot 30 "
+                      "minutes; the slot goes to the next", lines)
+        self.assertEqual((record["resolving"], record["resolve_queue"]),
+                         ([7], [6]))
+
+    def test_with_push_a_head_still_conflicting_is_no_resolution(self):
+        self.configure(resolve_slot_on="push")
+        six, = self.conflicting(6)
+        self.tick([six], live=True)
+        with open(os.path.join(self.state, "handed-back.json")) as handle:
+            said = json.load(handle)
+        # Pushed again, still on the old main: it conflicts as before.
+        self.repo.branch("rival6", "rival6")
+        again = self.repo.commit("x.txt", "more\n", "more")
+        self.repo.publish_pr(6, again)
+        self.repo.branch("feature", "feature")
+        found = m.resolutions(said, [dict(six, headRefOid=again)], [],
+                              self.repo.path, self.repo.main_tip(),
+                              tools_run())
+        self.assertEqual(found, [])
+
+    def test_the_order_slots_are_given_in(self):
+        base = pr(6, "2026-10-07T03:00:00Z")
+        layers = [pr(9, base="b6"), pr(10, base="b9", reviews=[])]
+        single = pr(7, "2026-10-07T01:00:00Z")
+        later = pr(8, "2026-10-07T02:00:00Z")
+        queue, everyone = [single, base, later], [single, base, later] + layers
+        order = lambda row=None: [p["number"] for p in m.resolve_slot_order(
+            [later, base, single], queue, everyone, row)]
+        self.assertEqual(order(), [7, 6, 8])
+        # Right of way comes first; unless it is idle.
+        self.assertEqual(order({"pr": 8}), [8, 7, 6])
+        self.assertEqual(order({"pr": 8, "idle": "drafted"}), [7, 6, 8])
+        # In batches of two, #7 and #6 would board together: the base
+        # with an approved layer above it goes first.
+        m.configure(project(resolve_slots=1, test_ahead={"batch": 2}))
+        self.assertEqual(order(), [6, 7, 8])
+        self.assertEqual(m.approved_above(6, everyone), 1)
+
+
 class YieldIgnoresConflicts(unittest.TestCase):
 
     def test_hand_backs_without_conflicts(self):
@@ -5669,6 +6792,37 @@ class CodeOwners(RepoCase):
         m.configure(project())
         self.assertIs(m.CODE_OWNERS, False)
 
+    def test_the_same_owned_lines_are_asked_one_at_a_time(self):
+        # agent-forge #264: #7 changes what #6 changes; #8 another file.
+        m.configure(project(code_owners=True, code_owner_sequence=True))
+        record, _ = self.tick([self.owned_pr(6), self.owned_pr(7),
+                               self.owned_pr(8, name="owned/y.json")],
+                              live=True)
+        self.assertEqual(record["held"], {
+            "6": "waits for code owner @TheOwner: owned/x.json",
+            "7": "waits for #6: both change owned/x.json lines 0-0, which "
+                 "a code owner must approve; one at a time",
+            "8": "waits for code owner @TheOwner: owned/y.json"})
+
+    def test_sequencing_is_off_by_default(self):
+        record, _ = self.tick([self.owned_pr(6), self.owned_pr(7)],
+                              live=True)
+        self.assertEqual(record["held"]["7"],
+                         "waits for code owner @TheOwner: owned/x.json")
+
+    def test_only_overlapping_lines_wait(self):
+        lines = {6: {"c.json": [(10, 12)]}, 7: {"c.json": [(13, 20)]},
+                 8: {"c.json": [(12, 12)]}, 9: {"c.json": [(1, 30)]}}
+        waits = {n: ("h%d" % n, "waits for code owner") for n in lines}
+        waits[10] = ("h10", None)
+        with mock.patch.object(m, "owned_lines",
+                               lambda repo, pr, *a, **k: lines[pr["number"]]):
+            got = m.sequence_owned(None, [{"number": n} for n in waits],
+                                   waits, [], "main")
+        self.assertEqual(got, {
+            8: ("h8", m.SEQUENCE_REASON % (6, "c.json", 12, 12)),
+            9: ("h9", m.SEQUENCE_REASON % (6, "c.json", 10, 12))})
+
     def test_off_by_default(self):
         m.configure(project())
         record, _ = self.tick([self.owned_pr()], live=True)
@@ -5849,8 +7003,9 @@ class Stacks(RepoCase):
                   reviews=[
             review(REVIEWER, oid=self.upper)] if reviews is None else reviews)
 
-    def tick(self, prs, live=True, minutes=0, check_state=None):
-        github = FakeGitHub(answers(prs=prs))
+    def tick(self, prs, live=True, minutes=0, check_state=None,
+             conclusions=("success",)):
+        github = FakeGitHub(answers(conclusions, prs=prs))
         self.github = github
         lines = []
         start = datetime.datetime(2026, 10, 7, 12, 0, 0,
@@ -5988,6 +7143,93 @@ class Stacks(RepoCase):
         self.state = os.path.join(self.tmp.name, "without")
         record, _ = self.tick([self.bottom(), self.layer()])
         self.assertEqual(record["ahead"], [5])
+
+    def own_green_tick(self, layers_need_own_green, minutes=0,
+                       check_state=None, **ahead):
+        """A live tick with merge.own_head_green on, #5 green on its own
+        and #6, its layer, with no run of its own yet."""
+        m.configure(project(stacks={}, own_head_green=True, test_ahead=dict(
+            {"batch": 2, "stacks": True, "trains": "live",
+             "layers_need_own_green": layers_need_own_green}, **ahead)))
+        table = dict(answers(prs=[self.bottom(), self.layer()]), **{
+            SLUG + "/commits/": [],
+            SLUG + "/commits/" + self.lower: [status()],
+            SLUG + "/pulls/5": {"merged": True},
+            SLUG + "/pulls/6": {"merged": True}})
+        self.github = FakeGitHub(table)
+        base = tools_run()
+
+        def run(args, cwd=None, env=None):
+            if "push" in args:
+                args = [self.repo.origin if a.startswith("https://github.com/")
+                        else a for a in args]
+            return base(args, cwd, env)
+        lines = []
+        start = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                                  tzinfo=datetime.timezone.utc)
+        with mock.patch.object(m, "RESOLVE_IDENTITY", ("Merger", "m@x")), \
+                mock.patch.object(m, "CI_WORKFLOW", ""):
+            record = m.tick(self.repo.path, self.state, self.github, run,
+                            lines.append, now=lambda: start
+                            + datetime.timedelta(minutes=minutes),
+                            live=True, check_state=check_state)
+        return record, lines
+
+    def test_a_layer_boards_without_its_own_green_when_told(self):
+        # Amendment of 2026-11-12: the train's top tests it.
+        record, _ = self.own_green_tick(True)
+        self.assertEqual(record["ahead"], [5])
+        self.state = os.path.join(self.tmp.name, "without")
+        record, _ = self.own_green_tick(False)
+        self.assertEqual(record["ahead"], [5, 6])
+
+    def test_its_train_merges_as_one_on_the_tops_green(self):
+        # Main moves on, so #5 isn't merged on its own at once.
+        self.advance_main("n.txt")
+        record, _ = self.own_green_tick(False, train_merge=True)
+        self.assertEqual(record["ahead"], [5, 6])
+        top = m.load_json(os.path.join(self.state, m.AHEAD_FILE),
+                          None)["entries"][1]
+        record, lines = self.own_green_tick(
+            False, minutes=1, train_merge=True, check_state={"results": {
+                top["sha"]: {"tree": top["tree"], "ok": True}}})
+        self.assertEqual([(d["pr"], d["action"], d.get("train"))
+                          for d in record["decisions"]],
+                         [(5, "MERGE", True), (6, "MERGE", True)])
+
+    def test_a_boarded_layer_needs_no_green_of_its_own(self):
+        github = FakeGitHub({SLUG + "/commits/": []})
+        layer = self.layer()
+        approval = m.approval_of(layer)
+        self.assertIsNotNone(m.own_green_wait(layer, approval, github, {}))
+        self.assertIsNone(m.own_green_wait(layer, approval, github, {},
+                                           boarded=self.upper))
+        self.assertIsNotNone(m.own_green_wait(layer, approval, github, {},
+                                              boarded="f" * 40))
+
+    def test_boarded_layers(self):
+        last = {"trains": True, "entries": [
+            {"pr": 5, "head": "a", "carriage": 5},
+            {"pr": 6, "head": "b", "carriage": 5, "on": 5},
+            {"pr": 7, "head": "c", "carriage": 7},
+            # Its base merged since: it heads its carriage, still a layer.
+            {"pr": 8, "head": "d", "carriage": 8, "on": 4}]}
+        self.assertEqual(m.boarded_layers(last), {6: "b", 8: "d"})
+        self.assertEqual(m.boarded_layers(dict(last, trains=False)), {})
+        self.assertEqual(m.boarded_layers(None), {})
+
+    def test_boarded_members(self):
+        last = {"trains": True, "entries": [
+            {"pr": 5, "head": "a"}, {"pr": 6, "head": "b"}]}
+        self.assertEqual(m.boarded_members(last), {5: "a", 6: "b"})
+        self.assertEqual(m.boarded_members(dict(last, trains=False)), {})
+        self.assertEqual(m.boarded_members(None), {})
+        # A red train's search: its batch and the trains it keeps, or
+        # the members flip between held and not every other tick and
+        # the search starts over each time (a sim, 2026-11-12).
+        searching = {"entries": [{"pr": 5, "head": "a"}],
+                     "kept_trains": last}
+        self.assertEqual(m.boarded_members(searching), {5: "a", 6: "b"})
 
     def hand_tick(self, pulls, minutes=1):
         """A live tick with only #6 open, and GitHub answering the
@@ -6425,6 +7667,20 @@ class Stacks(RepoCase):
         failed = m.checked_ahead(self.state, self.repo.path, layer, approval,
                                  None, {}, m.sh)
         self.assertIn("merges nothing from main", failed[1])
+
+    def test_a_layer_waiting_for_its_own_green_keeps_its_restack(self):
+        # own_green_to_board false: a layer on main held only for its own
+        # green may board a train, so the stack keeps it and #5's final
+        # head to restack onto (a sim, 2026-11-12: dropped, it was
+        # handed back for a conflict the restack would have resolved).
+        self.lower_moves_on(self.lines(l8="U"), self.lines(l3="Y"))
+        m.configure(project(stacks={}, own_head_green=True, test_ahead={
+            "batch": 2, "trains": "live", "own_green_to_board": False}))
+        record, _ = self.tick([self.layer("main")], minutes=2,
+                              conclusions=(None,))
+        self.assertIn("6", record["held"])
+        self.assertEqual([(e["pr"], e["head"]) for e in
+                          self.stack_file()["pending"]], [(6, self.lower)])
 
     def test_a_restack_is_tried_once_per_head(self):
         self.lower_moves_on(self.lines(l8="U"), self.lines(l3="Y"))
@@ -7000,6 +8256,103 @@ class QueuedStall(unittest.TestCase):
         self.assertEqual(self.stalled(30, {}), 30)
 
 
+class StallFromRecentRuns(unittest.TestCase):
+    """merge.stall_run_factor: a wait is a stall only once it is longer
+    than the build check's recent runs take, by the factor, with
+    stall_minutes as the floor."""
+
+    START = QueuedStall.START
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = tmp.name
+        self.addCleanup(m.configure, project())
+
+    def runs(self, *minutes, **extra):
+        results = {}
+        for k, took in enumerate(minutes):
+            start = self.START - datetime.timedelta(hours=10 - k)
+            results["%040d" % k] = dict({
+                "started": m.iso(start), "seconds": took * 60,
+                "finished": m.iso(start + datetime.timedelta(minutes=took))},
+                **extra)
+        return {"results": results}
+
+    def stalled(self, minutes, check, action="WAIT"):
+        waiting = {"pr": 5, "head": "h" * 40, "action": action}
+        m.stalled_for(self.state, waiting, self.START, check)
+        return m.stalled_for(
+            self.state, waiting,
+            self.START + datetime.timedelta(minutes=minutes), check)
+
+    def test_the_limit_follows_the_median_run(self):
+        m.configure(project())
+        check = self.runs(40, 20, 44, 40, 60)
+        self.assertEqual(m.stall_limit(check),
+                         datetime.timedelta(minutes=60))
+        self.assertIsNone(self.stalled(59, check))
+        self.assertEqual(self.stalled(60, check), 60)
+
+    def test_a_batch_tops_limit_follows_the_long_runs(self):
+        # A top runs every step its members touch: as long as the
+        # longest heads, not the median (2026-11-12: 17-minute median,
+        # 40-minute train tops, every train called a stall).
+        m.configure(project())
+        check = self.runs(*([1] * 4 + [16] * 12 + [41, 47, 44, 40]))
+        self.assertEqual(m.stall_limit(check),
+                         datetime.timedelta(minutes=30))
+        self.assertEqual(m.stall_limit(check, top=True),
+                         datetime.timedelta(minutes=44 * 1.5))
+
+    def test_stall_minutes_is_the_floor(self):
+        m.configure(project())
+        check = self.runs(5, 6, 7)
+        self.assertEqual(m.stall_limit(check),
+                         datetime.timedelta(minutes=30))
+        self.assertEqual(self.stalled(30, check), 30)
+
+    def test_only_the_recent_runs_count(self):
+        m.configure(project())
+        check = self.runs(*([100] * 5 + [20] * m.STALL_RUNS))
+        self.assertEqual(m.stall_limit(check),
+                         datetime.timedelta(minutes=30))
+
+    def test_copied_results_and_no_results_are_not_runs(self):
+        m.configure(project())
+        self.assertEqual(m.stall_limit(self.runs(60, 60, covered=True)),
+                         datetime.timedelta(minutes=30))
+        self.assertEqual(m.stall_limit(self.runs(60, 60, seconds=0)),
+                         datetime.timedelta(minutes=30))
+        self.assertEqual(m.stall_limit(None), datetime.timedelta(minutes=30))
+
+    def test_a_refused_write_keeps_stall_minutes(self):
+        m.configure(project())
+        self.assertEqual(self.stalled(30, self.runs(60, 60, 60),
+                                      action="UPDATE"), 30)
+
+    def test_the_factor_and_off(self):
+        m.configure(project(stall_run_factor=2))
+        self.assertEqual(m.stall_limit(self.runs(40, 40, 40)),
+                         datetime.timedelta(minutes=80))
+        m.configure(project(stall_run_factor=0))
+        self.assertEqual(m.stall_limit(self.runs(40, 40, 40)),
+                         datetime.timedelta(minutes=30))
+
+    def test_the_check_state_lists_the_running_slots(self):
+        with open(os.path.join(self.state, "state.json"), "w") as out:
+            out.write('{"results": {}}')
+        held = locks.try_lock(os.path.join(self.state, "worker-2.lock"),
+                              "#6 %s 2026-10-07T12:16:00Z pid=1 ahead"
+                              % ("s" * 40))
+        self.addCleanup(held.close)
+        idle = locks.try_lock(os.path.join(self.state, "worker.lock"), "#7 x y")
+        idle.close()
+        got = m.load_check_state(self.state)
+        self.assertEqual(got["running"], [{
+            "pr": 6, "sha": "s" * 40, "started": "2026-10-07T12:16:00Z"}])
+
+
 class BatchTopStall(unittest.TestCase):
     """A head first in the batch waits for its top's prediction: timed
     from when the build check started the top."""
@@ -7078,6 +8431,37 @@ class BatchTopStall(unittest.TestCase):
                         {"pr": 6, "sha": "q" * 40, "tree": "t2"},
                         {"pr": 7, "sha": "r" * 40, "tree": "t3"}]})
         self.assertEqual(m.stall_batch(self.state, 6), ("#6..#7", "r" * 40))
+
+    def test_a_run_of_the_tops_tree_at_another_commit_counts(self):
+        # 2026-11-12: the top wasn't started because an earlier
+        # prediction with the same tree was running, which covers it;
+        # the wait was called a stall at 30 minutes.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Repo(tmp.name)
+        tip = repo.main_tip()
+        tree = run_git(repo.path, "rev-parse", tip + "^{tree}")
+        top = run_git(repo.path, "commit-tree", tree, "-p", tip, "-m", "top")
+        earlier = run_git(repo.path, "commit-tree", tree, "-m", "earlier")
+        other = repo.commit("o.txt", "o\n", "another tree")
+        self.ahead({"size": 2}, [
+            {"pr": 5, "head": self.HEAD, "sha": "p" * 40, "tree": "t1"},
+            {"pr": 6, "head": "j" * 40, "sha": top, "tree": tree}])
+
+        def stalled(minutes, sha):
+            waiting = {"pr": 5, "head": self.HEAD, "action": "WAIT"}
+            check = {"waiting": {}, "ahead_started": {}, "running": [
+                {"pr": 6, "sha": sha, "started": "2026-10-07T12:16:00Z"}]}
+            m.stalled_for(self.state, waiting, self.START, check, repo.path)
+            return m.stalled_for(
+                self.state, waiting,
+                self.START + datetime.timedelta(minutes=minutes), check,
+                repo.path)
+
+        self.assertIsNone(stalled(31, earlier))
+        self.assertEqual(stalled(46, earlier), 46)
+        # A run of another tree is not the top's.
+        self.assertEqual(stalled(30, other), 30)
 
     def test_no_or_a_bad_ahead_file_is_as_before(self):
         self.ahead(None, None)
@@ -7778,7 +9162,9 @@ class Main0026(unittest.TestCase):
             json.dump({"waiting": {"h": {}}}, f)
         self.run_main({"queued_stall_minutes": 90},
                       ["--check-state", check])
-        self.assertEqual(self.ticks[0]["check_state"], {"waiting": {"h": {}}})
+        # With the build check's running slots, none here.
+        self.assertEqual(self.ticks[0]["check_state"],
+                         {"waiting": {"h": {}}, "running": []})
         # Without batches (designs/0050 makes them the default).
         self.run_main({"test_ahead": False}, ["--check-state", check])
         self.assertNotIn("check_state", self.ticks[0])
@@ -7884,6 +9270,235 @@ class RedMain(unittest.TestCase):
 SHARED = "".join("line %d\n" % k for k in range(1, 21))
 
 
+class LeftTopCovers(TrainSetup):
+    """merge.test_ahead.left_top_covers (agent-forge #296): when a member
+    leaves the first train mid-run, the members below it merge on the
+    old top's green instead of waiting for the new top's run."""
+
+    def setUp(self):
+        super().setUp()
+        self.last = dict(self.last, trains=True)
+        # #6 was pushed mid-train: the new first train is #5 and #6's
+        # new head, with another top.
+        self.moved = dict(self.entries[1], head="f" * 40, sha="e" * 40,
+                          tree="d" * 40)
+        self.new = [self.entries[0], self.moved]
+        self.started = {"results": {}, "ahead_started": {
+            self.entries[1]["sha"]: "2026-11-12T21:40:00Z"}}
+
+    def test_the_members_below_a_leaver_are_kept_with_the_old_top(self):
+        got = m.left_top(self.last, self.new, [2], self.tip, self.started)
+        self.assertEqual(got["tree"], self.entries[1]["tree"])
+        self.assertEqual([e["pr"] for e in got["entries"]], [5])
+
+    def test_only_a_started_top_that_is_not_red_covers(self):
+        self.assertIsNone(m.left_top(self.last, self.new, [2], self.tip,
+                                     {"results": {}}))
+        red = dict(self.started, results={"r": {
+            "ok": False, "tree": self.entries[1]["tree"]}})
+        self.assertIsNone(m.left_top(self.last, self.new, [2], self.tip, red))
+        self.assertIsNone(m.left_top(self.last, self.new, [2], "c" * 40,
+                                     self.started))
+
+    def test_a_kept_one_lasts_while_its_members_start_the_first_train(self):
+        kept = m.left_top(self.last, self.new, [2], self.tip, self.started)
+        later = dict(self.last, entries=self.new, left_top=kept,
+                     batch={"size": 2, "trees": [e["tree"]
+                                                 for e in self.new]})
+        self.assertEqual(m.left_top(later, self.new, [2], self.tip,
+                                    self.started), kept)
+        gone = [dict(self.entries[0], head="a" * 40), self.moved]
+        self.assertIsNone(m.left_top(later, gone, [2], self.tip,
+                                     self.started))
+
+    def test_nothing_is_kept_when_no_member_is_below_the_leaver(self):
+        first = [dict(self.entries[0], head="a" * 40, tree="b" * 40),
+                 self.moved]
+        self.assertIsNone(m.left_top(self.last, first, [2], self.tip,
+                                     self.started))
+
+    def test_switched_off_nothing_is_kept_or_merged(self):
+        with mock.patch.object(m, "LEFT_TOP_COVERS", False):
+            self.assertIsNone(m.left_top(self.last, self.new, [2], self.tip,
+                                         self.started))
+            last = dict(self.last, left_top={
+                "tree": self.entries[1]["tree"], "entries": self.new[:1]})
+            self.assertIsNone(m.left_ready(last, self.queue, self.tip,
+                                           self.check))
+
+    def test_the_members_merge_once_the_old_top_is_green(self):
+        last = dict(self.last, left_top=m.left_top(
+            self.last, self.new, [2], self.tip, self.started))
+        got = m.left_ready(last, self.queue, self.tip, self.check)
+        self.assertEqual([e["pr"] for e in got], [5])
+        self.assertIsNone(m.left_ready(last, self.queue, self.tip,
+                                       self.started))
+        self.assertIsNone(m.left_ready(last, self.queue, "c" * 40,
+                                       self.check))
+        pushed = [dict(self.queue[0], headRefOid="a" * 40), self.queue[1]]
+        self.assertIsNone(m.left_ready(last, pushed, self.tip, self.check))
+
+    def test_the_train_below_merges_with_the_old_tops_green(self):
+        self.github = FakeGitHub({SLUG + "/pulls/5": {"merged": True}})
+        got = m.train_merge(self.repo.path, "/nonexistent", self.entries[:1],
+                            self.queue, self.tip, self.check, self.github,
+                            self.git, lambda s: None, self.lines.append,
+                            tested_tree=self.entries[1]["tree"])
+        self.assertEqual(got, ([5], []))
+        status = self.github.writes[0][2]
+        self.assertIn("under a top tested green as r", status["description"])
+
+
+class TrainInTheWay(TrainSetup):
+    """A pull request outside the first train doesn't merge on its own
+    under that train's started run (2026-11-12: #10784 did, 25 minutes
+    into a train of eight, and every train was cut again)."""
+
+    def setUp(self):
+        super().setUp()
+        self.last = dict(self.last, trains=True,
+                         batch={"size": 1, "trees": [
+                             self.entries[0]["tree"]]},
+                         later=[{"size": 1, "trees": [
+                             self.entries[1]["tree"]]}])
+        self.started = {"results": {}, "ahead_started": {
+            self.entries[0]["sha"]: "2026-11-12T16:40:00Z"}}
+
+    def test_one_outside_the_started_first_train_waits(self):
+        got = m.train_in_the_way(self.last, self.queue[1], self.started)
+        self.assertEqual([e["pr"] for e in got], [5])
+
+    def test_a_member_of_the_first_train_is_not_in_its_way(self):
+        self.assertIsNone(m.train_in_the_way(self.last, self.queue[0],
+                                             self.started))
+
+    def test_a_train_not_started_or_red_is_no_reason_to_wait(self):
+        self.assertIsNone(m.train_in_the_way(self.last, self.queue[1],
+                                             {"results": {}}))
+        red = dict(self.started, results={"r": {
+            "ok": False, "tree": self.entries[0]["tree"]}})
+        self.assertIsNone(m.train_in_the_way(self.last, self.queue[1], red))
+        self.assertIsNone(m.train_in_the_way({}, self.queue[1],
+                                             self.started))
+
+
+class KeepTrains(TrainSetup):
+    """labels.keep_trains (amendment of 2026-11-12, tenth): the default
+    branch moving only by labelled merges keeps the trains on their
+    base, and a green train merges its chain with the default branch
+    merged on top."""
+
+    def setUp(self):
+        super().setUp()
+        self.state = tempfile.mkdtemp(dir=self.tmp.name)
+        patch = mock.patch.object(m, "KEEP_LABEL", "Merge:keep-trains")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.last = dict(self.last, trains=True,
+                         batch={"size": 1, "trees": [
+                             self.entries[0]["tree"]]},
+                         later=[{"size": 1, "trees": [
+                             self.entries[1]["tree"]]}])
+        self.labelled = {}
+
+    def move_main(self, name="pin.txt", text="pin\n"):
+        self.advance_main(name, text)
+        return self.repo.main_tip()
+
+    def carried(self, last=None, tip=None):
+        with mock.patch.object(m, "kept_by_label",
+                               lambda sha, github, cache:
+                               self.labelled.get(sha)):
+            return m.carried_base(self.repo.path, self.state,
+                                  last or self.last, tip, None,
+                                  out=self.lines.append)
+
+    def test_a_labelled_merge_keeps_the_trains_on_their_base(self):
+        tip = self.move_main()
+        self.labelled[tip] = 11009
+        self.assertEqual(self.carried(tip=tip), self.tip)
+
+    def test_any_other_commit_cuts_them_again(self):
+        tip = self.move_main()
+        self.assertEqual(self.carried(tip=tip), tip)
+        with mock.patch.object(m, "KEEP_LABEL", None):
+            self.labelled[tip] = 11009
+            self.assertEqual(self.carried(tip=tip), tip)
+
+    def test_a_kept_commit_that_conflicts_cuts_them_again(self):
+        tip = self.move_main("g.txt", "not the other\n")
+        self.labelled[tip] = 11009
+        self.assertEqual(self.carried(tip=tip), tip)
+        self.assertIn("TRAIN-KEEP", self.lines[-1])
+
+    def test_only_what_moved_main_since_is_asked(self):
+        first = self.move_main()
+        self.labelled[first] = 11009
+        tip = self.move_main("pin2.txt", "pin 2\n")
+        self.labelled[tip] = 11010
+        last = dict(self.last, main=first)
+        self.labelled.pop(first)
+        self.assertEqual(self.carried(last, tip), self.tip)
+
+    def test_a_kept_train_merges_with_main_on_top(self):
+        tip = self.move_main()
+        self.entries = self.entries[:1]
+        self.github = FakeGitHub({SLUG + "/pulls/5": {"merged": True}})
+        got = m.train_merge(self.repo.path, self.state, self.entries,
+                            self.queue, self.tip, {"results": {"r": {
+                                "ok": True,
+                                "tree": self.entries[0]["tree"]}}},
+                            self.github, self.git, lambda s: None,
+                            self.lines.append, main=tip)
+        self.assertEqual(got, ([5], []))
+        top = self.github.writes[0][1].rsplit("/", 1)[1]
+        run_git(self.repo.path, "fetch", "-q", "origin", "forge/train-5-5")
+        self.assertEqual(run_git(self.repo.path, "rev-parse", top + "^2"),
+                         tip)
+        files = run_git(self.repo.path, "ls-tree", "--name-only", top)
+        self.assertIn("pin.txt", files.split())
+        self.assertIn("f.txt", files.split())
+        self.assertIn("kept commits merged on top",
+                      self.github.writes[0][2]["description"])
+        # The trains behind it stay on its chain once it has merged.
+        merge = run_git(self.repo.path, "commit-tree", top + "^{tree}",
+                        "-p", tip, "-p", top, "-m", "Merge train")
+        last = dict(self.last, entries=self.last["entries"], main=tip)
+        self.assertEqual(self.carried(last, merge),
+                         self.last["entries"][0]["sha"])
+
+    def test_a_train_that_conflicts_with_main_goes_on_its_own(self):
+        tip = self.move_main("g.txt", "not the other\n")
+        self.github = FakeGitHub({})
+        got = m.train_merge(self.repo.path, self.state, self.entries,
+                            self.queue, self.tip, self.check, self.github,
+                            self.git, lambda s: None, self.lines.append,
+                            main=tip)
+        self.assertEqual(got, ([], [5, 6]))
+        self.assertIn("doesn't merge cleanly", self.lines[-1])
+        self.assertEqual(self.github.writes, [])
+
+    def test_the_label_is_read_from_the_commits_pull_request(self):
+        sha = "a" * 40
+        github = mock.Mock()
+        github.api.return_value = {"data": {"repository": {"object": {
+            "associatedPullRequests": {"nodes": [
+                {"number": 3, "merged": True, "mergeCommit": {"oid": "b" * 40},
+                 "labels": {"nodes": [{"name": "Merge:keep-trains"}]}},
+                {"number": 4, "merged": True, "mergeCommit": {"oid": sha},
+                 "labels": {"nodes": [{"name": "Merge:keep-trains"}]}}]}}}}}
+        cache = {}
+        self.assertEqual(m.kept_by_label(sha, github, cache), 4)
+        self.assertEqual(cache, {sha: 4})
+        github.api.return_value["data"]["repository"]["object"][
+            "associatedPullRequests"]["nodes"][1]["labels"]["nodes"] = []
+        self.assertIsNone(m.kept_by_label("c" * 40, github, {}))
+        github.api.side_effect = RuntimeError("down")
+        cache = {}
+        self.assertIsNone(m.kept_by_label("d" * 40, github, cache))
+        self.assertEqual(cache, {})
+
+
 class Trains(RepoCase):
     """designs/0047: trains of carriages that touch different files, cut
     once and kept."""
@@ -7921,6 +9536,12 @@ class Trains(RepoCase):
         text = SHARED.replace("line %d\n" % k, "line %d by #%d\n"
                               % (k, number))
         return self.change(number, "shared.txt", text, created)
+
+    def fixes(self, number):
+        """#`number` fixes a red default branch."""
+        patch = mock.patch.object(m, "MAIN_RED_FIXES", frozenset({number}))
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def cut(self, carriages, last=None, open_numbers=None, check=None,
             started=None, acting=None):
@@ -8019,16 +9640,60 @@ class Trains(RepoCase):
         entries, sizes, _ = self.cut([[six], [seven], [eight]])
         self.assertEqual(self.numbers(entries, sizes), [[6], [8]])
 
+    def test_a_red_only_for_an_old_conflict_boards(self):
+        # 2026-11-12: four heads the build check had found conflicting
+        # with an older tip of main merged cleanly onto the train's top,
+        # but their red kept them out of every train, and only one train
+        # was cut for an hour.
+        six = self.change(6, "x.txt", "x\n")
+        seven = self.change(7, "y.txt", "y\n")
+        conflicted = {"ok": False, "failed": ["merge"], "conflicts": ["a"],
+                      "base": "0" * 40}
+        broken = {"ok": False, "failed": ["test"], "base": "0" * 40}
+        check = {"results": {six["headRefOid"]: conflicted,
+                             seven["headRefOid"]: broken}}
+        self.assertFalse(m.head_red(check, six))
+        self.assertTrue(m.head_red(check, seven))
+        record, _ = self.tick([self.item(), six, seven], conclusions=(None,),
+                              live=True, check_state=check)
+        self.assertEqual(record["trains"], [[5, 6]])
+        self.assertEqual(record["train_waits"],
+                         {"7": "its own head is red"})
+
+    def test_why_each_left_out_waits(self):
+        self.configure(batch=3, batches=1)
+        six, seven = self.line(6, 1), self.line(7, 20)
+        clash = self.change(8, "shared.txt", "other\n")
+        nine = self.change(9, "z.txt", "z\n")
+        carriages = [[self.item()], [six], [clash], [seven], [nine]]
+        heads = {c[0]["number"]: c[0]["headRefOid"] for c in carriages}
+        note = {}
+        entries, sizes, _ = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), carriages, None, heads,
+            set(heads), note=note)
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6, 9]])
+        self.assertEqual(note["waits"], {
+            "7": "touches a file train 1 touches",
+            "8": "touches a file train 1 touches"})
+        self.configure(batch=3, batches=1, trains_within="clean")
+        entries, sizes, _ = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), carriages, None, heads,
+            set(heads), note=note)
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6, 7]])
+        self.assertEqual(note["waits"], {"8": "conflicts onto train 1",
+                                         "9": "every train is full"})
+
     def test_a_stack_is_one_carriage_and_never_split(self):
         six = self.change(6, "s.txt", "one\n")
         layer = self.change(9, "s2.txt", "two\n", start=six["headRefOid"])
         seven = self.change(7, "y.txt", "y\n")
         eight = self.change(8, "z.txt", "z\n")
         self.configure(batch=2, batches=2, depth=3)
-        # [#6, #9] doesn't fit beside #7: it goes next, whole.
+        # The biggest carriage, [#6, #9], has the first train, whole;
+        # #7 and #8 the next.
         entries, sizes, _ = self.cut([[seven], [six, layer], [eight]])
-        self.assertEqual(self.numbers(entries, sizes), [[7, 8], [6, 9]])
-        self.assertEqual([e["carriage"] for e in entries], [7, 8, 6, 6])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 9], [7, 8]])
+        self.assertEqual([e["carriage"] for e in entries], [6, 6, 7, 8])
 
     def test_a_layer_that_conflicts_stays_and_the_one_below_boards(self):
         six = self.change(6, "s.txt", "one\n")
@@ -8108,7 +9773,7 @@ class Trains(RepoCase):
         self.configure(batch=4, batches=1)
         entries, sizes, _ = self.cut([[self.item()], [six, layer],
                                       [seven]])
-        self.assertEqual(self.numbers(entries, sizes), [[5, 6, 9, 7]])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 9, 5, 7]])
         got, sizes, events = m.cut_trains(
             self.repo.path, self.repo.main_tip(),
             [[self.item()], [seven]], self.said(entries, sizes),
@@ -8117,6 +9782,93 @@ class Trains(RepoCase):
         self.assertEqual(self.numbers(got, sizes), [[5, 7]])
         self.assertEqual(events, [("left", "LEFT #6: left the queue; its "
                                    "stack's layers #9 leave with it")])
+
+    def sibling(self, number, base, name, text="x\n", reviews=True):
+        """A layer on #`base`'s branch writing `text` to `name`."""
+        got = self.change(number, name, text, start=base["headRefOid"])
+        got["baseRefName"] = base["headRefName"]
+        if not reviews:
+            got["reviews"] = []
+        return got
+
+    def siblings(self):
+        """#6 on main; #9 and #10 side by side on it, #11 on #9."""
+        six = self.change(6, "s.txt", "one\n")
+        nine = self.sibling(9, six, "s9.txt")
+        ten = self.sibling(10, six, "s10.txt")
+        eleven = self.sibling(11, nine, "s11.txt")
+        return six, nine, ten, eleven
+
+    def test_layers_side_by_side_are_ready_depth_first(self):
+        # Amendment of 2026-11-12: three layers on one base, all
+        # approved and green, and none boarded.
+        six, nine, ten, eleven = self.siblings()
+        twelve = self.sibling(12, six, "s12.txt", reviews=False)
+        thirteen = self.sibling(13, twelve, "s13.txt")
+        prs = [six, nine, ten, eleven, twelve, thirteen]
+        got = m.ready_layers(self.repo.path, six, prs,
+                             {p["number"] for p in prs},
+                             datetime.datetime.now(datetime.timezone.utc),
+                             {})
+        # #12 isn't approved: it and #13 on it stay out, the rest board.
+        self.assertEqual([p["number"] for p, _ in got], [9, 11, 10])
+
+    def test_a_carriage_that_is_a_tree_boards_whole(self):
+        six, nine, ten, eleven = self.siblings()
+        self.configure(batch=4, batches=1, depth=3)
+        entries, sizes, _ = self.cut([[six, nine, eleven, ten]])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 9, 11, 10]])
+        self.assertEqual([e["on"] for e in entries], [None, 6, 9, 6])
+        # Each is predicted on all before it: #10's holds #9 and #11.
+        files = m.git(self.repo.path, "ls-tree", "--name-only",
+                      entries[3]["tree"]).stdout.split()
+        for name in ("s.txt", "s9.txt", "s10.txt", "s11.txt"):
+            self.assertIn(name, files)
+
+    def test_a_red_layer_holds_back_only_its_own_branch(self):
+        six, nine, ten, eleven = self.siblings()
+        self.configure(batch=4, batches=1, depth=3)
+        entries, sizes, events = self.cut([[six, nine, eleven, ten]],
+                                          check={9})
+        self.assertEqual(self.numbers(entries, sizes), [[6, 10]])
+
+    def test_a_sibling_that_conflicts_stops_only_its_own_branch(self):
+        six = self.change(6, "s.txt", "one\n")
+        nine = self.sibling(9, six, "c.txt", "nine\n")
+        ten = self.sibling(10, six, "c.txt", "ten\n")
+        fourteen = self.sibling(14, ten, "s14.txt")
+        eleven = self.sibling(11, nine, "s11.txt")
+        self.configure(batch=5, batches=1, depth=4)
+        entries, sizes, events = self.cut(
+            [[six, nine, eleven, ten, fourteen]])
+        self.assertEqual(self.numbers(entries, sizes), [[6, 9, 11]])
+        self.assertIn(("left", "LEFT #10: won't board with the layers below "
+                       "it, which go without it; also held back: #14"),
+                      events)
+
+    def test_a_layer_recut_after_its_base_merged_keeps_its_mark(self):
+        # layers_need_own_green: the base #6 merged, and #9 heads its
+        # carriage in a train cut afresh; it boarded as a layer.
+        six, nine, ten, eleven = self.siblings()
+        self.configure(batch=4, batches=1, depth=3)
+        last = {"entries": [{"pr": 9, "head": nine["headRefOid"], "on": 6}]}
+        entries, sizes, _ = self.cut([[nine, eleven]], last=dict(
+            last, base="0" * 40))
+        self.assertEqual([(e["pr"], e["on"]) for e in entries],
+                         [(9, 6), (11, 9)])
+
+    def test_one_that_leaves_takes_only_the_layers_on_it(self):
+        six, nine, ten, eleven = self.siblings()
+        self.configure(batch=4, batches=1, depth=3)
+        entries, sizes, _ = self.cut([[six, nine, eleven, ten]])
+        heads = {p["number"]: p["headRefOid"]
+                 for p in (six, nine, ten, eleven)}
+        got, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), [[six, ten]],
+            self.said(entries, sizes), heads, set(heads))
+        self.assertEqual(events, [("left", "LEFT #9: left the queue; its "
+                                   "stack's layers #11 leave with it")])
+        self.assertEqual(self.numbers(got, sizes), [[6, 10]])
 
     def test_a_merged_member_just_goes(self):
         six = self.change(6, "y.txt", "y\n")
@@ -8145,7 +9897,36 @@ class Trains(RepoCase):
         self.assertEqual(events[0][0], "main moved")
         self.assertEqual(self.numbers(got, sizes), [[7], [5], [6]])
 
-    def test_an_urgent_one_cuts_the_trains_behind_the_first(self):
+    def test_a_kept_commit_keeps_every_train_and_its_trees(self):
+        # labels.keep_trains: the tick cuts on the base `carried_base`
+        # gives, the trains' own, though main has moved.
+        six, seven = self.change(6, "y.txt", "y\n"), self.change(
+            7, "z.txt", "z\n")
+        self.configure(batch=1, batches=3)
+        entries, sizes, _ = self.cut([[self.item()], [six], [seven]])
+        last = self.said(entries, sizes)
+        base = self.repo.main_tip()
+        self.advance_main("pin.txt", "pin\n")
+        tip = self.repo.main_tip()
+        with mock.patch.object(m, "KEEP_LABEL", "Merge:keep-trains"), \
+                mock.patch.object(m, "kept_by_label",
+                                  lambda sha, github, cache: 11009):
+            carried = m.carried_base(self.repo.path, self.tmp.name, last,
+                                     tip, None)
+        self.assertEqual(carried, base)
+        heads = {p["number"]: p["headRefOid"]
+                 for p in (self.item(), six, seven)}
+        got, sizes, events = m.cut_trains(
+            self.repo.path, carried, [[self.item()], [six], [seven]], last,
+            heads, set(heads), red=frozenset())
+        self.assertEqual(events, [])
+        self.assertEqual([e["tree"] for e in got],
+                         [e["tree"] for e in entries])
+
+    def test_a_red_mains_fix_cuts_the_trains_behind_the_first(self):
+        # Only a red default branch's fix cuts trains already cut; one
+        # labelled urgent heads the next train (2026-11-13).
+        self.fixes(8)
         six, seven = self.change(6, "y.txt", "y\n"), self.change(
             7, "z.txt", "z\n")
         self.configure(batch=1, batches=3)
@@ -8158,6 +9939,27 @@ class Trains(RepoCase):
                                      "trains after train 1 are cut "
                                      "again"))
         self.assertEqual(self.numbers(got, sizes), [[5], [8], [6]])
+
+    def test_an_urgent_one_heads_the_next_train_and_cuts_none(self):
+        # 2026-11-13: an urgent pin went in front of a train whose top
+        # was testing and every train was cut again. One labelled
+        # urgent heads the next train cut, behind those already cut,
+        # whether or not they have started.
+        self.configure(batch=2, batches=3)
+        six, seven = self.change(6, "y.txt", "y\n"), self.change(
+            7, "z.txt", "z\n")
+        entries, sizes, _ = self.cut([[self.item()], [six], [seven]])
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6], [7]])
+        hot = labelled(self.change(9, "u.txt", "u\n"), "Priority:urgent")
+        ten = self.change(10, "w.txt", "w\n")
+        for queue in ([[hot], [self.item()], [six], [seven], [ten]],
+                      [[self.item()], [six], [seven], [ten], [hot]]):
+            got, sizes2, events = self.cut(
+                queue, self.said(entries, sizes),
+                started=lambda sha, tree: False)
+            self.assertEqual(events, [("cut", "CUT 3: #9 #10")])
+            self.assertEqual(self.numbers(got, sizes2),
+                             [[5, 6], [7], [9, 10]])
 
     def test_others_fill_an_urgent_ones_train(self):
         # designs/0047, amendment of 2026-11-11: an urgent one goes first
@@ -8182,7 +9984,10 @@ class Trains(RepoCase):
         entries, sizes, _ = self.cut([[self.item()], [six], [hot]])
         self.assertEqual(self.numbers(entries, sizes), [[8, 5, 6]])
 
-    def test_an_urgent_one_heads_the_first_train_not_started(self):
+    def test_a_red_mains_fix_heads_the_first_train_not_started(self):
+        # Only a red default branch's fix cuts trains already cut; one
+        # labelled urgent heads the next train (2026-11-13).
+        self.fixes(9)
         # Train 2 hasn't started: #9 heads it again, and it fills up
         # with the queue's next ones, not a train of its own.
         self.configure(batch=2, batches=3)
@@ -8249,6 +10054,32 @@ class Trains(RepoCase):
         self.assertEqual(m.train_batches(entries, [2, 2, 1], red({"t2"})),
                          (2, 2, []))
 
+    def test_a_later_trains_green_top_folds_the_trains_in_front(self):
+        # Amendment of 2026-11-11: its tree contains them all, so they
+        # merge at once rather than waiting for their own tops.
+        entries = [{"pr": n, "tree": "t%d" % n} for n in (1, 2, 3, 4, 5)]
+        says = lambda good, bad=(): (
+            lambda tree: True if tree in good else
+            False if tree in bad else None)
+        self.assertEqual(m.train_batches(entries, [2, 2, 1], says({"t4"})),
+                         (4, None, [{"size": 1, "trees": ["t5"],
+                                     "fixed": True}]))
+        # The last train's green folds all three.
+        self.assertEqual(m.train_batches(entries, [2, 2, 1], says({"t5"})),
+                         (5, None, []))
+        # A red top in front of a green one is overruled, as a flake:
+        # no suspects.
+        self.assertEqual(m.train_batches(entries, [2, 2, 1],
+                                         says({"t4"}, {"t2"})),
+                         (4, None, [{"size": 1, "trees": ["t5"],
+                                     "fixed": True}]))
+        # The first train's own green folds nothing.
+        self.assertEqual(m.train_batches(entries, [2, 2, 1], says({"t2"})),
+                         (2, None, [{"size": 2, "trees": ["t3", "t4"],
+                                     "fixed": True},
+                                    {"size": 1, "trees": ["t5"],
+                                     "fixed": True}]))
+
     def test_trains_longer_than_the_entries_left_are_dropped(self):
         # A member handed back after the trains were cut: the sizes run
         # past the entries. That raised IndexError and ended the tick.
@@ -8277,6 +10108,9 @@ class Trains(RepoCase):
         self.assertEqual(sorted(t["pr"] for t in record["told_boarded"]),
                          [5, 6, 7])
         self.assertIn("TOLD-BOARDED #6 %s" % six["headRefOid"][:10], lines)
+        # What to do instead of pushing.
+        self.assertIn("If it needs a fix, open a new pull request stacked "
+                      "on this branch; don't push here.", told[0][2]["body"])
         # The next tick, the same trains: nobody is told again.
         record, lines = self.tick(prs, conclusions=(None,), live=True,
                                   minutes=1)
@@ -8371,7 +10205,10 @@ class Trains(RepoCase):
         self.assertEqual(record["train_events"], ["left"])
         self.assertIs(record["recut"], True)
 
-    def test_an_urgent_one_that_cannot_board_cuts_only_once(self):
+    def test_a_red_mains_fix_that_cannot_board_cuts_only_once(self):
+        # Only a red default branch's fix cuts trains already cut; one
+        # labelled urgent heads the next train (2026-11-13).
+        self.fixes(8)
         six, seven = self.change(6, "y.txt", "y\n"), self.change(
             7, "z.txt", "z\n")
         self.configure(batch=1, batches=3)
@@ -8387,7 +10224,8 @@ class Trains(RepoCase):
             self.said(entries, sizes), heads, set(heads), red={8},
             note=note)
         self.assertEqual([c for c, _ in events][:1], ["urgent"])
-        self.assertEqual(note, {"urgent_cut": [8]})
+        self.assertEqual(note, {"urgent_cut": [8],
+                                "waits": {"8": "its own head is red"}})
         last = dict(self.said(got, sizes), urgent_cut=[8])
         again, sizes2, events = m.cut_trains(
             self.repo.path, self.repo.main_tip(),
@@ -8408,7 +10246,10 @@ class Trains(RepoCase):
         self.assertEqual(self.numbers(got, sizes), [[5, 6]])
         self.assertEqual(events, [])
 
-    def test_an_urgent_one_the_queue_puts_first_cuts_every_train(self):
+    def test_a_red_mains_fix_the_queue_puts_first_cuts_every_train(self):
+        # Only a red default branch's fix cuts trains already cut; one
+        # labelled urgent heads the next train (2026-11-13).
+        self.fixes(8)
         six = self.change(6, "y.txt", "y\n")
         self.configure(batch=2, batches=2)
         entries, sizes, _ = self.cut([[self.item()], [six]])
@@ -8786,3 +10627,291 @@ class OwnGreenWaitAfterUpdates(RepoCase):
         self.head = self.repo.commit("f.txt", "more\n", "more")
         self.assertIsNotNone(self.wait({self.approved: [], self.head: [],
                                         self.first: [status()]}))
+
+
+class CodeOwnerAsk(unittest.TestCase):
+    """agent-forge #153: a pull request held for a code owner opens an
+    ask issue, closed when the hold ends at that head."""
+
+    def setUp(self):
+        m.configure(project(code_owners=True, code_owner_ask={
+            "labels": ["Status:waiting-owner"]}))
+        self.addCleanup(m.configure, project())
+        self.dir = tempfile.mkdtemp()
+        self.lines = []
+        self.github = FakeGitHub({})
+
+    def asks(self, waits, open_heads):
+        m.code_owner_asks(self.dir, self.github, waits, open_heads,
+                          self.lines.append)
+        return m.load_json(os.path.join(self.dir, m.CODE_OWNER_ASK_NAME), {})
+
+    def test_a_hold_opens_one_labelled_issue(self):
+        why = "waits for code owner @alex: .github/CODEOWNERS"
+        asks = self.asks({5: ("a" * 40, why), 6: ("b" * 40, None)},
+                         {5: "a" * 40, 6: "b" * 40})
+        self.assertEqual(asks, {"5": {"head": "a" * 40, "issue": 900,
+                                      "labeled": ["Status:waiting-owner"]}})
+        (method, path, fields), label = self.github.writes
+        self.assertEqual(fields["title"], "#5 waits for a code owner's approval")
+        self.assertIn(why, fields["body"])
+        self.assertEqual(label[2], {"labels[]": "Status:waiting-owner"})
+        # Once per head: the next tick opens nothing more.
+        self.asks({5: ("a" * 40, why)}, {5: "a" * 40})
+        self.assertEqual(len(self.github.writes), 2)
+
+    def test_an_unjudged_pr_keeps_its_ask(self):
+        self.asks({5: ("a" * 40, "waits")}, {5: "a" * 40})
+        self.assertEqual(set(self.asks({}, {5: "a" * 40})), {"5"})
+
+    def test_approval_new_head_or_close_ends_it(self):
+        for waits, heads, said in (
+                ({5: ("a" * 40, None)}, {5: "a" * 40}, "no longer waits"),
+                ({}, {5: "c" * 40}, "has a new head"),
+                ({}, {}, "was closed")):
+            self.github = FakeGitHub({})
+            m.save_json(os.path.join(self.dir, m.CODE_OWNER_ASK_NAME),
+                        {"5": {"head": "a" * 40, "issue": 9,
+                               "labeled": ["Status:waiting-owner"]}})
+            self.assertEqual(self.asks(waits, heads), {})
+            comment, close = self.github.writes
+            self.assertIn(said, comment[2]["body"])
+            self.assertEqual(close[:2], ("PATCH", "repos/example/widget/issues/9"))
+
+    def test_a_refused_create_is_tried_again(self):
+        self.github.refuse = "nope"
+        self.assertEqual(self.asks({5: ("a" * 40, "waits")}, {5: "a" * 40}),
+                         {})
+        self.assertIn("CODE-OWNER-ASK refused", self.lines[0])
+
+    def test_config(self):
+        data = example()
+        data["merge"] = {"code_owner_ask": {"title": "x", "labels": [""]}}
+        problems = config.check(data)
+        for said in ("needs merge.code_owners", "must name the pull request",
+                     "must be a list of label names"):
+            self.assertTrue(any(said in p for p in problems), problems)
+class InstanceMainRed(unittest.TestCase):
+    """agent-forge #154: an instance's own main-red issue puts the pull
+    requests that close it first, as the main context's does."""
+
+    def setUp(self):
+        data = example()
+        data["merge"] = {"gate": GATE, "own_head_green": False,
+                         "test_ahead": False}
+        data["checks"] = dict(data.get("checks", {}), instances={
+            "mac": {"context": "vm/mac", "poster": "Helper",
+                    "main_red_issue": {"labels": ["bug"]}},
+            "quiet": {"context": "vm/quiet"}})
+        self.project = config.Project(data, None)
+        m.configure(self.project)
+        self.addCleanup(m.configure, project())
+        self.addCleanup(setattr, m, "MAIN_RED_FIXES", frozenset())
+
+    def github(self, nodes):
+        github = mock.Mock()
+        github.api.return_value = {"data": {"repository": {"issues": {
+            "nodes": nodes}}}}
+        return github
+
+    def test_only_an_instance_with_an_issue_has_a_rule(self):
+        (title, labels, poster), = m.INSTANCE_RED
+        self.assertEqual(labels, ("bug",))
+        self.assertEqual(poster, self.project.bot_login("Helper"))
+        self.assertTrue(title.match(
+            "The default branch is red for vm/mac at 0123abcdef"))
+        self.assertFalse(title.match(
+            "The default branch is red for vm/quiet at 0123abcdef"))
+        self.assertFalse(title.match(
+            "The default branch is red for vm/mac at 0123abcdef!"))
+
+    def test_the_issues_are_the_posters_with_the_title(self):
+        login = self.project.slug("Helper")
+        github = self.github([
+            {"number": 7, "title": "The default branch is red for vm/mac "
+             "at 0123abcdef", "author": {"login": login}},
+            {"number": 8, "title": "The default branch is red for vm/mac "
+             "at 0123abcdef", "author": {"login": "someoneelse"}},
+            {"number": 9, "title": "Something else",
+             "author": {"login": login}}])
+        self.assertEqual(m.instance_red_issues(github), {7})
+        args = github.api.call_args[0]
+        self.assertIn("labels[]=bug", args)
+        self.assertIn("owner=example", args)
+
+    def test_github_unread_means_none(self):
+        github = mock.Mock()
+        github.api.side_effect = RuntimeError("down")
+        self.assertEqual(m.instance_red_issues(github), set())
+
+    def test_a_pr_that_closes_it_outside_code_is_a_fix(self):
+        prs = [{"number": 1, "title": "Fix the Mac", "body": "Fixes #7"},
+               {"number": 2, "title": "x", "body": "`Fixes #7`"},
+               {"number": 3, "title": "Closes #7", "body": None},
+               {"number": 4, "title": "y", "body": "Fixes #70"}]
+        self.assertEqual(m.red_fixes_of(prs, {7}), frozenset({1, 3}))
+        self.assertEqual(m.red_fixes_of(prs, set()), frozenset())
+
+
+class GreenApproval(unittest.TestCase):
+    """merge.approval green (2026-11-13)."""
+
+    def setUp(self):
+        m.configure(project(approval="green", own_head_green=True))
+        self.addCleanup(m.configure, project())
+
+    def node(self, **kw):
+        p = pr(reviews=[], **kw)
+        p["commits"] = {"nodes": [{"commit": {"committedDate": T1}}]}
+        return p
+
+    def test_the_head_approves_itself(self):
+        got = m.approval_of(self.node())
+        self.assertEqual((got["state"], got["submittedAt"],
+                          got["commit"]["oid"]), ("APPROVED", T1, "a" * 40))
+        approval, why = m.eligible(self.node(), [])
+        self.assertIsNone(why)
+        self.assertEqual(m.approval_of(pr(reviews=[])) ["submittedAt"], T0)
+
+    def test_a_remark_after_the_push_holds_it(self):
+        _, why = m.eligible(self.node(comments=[comment(PEER, T2)]), [])
+        self.assertIn("after the approval", why)
+        # One before the push doesn't.
+        _, why = m.eligible(self.node(comments=[comment(PEER, T0)]), [])
+        self.assertIsNone(why)
+
+    def test_the_default_still_needs_a_reviewer(self):
+        m.configure(project())
+        self.assertIsNone(m.approval_of(self.node()))
+
+    def test_the_configuration(self):
+        data = example()
+        data["merge"] = {"approval": "sometimes"}
+        self.assertIn("merge.approval must be reviewer or green",
+                      config.check(data))
+        data["merge"] = {"approval": "green", "own_head_green": False}
+        self.assertIn("merge.approval green needs own_head_green",
+                      config.check(data))
+
+
+class ManualMode(unittest.TestCase):
+    """agent-forge #274: merge.mode manual."""
+
+    def setUp(self):
+        m.configure(project(mode="manual"))
+        self.addCleanup(m.configure, project())
+        self.dir = tempfile.mkdtemp()
+        self.lines = []
+
+    def test_the_configuration(self):
+        self.assertTrue(m.MANUAL)
+        m.configure(project())
+        self.assertFalse(m.MANUAL)
+        data = example()
+        data["merge"] = {"mode": "sometimes"}
+        self.assertIn("merge.mode must be auto or manual",
+                      config.check(data))
+
+    def test_hand_merges_are_recorded_as_merges(self):
+        when = datetime.datetime(2026, 10, 7, 10, tzinfo=datetime.timezone.utc)
+        github = FakeGitHub({SLUG + "/pulls?state=closed": [
+            {"number": 7, "merged_at": "2026-10-07T10:30:00Z",
+             "merged_by": {"login": "leaddevwidgetagent"}},
+            {"number": 6, "merged_at": "2026-10-07T09:30:00Z"},
+            {"number": 5, "merged_at": None},
+            {"number": 8, "merged_at": "2026-10-07T10:20:00Z",
+             "user": {"login": "someone"}}]})
+        # The first run starts the clock.
+        self.assertEqual(m.record_hand_merges(self.dir, github,
+                                              self.lines.append, when), [])
+        got = m.record_hand_merges(self.dir, github, self.lines.append,
+                                   when + datetime.timedelta(hours=1))
+        self.assertEqual([(r["at"], r["decisions"][0]["pr"],
+                           r["decisions"][0]["by"]) for r in got],
+                         [("2026-10-07T10:20:00Z", 8, "someone"),
+                          ("2026-10-07T10:30:00Z", 7, "leaddevwidgetagent")])
+        with open(os.path.join(self.dir, "merger.jsonl")) as handle:
+            self.assertEqual(len(handle.readlines()), 2)
+        # Each once.
+        self.assertEqual(m.record_hand_merges(self.dir, github,
+                                              self.lines.append, when), [])
+        self.assertIn("2 hand merge(s) recorded: #8, #7", self.lines[1])
+
+
+    def test_ready_lists_what_holds_it(self):
+        m.configure(project(mode="manual", ci_workflow=""))
+        head = "a" * 40
+        prs = [{"number": 5, "headRefOid": head, "isDraft": False,
+                "body": "Blocked-by: #9\n"}, {"number": 9}]
+        green = [{"context": m.STATUS_CONTEXT, "state": "success",
+                  "creator": {"login": m.STATUS_CREATOR}}]
+        github = FakeGitHub({SLUG + "/commits/": green})
+        behind = {"answer": 1}
+
+        def git(repo, *args, run=None):
+            code = behind["answer"] if args[0] == "merge-base" else 0
+            return subprocess.CompletedProcess(args, code, "", "")
+        with mock.patch.object(m, "fetch_prs", return_value=prs), \
+                mock.patch.object(m, "fetch_open_issues", return_value=set()), \
+                mock.patch.object(m, "have_head"), \
+                mock.patch.object(m, "git", git):
+            self.assertEqual(m.merge_ready("/r", github, 5), [
+                "it is not current with main: merge main into it first",
+                "Blocked-by #9, still open"])
+            prs[0]["body"], behind["answer"] = "", 0
+            self.assertEqual(m.merge_ready("/r", github, 5), [])
+            self.assertEqual(m.merge_ready("/r", github, 6),
+                             ["#6 is not an open pull request"])
+class TrainAheadStall(unittest.TestCase):
+    """A head waiting for train 1's run is timed from that run's start,
+    not from when it began waiting: the wait is the train's."""
+
+    START = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                              tzinfo=datetime.timezone.utc)
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp()
+        m.configure(project(stall_run_factor=0))
+        self.addCleanup(m.configure, project())
+
+    def stalled(self, minutes, started):
+        waiting = {"pr": 5, "head": "h" * 40, "action": "WAIT",
+                   "train_top": "t" * 40}
+        check = {"ahead_started": {"t" * 40: started}} if started else {}
+        m.stalled_for(self.state, waiting, self.START, check)
+        return m.stalled_for(
+            self.state, waiting,
+            self.START + datetime.timedelta(minutes=minutes), check)
+
+    def test_timed_from_the_trains_run(self):
+        self.assertIsNone(self.stalled(45, "2026-10-07T12:20:00Z"))
+        self.assertEqual(self.stalled(50, "2026-10-07T12:20:00Z"), 50)
+
+    def test_no_run_start_known_is_timed_as_before(self):
+        self.assertEqual(self.stalled(30, None), 30)
+
+
+class Unblockers(unittest.TestCase):
+    """designs/0052: next.json's `unblocks`."""
+
+    def test_what_held_ones_wait_on(self):
+        self.assertEqual(m.unblockers({
+            "5": "Blocked-by: #9 is open", "6": "stacked on #7",
+            "8": "waits for code owner @x: y"}), [7, 9])
+
+
+class Boarded(unittest.TestCase):
+    """A stack layer and a member aboard together (the tick failed with
+    `keywords must be strings` once both were)."""
+
+    def test_layers_and_members_join(self):
+        with mock.patch.object(m, "LAYERS_OWN_GREEN", False), \
+                mock.patch.object(m, "OWN_GREEN_TO_BOARD", False), \
+                mock.patch.object(m, "boarded_layers",
+                                  return_value={10999: "b" * 40}), \
+                mock.patch.object(m, "boarded_members",
+                                  return_value={10990: "a" * 40,
+                                                10999: "c" * 40}):
+            self.assertEqual(m.boarded_now({}), {10990: "a" * 40,
+                                             10999: "b" * 40})
+

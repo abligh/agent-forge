@@ -10,7 +10,12 @@ pushes. It runs from cron under forge-cron-run.
 
 **`MEMORY.md` merges as a union** (the repository's `.gitattributes`):
 its lines are independent pointers, so keeping both sides' lines is
-right. **Any other conflict is never resolved here.** The rebase is
+right. **So does a conflict where both hosts only added lines to a
+memory file** (`*.md`): two appends, two inserts after the same line,
+or each host setting its front matter's `modified:` (the later is
+kept). The other hosts' lines come first, then this host's, in a merge
+commit (agent-forge #157). **Any other conflict is never resolved
+here.** The rebase is
 aborted, which leaves the working tree as it was, the local commit is
 kept, and the run exits 1. With `--file` it's reported on one GitHub
 issue. A person reconciles the files; docs/memory-sync.md says how.
@@ -45,13 +50,14 @@ Exit status:
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-from agent_forge import config, github, memory, proc  # noqa: E402
+from agent_forge import config, github, memory, proc, union  # noqa: E402
 
 PROG = "forge-memory-sync"
 INDEX = memory.INDEX
@@ -156,6 +162,64 @@ def rebase(git, cfg):
                              % (r.stderr or r.stdout).strip()[:200]]
 
 
+# What a conflict may be resolved in (agent-forge #157): memory files,
+# whose entries are lines and whose order doesn't matter. Alex,
+# 2026-11-12: a union is right for these, and for no other files.
+UNION_GLOBS = ("*.md",)
+MODIFIED_RE = re.compile(r"^\s*modified:\s*(\S.*?)\s*$")
+# union.resolve's `git -C <repo>`, mapped onto this repository's Git.
+UNION_REPO = "<memory>"
+
+
+def later_modified(base, head, main):
+    """For a conflicting hunk that is one front-matter `modified:` line
+    on every side: the later of the two hosts' lines. None otherwise."""
+    if not (len(base) == len(head) == len(main) == 1):
+        return None
+    got = [MODIFIED_RE.match(line.rstrip("\r\n"))
+           for line in base + head + main]
+    if not all(got):
+        return None
+    return [head[0] if got[1].group(1) >= got[2].group(1) else main[0]]
+
+
+def union_run(git):
+    """A `run` for agent_forge.union that runs its git commands as
+    `git` does, in this repository, keeping a temporary index it
+    sets."""
+    def run(args, env=None, **_):
+        if args[:3] != ["git", "-C", UNION_REPO]:
+            raise ValueError("not a union git command: %r" % (args,))
+        environ = dict(git.environ)
+        if env and "GIT_INDEX_FILE" in env:
+            environ["GIT_INDEX_FILE"] = env["GIT_INDEX_FILE"]
+        return git.run(git.argv(*args[3:]), cwd=git.cfg["dir"],
+                       env=environ, timeout=GIT_TIMEOUT_S)
+    return run
+
+
+def union_merge(git, cfg, conflicts):
+    """After a rebase stopped on `conflicts`: when every conflict is two
+    hosts adding lines to a memory file (or each setting its
+    `modified:`), merge as a union, the other hosts' lines first, and
+    fast-forward to the merge. Returns a line saying so, or None when
+    any conflict is more than that (agent-forge #157)."""
+    theirs = "origin/" + cfg["branch"]
+    got = union.resolve(UNION_REPO, theirs, "HEAD", UNION_GLOBS,
+                        run=union_run(git), pick=later_modified)
+    if not got:
+        return None
+    made = git("commit-tree", got.tree, "-p", theirs, "-p", "HEAD", "-m",
+               "%s: union of %s\n\nBoth sides only added lines; the other "
+               "hosts' first." % (cfg["host"], ", ".join(conflicts)))
+    # A fast-forward: it refuses rather than overwrite a file changed
+    # since the commit.
+    if git("merge", "--ff-only", "-q", made.stdout.strip(),
+           check=False).returncode != 0:
+        return None
+    return "union of %s" % ", ".join(conflicts)
+
+
 def push(git, cfg):
     """Push. "behind" when the other host pushed first, else "pushed"."""
     r = git("push", "-q", "origin", "HEAD:" + cfg["branch"], check=False)
@@ -185,17 +249,20 @@ def sync(git, cfg):
         raise Stop(NEEDS_PERSON, "a rebase is in progress in %s; leaving it "
                    "to whoever started it" % cfg["git_dir"])
     committed = commit_local(git, cfg)
+    merged = None
     for _attempt in (1, 2):
         conflicts = rebase(git, cfg)
         if conflicts:
-            raise Stop(NEEDS_PERSON, "conflict with the other hosts in: "
-                       + ", ".join(conflicts))
+            merged = union_merge(git, cfg, conflicts)
+            if merged is None:
+                raise Stop(NEEDS_PERSON, "conflict with the other hosts in: "
+                           + ", ".join(conflicts))
         if not ahead(git, cfg):
             return "in step with origin (%s)" % (
                 "committed and already pushed" if committed
                 else "nothing to commit")
         if push(git, cfg) == "pushed":
-            return "pushed"
+            return "pushed" + (" (%s)" % merged if merged else "")
     raise Stop(NEEDS_PERSON, "push refused twice: another host kept pushing "
                "first; the next run retries")
 

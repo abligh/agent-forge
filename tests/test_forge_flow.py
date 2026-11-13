@@ -364,6 +364,27 @@ class Graphs(Base):
         self.assertEqual((got["approval_median"], got["approval_n"]),
                          (18, 2))
 
+    def test_the_hour_under_way_comes_last_and_partial(self):
+        rows = self.flow(now=T("2026-11-04T11:20:00Z")).graph_hours()
+        self.assertEqual(len(rows), 25)
+        self.assertEqual(rows[-2]["hour"], "2026-11-04T10:00Z")
+        self.assertNotIn("partial", rows[-2])
+        last = rows[-1]
+        self.assertEqual((last["hour"], last["until"], last["partial"]),
+                         ("2026-11-04T11:00Z", "2026-11-04T11:20Z", True))
+
+    def test_only_the_merges_chart_draws_the_partial_hour_lighter(self):
+        rows = [{"hour": "2026-11-04T%02d:00Z" % h, "records": True,
+                 "merges": 3, "runs_per_merge": 2.0} for h in range(9, 11)]
+        rows.append({"hour": "2026-11-04T11:00Z", "until":
+                     "2026-11-04T11:20Z", "partial": True, "records": True,
+                     "merges": 1, "runs_per_merge": 9.0})
+        merges = tool.flow_graphs(rows)
+        self.assertEqual(merges.count('class="partial"'), 1)
+        self.assertIn("11:00\u201311:20 so far", merges)
+        self.assertNotIn("9.0", tool.efficiency_graphs(rows))
+        self.assertNotIn('class="partial"', tool.efficiency_graphs(rows))
+
     def test_an_hour_without_ticks_inside_the_records_is_a_gap(self):
         records = [rec("08:10:00"), rec("10:05:00", [1], [d("WAIT", 1)])]
         rows = self.flow(records=records).graph_hours()
@@ -570,7 +591,7 @@ class StacksAndTrains(Base):
         self.assertEqual([k["pr"] for k in twenty["layers"]], [21])
         self.assertEqual([k["pr"] for k in twenty["layers"][0]["layers"]],
                          [22, 24])
-        self.assertEqual(twenty["root_where"], "in train 1")
+        self.assertEqual(twenty["root_where"], "in train 2")
         self.assertEqual(got[1]["root_where"],
                          "held: conflicts with #20, ahead of it in the queue")
         self.assertTrue(got[2]["root_where"].startswith("not a candidate"))
@@ -601,6 +622,18 @@ class StacksAndTrains(Base):
         self.assertIn('<span class="note">behind #20, merges cleanly</span>',
                       html)
 
+    def test_candidates_in_no_stack_are_listed_on_one_line(self):
+        # Queue 20, 30 (20 a stack's base); 60 queued too, 50 held.
+        held = {"21": "stacked on #20", "50": "draft"}
+        records = RECORDS[:-1] + [rec("10:40:00", [20, 60], [d("WAIT", 20)],
+                                      held=held)]
+        flow = self.flow(records=records)
+        got = flow.singles()
+        self.assertEqual([o["pr"] for o in got], [60, 50])
+        self.assertEqual(got[1]["status"], tool.RED)
+        html = tool.stacks_html({"stacks": flow.stacks(), "singles": got})
+        self.assertIn("Not stacked</b> (2)", html)
+
     def test_a_loop_in_the_holds_does_not_hang(self):
         held = {"21": "stacked on #20", "20": "stacked on #21"}
         self.assertEqual(self.flow(records=self.last(held=held)).stacks(),
@@ -621,9 +654,9 @@ class StacksAndTrains(Base):
         got = self.flow(worker=worker, ahead=ahead).trains()
         self.assertEqual([(t["train"], t["prs"], t["top"], t["state"],
                            t["urgent"]) for t in got], [
-            (0, [11, 12], "b" * 10, "green, merging", False),
-            (1, [21], "8" * 10, "waiting for a slot", True),
-            (2, [31, 33], "9" * 10, "testing", False)])
+            (1, [11, 12], "b" * 10, "green, merging", False),
+            (2, [21], "8" * 10, "waiting for a slot", True),
+            (3, [31, 33], "9" * 10, "testing", False)])
         self.assertEqual(got[2]["since"], "2026-11-04T10:45Z")
 
     def test_without_trains_the_batch_sizes_cut_them(self):
@@ -632,7 +665,7 @@ class StacksAndTrains(Base):
                              ((11, "a"), (12, "b"), (13, "c"), (14, "d"))]}
         got = self.flow(ahead=ahead).trains()
         self.assertEqual([(t["train"], t["prs"]) for t in got],
-                         [(0, [11, 12]), (1, [13]), (None, [14])])
+                         [(1, [11, 12]), (2, [13]), (None, [14])])
         self.assertEqual(got[2]["state"], "predicted, not yet in a train")
         self.assertIn("in no train yet", tool.trains_html({"trains": got}))
 
@@ -668,6 +701,291 @@ class StacksAndTrains(Base):
         self.assertIn("No train", tool.trains_html({}))
         self.assertIn("No stacked", tool.stacks_html({}))
         self.assertIn(">#20<", tool.stacks_html(dict(data, repo=None)))
+
+
+class StatusPriorityCarriages(Base):
+    """The stacks' status dots, the priority marks and the trains'
+    carriages."""
+
+    def last(self, queue=(30,), **more):
+        return RECORDS[:-1] + [rec("10:40:00", list(queue), [], **more)]
+
+    def write_json(self, sub, name, data):
+        os.makedirs(os.path.join(self.root, sub), exist_ok=True)
+        with open(os.path.join(self.root, sub, name), "w") as handle:
+            json.dump(data, handle)
+
+    def test_carriages_from_ahead_json_or_from_the_stacks(self):
+        named = [{"pr": 11, "carriage": 11}, {"pr": 12, "carriage": 11},
+                 {"pr": 13, "carriage": 13}, {"pr": 14, "carriage": 14},
+                 {"pr": 15, "carriage": 14}]
+        self.assertEqual(tool.carriages_of(named, {}),
+                         [[11, 12], [13], [14, 15]])
+        bare = [{"pr": n} for n in (11, 12, 13, 14, 15)]
+        # 12 rides on 11, 15 on 14; 13 is stacked, but not on 12.
+        self.assertEqual(tool.carriages_of(bare, {12: 11, 13: 9, 15: 14}),
+                         [[11, 12], [13], [14, 15]])
+
+    def test_trains_carry_their_carriages(self):
+        held = {"12": "stacked on #11", "15": "stacked on #14"}
+        ahead = {"trains": True, "batch": {"size": 4}, "later": [
+            {"size": 1}], "entries": [
+            {"pr": 11, "train": 0, "carriage": 11, "sha": sha("a")},
+            {"pr": 12, "train": 0, "carriage": 11, "sha": sha("b")},
+            {"pr": 13, "train": 0, "carriage": 13, "sha": sha("c")},
+            {"pr": 14, "train": 0, "carriage": 14, "sha": sha("d")},
+            {"pr": 15, "train": 1, "sha": sha("e")}]}
+        got = self.flow(records=self.last(held=held), ahead=ahead).trains()
+        self.assertEqual([t["carriages"] for t in got],
+                         [[[11, 12], [13], [14]], [[15]]])
+        html = tool.trains_html({"trains": got})
+        self.assertIn("4 PRs in 3 carriages", html)
+        self.assertIn("1 PR in 1 carriage ", html)
+        self.assertEqual(html.count('<span class="carriage'), 4 + 2)
+        self.assertEqual(html.count('class="carriage van"'), 2)
+        self.assertEqual(html.count('<svg class="engine"'), 2 + 4)
+
+    def test_priority_inferred_without_github(self):
+        self.write_json("nightly", "nightly.json", {
+            "at": "2026-11-04T10:55:00Z", "issue_open": True,
+            "fixes": [41]})
+        self.write_json("pr-check", "state.json", {
+            "main_red": {"issue": 900, "fixes": [42]}})
+        flow = self.flow(records=self.last(right_of_way={"pr": 43}),
+                         ahead={"urgent_cut": [40, 41, 42]})
+        self.assertEqual({k: v["level"] for k, v in
+                          flow.priorities().items()},
+                         {"40": "urgent", "41": "elevated",
+                          "42": "elevated", "43": "elevated"})
+        self.assertIn("fixes nothing red", flow.priorities()["40"]["why"])
+        self.assertIn("right of way", flow.priorities()["43"]["why"])
+
+    def test_priority_from_the_merger_record(self):
+        # forge-merger names every labelled and elevated pull request it
+        # saw, held ones and layers too; that beats inferring.
+        flow = self.flow(records=self.last(urgent=[50, 51], elevated=[52]),
+                         ahead={"urgent_cut": [40]})
+        self.assertEqual({k: v["level"] for k, v in
+                          flow.priorities().items()},
+                         {"50": "urgent", "51": "urgent",
+                          "52": "elevated"})
+        self.assertNotIn("fixes nothing red", flow.priorities()["50"]["why"])
+
+    def test_priority_from_github_labels_and_stale_fixes(self):
+        self.write_json("nightly", "nightly.json", {
+            "at": "2026-11-04T09:00:00Z", "issue_open": True,
+            "fixes": [41]})
+        self.write_json("pr-check", "state.json", {
+            "main_red": {"issue": None, "fixes": [42]}})
+        flow = self.flow(records=self.last(), ahead={
+            "urgent_cut": [40, 41, 42]})
+        flow.labelled = {44}
+        self.assertEqual(flow.priorities(), {"44": {
+            "level": "urgent", "why": "urgent: carries the urgent label"}})
+
+    def test_status_of_each_layer(self):
+        worker = WORKER + [header("10:45:00", 52, "5", 2),
+                           header("10:46:00", 53, "3", 2),
+                           header("10:46:30", 54, "4", 2)]
+        verdicts = VERDICTS + [
+            "2026-11-04T10:47:00Z VERDICT #53 3333333333: red(test) "
+            "waited=0s ran=60s",
+            "2026-11-04T10:48:00Z VERDICT #54 4444444444: green "
+            "waited=0s ran=60s"]
+        held = {"51": "stacked on #50", "52": "stacked on #51",
+                "53": "stacked on #52", "54": "stacked on #50",
+                "55": "stacked on #54",
+                "56": "vm/build-and-test is pending on 1234567890, and no "
+                      "approved commit is green; waits for the build "
+                      "check to pass",
+                "57": "conflicts with #30, ahead of it in the queue",
+                "58": "stacked on #57, which merged; waiting for: draft"}
+        ahead = {"trains": True, "batch": {"size": 1}, "entries": [
+            {"pr": 60, "train": 0, "carriage": 60, "sha": sha("6")}]}
+        flow = self.flow(worker=worker, verdicts=verdicts, ahead=ahead,
+                         records=self.last(queue=(30, 59), held=held))
+        got = {pr: flow.status(pr)[0] for pr in range(50, 61)}
+        self.assertEqual(got, {
+            50: "red",      # not held, not queued: not a candidate
+            51: "orange",   # stacked, own check never run
+            52: "orange",   # stacked, own check running
+            53: "red",      # stacked, own check red
+            54: "green",    # stacked, own check green
+            55: "orange",
+            56: "orange",   # held for a pending check
+            57: "red",      # held for a conflict
+            58: "red",      # waits for something of its own
+            59: "green",    # eligible
+            60: "orange"})  # in a train waiting for a slot
+        self.assertIn("waits for #50 below it", flow.status(54)[1])
+        stacks = flow.stacks()
+        self.assertEqual(stacks[0]["pr"], 50)
+        self.assertEqual(stacks[0]["status"], "red")
+        self.assertEqual(stacks[0]["layers"][0]["status"], "orange")
+        # A base that merged, as a layer's hold says.
+        held["50"] = "stacked on #49"
+        held["58"] = "stacked on #49, which merged; waiting for: draft"
+        flow = self.flow(records=self.last(held=held))
+        self.assertEqual(flow.status(49), ("green", "merged"))
+
+    def test_a_hand_back_at_an_earlier_tick_stays_red_until_a_new_head(self):
+        # 2026-11-12: #10608, handed back for a conflict at 16:06, was
+        # still in the queue at 17:00 and showed green.
+        records = [
+            rec("10:00:00", [70, 71], [
+                d("HAND-BACK", 70, head="a" * 40, result="done",
+                  reason="it conflicts with main, so it can't be updated"),
+                d("HAND-BACK", 71, head="b" * 40, result="done",
+                  reason="red")]),
+            rec("10:05:00", [70, 71], [d("WAIT", 71, head="c" * 40)]),
+        ]
+        flow = self.flow(records=records)
+        colour, why = flow.status(70)
+        self.assertEqual(colour, "red")
+        self.assertIn("handed back at 2026-11-04T10:00Z: it conflicts", why)
+        # A new head since: the hand-back no longer stands.
+        self.assertEqual(flow.status(71)[0], "green")
+
+    def test_the_page_marks_priority_and_status(self):
+        data = {"priority": {"21": {"level": "urgent", "why": "u"},
+                             "22": {"level": "elevated", "why": "e"}},
+                "trains": [{"train": 0, "prs": [20, 21, 22],
+                            "carriages": [[20, 21], [22]], "top": "c" * 10,
+                            "state": "testing", "since": None,
+                            "urgent": True}],
+                "stacks": [{"pr": 20, "count": 1, "depth": 1,
+                            "status": "orange", "why": "in train 0",
+                            "root_where": "in train 0", "layers": [
+                                {"pr": 21, "count": 0, "depth": 0,
+                                 "status": "green", "why": "ok",
+                                 "layers": []}]}]}
+        trains = tool.trains_html(data)
+        self.assertIn("3 PRs in 2 carriages", trains)
+        self.assertIn('class="train t-testing"', trains)
+        self.assertIn('<span class="pri p-urgent" title="u">', trains)
+        self.assertIn('<span class="pri p-elevated" title="e">', trains)
+        self.assertIn('class="carriage van" title="the guard\'s van, '
+                      'carriage 2"', trains)
+        stacks = tool.stacks_html(data)
+        self.assertIn('class="dot d-orange" role="img" aria-label="testing '
+                      'underway: in train 0"', stacks)
+        self.assertIn('class="dot d-green"', stacks)
+        self.assertIn('<span class="pri p-urgent" title="u">', stacks)
+        # The legends.
+        for want in ("can merge", "testing underway", "cannot merge",
+                     "elevated:", "guard's van"):
+            self.assertIn(want, stacks + trains)
+        css = tool.css_vars()
+        self.assertIn("prefers-reduced-motion:reduce", css)
+        self.assertIn("@keyframes puff{0%{", css)
+
+
+class RecentTrains(Base):
+    """What became of the last trains, from merger.jsonl."""
+
+    RECORDS = [
+        rec("10:00:00", [1, 2, 3, 4, 5], [d("WAIT", 1)],
+            trains=[[1, 2, 3], [4, 5]], train_events=["cut"],
+            held={"2": "stacked on #1"}),
+        rec("10:05:00", [1, 2, 3, 4, 5], [d("WAIT", 1)],
+            trains=[[1, 2, 3], [4, 5]]),
+        rec("10:10:00", [4, 5], [d("MERGE", n, result="done", train=True)
+                                 for n in (1, 2, 3)], trains=[[4, 5]]),
+        # A red train's search: no trains in the record.
+        rec("10:15:00", [4, 5], [d("HAND-BACK", 5, result="done",
+                                   suspect=True, reason="red")]),
+        rec("10:20:00", [6, 7], [d("MERGE", 4, result="done")],
+            trains=[[6, 7]], train_events=["cut"]),
+        rec("10:25:00", [6, 7, 8], [], trains=[[6], [7, 8]],
+            train_events=["main moved", "cut"]),
+        rec("10:30:00", [7, 8], [], trains=[[7, 8]],
+            held={"6": "conflicts with #9, ahead of it in the queue"}),
+        rec("10:35:00", [7, 8], [], trains=[[9]], trains_dry=True),
+    ]
+
+    def flow_of(self):
+        worker = [header("10:11:00", 5, "5", 1, ahead=True)]
+        verdicts = ["2026-11-04T10:14:00Z VERDICT AHEAD #5 5555555555: "
+                    "red(test) waited=0s ran=180s"]
+        return self.flow(worker=worker, verdicts=verdicts,
+                         records=self.RECORDS)
+
+    def test_each_train_and_member(self):
+        got = self.flow_of().recent_trains()
+        self.assertEqual([(t["prs"], t["outcome"]) for t in got], [
+            ([7, 8], "running"), ([6], "re-cut"), ([6, 7], "re-cut"),
+            ([4, 5], "partly merged"), ([1, 2, 3], "merged")])
+        first = got[-1]
+        self.assertEqual(first["carriages"], [[1, 2], [3]])
+        self.assertEqual((first["cut"], first["end"], first["minutes"]),
+                         ("2026-11-04T10:00Z", "2026-11-04T10:10Z", 10))
+        self.assertEqual(first["why"], "all 3 merged in one train merge")
+        second = got[-2]
+        self.assertEqual({k: m["outcome"] for k, m in
+                          second["members"].items()},
+                         {"4": "merged", "5": "culprit"})
+        self.assertEqual(second["members"]["4"]["why"], "merged on its own")
+        self.assertIn("culprit #5", second["why"])
+        self.assertEqual(second["tops"][0]["res"], "red")
+        third = got[2]
+        self.assertEqual(third["members"]["6"]["outcome"], "recut")
+        self.assertIn("default branch moved", third["members"]["6"]["why"])
+        self.assertIn("default branch moved", third["why"])
+        self.assertEqual(got[1]["why"], "every member left")
+        self.assertIn("conflicts with #9", got[1]["members"]["6"]["why"])
+        self.assertEqual(got[0]["members"]["8"]["outcome"], "waiting")
+        self.assertIsNone(got[0]["end"])
+        self.assertEqual([t["prs"] for t in
+                          self.flow_of().recent_trains(2)], [[7, 8], [6]])
+        self.assertEqual(self.flow(records=RECORDS).recent_trains(), [])
+
+    def test_a_tick_that_merges_a_train_does_not_cut_it_again(self):
+        # A record's trains are as cut before its own merges: on
+        # 2026-11-12 #10777 merged and showed as cut a second time.
+        records = [
+            rec("10:22:00", [1, 2], [], trains=[[1], [2]],
+                train_events=["cut"]),
+            rec("10:34:00", [1, 2], [d("MERGE", 1, result="done",
+                                       train=True)], trains=[[1], [2]]),
+            rec("10:34:30", [2, 3], [], trains=[[2], [3]],
+                train_events=["cut"]),
+            rec("10:36:30", [2, 3], [d("MERGE", 2, result="done",
+                                       train=True)], trains=[[2], [3]]),
+            rec("10:37:00", [3], [], trains=[[3]]),
+        ]
+        got = self.flow(records=records).recent_trains()
+        self.assertEqual([(t["prs"], t["outcome"]) for t in got], [
+            ([3], "running"), ([2], "merged"), ([1], "merged")])
+
+    def test_the_page_tells_them(self):
+        data = {"recent_trains": self.flow_of().recent_trains()}
+        html = tool.recent_html(data)
+        self.assertEqual(html.count('<div class="rtrain '), 5)
+        # Each a train: an engine lit by its outcome, coupled carriages
+        # with the top in the guard's van.
+        self.assertEqual(html.count('<svg class="engine"'), 5)
+        self.assertEqual(html.count('class="carriage van"'), 5)
+        for cls, says in (("t-green", "merged: green lamp"),
+                          ("t-partly", "partly merged: amber lamp"),
+                          ("t-wait", "re-cut: lamp unlit"),
+                          ("t-testing", "still running")):
+            self.assertIn('<div class="rtrain %s">' % cls, html)
+            self.assertIn('aria-label="engine, %s' % says, html)
+        self.assertIn(".rtrain .engine .puff{animation:none", tool.css_vars())
+        self.assertIn('<span class="ob o-partly-merged">partly merged'
+                      "</span> cut 2026-11-04T10:00Z", html)
+        self.assertIn("3 PRs in 2 carriages · 10 min to 10:10Z", html)
+        self.assertIn('class="car m-culprit top" title="red on its own',
+                      html)
+        self.assertIn("top run red after 3 min", html)
+        self.assertIn("so far", html)
+        for kind in ("merged", "culprit", "left", "recut", "waiting"):
+            self.assertIn('class="car m-%s lg"' % kind, html)
+        self.assertIn("No train", tool.recent_html({}))
+        page = tool.page(dict(tool.compute(self.flow_of(), "widget"),
+                              repo=None))
+        self.assertLess(page.index("Recent trains"),
+                        page.index("Trains now"))
 
 
 class Main(Base):
@@ -764,6 +1082,31 @@ class Main(Base):
         self.assertEqual(len(asked), 1)
         self.assertIn("from GitHub's first approval",
                       self.read("index.html"))
+
+    def test_github_gives_the_urgent_label(self):
+        config = os.path.join(self.tmp.name, "config.json")
+        conf = example()
+        conf["labels"]["urgent"] = "Urgent"
+        with open(config, "w") as handle:
+            json.dump(conf, handle)
+        asked = []
+
+        def call(url, token, scheme=None, method=None, body=None):
+            asked.append(url)
+            if body is None:
+                return 200, [{"number": 5, "pull_request": {}},
+                             {"number": 6}]
+            return 200, {"data": {"repository": {"p1": {}, "p3": {}}}}
+        env = {"HOME": self.tmp.name, "FORGE_CONFIG": config}
+        self.assertEqual(self.main("--github", call=call, environ=env), 0)
+        self.assertTrue(any("issues?state=open&labels=Urgent" in u
+                            for u in asked))
+        data = json.loads(self.read("flow.json"))
+        self.assertEqual(data["priority"], {"5": {
+            "level": "urgent", "why": "urgent: carries the urgent label"}})
+        self.assertEqual(self.main("--github", call=lambda *a, **k: (
+            502, {}), environ=env), 0)
+        self.assertIn("urgent labels inferred", self.err[-1])
 
     def test_a_github_failure_leaves_github_out(self):
         config = os.path.join(self.tmp.name, "config.json")

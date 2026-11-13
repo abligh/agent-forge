@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -802,6 +803,107 @@ class Tick(StateCase):
         self.assertEqual(self.spawned,
                          [(self.state_dir, SHA_B, 8, False, 1)])
 
+    # Placement: the free slot nearest what is built.
+
+    def worktrees(self, *slots):
+        for slot in slots:
+            wt = os.path.join(self.state_dir, pc.slot_name("wt", slot))
+            os.makedirs(wt, exist_ok=True)
+            pathlib.Path(wt, ".git").write_text("gitdir: /repo\n")
+
+    def differs(self, by_slot, missing=()):
+        """A rule: `git diff --name-only HEAD target` in slot N's
+        worktree lists by_slot[N] paths; a target in `missing` isn't in
+        the object store."""
+        def answer(args):
+            if args[6] in missing:
+                return done(args, 128, "", "bad object")
+            slot = os.path.basename(args[2])
+            n = by_slot[1 if slot == "wt" else int(slot.split("-")[1])]
+            return done(args, 0, "".join("p%d\n" % i for i in range(n)))
+        return (lambda a: a[:1] == ["git"] and "diff" in a, answer)
+
+    def test_the_slot_nearest_the_head_is_used_first(self):
+        self.worktrees(1, 2, 3)
+        self.hold(4, "#9 %s %s" % (SHA_C, pc.iso(T0)))
+        run = FakeRun((is_pulls, done([], 0, heads_tsv(
+            (7, SHA_A, REPO, "false")))), self.differs({1: 40, 2: 3, 3: 9}))
+        spawned = []
+        pc.tick(self.state_dir, "tok", run, lambda *a: spawned.append(a),
+                self.lines.append, when=T0, slots=4)
+        self.assertEqual(spawned, [(self.state_dir, SHA_A, 7, False, 2)])
+        self.assertIn("PLACED #7 aaaaaaaaaa in slot 2, 3 paths from its "
+                      "last build", self.lines)
+        diffs = [c["args"] for c in run.calls if "diff" in c["args"]]
+        self.assertEqual({a[6] for a in diffs}, {SHA_A})
+
+    def test_a_merged_run_and_an_unfetched_head_compare_the_tip(self):
+        self.worktrees(1, 2)
+        tip = "refs/remotes/origin/" + pc.MAIN
+        free, files = pc.nearest_first(
+            self.state_dir, [1, 2], SHA_A, False,
+            FakeRun(self.differs({1: 5, 2: 1}, missing=(SHA_A,))))
+        self.assertEqual((free, files), ([2, 1], 1))
+        run = FakeRun(self.differs({1: 0, 2: 7}))
+        self.assertEqual(pc.nearest_first(self.state_dir, [2, 1], SHA_A,
+                                          True, run), ([1, 2], 0))
+        self.assertEqual({c["args"][6] for c in run.calls}, {tip})
+
+    def test_a_slot_without_a_worktree_goes_last_and_ties_keep_order(self):
+        self.worktrees(2, 3)
+        run = FakeRun(self.differs({2: 4, 3: 4}))
+        self.assertEqual(pc.nearest_first(self.state_dir, [1, 2, 3], SHA_A,
+                                          False, run), ([2, 3, 1], 4))
+        self.assertEqual(pc.nearest_first(self.state_dir, [1, 2], SHA_A,
+                                          False, FakeRun()), ([2, 1], 0))
+
+    def test_nothing_known_keeps_the_order_and_one_slot_asks_nothing(self):
+        run = FakeRun()
+        self.assertEqual(pc.nearest_first(self.state_dir, [1, 2], SHA_A,
+                                          False, run), ([1, 2], None))
+        self.worktrees(1)
+        self.assertEqual(pc.nearest_first(self.state_dir, [1], SHA_A,
+                                          False, run), ([1], None))
+        self.assertEqual(run.calls, [])
+
+    # designs/0053: resolutions in the Merger's resolve slots.
+
+    def merger_resolves(self, slotted=(), queued=()):
+        merger = self.merger_says(None)
+        with open(os.path.join(merger, "next.json"), "w") as handle:
+            json.dump({"at": pc.iso(T0 - datetime.timedelta(minutes=1)),
+                       "pr": None,
+                       "resolve_slotted": [{"pr": p, "head": h}
+                                           for p, h in slotted],
+                       "resolve_queue": [{"pr": p, "head": h}
+                                         for p, h in queued]}, handle)
+        return merger
+
+    def test_a_slotted_resolution_runs_first_and_a_queued_one_not_at_all(self):
+        self.write_state({"waiting": {
+            SHA_A: {"pr": 7, "since": pc.iso(T0 - datetime.timedelta(hours=3))},
+            SHA_B: {"pr": 8, "since": pc.iso(T0 - datetime.timedelta(hours=2))},
+            SHA_C: {"pr": 9, "since": pc.iso(T0 - datetime.timedelta(hours=1))}}})
+        merger = self.merger_resolves(slotted=[(9, SHA_C)],
+                                      queued=[(7, SHA_A)])
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false"),
+                   (9, SHA_C, REPO, "false")], slots=2, merger_dir=merger)
+        self.assertEqual([a[1] for a in self.spawned], [SHA_C, SHA_B])
+        self.assertIn("HELD #7 aaaaaaaaaa: a resolution, waiting for a "
+                      "resolve slot", self.lines)
+        self.assertTrue(any(l.startswith("STARTED #9 cccccccccc")
+                            and "first: it holds a resolve slot" in l
+                            for l in self.lines), self.lines)
+
+    def test_resolutions_are_read_from_a_fresh_next_json(self):
+        merger = self.merger_resolves(slotted=[(9, SHA_C)],
+                                      queued=[(7, SHA_A)])
+        self.assertEqual(pc.merger_resolutions(merger, T0),
+                         ({SHA_C}, {SHA_A}))
+        self.assertEqual(pc.merger_resolutions(
+            merger, T0 + pc.MERGER_FRESH), (set(), set()))
+        self.assertEqual(pc.merger_resolutions(None, T0), (set(), set()))
+
     def test_every_slot_held_starts_nothing(self):
         self.hold(1, "#7 %s %s" % (SHA_A, pc.iso(T0)))
         self.hold(2, "#8 %s %s" % (SHA_B, pc.iso(T0)))
@@ -1473,12 +1575,45 @@ class Worker(StateCase):
 
     def test_a_full_disk_is_a_host_fault(self):
         self.queue()
-        self.assertEqual(self.work(self.faulty(
-            text="error: failed to write: No space left on device (os "
-                 "error 28)\n")), 2)
+        with mock.patch.object(pc, "short_of_space",
+                               return_value="/wt has 3 MB free"):
+            self.assertEqual(self.work(self.faulty(
+                text="error: failed to write: No space left on device (os "
+                     "error 28)\n")), 2)
         self.assertNotIn(SHA_A, self.state().get("results", {}))
         self.assertIn("test: no space left on device", pathlib.Path(
             self.state_dir, "verdicts.log").read_text())
+
+    def test_the_phrase_with_room_on_the_host_is_a_red(self):
+        # agent-forge #343: a docs test printed a document quoting the
+        # phrase, on a disk 33% full, and was taken for a host fault.
+        self.queue()
+        with mock.patch.object(pc, "short_of_space", return_value=None):
+            self.work(self.faulty(text="AssertionError: ... quotes `No "
+                                  "space left on device` ...\n"))
+        self.assertIn(SHA_A, self.state().get("results", {}))
+        logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertIn("NOT-HOST-FAULT #7 aaaaaaaaaa: test: its output says "
+                      "no space left on device, but ", logged)
+        self.assertNotIn("HOST-FAULT #7", logged.replace("NOT-HOST-FAULT", ""))
+
+    def test_short_of_space(self):
+        fs = os.statvfs_result((4096, 4096, 10, 10, 10, 100000, 50000,
+                                50000, 0, 255))
+        with mock.patch.object(pc.os, "statvfs", return_value=fs):
+            self.assertEqual(pc.short_of_space(["/x"]), "/x has 0 MB free")
+        roomy = os.statvfs_result((4096, 4096, 10 ** 9, 10 ** 9, 10 ** 9,
+                                   10 ** 6, 10 ** 6, 10 ** 6, 0, 255))
+        with mock.patch.object(pc.os, "statvfs", return_value=roomy):
+            self.assertIsNone(pc.short_of_space(["/x", "/y"]))
+        few = os.statvfs_result((4096, 4096, 10 ** 9, 10 ** 9, 10 ** 9,
+                                 10 ** 6, 5, 5, 0, 255))
+        with mock.patch.object(pc.os, "statvfs", return_value=few):
+            self.assertEqual(pc.short_of_space(["/x"]), "/x has 5 inodes free")
+        self.assertIn("can't be looked at",
+                      pc.short_of_space(["/no/such/place/at/all"]))
+        self.assertEqual(pc.space_paths("/wt", {"TMPDIR": "/t", "C": "/c"})[:2],
+                         ["/wt", "/t"])
 
     def test_a_missing_command_behind_make_is_a_host_fault(self):
         # agent-forge #31: make exits 2 for a recipe's 127, so only its
@@ -1625,12 +1760,57 @@ class Worker(StateCase):
         pc.worker("/repo", self.state_dir, SHA_A, 7, run, self.lines.append,
                   lambda: next(clock), memory_max="12G")
         prefix = pc.scope_prefix("12G")
-        steps = [c["args"][len(prefix):] for c in run.calls
-                 if c["args"][:len(prefix)] == prefix]
+        unnamed = [[a for a in c["args"] if not a.startswith("--unit=")]
+                   for c in run.calls]
+        steps = [a[len(prefix):] for a in unnamed
+                 if a[:len(prefix)] == prefix]
         self.assertEqual(steps, [["true"], ["make", "fmt-check"],
                                  ["make", "vet"], ["make", "test"],
                                  ["make", "doc-check"]])
         self.assertIn("  each step limited to 12G", self.lines)
+        # agent-forge #263: each step's scope is named, and asked about
+        # once the step ends.
+        units = [a[len("--unit="):] for c in run.calls for a in c["args"]
+                 if a.startswith("--unit=")]
+        self.assertEqual(len(units), 4)
+        self.assertTrue(all(u.startswith("forgestep-make_") or
+                            u.startswith("forgestep-") for u in units))
+        shown = [c["args"][-1] for c in run.calls
+                 if c["args"][:3] == ["systemctl", "--user", "show"]]
+        self.assertEqual(shown, [u + ".scope" for u in units])
+
+    def test_a_scope_left_running_after_its_step_is_stopped(self):
+        calls = []
+
+        def run(args, env=None, timeout=None, **kw):
+            calls.append(args)
+            if args[2] == "show":
+                return subprocess.CompletedProcess(
+                    args, 0, "ActiveState=active\nTasksCurrent=23\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        self.assertEqual(pc.stop_scope("forgestep-x-1", {}, run),
+                         {"tasks": 23})
+        self.assertEqual([a[2] for a in calls], ["show", "kill", "stop"])
+        self.assertIn("--signal=SIGKILL", calls[1])
+
+    def test_a_scope_gone_with_its_step_is_left_alone(self):
+        calls = []
+
+        def run(args, env=None, timeout=None, **kw):
+            calls.append(args)
+            return subprocess.CompletedProcess(
+                args, 0, "ActiveState=inactive\nTasksCurrent=[not set]\n",
+                "")
+        self.assertIsNone(pc.stop_scope("forgestep-x-1", {}, run))
+        self.assertEqual(len(calls), 1)
+
+    def test_a_named_scope_keeps_the_prefix_and_adds_a_unit(self):
+        prefix = pc.scope_prefix("12G")
+        named, unit = pc.named_scope(prefix, "make test/rust")
+        self.assertTrue(unit.startswith("forgestep-make_test_rust-"))
+        self.assertEqual([a for a in named if a != "--unit=" + unit], prefix)
+        self.assertEqual(named[named.index("--unit=" + unit) + 1], "--")
+        self.assertEqual(pc.named_scope([], "x"), ([], None))
 
     def test_no_memory_limit_runs_the_steps_bare(self):
         self.queue()
@@ -2274,6 +2454,22 @@ class Batch(unittest.TestCase):
                                            batch=self.entries[:2]),
                              (SHA_Q, 8), stale)
 
+    def test_relabel_host_makes_a_moved_states_verdicts_count(self):
+        # agent-forge #197: after a move to a new container every earlier
+        # verdict stopped counting, and everything ran again.
+        state_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state_dir)
+        state = empty()
+        state["results"][SHA_Q] = verdict(pr=8, tree=TREE_3, host="old-box")
+        state["results"][SHA_P] = verdict(pr=7, tree=TREE_2, host="other")
+        pc.save(state_dir, state)
+        self.assertIsNone(pc.tested(pc.load(state_dir), TREE_3, T0))
+        self.assertEqual(pc.relabel_host(state_dir, "old-box"), 1)
+        moved = pc.load(state_dir)
+        self.assertEqual(pc.tested(moved, TREE_3, T0), SHA_Q)
+        self.assertEqual(moved["results"][SHA_P]["host"], "other")
+        self.assertEqual(pc.relabel_host(state_dir, "old-box"), 0)
+
     def test_a_top_with_a_verdict_here_is_not_run_again(self):
         state = empty()
         state["results"][SHA_Q] = dict(verdict(pr=8, tree=TREE_3, ok=False),
@@ -2815,6 +3011,129 @@ class TickAhead(Tick):
                              for line in self.lines))
         self.assertTrue(any("STOPPED-SPENT #3 %s" % SHA_Q[:10] in line
                             for line in self.lines))
+
+    def test_a_green_folded_top_stops_the_tops_in_front_of_it(self):
+        # Amendment of 2026-11-11: a later train's green top was folded
+        # with the train in front of it into the Merger's batch; that
+        # train's own top, still running, is spent.
+        merger = self.merger_says(7)
+        write_ahead(merger, [entry(7, SHA_P, TREE_1),
+                             entry(8, SHA_Q, TREE_3)],
+                    when=T0 - datetime.timedelta(minutes=1), batch=2)
+        self.write_state({"waiting": {}, "results": {
+            "e" * 40: verdict(pr=8, tree=TREE_3, ahead=True)}})
+        self.hold(1, "#7 %s %s pid=4242 ahead" % (SHA_P, pc.iso(T0)))
+        stopped = []
+        old = pc.STOP_SPENT
+        pc.STOP_SPENT = True
+        try:
+            pc.tick(self.state_dir, "tok", FakeRun((is_pulls, done(
+                [], 0, heads_tsv()))), lambda *a: None, self.lines.append,
+                when=T0, slots=2, merger_dir=merger,
+                stop=lambda pid: stopped.append(pid) or True)
+        finally:
+            pc.STOP_SPENT = old
+        self.assertEqual(stopped, [4242])
+        self.assertTrue(any("STOPPED-FOLDED #7 %s" % SHA_P[:10] in line
+                            for line in self.lines))
+
+    def test_a_running_top_is_kept_while_the_folded_top_has_no_green(self):
+        merger = self.merger_says(7)
+        write_ahead(merger, [entry(7, SHA_P, TREE_1),
+                             entry(8, SHA_Q, TREE_3)],
+                    when=T0 - datetime.timedelta(minutes=1), batch=2)
+        self.write_state(empty())
+        self.hold(1, "#7 %s %s pid=4242 ahead" % (SHA_P, pc.iso(T0)))
+        stopped = []
+        old = pc.STOP_SPENT
+        pc.STOP_SPENT = True
+        try:
+            pc.tick(self.state_dir, "tok", FakeRun((is_pulls, done(
+                [], 0, heads_tsv()))), lambda *a: None, self.lines.append,
+                when=T0, slots=2, merger_dir=merger,
+                stop=lambda pid: stopped.append(pid) or True)
+        finally:
+            pc.STOP_SPENT = old
+        self.assertNotIn(4242, stopped)
+
+    def reserve(self, n=1):
+        """merge.test_ahead.train_slots (amendment of 2026-11-12)."""
+        patch = mock.patch.object(pc, "TRAIN_SLOTS", n)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_no_slot_is_kept_while_no_prediction_waits_or_runs(self):
+        # Second amendment of 2026-11-12: one train, its top running,
+        # and a slot sat idle for a train that didn't exist.
+        self.reserve()
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
+                  merger_dir=self.merger(entries=()))
+        self.assertEqual(sorted(a[1] for a in self.spawned),
+                         sorted([SHA_A, SHA_B]))
+        self.assertFalse(any(l.startswith("RESERVED") for l in self.lines))
+
+    def test_a_running_top_is_the_slot_kept(self):
+        self.reserve()
+        self.slots = 3
+        self.hold(1, "#2 %s %s ahead" % (SHA_P, pc.iso(T0)))
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")],
+                  merger_dir=self.merger())
+        self.assertEqual(sorted(a[1] for a in self.spawned),
+                         sorted([SHA_A, SHA_B]))
+
+    def test_waiting_predictions(self):
+        state = empty()
+        ahead = [entry(2, SHA_P, TREE_1), entry(3, SHA_Q, TREE_2)]
+        self.assertEqual(pc.waiting_predictions(state, ahead, when=T0), 2)
+        self.assertEqual(pc.waiting_predictions(state, ahead, {SHA_P}, T0),
+                         1)
+        # With a batch, only its top, and the later tops.
+        self.assertEqual(pc.waiting_predictions(state, ahead, (), T0,
+                                                batch=ahead), 1)
+        self.assertEqual(pc.waiting_predictions(
+            state, ahead, (), T0, batch=ahead[:1], later=ahead[1:]), 2)
+        self.assertEqual(pc.waiting_predictions(state, [], (), T0), 0)
+
+    def test_a_train_slot_takes_a_prediction_before_the_mergers_head(self):
+        # The head can't have the slot, so a prediction waiting for it
+        # to start would leave the slot idle.
+        self.reserve()
+        self.hold(1, "#5 %s %s" % (SHA_C, pc.iso(T0)))
+        self.tick([(5, SHA_C, REPO, "false"), (7, SHA_A, REPO, "false")],
+                  merger_dir=self.merger())
+        self.assertEqual(self.spawned,
+                         [(self.state_dir, SHA_P, 2, False, 2, None, True)])
+
+    def test_a_prediction_running_uses_the_train_slot(self):
+        self.reserve()
+        self.hold(1, "#2 %s %s ahead" % (SHA_P, pc.iso(T0)))
+        self.tick([(7, SHA_A, REPO, "false")], merger_dir=self.merger())
+        self.assertEqual(self.spawned, [(self.state_dir, SHA_A, 7, False, 2)])
+
+    def test_the_default_branchs_run_is_not_a_prediction(self):
+        self.assertFalse(pc.is_prediction((0, SHA_C, pc.iso(T0), None, True)))
+        self.assertTrue(pc.is_prediction((2, SHA_P, pc.iso(T0), None, True)))
+        self.assertFalse(pc.is_prediction((7, SHA_A, pc.iso(T0), None,
+                                           False)))
+        self.assertFalse(pc.is_prediction(None))
+
+    def test_no_running_head_is_stopped_for_a_train_slot(self):
+        self.reserve()
+        self.hold(1, "#5 %s %s pid=4242" % (SHA_C, pc.iso(T0)))
+        self.hold(2, "#7 %s %s pid=4343" % (SHA_A, pc.iso(T0)))
+        stopped = []
+        run = FakeRun((is_pulls, done([], 0, heads_tsv(
+            (5, SHA_C, REPO, "false"), (7, SHA_A, REPO, "false")))))
+        pc.tick(self.state_dir, "tok", run, lambda *a: None,
+                self.lines.append, when=T0, slots=2,
+                merger_dir=self.merger(),
+                stop=lambda pid: stopped.append(pid) or True)
+        self.assertEqual(stopped, [])
+
+    def test_without_test_ahead_nothing_is_reserved(self):
+        self.reserve()
+        self.tick([(7, SHA_A, REPO, "false"), (8, SHA_B, REPO, "false")])
+        self.assertEqual(len(self.spawned), 2)
 
     def test_a_prediction_runs_while_the_mergers_head_is_not_waiting(self):
         self.slots = 1  # which goes first, not how many start
@@ -3788,7 +4107,7 @@ class ApprovedFirst(StateCase):
         # isn't waiting yet; one it holds as Blocked-by or stacked must
         # not take the slot ahead of the rest.
         state = self.waiting(**{SHA_A: (1, 120), SHA_B: (2, 60),
-                                SHA_C: (3, 10)})
+                                SHA_C: (3, 40)})
         for sha in (SHA_A, SHA_B, SHA_C):
             state["waiting"][sha]["approved"] = True
         self.assertEqual(pc.next_head(state, when=T0, blocked={1}),
@@ -3816,6 +4135,58 @@ class ApprovedFirst(StateCase):
             json.dump({"at": pc.iso(T0), "pr": 5}, handle)
         self.assertEqual(pc.merger_blocked(merger, T0), set())
         self.assertEqual(pc.merger_blocked(None, T0), set())
+
+    def test_order_merge_puts_unblockers_first_and_held_last(self):
+        # designs/0052: among unapproved heads, overdue or not.
+        state = self.waiting(**{SHA_A: (1, 120), SHA_B: (2, 60),
+                                SHA_C: (3, 40)})
+        with mock.patch.object(pc, "MAX_WAIT",
+                               datetime.timedelta(minutes=30)):
+            self.assertEqual(pc.next_head(state, when=T0, blocked={1},
+                                          unblocks={3}), (SHA_A, 1))
+            with mock.patch.object(pc, "ORDER", "merge"):
+                self.assertEqual(pc.next_head(state, when=T0, blocked={1},
+                                              unblocks={3}), (SHA_C, 3))
+                self.assertEqual(pc.next_head(state, when=T0, blocked={1}),
+                                 (SHA_B, 2))
+                # Not overdue: the same order.
+                self.assertEqual(pc.next_head(
+                    state, when=T0 - datetime.timedelta(hours=3),
+                    blocked={1}, unblocks={3}), (SHA_C, 3))
+
+    def test_unblocks_is_read_from_a_fresh_next_json(self):
+        merger = os.path.join(self.state_dir, "merger")
+        os.makedirs(merger)
+        with open(os.path.join(merger, "next.json"), "w") as handle:
+            json.dump({"at": pc.iso(T0), "pr": 5, "blocked": [6],
+                       "unblocks": [4, True, "8"]}, handle)
+        self.assertEqual(pc.merger_unblocks(merger, T0), {4})
+        self.assertEqual(pc.merger_unblocks(
+            merger, T0 + pc.MERGER_FRESH + datetime.timedelta(seconds=1)),
+            set())
+        self.assertEqual(pc.merger_unblocks(None, T0), set())
+
+    def test_a_pull_request_keeps_its_place_across_a_run(self):
+        # designs/0052 §1: a head that ran (red at the merge, say) and
+        # its rebase keep the pull request's first place.
+        state = {"waiting": {SHA_A: {"pr": 1, "since": pc.iso(T0)}},
+                 "results": {}}
+        pc.keep_pr_places(state, {1}, [SHA_A], T0)
+        del state["waiting"][SHA_A]
+        later = T0 + datetime.timedelta(hours=2)
+        state["waiting"][SHA_B] = {"pr": 1, "since": pc.iso(later)}
+        pc.keep_pr_places(state, {1}, [SHA_B], later)
+        self.assertEqual(state["waiting"][SHA_B]["since"], pc.iso(T0))
+        # Forgotten once closed, or a day after a head of it last waited.
+        pc.keep_pr_places(state, set(), [], later)
+        self.assertEqual(state["pr_since"], {})
+        state["pr_since"] = {"1": {"since": pc.iso(T0), "last": pc.iso(T0)}}
+        state["waiting"] = {SHA_C: {"pr": 1, "since": pc.iso(
+            T0 + datetime.timedelta(days=2))}}
+        pc.keep_pr_places(state, {1}, [SHA_C],
+                          T0 + datetime.timedelta(days=2))
+        self.assertEqual(state["waiting"][SHA_C]["since"],
+                         pc.iso(T0 + datetime.timedelta(days=2)))
 
     def test_urgent_still_goes_before_approved(self):
         state = self.waiting(**{SHA_A: (1, 10), SHA_B: (2, 120)})
@@ -3858,6 +4229,17 @@ class ApprovedFirst(StateCase):
                 return done(args, 1, "", "boom")
             return done(args, 0, "".join(l + "\n" for l in by_pr[pr]))
         return FakeRun((is_reviews, answer))
+
+    def test_an_armed_label_counts_as_approved(self):
+        # A reviewer that approves only on green says so with
+        # labels.armed; its review shouldn't wait behind unreviewed heads.
+        heads = [(1, SHA_A, "o/r", False, "a", ["Review:armed"]),
+                 (2, SHA_B, "o/r", False, "b", ["other"]),
+                 (3, "c" * 40, "o/r", False, "c")]
+        with mock.patch.object(pc, "ARMED_LABEL", "Review:armed"):
+            self.assertEqual(pc.armed_prs(heads), frozenset({1}))
+        with mock.patch.object(pc, "ARMED_LABEL", None):
+            self.assertEqual(pc.armed_prs(heads), frozenset())
 
     def test_only_a_reviewer_agents_approval_counts(self):
         run = self.reviews({1: [self.REVIEWER], 2: ["someone"], 3: []})

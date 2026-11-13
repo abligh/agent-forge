@@ -83,7 +83,10 @@ class QueueTest(unittest.TestCase):
 
     def send(self, job, text):
         self.sent.append((job["agent"], text))
-        return self.refuse.pop(0) if self.refuse else None
+        got = self.refuse.pop(0) if self.refuse else None
+        if isinstance(got, BaseException):
+            raise got
+        return got
 
     def clock(self):
         return self.now
@@ -470,6 +473,37 @@ class Recover(QueueTest):
         st = self.status(ticket)
         self.assertTrue(st["delivered"])
         self.assertEqual(st["deliveries"], 2)
+
+    def test_a_runner_split_by_an_upgrade_leaves_the_message_to_recover(self):
+        # agent-forge #289: a runner that outlived a pin bump retried an
+        # import error for 46 hours.
+        ticket = self.submit("gate", "true")
+        self.refuse = [AttributeError("module 'agent_forge.config' has no "
+                                      "attribute 'DEFAULT_AHEAD_DEPTH'")]
+        self.assertEqual(self.run_ticket(ticket), 0)
+        self.assertEqual(len(self.sent), 1)
+        st = self.status(ticket)
+        self.assertFalse(st["delivered"])
+        self.assertTrue(st["runner_gave_up"])
+        self.assertIn("forge-queue recover", st["delivery_error"])
+        self.assertIn("left to recover", self.lines[-1])
+        self.now = T0 + datetime.timedelta(hours=3)
+        self.cli("recover")
+        self.assertEqual(len(self.sent), 2)
+        self.assertTrue(self.status(ticket)["delivered"])
+
+    def test_a_runner_tries_a_bounded_number_of_times(self):
+        ticket = self.submit("gate", "true")
+        self.refuse = ["relay unreachable"] * (fq.RUNNER_TRIES + 5)
+        self.assertEqual(self.run_ticket(ticket), 0)
+        self.assertEqual(len(self.sent), fq.RUNNER_TRIES)
+        self.assertFalse(self.status(ticket)["delivered"])
+
+    def test_tools_are_loaded_once_per_process(self):
+        fq._TOOLS.pop("forge-merger", None)
+        self.addCleanup(fq._TOOLS.pop, "forge-merger", None)
+        self.assertIs(fq._load_tool("forge-merger"),
+                      fq._load_tool("forge-merger"))
 
     def test_recover_retries_what_a_gone_runner_left(self):
         ticket = self.submit("gate", "true")

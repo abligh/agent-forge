@@ -140,6 +140,26 @@ def is_cache_dir(path):
         return False
 
 
+# What marks Cargo's own home (~/.cargo, $CARGO_HOME). Cargo tags its
+# registry/ and git/ caches with CACHEDIR.TAG, but rustc reads the
+# dependencies' sources there through a whole compile with no lock
+# held, so clearing them breaks running builds. A Cargo home is never
+# a cache to prune, whatever its age or the disk pressure.
+CARGO_HOME_MARKS = (".package-cache", ".global-cache", ".crates.toml")
+
+
+def is_cargo_home(path):
+    """True if `path` is a Cargo home: named `.cargo`, the directory
+    $CARGO_HOME names, or holding Cargo's own lock or index files."""
+    if os.path.basename(path.rstrip("/")) == ".cargo":
+        return True
+    home = os.environ.get("CARGO_HOME")
+    if home and os.path.realpath(home) == os.path.realpath(path):
+        return True
+    return any(os.path.exists(os.path.join(path, m))
+               for m in CARGO_HOME_MARKS)
+
+
 def is_cargo_profile(path):
     """True if `path` is a Cargo profile directory: named `debug` or
     `release`, holding a `.fingerprint` directory or a `.cargo-lock`.
@@ -267,7 +287,7 @@ def target_dirs(proc="/proc"):
 
 def shared_caches(root):
     """The tagged cache directories under `root`, down to CACHE_DEPTH
-    levels and outside any worktree, and leftovers of an interrupted run
+    levels and outside any worktree or Cargo home, and leftovers of an interrupted run
     there. A tagged directory is not searched further: it is one cache.
     A directory of per-kind targets (`.tgt-x/wasm32-wasip1`,
     `.tgt-x/vet-windows`) carries its tags one level down."""
@@ -278,7 +298,7 @@ def shared_caches(root):
         if path.endswith(PRUNING):
             leftovers.append(path)
             names[:] = []
-        elif os.path.exists(os.path.join(path, ".git")):
+        elif os.path.exists(os.path.join(path, ".git")) or is_cargo_home(path):
             names[:] = []
         elif is_cache_dir(path):
             caches.append(path)
