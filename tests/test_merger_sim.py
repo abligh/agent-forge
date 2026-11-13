@@ -42,7 +42,9 @@ class Morning(unittest.TestCase):
         # Every pull request merges but the red one, which is the only
         # one handed back.
         self.assertEqual(got.merged, 15, figures(got))
-        self.assertLessEqual(got.runs / got.merged, 3.0, figures(got))
+        # 3.13 since 2026-11-13: the urgent one rides the next train
+        # rather than cutting them again (it merges at the same minute).
+        self.assertLessEqual(got.runs / got.merged, 3.2, figures(got))
 
     def test_a_restacked_layer_keeps_its_train(self):
         # 2026-11-12: the Merger restacked a train's layer, and the next

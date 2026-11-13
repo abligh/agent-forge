@@ -604,8 +604,10 @@ the members below it are kept with that top (ahead.json's `left_top`;
 tree held each of theirs as the new train does, and a prediction's run
 is never stopped, so once it is green they merge as one train
 (`TRAIN-UNDER-LEFT #a..#b`) without waiting for the new top's run. A
-pull request that is urgent or fixes a red default branch and is in no train
-cuts every train after the first again, and the default branch moving to
+pull request that fixes a red default branch and is in no train cuts
+every train after the first again (one labelled urgent heads the next
+train cut, behind those already cut, 2026-11-13), and the default
+branch moving to
 a tree no train predicted cuts them all (`TRAIN-RECUT: ...`). A red
 top's members are the suspects, as a red batch's, a stack's layers held
 as stacked among them, each where its train had it (`with_suspects`).
@@ -1767,6 +1769,14 @@ def labelled_urgent(pr):
     return bool(URGENT_LABEL) and URGENT_LABEL in [
         (n or {}).get("name") for n in
         ((pr.get("labels") or {}).get("nodes") or [])]
+
+
+def cuts_trains(pr):
+    """Whether `pr` may cut trains already cut: a red nightly's or
+    default branch's fix. One labelled urgent may not: it heads the next
+    train cut, behind those already cut (Alex, 2026-11-13); only a
+    bypass merge goes in front of them."""
+    return pr.get("number") in NIGHTLY_FIXES | MAIN_RED_FIXES
 
 
 def labelled_keep(pr):
@@ -5381,8 +5391,9 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                            "again" % (MAIN, main_tip[:10])))
             prior = []
     first = carriages[0][0] if carriages and carriages[0] else None
-    if prior and first is not None and urgent(first) and first["number"] \
-            not in {e.get("pr") for c in prior[0] for e in c}:
+    if prior and first is not None and cuts_trains(first) and \
+            first["number"] not in {e.get("pr") for c in prior[0]
+                                    for e in c}:
         # The queue put it in front of the first train (a red default
         # branch's fix, say, while that train isn't merging yet): the
         # Merger acts on it first, so every train is cut again.
@@ -5390,7 +5401,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                        "train; every train is cut again" % first["number"]))
         prior = []
     in_prior = {e.get("pr") for t in prior for c in t for e in c}
-    hot = sorted(n for n, pr in by_number.items() if urgent(pr))
+    hot = sorted(n for n, pr in by_number.items() if cuts_trains(pr))
     had = set((last or {}).get("urgent_cut") or ()) if prior else set()
     jump = [n for n in hot if n not in in_prior and n not in had]
     if note is not None:
@@ -8068,14 +8079,15 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             decision = {"action": "WAIT", "pr": pr["number"],
                         "head": pr["headRefOid"], "reason": suspected}
         # Merged on its own, one outside the first train would move the
-        # default branch under that train's started run. An urgent one,
-        # or one the trains are kept through (labels.keep_trains), goes
-        # all the same.
+        # default branch under that train's started run. A red default
+        # branch's or nightly's fix, or one the trains are kept through
+        # (labels.keep_trains), goes all the same; one labelled urgent
+        # waits for its train like any other (2026-11-13).
         ahead_of = train_in_the_way(
             last_ahead if last_ahead is not None else load_json(
                 os.path.join(state_dir, AHEAD_FILE), {}), pr, check_state) \
             if decision["action"] == "MERGE" and TRAINS == "live" \
-            and not train_failed and not urgent(pr) \
+            and not train_failed and not cuts_trains(pr) \
             and not labelled_keep(pr) else None
         if ahead_of:
             decision = {"action": "WAIT", "pr": pr["number"],
