@@ -10245,3 +10245,32 @@ class InstanceMainRed(unittest.TestCase):
                {"number": 4, "title": "y", "body": "Fixes #70"}]
         self.assertEqual(m.red_fixes_of(prs, {7}), frozenset({1, 3}))
         self.assertEqual(m.red_fixes_of(prs, set()), frozenset())
+
+
+class TrainAheadStall(unittest.TestCase):
+    """A head waiting for train 1's run is timed from that run's start,
+    not from when it began waiting: the wait is the train's."""
+
+    START = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                              tzinfo=datetime.timezone.utc)
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp()
+        m.configure(project(stall_run_factor=0))
+        self.addCleanup(m.configure, project())
+
+    def stalled(self, minutes, started):
+        waiting = {"pr": 5, "head": "h" * 40, "action": "WAIT",
+                   "train_top": "t" * 40}
+        check = {"ahead_started": {"t" * 40: started}} if started else {}
+        m.stalled_for(self.state, waiting, self.START, check)
+        return m.stalled_for(
+            self.state, waiting,
+            self.START + datetime.timedelta(minutes=minutes), check)
+
+    def test_timed_from_the_trains_run(self):
+        self.assertIsNone(self.stalled(45, "2026-10-07T12:20:00Z"))
+        self.assertEqual(self.stalled(50, "2026-10-07T12:20:00Z"), 50)
+
+    def test_no_run_start_known_is_timed_as_before(self):
+        self.assertEqual(self.stalled(30, None), 30)
