@@ -125,7 +125,7 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "queued_stall_minutes": int, "read_as": str, "age_first": dict,
          "hand_back_once_per_head": bool, "own_head_green": bool,
          "stall_run_factor": (int, float), "resolve_slots": int,
-         "code_owner_ask": dict}
+         "code_owner_ask": dict, "code_owner_sequence": bool}
 # merge.code_owner_ask (agent-forge #153).
 CODE_OWNER_ASK = {"labels": list, "title": str}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
@@ -689,6 +689,10 @@ def check(data):
             _check_stall_alert(merge["stall_alert"], data["agents"], problems)
         if isinstance(merge.get("code_owner_ask"), dict):
             _check_code_owner_ask(merge, problems)
+        if merge.get("code_owner_sequence") is True and \
+                merge.get("code_owners") is not True:
+            problems.append("merge.code_owner_sequence needs "
+                            "merge.code_owners")
         if merge.get("test_ahead") is True and not isinstance(
                 data.get("checks"), dict):
             problems.append("merge.test_ahead needs checks: the build "

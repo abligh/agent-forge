@@ -935,6 +935,13 @@ STALL_TITLE = DEFAULT_STALL_TITLE
 CODE_OWNER_ASK = None
 DEFAULT_CODE_OWNER_ASK_TITLE = "#{pr} waits for a code owner's approval"
 CODE_OWNER_ASK_NAME = "code-owner-asks.json"
+# merge.code_owner_sequence (agent-forge #264): of the pull requests
+# held for a code owner that change the same lines of an owned path,
+# only the oldest is asked; the rest wait for it.
+CODE_OWNER_SEQUENCE = False
+SEQUENCE_REASON = "waits for #%d: both change %s lines %d-%d, which a " \
+    "code owner must approve; one at a time"
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@", re.M)
 STALL_LABELS = ()
 WAITING_OWNER = DEFAULT_WAITING_OWNER
 # labels.urgent: the label that puts a pull request first, or None.
@@ -1331,7 +1338,8 @@ def configure(project):
         "owner_after_minutes", DEFAULT_STALL_OWNER_AFTER_MINUTES))
     STALL_TITLE = alert.get("title", DEFAULT_STALL_TITLE)
     STALL_LABELS = tuple(alert.get("labels", ()))
-    global CODE_OWNER_ASK
+    global CODE_OWNER_ASK, CODE_OWNER_SEQUENCE
+    CODE_OWNER_SEQUENCE = merge.get("code_owner_sequence", False) is True
     ask = merge.get("code_owner_ask")
     CODE_OWNER_ASK = None if ask is None else (
         ask.get("title", DEFAULT_CODE_OWNER_ASK_TITLE),
@@ -4399,6 +4407,60 @@ def code_owner_wait(repo, pr, rules, main_ref, run=sh, regenerated=None):
         who, paths[0], " and %d more" % more if more else "")
 
 
+def owned_lines(repo, pr, rules, main_ref, run=sh):
+    """{path: [(first, last), ...]}: the default branch's lines each
+    code-owned path `pr` changes since `main_ref` covers (a pure
+    insertion as the line it follows), or None if git can't say."""
+    got = git(repo, "diff", "-U0", "--no-color", "%s...%s"
+              % (main_ref, pr["headRefOid"]), run=run)
+    if got.returncode != 0:
+        return None
+    found, path = {}, None
+    for line in got.stdout.splitlines():
+        if line.startswith("--- "):
+            name = line[4:]
+            path = name[2:] if name.startswith("a/") else None
+        elif line.startswith("+++ ") and path is None:
+            name = line[4:]
+            path = name[2:] if name.startswith("b/") else None
+        elif line.startswith("@@") and path and owners_of(path, rules):
+            m = HUNK_RE.match(line)
+            if m:
+                start, count = int(m.group(1)), int(m.group(2) or 1)
+                found.setdefault(path, []).append(
+                    (start, start + max(count, 1) - 1))
+    return found
+
+
+def sequence_owned(repo, prs, waits, rules, main_ref, run=sh):
+    """merge.code_owner_sequence (agent-forge #264): {number: (head,
+    why)} for each pull request held for a code owner (`waits`) that
+    changes lines of an owned path an older such pull request also
+    changes. It waits for the oldest, so the owner is asked once."""
+    by_number = {pr["number"]: pr for pr in prs}
+    held = sorted(n for n, (_head, why) in waits.items() if why)
+    lines = {}
+    for number in held:
+        lines[number] = owned_lines(repo, by_number[number], rules,
+                                    main_ref, run) or {}
+    out = {}
+    for i, number in enumerate(held):
+        for older in held[:i]:
+            if older in out:
+                continue
+            clash = [(path, max(a, c), min(b, d))
+                     for path, ranges in sorted(lines[number].items())
+                     for a, b in ranges
+                     for c, d in lines[older].get(path, ())
+                     if a <= d and c <= b]
+            if clash:
+                path, first, last = clash[0]
+                out[number] = (waits[number][0],
+                               SEQUENCE_REASON % (older, path, first, last))
+                break
+    return out
+
+
 def conflicts_with(repo, head, queue, run=sh):
     """The pull requests in `queue` whose heads conflict with `head`.
     A comparison git can't make holds nothing."""
@@ -7183,6 +7245,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
+        if CODE_OWNER_SEQUENCE:
+            for number, (head, why) in sequence_owned(
+                    repo, prs, owner_waits, rules, main_tip, run).items():
+                held[str(number)] = why
+                owner_waits[number] = (head, None)
         if live and CODE_OWNER_ASK:
             code_owner_asks(state_dir, github, owner_waits,
                             {p["number"]: p["headRefOid"] for p in prs}, out)
