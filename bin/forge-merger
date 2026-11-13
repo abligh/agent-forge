@@ -6243,6 +6243,20 @@ def boarded_layers(last):
                  and e.get("carriage") != e["pr"])}
 
 
+def boarded_now(said_trains):
+    """{number: head} of the pull requests aboard a train that stay
+    candidates without a green of their own: stack layers, unless
+    merge.test_ahead.layers_need_own_green, and with own_green_to_board
+    false any member. The keys are numbers, so the two are joined with
+    `|`, not `dict(..., **aboard)`, which takes only string keys."""
+    aboard = {} if LAYERS_OWN_GREEN else boarded_layers(said_trains)
+    if not OWN_GREEN_TO_BOARD:
+        # merge.test_ahead.own_green_to_board false: so does any pull
+        # request that boarded without its own green.
+        aboard = boarded_members(said_trains) | aboard
+    return aboard
+
+
 def boarded_members(last):
     """{number: head} of every member of the trains in `last`
     (ahead.json), for merge.test_ahead.own_green_to_board false: one
@@ -7427,11 +7441,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # boarded a train is tested by its top, and stays a candidate
         # without a green of its own once its base has merged.
         said_trains = load_json(os.path.join(state_dir, AHEAD_FILE), {})
-        aboard = {} if LAYERS_OWN_GREEN else boarded_layers(said_trains)
-        if not OWN_GREEN_TO_BOARD:
-            # merge.test_ahead.own_green_to_board false: so does any
-            # pull request that boarded without its own green.
-            aboard = dict(boarded_members(said_trains), **aboard)
+        aboard = boarded_now(said_trains)
         for pr in list(candidates):
             if pr["number"] in aboard:
                 # The walk back to the head it boarded with reads the
