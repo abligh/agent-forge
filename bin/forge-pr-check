@@ -2580,7 +2580,7 @@ def lane_head(state, cheap, busy=(), when=None):
 
 
 def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
-              urgent=False, blocked=(), queued=(), unblocks=()):
+              urgent=False, blocked=(), queued=(), unblocks=(), slotted=()):
     """(sha, pr) of the head that has waited longest, or None. A head
     that failed to prepare goes behind every head that has not; one
     whose run the host broke keeps its place, since the fault was not
@@ -2614,7 +2614,11 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
     With checks.order "merge" (designs/0052), among the other heads,
     overdue ones and the rest alike, those of pull requests in
     `unblocks` (what the Merger's held ones wait on) go first and those
-    in `blocked` last."""
+    in `blocked` last.
+
+    A head in `slotted`, a resolution holding one of the Merger's resolve
+    slots (designs/0053), goes with the approved heads, approved or not:
+    the slot is there to check it."""
     waiting = state["waiting"]
 
     def merge_first(s):
@@ -2651,7 +2655,8 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
     # checks.approved_first: a reviewer has approved its pull request,
     # so it is near merging. The Merger's own goes first among them.
     ready = [s for s in heads
-             if waiting[s].get("approved") and not waiting[s].get("errors")]
+             if (waiting[s].get("approved") or s in slotted)
+             and not waiting[s].get("errors")]
     if ready:
         sha = min(ready, key=lambda s: (waiting[s]["pr"] != first_pr,
                                         waiting[s]["pr"] not in queued,
@@ -2711,6 +2716,26 @@ def merger_blocked(merger_dir, when):
                 if isinstance(pr, int) and not isinstance(pr, bool)}
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return set()
+
+
+def merger_resolutions(merger_dir, when):
+    """designs/0053: (slotted, queued), the heads of the resolutions the
+    Merger has given a resolve slot and of those waiting for one, from
+    its next.json's `resolve_slotted` and `resolve_queue`; two empty
+    sets when there are none, it can't be read, or it is older than
+    MERGER_FRESH, and the order is then as without slots."""
+    if not merger_dir:
+        return set(), set()
+    try:
+        with open(os.path.join(merger_dir, "next.json")) as handle:
+            said = json.load(handle)
+        if when - parse(said["at"]) > MERGER_FRESH:
+            return set(), set()
+        return tuple({e["head"] for e in said.get(key) or []
+                      if isinstance(e, dict) and isinstance(e.get("head"), str)}
+                     for key in ("resolve_slotted", "resolve_queue"))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return set(), set()
 
 
 def merger_unblocks(merger_dir, when):
@@ -4362,6 +4387,9 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         if APPROVED_FIRST or ORDER == "merge" else set()
     unblocks = merger_unblocks(merger_dir, when) if ORDER == "merge" \
         else set()
+    # designs/0053: resolutions in a resolve slot run with the approved
+    # heads; those waiting for one don't run.
+    slotted, slot_queued = merger_resolutions(merger_dir, when)
     predicted_prs = {e["pr"] for e in ahead} if APPROVED_FIRST else set()
     # merge.test_ahead.train_slots (amendment of 2026-11-12): only the
     # Merger's predictions may run in the reserved slots, so the heads'
@@ -4444,13 +4472,15 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                                       later_all)) if reserve else 0
             own_full = own_running >= slots - kept
             if free and not own_full:
-                pick = next_head(state, taken | set(held), first_pr, when,
-                                 cheap, urgent, blocked, predicted_prs,
-                                 unblocks) \
-                    if fresh else next_head(state, taken, first_pr, when,
-                                            cheap, blocked=blocked,
+                pick = next_head(state, taken | set(held) | slot_queued,
+                                 first_pr, when, cheap, urgent, blocked,
+                                 predicted_prs, unblocks, slotted) \
+                    if fresh else next_head(state, taken | slot_queued,
+                                            first_pr, when, cheap,
+                                            blocked=blocked,
                                             queued=predicted_prs,
-                                            unblocks=unblocks)
+                                            unblocks=unblocks,
+                                            slotted=slotted)
             if free:
                 if TEST_AHEAD:
                     forget_ahead(state, ahead)
@@ -4508,6 +4538,10 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             for sha in sorted(held, key=lambda s: order(state["waiting"], s)):
                 out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
                                          held[sha]))
+            for sha in sorted(slot_queued & set(state["waiting"]),
+                              key=lambda s: order(state["waiting"], s)):
+                out("HELD #%d %s: a resolution, waiting for a resolve slot"
+                    % (state["waiting"][sha]["pr"], sha[:10]))
             for sha in sorted(twins, key=lambda s: order(state["waiting"], s)):
                 out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
                                          twins[sha]))
@@ -4593,6 +4627,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                ", first: the Merger waits on it" if pr == first_pr else
                ", first: it is approved"
                if state["waiting"].get(sha, {}).get("approved") else
+               ", first: it holds a resolve slot" if sha in slotted else
                ", first: approved pull requests wait on it"
                if pr in unblocks else
                ", first: it has waited %d minutes"
