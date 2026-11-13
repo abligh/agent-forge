@@ -246,7 +246,7 @@ FRESH = {"wait_minutes": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool,
         "version": list, "reads_base": bool, "outputs": list,
         "after": list, "alone": bool, "light": bool, "caches": dict,
-        "pull_requests": dict, "env_file": str}
+        "pull_requests": dict, "env_file": str, "timeout_minutes": int}
 # checks.tracer's values (docs/designs/0005).
 TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.
@@ -1180,6 +1180,9 @@ def _check_checks(checks, data, problems, where="checks"):
                 continue
             if "name" not in step:
                 problems.append("%s: missing 'name'" % at)
+            if _is(step.get("timeout_minutes"), int) and \
+                    step["timeout_minutes"] < 1:
+                problems.append("%s.timeout_minutes must be at least 1" % at)
             run = step.get("run")
             if not (isinstance(run, list) and run
                     and all(isinstance(a, str) for a in run)):

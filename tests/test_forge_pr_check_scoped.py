@@ -189,6 +189,32 @@ class Budget(unittest.TestCase):
         self.assertNotIn("over_budget", results[0])
 
 
+    def test_a_steps_own_timeout_stands_for_it_alone(self):
+        seen = {}
+
+        def run(args, cwd=None, env=None, timeout=None):
+            seen[args[0]] = timeout
+            return done(args)
+        with mock.patch.object(pc, "STEP_TIMEOUT_S", 1800), \
+                mock.patch.object(pc, "STEP_TIMEOUTS", {"slow": 2700}):
+            pc.check(self.wt, {}, run, steps=[("slow", ["slow"], None),
+                                              ("fast", ["fast"], None)])
+        self.assertEqual(seen, {"slow": 2700, "fast": 1800})
+
+    def test_step_timeout_minutes_is_configured_and_checked(self):
+        from agent_forge import config
+        from tests.helpers import example
+        data = example()
+        data["checks"] = {"steps": [
+            {"name": "slow", "run": ["x"], "timeout_minutes": 45},
+            {"name": "fast", "run": ["y"]}]}
+        pc.configure(config.Project(data, None))
+        self.addCleanup(pc.configure, config.Project(example(), None))
+        self.assertEqual(pc.STEP_TIMEOUTS, {"slow": 2700})
+        data["checks"]["steps"][0]["timeout_minutes"] = 0
+        self.assertIn("checks.steps[0].timeout_minutes must be at least 1",
+                      config.check(data))
+
 class ScopedCase(RepoCase):
     """A fast step and a slow one scoped to corpus/*, each writing its
     name to `order` as it runs."""
