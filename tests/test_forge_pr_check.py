@@ -1474,12 +1474,45 @@ class Worker(StateCase):
 
     def test_a_full_disk_is_a_host_fault(self):
         self.queue()
-        self.assertEqual(self.work(self.faulty(
-            text="error: failed to write: No space left on device (os "
-                 "error 28)\n")), 2)
+        with mock.patch.object(pc, "short_of_space",
+                               return_value="/wt has 3 MB free"):
+            self.assertEqual(self.work(self.faulty(
+                text="error: failed to write: No space left on device (os "
+                     "error 28)\n")), 2)
         self.assertNotIn(SHA_A, self.state().get("results", {}))
         self.assertIn("test: no space left on device", pathlib.Path(
             self.state_dir, "verdicts.log").read_text())
+
+    def test_the_phrase_with_room_on_the_host_is_a_red(self):
+        # agent-forge #343: a docs test printed a document quoting the
+        # phrase, on a disk 33% full, and was taken for a host fault.
+        self.queue()
+        with mock.patch.object(pc, "short_of_space", return_value=None):
+            self.work(self.faulty(text="AssertionError: ... quotes `No "
+                                  "space left on device` ...\n"))
+        self.assertIn(SHA_A, self.state().get("results", {}))
+        logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertIn("NOT-HOST-FAULT #7 aaaaaaaaaa: test: its output says "
+                      "no space left on device, but ", logged)
+        self.assertNotIn("HOST-FAULT #7", logged.replace("NOT-HOST-FAULT", ""))
+
+    def test_short_of_space(self):
+        fs = os.statvfs_result((4096, 4096, 10, 10, 10, 100000, 50000,
+                                50000, 0, 255))
+        with mock.patch.object(pc.os, "statvfs", return_value=fs):
+            self.assertEqual(pc.short_of_space(["/x"]), "/x has 0 MB free")
+        roomy = os.statvfs_result((4096, 4096, 10 ** 9, 10 ** 9, 10 ** 9,
+                                   10 ** 6, 10 ** 6, 10 ** 6, 0, 255))
+        with mock.patch.object(pc.os, "statvfs", return_value=roomy):
+            self.assertIsNone(pc.short_of_space(["/x", "/y"]))
+        few = os.statvfs_result((4096, 4096, 10 ** 9, 10 ** 9, 10 ** 9,
+                                 10 ** 6, 5, 5, 0, 255))
+        with mock.patch.object(pc.os, "statvfs", return_value=few):
+            self.assertEqual(pc.short_of_space(["/x"]), "/x has 5 inodes free")
+        self.assertIn("can't be looked at",
+                      pc.short_of_space(["/no/such/place/at/all"]))
+        self.assertEqual(pc.space_paths("/wt", {"TMPDIR": "/t", "C": "/c"})[:2],
+                         ["/wt", "/t"])
 
     def test_a_missing_command_behind_make_is_a_host_fault(self):
         # agent-forge #31: make exits 2 for a recipe's 127, so only its
