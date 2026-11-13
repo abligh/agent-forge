@@ -6013,6 +6013,26 @@ class ResolveSlots(RepoCase):
         self.assertEqual((record["resolving"], record["resolve_queue"]),
                          ([7], [6]))
 
+    def test_with_push_progress_restarts_a_slots_clock(self):
+        # agent-forge #372: a green check on its head is progress, so the
+        # slot runs out resolve_slot_minutes after it, not after the push.
+        self.configure(resolve_slot_on="push", resolve_slot_minutes=30)
+        prs = self.conflicting(6, 7)
+        self.tick(prs, live=True)
+        six = self.resolved(6, "2026-10-07T10:00:00Z")
+        seven = self.resolved(7, "2026-10-07T11:00:00Z")
+        self.tick([six, seven], live=True, minutes=1)
+        green = {"results": {six["headRefOid"]: {"ok": True}}}
+        self.tick([six, seven], live=True, minutes=20, check_state=green)
+        record, lines = self.tick([six, seven], live=True, minutes=31,
+                                  check_state=green)
+        self.assertEqual(record["resolving"], [6])
+        self.assertFalse([l for l in lines if "RESOLVE-EXPIRED" in l])
+        record, lines = self.tick([six, seven], live=True, minutes=50,
+                                  check_state=green)
+        self.assertEqual((record["resolving"], record["resolve_queue"]),
+                         ([7], [6]))
+
     def test_with_push_a_head_still_conflicting_is_no_resolution(self):
         self.configure(resolve_slot_on="push")
         six, = self.conflicting(6)

@@ -611,7 +611,9 @@ resolution's head with the approved heads, approved or not, and runs
 no queued one (`HELD #n ...: a resolution, waiting for a resolve
 slot`). A slot frees when its pull request is a candidate again,
 merges or closes, or conflicts again, or, with `resolve_slot_minutes`,
-that long after it was given or its head last moved. The tick prints
+that long after it was given, its head last moved, or it last made
+progress: a green build check on its head, or a newer approval
+(agent-forge #372). The tick prints
 `RESOLVE-SLOTS: #a checking; #b #c queued`, and the record says
 `resolving` and `resolve_queue`.
 
