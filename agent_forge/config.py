@@ -126,7 +126,8 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "hand_back_once_per_head": bool, "own_head_green": bool,
          "stall_run_factor": (int, float), "resolve_slots": int,
          "resolve_slot_minutes": (int, float), "resolve_slot_on": str,
-         "mode": str, "code_owner_ask": dict, "code_owner_sequence": bool}
+         "mode": str, "code_owner_ask": dict, "code_owner_sequence": bool,
+         "approval": str}
 # merge.code_owner_ask (agent-forge #153).
 CODE_OWNER_ASK = {"labels": list, "title": str}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
@@ -688,6 +689,12 @@ def check(data):
         if isinstance(merge.get("mode"), str) and \
                 merge["mode"] not in ("auto", "manual"):
             problems.append("merge.mode must be auto or manual")
+        if isinstance(merge.get("approval"), str):
+            if merge["approval"] not in ("reviewer", "green"):
+                problems.append("merge.approval must be reviewer or green")
+            elif merge["approval"] == "green" \
+                    and merge.get("own_head_green") is False:
+                problems.append("merge.approval green needs own_head_green")
         name = merge.get("merger")
         if isinstance(name, str) and name not in data.get("machinery", {}):
             problems.append("merge.merger %r is not in machinery" % name)
