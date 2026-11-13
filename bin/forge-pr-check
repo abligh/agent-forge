@@ -60,8 +60,13 @@ or 127 (its command can't be run: a tool missing from the host's
 (make's `*** [...] Error 127`, or a shell's `...: not found` line),
 whose output says the container runtime could not start a container
 (docker's `OCI runtime create failed` or `failed to create shim task`),
-or whose output says `No space left on device` (or `ENOSPC`) failed for
-the host, not the head. Such a run records no
+or whose output says `No space left on device` (or `ENOSPC`) while a
+file system the run writes to (its worktree, `TMPDIR`, its caches) is
+short of room (ROOM_MIN_BYTES or ROOM_MIN_INODES) failed for the host,
+not the head. When every one has room, the phrase is a quotation (a
+test or a document that prints it), the step is red as usual, and
+`verdicts.log` says `NOT-HOST-FAULT` with the room each has
+(agent-forge #343). Such a run records no
 verdict and posts nothing more: the head stays waiting, `pending`, its
 faults counted (`faults`, apart from a checkout's `errors`), and
 `verdicts.log` says `HOST-FAULT` with the step and why. It keeps its
@@ -3881,13 +3886,68 @@ UNSTARTABLE = re.compile(
     r"^.*(?:OCI runtime create failed|failed to create shim task).*$", re.M)
 
 
-def host_fault(results):
+# The least room, in bytes and in inodes, a file system the run writes to
+# must have for "No space left on device" in a step's output to be
+# believed rather than taken for a quotation (agent-forge #343).
+ROOM_MIN_BYTES = 1 << 30
+ROOM_MIN_INODES = 10000
+
+
+def short_of_space(paths):
+    """A description of the first of `paths` whose file system is short
+    of room (ROOM_MIN_BYTES or ROOM_MIN_INODES), or None if all have
+    room. A path that can't be looked at counts as short, so a doubt
+    keeps the old reading: the host's fault."""
+    for path in paths:
+        try:
+            fs = os.statvfs(path)
+        except OSError as err:
+            return "%s can't be looked at (%s)" % (path, err.strerror)
+        if fs.f_bavail * fs.f_frsize < ROOM_MIN_BYTES:
+            return "%s has %d MB free" % (
+                path, fs.f_bavail * fs.f_frsize >> 20)
+        if fs.f_files and fs.f_favail < ROOM_MIN_INODES:
+            return "%s has %d inodes free" % (path, fs.f_favail)
+    return None
+
+
+def room_report(paths):
+    """What room each of `paths` has, for the log."""
+    said = []
+    for path in paths:
+        try:
+            fs = os.statvfs(path)
+            said.append("%s has %.1f GB free" % (
+                path, fs.f_bavail * fs.f_frsize / 1e9))
+        except OSError:
+            pass
+    return "; ".join(said) or "the host has room"
+
+
+def space_paths(wt, env):
+    """The file systems a run writes to: its worktree, its TMPDIR and its
+    slot's caches (`checks.caches`)."""
+    paths = [wt, env.get("TMPDIR") or tempfile.gettempdir()]
+    paths += [env[k] for k in CACHES if env.get(k)]
+    seen = []
+    for path in paths:
+        if path and path not in seen:
+            seen.append(path)
+    return seen
+
+
+def host_fault(results, paths=()):
     """(step, why) for the first failed step the host broke, or None:
     one that exited 126 or 127, so its command could not be run, or
     whose output says so for a command behind it (make's "Error 127",
     the shell's "not found"), or says a container could not be started
     (docker's "OCI runtime create failed"), or says the disk is full,
-    or holds one of checks.host_fault_text, which `why` quotes."""
+    or holds one of checks.host_fault_text, which `why` quotes.
+
+    The disk-full text counts only when one of `paths` (the file
+    systems the run writes to) is short of room; when every one has
+    room the step is red as usual, and the result's `not_host_fault`
+    says why (agent-forge #343). With no `paths` it counts as before."""
     for r in results:
         if r["rc"] == 0:
             continue
@@ -3903,7 +3963,14 @@ def host_fault(results):
                 json.dumps(unstartable.group(0).strip()[:300],
                            ensure_ascii=False))
         if any(text in r["tail"] for text in HOST_FAULT_TEXT):
-            return r["name"], "no space left on device"
+            short = short_of_space(paths) if paths else "unchecked"
+            if short:
+                return r["name"], "no space left on device"
+            # The output quotes the phrase, but every file system the
+            # step writes to has room: a test or a document that prints
+            # it, not a full disk (agent-forge #343). The step is red.
+            r["not_host_fault"] = "its output says no space left on " \
+                "device, but %s" % room_report(paths)
         for text in HOST_FAULT_EXTRA:
             if text in r["tail"]:
                 return r["name"], "its output says %s" % json.dumps(
@@ -7156,7 +7223,12 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                        RESULTS_MAX), finished, out)
         if not any(r.get("results_bytes") for r in results):
             shutil.rmtree(kept, ignore_errors=True)
-        fault = host_fault(results)
+        fault = host_fault(results, space_paths(wt, env))
+        for r in results:
+            if r.get("not_host_fault"):
+                log(state_dir, "NOT-HOST-FAULT%s %s %s: %s: %s" % (
+                    " AHEAD" if ahead else "", name, sha[:10], r["name"],
+                    r.pop("not_host_fault")), finished, out)
         if fault is not None:
             errors = count_error(state_dir, sha, ahead, "faults")
             why = "%s: %s" % fault
