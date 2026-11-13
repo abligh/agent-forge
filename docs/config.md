@@ -62,7 +62,7 @@ starts with `_` is a comment, at any level.
 | `checks` | no | The build check, `forge-pr-check`; see below. |
 | `labels` | no | The labels tools read: `owner_prefix` (default `Owner:`; `Owner:<Name>` says whose an item is), `status_prefix` (default `Status:`), `waiting_on_owner` (default `Status:waiting-owner`: the owner's turn), `waiting_external` (default `Status:waiting-external`: nobody's) and `urgent` (default none: off), a label that puts a pull request first: its waiting head is checked before every other pull request's (before `first_authors` and `max_wait_minutes`; a head that failed to prepare still goes behind, and the default branch's traced run still goes first when due), and the Merger takes it before every other candidate but the one a run is in flight for and, with `merge.test_ahead`, those already predicted. Several urgent ones go oldest first. A label anyone with triage access can set, so it is for a person to use sparingly, not agents. `rerun` (default none: off), a label that runs a red head once more ([designs/0022](designs/0022-run-a-red-head-again.md)): on a posting tick, `forge-pr-check` moves the head's red verdict into `reruns` in its state (with who put the label on, from the pull request's events, and when), queues the head as if new, takes the label off, logs `RERUN #<pr> <sha>: was red(<steps>); queued by <login>` and posts pending. The second verdict stands and its description says `(run again after red(<steps>))`. A pull request's green head is run again too, once, the same way, so that a flake in the Merger's batch can be lifted ([designs/0044](designs/0044-a-quieter-merger-and-batches-that-keep-their-order.md), amendment): that run is forced, neither matched nor covered and reusing no step, since its tree is green here already, posts pending as `queued again after a green, by <login>`, and its verdict says `(run again after green)`. On a head already run again, the label comes off with a comment saying so; on a pending or unrun head, or the default branch's green head, it just comes off. On a head given up on after `MAX_ERRORS` failures to prepare it or host faults, it clears those counts so the head is tried again in its place, logs `RERUN #<pr> <sha>: given up after <why>; queued again by <login>` and posts pending; that doesn't use up the head's one run again. Anyone with triage access can set it; once per head bounds what it costs. The poster's App needs `issues: write`. The default branch's red head, which has no pull request, is run again the same way, once, by the label on the open `checks.main_red_issue` issue; the label comes off the issue. Each instance (`checks.instances`) acts on it too, for its own context: while another of the project's contexts is red on the head, a head red here is run again but the label stays on, for the instance whose red that is, and one with nothing of its own to run again is left alone; an instance never takes the label off a head it has no red for. So one label runs every red context on the head again. `armed` (default none: off), a label a reviewer agent puts on a pull request it has reviewed and will approve once its check is green (an approval "armed"), and takes off when the approval posts or the head changes: with `checks.approved_first`, `forge-pr-check` counts it as approved, so the reviewed pull request's head is checked before unreviewed ones'. It only orders; the Merger still needs the approval itself. `keep_trains` (default none: off), a label for a pull request whose merge should not cut the trains again, such as a pin or a configuration change (amendment of 2026-11-12, tenth): while the default branch has moved since the trains were cut only by merges of pull requests carrying it (looked up once per commit and kept in `keep.json` in the Merger's state directory; at most 10 such commits), and the last train's top still merges with the default branch cleanly, `forge-merger` keeps the trains predicted on their base, so their runs go on and `forge-pr-check` stops none of them as spent. `ahead.json` then says `base`, the trains' base, and `main`, the default branch's tip, and the log says `TRAIN-KEPT` once. A green train merges its tested chain with one more commit on top, a merge of the default branch, given that it merges cleanly (else the members merge on their own, as when GitHub refuses a train); the tree that goes in is then the tested one plus only the labelled commits, unbuilt together. The trains behind a train merged so stay on its chain. Any other commit, or a conflict (`TRAIN-KEEP`), cuts every train again, as before. A label for a person to use, like `urgent`. |
 | `relay` | no | Where `forge-router` posts wakes, `forge-merger` its stall messages (`merge.stall_alert`), `forge-queue` its end-of-job messages and `forge-stats-watch` its `notify` messages: `url`, the xmpp-webhook-relay's base (default `http://127.0.0.1:8788`), `token_file`, its environment file holding `WEBHOOK_TOKEN` (default `~/.config/xmpp-webhook-relay/token`), `remind_seconds`, how long before a turn is woken again (default 7200), and `room`, the room the agents share. |
-| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, `merge_notice` their merge notice, `stuck` their rules for stuck pull requests, `owners` their reading of whose an issue is, `unreviewed` their issue for paths no reviewer covers, `red_first` their putting red builds first, and `nightly_wake` their waking issues that wait for a nightly when one goes green (all below). `forget_minutes`, the engine's, is how long a turn no run decides is kept before it is forgotten (default 0: at once; below). `quiet_labels` lists labels that make an item nobody's turn under every default rule (below). `issue_blocked_by` says where an issue's `Blocked-by:` lines may be (default `"body"`; below). Every key is checked. |
+| `router` | no | How `forge-router` decides whose turn an item is: `rules`, the rules module (default `"default"`, the rules in `agent_forge/rules_default.py`), or a Python file in the project's own repository, by its path from the root, read from the cron checkout so it is reviewed there. docs/router.md is what a rules module provides. `idle_offer` turns on the default rules' idle offer, `merge_notice` their merge notice, `stuck` their rules for stuck pull requests, `owners` their reading of whose an issue is, `unreviewed` their issue for paths no reviewer covers, `red_first` their putting red builds first, and `nightly_wake` their waking issues that wait for a nightly when one goes green (all below). `forget_minutes`, the engine's, is how long a turn no run decides is kept before it is forgotten (default 0: at once; below). `quiet_labels` lists labels that make an item nobody's turn under every default rule (below). `issue_blocked_by` says where an issue's `Blocked-by:` lines may be (default `"body"`; below). `escalate` tells a person when an agent can't be reached (default none: off; below). Every key is checked. |
 | `closing_keywords` | no | How `forge-closing-keywords` words a refusal: `enforced_by`, what refuses a pull request it fails (default `the Merger`), and `rerun`, how to run it again once GitHub's `closingIssuesReferences` catches up with a body edit (default `run the check again (the Merger does, within a few minutes)`). A project that runs it in CI names its workflow and `gh run rerun --failed <run>`. The issues it judges are `repo`'s, and its default range starts at `default_branch`. The Merger runs it as a gate: `["forge-closing-keywords", "--pr", "{pr}", "--include-subject"]`. |
 
 ### An agent
@@ -1130,6 +1130,44 @@ reminded while it is undecided. An `--only` run then forgets nothing.
 Each recorded turn keeps `decided_at` in `state.json`; one recorded
 before has its `woken_at` used. An integer, at least 0; 0, the
 default, forgets at once. docs/router.md has the detail.
+
+### `router.escalate`
+
+[designs/0049](designs/0049-the-router-tells-a-person-when-an-agent-cannot-be-reached.md):
+the router tells a person when an agent can't be reached. Off until
+set. `{"after_reminders": 4, "undelivered_minutes": 120, "label":
+..., "to": ...}`; at least one of the first two.
+
+* `after_reminders` (at least 1; none: off): a turn decision (not a
+  notice or a relook) whose delivered reminders, to any of the agent's
+  sessions, reach it while it is still decided escalates for its
+  agent. A `ONCE` turn never does.
+* `undelivered_minutes` (at least 30; 60 or more advised, since a
+  session restart leaves an agent out of the room for some minutes;
+  none: off): an agent every wake to whom has gone undelivered that
+  long escalates, unless she has `away` set. The first run that
+  refused her records `undelivered_since` in `escalate.json` in the
+  router's state directory; a delivered wake clears it. A run whose
+  relay didn't answer, or that refused every one of two or more agents
+  with wakes due, is the relay's fault instead (`relay_down_since`):
+  after the same minutes one issue opens for the relay, and no agent's
+  time is set by that run.
+* `label` (default `labels.waiting_on_owner`): the issue's label,
+  beside `<labels.owner_prefix><agent>` (none on the relay's).
+* `to` (default none): a login the issue's body mentions. Nobody is
+  ever assigned.
+
+One issue per agent, opened as the Merger's App: `forge-router: <agent>
+hasn't taken up #N` or `forge-router: <agent> can't be reached`, as
+the first trigger was. Each later trigger comments once. It closes
+itself, with a comment and its label taken off, once no trigger
+remains: the agent took a wake and none of her turns is reminded past
+the limit. One closed by a person is answered: the same trigger
+doesn't reopen it, and a new one opens a new issue. Only a sending run
+that isn't `--only`'s or `--seed`'s escalates; a dry run prints
+`WOULD ESCALATE <agent>: <why>`. A refused GitHub write is printed,
+journalled in `wakes.jsonl` as a `run` record, and tried again next
+run. Logged `ESCALATE`, `ESCALATE-CLOSED`, `ESCALATE-ANSWERED`.
 
 ### `router.issue_blocked_by`
 

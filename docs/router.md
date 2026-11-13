@@ -64,7 +64,13 @@ The engine runs one pass:
    withheld or surfaced, once); the journal for every wake sent,
    failed, withheld, withdrawn or surfaced; and every decision the run
    made, for the next run's rules (`previous.json`, below).
-7. **Once a run.** The module's `each_run` actions, on a sending run
+7. **Escalate.** With `router.escalate` ([designs/0049](designs/0049-the-router-tells-a-person-when-an-agent-cannot-be-reached.md)),
+   on a sending run that isn't `--only`'s or `--seed`'s: one issue per
+   agent whose turn was reminded `after_reminders` times and is still
+   decided, or whose wakes have all gone undelivered for
+   `undelivered_minutes`, and one for a relay that delivers nothing
+   that long (docs/config.md, `router.escalate`).
+8. **Once a run.** The module's `each_run` actions, on a sending run
    that isn't `--only`'s (below).
 
 **Several decisions per item.** `decide` may return any number for
