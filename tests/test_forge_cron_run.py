@@ -2,6 +2,7 @@
 checkout of it, and tools that report what they saw."""
 import fcntl
 import os
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -191,6 +192,80 @@ class CronRun(unittest.TestCase):
         self.assertIn("PIN-WAIT: PIN-MISMATCH", log)
         self.assertIn("PIN-WAITED 30s", log)
         self.assertIn("cwd=", log)
+
+    def releases(self):
+        """forge-install --versions' layout: `install` links to the release
+        at `install.d/<sha>`, a git repository. Returns (link, old
+        release, new release, new release's sha)."""
+        old, sha = self.install_at()
+        self.r.git(old, "-c", "user.name=t", "-c", "user.email=t@t",
+                   "commit", "-q", "--allow-empty", "-m", "v1")
+        new_sha = self.r.git(old, "rev-parse", "HEAD").stdout.strip()
+        self.r.git(old, "checkout", "-q", sha)
+        link = os.path.join(self.r.dir, "agent-forge")
+        os.makedirs(link + ".d")
+        release = os.path.join(link + ".d", sha)
+        os.rename(old, release)
+        moved = os.path.join(link + ".d", new_sha)
+        os.makedirs(os.path.join(moved, "bin"))
+        os.symlink(os.path.join("agent-forge.d", sha), link)
+        return link, release, moved, new_sha
+
+    def move(self, link, release):
+        os.symlink(os.path.relpath(release, os.path.dirname(link)),
+                   link + ".new")
+        os.replace(link + ".new", link)
+
+    def test_a_job_on_a_release_left_behind_runs_the_new_one(self):
+        # A job started from a release just before forge-install moved
+        # the link waited out its whole bound holding its tool's lock
+        # (2026-11-13: ten minutes of no ticks after a pin bump).
+        link, release, moved, new = self.releases()
+        self.pin("%s v1\n" % new)
+        clock, naps, ran = [0.0], [], []
+
+        def nap(seconds):
+            naps.append(seconds)
+            clock[0] += seconds
+            if len(naps) == 2:
+                self.move(link, moved)
+        got = tool.main(["report", "--x"],
+                        dict(self.env, FORGE_CRON_PIN_WAIT_S="600"),
+                        lambda repo, app: "x", clock=lambda: clock[0],
+                        nap=nap, err=self.err.append, install=release,
+                        execute=lambda *a: ran.append(a))
+        self.assertEqual(got, 0)
+        self.assertEqual(ran, [(sys.executable, [
+            sys.executable, os.path.join(moved, "bin", "forge-cron-run"),
+            "report", "--x"])])
+        log = self.log()
+        self.assertIn("PIN-WAIT: PIN-MISMATCH", log)
+        self.assertIn("PIN-MOVED: PIN-MISMATCH", log)
+        self.assertIn("running %s instead" % moved, log)
+        self.assertNotIn("cwd=", log)
+        self.assertEqual(len(naps), 2)
+
+    def test_a_job_on_a_release_already_left_runs_the_new_one_at_once(self):
+        link, release, moved, new = self.releases()
+        self.move(link, moved)
+        self.pin("%s v1\n" % new)
+        ran = []
+        got = tool.main(["report"], self.env, lambda repo, app: "x",
+                        nap=lambda s: self.fail("waited"),
+                        err=self.err.append, install=release,
+                        execute=lambda *a: ran.append(a))
+        self.assertEqual(got, 0)
+        self.assertEqual(len(ran), 1)
+        self.assertNotIn("PIN-WAIT:", self.log())
+
+    def test_moved_release(self):
+        link, release, moved, new = self.releases()
+        self.assertIsNone(tool.moved_release(release))
+        self.move(link, moved)
+        self.assertEqual(tool.moved_release(release),
+                         os.path.realpath(moved))
+        # An installation that isn't a release can't be left behind.
+        self.assertIsNone(tool.moved_release(self.r.dir))
 
     def test_a_job_waits_no_longer_than_its_bound(self):
         install, sha = self.install_at()
