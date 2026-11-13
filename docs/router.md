@@ -172,9 +172,9 @@ wake has always had (`Your turn:`, so a message of turns alone is the
 text it always was), then `For your information (not your turn):` and
 `Worth another look (not your turn):`, each only when it has lines. A
 `surface` is sent to nobody: it is printed on every run, sending or
-not, as nobody's turn is printed (`#9 nobody's (rule 7: …)`), and
-journalled once per key. The default rules' rule 7, a pull request
-nobody can review, is a surface.
+not, as nobody's turn is printed (`#9 nobody's (rule 18: …)`), and
+journalled once per key. The default rules' rule 18, an unowned issue
+with no `owners.triage`, is a surface.
 
 **Actions** are `Action`s on the decision, done before delivery as the
 Merger's App, through the engine's own GitHub client, when the
