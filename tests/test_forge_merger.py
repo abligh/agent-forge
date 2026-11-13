@@ -10515,6 +10515,47 @@ class InstanceMainRed(unittest.TestCase):
         self.assertEqual(m.red_fixes_of(prs, set()), frozenset())
 
 
+class GreenApproval(unittest.TestCase):
+    """merge.approval green (2026-11-13)."""
+
+    def setUp(self):
+        m.configure(project(approval="green", own_head_green=True))
+        self.addCleanup(m.configure, project())
+
+    def node(self, **kw):
+        p = pr(reviews=[], **kw)
+        p["commits"] = {"nodes": [{"commit": {"committedDate": T1}}]}
+        return p
+
+    def test_the_head_approves_itself(self):
+        got = m.approval_of(self.node())
+        self.assertEqual((got["state"], got["submittedAt"],
+                          got["commit"]["oid"]), ("APPROVED", T1, "a" * 40))
+        approval, why = m.eligible(self.node(), [])
+        self.assertIsNone(why)
+        self.assertEqual(m.approval_of(pr(reviews=[])) ["submittedAt"], T0)
+
+    def test_a_remark_after_the_push_holds_it(self):
+        _, why = m.eligible(self.node(comments=[comment(PEER, T2)]), [])
+        self.assertIn("after the approval", why)
+        # One before the push doesn't.
+        _, why = m.eligible(self.node(comments=[comment(PEER, T0)]), [])
+        self.assertIsNone(why)
+
+    def test_the_default_still_needs_a_reviewer(self):
+        m.configure(project())
+        self.assertIsNone(m.approval_of(self.node()))
+
+    def test_the_configuration(self):
+        data = example()
+        data["merge"] = {"approval": "sometimes"}
+        self.assertIn("merge.approval must be reviewer or green",
+                      config.check(data))
+        data["merge"] = {"approval": "green", "own_head_green": False}
+        self.assertIn("merge.approval green needs own_head_green",
+                      config.check(data))
+
+
 class ManualMode(unittest.TestCase):
     """agent-forge #274: merge.mode manual."""
 

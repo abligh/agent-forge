@@ -230,6 +230,19 @@ class PullRequestRules(unittest.TestCase):
         rules.MANUAL = False
         self.assertNotEqual(decide_pr(pr_node())["rule"], 23)
 
+    # Rule 6 with merge.approval green.
+    def test_6_with_green_approval_a_green_pr_is_the_mergers(self):
+        self.addCleanup(setattr, rules, "GREEN_APPROVES", False)
+        rules.GREEN_APPROVES = True
+        self.assertNobody(decide_pr(pr_node(author=REVIEWER)), 6)
+        # Red is still its author's.
+        self.assertTurn(decide_pr(pr_node(
+            author=REVIEWER, statuses=[status("FAILURE")])), "Reviewer", 4)
+        # The owner's remark after the push holds it: the author's.
+        d = decide_pr(pr_node(author=REVIEWER,
+                              comments=[comment(OWNER, T3)]))
+        self.assertNotEqual(d["rule"], 6)
+
     # Rule 2.
     def test_2_a_plain_hand_back_is_the_authors(self):
         body = "Not merging 5b257c8: it conflicts.\n\n— Merger"
