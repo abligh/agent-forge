@@ -9876,6 +9876,9 @@ class Trains(RepoCase):
         self.assertEqual(sorted(t["pr"] for t in record["told_boarded"]),
                          [5, 6, 7])
         self.assertIn("TOLD-BOARDED #6 %s" % six["headRefOid"][:10], lines)
+        # What to do instead of pushing.
+        self.assertIn("If it needs a fix, open a new pull request stacked "
+                      "on this branch; don't push here.", told[0][2]["body"])
         # The next tick, the same trains: nobody is told again.
         record, lines = self.tick(prs, conclusions=(None,), live=True,
                                   minutes=1)

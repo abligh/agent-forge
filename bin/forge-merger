@@ -1046,7 +1046,9 @@ TOLD_BOARDED_FILE = "told-boarded.json"
 TOLD_BOARDED_NOTE = ("Not-a-review\n\nIn the Merger's train at %s: please "
                      "don't push to this branch unless it is handed back. "
                      "A push takes it out of the train and runs the check "
-                     "again for every pull request after it.\n\n%s")
+                     "again for every pull request after it. If it needs "
+                     "a fix, open a new pull request stacked on this "
+                     "branch; don't push here.\n\n%s")
 # merge.test_ahead.unstable_after_recuts and batches_when_unstable
 # (designs/0044, rule 5): when more than UNSTABLE_AFTER ticks in the
 # last UNSTABLE_WINDOW re-cut a batch whose top's run had started, only
