@@ -4125,6 +4125,31 @@ class TickAhead(RepoCase):
                          [("WAIT", m.TRAIN_AHEAD_REASON % "#6..#6")])
         self.assertNotIn("/merge", " ".join(w[1] for w in self.github.writes))
 
+    def test_a_keep_trains_one_outside_a_building_train_waits_too(self):
+        # Alex, 2026-11-13: keep_trains says a bypass merge of it keeps
+        # the trains; it doesn't let the Merger merge it ahead of them.
+        m.configure(project(test_ahead={"batch": 1, "batches": 2,
+                                        "trains": "live",
+                                        "train_merge": True}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        said = self.ahead_json()
+        said["entries"].reverse()
+        said["batch"] = {"size": 1, "trees": [said["entries"][0]["tree"]]}
+        said["later"] = [{"size": 1, "trees": [said["entries"][1]["tree"]],
+                          "fixed": True}]
+        with open(os.path.join(self.state, m.AHEAD_FILE), "w") as handle:
+            json.dump(said, handle)
+        top = said["entries"][0]
+        prs[0] = labelled(prs[0], "Merge:keep-trains")
+        with mock.patch.object(m, "KEEP_LABEL", "Merge:keep-trains"):
+            record, _ = self.tick(prs, live=True, minutes=1, check_state={
+                "results": {}, "ahead_started": {top["sha"]: "x"}})
+        five = [d for d in record["decisions"] if d["pr"] == 5]
+        self.assertEqual([(d["action"], d.get("reason")) for d in five],
+                         [("WAIT", m.TRAIN_AHEAD_REASON % "#6..#6")])
+        self.assertNotIn("/merge", " ".join(w[1] for w in self.github.writes))
+
     def test_an_urgent_one_heads_the_next_train(self):
         # 2026-11-13: an urgent pin (#11215) went in front of a train
         # whose top was testing, cut every train again and spent that
