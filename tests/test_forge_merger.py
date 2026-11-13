@@ -10452,3 +10452,20 @@ class TrainAheadStall(unittest.TestCase):
 
     def test_no_run_start_known_is_timed_as_before(self):
         self.assertEqual(self.stalled(30, None), 30)
+
+
+class Boarded(unittest.TestCase):
+    """A stack layer and a member aboard together (the tick failed with
+    `keywords must be strings` once both were)."""
+
+    def test_layers_and_members_join(self):
+        with mock.patch.object(m, "LAYERS_OWN_GREEN", False), \
+                mock.patch.object(m, "OWN_GREEN_TO_BOARD", False), \
+                mock.patch.object(m, "boarded_layers",
+                                  return_value={10999: "b" * 40}), \
+                mock.patch.object(m, "boarded_members",
+                                  return_value={10990: "a" * 40,
+                                                10999: "c" * 40}):
+            self.assertEqual(m.boarded_now({}), {10990: "a" * 40,
+                                             10999: "b" * 40})
+
