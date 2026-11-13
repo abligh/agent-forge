@@ -10278,6 +10278,74 @@ class InstanceMainRed(unittest.TestCase):
         self.assertEqual(m.red_fixes_of(prs, set()), frozenset())
 
 
+class ManualMode(unittest.TestCase):
+    """agent-forge #274: merge.mode manual."""
+
+    def setUp(self):
+        m.configure(project(mode="manual"))
+        self.addCleanup(m.configure, project())
+        self.dir = tempfile.mkdtemp()
+        self.lines = []
+
+    def test_the_configuration(self):
+        self.assertTrue(m.MANUAL)
+        m.configure(project())
+        self.assertFalse(m.MANUAL)
+        data = example()
+        data["merge"] = {"mode": "sometimes"}
+        self.assertIn("merge.mode must be auto or manual",
+                      config.check(data))
+
+    def test_hand_merges_are_recorded_as_merges(self):
+        when = datetime.datetime(2026, 10, 7, 10, tzinfo=datetime.timezone.utc)
+        github = FakeGitHub({SLUG + "/pulls?state=closed": [
+            {"number": 7, "merged_at": "2026-10-07T10:30:00Z",
+             "merged_by": {"login": "leaddevwidgetagent"}},
+            {"number": 6, "merged_at": "2026-10-07T09:30:00Z"},
+            {"number": 5, "merged_at": None},
+            {"number": 8, "merged_at": "2026-10-07T10:20:00Z",
+             "user": {"login": "someone"}}]})
+        # The first run starts the clock.
+        self.assertEqual(m.record_hand_merges(self.dir, github,
+                                              self.lines.append, when), [])
+        got = m.record_hand_merges(self.dir, github, self.lines.append,
+                                   when + datetime.timedelta(hours=1))
+        self.assertEqual([(r["at"], r["decisions"][0]["pr"],
+                           r["decisions"][0]["by"]) for r in got],
+                         [("2026-10-07T10:20:00Z", 8, "someone"),
+                          ("2026-10-07T10:30:00Z", 7, "leaddevwidgetagent")])
+        with open(os.path.join(self.dir, "merger.jsonl")) as handle:
+            self.assertEqual(len(handle.readlines()), 2)
+        # Each once.
+        self.assertEqual(m.record_hand_merges(self.dir, github,
+                                              self.lines.append, when), [])
+        self.assertIn("2 hand merge(s) recorded: #8, #7", self.lines[1])
+
+
+    def test_ready_lists_what_holds_it(self):
+        m.configure(project(mode="manual", ci_workflow=""))
+        head = "a" * 40
+        prs = [{"number": 5, "headRefOid": head, "isDraft": False,
+                "body": "Blocked-by: #9\n"}, {"number": 9}]
+        green = [{"context": m.STATUS_CONTEXT, "state": "success",
+                  "creator": {"login": m.STATUS_CREATOR}}]
+        github = FakeGitHub({SLUG + "/commits/": green})
+        behind = {"answer": 1}
+
+        def git(repo, *args, run=None):
+            code = behind["answer"] if args[0] == "merge-base" else 0
+            return subprocess.CompletedProcess(args, code, "", "")
+        with mock.patch.object(m, "fetch_prs", return_value=prs), \
+                mock.patch.object(m, "fetch_open_issues", return_value=set()), \
+                mock.patch.object(m, "have_head"), \
+                mock.patch.object(m, "git", git):
+            self.assertEqual(m.merge_ready("/r", github, 5), [
+                "it is not current with main: merge main into it first",
+                "Blocked-by #9, still open"])
+            prs[0]["body"], behind["answer"] = "", 0
+            self.assertEqual(m.merge_ready("/r", github, 5), [])
+            self.assertEqual(m.merge_ready("/r", github, 6),
+                             ["#6 is not an open pull request"])
 class TrainAheadStall(unittest.TestCase):
     """A head waiting for train 1's run is timed from that run's start,
     not from when it began waiting: the wait is the train's."""

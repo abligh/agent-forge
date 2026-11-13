@@ -930,6 +930,10 @@ STALL_RETELL = datetime.timedelta(minutes=DEFAULT_STALL_RETELL_MINUTES)
 STALL_TO_OWNER = datetime.timedelta(
     minutes=DEFAULT_STALL_OWNER_AFTER_MINUTES)
 STALL_TITLE = DEFAULT_STALL_TITLE
+# merge.mode (agent-forge #274): "manual" merges nothing and records the
+# hand merges, so forge-stats and forge-flow count them.
+MANUAL = False
+HAND_MERGES_NAME = "hand-merges.json"
 # merge.code_owner_ask (agent-forge #153): (title, labels) of the issue
 # opened for a pull request held for a code owner, or None for none.
 CODE_OWNER_ASK = None
@@ -1338,6 +1342,8 @@ def configure(project):
         "owner_after_minutes", DEFAULT_STALL_OWNER_AFTER_MINUTES))
     STALL_TITLE = alert.get("title", DEFAULT_STALL_TITLE)
     STALL_LABELS = tuple(alert.get("labels", ()))
+    global MANUAL
+    MANUAL = merge.get("mode", "auto") == "manual"
     global CODE_OWNER_ASK, CODE_OWNER_SEQUENCE
     CODE_OWNER_SEQUENCE = merge.get("code_owner_sequence", False) is True
     ask = merge.get("code_owner_ask")
@@ -3294,6 +3300,86 @@ def end_stall(state_dir, github, alert, decisions, out):
         os.remove(path)
 
 
+MERGED_PATH = ("repos/%s/pulls?state=closed&sort=updated&direction=desc"
+               "&per_page=50&base=%s")
+
+
+def record_hand_merges(state_dir, github, out, when):
+    """merge.mode manual (agent-forge #274): append a MERGE record to
+    merger.jsonl, at its merge time, for each pull request merged since
+    the last run, so what counts the Merger's merges counts these. The
+    first run only starts the clock: nothing before it is recorded."""
+    path = os.path.join(state_dir, HAND_MERGES_NAME)
+    seen = load_json(path, {})
+    since = seen.get("since") if isinstance(seen, dict) else None
+    if not since:
+        save_json(path, {"since": iso(when)})
+        out("MANUAL: merge.mode is manual; counting hand merges from now")
+        return []
+    merged = sorted(
+        (pr["merged_at"], pr["number"], (pr.get("merged_by") or {}).get(
+            "login") or (pr.get("user") or {}).get("login"))
+        for pr in github.api(MERGED_PATH % (REPO_SLUG, MAIN)) or []
+        if isinstance(pr, dict) and pr.get("merged_at")
+        and pr["merged_at"] > since)
+    records = [{"at": at, "queue": [], "held": {}, "manual": True,
+                "decisions": [{"pr": number, "action": "MERGE",
+                               "result": "done", "by": who}]}
+               for at, number, who in merged]
+    if records:
+        with open(os.path.join(state_dir, "merger.jsonl"), "a") as handle:
+            for record in records:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        save_json(path, {"since": merged[-1][0]})
+    out("MANUAL: merge.mode is manual; %d hand merge(s) recorded%s" % (
+        len(records), ": " + ", ".join("#%d" % n for _, n, _ in merged)
+        if merged else ""))
+    return records
+
+
+def merge_ready(repo, github, number, run=sh):
+    """Why pull request `number` isn't ready to merge by hand, as a
+    list, empty when it is (agent-forge #274): open and not a draft,
+    `checks.context` green (by its poster) and the CI workflow passed on
+    the head, the default branch's tip in its history, no `Blocked-by:`
+    item open, and, with merge.code_owners, an owner's word."""
+    prs = fetch_prs(github)
+    pr = next((p for p in prs if p["number"] == number), None)
+    if pr is None:
+        return ["#%d is not an open pull request" % number]
+    head, why = pr["headRefOid"], []
+    if pr.get("isDraft"):
+        why.append("it is a draft")
+    state, said = status_state(github.api(
+        "repos/%s/commits/%s/statuses?per_page=100" % (REPO_SLUG, head))
+        or [])
+    if state != "success":
+        why.append("%s is %s%s" % (STATUS_CONTEXT, state or "absent",
+                                   ": " + said if said else ""))
+    if CI_WORKFLOW:
+        problem = ci_problem(github.api(
+            "repos/%s/actions/runs?head_sha=%s&per_page=100"
+            % (REPO_SLUG, head)).get("workflow_runs") or [])
+        if problem:
+            why.append(problem)
+    git(repo, "fetch", "-q", "origin", MAIN, run=run)
+    main_ref = "refs/remotes/origin/" + MAIN
+    have_head(repo, pr, run)
+    if git(repo, "merge-base", "--is-ancestor", main_ref, head,
+           run=run).returncode != 0:
+        why.append("it is not current with %s: merge %s into it first"
+                   % (MAIN, MAIN))
+    open_numbers = {p["number"] for p in prs} | fetch_open_issues(github)
+    blocking = sorted(blockers_of(pr) & open_numbers)
+    if blocking:
+        why.append("Blocked-by %s, still open" % ", ".join(
+            "#%d" % n for n in blocking))
+    if CODE_OWNERS:
+        rules = codeowners_rules(repo, main_ref, run)
+        held = rules and code_owner_wait(repo, pr, rules, main_ref, run)
+        if held:
+            why.append(held)
+    return why
 def code_owner_asks(state_dir, github, waits, open_heads, out):
     """merge.code_owner_ask (agent-forge #153): one issue for each pull
     request held for a code owner at a head, so an owner working from a
@@ -8344,6 +8430,10 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
     parser.add_argument("--checkout", default=environ.get(
         "FORGE_CRON_CHECKOUT"), help="the checkout kept at the default "
         "branch (default $FORGE_CRON_CHECKOUT)")
+    parser.add_argument("--ready", type=int, metavar="PR", default=None,
+                        help="say whether pull request PR may be merged by "
+                        "hand now, and exit 0 if so, 1 if not (merge.mode "
+                        "manual; agent-forge #274)")
     parser.add_argument("--check-state", default=None,
                         help="the build check's state directory, read for "
                         "merge.queued_stall_minutes (default "
@@ -8364,6 +8454,20 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
         out("NO-CONFIG: %s" % err)
         return 2
     configure(project)
+    if args.ready is not None:
+        token = environ.get("GH_TOKEN") or mint(project, READ_AS or ACT_AS)
+        if not token:
+            out("NO-TOKEN: no GH_TOKEN, and no token could be minted")
+            return 2
+        try:
+            why = merge_ready(repo, GitHub(token, run), args.ready, run)
+        except (RuntimeError, KeyError, TypeError, ValueError) as err:
+            out("FAILED: %s" % err)
+            return 2
+        out("NOT READY #%d: %s" % (args.ready, "; ".join(why)) if why
+            else "READY #%d: merge it with gh pr merge %d --match-head-commit"
+            " <its head>" % (args.ready, args.ready))
+        return 1 if why else 0
     NIGHTLY_FIXES = nightly.fixes(project, environ)
     state_dir = args.state_dir or locks.state_dir(project.name, "merger",
                                                   environ)
@@ -8387,6 +8491,17 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
                 os.path.expanduser(args.check_state) if args.check_state
                 else locks.state_dir(project.name, "pr-check", environ))
         MAIN_RED_FIXES = main_red_fixes(check_state)
+        if MANUAL:
+            if args.dry_run:
+                out("MANUAL: merge.mode is manual; nothing to merge")
+                return 0
+            try:
+                record_hand_merges(state_dir, GitHub(token, run), out,
+                                   now_utc())
+            except (RuntimeError, KeyError, TypeError, ValueError) as err:
+                out("FAILED: %s" % err)
+                return 2
+            return 0
         # Only a live tick, and only with a stall alert, is given the
         # relay: a dry run messages nobody.
         send = ((sender or relay_sender)(project, environ)

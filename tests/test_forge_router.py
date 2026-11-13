@@ -214,6 +214,22 @@ class PullRequestRules(unittest.TestCase):
         for label in ("Status:waiting-owner", "Status:waiting-external"):
             self.assertNobody(decide_pr(pr_node(labels=[label])), 1)
 
+    # Rule 23 (agent-forge #274).
+    def test_23_manual_mode_offers_a_green_pr_to_its_author(self):
+        self.addCleanup(setattr, rules, "MANUAL", False)
+        rules.MANUAL = True
+        d = decide_pr(pr_node())
+        self.assertTurn(d, "LeadDev", 23)
+        self.assertIn("is green at 5b257c8: check it with forge-merger "
+                      "--ready 41, then merge it", d["line"])
+        self.assertNobody(decide_pr(pr_node(
+            labels=["Status:waiting-for-a-fix"])), 23)
+        # Red is still rule 4's, pending rule 5's.
+        self.assertTurn(decide_pr(pr_node(statuses=[status("FAILURE")])),
+                        "LeadDev", 4)
+        rules.MANUAL = False
+        self.assertNotEqual(decide_pr(pr_node())["rule"], 23)
+
     # Rule 2.
     def test_2_a_plain_hand_back_is_the_authors(self):
         body = "Not merging 5b257c8: it conflicts.\n\n— Merger"

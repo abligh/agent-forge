@@ -14,6 +14,7 @@ It never merges on its own judgment: it merges what reviewers approved.
 
     forge-merger [--dry-run] [--state-dir DIR] [--checkout DIR]
                  [--check-state DIR]
+    forge-merger --ready PR [--checkout DIR]
 
 It is normally run in two ways at once, both through
 [forge-cron-run](forge-cron-run.md), which keeps the cron checkout at
@@ -51,6 +52,7 @@ It needs `git` (2.38 or later, for `git merge-tree --write-tree`),
 | `--dry-run` | off | Read and report, and write nothing to GitHub. It writes its record to `dry-run.jsonl` instead of `merger.jsonl`, and never writes `next.json` or `ahead.json`. It reads as [`merge.read_as`](../config.md#mergeread_as) when that is set, else as the Merger's App. |
 | `--state-dir DIR` | `~/.local/state/agent-forge/<project>/merger` | Where its records and state live ([Where state lives](../config.md#where-state-lives)). |
 | `--checkout DIR` | `$FORGE_CRON_CHECKOUT` | The cron checkout, kept at the default branch. Its configuration is the one used, and gate tools run there. With neither, it prints `NO-REPO` and exits 2. |
+| `--ready PR` | off | Say whether pull request PR may be merged by hand now ([`merge.mode`](../config.md#mergemode) `manual`), and do nothing else: `READY #N` and exit 0, or `NOT READY #N: <why>; <why>` and exit 1, from what holds it: not open, a draft, `checks.context` not green by its poster on the head, the CI workflow not passed, the default branch's tip not in its history, a `Blocked-by:` item still open, a code owner's word missing (with `merge.code_owners`). Reads GitHub as `GH_TOKEN`, else as `merge.read_as` or the Merger's App. |
 | `--check-state DIR` | `~/.local/state/agent-forge/<project>/pr-check` | The build check's state directory. Read only with [`merge.queued_stall_minutes`](../config.md#mergequeued_stall_minutes) or `merge.test_ahead.batch` above 1. |
 
 ## Environment
