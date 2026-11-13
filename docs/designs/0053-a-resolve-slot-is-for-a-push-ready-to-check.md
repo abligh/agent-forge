@@ -1,6 +1,7 @@
 # 0053: A resolve slot is for a push ready to check
 
-* Status: proposed
+* Status: approved (Alex, 2026-11-13), with one change: a resolution
+  may merge a train's head as well as the default branch (§1, §2)
 * Author: XMPPEngineer
 * Date: 2026-11-13
 
@@ -22,8 +23,8 @@ check host. This design moves the slot to the scarce thing:
   in a queue until a slot is free, and the slot then covers its check,
   its re-review and its boarding.
 
-Resolving is cheap: a merge of the default branch into the branch,
-without the full test. The test is the expensive part, and the slot is
+Resolving is cheap: a merge of the default branch, or of a head
+already in a train, into the branch, without the full test. The test is the expensive part, and the slot is
 what pays for it.
 
 ## Evidence
@@ -55,14 +56,26 @@ With `merge.resolve_slot_on: "push"`, a conflict with the default
 branch is handed back as soon as it is found, at the front or behind
 it (`early_conflicts`), exactly as with no `resolve_slots`. Nothing is
 held untold. The hand-back says that a slot is needed for the
-resolution's check, and that a merge of the default branch, not a full
-local test run, is all the author needs to do before pushing.
+resolution's check, and that a merge, not a full local test run, is
+all the author needs to do before pushing.
+
+**What to merge.** The hand-back lists the viable heads, and so does
+`next.json` as `resolve_bases`: the default branch's tip, and the head
+of each train now being checked or about to merge (a train's own pull
+request, top first). Trains merge far more often than not, so a
+resolution on a train's head builds on what is about to be the
+default branch and is less likely to conflict again. Each listed head
+is one the author can fetch: a train's pull request branch.
 
 ### 2. A resolution's push queues for a slot
 
 A **resolution** is a new head of a pull request that was handed back
-for a conflict with the default branch and that now merges cleanly with
-it. The Merger keeps the resolutions in its record:
+for a conflict with the default branch and that now merges cleanly
+with it, or that has one of the listed train heads as an ancestor and
+merges cleanly with that train's head. One on a train is stacked on
+it: it boards only after that train merges, and if the train fails
+and is cut, it is handed back again at once with the new list. The
+Merger keeps the resolutions in its record:
 
 * `resolve_slots` of them hold a slot, given in `resolve_slot_order`
   (urgent first, then right of way, then the soonest to board).
@@ -109,6 +122,10 @@ pull request had.
 
 ## Trade-offs and failure modes
 
+* **A resolution on a train carries the train's other pull requests**
+  until the train merges. Its diff on GitHub shows them, and if the
+  train fails, the author resolves again. Trains merge far more often
+  than they fail, so this is a good trade.
 * **More resolving.** Every conflict is told, so more authors resolve,
   and some resolutions are undone by a later merge before they get a
   slot. That costs agent time, which is cheap, rather than build check
@@ -140,8 +157,9 @@ pull request had.
 
 ## Implementation plan
 
-1. forge-merger: tell at once, track resolutions, `resolve_queue`, slot
-   freeing.
+1. forge-merger: tell at once with the viable heads (`resolve_bases`),
+   track resolutions, a resolution on a train boarding after it,
+   `resolve_queue`, slot freeing.
 2. forge-pr-check: read the slotted and queued resolutions from
    `next.json`, and run or hold them.
 3. Docs, release, and a project's config change.
