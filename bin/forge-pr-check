@@ -235,6 +235,13 @@ by `keep_pr_places`, so a rebase or a red run doesn't send it to the
 back. A pull request's place is forgotten when it closes, or once no
 head of it has waited for PR_PLACE_KEPT.
 
+**A run goes to the free slot nearest it** (`nearest_first`): a
+slot's worktree, and its caches, stay at what it last built, so a run
+started in the slot whose last build differs from it in the fewest
+paths rebuilds least. A head merged with the default branch, or not yet
+in the object store, is compared with the default branch's tip instead.
+A start that this moves off the lowest free slot is logged `PLACED`.
+
 **With `checks.order: "merge"`, what can merge first goes first**
 (designs/0052 §2): among the heads no rule above puts first, overdue
 ones too, a head of a pull request an approved one is held for (the
@@ -2397,6 +2404,40 @@ def main_rerun_labelled(state, head, token, run=sh):
     return [(issue, head[0], False, None)]
 
 
+def nearest_first(state_dir, free, sha, merged, run=sh):
+    """Placement: `free` reordered so the slot whose worktree is nearest
+    what is about to be built comes first, as (slots, files) with
+    `files` the paths that differ from its last build (None when the
+    order is unchanged). A slot's worktree is left at what it last
+    built, and its caches with it, so the fewer the paths that differ
+    the less it rebuilds. What it is compared with is `sha`, or, when
+    the run will merge `sha` with the default branch (`merged`) or
+    `sha` is not in the object store yet, the default branch's tip:
+    the merge is that tip plus the head's own change, which is the same
+    whatever the slot. A slot with no worktree yet, or whose difference
+    can't be had, goes after the rest; ties keep `free`'s order."""
+    if len(free) < 2:
+        return free, None
+    targets = ([] if merged else [sha]) + ["refs/remotes/origin/" + MAIN]
+    near = {}
+    for target in targets:
+        for slot in free:
+            wt = os.path.join(state_dir, slot_name("wt", slot))
+            if slot in near or not os.path.exists(os.path.join(wt, ".git")):
+                continue
+            got = run(["git", "-C", wt, "diff", "--name-only", "HEAD",
+                       target, "--"])
+            if got.returncode == 0:
+                near[slot] = len(got.stdout.splitlines())
+        if near:
+            break
+    if not near:
+        return free, None
+    ranked = sorted(free, key=lambda s: (s not in near, near.get(s, 0),
+                                         free.index(s)))
+    return ranked, near[ranked[0]]
+
+
 def warm_slot(state, free, head, checkout, when, run=sh):
     """checks.warm: (slot, cached, changed) for the first of the `free`
     slots whose caches want building at the default branch's head
@@ -4337,6 +4378,15 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     # Fill every free slot, not one per tick: a tick's start rate was the
     # queue's ceiling (see the module docstring). What a pass starts is
     # as good as running to the next pass; the listing above isn't redone.
+    def place(sha, merged, pr):
+        # Placement: the free slot nearest what is built goes first.
+        ranked, files = nearest_first(state_dir, free, sha, merged, run)
+        if ranked[0] != free[0]:
+            out("PLACED %s %s in %s, %d path%s from its last build"
+                % (who(pr, pr == 0), sha[:10], slot_label(ranked[0]), files,
+                   "" if files == 1 else "s"))
+        free[:] = ranked
+
     first_pass = True
     while free or lane_free:
         predicted = pick = fast = None
@@ -4473,6 +4523,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             return 0
         if predicted is not None:
             sha, pr = predicted
+            place(sha, False, pr)
             spawn(state_dir, sha, pr, post is not None, free[0], checkout, True)
             out("STARTED-AHEAD #%d %s%s, the Merger's prediction; %d waiting"
                 % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
@@ -4520,6 +4571,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                     % (len(queued), MAX_ERRORS))
             return 0
         sha, pr = pick
+        place(sha, pr != 0 and MERGE_DEFAULT, pr)
         if pr == 0:
             spawn(state_dir, sha, pr, post is not None, free[0], checkout,
                   main=True)

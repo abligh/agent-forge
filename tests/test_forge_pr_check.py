@@ -803,6 +803,69 @@ class Tick(StateCase):
         self.assertEqual(self.spawned,
                          [(self.state_dir, SHA_B, 8, False, 1)])
 
+    # Placement: the free slot nearest what is built.
+
+    def worktrees(self, *slots):
+        for slot in slots:
+            wt = os.path.join(self.state_dir, pc.slot_name("wt", slot))
+            os.makedirs(wt, exist_ok=True)
+            pathlib.Path(wt, ".git").write_text("gitdir: /repo\n")
+
+    def differs(self, by_slot, missing=()):
+        """A rule: `git diff --name-only HEAD target` in slot N's
+        worktree lists by_slot[N] paths; a target in `missing` isn't in
+        the object store."""
+        def answer(args):
+            if args[6] in missing:
+                return done(args, 128, "", "bad object")
+            slot = os.path.basename(args[2])
+            n = by_slot[1 if slot == "wt" else int(slot.split("-")[1])]
+            return done(args, 0, "".join("p%d\n" % i for i in range(n)))
+        return (lambda a: a[:1] == ["git"] and "diff" in a, answer)
+
+    def test_the_slot_nearest_the_head_is_used_first(self):
+        self.worktrees(1, 2, 3)
+        self.hold(4, "#9 %s %s" % (SHA_C, pc.iso(T0)))
+        run = FakeRun((is_pulls, done([], 0, heads_tsv(
+            (7, SHA_A, REPO, "false")))), self.differs({1: 40, 2: 3, 3: 9}))
+        spawned = []
+        pc.tick(self.state_dir, "tok", run, lambda *a: spawned.append(a),
+                self.lines.append, when=T0, slots=4)
+        self.assertEqual(spawned, [(self.state_dir, SHA_A, 7, False, 2)])
+        self.assertIn("PLACED #7 aaaaaaaaaa in slot 2, 3 paths from its "
+                      "last build", self.lines)
+        diffs = [c["args"] for c in run.calls if "diff" in c["args"]]
+        self.assertEqual({a[6] for a in diffs}, {SHA_A})
+
+    def test_a_merged_run_and_an_unfetched_head_compare_the_tip(self):
+        self.worktrees(1, 2)
+        tip = "refs/remotes/origin/" + pc.MAIN
+        free, files = pc.nearest_first(
+            self.state_dir, [1, 2], SHA_A, False,
+            FakeRun(self.differs({1: 5, 2: 1}, missing=(SHA_A,))))
+        self.assertEqual((free, files), ([2, 1], 1))
+        run = FakeRun(self.differs({1: 0, 2: 7}))
+        self.assertEqual(pc.nearest_first(self.state_dir, [2, 1], SHA_A,
+                                          True, run), ([1, 2], 0))
+        self.assertEqual({c["args"][6] for c in run.calls}, {tip})
+
+    def test_a_slot_without_a_worktree_goes_last_and_ties_keep_order(self):
+        self.worktrees(2, 3)
+        run = FakeRun(self.differs({2: 4, 3: 4}))
+        self.assertEqual(pc.nearest_first(self.state_dir, [1, 2, 3], SHA_A,
+                                          False, run), ([2, 3, 1], 4))
+        self.assertEqual(pc.nearest_first(self.state_dir, [1, 2], SHA_A,
+                                          False, FakeRun()), ([2, 1], 0))
+
+    def test_nothing_known_keeps_the_order_and_one_slot_asks_nothing(self):
+        run = FakeRun()
+        self.assertEqual(pc.nearest_first(self.state_dir, [1, 2], SHA_A,
+                                          False, run), ([1, 2], None))
+        self.worktrees(1)
+        self.assertEqual(pc.nearest_first(self.state_dir, [1], SHA_A,
+                                          False, run), ([1], None))
+        self.assertEqual(run.calls, [])
+
     def test_every_slot_held_starts_nothing(self):
         self.hold(1, "#7 %s %s" % (SHA_A, pc.iso(T0)))
         self.hold(2, "#8 %s %s" % (SHA_B, pc.iso(T0)))
