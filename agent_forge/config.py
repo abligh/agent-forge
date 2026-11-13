@@ -177,7 +177,7 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "side_by_side": dict, "merger_cpu_weight": int,
           "docker_slices": dict, "pull_requests": dict, "warm": dict,
           "approved_first": bool, "scoped_minutes": int,
-          "gate": bool, "flake_issue": dict}
+          "gate": bool, "flake_issue": dict, "order": str}
 # checks.flake_issue (agent-forge #287): an issue for each step a
 # prediction's retry (merge.test_ahead.retry_red) turned green.
 FLAKE_ISSUE = {"labels": list, "owner": str}
@@ -189,6 +189,8 @@ DOCKER_SLICES = {"front": str, "other": str}
 PULL_REQUESTS = {"paths": list, "label": str}
 # checks.cpu_share (designs/0029): when a step's CHECK_CPUS is taken.
 CPU_SHARES = ("run", "step")
+# checks.order (designs/0052).
+CHECK_ORDERS = ("age", "merge")
 # checks.side_by_side (designs/0029): a run's steps side by side.
 SIDE_BY_SIDE = {"max_steps": int}
 # checks.step_alert (designs/0019): an issue when a step gets slower.
@@ -207,7 +209,7 @@ INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight", "cpu_quota",
                       "keep_ignored", "drop_env", "merge_default",
                       "red_comment", "max_wait_minutes", "host_fault_text",
                       "cache_fault_text", "step_alert", "cpu_share",
-                      "side_by_side", "warm", "approved_first")
+                      "side_by_side", "warm", "approved_first", "order")
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main", "main_red_issue")
 INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
@@ -1231,6 +1233,10 @@ def _check_checks(checks, data, problems, where="checks"):
             and checks["cpu_share"] not in CPU_SHARES:
         problems.append("%s.cpu_share must be one of %s"
                         % (where, ", ".join(CPU_SHARES)))
+    if isinstance(checks.get("order"), str) \
+            and checks["order"] not in CHECK_ORDERS:
+        problems.append("%s.order must be one of %s"
+                        % (where, ", ".join(CHECK_ORDERS)))
     if isinstance(checks.get("side_by_side"), dict):
         block = checks["side_by_side"]
         if _fields(where + ".side_by_side", block, SIDE_BY_SIDE, problems) \

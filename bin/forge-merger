@@ -349,7 +349,9 @@ when there is none. Every live tick writes it, and a dry run never
 does. It also lists, as `"blocked": [N, ...]`, the approved pull
 requests held for a reason only another merge clears (`Blocked-by:` an
 open one, or stacked on one), when there are any; the build check
-starts their heads after other approved ones. With `checks.merger_first` on, the build check (`forge-pr-check`)
+starts their heads after other approved ones. Then, as `"unblocks"`,
+the numbers those wait on, which the build check starts first among
+unapproved heads with `checks.order` "merge" (designs/0052). With `checks.merger_first` on, the build check (`forge-pr-check`)
 reads it and checks that pull request's head before any other, since
 the next merge waits on that verdict.
 
@@ -1682,6 +1684,19 @@ def blocked_prs(held):
     starts their heads after other approved ones (agent-forge #256)."""
     return sorted(int(number) for number, why in held.items()
                   if why.startswith(("Blocked-by: #", "stacked on #")))
+
+
+def unblockers(held):
+    """The numbers the pull requests in `blocked_prs(held)` wait on: the
+    `Blocked-by: #N` and `stacked on #N` they name. next.json lists them
+    as `unblocks`, and with checks.order "merge" the build check starts
+    their heads before other unapproved ones (designs/0052)."""
+    found = set()
+    for why in held.values():
+        m = re.match(r"(?:Blocked-by: |stacked on )#(\d+)", why)
+        if m:
+            found.add(int(m.group(1)))
+    return sorted(found)
 
 
 def eligible(pr, open_numbers, now=None, stacked=None, any_base=False):
@@ -8152,6 +8167,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         blocked = blocked_prs(held)
         if blocked:
             said_next["blocked"] = blocked
+            said_next["unblocks"] = unblockers(held)
         if TEST_AHEAD:
             acted = [d["action"] for d in record["decisions"]
                      if d["pr"] == waiting_on]
