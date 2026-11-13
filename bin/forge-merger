@@ -3933,6 +3933,29 @@ def resolutions(said, prs, queue, repo, main_tip, run=sh, known=()):
     return found
 
 
+def pushed_since_told(said, prs, queue):
+    """designs/0053 (agent-forge #373): the open pull requests handed back
+    for a conflict with main (CONFLICT_REASON, not a restack's) at
+    another head than they have now, that aren't drafts or candidates
+    (in `queue`). Those among them that conflict with main again,
+    whether a resolution that main has since moved under or a push that
+    never resolved it, are told again at once (`early_conflicts`): they
+    wait for a review, not in the queue, so nothing else would tell
+    them."""
+    candidates = {pr["number"] for pr in queue}
+    out = []
+    for pr in prs:
+        before = said.get(str(pr["number"])) or {}
+        reason = str(before.get("reason") or "")
+        if (reason.startswith(CONFLICT_REASON)
+                and "'s final head" not in reason
+                and before.get("head") not in (None, pr["headRefOid"])
+                and not pr.get("isDraft")
+                and pr["number"] not in candidates):
+            out.append(pr)
+    return out
+
+
 def push_slots(path, found, queue, prs, when, row=None, progress=None):
     """designs/0053: (slotted, waiting, expired, slots), the resolutions
     `found` (`resolutions`) split into those holding one of
@@ -8394,6 +8417,16 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # designs/0053: the resolutions pushed, slotted or queued.
         found = resolutions(said, prs, queue + instance_held, repo,
                             main_tip, run, known=load_json(slots_path, {}))
+        # A push that conflicts with main (again) is told at once, like
+        # any other conflict (agent-forge #373).
+        resolved = {pr["number"] for pr in found}
+        again = [pr for pr in pushed_since_told(said, prs,
+                                                queue + instance_held)
+                 if pr["number"] not in resolved]
+        record["decisions"].extend(early_conflicts(
+            repo, main_tip, again,
+            {pr["number"]: approval_of(pr) or {} for pr in again},
+            github, said, live, run, layers))
         results = (check_state or {}).get("results") or {}
 
         def progress(pr):
