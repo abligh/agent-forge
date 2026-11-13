@@ -3933,7 +3933,7 @@ def resolutions(said, prs, queue, repo, main_tip, run=sh, known=()):
     return found
 
 
-def push_slots(path, found, queue, prs, when, row=None):
+def push_slots(path, found, queue, prs, when, row=None, progress=None):
     """designs/0053: (slotted, waiting, expired, slots), the resolutions
     `found` (`resolutions`) split into those holding one of
     RESOLVE_SLOTS, in the order given, and those waiting for one, in
@@ -3942,8 +3942,11 @@ def push_slots(path, found, queue, prs, when, row=None):
     holds a slot, and since when. A slot is kept until its pull request
     is no longer a resolution (a candidate again, merged, closed, or
     conflicting again), or, with RESOLVE_SLOT_MINUTES, until that long
-    after it was given or its head last moved. One whose slot ran out
-    waits behind the others."""
+    after it was given, its head last moved, or it last made progress:
+    `progress(pr)` says what it has made (a green check on its head, a
+    newer approval), and a change in that restarts the clock
+    (agent-forge #372). One whose slot ran out waits behind the
+    others."""
     before = load_json(path, {})
     before = before if isinstance(before, dict) else {}
     limit = datetime.timedelta(minutes=RESOLVE_SLOT_MINUTES) \
@@ -3955,6 +3958,11 @@ def push_slots(path, found, queue, prs, when, row=None):
         if entry.get("head") != pr["headRefOid"]:
             entry["since"] = iso(when)
         entry["head"] = pr["headRefOid"]
+        made = progress(pr) if progress is not None else None
+        if made is not None and made != entry.get("progress"):
+            if "progress" in entry:
+                entry["since"] = iso(when)
+            entry["progress"] = made
         if entry.get("slot"):
             try:
                 held = when - parse_time(entry["since"])
@@ -8386,8 +8394,17 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         # designs/0053: the resolutions pushed, slotted or queued.
         found = resolutions(said, prs, queue + instance_held, repo,
                             main_tip, run, known=load_json(slots_path, {}))
+        results = (check_state or {}).get("results") or {}
+
+        def progress(pr):
+            # A green check on its head, or a newer approval (#372).
+            head = pr["headRefOid"]
+            ok = (results.get(head) or {}).get("ok") is True \
+                or greens.get(head) == "success"
+            return [ok and head, (approval_of(pr) or {}).get("submittedAt")]
         slotted, queued, expired, slots = push_slots(
-            slots_path, found, queue + instance_held, prs, when, row)
+            slots_path, found, queue + instance_held, prs, when, row,
+            progress)
         resolving = [pr["number"] for pr in slotted]
         pushed = (slotted, queued)
         for number in expired:
