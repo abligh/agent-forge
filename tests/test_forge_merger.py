@@ -10629,6 +10629,40 @@ class OwnGreenWaitAfterUpdates(RepoCase):
                                         self.first: [status()]}))
 
 
+class WalksPast(RepoCase):
+    """designs/0025, fourth amendment: a layer brought up to date while
+    its base was open holds several of the base's heads. Once the base
+    has merged, the walks back to an earlier verdict pass its final
+    head (a squash on main) and then its older ones."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.branch("lower", "main")
+        self.older = self.repo.commit("l.txt", "one\n", "lower")
+        self.final = self.repo.commit("l.txt", "two\n", "lower again")
+        # The squash of the lower layer's final head goes onto main.
+        self.repo.branch("main")
+        run_git(self.repo.path, "checkout", "-q", self.final, "--", "l.txt")
+        run_git(self.repo.path, "commit", "-q", "-m", "squash lower")
+        self.repo.push("main")
+
+    def test_an_older_head_counts_after_the_final_one(self):
+        tip, heads = self.repo.main_tip(), []
+        self.assertFalse(m.walks_past(self.repo.path, self.older, tip,
+                                      layer_heads=[]))
+        self.assertTrue(m.walks_past(self.repo.path, self.final, tip,
+                                     layer_heads=heads))
+        self.assertEqual(heads, [self.final])
+        self.assertTrue(m.walks_past(self.repo.path, self.older, tip,
+                                     layer_heads=heads))
+        # A commit of the lower layer's that isn't in its final head
+        # still stops the walk.
+        self.repo.branch("other", self.older)
+        stray = self.repo.commit("x.txt", "x\n", "stray")
+        self.assertFalse(m.walks_past(self.repo.path, stray, tip,
+                                      layer_heads=heads))
+
+
 class CodeOwnerAsk(unittest.TestCase):
     """agent-forge #153: a pull request held for a code owner opens an
     ask issue, closed when the hold ends at that head."""

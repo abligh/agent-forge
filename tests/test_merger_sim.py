@@ -54,7 +54,12 @@ class Morning(unittest.TestCase):
         m = ms.load_merger()
         m.configure(ms.project())
         got = simulate(m, ms.restacked_day())
-        self.assertTrue(any("RESTACK (done)" in l for l in got.lines))
+        # Brought up to date by the Merger: at its base's merge
+        # (RESTACK), or before it, while the base was open (STALE,
+        # designs/0025, fourth amendment of 2026-11-11).
+        self.assertTrue(any("RESTACK (done)" in l or (
+            l[6:].startswith("STALE #21") and "merged #20's head" in l)
+            for l in got.lines), "\n".join(got.lines))
         self.assertEqual(got.broken, [], figures(got))
         self.assertFalse(any("TRAIN-LEFT" in l for l in got.lines),
                          figures(got))

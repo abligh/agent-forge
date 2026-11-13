@@ -219,8 +219,15 @@ class World:
         """The gated instance's verdict for #`number` as the Merger reads
         it: on the head, or, while that has none final, on the commit
         before each merge of the default branch, or of a merged layer's
-        final head (RESTACK: its tree is a squash on main), into it."""
-        sha, first = self.prs[number]["head"], None
+        final head (RESTACK: its tree is a squash on main), or of an
+        older head of such a layer once its final head is passed (STALE
+        brought it up to date more than once), into it."""
+        sha, first, layer_heads = self.prs[number]["head"], None, []
+
+        def ancestor(a, b):
+            return subprocess.run(
+                ["git", "-C", self.origin, "merge-base", "--is-ancestor",
+                 a, b], env=git_env()).returncode == 0
         for _ in range(20):
             state = next((s["state"] for s in self.statuses.get(sha, ())
                           if s["context"] == GATED), None)
@@ -231,12 +238,15 @@ class World:
                               sha).split()
             if len(parents) != 3:
                 break
-            got = subprocess.run(
-                ["git", "-C", self.origin, "merge-base", "--is-ancestor",
-                 parents[2], self.main()], env=git_env())
-            if got.returncode != 0 and self.tree(parents[2]) not in self.og(
+            other = parents[2]
+            if ancestor(other, self.main()) or any(
+                    ancestor(other, h) for h in layer_heads):
+                pass
+            elif self.tree(other) in self.og(
                     "log", "--first-parent", "--format=%T",
                     self.main()).split():
+                layer_heads.append(other)
+            else:
                 break
             sha = parents[1]
         return first

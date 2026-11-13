@@ -2100,6 +2100,25 @@ def on_main(repo, sha, main_tip, run=sh):
         squashed(repo, sha, main_tip, run)
 
 
+def walks_past(repo, sha, main_tip, run=sh, layer_heads=None):
+    """Whether a merge of `sha` into a pull request changes nothing of
+    its own, for the walks back to an earlier verdict: `on_main`, or an
+    older head of a merged layer whose final head the walk has already
+    passed (in `layer_heads`, which this extends). A layer brought up to
+    date while its base was open (`STALE`) can hold several of the
+    base's heads, merged in turn; only the last is the final one."""
+    if is_ancestor(repo, sha, main_tip, run):
+        return True
+    if layer_heads is not None and any(
+            is_ancestor(repo, sha, h, run) for h in layer_heads):
+        return True
+    if squashed(repo, sha, main_tip, run):
+        if layer_heads is not None:
+            layer_heads.append(sha)
+        return True
+    return False
+
+
 def based_merge(repo, main_side, layer, lower, run=sh):
     """The tree of `main_side` merged into `layer` against `lower`, the
     final head of the merged layer below (designs/0025), or None when it
@@ -4556,7 +4575,7 @@ def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
     catch up with a head the Merger updates whenever the default
     branch moves. A head's own pending verdict is the answer when no
     earlier one is final."""
-    commit, first, depth = pr["headRefOid"], None, 0
+    commit, first, depth, layer_heads = pr["headRefOid"], None, 0, []
     while commit and depth < GATE_DEPTH:
         depth += 1
         state, said = newest_status(github.api(status_path(commit)),
@@ -4567,8 +4586,8 @@ def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
             first = (state, said, commit)
         parents = git(repo, "rev-list", "--parents", "-n", "1", commit,
                       run=run).stdout.split()
-        if len(parents) != 3 or not on_main(repo, parents[2], main_tip,
-                                            run):
+        if len(parents) != 3 or not walks_past(repo, parents[2], main_tip,
+                                               run, layer_heads):
             break
         commit = parents[1]
     return first or (None, "", pr["headRefOid"])
@@ -4602,13 +4621,14 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
     head = pr.get("headRefOid")
     shas = [approved, head]
     if repo is not None and main_tip and head:
-        commit, depth = head, 0
+        commit, depth, layer_heads = head, 0, []
         while depth < GATE_DEPTH:
             depth += 1
             parents = git(repo, "rev-list", "--parents", "-n", "1", commit,
                           run=run).stdout.split()
-            if len(parents) != 3 or not on_main(repo, parents[2],
-                                                main_tip, run):
+            if len(parents) != 3 or not walks_past(repo, parents[2],
+                                                   main_tip, run,
+                                                   layer_heads):
                 break
             commit = parents[1]
             shas.append(commit)
