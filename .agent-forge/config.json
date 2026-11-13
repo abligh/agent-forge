@@ -14,7 +14,9 @@
   },
   "merge": {
     "merger": "Merger",
-    "ci_workflow": ""
+    "ci_workflow": "",
+    "approval": "green",
+    "own_head_green": true
   },
   "checks": {
     "context": "build-and-test",
