@@ -6049,6 +6049,24 @@ class ResolveSlots(RepoCase):
                               tools_run())
         self.assertEqual(found, [])
 
+    def test_with_push_a_resolution_main_moves_under_is_told_again(self):
+        # agent-forge #373: unapproved, it isn't a candidate, so only
+        # this tells it.
+        self.configure(resolve_slot_on="push")
+        prs = self.conflicting(6, 7)
+        self.tick(prs, live=True)
+        six = self.resolved(6, "2026-10-07T10:00:00Z")
+        record, _ = self.tick([six, prs[1]], live=True, minutes=5)
+        self.assertEqual(record["resolving"], [6])
+        self.advance_main("r6.txt", "main moved r6\n")
+        record, _ = self.tick([six, prs[1]], live=True, minutes=10)
+        self.assertEqual(self.told(), [6])
+        self.assertIn((6, "HAND-BACK"), self.acted(record))
+        self.assertEqual(record["resolving"], [])
+        # Told once for this head.
+        record, _ = self.tick([six, prs[1]], live=True, minutes=15)
+        self.assertNotIn((6, "HAND-BACK"), self.acted(record))
+
     def test_the_order_slots_are_given_in(self):
         base = pr(6, "2026-10-07T03:00:00Z")
         layers = [pr(9, base="b6"), pr(10, base="b9", reviews=[])]
