@@ -335,7 +335,9 @@ the wait is timed from the later of the top's start and the wait's, so
 a top that is running isn't called a stall, and one that hangs still
 is, `STALL_AFTER` after it started. A slot running the top's tree at
 another commit (an earlier prediction, which keeps the check from
-starting the top) counts as the top's start. With
+starting the top) counts as the top's start. A head kept off train 1
+while its run goes on (it would spend that run, "waits for its train")
+is timed from that run's start the same way. With
 `merge.stall_run_factor` (default 1.5), a wait on checks is timed
 against that many times the median of the build check's recent runs
 when that is longer than `STALL_AFTER`, which stays the floor.
@@ -937,6 +939,13 @@ HAND_MERGES_NAME = "hand-merges.json"
 CODE_OWNER_ASK = None
 DEFAULT_CODE_OWNER_ASK_TITLE = "#{pr} waits for a code owner's approval"
 CODE_OWNER_ASK_NAME = "code-owner-asks.json"
+# merge.code_owner_sequence (agent-forge #264): of the pull requests
+# held for a code owner that change the same lines of an owned path,
+# only the oldest is asked; the rest wait for it.
+CODE_OWNER_SEQUENCE = False
+SEQUENCE_REASON = "waits for #%d: both change %s lines %d-%d, which a " \
+    "code owner must approve; one at a time"
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@", re.M)
 STALL_LABELS = ()
 WAITING_OWNER = DEFAULT_WAITING_OWNER
 # labels.urgent: the label that puts a pull request first, or None.
@@ -1335,7 +1344,8 @@ def configure(project):
     STALL_LABELS = tuple(alert.get("labels", ()))
     global MANUAL
     MANUAL = merge.get("mode", "auto") == "manual"
-    global CODE_OWNER_ASK
+    global CODE_OWNER_ASK, CODE_OWNER_SEQUENCE
+    CODE_OWNER_SEQUENCE = merge.get("code_owner_sequence", False) is True
     ask = merge.get("code_owner_ask")
     CODE_OWNER_ASK = None if ask is None else (
         ask.get("title", DEFAULT_CODE_OWNER_ASK_TITLE),
@@ -3018,7 +3028,9 @@ def stalled_for(state_dir, waiting, when, check_state=None, repo=None,
     build check started a run of the batch's top, or of any commit with
     the top's tree (`batch_top_started`, given `repo`): the check runs a
     tree once, and a later prediction with the same tree waits for it.
-    Neither started, it is timed as before."""
+    Neither started, it is timed as before. A head waiting for train 1's
+    run (TRAIN_AHEAD_REASON, `train_top`) is timed from that run's start
+    the same way."""
     path = os.path.join(state_dir, "waiting.json")
     if waiting is None:
         if os.path.exists(path):
@@ -3053,7 +3065,19 @@ def stalled_for(state_dir, waiting, when, check_state=None, repo=None,
             limit = QUEUED_STALL_AFTER
         else:
             since = max(began, started)
-    if waiting.get("action") == "WAIT":
+    if waiting.get("action") == "WAIT" and waiting.get("train_top"):
+        # Waiting for train 1's run, not its own: timed from that run's
+        # start against a top's limit, as the train's own wait is.
+        started = (check_state or {}).get("ahead_started") or {}
+        try:
+            top = parse_time((started if isinstance(started, dict) else {})
+                             .get(waiting["train_top"]))
+        except (TypeError, ValueError):
+            top = None
+        if top is not None:
+            limit, since = stall_limit(check_state, top=True), \
+                max(since, top)
+    elif waiting.get("action") == "WAIT":
         top = batch_top_started(state_dir, waiting, check_state, repo, run)
         if top is not None:
             limit, since = stall_limit(check_state, top=True), \
@@ -4467,6 +4491,60 @@ def code_owner_wait(repo, pr, rules, main_ref, run=sh, regenerated=None):
     more = sum(len(p) for p in waiting.values()) - 1
     return "waits for code owner %s: %s%s" % (
         who, paths[0], " and %d more" % more if more else "")
+
+
+def owned_lines(repo, pr, rules, main_ref, run=sh):
+    """{path: [(first, last), ...]}: the default branch's lines each
+    code-owned path `pr` changes since `main_ref` covers (a pure
+    insertion as the line it follows), or None if git can't say."""
+    got = git(repo, "diff", "-U0", "--no-color", "%s...%s"
+              % (main_ref, pr["headRefOid"]), run=run)
+    if got.returncode != 0:
+        return None
+    found, path = {}, None
+    for line in got.stdout.splitlines():
+        if line.startswith("--- "):
+            name = line[4:]
+            path = name[2:] if name.startswith("a/") else None
+        elif line.startswith("+++ ") and path is None:
+            name = line[4:]
+            path = name[2:] if name.startswith("b/") else None
+        elif line.startswith("@@") and path and owners_of(path, rules):
+            m = HUNK_RE.match(line)
+            if m:
+                start, count = int(m.group(1)), int(m.group(2) or 1)
+                found.setdefault(path, []).append(
+                    (start, start + max(count, 1) - 1))
+    return found
+
+
+def sequence_owned(repo, prs, waits, rules, main_ref, run=sh):
+    """merge.code_owner_sequence (agent-forge #264): {number: (head,
+    why)} for each pull request held for a code owner (`waits`) that
+    changes lines of an owned path an older such pull request also
+    changes. It waits for the oldest, so the owner is asked once."""
+    by_number = {pr["number"]: pr for pr in prs}
+    held = sorted(n for n, (_head, why) in waits.items() if why)
+    lines = {}
+    for number in held:
+        lines[number] = owned_lines(repo, by_number[number], rules,
+                                    main_ref, run) or {}
+    out = {}
+    for i, number in enumerate(held):
+        for older in held[:i]:
+            if older in out:
+                continue
+            clash = [(path, max(a, c), min(b, d))
+                     for path, ranges in sorted(lines[number].items())
+                     for a, b in ranges
+                     for c, d in lines[older].get(path, ())
+                     if a <= d and c <= b]
+            if clash:
+                path, first, last = clash[0]
+                out[number] = (waits[number][0],
+                               SEQUENCE_REASON % (older, path, first, last))
+                break
+    return out
 
 
 def conflicts_with(repo, head, queue, run=sh):
@@ -7253,6 +7331,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
+        if CODE_OWNER_SEQUENCE:
+            for number, (head, why) in sequence_owned(
+                    repo, prs, owner_waits, rules, main_tip, run).items():
+                held[str(number)] = why
+                owner_waits[number] = (head, None)
         if live and CODE_OWNER_ASK:
             code_owner_asks(state_dir, github, owner_waits,
                             {p["number"]: p["headRefOid"] for p in prs}, out)
@@ -7700,7 +7783,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         "head": pr["headRefOid"],
                         "reason": TRAIN_AHEAD_REASON % (
                             "#%d..#%d" % (ahead_of[0]["pr"],
-                                          ahead_of[-1]["pr"]))}
+                                          ahead_of[-1]["pr"])),
+                        # Timed as the train's top's run (stalled_for).
+                        "train_top": ahead_of[-1].get("sha")}
         if (RESOLVE_SLOTS and decision["action"] == "HAND-BACK"
                 and decision.get("to") == "author"
                 and decision.get("reason", "").startswith(CONFLICT_REASON)

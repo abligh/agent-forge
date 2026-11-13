@@ -6613,6 +6613,37 @@ class CodeOwners(RepoCase):
         m.configure(project())
         self.assertIs(m.CODE_OWNERS, False)
 
+    def test_the_same_owned_lines_are_asked_one_at_a_time(self):
+        # agent-forge #264: #7 changes what #6 changes; #8 another file.
+        m.configure(project(code_owners=True, code_owner_sequence=True))
+        record, _ = self.tick([self.owned_pr(6), self.owned_pr(7),
+                               self.owned_pr(8, name="owned/y.json")],
+                              live=True)
+        self.assertEqual(record["held"], {
+            "6": "waits for code owner @TheOwner: owned/x.json",
+            "7": "waits for #6: both change owned/x.json lines 0-0, which "
+                 "a code owner must approve; one at a time",
+            "8": "waits for code owner @TheOwner: owned/y.json"})
+
+    def test_sequencing_is_off_by_default(self):
+        record, _ = self.tick([self.owned_pr(6), self.owned_pr(7)],
+                              live=True)
+        self.assertEqual(record["held"]["7"],
+                         "waits for code owner @TheOwner: owned/x.json")
+
+    def test_only_overlapping_lines_wait(self):
+        lines = {6: {"c.json": [(10, 12)]}, 7: {"c.json": [(13, 20)]},
+                 8: {"c.json": [(12, 12)]}, 9: {"c.json": [(1, 30)]}}
+        waits = {n: ("h%d" % n, "waits for code owner") for n in lines}
+        waits[10] = ("h10", None)
+        with mock.patch.object(m, "owned_lines",
+                               lambda repo, pr, *a, **k: lines[pr["number"]]):
+            got = m.sequence_owned(None, [{"number": n} for n in waits],
+                                   waits, [], "main")
+        self.assertEqual(got, {
+            8: ("h8", m.SEQUENCE_REASON % (6, "c.json", 12, 12)),
+            9: ("h9", m.SEQUENCE_REASON % (6, "c.json", 10, 12))})
+
     def test_off_by_default(self):
         m.configure(project())
         record, _ = self.tick([self.owned_pr()], live=True)
@@ -10315,3 +10346,30 @@ class ManualMode(unittest.TestCase):
             self.assertEqual(m.merge_ready("/r", github, 5), [])
             self.assertEqual(m.merge_ready("/r", github, 6),
                              ["#6 is not an open pull request"])
+class TrainAheadStall(unittest.TestCase):
+    """A head waiting for train 1's run is timed from that run's start,
+    not from when it began waiting: the wait is the train's."""
+
+    START = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                              tzinfo=datetime.timezone.utc)
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp()
+        m.configure(project(stall_run_factor=0))
+        self.addCleanup(m.configure, project())
+
+    def stalled(self, minutes, started):
+        waiting = {"pr": 5, "head": "h" * 40, "action": "WAIT",
+                   "train_top": "t" * 40}
+        check = {"ahead_started": {"t" * 40: started}} if started else {}
+        m.stalled_for(self.state, waiting, self.START, check)
+        return m.stalled_for(
+            self.state, waiting,
+            self.START + datetime.timedelta(minutes=minutes), check)
+
+    def test_timed_from_the_trains_run(self):
+        self.assertIsNone(self.stalled(45, "2026-10-07T12:20:00Z"))
+        self.assertEqual(self.stalled(50, "2026-10-07T12:20:00Z"), 50)
+
+    def test_no_run_start_known_is_timed_as_before(self):
+        self.assertEqual(self.stalled(30, None), 30)

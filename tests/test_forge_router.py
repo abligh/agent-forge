@@ -1496,5 +1496,181 @@ class Main(unittest.TestCase):
             "router"))
 
 
+class EscalateGitHub(FakeGitHub):
+    """FakeGitHub, plus the issue writes router.escalate makes, and an
+    issue's state for `closed` numbers."""
+
+    def __init__(self, *pages, closed=(), refuse=None):
+        super().__init__(*pages)
+        self.writes, self.closed, self.refuse = [], set(closed), refuse
+        self.made = 899
+
+    def api(self, *args):
+        if args[0] != "graphql":
+            self.calls.append(args)
+            number = int(args[0].rsplit("/", 1)[1])
+            return {"state": "closed" if number in self.closed else "open"}
+        return super().api(*args)
+
+    def write(self, method, path, **fields):
+        self.writes.append((method, path, fields))
+        return (False, self.refuse) if self.refuse else (True, "")
+
+    def create(self, path, **fields):
+        ok, why = self.write("POST", path, **fields)
+        if not ok:
+            return None, why
+        self.made += 1
+        return self.made, ""
+
+
+class Escalate(StateCase):
+    """designs/0049: router.escalate."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, r, "ESCALATE", None)
+        r.ESCALATE = {"after_reminders": 2, "undelivered_minutes": 60,
+                      "label": "Status:waiting-owner"}
+        self.github = None
+
+    def tick(self, prs, minutes, send=True, refuse=None, closed=()):
+        self.refuse = refuse
+        self.github = EscalateGitHub(response(list(prs), []), closed=closed)
+        return r.run(self.github, ROSTER, self.dir, send, self.post, None,
+                     self.lines.append, when=NOW + datetime.timedelta(
+                         minutes=minutes), remind_s=600)
+
+    def made(self):
+        return [w for w in self.github.writes
+                if w[0] == "POST" and w[1] == "repos/example/widget/issues"]
+
+    def escalated(self):
+        with open(os.path.join(self.dir, r.ESCALATE_NAME)) as handle:
+            return json.load(handle)
+
+    def test_a_turn_reminded_after_reminders_times_opens_one_issue(self):
+        self.tick([pr_node(41)], 0)
+        self.tick([pr_node(41)], 10)
+        self.assertEqual(self.made(), [])
+        self.tick([pr_node(41)], 20)
+        (made,) = self.made()
+        self.assertEqual(made[2]["title"],
+                         "forge-router: Reviewer hasn't taken up #41")
+        self.assertIn("#41 has had 2 reminders", made[2]["body"])
+        self.assertNotIn("@", made[2]["body"].split("\n\n")[0])
+        labels = [w[2]["labels[]"] for w in self.github.writes
+                  if w[1].endswith("/issues/900/labels")]
+        self.assertEqual(labels, ["Status:waiting-owner", "Owner:Reviewer"])
+        # Told once: the next reminder neither opens nor comments.
+        self.tick([pr_node(41)], 30)
+        self.assertEqual(self.made(), [])
+        self.assertFalse([w for w in self.github.writes
+                          if w[1].endswith("/comments")])
+        # The turn stops being decided: closed with a comment.
+        self.tick([], 40)
+        comment, unlabel, close = self.github.writes
+        self.assertIn("no turn left unanswered", comment[2]["body"])
+        self.assertEqual(unlabel[0], "DELETE")
+        self.assertEqual(close[2], {"state": "closed"})
+        self.assertEqual(self.escalated()["issues"], {})
+
+    def test_to_is_mentioned_never_assigned(self):
+        r.ESCALATE = dict(r.ESCALATE, to="example-owner")
+        for minutes in (0, 10, 20):
+            self.tick([pr_node(41)], minutes)
+        (made,) = self.made()
+        self.assertTrue(made[2]["body"].startswith("@example-owner: "))
+        self.assertFalse([w for w in self.github.writes
+                          if "assignees" in w[1] or "assignees" in w[2]])
+
+    def test_undelivered_wakes_escalate_after_the_minutes(self):
+        self.tick([pr_node(41)], 0, refuse="404 unknown-name")
+        self.assertEqual(self.escalated()["agents"]["Reviewer"][
+            "undelivered_since"], "2026-10-09T14:00:00Z")
+        self.tick([pr_node(41)], 59, refuse="404 unknown-name")
+        self.assertEqual(self.made(), [])
+        self.tick([pr_node(41)], 60, refuse="404 unknown-name")
+        (made,) = self.made()
+        self.assertEqual(made[2]["title"],
+                         "forge-router: Reviewer can't be reached")
+        self.assertIn("404 unknown-name", made[2]["body"])
+        # A delivered wake closes it, and forgets the time.
+        self.tick([pr_node(41)], 70)
+        self.assertEqual(self.github.writes[-1][2], {"state": "closed"})
+        self.assertNotIn("Reviewer", self.escalated()["agents"])
+
+    def test_an_away_agent_is_never_escalated_for_undelivered_wakes(self):
+        roster = ROSTER
+        self.addCleanup(setattr, roster, "stand_in", roster.stand_in)
+        roster.stand_in = lambda name: "LeadDev" if name == "Reviewer" \
+            else name
+        for minutes in (0, 61):
+            self.tick([pr_node(41)], minutes, refuse="404 unknown-name")
+        self.assertEqual(self.made(), [])
+
+    def test_an_unreachable_relay_is_one_issue_not_one_per_agent(self):
+        prs = [pr_node(41), pr_node(44, statuses=[status("FAILURE")])]
+        for minutes in (0, 61):
+            self.tick(prs, minutes, refuse=r.UNREACHABLE + ": refused")
+        (made,) = self.made()
+        self.assertEqual(made[2]["title"],
+                         "forge-router: the relay delivers no wakes")
+        self.assertEqual(self.escalated()["agents"], {})
+        self.assertEqual([w[2]["labels[]"] for w in self.github.writes
+                          if w[1].endswith("/labels")],
+                         ["Status:waiting-owner"])
+
+    def test_a_second_trigger_comments(self):
+        for minutes in (0, 10, 20):
+            self.tick([pr_node(41), pr_node(43)], minutes)
+        # Both of Reviewer's turns reached it in the same run: one issue.
+        self.assertEqual(len(self.made()), 1)
+        self.tick([pr_node(41), pr_node(43)], 30, refuse="404 unknown-name")
+        self.tick([pr_node(41), pr_node(43)], 91, refuse="404 unknown-name")
+        (comment,) = [w for w in self.github.writes
+                      if w[1].endswith("/comments")]
+        self.assertIn("no session of hers has taken a wake", comment[2]["body"])
+
+    def test_closed_by_hand_is_answered(self):
+        for minutes in (0, 10, 20):
+            self.tick([pr_node(41)], minutes)
+        self.tick([pr_node(41)], 30, closed={900})
+        self.assertEqual(self.made(), [])
+        self.assertEqual(self.escalated()["answered"],
+                         {"Reviewer": [json.dumps(
+                             ["Reviewer", "41", T1]).join(["a:", ""])]})
+        self.tick([pr_node(41)], 40)
+        self.assertEqual(self.made(), [])
+
+    def test_a_dry_run_writes_nothing(self):
+        for minutes in (0, 10, 20):
+            self.tick([pr_node(41)], minutes)
+        os.remove(os.path.join(self.dir, r.ESCALATE_NAME))
+        self.tick([pr_node(41)], 25, send=False)
+        self.assertEqual(self.github.writes, [])
+        self.assertFalse(os.path.exists(os.path.join(self.dir,
+                                                     r.ESCALATE_NAME)))
+        self.assertTrue(any(l.startswith("WOULD ESCALATE Reviewer: #41")
+                            for l in self.lines))
+
+    def test_config(self):
+        data = example()
+        for escalate, said in (
+                ({}, "needs after_reminders or undelivered_minutes"),
+                ({"after_reminders": 0}, "after_reminders must be at least 1"),
+                ({"undelivered_minutes": 10},
+                 "undelivered_minutes must be at least 30"),
+                ({"after_reminders": 3, "to": " "}, "to must not be empty"),
+                ({"after_reminders": 3, "who": "x"}, "who")):
+            data["router"] = {"escalate": escalate}
+            problems = config.check(data)
+            self.assertTrue(any(said in p for p in problems),
+                            (escalate, problems))
+        data["router"] = {"escalate": {"after_reminders": 4,
+                                       "undelivered_minutes": 120}}
+        self.assertEqual(config.check(data), [])
+
+
 if __name__ == "__main__":
     unittest.main()

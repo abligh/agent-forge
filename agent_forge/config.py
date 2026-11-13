@@ -125,7 +125,7 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "queued_stall_minutes": int, "read_as": str, "age_first": dict,
          "hand_back_once_per_head": bool, "own_head_green": bool,
          "stall_run_factor": (int, float), "resolve_slots": int,
-         "mode": str, "code_owner_ask": dict}
+         "mode": str, "code_owner_ask": dict, "code_owner_sequence": bool}
 # merge.code_owner_ask (agent-forge #153).
 CODE_OWNER_ASK = {"labels": list, "title": str}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
@@ -258,7 +258,10 @@ RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
           "stuck": dict, "owners": dict, "unreviewed": dict,
           "forget_minutes": int, "quiet_labels": list, "red_first": dict,
-          "nightly_wake": dict, "issue_blocked_by": str}
+          "nightly_wake": dict, "issue_blocked_by": str, "escalate": dict}
+# router.escalate (designs/0049).
+ESCALATE = {"after_reminders": int, "undelivered_minutes": int,
+            "label": str, "to": str}
 # Where an issue's `Blocked-by:` lines may be (agent_forge/rules_default.py).
 ISSUE_BLOCKED_BY = ("body", "agents")
 IDLE_OFFER = {"idle_minutes": int, "shell_minutes": int, "report_to": str,
@@ -659,6 +662,8 @@ def check(data):
         if isinstance(router.get("nightly_wake"), dict):
             _check_nightly_wake(router["nightly_wake"], "nightly" in data,
                                 problems)
+        if isinstance(router.get("escalate"), dict):
+            _check_escalate(router["escalate"], problems)
         if isinstance(router.get("issue_blocked_by"), str) and \
                 router["issue_blocked_by"] not in ISSUE_BLOCKED_BY:
             problems.append("router.issue_blocked_by must be one of %s"
@@ -687,6 +692,10 @@ def check(data):
             _check_stall_alert(merge["stall_alert"], data["agents"], problems)
         if isinstance(merge.get("code_owner_ask"), dict):
             _check_code_owner_ask(merge, problems)
+        if merge.get("code_owner_sequence") is True and \
+                merge.get("code_owners") is not True:
+            problems.append("merge.code_owner_sequence needs "
+                            "merge.code_owners")
         if merge.get("test_ahead") is True and not isinstance(
                 data.get("checks"), dict):
             problems.append("merge.test_ahead needs checks: the build "
@@ -975,6 +984,23 @@ def _check_stall_alert(alert, agents, problems):
     if isinstance(labels, list) and not all(
             isinstance(l, str) and l.strip() for l in labels):
         problems.append("%s.labels must be a list of label names" % where)
+
+
+def _check_escalate(escalate, problems):
+    """router.escalate (designs/0049)."""
+    where = "router.escalate"
+    if not _fields(where, escalate, ESCALATE, problems):
+        return
+    if "after_reminders" not in escalate and \
+            "undelivered_minutes" not in escalate:
+        problems.append("%s needs after_reminders or undelivered_minutes"
+                        % where)
+    for key, low in (("after_reminders", 1), ("undelivered_minutes", 30)):
+        if _is(escalate.get(key), int) and escalate[key] < low:
+            problems.append("%s.%s must be at least %d" % (where, key, low))
+    for key in ("label", "to"):
+        if isinstance(escalate.get(key), str) and not escalate[key].strip():
+            problems.append("%s.%s must not be empty" % (where, key))
 
 
 def _check_code_owner_ask(merge, problems):
