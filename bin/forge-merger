@@ -588,8 +588,14 @@ the top's run still counts, and a train merged as one (`train_merge`)
 merges its new head. A restacked layer stays a candidate meanwhile: its
 build check's and gated instances' verdicts on the head before the
 restack still count (`on_main`). The rest keep their
-places, and the train's top, now a new tree, is run again. A pull
-request that is urgent or fixes a red default branch and is in no train
+places, and the train's top, now a new tree, is run again. When one
+leaves the first train after its top's run has started (and isn't red),
+the members below it are kept with that top (ahead.json's `left_top`;
+`merge.test_ahead.left_top_covers`, agent-forge #296): the old top's
+tree held each of theirs as the new train does, and a prediction's run
+is never stopped, so once it is green they merge as one train
+(`TRAIN-UNDER-LEFT #a..#b`) without waiting for the new top's run. A
+pull request that is urgent or fixes a red default branch and is in no train
 cuts every train after the first again, and the default branch moving to
 a tree no train predicted cuts them all (`TRAIN-RECUT: ...`). A red
 top's members are the suspects, as a red batch's, a stack's layers held
@@ -1099,6 +1105,10 @@ BATCH_WAIT_REASON = ("its green came from a batch that has changed since; "
 # merge.test_ahead.layers_need_own_green: whether a stack's layer needs
 # its own build check's green to board its base's train.
 LAYERS_OWN_GREEN = True
+# merge.test_ahead.left_top_covers (agent-forge #296): when a member
+# leaves the first train mid-run, the members below it merge on the old
+# top's green rather than waiting for the new top's run.
+LEFT_TOP_COVERS = True
 # merge.test_ahead.own_green_to_board: whether any pull request needs
 # its own build check's green to board a train (false: its approval is
 # enough, and the train's top tests it; amendment of 2026-11-12, ninth).
@@ -1308,6 +1318,7 @@ def configure(project):
     global UNSTABLE_BATCHES, TELL_BOARDED
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
     global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR, LAYERS_OWN_GREEN
+    global LEFT_TOP_COVERS
     global OWN_GREEN_TO_BOARD
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
@@ -1370,6 +1381,7 @@ def configure(project):
     TRAINS = (ahead or {}).get("trains")
     TRAINS_WITHIN = (ahead or {}).get("trains_within", "files")
     TRAIN_MERGE = (ahead or {}).get("train_merge") is True
+    LEFT_TOP_COVERS = (ahead or {}).get("left_top_covers") is not False
     LAYERS_OWN_GREEN = (ahead or {}).get("layers_need_own_green") \
         is not False
     OWN_GREEN_TO_BOARD = (ahead or {}).get("own_green_to_board") \
@@ -6154,6 +6166,69 @@ def train_ready(last, queue, main_tip, check_state, repo=None, run=sh,
     return ready
 
 
+def left_top(last, entries, sizes, base, check_state):
+    """merge.test_ahead.left_top_covers (agent-forge #296): the first
+    train as `last` (ahead.json) cut it, cut back to the members below
+    the first to leave it, when its top's run has started and isn't red,
+    as {"tree": that top's tree, "sha", "entries": those members}; or
+    the one `last` kept, while it is still the start of the new first
+    train. None otherwise. The old top's tree held every one of those
+    members' trees as the new train does, so its green covers them, as
+    a green top covers every member under it; a prediction's run is
+    never stopped for another (forge-pr-check `preempt_victim`), so it
+    finishes. On one project (2026-11-11) a push to the fourth member of
+    six made the third wait 24 minutes for the new top's run."""
+    if not LEFT_TOP_COVERS or not isinstance(last, dict) \
+            or not last.get("trains") or not sizes or not entries \
+            or last.get("base") != base:
+        return None
+    old = (last.get("entries") or [])[
+        :((last.get("batch") or {}).get("size") or 0)]
+    new = entries[:sizes[0]]
+    kept = last.get("left_top") if isinstance(last.get("left_top"),
+                                              dict) else None
+
+    def same(a, b):
+        return all(a.get(k) == b.get(k) for k in ("pr", "head", "tree",
+                                                  "sha"))
+    if old and old[-1].get("tree") != new[-1].get("tree") \
+            and ahead_started(check_state, old[-1].get("sha"),
+                              old[-1].get("tree")) \
+            and tree_verdict(check_state, old[-1].get("tree")) is not False:
+        k = 0
+        while k < min(len(old), len(new)) and same(old[k], new[k]):
+            k += 1
+        if 0 < k < len(old):
+            kept = {"tree": old[-1]["tree"], "sha": old[-1].get("sha"),
+                    "entries": old[:k]}
+    if kept is None:
+        return None
+    members = kept.get("entries") or []
+    if not members or len(members) > len(new) \
+            or tree_verdict(check_state, kept.get("tree")) is False \
+            or not all(same(a, b) for a, b in zip(members, new)):
+        return None
+    return kept
+
+
+def left_ready(last, queue, base, check_state):
+    """The members of `last`'s `left_top` (ahead.json) that merge now,
+    on its top's green, as one train: when that top is green, the trains
+    are still predicted on `base`, and each member is in `queue` at the
+    head it boarded with. None otherwise."""
+    kept = (last or {}).get("left_top")
+    if not LEFT_TOP_COVERS or not isinstance(kept, dict) \
+            or last.get("base") != base \
+            or tree_verdict(check_state, kept.get("tree")) is not True:
+        return None
+    members = kept.get("entries") or []
+    heads = {pr["number"]: pr["headRefOid"] for pr in queue}
+    if not members or any(heads.get(e.get("pr")) != e.get("head")
+                          for e in members):
+        return None
+    return members
+
+
 def boarded_layers(last):
     """{number: head} of the stack's layers on the trains in `last`
     (ahead.json): members that boarded on a pull request below them,
@@ -6280,7 +6355,7 @@ def train_onto(repo, top, main, run=sh):
 
 def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
                 github, run=sh, sleep=time.sleep, out=print, note=None,
-                main=None):
+                main=None, tested_tree=None):
     """merge.test_ahead.train_merge (designs/0047, amendment of
     2026-11-11): merge a green train with one pull request. The chain
     of `train_commits` is pushed to TRAIN_BRANCH<first>-<last>, given
@@ -6296,7 +6371,9 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
     `main`, the default branch's tip when the train was kept on
     `main_tip`, an older base (`carried_base`), is merged on top of the
     chain, cleanly or not at all: the tree that goes in is the tested
-    one plus only the commits of labels.keep_trains."""
+    one plus only the commits of labels.keep_trains. `tested_tree`,
+    when the train is the members below a left member (`left_ready`), is
+    the old top's tree, whose green covers them."""
     prs = {pr["number"]: pr for pr in queue}
     numbers = [e["pr"] for e in entries]
     span = "#%d..#%d" % (numbers[0], numbers[-1])
@@ -6332,13 +6409,15 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
     tested = [sha for sha, r in ((check_state or {}).get("results")
                                  or {}).items()
               if isinstance(r, dict) and r.get("ok") is True
-              and r.get("tree") == entries[-1]["tree"]
+              and r.get("tree") == (tested_tree or entries[-1]["tree"])
               and not r.get("covered")]
     ok, why = github.write(
         "POST", "repos/%s/statuses/%s" % (REPO_SLUG, top), state="success",
         context=STATUS_CONTEXT, description=(
-            "green: the Merger's train %s, its tree tested as %s%s"
-            % (span, short(tested[0]) if tested else "its top",
+            "green: the Merger's train %s, %s %s%s"
+            % (span, "under a top tested green as" if tested_tree
+               else "its tree tested as",
+               short(tested[0]) if tested else "its top",
                ", %s's kept commits merged on top" % MAIN
                if main and main != main_tip else ""))[:140])
     if not ok:
@@ -7661,11 +7740,22 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         entries = train_ready(last_ahead, members, train_base, check_state,
                               repo, run,
                               restacks if PREDICT_RESTACKED else None)
+        tested_tree = None
+        if not entries:
+            entries = left_ready(last_ahead, members, train_base,
+                                 check_state)
+            if entries:
+                tested_tree = last_ahead["left_top"]["tree"]
+                out("TRAIN-UNDER-LEFT #%d..#%d: merge on the green of the "
+                    "top they were cut under, %s" % (
+                        entries[0]["pr"], entries[-1]["pr"],
+                        short(last_ahead["left_top"].get("sha") or "")))
         if entries:
             opened = {}
             merged, _ = train_merge(repo, state_dir, entries, members,
                                     train_base, check_state, github, run,
-                                    sleep, out, opened, main=main_tip)
+                                    sleep, out, opened, main=main_tip,
+                                    tested_tree=tested_tree)
             # GitHub wouldn't take the train: its members merge one at
             # a time this tick, updated as before.
             train_failed = not merged
@@ -8211,6 +8301,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 said_ahead["kept_trains"] = last["kept_trains"]
             if sizes is not None:
                 said_ahead["trains"] = True
+                under = left_top(last, entries, sizes,
+                                 said_ahead["base"], check_state)
+                if under is not None:
+                    said_ahead["left_top"] = under
                 if note.get("urgent_cut"):
                     said_ahead["urgent_cut"] = note["urgent_cut"]
                 record["trains"] = train_lists(entries, sizes)

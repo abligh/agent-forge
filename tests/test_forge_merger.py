@@ -8916,6 +8916,85 @@ class RedMain(unittest.TestCase):
 SHARED = "".join("line %d\n" % k for k in range(1, 21))
 
 
+class LeftTopCovers(TrainSetup):
+    """merge.test_ahead.left_top_covers (agent-forge #296): when a member
+    leaves the first train mid-run, the members below it merge on the
+    old top's green instead of waiting for the new top's run."""
+
+    def setUp(self):
+        super().setUp()
+        self.last = dict(self.last, trains=True)
+        # #6 was pushed mid-train: the new first train is #5 and #6's
+        # new head, with another top.
+        self.moved = dict(self.entries[1], head="f" * 40, sha="e" * 40,
+                          tree="d" * 40)
+        self.new = [self.entries[0], self.moved]
+        self.started = {"results": {}, "ahead_started": {
+            self.entries[1]["sha"]: "2026-11-12T21:40:00Z"}}
+
+    def test_the_members_below_a_leaver_are_kept_with_the_old_top(self):
+        got = m.left_top(self.last, self.new, [2], self.tip, self.started)
+        self.assertEqual(got["tree"], self.entries[1]["tree"])
+        self.assertEqual([e["pr"] for e in got["entries"]], [5])
+
+    def test_only_a_started_top_that_is_not_red_covers(self):
+        self.assertIsNone(m.left_top(self.last, self.new, [2], self.tip,
+                                     {"results": {}}))
+        red = dict(self.started, results={"r": {
+            "ok": False, "tree": self.entries[1]["tree"]}})
+        self.assertIsNone(m.left_top(self.last, self.new, [2], self.tip, red))
+        self.assertIsNone(m.left_top(self.last, self.new, [2], "c" * 40,
+                                     self.started))
+
+    def test_a_kept_one_lasts_while_its_members_start_the_first_train(self):
+        kept = m.left_top(self.last, self.new, [2], self.tip, self.started)
+        later = dict(self.last, entries=self.new, left_top=kept,
+                     batch={"size": 2, "trees": [e["tree"]
+                                                 for e in self.new]})
+        self.assertEqual(m.left_top(later, self.new, [2], self.tip,
+                                    self.started), kept)
+        gone = [dict(self.entries[0], head="a" * 40), self.moved]
+        self.assertIsNone(m.left_top(later, gone, [2], self.tip,
+                                     self.started))
+
+    def test_nothing_is_kept_when_no_member_is_below_the_leaver(self):
+        first = [dict(self.entries[0], head="a" * 40, tree="b" * 40),
+                 self.moved]
+        self.assertIsNone(m.left_top(self.last, first, [2], self.tip,
+                                     self.started))
+
+    def test_switched_off_nothing_is_kept_or_merged(self):
+        with mock.patch.object(m, "LEFT_TOP_COVERS", False):
+            self.assertIsNone(m.left_top(self.last, self.new, [2], self.tip,
+                                         self.started))
+            last = dict(self.last, left_top={
+                "tree": self.entries[1]["tree"], "entries": self.new[:1]})
+            self.assertIsNone(m.left_ready(last, self.queue, self.tip,
+                                           self.check))
+
+    def test_the_members_merge_once_the_old_top_is_green(self):
+        last = dict(self.last, left_top=m.left_top(
+            self.last, self.new, [2], self.tip, self.started))
+        got = m.left_ready(last, self.queue, self.tip, self.check)
+        self.assertEqual([e["pr"] for e in got], [5])
+        self.assertIsNone(m.left_ready(last, self.queue, self.tip,
+                                       self.started))
+        self.assertIsNone(m.left_ready(last, self.queue, "c" * 40,
+                                       self.check))
+        pushed = [dict(self.queue[0], headRefOid="a" * 40), self.queue[1]]
+        self.assertIsNone(m.left_ready(last, pushed, self.tip, self.check))
+
+    def test_the_train_below_merges_with_the_old_tops_green(self):
+        self.github = FakeGitHub({SLUG + "/pulls/5": {"merged": True}})
+        got = m.train_merge(self.repo.path, "/nonexistent", self.entries[:1],
+                            self.queue, self.tip, self.check, self.github,
+                            self.git, lambda s: None, self.lines.append,
+                            tested_tree=self.entries[1]["tree"])
+        self.assertEqual(got, ([5], []))
+        status = self.github.writes[0][2]
+        self.assertIn("under a top tested green as r", status["description"])
+
+
 class TrainInTheWay(TrainSetup):
     """A pull request outside the first train doesn't merge on its own
     under that train's started run (2026-11-12: #10784 did, 25 minutes

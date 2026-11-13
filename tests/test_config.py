@@ -94,6 +94,14 @@ class Check(unittest.TestCase):
         self.assertEqual(config.check(data), [
             "merge.test_ahead.own_green_to_board must be true or false"])
 
+    def test_test_ahead_left_top_covers_is_a_boolean(self):
+        data = example()
+        data.setdefault("merge", {})["test_ahead"] = {"left_top_covers": False}
+        self.assertEqual(config.check(data), [])
+        data["merge"]["test_ahead"]["left_top_covers"] = "no"
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.left_top_covers must be true or false"])
+
     def test_test_ahead_spare_slots_only_is_a_boolean(self):
         data = example()
         data.setdefault("merge", {})["test_ahead"] = {"spare_slots_only": True}
