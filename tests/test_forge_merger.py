@@ -4125,6 +4125,30 @@ class TickAhead(RepoCase):
                          [("WAIT", m.TRAIN_AHEAD_REASON % "#6..#6")])
         self.assertNotIn("/merge", " ".join(w[1] for w in self.github.writes))
 
+    def test_an_urgent_one_heads_the_next_train(self):
+        # 2026-11-13: an urgent pin (#11215) went in front of a train
+        # whose top was testing, cut every train again and spent that
+        # run. An urgent one heads the next train cut instead.
+        data = urgent_project(test_ahead={"batch": 1, "batches": 2,
+                                          "trains": "live",
+                                          "train_merge": True})
+        m.configure(data)
+        self.addCleanup(m.configure, project())
+        five = self.item()
+        self.tick([five], conclusions=(None,), live=True)
+        self.assertEqual([e["pr"] for e in self.ahead_json()["entries"]],
+                         [5])
+        top = self.ahead_json()["entries"][0]
+        hot = labelled(self.other_pr(), "Priority:urgent")
+        record, lines = self.tick([five, hot], live=True, minutes=1,
+                                  check_state={"results": {},
+                                               "ahead_started": {
+                                                   top["sha"]: "x"}})
+        self.assertFalse([l for l in lines if "RECUT" in l], lines)
+        # It heads the next train, behind #5's.
+        self.assertEqual(record["ahead"], [5, 6])
+        self.assertEqual(record["trains"], [[5], [6]])
+
     def behind_main_on_a_train(self, **ahead):
         """#5 and #6 boarded on one train, then main moves on, so #5,
         first in the queue, is behind it: the second tick's record."""
@@ -9338,6 +9362,12 @@ class Trains(RepoCase):
                               % (k, number))
         return self.change(number, "shared.txt", text, created)
 
+    def fixes(self, number):
+        """#`number` fixes a red default branch."""
+        patch = mock.patch.object(m, "MAIN_RED_FIXES", frozenset({number}))
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def cut(self, carriages, last=None, open_numbers=None, check=None,
             started=None, acting=None):
         heads = {p["number"]: p["headRefOid"]
@@ -9718,7 +9748,10 @@ class Trains(RepoCase):
         self.assertEqual([e["tree"] for e in got],
                          [e["tree"] for e in entries])
 
-    def test_an_urgent_one_cuts_the_trains_behind_the_first(self):
+    def test_a_red_mains_fix_cuts_the_trains_behind_the_first(self):
+        # Only a red default branch's fix cuts trains already cut; one
+        # labelled urgent heads the next train (2026-11-13).
+        self.fixes(8)
         six, seven = self.change(6, "y.txt", "y\n"), self.change(
             7, "z.txt", "z\n")
         self.configure(batch=1, batches=3)
@@ -9731,6 +9764,27 @@ class Trains(RepoCase):
                                      "trains after train 1 are cut "
                                      "again"))
         self.assertEqual(self.numbers(got, sizes), [[5], [8], [6]])
+
+    def test_an_urgent_one_heads_the_next_train_and_cuts_none(self):
+        # 2026-11-13: an urgent pin went in front of a train whose top
+        # was testing and every train was cut again. One labelled
+        # urgent heads the next train cut, behind those already cut,
+        # whether or not they have started.
+        self.configure(batch=2, batches=3)
+        six, seven = self.change(6, "y.txt", "y\n"), self.change(
+            7, "z.txt", "z\n")
+        entries, sizes, _ = self.cut([[self.item()], [six], [seven]])
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6], [7]])
+        hot = labelled(self.change(9, "u.txt", "u\n"), "Priority:urgent")
+        ten = self.change(10, "w.txt", "w\n")
+        for queue in ([[hot], [self.item()], [six], [seven], [ten]],
+                      [[self.item()], [six], [seven], [ten], [hot]]):
+            got, sizes2, events = self.cut(
+                queue, self.said(entries, sizes),
+                started=lambda sha, tree: False)
+            self.assertEqual(events, [("cut", "CUT 3: #9 #10")])
+            self.assertEqual(self.numbers(got, sizes2),
+                             [[5, 6], [7], [9, 10]])
 
     def test_others_fill_an_urgent_ones_train(self):
         # designs/0047, amendment of 2026-11-11: an urgent one goes first
@@ -9755,7 +9809,10 @@ class Trains(RepoCase):
         entries, sizes, _ = self.cut([[self.item()], [six], [hot]])
         self.assertEqual(self.numbers(entries, sizes), [[8, 5, 6]])
 
-    def test_an_urgent_one_heads_the_first_train_not_started(self):
+    def test_a_red_mains_fix_heads_the_first_train_not_started(self):
+        # Only a red default branch's fix cuts trains already cut; one
+        # labelled urgent heads the next train (2026-11-13).
+        self.fixes(9)
         # Train 2 hasn't started: #9 heads it again, and it fills up
         # with the queue's next ones, not a train of its own.
         self.configure(batch=2, batches=3)
@@ -9973,7 +10030,10 @@ class Trains(RepoCase):
         self.assertEqual(record["train_events"], ["left"])
         self.assertIs(record["recut"], True)
 
-    def test_an_urgent_one_that_cannot_board_cuts_only_once(self):
+    def test_a_red_mains_fix_that_cannot_board_cuts_only_once(self):
+        # Only a red default branch's fix cuts trains already cut; one
+        # labelled urgent heads the next train (2026-11-13).
+        self.fixes(8)
         six, seven = self.change(6, "y.txt", "y\n"), self.change(
             7, "z.txt", "z\n")
         self.configure(batch=1, batches=3)
@@ -10011,7 +10071,10 @@ class Trains(RepoCase):
         self.assertEqual(self.numbers(got, sizes), [[5, 6]])
         self.assertEqual(events, [])
 
-    def test_an_urgent_one_the_queue_puts_first_cuts_every_train(self):
+    def test_a_red_mains_fix_the_queue_puts_first_cuts_every_train(self):
+        # Only a red default branch's fix cuts trains already cut; one
+        # labelled urgent heads the next train (2026-11-13).
+        self.fixes(8)
         six = self.change(6, "y.txt", "y\n")
         self.configure(batch=2, batches=2)
         entries, sizes, _ = self.cut([[self.item()], [six]])
