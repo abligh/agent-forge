@@ -1009,7 +1009,13 @@ reference, or `#N`, its URL or "issue N" in the body). With
 its turn has ended and only a background task it started still runs,
 such as a wait loop that will never finish (designs/0017). Its offer
 says since when the task has been running. One offer per idle period,
-never reminded, unless `retell_minutes` is set. An idle developer with
+never reminded, unless `retell_minutes` is set. An idle agent that
+has a turn from the other rules, one the last sending run already woke
+it for, is told that instead: "You have been idle since …, and it is
+your turn: …", naming up to three turns, pull requests first, once per
+idle period (or every `retell_minutes`). Without it, an agent that
+went idle on a turn heard of it again only at the turn's reminder,
+hours later. An idle developer with
 nothing to act on is reported to `report_to`, once per idle period. A
 directory that can't
 be read, or isn't complete, makes nobody idle. Off without the key;
@@ -1032,7 +1038,9 @@ waits until someone tells it. With `merge_notice`, each router run
 that isn't `--only`'s reads the pull requests merged in the last
 `window_minutes`, and tells each agent that wrote one, once: that it
 merged, which open issues it leaves with nothing blocking them, and
-the author's oldest issue it can act on (as the idle offer reads it).
+the author's turns from the other rules (as the idle offer names
+them), or, with none, the author's oldest issue it can act on (as the
+idle offer reads it).
 Merges that can't be read are not taken as none. Off without the key;
 `{}` turns it on with the defaults. `agent_forge/rules_default.py`
 (rule 17) has the detail.

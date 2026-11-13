@@ -351,8 +351,10 @@ IN_PROGRESS = "Status:in-progress"
 # How many unstarted issues rule 16 names at most (designs/0038).
 HAND_OVER_LIST = 10
 DEFAULT_IDLE_MINUTES = 10
-# The engine reads the relay's directory only for the idle offer.
+# The engine reads the relay's directory only for the idle offer, and
+# the last run's decisions only for its reminder of turns.
 wants_directory = False
+wants_previous = False
 # `router.merge_notice`, with its defaults filled in, or None: off.
 MERGE_NOTICE = None
 DEFAULT_MERGE_WINDOW = 30
@@ -441,7 +443,8 @@ def configure(project, merger_tool):
     """Set the rules' settings from `project`. `merger_tool`, already
     configured for it, is bin/forge-merger."""
     global merger, MERGER, OWNER, WAITING_OWNER, WAITING_EXTERNAL
-    global OWNER_PREFIX, STATUS_CONTEXT, IDLE_OFFER, wants_directory
+    global OWNER_PREFIX, STATUS_CONTEXT, IDLE_OFFER, wants_directory, \
+        wants_previous
     global MERGE_NOTICE, merged_window
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
     global UNREVIEWED, QUIET_LABELS, IN_PROGRESS, RED_FIRST, PROJECT
@@ -468,6 +471,7 @@ def configure(project, merger_tool):
         "retell_minutes": offer.get("retell_minutes")}
     IN_PROGRESS = labels.get("status_prefix", "Status:") + "in-progress"
     wants_directory = IDLE_OFFER is not None
+    wants_previous = IDLE_OFFER is not None
     notice = project.section("router").get("merge_notice")
     MERGE_NOTICE = None if notice is None else {
         "window_minutes": notice.get("window_minutes",
@@ -1326,15 +1330,47 @@ def owned_issues(agent, ctx):
     return actionable, held, waiting
 
 
+def turns_of(agent, ctx):
+    """The turns rules 0a-14 give the agent on open items, as `turn`
+    builds them: pull requests first, then issues, each oldest first."""
+    found = []
+    for item in ctx.prs + ctx.issues:
+        pr = item.get("__typename") == "PullRequest"
+        decided = route_pr(item, ctx.roster, ctx.when) if pr \
+            else route_issue(item, ctx.roster, ctx)
+        if decided["who"] == agent and decided.get("line"):
+            found.append((not pr, item["number"], decided))
+    return [decided for _, _, decided in sorted(found, key=lambda t: t[:2])]
+
+
 def has_turn(agent, ctx):
     """Whether rules 0a-14 make any open item the agent's turn."""
-    for item in ctx.prs + ctx.issues:
-        decided = route_pr(item, ctx.roster, ctx.when) \
-            if item.get("__typename") == "PullRequest" \
-            else route_issue(item, ctx.roster, ctx)
-        if decided["who"] == agent:
-            return True
-    return False
+    return bool(turns_of(agent, ctx))
+
+
+def already_decided(agent, decided, ctx):
+    """Whether the last sending run (`ctx.previous`) gave `agent` the
+    turn `decided` (`turn`'s dict), at the same event. False when that
+    run is unknown."""
+    items = (ctx.previous or {}).get("items")
+    if not isinstance(items, dict):
+        return False
+    return any(isinstance(e, dict) and e.get("agent") == agent
+               and e.get("event") == decided.get("event")
+               for e in items.get(str(decided.get("item"))) or ())
+
+
+# The most turns an idle reminder names.
+IDLE_TURNS = 3
+
+
+def turns_text(turns):
+    """The turns an idle reminder names: "#5 the Merger handed it back
+    (...)", up to IDLE_TURNS of them, then how many more."""
+    text = "; ".join(t["line"] for t in turns[:IDLE_TURNS])
+    if len(turns) > IDLE_TURNS:
+        text += "; and %d more" % (len(turns) - IDLE_TURNS)
+    return text
 
 
 def since_text(stamp, when):
@@ -1373,7 +1409,29 @@ def idle_offers(ctx, skip=()):
     offered = set()
     for agent, (stamp, shell) in sorted(idle_sweep(ctx).items()):
         if agent in skip or not ctx.roster.is_agent(agent) \
-                or not ctx.roster.offered(agent) or has_turn(agent, ctx):
+                or not ctx.roster.offered(agent):
+            continue
+        turns = turns_of(agent, ctx)
+        # Only turns the last sending run already had (`ctx.previous`),
+        # so woken for: a new one's own wake tells it, in this run.
+        told = [t for t in turns if already_decided(agent, t, ctx)]
+        if turns and not told:
+            continue
+        if told:
+            turns = told
+            # Idle with a turn: its own wake may have come hours ago and
+            # its reminder is hours away, so the idle period reminds it
+            # (agent-forge, 2026-11-13: a stack's base handed back for a
+            # conflict sat with an idle author for over an hour).
+            decisions.append(Decision(
+                None, agent, 15, stamp,
+                "You have been idle since %s, and it is your turn: %s. "
+                "Act on it, or say on it why not.%s" % (
+                    since_text(stamp, ctx.when), turns_text(turns),
+                    " A background task of yours has been running since "
+                    "%s. Stop it if it is stale." % since_text(
+                        stamp, ctx.when) if shell else ""),
+                reminder=retell()))
             continue
         if steps and ctx.roster.project.kind(agent) not in NOT_REPORTED:
             # `red_first.everyone` (designs/0051): a red step first,
@@ -1832,7 +1890,10 @@ def merge_notices(ctx):
         if freed:
             text += " It unblocks %s." % ", ".join(freed)
         actionable, _, _ = owned_issues(agent, ctx)
-        if actionable:
+        turns = turns_of(agent, ctx)
+        if turns:
+            text += " Your turn next: %s." % turns_text(turns)
+        elif actionable:
             nxt = actionable[0]
             nxt_title = (nxt.get("title") or "").strip()
             text += " Your oldest item nothing blocks: #%d%s." % (
