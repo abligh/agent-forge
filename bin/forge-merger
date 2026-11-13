@@ -93,7 +93,10 @@ before. The rest are held, untold, with nothing in `handed-back.json`:
 `held` says `conflicts with main; waits for a resolve slot (2 out:
 #a, #b)`, they leave the record's `queue` and every prediction, and
 one `RESOLVE-WAIT #c #d: ...` line is printed. The record says
-`resolving` (those out) and `resolve_waiting`. A resolution done while
+`resolving` (those out) and `resolve_waiting`. With
+`merge.resolve_slot_minutes: M`, a slot held M minutes with no push runs
+out (`RESOLVE-EXPIRED`, `resolve_expired`): its pull request stays with
+its author and waits behind the others for another. A resolution done while
 others merge is often undone by the next merge; a slot keeps the few
 being resolved near the front, where they board soon after. A stack's
 layers are held as stacked while their base is out, as before, and a
@@ -1166,6 +1169,8 @@ EARLY_CONFLICTS = False
 # their authors for a conflict with main at once; the others that
 # conflict wait, held and not told, for a slot (0: no limit).
 RESOLVE_SLOTS = 0
+RESOLVE_SLOT_MINUTES = None
+RESOLVE_FILE = "resolve-slots.json"
 # merge.code_owners: hold one that changes a path CODEOWNERS gives an
 # owner until an owner has approved its head.
 CODE_OWNERS = False
@@ -1312,7 +1317,7 @@ def configure(project):
     global ROW_FOR, CODE_OWNERS, CHANGERS, EARLY_CONFLICTS, URGENT_LABEL
     global KEEP_LABEL
     global STACKS, STACK_MAX_RUN, STACK_WAIT, RESOLVE, HOLD_LABELS, BLOCKED_BY
-    global UNION, RESOLVE_SLOTS
+    global UNION, RESOLVE_SLOTS, RESOLVE_SLOT_MINUTES
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
@@ -1397,6 +1402,7 @@ def configure(project):
     CODE_OWNERS = merge.get("code_owners", False) is True
     EARLY_CONFLICTS = merge.get("early_conflicts", False) is True
     RESOLVE_SLOTS = merge.get("resolve_slots", 0)
+    RESOLVE_SLOT_MINUTES = merge.get("resolve_slot_minutes")
     row = merge.get("right_of_way")
     RIGHT_OF_WAY = row is not None
     ROW_AFTER = (row or {}).get("after_conflicts", 2)
@@ -3744,6 +3750,43 @@ def ci_rerun(decision, github, state_dir, when, live, out):
 # than handed back (designs/0012, amendment of 2026-11-12).
 RESOLVE_WAIT_REASON = ("conflicts with %s; waits for a resolve slot "
                        "(%d out: %s)")
+# merge.resolve_slot_minutes: why one whose slot ran out is held.
+RESOLVE_EXPIRED_REASON = ("conflicts with %s; its resolve slot ran out "
+                          "after %s minutes with no push, and it waits "
+                          "behind the others for another (%d out: %s)")
+
+
+def expire_resolving(path, resolving, prs, when):
+    """merge.resolve_slot_minutes: (kept, expired, slots), `resolving`
+    (`out_for_resolving`) split into those still holding their slot and
+    those whose slot ran out, and what `path` (RESOLVE_FILE) keeps: per
+    pull request out, its head and since when its slot has been held
+    at it. A slot runs out RESOLVE_SLOT_MINUTES after it was given with
+    no push, so one author's long resolution doesn't keep the others
+    from theirs; it is the author's push that frees a slot, and one
+    that ran out is still told and can still be pushed. Its pull request
+    is held like those that wait, behind them all (`resolve_slot_order`).
+    A pull request first seen out, or out at another head, counts from
+    now."""
+    before = load_json(path, {})
+    heads = {pr["number"]: pr["headRefOid"] for pr in prs}
+    slots, kept, expired = {}, [], []
+    for number in resolving:
+        entry = before.get(str(number))
+        if not isinstance(entry, dict) or entry.get("head") != heads[number]:
+            entry = {"head": heads[number], "since": iso(when)}
+        slots[str(number)] = entry
+        try:
+            held = when - parse_time(entry["since"])
+        except (KeyError, TypeError, ValueError):
+            entry["since"] = iso(when)
+            held = datetime.timedelta(0)
+        if RESOLVE_SLOT_MINUTES and held >= datetime.timedelta(
+                minutes=RESOLVE_SLOT_MINUTES):
+            expired.append(number)
+        else:
+            kept.append(number)
+    return kept, expired, slots
 
 
 def out_for_resolving(said, prs, repo, main_tip, run=sh):
@@ -3792,7 +3835,7 @@ def approved_above(number, prs):
     return count
 
 
-def resolve_slot_order(waiting, queue, prs, row=None):
+def resolve_slot_order(waiting, queue, prs, row=None, last=()):
     """merge.resolve_slots: `waiting`, pull requests that conflict with
     main and aren't out for resolving, in the order they get a slot:
     those labelled urgent, then the other urgent ones (`urgent`), then
@@ -3801,14 +3844,16 @@ def resolve_slot_order(waiting, queue, prs, row=None):
     them in, grouped by `merge.test_ahead.batch` when there are
     batches; within a group, a stack's base with more approved layers
     above it (`approved_above`) first, then the queue's order; last,
-    one not in the queue (held for an instance), oldest first."""
+    one not in the queue (held for an instance), oldest first. Those in
+    `last`, whose slot ran out (merge.resolve_slot_minutes), go after
+    all of them."""
     places = {pr["number"]: at for at, pr in enumerate(queue)}
     group = AHEAD_BATCH if TEST_AHEAD and AHEAD_BATCH > 1 else 1
     holder = row.get("pr") if row and not row.get("idle") else None
 
     def key(pr):
         place = places.get(pr["number"], len(places))
-        return (not labelled_urgent(pr), not urgent(pr),
+        return (pr["number"] in last, not labelled_urgent(pr), not urgent(pr),
                 pr["number"] != holder, place // group,
                 -approved_above(pr["number"], prs), place,
                 pr.get("createdAt") or "", pr["number"])
@@ -7809,6 +7854,19 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     # when the free slots go to those first in `resolve_slot_order`.
     resolving = out_for_resolving(said, prs, repo, main_tip, run) \
         if RESOLVE_SLOTS else []
+    # merge.resolve_slot_minutes: a slot held that long with no push runs
+    # out; its pull request waits behind the others for another.
+    expired, slots, slots_path = [], {}, os.path.join(
+        state_dir, RESOLVE_FILE if live else "dry-run-" + RESOLVE_FILE)
+    if RESOLVE_SLOTS and RESOLVE_SLOT_MINUTES:
+        resolving, expired, slots = expire_resolving(slots_path, resolving,
+                                                     prs, when)
+        for number in expired:
+            if not slots[str(number)].get("expired"):
+                slots[str(number)]["expired"] = True
+                out("RESOLVE-EXPIRED #%d: out for resolving %s minutes "
+                    "with no push; its slot goes to the next"
+                    % (number, "%g" % RESOLVE_SLOT_MINUTES))
     pending = []
 
     def conflict_back(pr, approval, reason=CONFLICT_REASON, detail=None):
@@ -8114,6 +8172,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             else:
                 record["decisions"].append(decision)
     slot_waiting = set()
+    if expired:
+        # Already told: if one gets a slot again there is nothing to say.
+        by_number = {pr["number"]: pr for pr in prs}
+        pending = pending + [(by_number[n], approvals.get(n), None)
+                             for n in expired]
     if pending:
         # merge.resolve_slots (designs/0012, amendment of 2026-11-12).
         seen, first = set(), []
@@ -8123,23 +8186,32 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 first.append(entry)
         entries = {entry[0]["number"]: entry for entry in first}
         ranked = resolve_slot_order([entry[0] for entry in first],
-                                    queue + instance_held, prs, row)
+                                    queue + instance_held, prs, row,
+                                    last=set(expired))
         free = max(0, RESOLVE_SLOTS - len(resolving))
         for pr in ranked[:free]:
             # Told now, while the others that wait still show as queued
             # in the comment's list of the author's other pull requests.
             _, approval, decision = entries[pr["number"]]
-            if live:
-                decision["result"] = carry_out(decision, approval, github,
-                                               said)
-            record["decisions"].append(decision)
+            if decision is not None:
+                if live:
+                    decision["result"] = carry_out(decision, approval,
+                                                   github, said)
+                record["decisions"].append(decision)
             resolving = resolving + [pr["number"]]
+            # A slot given, or given again, counts from now.
+            slots[str(pr["number"])] = {"head": pr["headRefOid"],
+                                        "since": iso(when)}
         slot_waiting = {pr["number"] for pr in ranked[free:]}
         for pr in ranked[free:]:
             if str(pr["number"]) not in held:
-                held[str(pr["number"])] = RESOLVE_WAIT_REASON % (
-                    MAIN, len(resolving),
-                    ", ".join("#%d" % n for n in resolving))
+                held[str(pr["number"])] = (
+                    RESOLVE_EXPIRED_REASON % (
+                        MAIN, "%g" % RESOLVE_SLOT_MINUTES, len(resolving),
+                        ", ".join("#%d" % n for n in resolving))
+                    if pr["number"] in expired else RESOLVE_WAIT_REASON % (
+                        MAIN, len(resolving),
+                        ", ".join("#%d" % n for n in resolving)))
         if slot_waiting:
             out("RESOLVE-WAIT %s: conflict with %s; %d of %d slots out (%s)"
                 % (" ".join("#%d" % pr["number"] for pr in ranked[free:]),
@@ -8147,6 +8219,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                    ", ".join("#%d" % n for n in resolving)))
             record["queue"] = [n for n in record["queue"]
                                if n not in slot_waiting]
+    if RESOLVE_SLOTS and RESOLVE_SLOT_MINUTES:
+        save_json(slots_path, slots)
+        if expired:
+            record["resolve_expired"] = sorted(expired)
     if RESOLVE_SLOTS:
         record["resolving"] = sorted(resolving)
         if slot_waiting:
