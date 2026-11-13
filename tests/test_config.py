@@ -831,6 +831,16 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"resolve_slots": "2"}),
                          ["merge.resolve_slots must be an integer"])
 
+    def test_merge_resolve_slot_minutes(self):
+        self.assertEqual(self.problems(merge={
+            "resolve_slots": 2, "resolve_slot_minutes": 45}), [])
+        self.assertEqual(self.problems(merge={
+            "resolve_slots": 2, "resolve_slot_minutes": 0}),
+            ["merge.resolve_slot_minutes must be above 0"])
+        self.assertEqual(self.problems(merge={"resolve_slot_minutes": 45}),
+                         ["merge.resolve_slot_minutes needs "
+                          "merge.resolve_slots"])
+
     def test_merge_right_of_way(self):
         self.assertEqual(self.problems(merge={
             "yield_ignores_conflicts": True,

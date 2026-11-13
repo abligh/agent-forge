@@ -5850,6 +5850,71 @@ class ResolveSlots(RepoCase):
         self.assertIn("9", record["held"])
         self.assertNotIn("resolve slot", record["held"]["9"])
 
+    # merge.resolve_slot_minutes: a slot held with no push runs out.
+
+    EXPIRED = ("conflicts with main; its resolve slot ran out after 30 "
+               "minutes with no push, and it waits behind the others for "
+               "another (%d out: %s)")
+
+    def test_a_slot_held_with_no_push_runs_out(self):
+        self.configure(resolve_slot_minutes=30)
+        prs = self.conflicting(6, 7, 8)
+        self.tick(prs, live=True)
+        self.assertEqual(self.told(), [6])
+        record, lines = self.tick(prs, live=True, minutes=29)
+        self.assertEqual((record["resolving"], self.told()), ([6], []))
+        record, lines = self.tick(prs, live=True, minutes=30)
+        self.assertIn("RESOLVE-EXPIRED #6: out for resolving 30 minutes "
+                      "with no push; its slot goes to the next", lines)
+        self.assertEqual(self.told(), [7])
+        self.assertEqual(record["resolving"], [7])
+        self.assertEqual(record["resolve_expired"], [6])
+        self.assertEqual(record["held"]["6"], self.EXPIRED % (1, "#7"))
+        self.assertEqual(record["held"]["8"], self.WAIT % (1, "#7"))
+        # Said once; #7's slot counts from when it was given.
+        record, lines = self.tick(prs, live=True, minutes=59)
+        self.assertFalse([l for l in lines if "RESOLVE-EXPIRED" in l])
+        self.assertEqual((record["resolving"], self.told()), ([7], []))
+
+    def test_one_whose_slot_ran_out_goes_after_those_waiting(self):
+        self.configure(resolve_slot_minutes=30)
+        prs = self.conflicting(6, 7, 8)
+        self.tick(prs, live=True)
+        self.tick(prs, live=True, minutes=30)
+        # #7 closes: #8 has waited, so it goes before #6 again.
+        record, _ = self.tick([prs[0], prs[2]], live=True, minutes=31)
+        self.assertEqual((record["resolving"], self.told()), ([8], [8]))
+        # #8 closes too: #6 has its slot back, untold, from now.
+        record, _ = self.tick(prs[:1], live=True, minutes=32)
+        self.assertEqual((record["resolving"], self.told()), ([6], []))
+        record, _ = self.tick(prs[:1], live=True, minutes=61)
+        self.assertEqual(record["resolving"], [6])
+        record, _ = self.tick(prs[:1], live=True, minutes=62)
+        self.assertEqual(record.get("resolve_expired"), [6])
+
+    def test_its_push_frees_one_whose_slot_ran_out(self):
+        self.configure(resolve_slot_minutes=30)
+        prs = self.conflicting(6, 7)
+        self.tick(prs, live=True)
+        self.tick(prs, live=True, minutes=30)
+        with open(os.path.join(self.state, m.RESOLVE_FILE)) as handle:
+            self.assertEqual(sorted(json.load(handle)), ["6", "7"])
+        # A head it wasn't told at is not out, whatever its slot did.
+        pushed = dict(prs[0], headRefOid="9" * 40)
+        kept, expired, slots = m.expire_resolving(
+            os.path.join(self.state, m.RESOLVE_FILE), [7], [pushed, prs[1]],
+            m.parse_time(T0))
+        self.assertEqual((kept, expired, sorted(slots)), ([7], [], ["7"]))
+
+    def test_without_minutes_a_slot_never_runs_out(self):
+        prs = self.conflicting(6, 7)
+        self.tick(prs, live=True)
+        record, _ = self.tick(prs, live=True, minutes=600)
+        self.assertEqual(record["resolving"], [6])
+        self.assertNotIn("resolve_expired", record)
+        self.assertFalse(os.path.exists(os.path.join(self.state,
+                                                     m.RESOLVE_FILE)))
+
     def test_the_order_slots_are_given_in(self):
         base = pr(6, "2026-10-07T03:00:00Z")
         layers = [pr(9, base="b6"), pr(10, base="b9", reviews=[])]

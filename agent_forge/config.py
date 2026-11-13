@@ -125,6 +125,7 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "queued_stall_minutes": int, "read_as": str, "age_first": dict,
          "hand_back_once_per_head": bool, "own_head_green": bool,
          "stall_run_factor": (int, float), "resolve_slots": int,
+         "resolve_slot_minutes": (int, float),
          "mode": str, "code_owner_ask": dict, "code_owner_sequence": bool}
 # merge.code_owner_ask (agent-forge #153).
 CODE_OWNER_ASK = {"labels": list, "title": str}
@@ -727,6 +728,12 @@ def check(data):
         if _is(merge.get("resolve_slots"), int) and merge["resolve_slots"] < 0:
             # 0 is no limit (designs/0012, amendment of 2026-11-12).
             problems.append("merge.resolve_slots must be at least 0")
+        if _is(merge.get("resolve_slot_minutes"), (int, float)) \
+                and merge["resolve_slot_minutes"] <= 0:
+            problems.append("merge.resolve_slot_minutes must be above 0")
+        if "resolve_slot_minutes" in merge and not merge.get("resolve_slots"):
+            problems.append("merge.resolve_slot_minutes needs "
+                            "merge.resolve_slots")
         if isinstance(merge.get("right_of_way"), dict):
             row = merge["right_of_way"]
             _fields("merge.right_of_way", row, RIGHT_OF_WAY, problems)
