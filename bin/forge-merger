@@ -335,7 +335,9 @@ the wait is timed from the later of the top's start and the wait's, so
 a top that is running isn't called a stall, and one that hangs still
 is, `STALL_AFTER` after it started. A slot running the top's tree at
 another commit (an earlier prediction, which keeps the check from
-starting the top) counts as the top's start. With
+starting the top) counts as the top's start. A head kept off train 1
+while its run goes on (it would spend that run, "waits for its train")
+is timed from that run's start the same way. With
 `merge.stall_run_factor` (default 1.5), a wait on checks is timed
 against that many times the median of the build check's recent runs
 when that is longer than `STALL_AFTER`, which stays the floor.
@@ -3012,7 +3014,9 @@ def stalled_for(state_dir, waiting, when, check_state=None, repo=None,
     build check started a run of the batch's top, or of any commit with
     the top's tree (`batch_top_started`, given `repo`): the check runs a
     tree once, and a later prediction with the same tree waits for it.
-    Neither started, it is timed as before."""
+    Neither started, it is timed as before. A head waiting for train 1's
+    run (TRAIN_AHEAD_REASON, `train_top`) is timed from that run's start
+    the same way."""
     path = os.path.join(state_dir, "waiting.json")
     if waiting is None:
         if os.path.exists(path):
@@ -3047,7 +3051,19 @@ def stalled_for(state_dir, waiting, when, check_state=None, repo=None,
             limit = QUEUED_STALL_AFTER
         else:
             since = max(began, started)
-    if waiting.get("action") == "WAIT":
+    if waiting.get("action") == "WAIT" and waiting.get("train_top"):
+        # Waiting for train 1's run, not its own: timed from that run's
+        # start against a top's limit, as the train's own wait is.
+        started = (check_state or {}).get("ahead_started") or {}
+        try:
+            top = parse_time((started if isinstance(started, dict) else {})
+                             .get(waiting["train_top"]))
+        except (TypeError, ValueError):
+            top = None
+        if top is not None:
+            limit, since = stall_limit(check_state, top=True), \
+                max(since, top)
+    elif waiting.get("action") == "WAIT":
         top = batch_top_started(state_dir, waiting, check_state, repo, run)
         if top is not None:
             limit, since = stall_limit(check_state, top=True), \
@@ -7614,7 +7630,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         "head": pr["headRefOid"],
                         "reason": TRAIN_AHEAD_REASON % (
                             "#%d..#%d" % (ahead_of[0]["pr"],
-                                          ahead_of[-1]["pr"]))}
+                                          ahead_of[-1]["pr"])),
+                        # Timed as the train's top's run (stalled_for).
+                        "train_top": ahead_of[-1].get("sha")}
         if (RESOLVE_SLOTS and decision["action"] == "HAND-BACK"
                 and decision.get("to") == "author"
                 and decision.get("reason", "").startswith(CONFLICT_REASON)
