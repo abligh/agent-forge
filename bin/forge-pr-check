@@ -60,8 +60,13 @@ or 127 (its command can't be run: a tool missing from the host's
 (make's `*** [...] Error 127`, or a shell's `...: not found` line),
 whose output says the container runtime could not start a container
 (docker's `OCI runtime create failed` or `failed to create shim task`),
-or whose output says `No space left on device` (or `ENOSPC`) failed for
-the host, not the head. Such a run records no
+or whose output says `No space left on device` (or `ENOSPC`) while a
+file system the run writes to (its worktree, `TMPDIR`, its caches) is
+short of room (ROOM_MIN_BYTES or ROOM_MIN_INODES) failed for the host,
+not the head. When every one has room, the phrase is a quotation (a
+test or a document that prints it), the step is red as usual, and
+`verdicts.log` says `NOT-HOST-FAULT` with the room each has
+(agent-forge #343). Such a run records no
 verdict and posts nothing more: the head stays waiting, `pending`, its
 faults counted (`faults`, apart from a checkout's `errors`), and
 `verdicts.log` says `HOST-FAULT` with the step and why. It keeps its
@@ -98,6 +103,25 @@ included) has been spent by a re-cut: no head or batch will be matched
 to it. Its run is stopped as a superseded head's is, logged
 `STOPPED-SPENT`, and its slot is freed. Nothing is stopped while
 `ahead.json` is stale, unreadable or empty.
+
+With it too, once the Merger has folded the trains in front of a later
+train's green top into its batch (amendment of 2026-11-11), a run of a
+prediction inside that batch, such as an earlier train's top, is
+stopped, logged `STOPPED-FOLDED`: the green top covers its tree.
+
+**With `stop_spent`, the Merger's batch top never waits for a slot**
+(amendment of 2026-11-11). When every slot is busy and the top of the
+Merger's batch (designs/0032; a red batch's suspects included) waits
+unstarted with no verdict, the ordinary pull request's head started
+last is stopped for it: not a prediction, not the default branch's
+run, not a head of the Merger's own pull request, nor one put first on
+purpose. It is logged `PREEMPTED`, keeps its place in the queue (its
+`since`) and starts again later; the freed slot goes to the top, before
+an overdue head or one put first. One at a time: no other run is
+stopped for it for PREEMPT_HOLD, while the top waits to start. Every
+merge waits on that top's verdict, and a culprit hunt's steps
+otherwise waited behind ordinary runs for a slot each (an hour's
+merges lost on one red batch).
 
 **With `merge.test_ahead.retry_red`, a prediction's red steps run once
 more** (designs/0035, amendment of 2026-11-10). In the same slot, on
@@ -204,6 +228,28 @@ is never overdue, and the default branch's traced run still goes first
 when due or urgent. Without it, a queue kept busy by the Merger's head
 and predictions could leave an ordinary head waiting for hours.
 
+**A pull request keeps its place** (designs/0052 §1): a head's age,
+for `max_wait_minutes` and for oldest-first, counts from when the pull
+request's first head started waiting, kept in the state's `pr_since`
+by `keep_pr_places`, so a rebase or a red run doesn't send it to the
+back. A pull request's place is forgotten when it closes, or once no
+head of it has waited for PR_PLACE_KEPT.
+
+**A run goes to the free slot nearest it** (`nearest_first`): a
+slot's worktree, and its caches, stay at what it last built, so a run
+started in the slot whose last build differs from it in the fewest
+paths rebuilds least. A head merged with the default branch, or not yet
+in the object store, is compared with the default branch's tip instead.
+A start that this moves off the lowest free slot is logged `PLACED`.
+
+**With `checks.order: "merge"`, what can merge first goes first**
+(designs/0052 §2): among the heads no rule above puts first, overdue
+ones too, a head of a pull request an approved one is held for (the
+Merger's `next.json` `unblocks`, read by `merger_unblocks`) goes
+first, then the others oldest first, and those the Merger holds
+(`blocked`) last; the `STARTED` line ends `, first: approved pull
+requests wait on it`. The default, `"age"`, is oldest first alone.
+
 **With `checks.merger_first` on, the Merger's pull request goes first**
 (default off). The Merger writes `next.json` in its state directory
 each tick, naming the pull request it is waiting on (`--merger-dir`,
@@ -241,9 +287,30 @@ none can merge anything before it has its verdict), nor before a head
 put first on purpose (`labels.urgent`, `checks.first_authors`) or one
 that has waited `max_wait_minutes`.
 
+**Moving the check to another host keeps its verdicts only on purpose.**
+A verdict counts only on the host it was recorded on (the toolchain may
+differ elsewhere), so after the state is moved to a new host or
+container every earlier one is run again. When the move keeps the same
+toolchain, `forge-pr-check --relabel-host OLD` on the new host makes
+every verdict recorded on OLD count as this host's (agent-forge #197).
+The steps digest and the age limit still apply.
+
 When a head of the Merger's own pull request is held for its batch's
 top (below), that top goes first instead, before every other waiting
 head: its run is the one the next merge waits on.
+
+With `merge.test_ahead.train_slots` n (amendment of 2026-11-12, default
+0), n of the slots are the predictions' alone: the heads' own runs and
+the default branch's (its warm-ups too) start only while fewer than
+slots - n of them are running, and a prediction running in any slot
+counts against the n. Only as many are kept as there are predictions
+running or waiting to start (`next_ahead` would start them now; second
+amendment of 2026-11-12): with one train, its top running, nothing
+else is kept. Once the heads have their share, a free slot
+takes the next prediction even while the Merger's own head waits (it
+couldn't have the slot), or stays free, logged `RESERVED: k free slots
+kept for the Merger's predictions ...`. A prediction may still take any
+free slot, and nothing running is stopped for it.
 
 Nothing after an entry whose tree is red here is started: every later
 prediction contains that pull request, so it would only be red too.
@@ -367,9 +434,10 @@ older base counted more as changed, so it ran a superset: the Merger's
 second prediction and on); a match keeps the selection it stands for.
 
 **`checks.fast_lane` (`{"max_seconds": 60}`) adds a slot for cheap
-heads** (designs/0006; only with `depends`). Each tick works out, in
-the cron checkout, the steps each waiting head would run, as the
-worker does, fetching the head there if it hasn't it; the answer is
+heads** (designs/0006). Each tick works out, in the cron checkout, the
+steps each waiting head would run, as the worker does (with `depends`,
+the tracer's choice; without it, every step that applies, scoped steps
+by their scope: agent-forge #261), fetching the head there if it hasn't it; the answer is
 kept with the head in `state.json` (`lane_steps`). A step's cost is
 the median of its last COST_RUNS runs here, from the verdicts'
 `step_seconds`; with fewer than COST_MIN_RUNS it has none. A head is
@@ -419,7 +487,8 @@ maps an environment variable to a directory name, such as
 `{"CARGO_TARGET_DIR": "cargo-target"}`: each slot gets its own such
 directory in the state directory, outside the worktree, so a head isn't
 built from nothing each time. A variable the host already sets wins.
-A step is stopped after `checks.step_timeout_minutes` (default 30).
+A step is stopped after `checks.step_timeout_minutes` (default 30), or
+its own `timeout_minutes`.
 A step's `env_file`, a mode-0600 file of the check user's on the host,
 adds its `KEY=VALUE` lines to that step's environment: secrets the
 check can't take from CI. A file others can reach, or that can't be
@@ -463,7 +532,10 @@ time together as `scoped_seconds`.
 Its `OOMPolicy` is `continue`, so a test that runs out is killed alone:
 the step fails with that test's output, rather than systemd stopping
 the whole step without a word. A worker that can't start a user scope
-says so in `worker.log` and runs its steps without the limit.
+says so in `worker.log` and runs its steps without the limit. Each
+scope is named (`forgestep-<step>-<random>`), and when the step ends,
+anything left in it, which its process group didn't hold, is killed
+and the scope stopped (`SCOPE-LEFT`; agent-forge #263).
 
 **With `checks.reuse`, a step isn't run on inputs it has passed on**
 (designs/0009). Each step that applies to a pull request's head gets an
@@ -803,6 +875,9 @@ CACHE_CEILING = 1.5
 SIZE_UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 DEFAULT_STEP_TIMEOUT_S = 30 * 60
 STEP_TIMEOUT_S = DEFAULT_STEP_TIMEOUT_S
+# checks.steps[].timeout_minutes, in seconds, by step name (agent-forge:
+# a step whose wall time follows the host's load may need longer).
+STEP_TIMEOUTS = {}
 # Each step's memory limit, in systemd's syntax; FORGE_PR_CHECK_MEMORY_MAX
 # overrides it, and "off" runs the steps without one.
 DEFAULT_MEMORY_MAX = "16G"
@@ -904,8 +979,19 @@ MAIN_RED_FIXES = frozenset()
 # agent has approved goes first, and those reviewers' bot logins, lower
 # case. APPROVED_PRS is this tick's answer, from `approved_prs`.
 APPROVED_FIRST = False
+# checks.order (designs/0052): "merge" starts what the Merger's held
+# pull requests wait on first among unapproved heads, and held ones last.
+ORDER = "age"
+# designs/0052 §1: how long a pull request keeps its place in the queue
+# after its last head stopped waiting.
+PR_PLACE_KEPT = datetime.timedelta(hours=24)
 REVIEWER_LOGINS = frozenset()
 APPROVED_PRS = frozenset()
+# labels.armed: a label a reviewer agent puts on a pull request it has
+# reviewed and will approve once its check is green (an approval
+# "armed"); with checks.approved_first it counts as approved, so the
+# review isn't left waiting behind unreviewed heads. None: off.
+ARMED_LABEL = None
 # How long a pull request's approval answer is kept in approved.json
 # before it is asked again, and the most pull requests asked in a tick.
 APPROVED_FRESH = datetime.timedelta(minutes=5)
@@ -933,12 +1019,20 @@ TEST_AHEAD = False
 # merge.test_ahead.spare_slots_only (designs/0014): predictions only when
 # no ordinary head is waiting.
 SPARE_ONLY = False
+# merge.test_ahead.train_slots (amendment of 2026-11-12): how many slots
+# only the Merger's predictions may use; the pull requests' own heads
+# and the default branch's runs share the rest.
+TRAIN_SLOTS = 0
 # merge.test_ahead.later_first (designs/0035, amendment of 2026-11-11):
 # how many later batches' tops go before an ordinary head.
 LATER_FIRST = 0
 # merge.test_ahead.stop_spent (designs/0014, amendment of 2026-11-10): a
 # running prediction whose tree the Merger no longer predicts is stopped.
 STOP_SPENT = False
+# How long one run stopped for the Merger's batch top holds off another
+# (stop_spent, amendment of 2026-11-11): the stopped run's slot frees in
+# seconds, and the tick its worker chains starts the top in it.
+PREEMPT_HOLD = datetime.timedelta(minutes=5)
 # merge.test_ahead.retry_red (designs/0035, amendment of 2026-11-10): a
 # prediction's red steps are run once more on the same tree before the
 # red stands.
@@ -1067,11 +1161,12 @@ def configure(project, instance=None):
     the context the Merger requires."""
     global REPO_SLUG, MAIN, CONFIG_PATH, STATUS_CONTEXT, POSTER, HOST
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
+    global STEP_TIMEOUTS
     global CPU_WEIGHT, CPU_SHARE, SIDE_BY_SIDE, AFTER, ALONE, LIGHT
     global MERGER_CPU_WEIGHT, DOCKER_SLICES, CPU_QUOTA
     global STEP_CACHES, ENV_FILES
     global FLAKE_ISSUE
-    global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, LATER_FIRST, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
+    global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, LATER_FIRST, TRAIN_SLOTS, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT, WARM_PATHS, WARM_EVERY
     global RESULTS_MAX
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
@@ -1083,7 +1178,8 @@ def configure(project, instance=None):
     global OTHER_CONTEXTS
     global CACHE_FAULT_TEXT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
-    global PULL_REQUESTS, HOST_LOCK, APPROVED_FIRST, REVIEWER_LOGINS
+    global PULL_REQUESTS, HOST_LOCK, APPROVED_FIRST, REVIEWER_LOGINS, ORDER
+    global ARMED_LABEL
     global SCOPED, SCOPED_S
     INSTANCE = instance
     if instance is None:
@@ -1102,6 +1198,9 @@ def configure(project, instance=None):
                        if s.get("always"))
     VERSIONS = {s["name"]: list(s["version"])
                 for s in checks.get("steps", []) if s.get("version")}
+    STEP_TIMEOUTS = {s["name"]: 60 * s["timeout_minutes"]
+                     for s in checks.get("steps", [])
+                     if s.get("timeout_minutes")}
     # Steps that say they never read CHECK_BASE: their digests leave the
     # base out, so they can be reused across the default branch moving.
     NO_BASE = frozenset(s["name"] for s in checks.get("steps", [])
@@ -1142,7 +1241,8 @@ def configure(project, instance=None):
     DEPENDS_WAIT = datetime.timedelta(minutes=checks.get(
         "depends_minutes", DEFAULT_DEPENDS_MINUTES))
     TRACER = checks.get("tracer", trace.DEFAULT_TRACER)
-    # The configuration refuses fast_lane without depends.
+    # Without depends, a head's chosen steps are every step that
+    # applies, scoped ones by their scope (agent-forge #261).
     FAST_LANE_S = checks["fast_lane"].get("max_seconds", DEFAULT_FAST_LANE_S) \
         if "fast_lane" in checks else None
     MERGE_DEFAULT = checks.get("merge_default", False)
@@ -1153,9 +1253,11 @@ def configure(project, instance=None):
     MAX_WAIT = datetime.timedelta(minutes=checks["max_wait_minutes"]) \
         if "max_wait_minutes" in checks else None
     APPROVED_FIRST = checks.get("approved_first", False) is True
+    ORDER = checks.get("order", "age")
     REVIEWER_LOGINS = frozenset(project.bot_login(name).lower()
                                 for name in project.reviewers())
     URGENT_LABEL = project.section("labels").get("urgent")
+    ARMED_LABEL = project.section("labels").get("armed")
     # Every instance acts on it, for its own red; one leaves the label
     # on while another context of the project is red on the head, so
     # that instance runs its red again too (OTHER_CONTEXTS).
@@ -1216,6 +1318,7 @@ def configure(project, instance=None):
     SPARE_ONLY = bool((ahead or {}).get("spare_slots_only"))
     STOP_SPENT = (ahead or {}).get("stop_spent") is True
     LATER_FIRST = (ahead or {}).get("later_first", 0)
+    TRAIN_SLOTS = (ahead or {}).get("train_slots", 0)
     RETRY_RED = (ahead or {}).get("retry_red") is True
     FLAKE_ISSUE = None
     if instance is None and isinstance(checks.get("flake_issue"), dict):
@@ -1491,6 +1594,14 @@ def holder_fields(line):
             "ahead" in parts[3:] or "main" in parts[3:])
 
 
+def is_prediction(got):
+    """Whether a slot's run (`holder_fields`) is one of the Merger's
+    predictions, which merge.test_ahead.train_slots's slots are for: a
+    pull request's own head, the default branch's run (pr 0, which
+    `ahead` also marks) and a run its lock line doesn't name aren't."""
+    return bool(got and got[4] and got[0])
+
+
 def stop_worker(pid):
     """SIGTERM to worker pid's process group, which it leads when it was
     started by a tick, else to pid alone; the worker then ends its
@@ -1637,6 +1748,13 @@ def approved_prs(state_dir, state, heads, token, when, run=sh):
         pass
     return frozenset(int(k) for k, v in known.items()
                      if isinstance(v, dict) and v.get("approved"))
+
+
+def armed_prs(heads):
+    """labels.armed: the pull requests among `heads` (`open_heads`'
+    tuples) that carry it, for checks.approved_first."""
+    return frozenset(head[0] for head in heads
+                     if ARMED_LABEL in (head[5] if len(head) > 5 else ()))
 
 
 def open_heads(token, run=sh, why=None):
@@ -1937,11 +2055,46 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
         entry = state["waiting"][sha]
         if entry["pr"] in replaced and replaced[entry["pr"]] < entry["since"]:
             entry["since"] = replaced[entry["pr"]]
+    keep_pr_places(state, {h[0] for h in heads}, new, when)
     # A head waits unseen otherwise: pending is posted only when its
     # steps start, and a busy host can keep it waiting half an hour.
     if post is not None:
         for sha in new:
             post(sha, "pending", queued_description(state, sha, when))
+
+
+def keep_pr_places(state, open_prs, new, when):
+    """designs/0052 §1: a pull request keeps its place across heads. The
+    state's `pr_since` holds, per pull request, when any head of it first
+    waited (`since`) and when one last did (`last`). A new head takes its
+    pull request's `since` when that is older, so a rebase after a run,
+    which the head-to-head rule above can't see, keeps its place too. A
+    pull request is forgotten once closed, or PR_PLACE_KEPT after a head
+    of it last waited."""
+    places = state.setdefault("pr_since", {})
+    for sha, entry in state["waiting"].items():
+        if entry.get("main"):
+            continue
+        key = str(entry.get("pr"))
+        place = places.get(key)
+        if not isinstance(place, dict) or not kept_place(place, when):
+            place = places[key] = {"since": entry["since"]}
+        if sha in new and place["since"] < entry["since"]:
+            entry["since"] = place["since"]
+        place["since"] = min(place["since"], entry["since"])
+        place["last"] = iso(when)
+    for key in list(places):
+        if not key.isdigit() or int(key) not in open_prs \
+                or not kept_place(places[key], when):
+            del places[key]
+
+
+def kept_place(place, when):
+    """Whether a `pr_since` entry is still in force at `when`."""
+    try:
+        return when - parse(place["last"]) <= PR_PLACE_KEPT
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def queued_description(state, sha, when):
@@ -2251,6 +2404,40 @@ def main_rerun_labelled(state, head, token, run=sh):
     return [(issue, head[0], False, None)]
 
 
+def nearest_first(state_dir, free, sha, merged, run=sh):
+    """Placement: `free` reordered so the slot whose worktree is nearest
+    what is about to be built comes first, as (slots, files) with
+    `files` the paths that differ from its last build (None when the
+    order is unchanged). A slot's worktree is left at what it last
+    built, and its caches with it, so the fewer the paths that differ
+    the less it rebuilds. What it is compared with is `sha`, or, when
+    the run will merge `sha` with the default branch (`merged`) or
+    `sha` is not in the object store yet, the default branch's tip:
+    the merge is that tip plus the head's own change, which is the same
+    whatever the slot. A slot with no worktree yet, or whose difference
+    can't be had, goes after the rest; ties keep `free`'s order."""
+    if len(free) < 2:
+        return free, None
+    targets = ([] if merged else [sha]) + ["refs/remotes/origin/" + MAIN]
+    near = {}
+    for target in targets:
+        for slot in free:
+            wt = os.path.join(state_dir, slot_name("wt", slot))
+            if slot in near or not os.path.exists(os.path.join(wt, ".git")):
+                continue
+            got = run(["git", "-C", wt, "diff", "--name-only", "HEAD",
+                       target, "--"])
+            if got.returncode == 0:
+                near[slot] = len(got.stdout.splitlines())
+        if near:
+            break
+    if not near:
+        return free, None
+    ranked = sorted(free, key=lambda s: (s not in near, near.get(s, 0),
+                                         free.index(s)))
+    return ranked, near[ranked[0]]
+
+
 def warm_slot(state, free, head, checkout, when, run=sh):
     """checks.warm: (slot, cached, changed) for the first of the `free`
     slots whose caches want building at the default branch's head
@@ -2393,7 +2580,7 @@ def lane_head(state, cheap, busy=(), when=None):
 
 
 def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
-              urgent=False, blocked=(), queued=()):
+              urgent=False, blocked=(), queued=(), unblocks=(), slotted=()):
     """(sha, pr) of the head that has waited longest, or None. A head
     that failed to prepare goes behind every head that has not; one
     whose run the host broke keeps its place, since the fault was not
@@ -2422,8 +2609,23 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
     own, those of pull requests in `queued` (the Merger's predictions)
     go first, and those in `blocked` (held by the Merger until another
     merges: next.json's `blocked`) last; they still run when nothing
-    better waits (agent-forge #256)."""
+    better waits (agent-forge #256).
+
+    With checks.order "merge" (designs/0052), among the other heads,
+    overdue ones and the rest alike, those of pull requests in
+    `unblocks` (what the Merger's held ones wait on) go first and those
+    in `blocked` last.
+
+    A head in `slotted`, a resolution holding one of the Merger's resolve
+    slots (designs/0053), goes with the approved heads, approved or not:
+    the slot is there to check it."""
     waiting = state["waiting"]
+
+    def merge_first(s):
+        if ORDER != "merge":
+            return ()
+        return (waiting[s]["pr"] not in unblocks,
+                waiting[s]["pr"] in blocked)
     live = live_heads(state, busy, when)
     if not live:
         return None
@@ -2453,7 +2655,8 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
     # checks.approved_first: a reviewer has approved its pull request,
     # so it is near merging. The Merger's own goes first among them.
     ready = [s for s in heads
-             if waiting[s].get("approved") and not waiting[s].get("errors")]
+             if (waiting[s].get("approved") or s in slotted)
+             and not waiting[s].get("errors")]
     if ready:
         sha = min(ready, key=lambda s: (waiting[s]["pr"] != first_pr,
                                         waiting[s]["pr"] not in queued,
@@ -2467,13 +2670,15 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
     # a deep queue every head falls due and the cap would keep it last.
     late = [s for s in heads if overdue(waiting[s], when)]
     if late and not mine:
-        sha = min(late, key=lambda s: (waiting[s]["since"], s))
+        sha = min(late, key=lambda s: (merge_first(s), waiting[s]["since"],
+                                       s))
         return sha, waiting[sha]["pr"]
     # checks.first_authors go even before the Merger's pull request,
     # unless they failed to prepare.
     top = [s for s in heads
            if first(waiting[s]) and not waiting[s].get("errors")]
-    sha = min(top or mine or heads, key=lambda s: order(waiting, s))
+    sha = min(top or mine or heads, key=lambda s: (
+        () if top or mine else merge_first(s), order(waiting, s)))
     return sha, waiting[sha]["pr"]
 
 
@@ -2508,6 +2713,43 @@ def merger_blocked(merger_dir, when):
         if when - parse(said["at"]) > MERGER_FRESH:
             return set()
         return {pr for pr in said.get("blocked") or []
+                if isinstance(pr, int) and not isinstance(pr, bool)}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return set()
+
+
+def merger_resolutions(merger_dir, when):
+    """designs/0053: (slotted, queued), the heads of the resolutions the
+    Merger has given a resolve slot and of those waiting for one, from
+    its next.json's `resolve_slotted` and `resolve_queue`; two empty
+    sets when there are none, it can't be read, or it is older than
+    MERGER_FRESH, and the order is then as without slots."""
+    if not merger_dir:
+        return set(), set()
+    try:
+        with open(os.path.join(merger_dir, "next.json")) as handle:
+            said = json.load(handle)
+        if when - parse(said["at"]) > MERGER_FRESH:
+            return set(), set()
+        return tuple({e["head"] for e in said.get(key) or []
+                      if isinstance(e, dict) and isinstance(e.get("head"), str)}
+                     for key in ("resolve_slotted", "resolve_queue"))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return set(), set()
+
+
+def merger_unblocks(merger_dir, when):
+    """designs/0052: what the Merger's held pull requests wait on, from
+    its next.json's `unblocks`, or an empty set when there is none, it
+    can't be read, or it is older than MERGER_FRESH."""
+    if not merger_dir:
+        return set()
+    try:
+        with open(os.path.join(merger_dir, "next.json")) as handle:
+            said = json.load(handle)
+        if when - parse(said["at"]) > MERGER_FRESH:
+            return set()
+        return {pr for pr in said.get("unblocks") or []
                 if isinstance(pr, int) and not isinstance(pr, bool)}
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return set()
@@ -2644,6 +2886,76 @@ def merger_spent(merger_dir, when, running, repo=None, run=sh):
     return spent
 
 
+def preempt_victim(state, fields, first_pr):
+    """(slot, holder fields) of the run to stop for the Merger's batch
+    top, or None: of the ordinary pull requests' heads running, the one
+    started last. Never a prediction, the default branch's run, the fast
+    lane's, a head of the Merger's own pull request (`first_pr`), one put
+    first on purpose, or one this host's queue doesn't list."""
+    best = None
+    for slot, got in fields.items():
+        if slot == LANE or not got or got[4] or not got[0] or not got[3]:
+            continue
+        entry = state["waiting"].get(got[1])
+        if got[0] == first_pr or entry is None or put_first(entry):
+            continue
+        try:
+            since = parse(got[2])
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if best is None or since > best[0]:
+            best = (since, slot, got)
+    return best[1:] if best else None
+
+
+def preempt_front(state_dir, fields, batch, busy, when, checkout, run,
+                  merger_dir, stop, out):
+    """stop_spent, amendment of 2026-11-11: with every slot busy, stop
+    the last-started ordinary run for the Merger's batch top, if it
+    waits unstarted with no verdict (see the module docstring). Forgets
+    a preemption once its top has started or isn't the top any more."""
+    top = batch[-1] if batch else None
+    trees = busy_trees(busy, checkout, run) if top else frozenset()
+    with state_lock(state_dir):
+        state = load(state_dir)
+        pre = state.get("preempting")
+        if pre is not None and pre.get("victim") not in busy and (
+                top is None or pre.get("for") != top["sha"]
+                or pre.get("for") in state.get("ahead_started", {})):
+            del state["preempting"]
+            save(state_dir, state)
+            pre = None
+        if top is None:
+            return
+        if pre is not None and pre.get("for") == top["sha"]:
+            try:
+                if when - parse(pre["at"]) < PREEMPT_HOLD:
+                    return
+            except (KeyError, TypeError, ValueError):
+                pass
+        if next_ahead(state, [], busy, when, trees, batch) is None:
+            return
+        victim = preempt_victim(state, fields, merger_first(merger_dir, when))
+        if victim is None:
+            return
+        slot, (pr, sha, since, pid, _) = victim
+        state["preempting"] = {"for": top["sha"], "victim": sha,
+                               "at": iso(when)}
+        save(state_dir, state)
+    sent = stop(pid)
+    if not sent:
+        with state_lock(state_dir):
+            state = load(state_dir)
+            if (state.get("preempting") or {}).get("victim") == sha:
+                del state["preempting"]
+                save(state_dir, state)
+    log(state_dir, "PREEMPTED #%d %s: the Merger's batch top %s waits for a "
+        "slot; %s the run in %s (pid %d), since %s"
+        % (pr, sha[:10], top["sha"][:10],
+           "stopping" if sent else "could not stop", slot_label(slot), pid,
+           since), when, out)
+
+
 def is_front(merger_dir, when, sha, pr, ahead=False, repo=None):
     """designs/0031: whether sha's run is one the next merge waits on,
     as the Merger's files say at `when`: with `ahead`, the first of its
@@ -2657,6 +2969,40 @@ def is_front(merger_dir, when, sha, pr, ahead=False, repo=None):
         entries = merger_ahead(merger_dir, when, repo)
         return bool(entries) and entries[0]["sha"] == sha
     return pr is not None and merger_first(merger_dir, when) == pr
+
+
+def named_scope(prefix, step):
+    """(prefix, unit): a step's scope prefix (scope_prefix) with a unit
+    name of its own, `forgestep-<step>-<random>`, so the scope can be
+    found and stopped once the step ends (`stop_scope`). No prefix, no
+    scope: (prefix, None)."""
+    if not prefix or prefix[0] != "systemd-run" or "--" not in prefix:
+        return list(prefix), None
+    unit = "forgestep-%s-%s" % (
+        re.sub(r"[^A-Za-z0-9_]", "_", step)[:40], os.urandom(4).hex())
+    at = prefix.index("--")
+    return list(prefix[:at]) + ["--unit=" + unit] + list(prefix[at:]), unit
+
+
+def stop_scope(unit, env, run=sh):
+    """Stop a step's scope if anything is still in it after the step
+    ended, as {"tasks": n} (n None when systemd didn't say), else None.
+    Killing the step's process group misses what left it: on one host
+    (2026-11-09) a timed-out test step's scope held a GUI test and its
+    session bus helpers for 2.5 days (agent-forge #263)."""
+    got = run(["systemctl", "--user", "show", "-p", "ActiveState",
+               "-p", "TasksCurrent", unit + ".scope"], env=env, timeout=30)
+    props = dict(line.split("=", 1) for line in (got.stdout or "")
+                 .splitlines() if "=" in line)
+    if got.returncode != 0 or props.get("ActiveState") not in (
+            "active", "activating", "deactivating", "reloading"):
+        return None
+    tasks = props.get("TasksCurrent", "")
+    run(["systemctl", "--user", "kill", "--signal=SIGKILL",
+         unit + ".scope"], env=env, timeout=30)
+    run(["systemctl", "--user", "stop", unit + ".scope"], env=env,
+        timeout=60)
+    return {"tasks": int(tasks) if tasks.isdigit() else None}
 
 
 def weighted(prefix, weight):
@@ -2719,6 +3065,26 @@ def foreign(record, when):
         datetime.timedelta(0) <= age <= MATCH_MAX_AGE)
 
 
+def relabel_host(state_dir, old, new=None):
+    """Give every verdict recorded on host `old` this host's name (or
+    `new`), under the state lock, for a deliberate move of the check's
+    state to another host or container (agent-forge #197): `tested`
+    trusts only this host's verdicts, so a move made every earlier one
+    count for nothing, and every head and batch ran again. The steps
+    digest and the age limit still apply. Returns how many changed."""
+    new = new or socket.gethostname()
+    with state_lock(state_dir):
+        state = load(state_dir)
+        changed = 0
+        for record in state["results"].values():
+            if isinstance(record, dict) and record.get("host") == old:
+                record["host"] = new
+                changed += 1
+        if changed:
+            save(state_dir, state)
+    return changed
+
+
 def tested(state, tree, when, ok=None, accept=None):
     """The sha of the newest verdict on `tree` from this host and step
     list, green only when `ok`, and only one `accept(record)` takes when
@@ -2778,6 +3144,21 @@ def next_ahead(state, ahead, busy=(), when=None, busy_trees=(), batch=(),
             continue
         return sha, entry["pr"]
     return None
+
+
+def waiting_predictions(state, ahead, busy=(), when=None, batch=(),
+                        later=()):
+    """How many of the Merger's predictions `next_ahead` would start
+    one after another now, `busy` running: what
+    merge.test_ahead.train_slots keeps slots for, with the ones
+    running."""
+    taken, count = set(busy), 0
+    while True:
+        got = next_ahead(state, ahead, taken, when, (), batch, later)
+        if got is None or got[0] in taken:
+            return count
+        taken.add(got[0])
+        count += 1
 
 
 def forget_ahead(state, ahead):
@@ -3571,13 +3952,68 @@ UNSTARTABLE = re.compile(
     r"^.*(?:OCI runtime create failed|failed to create shim task).*$", re.M)
 
 
-def host_fault(results):
+# The least room, in bytes and in inodes, a file system the run writes to
+# must have for "No space left on device" in a step's output to be
+# believed rather than taken for a quotation (agent-forge #343).
+ROOM_MIN_BYTES = 1 << 30
+ROOM_MIN_INODES = 10000
+
+
+def short_of_space(paths):
+    """A description of the first of `paths` whose file system is short
+    of room (ROOM_MIN_BYTES or ROOM_MIN_INODES), or None if all have
+    room. A path that can't be looked at counts as short, so a doubt
+    keeps the old reading: the host's fault."""
+    for path in paths:
+        try:
+            fs = os.statvfs(path)
+        except OSError as err:
+            return "%s can't be looked at (%s)" % (path, err.strerror)
+        if fs.f_bavail * fs.f_frsize < ROOM_MIN_BYTES:
+            return "%s has %d MB free" % (
+                path, fs.f_bavail * fs.f_frsize >> 20)
+        if fs.f_files and fs.f_favail < ROOM_MIN_INODES:
+            return "%s has %d inodes free" % (path, fs.f_favail)
+    return None
+
+
+def room_report(paths):
+    """What room each of `paths` has, for the log."""
+    said = []
+    for path in paths:
+        try:
+            fs = os.statvfs(path)
+            said.append("%s has %.1f GB free" % (
+                path, fs.f_bavail * fs.f_frsize / 1e9))
+        except OSError:
+            pass
+    return "; ".join(said) or "the host has room"
+
+
+def space_paths(wt, env):
+    """The file systems a run writes to: its worktree, its TMPDIR and its
+    slot's caches (`checks.caches`)."""
+    paths = [wt, env.get("TMPDIR") or tempfile.gettempdir()]
+    paths += [env[k] for k in CACHES if env.get(k)]
+    seen = []
+    for path in paths:
+        if path and path not in seen:
+            seen.append(path)
+    return seen
+
+
+def host_fault(results, paths=()):
     """(step, why) for the first failed step the host broke, or None:
     one that exited 126 or 127, so its command could not be run, or
     whose output says so for a command behind it (make's "Error 127",
     the shell's "not found"), or says a container could not be started
     (docker's "OCI runtime create failed"), or says the disk is full,
-    or holds one of checks.host_fault_text, which `why` quotes."""
+    or holds one of checks.host_fault_text, which `why` quotes.
+
+    The disk-full text counts only when one of `paths` (the file
+    systems the run writes to) is short of room; when every one has
+    room the step is red as usual, and the result's `not_host_fault`
+    says why (agent-forge #343). With no `paths` it counts as before."""
     for r in results:
         if r["rc"] == 0:
             continue
@@ -3593,7 +4029,14 @@ def host_fault(results):
                 json.dumps(unstartable.group(0).strip()[:300],
                            ensure_ascii=False))
         if any(text in r["tail"] for text in HOST_FAULT_TEXT):
-            return r["name"], "no space left on device"
+            short = short_of_space(paths) if paths else "unchecked"
+            if short:
+                return r["name"], "no space left on device"
+            # The output quotes the phrase, but every file system the
+            # step writes to has room: a test or a document that prints
+            # it, not a full disk (agent-forge #343). The step is red.
+            r["not_host_fault"] = "its output says no space left on " \
+                "device, but %s" % room_report(paths)
         for text in HOST_FAULT_EXTRA:
             if text in r["tail"]:
                 return r["name"], "its output says %s" % json.dumps(
@@ -3721,8 +4164,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     """Queue the open heads and start the next one in a free slot. With
     `merger_dir` (only with MERGER_FIRST), the Merger's pull request goes
     first; with TEST_AHEAD too, its predictions come next (see the
-    module docstring). With FAST_LANE_S, `depends` and a checkout, the
-    fast lane is one more slot, which starts the oldest cheap head."""
+    module docstring). With FAST_LANE_S and a checkout, the fast lane
+    is one more slot, which starts the oldest cheap head."""
     when = when or now_utc()
     why = []
     heads = open_heads(token, run, why)
@@ -3734,7 +4177,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     # rest of the tick, the others aren't open (designs/0034).
     heads, dropped = in_scope(heads, state_dir, token, run, out, when)
     slots = slots or slots_from_env()
-    lane = FAST_LANE_S is not None and DEPENDS and bool(checkout)
+    lane = FAST_LANE_S is not None and bool(checkout)
     holders = {slot: running(state_dir, slot)
                for slot in list(range(1, slots + 1)) + ([LANE] if lane else [])}
     fields = {slot: holder_fields(h) for slot, h in holders.items()}
@@ -3774,6 +4217,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     global APPROVED_PRS
     APPROVED_PRS = approved_prs(state_dir, seen, heads, token, when, run) \
         if APPROVED_FIRST else frozenset()
+    if APPROVED_FIRST and ARMED_LABEL:
+        APPROVED_PRS = APPROVED_PRS | armed_prs(heads)
     todo = []
     with state_lock(state_dir):
         state = load(state_dir)
@@ -3817,6 +4262,16 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         if TEST_AHEAD and STOP_SPENT and merger_dir else set()
     batch = merger_batch(merger_dir, when, checkout) \
         if TEST_AHEAD and merger_dir else []
+    # A later train's green top folded the trains in front of it into the
+    # Merger's batch (amendment of 2026-11-11): a member's prediction
+    # still running is spent, since the green top covers its tree.
+    if STOP_SPENT and len(batch) > 1 and tested(
+            state, batch[-1]["tree"], when, ok=True) is not None:
+        inner = {e["sha"] for e in batch[:-1]}
+        folded = {got[1] for got in fields.values()
+                  if got and got[4] and got[0] and got[1] in inner}
+    else:
+        folded = set()
     # A head a slot is running that its batch's green top now covers:
     # the Merger updated it to its predicted tree, and a free slot took
     # it before the cover could. Its run is stopped and it is matched.
@@ -3828,6 +4283,14 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         covering = {got[0]: got for got in settled_heads(
             unstarted, checkout, (), when, run, state_dir, batch)
             if got[4] and got[0] in busy}
+    # Whether this tick stopped a run already: its slot frees by itself.
+    stopped_now = []
+
+    def stop(pid, _stop=stop):
+        sent = _stop(pid)
+        stopped_now.append(sent)
+        return sent
+
     for slot, holder in holders.items():
         if holder is None:
             continue
@@ -3859,6 +4322,14 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 "%s" % (pr, sha[:10], "stopping" if sent else
                         "could not stop", slot_label(slot), pid, since),
                 when, out)
+        elif got and got[4] and got[1] in folded and got[3]:
+            pr, sha, since, pid, _ = got
+            sent = stop(pid)
+            log(state_dir, "STOPPED-FOLDED #%d %s: the Merger's batch top %s "
+                "is green and covers its tree; %s the run in %s (pid %d), "
+                "since %s" % (pr, sha[:10], batch[-1]["sha"][:10],
+                              "stopping" if sent else "could not stop",
+                              slot_label(slot), pid, since), when, out)
         elif got and got[4] and got[0] and got[1] in spent and got[3]:
             # got[0] is 0 for the default branch's run, which `ahead`
             # also marks (holder_fields): it is never a prediction, so
@@ -3888,6 +4359,11 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     free = [slot for slot, holder in holders.items()
             if holder is None and slot != LANE]
     lane_free = lane and holders[LANE] is None
+    if TEST_AHEAD and STOP_SPENT and merger_dir and not free \
+            and not any(stopped_now) \
+            and not (QUIET_DIR and quiet.live(QUIET_DIR, when)):
+        preempt_front(state_dir, fields, batch, busy, when, checkout, run,
+                      merger_dir, stop, out)
     if not free and not lane_free:
         return 0
     holds = quiet.live(QUIET_DIR, when) if QUIET_DIR else []
@@ -3907,11 +4383,38 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     # checks.approved_first: approved heads the Merger can't merge until
     # another merges go after other approved ones, and those it predicts
     # before them.
-    blocked = merger_blocked(merger_dir, when) if APPROVED_FIRST else set()
+    blocked = merger_blocked(merger_dir, when) \
+        if APPROVED_FIRST or ORDER == "merge" else set()
+    unblocks = merger_unblocks(merger_dir, when) if ORDER == "merge" \
+        else set()
+    # designs/0053: resolutions in a resolve slot run with the approved
+    # heads; those waiting for one don't run.
+    slotted, slot_queued = merger_resolutions(merger_dir, when)
     predicted_prs = {e["pr"] for e in ahead} if APPROVED_FIRST else set()
+    # merge.test_ahead.train_slots (amendment of 2026-11-12): only the
+    # Merger's predictions may run in the reserved slots, so the heads'
+    # own runs and the default branch's fill at most the rest. Only as
+    # many are kept as there are predictions running or waiting to
+    # start (second amendment of 2026-11-12): a slot kept for a train
+    # that doesn't exist sat idle. Nothing running is stopped for it.
+    reserve = min(TRAIN_SLOTS, slots - 1) if TEST_AHEAD and merger_dir \
+        else 0
+    later_all = merger_later(merger_dir, when, checkout) if reserve else []
+    own_running = sum(1 for slot, holder in holders.items()
+                      if slot != LANE and holder is not None
+                      and not is_prediction(fields[slot]))
     # Fill every free slot, not one per tick: a tick's start rate was the
     # queue's ceiling (see the module docstring). What a pass starts is
     # as good as running to the next pass; the listing above isn't redone.
+    def place(sha, merged, pr):
+        # Placement: the free slot nearest what is built goes first.
+        ranked, files = nearest_first(state_dir, free, sha, merged, run)
+        if ranked[0] != free[0]:
+            out("PLACED %s %s in %s, %d path%s from its last build"
+                % (who(pr, pr == 0), sha[:10], slot_label(ranked[0]), files,
+                   "" if files == 1 else "s"))
+        free[:] = ranked
+
     first_pass = True
     while free or lane_free:
         predicted = pick = fast = None
@@ -3962,12 +4465,23 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 state["waiting"].get(s, {}).get("pr") == first_pr
                 and not state["waiting"].get(s, {}).get("main")
                 for s in twins)
+            kept = min(reserve, sum(
+                1 for slot, got in fields.items()
+                if slot != LANE and is_prediction(got))
+                + waiting_predictions(state, ahead, taken, when, batch,
+                                      later_all)) if reserve else 0
+            own_full = own_running >= slots - kept
+            if free and not own_full:
+                pick = next_head(state, taken | set(held) | slot_queued,
+                                 first_pr, when, cheap, urgent, blocked,
+                                 predicted_prs, unblocks, slotted) \
+                    if fresh else next_head(state, taken | slot_queued,
+                                            first_pr, when, cheap,
+                                            blocked=blocked,
+                                            queued=predicted_prs,
+                                            unblocks=unblocks,
+                                            slotted=slotted)
             if free:
-                pick = next_head(state, taken | set(held), first_pr, when,
-                                 cheap, urgent, blocked, predicted_prs) \
-                    if fresh else next_head(state, taken, first_pr, when,
-                                            cheap, blocked=blocked,
-                                            queued=predicted_prs)
                 if TEST_AHEAD:
                     forget_ahead(state, ahead)
                     # The Merger's predictions go before an ordinary pick,
@@ -3982,7 +4496,15 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                     # own verdict, and a pick put before it would otherwise
                     # let predictions starve both. With spare_slots_only
                     # (designs/0014), never before an ordinary pick.
-                    if front_held or not merger_head_waits(
+                    # A run was stopped for the batch's top: its slot
+                    # is the top's, before an overdue head or one put
+                    # first. And a slot only predictions may use
+                    # (train_slots) is a prediction's: no head can
+                    # have it, the Merger's own included.
+                    preferring = bool(batch) and (state.get(
+                        "preempting") or {}).get("for") == batch[-1]["sha"]
+                    if front_held or preferring or own_full \
+                            or not merger_head_waits(
                             state, first_pr, taken, when) and (
                             pick is None or not SPARE_ONLY and not (
                             pick[1] == first_pr
@@ -4016,6 +4538,10 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             for sha in sorted(held, key=lambda s: order(state["waiting"], s)):
                 out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
                                          held[sha]))
+            for sha in sorted(slot_queued & set(state["waiting"]),
+                              key=lambda s: order(state["waiting"], s)):
+                out("HELD #%d %s: a resolution, waiting for a resolve slot"
+                    % (state["waiting"][sha]["pr"], sha[:10]))
             for sha in sorted(twins, key=lambda s: order(state["waiting"], s)):
                 out("HELD #%d %s: %s" % (state["waiting"][sha]["pr"], sha[:10],
                                          twins[sha]))
@@ -4031,6 +4557,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             return 0
         if predicted is not None:
             sha, pr = predicted
+            place(sha, False, pr)
             spawn(state_dir, sha, pr, post is not None, free[0], checkout, True)
             out("STARTED-AHEAD #%d %s%s, the Merger's prediction; %d waiting"
                 % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
@@ -4040,9 +4567,16 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             fields[free.pop(0)] = (pr, sha, iso(when), None, True)
             continue
         if pick is None:
+            if own_full and fast is None and live_heads(state, taken, when):
+                out("RESERVED: %d free slot%s kept for the Merger's "
+                    "predictions (%d of merge.test_ahead.train_slots %d "
+                    "kept, for the predictions running or waiting); %d "
+                    "waiting" % (len(free), "" if len(free) == 1 else "s",
+                                 kept, TRAIN_SLOTS, len(queued - taken)))
+                return 0
             warming = warm_slot(state, free, head_of_main, checkout, when, run) \
-                if fast is None and not starting and not live_heads(
-                    state, taken, when) else None
+                if fast is None and not starting and not own_full \
+                and not live_heads(state, taken, when) else None
             if warming is not None:
                 slot, cached, changed = warming
                 with state_lock(state_dir):
@@ -4071,6 +4605,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                     % (len(queued), MAX_ERRORS))
             return 0
         sha, pr = pick
+        place(sha, pr != 0 and MERGE_DEFAULT, pr)
         if pr == 0:
             spawn(state_dir, sha, pr, post is not None, free[0], checkout,
                   main=True)
@@ -4080,6 +4615,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                    len(queued - taken) - 1))
             busy.add(sha)
             free.pop(0)
+            own_running += 1
             continue
         if checkout:
             spawn(state_dir, sha, pr, post is not None, free[0], checkout)
@@ -4091,11 +4627,15 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                ", first: the Merger waits on it" if pr == first_pr else
                ", first: it is approved"
                if state["waiting"].get(sha, {}).get("approved") else
+               ", first: it holds a resolve slot" if sha in slotted else
+               ", first: approved pull requests wait on it"
+               if pr in unblocks else
                ", first: it has waited %d minutes"
                % (MAX_WAIT.total_seconds() // 60)
                if overdue(state["waiting"].get(sha, {}), when) else ""))
         busy.add(sha)
         free.pop(0)
+        own_running += 1
     return 0
 
 
@@ -4846,18 +5386,19 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
             shutil.rmtree(folder, ignore_errors=True)
             os.makedirs(folder)
             step_env_["CHECK_RESULTS"] = folder
+        step_prefix, unit = named_scope(step_prefix, name)
         step_args = step_prefix + args
         if wrap is not None:
             step_args, step_env_ = wrap(name, step_prefix, args, step_env_)
-        return step_args, step_env_, folder
+        return step_args, step_env_, folder, unit
 
-    def execute(name, step_args, step_env_, folder, usage=None,
+    def execute(name, step_args, step_env_, folder, unit=None, usage=None,
                 on_start=None):
         if name in refused:
             return {"name": name, "rc": 1, "seconds": 0, "wall": 0.0,
                     "tail": "not run: " + refused[name]}
         started = time.monotonic()
-        timeout, budget = STEP_TIMEOUT_S, False
+        timeout, budget = STEP_TIMEOUTS.get(name, STEP_TIMEOUT_S), False
         if deadline is not None:
             left = deadline - started
             if left <= 0:
@@ -4881,6 +5422,12 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
         result = {"name": name, "rc": got.returncode,
                   "seconds": int(wall), "wall": round(wall, 2),
                   "tail": tail((got.stdout or "") + (got.stderr or ""))}
+        left = stop_scope(unit, step_env_, run) if unit else None
+        if left is not None:
+            result["scope_left"] = left["tasks"]
+            out("SCOPE-LEFT %s.scope %s tasks after step %s; stopped"
+                % (unit, "?" if left["tasks"] is None else left["tasks"],
+                   name))
         if budget and got.returncode == 124:
             result["over_budget"] = True
             result["tail"] = "stopped: over the scoped budget of %d " \
@@ -5830,7 +6377,13 @@ def lane_steps(checkout, sha, pr, state_dir, run=sh, tip=None):
     worked out in the cron checkout without a worktree, fetching the
     head first if the checkout doesn't have it. The fetch writes no
     FETCH_HEAD, which the checkout's other users may read. As `choose`
-    returns, with {"every": why} when the steps can't be worked out."""
+    returns, with {"every": why} when the steps can't be worked out.
+
+    Without `depends` (agent-forge #261) nothing is traced, so a run
+    takes every step that applies: that is the answer, as {"ran"}, and
+    `estimate` puts the scoped steps (designs/0048) by their scope, as
+    a run does. A head with a scoped step in scope never takes the
+    lane, so only the light, unscoped steps can make a head cheap."""
     def have():
         return run(["git", "-C", checkout, "cat-file", "-e",
                     sha + "^{commit}"]).returncode == 0
@@ -5844,6 +6397,9 @@ def lane_steps(checkout, sha, pr, state_dir, run=sh, tip=None):
         if not have():
             return {"every": "pull/%d/head is no longer %s" % (pr, sha[:10])}
     names = [name for name, _, _ in applicable_at(checkout, sha, run)]
+    if not DEPENDS:
+        return {"ran": {name: "every step runs without depends"
+                        for name in names}}
     if FRESH_WAIT is not None:
         return choose_fresh(checkout, sha, state_dir, run, names,
                             tip if MERGE_DEFAULT else None)
@@ -6754,7 +7310,12 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                        RESULTS_MAX), finished, out)
         if not any(r.get("results_bytes") for r in results):
             shutil.rmtree(kept, ignore_errors=True)
-        fault = host_fault(results)
+        fault = host_fault(results, space_paths(wt, env))
+        for r in results:
+            if r.get("not_host_fault"):
+                log(state_dir, "NOT-HOST-FAULT%s %s %s: %s: %s" % (
+                    " AHEAD" if ahead else "", name, sha[:10], r["name"],
+                    r.pop("not_host_fault")), finished, out)
         if fault is not None:
             errors = count_error(state_dir, sha, ahead, "faults")
             why = "%s: %s" % fault
@@ -6970,11 +7531,20 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     except Stopped:
         with state_lock(state_dir):
             state = load(state_dir)
-            state["waiting"].pop(sha, None)
+            # Stopped for the Merger's batch top (stop_spent): it keeps
+            # its place and starts again later.
+            kept = (state.get("preempting") or {}).get("victim") == sha \
+                and sha in state["waiting"]
+            if kept:
+                state["waiting"][sha].pop("started", None)
+            else:
+                state["waiting"].pop(sha, None)
             save(state_dir, state)
         stopped = clock()
-        log(state_dir, "STOPPED %s %s after %ds: superseded; no verdict"
-            % (name, sha[:10], (stopped - started).total_seconds()),
+        log(state_dir, "STOPPED %s %s after %ds: %s"
+            % (name, sha[:10], (stopped - started).total_seconds(),
+               "preempted for the Merger's batch top; back in the queue"
+               if kept else "superseded; no verdict"),
             stopped, out)
         settled = True
         return 3
@@ -7025,6 +7595,10 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
                         "--slot only to bring the slot's caches up to it "
                         "(checks.warm): untraced, posted nowhere, and kept "
                         "apart from its verdict")
+    parser.add_argument("--relabel-host", metavar="OLD",
+                        help="after moving the state to this host: count "
+                        "every verdict recorded on host OLD as this "
+                        "host's, then exit")
     parser.add_argument("--state-dir", default=None,
                         help="where the queue, the verdicts and the logs "
                         "live (default ~/.local/state/agent-forge/"
@@ -7078,6 +7652,11 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
         project.name, "pr-check" if args.instance is None
         else "pr-check-" + args.instance, environ)
     os.makedirs(state_dir, exist_ok=True)
+    if args.relabel_host:
+        changed = relabel_host(state_dir, args.relabel_host)
+        out("RELABELLED: %d verdict(s) from host %s are now %s's"
+            % (changed, args.relabel_host, socket.gethostname()))
+        return 0
     post = make_poster(run, out, project) if args.post and not args.warm \
         else None
     if args.worker:

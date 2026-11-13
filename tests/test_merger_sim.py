@@ -44,6 +44,20 @@ class Morning(unittest.TestCase):
         self.assertEqual(got.merged, 15, figures(got))
         self.assertLessEqual(got.runs / got.merged, 3.0, figures(got))
 
+    def test_a_restacked_layer_keeps_its_train(self):
+        # 2026-11-12: the Merger restacked a train's layer, and the next
+        # tick held it for its gated instance's verdict on the new head
+        # (the walk back to an earlier verdict stopped at the restack),
+        # so it left its train as a push and every train was cut again.
+        m = ms.load_merger()
+        m.configure(ms.project())
+        got = simulate(m, ms.restacked_day())
+        self.assertTrue(any("RESTACK (done)" in l for l in got.lines))
+        self.assertEqual(got.broken, [], figures(got))
+        self.assertFalse(any("TRAIN-LEFT" in l for l in got.lines),
+                         figures(got))
+        self.assertEqual(got.merged, 15, figures(got))
+
     def test_it_finds_the_faults_of_v0_4_173(self):
         # v0.4.173 is the last release without agent-forge #306 and #307.
         # Its trains were spent by its own updates (BATCH-FIRST, then
@@ -59,6 +73,31 @@ class Morning(unittest.TestCase):
         self.assertEqual(rules, {"1", "3"}, "\n".join(got.broken))
         self.assertTrue(any("BATCH-FIRST" in l for l in got.lines))
         self.assertTrue(any("TRAIN-LEFT" in l for l in got.lines))
+
+    def test_a_red_train_is_searched_and_kept(self):
+        # 2026-11-12, with train_merge: the tick that found a train's
+        # top red updated its first member, a suspect; the search lost
+        # it and its stacked layers, forgot that the whole train was
+        # red, and every train was cut again with newer pull requests
+        # in the middle.
+        m = ms.load_merger()
+        m.configure(ms.project(batch=8, train_merge=True,
+                               layers_need_own_green=False))
+        got = simulate(m, ms.red_stack_day())
+        self.assertEqual(got.broken, [], figures(got))
+        red = [l for l in got.lines if " top red" in l]
+        self.assertTrue(red, figures(got))
+        start = red[0][:5]
+        found = [l for l in got.lines if l[6:].startswith("SUSPECT-RED #32")]
+        self.assertTrue(found, "\n".join(got.lines))
+        during = [l for l in got.lines if start <= l[:5] <= found[0][:5]]
+        self.assertFalse([l for l in during if "UPDATE" in l
+                          and l[:5] < found[0][:5]], "\n".join(during))
+        self.assertFalse([l for l in during if "red from none" in l],
+                         "\n".join(during))
+        self.assertFalse([l for l in got.lines if l[:5] >= start
+                          and l[6:].startswith("TRAIN-CUT 1")],
+                         "\n".join(got.lines))
 
     @unittest.skipUnless(os.environ.get("AGENT_FORGE_SIM_LONG"),
                          "AGENT_FORGE_SIM_LONG=1 runs it")

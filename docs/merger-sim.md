@@ -21,13 +21,18 @@ Merger's writes, GitHub's answers and the build check's verdicts meet.
   - statuses are kept per commit.
 - **`SimCheck`.** A model of `forge-pr-check`:
   - it runs the Merger's batch tops first, then the heads no batch
-    covers, in `slots` slots, each taking `minutes`;
+    covers, in `slots` slots, each taking `minutes` (a stack's layer's
+    own run takes `layer_minutes` when given, to show what waits for
+    those, and any other pull request's own run `own_minutes`, to show
+    what waits for own runs queued behind many others);
   - it matches a head to a green run of its tree, covers a batch
     member once its top is green, and holds one while the top runs;
   - it notices a new head `notice` minutes after it appears;
   - it runs the gated instance (`vm/mac`, for paths under `mac/`) in a
     queue of its own, `mac_slots` slots taking `mac_minutes`;
-  - a tree with a `red-*` file is red.
+  - a tree with a `red-*` file is red, and so is one with two
+    `clash-<name>-*` files of the same name (two changes each green
+    alone, red together).
 
   With `later_first` set, it starts runs in `forge-pr-check`'s own
   order instead of every top first:
@@ -49,8 +54,10 @@ Merger's writes, GitHub's answers and the build check's verdicts meet.
 
 1. A pull request leaves a started train only by merging at the tree
    predicted for its place. The exceptions are a red top (the search
-   for the culprit), and the scenario having pushed to or approved it
-   or one ahead of it. Never through the Merger's own doing.
+   for the culprit), one found red on its own that minute (boarded
+   without its own green, `own_green_to_board` false), and the
+   scenario having pushed to or approved it or one ahead of it. Never
+   through the Merger's own doing.
 2. `main` only takes a tree a green run tested: its own, or a prefix
    of a train whose top was green.
 3. Nothing boards a train without an approval of its author's latest
@@ -74,7 +81,17 @@ A scenario is a list of `(minute, World method, args)`:
 - `push(number)` is its author pushing a change of their own;
 - `review(number)` approves its head again.
 
-`day()` is the short scenario the normal suite runs. `busy()` builds a
+`open` also takes `clash`, a name: two pull requests opened with the
+same one are each green alone and red together.
+
+`day()` is the short scenario the normal suite runs;
+`restacked_day()` adds a push to a stack's bottom layer, and
+`siblings_day()` a base with three layers side by side on it.
+`red_train_day()` has a long train with two clashing members, and
+`red_stack_day()` a stack of three in a train whose top layer clashes
+with another member; the normal suite runs the latter with
+`train_merge`. `busy()`
+builds a
 longer one from a seeded random source, and
 `AGENT_FORGE_SIM_LONG=1` runs it. Run an older Merger by passing
 `load_merger(merger_source("<tag>"))` to `Sim`.

@@ -60,8 +60,12 @@ with the confirmed delivery `forge-router` and `forge-merger` use:
     <the last line the job wrote to $FORGE_QUEUE_SUMMARY, if any>
 
 A delivery the relay didn't take is tried again every
-`relay.remind_seconds` (default 7200): by the runner, which stays until
-it is taken, and, once the runner is gone, by `recover`. `list
+`relay.remind_seconds` (default 7200): by the runner, up to 12 times,
+and then, once the runner is gone, by `recover`. A runner whose
+delivery fails with an import error (the installation moved under it)
+leaves it to `recover` at once, since it can never deliver from that
+process; it loads what delivery needs before its job starts, so an
+upgrade underneath doesn't split it (agent-forge #289). `list
 --undelivered` lists the tickets whose message hasn't landed.
 
 **list [QUEUE]** shows running and waiting jobs, in order; `--done`
@@ -381,12 +385,26 @@ def message(sd, job, status):
     return "\n".join(lines)
 
 
+_TOOLS = {}
+
+# A runner tries the message this many times, then leaves it to
+# `recover`, a fresh process (agent-forge #289).
+RUNNER_TRIES = 12
+
+
 def _load_tool(name):
+    """Another tool of this installation as a module, loaded once per
+    process: a runner loads forge-merger before its job starts, so an
+    upgrade underneath can't give it a newer tool over an older
+    package (agent-forge #289)."""
+    if name in _TOOLS:
+        return _TOOLS[name]
     loader = importlib.machinery.SourceFileLoader(
         name.replace("-", "_"), os.path.join(BIN, name))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
+    _TOOLS[name] = module
     return module
 
 
@@ -421,6 +439,12 @@ def deliver(sd, job, send, clock, out):
             return bool(status.get("delivered"))
         try:
             why = send(job, message(sd, job, status))
+        except (ImportError, AttributeError) as err:
+            # The installation moved under this process: it will never
+            # deliver from here. `recover`, a fresh process, will.
+            why = "delivery can't work in this process (%s: %s); " \
+                "`forge-queue recover` sends it" % (type(err).__name__, err)
+            status["runner_gave_up"] = True
         except Exception as err:  # a fault in delivery must not lose state
             why = "delivery failed: %s" % err
         when = clock()
@@ -489,6 +513,11 @@ def run_ticket(sd, ticket, run, out, clock, sleep, send, spawn_job):
         out("%s: %s already has a runner" % (PROG, ticket))
         return 0
     cancel_mark = job_file(sd, ticket, "cancel")
+    if send is relay_send:
+        try:
+            _load_tool("forge-merger")
+        except Exception:  # delivery says why, when it comes to it
+            pass
 
     def cancelled():
         return os.path.exists(cancel_mark)
@@ -522,6 +551,11 @@ def run_ticket(sd, ticket, run, out, clock, sleep, send, spawn_job):
         while not deliver(sd, job, send, clock, out):
             st = load_status(sd, ticket)
             if st.get("delivered") or st.get("state") not in ENDED:
+                break
+            if st.get("runner_gave_up") or \
+                    st.get("deliveries", 0) >= RUNNER_TRIES:
+                out("left to recover: %s's message after %d tries"
+                    % (ticket, st.get("deliveries", 0)))
                 break
             at = parse_time(st.get("next_delivery")) or clock()
             sleep(max(1, (at - clock()).total_seconds()))

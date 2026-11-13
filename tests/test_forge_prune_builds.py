@@ -603,6 +603,46 @@ class Shared(unittest.TestCase):
         self.assertEqual((cleared, kept), (1, 0))
         self.assertFalse(os.path.exists(old))
 
+    def cargo_home(self, name, mark=None):
+        home = os.path.join(self.shared, name)
+        os.makedirs(home)
+        if mark:
+            open(os.path.join(home, mark), "w").close()
+        caches = [self.fx.cache(home, rel=r, age_hours=100, locks=())
+                  for r in ("registry", "git")]
+        return caches
+
+    def test_cargos_own_caches_are_never_cleared(self):
+        # Cargo tags ~/.cargo/registry and ~/.cargo/git, but rustc
+        # reads sources there through a build with no lock held.
+        caches = self.cargo_home(".cargo")
+        for kw in ({}, {"high": 85, "low": 75, "usage": lambda r: 99}):
+            (cleared, _, _), _ = self.go(**kw)
+            self.assertEqual(cleared, 0)
+            for cache in caches:
+                self.assertTrue(os.path.exists(cache), cache)
+
+    def test_a_cargo_home_by_another_name_is_never_cleared(self):
+        caches = self.cargo_home("cargo-home", mark=".package-cache")
+        self.go(high=85, low=75, usage=lambda r: 99)
+        for cache in caches:
+            self.assertTrue(os.path.exists(cache), cache)
+
+    def test_cargo_home_from_the_environment_is_never_cleared(self):
+        caches = self.cargo_home("ch")
+        home = os.path.join(self.shared, "ch")
+        old = os.environ.get("CARGO_HOME")
+        os.environ["CARGO_HOME"] = home
+        try:
+            self.go()
+        finally:
+            if old is None:
+                del os.environ["CARGO_HOME"]
+            else:
+                os.environ["CARGO_HOME"] = old
+        for cache in caches:
+            self.assertTrue(os.path.exists(cache), cache)
+
     def test_a_tagged_cache_is_not_searched_inside(self):
         outer = self.tgt(".tgt-outer", 10)
         inner = self.fx.cache(outer, rel="nested", age_hours=100)

@@ -62,7 +62,7 @@ class ReplayWorld(ms.World):
                 under = self.prs[base]
             if under["state"] != "OPEN":
                 base = None
-        self.open(number, base, mac, red, urgent, approve, shared)
+        self.open(number, base, mac, red, urgent, approve, shared=shared)
 
     def approve(self, number):
         pr = self.prs.get(number)

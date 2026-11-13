@@ -77,9 +77,10 @@ def merger_source(tag):
     return got.stdout if got.returncode == 0 else None
 
 
-def project(**ahead):
+def project(merge=None, **ahead):
     """The configuration the simulation runs the Merger with: batches,
-    trains, stacks and a gated instance, as a busy project has them."""
+    trains, stacks and a gated instance, as a busy project has them.
+    `merge` adds or replaces other `merge` keys."""
     data = example()
     data["merge"] = {
         "merger": "Merger", "ci_workflow": "", "stall_minutes": 600,
@@ -90,6 +91,7 @@ def project(**ahead):
             "retry_red": True, "max_age_hours": 24}, **ahead),
         "stacks": {"wait_hours": 24, "predict_restacked": True},
     }
+    data["merge"].update(merge or {})
     data.setdefault("labels", {})["urgent"] = URGENT
     data["checks"]["instances"] = {"mac": {
         "context": GATED, "poster": "Merger", "gate": True,
@@ -166,6 +168,9 @@ class World:
         self.events = []
         self.merges = []
         self.auto_retarget = True
+        # authors_resolve: who answers a hand-back, and how fast.
+        self.resolver = None
+        self.scheduled = []
 
     # git plumbing in origin
 
@@ -191,11 +196,7 @@ class World:
         return cache[sha]
 
     def main(self):
-        # Only a squash merge moves main (SimGitHub.merge), which
-        # forgets this.
-        if self.__dict__.get("main_sha") is None:
-            self.main_sha = self.og("rev-parse", "refs/heads/main")
-        return self.main_sha
+        return self.og("rev-parse", "refs/heads/main")
 
     def ref(self, name):
         return self.og("rev-parse", "--verify", "-q", name, check=False)
@@ -217,7 +218,8 @@ class World:
     def gate_verdict(self, number):
         """The gated instance's verdict for #`number` as the Merger reads
         it: on the head, or, while that has none final, on the commit
-        before each merge of the default branch into it."""
+        before each merge of the default branch, or of a merged layer's
+        final head (RESTACK: its tree is a squash on main), into it."""
         sha, first = self.prs[number]["head"], None
         for _ in range(20):
             state = next((s["state"] for s in self.statuses.get(sha, ())
@@ -232,7 +234,9 @@ class World:
             got = subprocess.run(
                 ["git", "-C", self.origin, "merge-base", "--is-ancestor",
                  parents[2], self.main()], env=git_env())
-            if got.returncode != 0:
+            if got.returncode != 0 and self.tree(parents[2]) not in self.og(
+                    "log", "--first-parent", "--format=%T",
+                    self.main()).split():
                 break
             sha = parents[1]
         return first
@@ -277,17 +281,26 @@ class World:
         self.note("approve", pr=number)
 
     def open(self, number, base=None, mac=False, red=False, urgent=False,
-             approve=True, shared=()):
+             approve=True, clash=None, hot=False, shared=()):
         """Opens #`number`, on main or on the pull request `base`, with a
         change of its own (a file of its own, so nothing conflicts), and
         a line of its own in each of the `shared` files, so that it
         conflicts with every other pull request that writes one of
-        them."""
+        them. `clash`, a name: it is green alone, but red with the other
+        pull request of that name, as two changes that each build and
+        break the build together (a field one adds, an initializer
+        without it in the other). `hot`: it also writes `hot.txt`, as
+        every other hot one does, so each that merges makes the others
+        conflict with main."""
         branch = "b%d" % number
         start = self.main() if base is None else self.prs[base]["head"]
         files = {"p%d.txt" % number: "v1\n"}
         for name in shared:
             files[name] = "#%d\n" % number
+        if clash:
+            files["clash-%s-%d.txt" % (clash, number)] = "v1\n"
+        if hot:
+            files["hot.txt"] = "#%d\n" % number
         if mac:
             files["mac/p%d.txt" % number] = "v1\n"
         if red:
@@ -298,6 +311,7 @@ class World:
             "base": "main" if base is None else self.prs[base]["branch"],
             "branch": branch, "head": sha, "version": 1, "approved": None,
             "mac": mac, "red": red, "state": "OPEN", "reviews": [],
+            "files": dict(files),
             "labels": [URGENT] if urgent else [], "comments": []}
         self.set_head(number, sha)
         self.note("open", pr=number, base=base, mac=mac, red=red,
@@ -309,6 +323,7 @@ class World:
         """The author pushes a change of their own to #`number`."""
         pr = self.prs[number]
         pr["version"] += 1
+        pr["files"]["p%d.txt" % number] = "v%d\n" % pr["version"]
         sha = self.commit(pr["head"], {"p%d.txt" % number: "v%d\n"
                                        % pr["version"]}, "push")
         self.set_head(number, sha)
@@ -332,25 +347,67 @@ class World:
         pr["red"] = False
         self.note("fix", pr=number)
 
-    def resolve(self, number):
-        """The author of #`number` merges main into it, taking main's
-        side of every conflict: a new head that no longer conflicts with
-        what has merged."""
-        pr = self.prs[number]
-        if pr["state"] != "OPEN":
+    def authors_resolve(self, seed=0, author=(10, 40), reviewer=(5, 20)):
+        """From now on authors and the reviewer answer the Merger's
+        hand-backs, as agents do: an author handed back a conflict with
+        main merges main into the branch by hand some `author` minutes
+        later (`resolve`), and the reviewer handed back a head approves
+        it some `reviewer` minutes later."""
+        import random
+        self.resolver = (random.Random(seed), author, reviewer)
+
+    def handed_back(self, number, body):
+        """The Merger commented `body` on #`number`."""
+        if self.resolver is None or number not in self.prs:
             return
-        pr["version"] += 1
+        rng, author, reviewer = self.resolver
+        head = self.prs[number]["head"]
+        if body.startswith("Not merging") and "conflicts with main" in body:
+            self.note("conflict-hand-back", pr=number)
+            self.scheduled.append((self.minute() + rng.randint(*author),
+                                   "resolve", (number, head)))
+        elif body.startswith("Not-a-review"):
+            self.note("reviewer-hand-back", pr=number)
+            self.scheduled.append((self.minute() + rng.randint(*reviewer),
+                                   "review_if", (number, head)))
+
+    def minute(self):
+        return int((self.now - START).total_seconds() // 60)
+
+    def resolve(self, number, head=None):
+        """The author resolves #`number`'s conflict with main. With
+        `head` (an author answering a hand-back), by hand, keeping their
+        own lines: a merge of main whose tree is main's with the
+        author's files, and not if it has moved on since. Without (a
+        replayed resolution), by merging main and taking main's side of
+        every conflict: a new head that no longer conflicts with what
+        has merged."""
+        pr = self.prs[number]
+        if pr["state"] != "OPEN" or head not in (None, pr["head"]):
+            return
         main = self.main()
-        got = subprocess.run(
-            ["git", "-C", self.origin, "merge-tree", "--write-tree",
-             "--no-messages", "-X", "theirs", pr["head"], main],
-            capture_output=True, text=True, env=git_env())
-        tree = got.stdout.split()[0] if got.returncode == 0 \
-            else self.tree(main)
+        pr["version"] += 1
+        if head is not None:
+            tree = self.write_tree(self.tree(main), pr["files"])
+            message = "Merge main, resolving by hand"
+        else:
+            got = subprocess.run(
+                ["git", "-C", self.origin, "merge-tree", "--write-tree",
+                 "--no-messages", "-X", "theirs", pr["head"], main],
+                capture_output=True, text=True, env=git_env())
+            tree = got.stdout.split()[0] if got.returncode == 0 \
+                else self.tree(main)
+            message = "Merge main into %s" % pr["branch"]
         sha = self.og("commit-tree", tree, "-p", pr["head"], "-p", main,
-                      "-m", "Merge main into %s" % pr["branch"])
+                      "-m", message)
         self.set_head(number, sha)
         self.note("resolve", pr=number)
+
+    def review_if(self, number, head):
+        """The reviewer approves #`number`, if it is still at `head`."""
+        pr = self.prs[number]
+        if pr["state"] == "OPEN" and pr["head"] == head:
+            self.review(number)
 
     def close(self, number):
         """#`number` is closed without merging."""
@@ -395,6 +452,8 @@ class SimGitHub:
     def api(self, *args):
         w = self.world
         path = args[1] if args[0] == "--paginate" else args[0]
+        if path == "graphql" and any("issues(states:OPEN" in a for a in args):
+            return sorted(w.issues)
         if path == "graphql":
             if any("closingIssuesReferences" in a for a in args):
                 return {"data": {"repository": {"pullRequest": {
@@ -444,6 +503,8 @@ class SimGitHub:
         w = self.world
         rest = path[len("repos/%s/" % SLUG):]
         parts = rest.split("/")
+        if parts[0] == "issues" and parts[2:] == ["comments"]:
+            w.handed_back(int(parts[1]), fields.get("body") or "")
         if parts[0] == "pulls" and len(parts) == 3:
             number, pr = int(parts[1]), w.prs[int(parts[1])]
             if parts[2] == "update-branch":
@@ -502,7 +563,6 @@ class SimGitHub:
         squash = w.og("commit-tree", tree, "-p", main, "-m",
                       "#%d" % number)
         w.og("update-ref", "refs/heads/main", squash, main)
-        w.main_sha = None
         pr["state"] = "MERGED"
         pr["merged_at"] = iso(w.now)
         w.merges.append({"pr": number, "tree": tree, "at": iso(w.now),
@@ -520,12 +580,17 @@ class SimCheck:
     """A model of the build check: a few slots, a verdict after
     `minutes`, the Merger's tops first, heads matched or covered by a
     green run as forge-pr-check does, and the gated instance in a queue
-    of its own with `mac_slots` slots taking `mac_minutes`."""
+    of its own with `mac_slots` slots taking `mac_minutes`. A stack's
+    layer's own run (one based on another pull request's branch when it
+    starts) takes `layer_minutes` (default `minutes`): longer, it shows
+    what waits for layers' own runs. Any other pull request's own run
+    takes `own_minutes` (default `minutes`): longer, it shows what waits
+    for own runs queued behind many others."""
 
     def __init__(self, world, merger_dir, slots=4, minutes=8,
                  mac_slots=1, mac_minutes=12, notice=2, later_first=None,
                  max_wait=None, stop_spent=False, background=(),
-                 first_pr=None):
+                 first_pr=None, layer_minutes=None, own_minutes=None):
         """`minutes` is a run's length, or a function of (pull request
         number, whether the run is a top) giving it. With `later_first`
         (a number), runs start in `forge-pr-check`'s order rather than
@@ -538,10 +603,15 @@ class SimCheck:
         pull request has any more, stop. `background` is other work in
         the same slots: [{"at": minute, "minutes": n, "main": bool}],
         each queued at its minute (a default-branch run first, anything
-        else as an ordinary head)."""
+        else as an ordinary head). `layer_minutes` and `own_minutes`,
+        when `minutes` is a number, are a layer's own run's and any
+        other own run's length (both default `minutes`)."""
         self.world = world
         self.merger_dir = merger_dir
         self.slots, self.minutes = slots, minutes
+        self.layer_minutes = minutes if layer_minutes is None \
+            else layer_minutes
+        self.own_minutes = minutes if own_minutes is None else own_minutes
         self.later_first, self.max_wait = later_first, max_wait
         self.stop_spent = stop_spent
         self.background = sorted(background, key=lambda b: b["at"])
@@ -605,8 +675,11 @@ class SimCheck:
         return entries, batches
 
     def verdict(self, tree):
-        return not any(name.startswith("red-")
-                       for name in self.world.files(tree))
+        names = self.world.files(tree)
+        clashes = collections.Counter(name.split("-")[1] for name in names
+                                      if name.startswith("clash-"))
+        return not any(name.startswith("red-") for name in names) \
+            and all(n < 2 for n in clashes.values())
 
     def green(self, tree):
         return any(r.get("ok") is True and r.get("tree") == tree
@@ -618,9 +691,13 @@ class SimCheck:
 
     def length(self, pr, top):
         """A run's length in minutes, as a timedelta."""
-        minutes = self.minutes(pr, top) if callable(self.minutes) \
-            else self.minutes
-        return datetime.timedelta(minutes=minutes)
+        if callable(self.minutes):
+            return datetime.timedelta(minutes=self.minutes(pr, top))
+        layer = not top and self.world.prs.get(
+            pr, {}).get("base", "main") != "main"
+        return datetime.timedelta(
+            minutes=self.layer_minutes if layer
+            else self.minutes if top else self.own_minutes)
 
     def step(self):
         if self.later_first is not None:
@@ -836,7 +913,12 @@ class Monitor:
     3. No pull request boards a train without an approval of its
        author's latest change, nor without the gated instance's green
        on that change when it needs one.
-    4. Nothing red ever reaches the default branch."""
+    4. Nothing red ever reaches the default branch.
+    5. A train whose top has started merges in its own order: no member
+       merges while one before it in the train is still unmerged (on
+       2026-11-11 a member merged on its own green ahead of an urgent
+       one cut in front of it, and the green train's prediction no
+       longer held)."""
 
     def __init__(self, sim):
         self.sim = sim
@@ -906,9 +988,12 @@ class Monitor:
                     self.say(3, "#%d boarded with %s not yet green on its "
                              "change" % (e["pr"], GATED))
         # Every batch the Merger predicted: a green top covers its
-        # prefixes, whoever's run found its tree green.
+        # prefixes, whoever's run found its tree green. Every prefix any
+        # batch with that top had: a later, shorter batch with the same
+        # top (its first members merged) doesn't uncover them.
         for batch in batches:
-            self.batches[batch[-1]["tree"]] = [e["tree"] for e in batch]
+            self.batches.setdefault(batch[-1]["tree"], set()).update(
+                e["tree"] for e in batch)
         # Trains are tracked from the minute their top starts.
         for batch in batches:
             top = batch[-1]
@@ -918,6 +1003,23 @@ class Monitor:
                     "members": [(e["pr"], e["tree"]) for e in batch],
                     "since": check.state["ahead_started"][top["sha"]],
                     "tree": top["tree"], "done": False}
+        # Rule 5: a started train merges in its own order.
+        before = {m["pr"] for m in w.merges[:self.seen_merges]}
+        for m in w.merges[self.seen_merges:]:
+            for train in self.trains.values():
+                if train["done"]:
+                    continue
+                order = [n for n, _ in train["members"]]
+                if m["pr"] not in order:
+                    continue
+                ahead = [n for n in order[:order.index(m["pr"])]
+                         if n not in before]
+                if ahead:
+                    self.say(5, "#%d merged ahead of #%d, before it in the "
+                             "train #%d..#%d (%s)" % (
+                                 m["pr"], ahead[0], order[0], order[-1],
+                                 self.why(m["pr"])))
+            before.add(m["pr"])
         merged = {m["pr"]: m["tree"] for m in w.merges}
         for top, train in self.trains.items():
             if train["done"]:
@@ -934,6 +1036,13 @@ class Monitor:
                               for n, _ in train["members"][:at + 1]):
                     break
                 minute = iso(w.now)[11:16]
+                if any(l.startswith(minute + " SUSPECT-RED")
+                       for l in self.sim.lines):
+                    # One found red on its own leaves, and the trains
+                    # with or behind it change: with own_green_to_board
+                    # false, a pull request boards before its own run
+                    # says so.
+                    break
                 if any(l.startswith(minute + " TRAIN-RECUT")
                        for l in self.sim.lines):
                     # An urgent pull request goes first by design, and
@@ -1077,6 +1186,9 @@ class Sim:
                 now=lambda: w.now, sleep=lambda s: None, live=True,
                 check_state=self.check.state)
             self.records.append(record)
+            if w.scheduled:
+                events = sorted(events + w.scheduled, key=lambda e: e[0])
+                w.scheduled = []
             w.sync()
             self.check.step()
             self.monitor.check()
@@ -1115,6 +1227,65 @@ def day(prs=14, seed=0):
     s += [(12, "open", (10, None, False, True))]
     s += [(14, "push", (7,)), (18, "review", (7,))]
     s += [(20 + 2 * k, "open", (n,)) for k, n in enumerate(range(11, prs))]
+    return s
+
+
+def restacked_day():
+    """`day`, with the stack's bottom layer pushed to (and approved
+    again) after the layer above it was opened: once it merges, the
+    middle layer, which needs the gated instance, conflicts with main
+    and the Merger restacks it."""
+    return sorted(day() + [(2, "push", (20,)), (3, "review", (20,))],
+                  key=lambda event: event[0])
+
+
+def siblings_day():
+    """`day`, with a base on main that has three layers on it, side by
+    side, and a layer on the second of those."""
+    s = day()
+    s += [(5, "open", (30,)), (6, "open", (31, 30)), (6, "open", (32, 30)),
+          (6, "open", (33, 30)), (7, "open", (34, 32))]
+    return sorted(s, key=lambda event: event[0])
+
+
+def red_train_day():
+    """A long train with two members that clash (each green alone, red
+    together), so its top is red and its members are searched, while
+    new pull requests keep arriving. Run with `train_merge`, a batch of
+    eight and `layers_need_own_green` false, as a busy project has."""
+    s = [(0, "open", (n,)) for n in range(1, 11) if n not in (3, 7)]
+    s += [(0, "open", (3, None, False, False, False, True, "f")),
+          (0, "open", (7, None, False, False, False, True, "f"))]
+    s += [(4 + 2 * k, "open", (n,)) for k, n in enumerate(range(11, 25))]
+    return sorted(s, key=lambda event: event[0])
+
+
+def red_stack_day():
+    """`red_train_day`, with a stack of three in the red train: its
+    layers are members that are held as stacked, not candidates, and the
+    search must predict them where the train had them."""
+    s = [(0, "open", (30,)), (0, "open", (31, 30)),
+         (0, "open", (32, 31, False, False, False, True, "f")),
+         (0, "open", (3, None, False, False, False, True, "f"))]
+    s += [(1, "open", (n,)) for n in range(1, 11) if n != 3]
+    s += [(4 + 2 * k, "open", (n,)) for k, n in enumerate(range(11, 25))]
+    return s
+
+
+def hot(prs=30, seed=1, share=0.7, minutes=240):
+    """A scenario where most pull requests (`share`) write the same
+    file, so each merge makes the others conflict with main, and authors
+    and the reviewer answer hand-backs (`World.authors_resolve`): the
+    conflict hand-backs, resolutions by hand and re-reviews of a busy
+    queue whose changes meet in one place. Pull requests arrive over
+    `minutes`."""
+    import random
+    rng = random.Random(seed)
+    s, at = [(0, "authors_resolve", (seed,))], 0
+    for number in range(1, prs + 1):
+        at += rng.randint(1, max(2, minutes // prs * 2))
+        s.append((at, "open", (number, None, False, False, False, True,
+                               None, rng.random() < share)))
     return s
 
 

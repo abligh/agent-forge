@@ -2,6 +2,7 @@
 checkout of it, and tools that report what they saw."""
 import fcntl
 import os
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -47,6 +48,7 @@ class CronRun(unittest.TestCase):
         self.env = dict(self.r.env, FORGE_CRON_CHECKOUT=self.cron,
                         FORGE_CRON_LOGDIR=self.logs,
                         FORGE_CRON_LOCK_WAIT_S="1",
+                        FORGE_CRON_PIN_WAIT_S="0",
                         FORGE_CRON_PATH="/opt/tool/bin")
         self.err = []
 
@@ -164,6 +166,163 @@ class CronRun(unittest.TestCase):
         with open(os.path.join(self.cron, ".agent-forge", "pin"), "w") as h:
             h.write("0" * 40)
         self.assertEqual(self.run_installed(install), 0)
+
+    def test_a_job_waits_for_forge_install_after_a_pin_bump(self):
+        # agent-forge #262: an hourly job that fired between a pin bump
+        # and forge-install's next run lost its hour.
+        install, old = self.install_at()
+        self.r.git(install, "-c", "user.name=t", "-c", "user.email=t@t",
+                   "commit", "-q", "--allow-empty", "-m", "v1")
+        new = self.r.git(install, "rev-parse", "HEAD").stdout.strip()
+        self.r.git(install, "checkout", "-q", old)
+        self.pin("%s v1\n" % new)
+        clock, naps = [0.0], []
+
+        def nap(seconds):
+            naps.append(seconds)
+            clock[0] += seconds
+            if len(naps) == 3:
+                # forge-install moves the installation meanwhile.
+                self.r.git(install, "checkout", "-q", new)
+        got = tool.main(["report"], dict(self.env, FORGE_CRON_PIN_WAIT_S="600"),
+                        lambda repo, app: "x", clock=lambda: clock[0],
+                        nap=nap, err=self.err.append, install=install)
+        self.assertEqual(got, 0)
+        log = self.log()
+        self.assertIn("PIN-WAIT: PIN-MISMATCH", log)
+        self.assertIn("PIN-WAITED 30s", log)
+        self.assertIn("cwd=", log)
+
+    def releases(self):
+        """forge-install --versions' layout: `install` links to the release
+        at `install.d/<sha>`, a git repository. Returns (link, old
+        release, new release, new release's sha)."""
+        old, sha = self.install_at()
+        self.r.git(old, "-c", "user.name=t", "-c", "user.email=t@t",
+                   "commit", "-q", "--allow-empty", "-m", "v1")
+        new_sha = self.r.git(old, "rev-parse", "HEAD").stdout.strip()
+        self.r.git(old, "checkout", "-q", sha)
+        link = os.path.join(self.r.dir, "agent-forge")
+        os.makedirs(link + ".d")
+        release = os.path.join(link + ".d", sha)
+        os.rename(old, release)
+        moved = os.path.join(link + ".d", new_sha)
+        os.makedirs(os.path.join(moved, "bin"))
+        os.symlink(os.path.join("agent-forge.d", sha), link)
+        return link, release, moved, new_sha
+
+    def move(self, link, release):
+        os.symlink(os.path.relpath(release, os.path.dirname(link)),
+                   link + ".new")
+        os.replace(link + ".new", link)
+
+    def test_a_job_on_a_release_left_behind_runs_the_new_one(self):
+        # A job started from a release just before forge-install moved
+        # the link waited out its whole bound holding its tool's lock
+        # (2026-11-13: ten minutes of no ticks after a pin bump).
+        link, release, moved, new = self.releases()
+        self.pin("%s v1\n" % new)
+        clock, naps, ran = [0.0], [], []
+
+        def nap(seconds):
+            naps.append(seconds)
+            clock[0] += seconds
+            if len(naps) == 2:
+                self.move(link, moved)
+        got = tool.main(["report", "--x"],
+                        dict(self.env, FORGE_CRON_PIN_WAIT_S="600"),
+                        lambda repo, app: "x", clock=lambda: clock[0],
+                        nap=nap, err=self.err.append, install=release,
+                        execute=lambda *a: ran.append(a))
+        self.assertEqual(got, 0)
+        self.assertEqual(ran, [(sys.executable, [
+            sys.executable, os.path.join(moved, "bin", "forge-cron-run"),
+            "report", "--x"])])
+        log = self.log()
+        self.assertIn("PIN-WAIT: PIN-MISMATCH", log)
+        self.assertIn("PIN-MOVED: PIN-MISMATCH", log)
+        self.assertIn("running %s instead" % moved, log)
+        self.assertNotIn("cwd=", log)
+        self.assertEqual(len(naps), 2)
+
+    def test_a_job_on_a_release_already_left_runs_the_new_one_at_once(self):
+        link, release, moved, new = self.releases()
+        self.move(link, moved)
+        self.pin("%s v1\n" % new)
+        ran = []
+        got = tool.main(["report"], self.env, lambda repo, app: "x",
+                        nap=lambda s: self.fail("waited"),
+                        err=self.err.append, install=release,
+                        execute=lambda *a: ran.append(a))
+        self.assertEqual(got, 0)
+        self.assertEqual(len(ran), 1)
+        self.assertNotIn("PIN-WAIT:", self.log())
+
+    def test_moved_release(self):
+        link, release, moved, new = self.releases()
+        self.assertIsNone(tool.moved_release(release))
+        self.move(link, moved)
+        self.assertEqual(tool.moved_release(release),
+                         os.path.realpath(moved))
+        # An installation that isn't a release can't be left behind.
+        self.assertIsNone(tool.moved_release(self.r.dir))
+
+    def test_a_job_waits_no_longer_than_its_bound(self):
+        install, sha = self.install_at()
+        self.pin("%s v0.1.0\n" % ("0" * 40))
+        clock = [0.0]
+
+        def nap(seconds):
+            clock[0] += seconds
+        got = tool.main(["report"], dict(self.env, FORGE_CRON_PIN_WAIT_S="60"),
+                        lambda repo, app: "x", clock=lambda: clock[0],
+                        nap=nap, err=self.err.append, install=install)
+        self.assertEqual(got, 2)
+        log = self.log()
+        self.assertIn("PIN-WAIT:", log)
+        self.assertIn("PIN-MISMATCH", log.split("PIN-WAIT:")[1].split(
+            "\n", 1)[1])
+        self.assertNotIn("cwd=", log)
+        self.assertGreaterEqual(clock[0], 60)
+
+    def test_a_waiting_job_holds_no_installation_lock(self):
+        install, sha = self.install_at()
+        self.pin("%s v0.1.0\n" % ("0" * 40))
+        lock = install + ".lock"
+        free = []
+
+        def nap(seconds):
+            with open(lock, "a") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    free.append(True)
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                except OSError:
+                    free.append(False)
+            clock[0] += seconds
+        clock = [0.0]
+        tool.main(["report"], dict(self.env, FORGE_CRON_PIN_WAIT_S="30"),
+                  lambda repo, app: "x", clock=lambda: clock[0], nap=nap,
+                  err=self.err.append, install=install)
+        self.assertTrue(free)
+        self.assertTrue(all(free))
+
+    def test_a_pending_install_is_waited_for_too(self):
+        install, sha = self.install_at()
+        self.pin("%s v0.1.0\n" % sha)
+        marker = install + ".install-wanted"
+        open(marker, "w").close()
+        clock = [0.0]
+
+        def nap(seconds):
+            clock[0] += seconds
+            if os.path.exists(marker):
+                os.unlink(marker)
+        got = tool.main(["report"], dict(self.env, FORGE_CRON_PIN_WAIT_S="600"),
+                        lambda repo, app: "x", clock=lambda: clock[0],
+                        nap=nap, err=self.err.append, install=install)
+        self.assertEqual(got, 0)
+        self.assertIn("PIN-WAIT: INSTALL-PENDING", self.log())
 
     def test_a_pin_that_isnt_a_full_sha_runs_nothing(self):
         install, sha = self.install_at()

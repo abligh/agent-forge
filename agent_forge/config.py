@@ -123,7 +123,12 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "hold_labels": list, "blocked_by": str, "said_since": dict,
          "update_once": bool, "ci_never_started": int,
          "queued_stall_minutes": int, "read_as": str, "age_first": dict,
-         "hand_back_once_per_head": bool, "own_head_green": bool}
+         "hand_back_once_per_head": bool, "own_head_green": bool,
+         "stall_run_factor": (int, float), "resolve_slots": int,
+         "resolve_slot_minutes": (int, float), "resolve_slot_on": str,
+         "mode": str, "code_owner_ask": dict, "code_owner_sequence": bool}
+# merge.code_owner_ask (agent-forge #153).
+CODE_OWNER_ASK = {"labels": list, "title": str}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
 # merge.resolve as an object: designs/0026's rules as `regenerate`, and
 # designs/0046's `union` globs.
@@ -139,12 +144,17 @@ TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "unstable_after_recuts": int, "batches_when_unstable": int,
               "trains": str, "trains_within": str, "stop_spent": bool,
               "green_batch_first": bool, "retry_red": bool,
-              "tell_boarded": bool, "later_first": int}
+              "tell_boarded": bool, "later_first": int,
+              "train_merge": bool, "train_branch": str,
+              "train_slots": int, "layers_need_own_green": bool,
+              "own_green_to_board": bool, "left_top_covers": bool}
 TRAINS = ("dry-run", "live", "off")
 # designs/0050: what testing ahead is when the project says nothing.
 # Trains of up to 4, two in flight, predicted 7 deep; batches x batch
 # is then depth + 1.
 DEFAULT_AHEAD_DEPTH = 7
+# forge-pr-check's checks.slots when the project gives none.
+DEFAULT_CHECK_SLOTS = 2
 DEFAULT_AHEAD_BATCH = 4
 DEFAULT_AHEAD_BATCHES = 2
 DEFAULT_TRAINS = "live"
@@ -168,7 +178,7 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "side_by_side": dict, "merger_cpu_weight": int,
           "docker_slices": dict, "pull_requests": dict, "warm": dict,
           "approved_first": bool, "scoped_minutes": int,
-          "gate": bool, "flake_issue": dict}
+          "gate": bool, "flake_issue": dict, "order": str}
 # checks.flake_issue (agent-forge #287): an issue for each step a
 # prediction's retry (merge.test_ahead.retry_red) turned green.
 FLAKE_ISSUE = {"labels": list, "owner": str}
@@ -180,6 +190,8 @@ DOCKER_SLICES = {"front": str, "other": str}
 PULL_REQUESTS = {"paths": list, "label": str}
 # checks.cpu_share (designs/0029): when a step's CHECK_CPUS is taken.
 CPU_SHARES = ("run", "step")
+# checks.order (designs/0052).
+CHECK_ORDERS = ("age", "merge")
 # checks.side_by_side (designs/0029): a run's steps side by side.
 SIDE_BY_SIDE = {"max_steps": int}
 # checks.step_alert (designs/0019): an issue when a step gets slower.
@@ -198,7 +210,7 @@ INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight", "cpu_quota",
                       "keep_ignored", "drop_env", "merge_default",
                       "red_comment", "max_wait_minutes", "host_fault_text",
                       "cache_fault_text", "step_alert", "cpu_share",
-                      "side_by_side", "warm", "approved_first")
+                      "side_by_side", "warm", "approved_first", "order")
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main", "main_red_issue")
 INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
@@ -237,19 +249,22 @@ FRESH = {"wait_minutes": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool,
         "version": list, "reads_base": bool, "outputs": list,
         "after": list, "alone": bool, "light": bool, "caches": dict,
-        "pull_requests": dict, "env_file": str}
+        "pull_requests": dict, "env_file": str, "timeout_minutes": int}
 # checks.tracer's values (docs/designs/0005).
 TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.
 LABELS = {"owner_prefix": str, "status_prefix": str,
           "waiting_on_owner": str, "waiting_external": str, "urgent": str,
-          "rerun": str}
+          "rerun": str, "armed": str, "keep_trains": str}
 RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 # forge-router's own: every key is checked.
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
           "stuck": dict, "owners": dict, "unreviewed": dict,
           "forget_minutes": int, "quiet_labels": list, "red_first": dict,
-          "nightly_wake": dict, "issue_blocked_by": str}
+          "nightly_wake": dict, "issue_blocked_by": str, "escalate": dict}
+# router.escalate (designs/0049).
+ESCALATE = {"after_reminders": int, "undelivered_minutes": int,
+            "label": str, "to": str}
 # Where an issue's `Blocked-by:` lines may be (agent_forge/rules_default.py).
 ISSUE_BLOCKED_BY = ("body", "agents")
 IDLE_OFFER = {"idle_minutes": int, "shell_minutes": int, "report_to": str,
@@ -357,8 +372,9 @@ def _is(value, kinds):
 
 def _type_name(kinds):
     kinds = kinds if isinstance(kinds, tuple) else (kinds,)
-    names = {str: "a string", int: "an integer", bool: "true or false",
-             dict: "an object", list: "a list", type(None): "null"}
+    names = {str: "a string", int: "an integer", float: "a number",
+             bool: "true or false", dict: "an object", list: "a list",
+             type(None): "null"}
     return " or ".join(names[k] for k in kinds)
 
 
@@ -649,6 +665,8 @@ def check(data):
         if isinstance(router.get("nightly_wake"), dict):
             _check_nightly_wake(router["nightly_wake"], "nightly" in data,
                                 problems)
+        if isinstance(router.get("escalate"), dict):
+            _check_escalate(router["escalate"], problems)
         if isinstance(router.get("issue_blocked_by"), str) and \
                 router["issue_blocked_by"] not in ISSUE_BLOCKED_BY:
             problems.append("router.issue_blocked_by must be one of %s"
@@ -667,11 +685,20 @@ def check(data):
                     and all(isinstance(a, str) for a in argv)):
                 problems.append("merge.gate[%d] must be a non-empty list of "
                                 "strings" % i)
+        if isinstance(merge.get("mode"), str) and \
+                merge["mode"] not in ("auto", "manual"):
+            problems.append("merge.mode must be auto or manual")
         name = merge.get("merger")
         if isinstance(name, str) and name not in data.get("machinery", {}):
             problems.append("merge.merger %r is not in machinery" % name)
         if isinstance(merge.get("stall_alert"), dict):
             _check_stall_alert(merge["stall_alert"], data["agents"], problems)
+        if isinstance(merge.get("code_owner_ask"), dict):
+            _check_code_owner_ask(merge, problems)
+        if merge.get("code_owner_sequence") is True and \
+                merge.get("code_owners") is not True:
+            problems.append("merge.code_owner_sequence needs "
+                            "merge.code_owners")
         if merge.get("test_ahead") is True and not isinstance(
                 data.get("checks"), dict):
             problems.append("merge.test_ahead needs checks: the build "
@@ -698,6 +725,20 @@ def check(data):
                 problems.append("merge.%s must be at least 1" % key)
         if "yield_cap" in merge and "yield_after_hand_back" not in merge:
             problems.append("merge.yield_cap needs merge.yield_after_hand_back")
+        if _is(merge.get("resolve_slots"), int) and merge["resolve_slots"] < 0:
+            # 0 is no limit (designs/0012, amendment of 2026-11-12).
+            problems.append("merge.resolve_slots must be at least 0")
+        if _is(merge.get("resolve_slot_minutes"), (int, float)) \
+                and merge["resolve_slot_minutes"] <= 0:
+            problems.append("merge.resolve_slot_minutes must be above 0")
+        if merge.get("resolve_slot_on") not in (None, "hand-back", "push"):
+            problems.append('merge.resolve_slot_on must be "hand-back" or '
+                            '"push"')
+        if "resolve_slot_on" in merge and not merge.get("resolve_slots"):
+            problems.append("merge.resolve_slot_on needs merge.resolve_slots")
+        if "resolve_slot_minutes" in merge and not merge.get("resolve_slots"):
+            problems.append("merge.resolve_slot_minutes needs "
+                            "merge.resolve_slots")
         if isinstance(merge.get("right_of_way"), dict):
             row = merge["right_of_way"]
             _fields("merge.right_of_way", row, RIGHT_OF_WAY, problems)
@@ -928,6 +969,10 @@ def _check_merge_0026(merge, data, problems):
     for key in ("ci_never_started", "queued_stall_minutes"):
         if _is(merge.get(key), int) and merge[key] < 1:
             problems.append("merge.%s must be at least 1" % key)
+    factor = merge.get("stall_run_factor")
+    if _is(factor, (int, float)) and not (math.isfinite(factor)
+                                          and factor >= 0):
+        problems.append("merge.stall_run_factor must be 0 or more")
     if isinstance(merge.get("read_as"), str) and merge["read_as"] not in names:
         problems.append("merge.read_as %r is not an agent or machinery"
                         % merge["read_as"])
@@ -950,6 +995,39 @@ def _check_stall_alert(alert, agents, problems):
     if isinstance(alert.get("title"), str) and not alert["title"].strip():
         problems.append("%s.title must not be empty" % where)
     labels = alert.get("labels")
+    if isinstance(labels, list) and not all(
+            isinstance(l, str) and l.strip() for l in labels):
+        problems.append("%s.labels must be a list of label names" % where)
+
+
+def _check_escalate(escalate, problems):
+    """router.escalate (designs/0049)."""
+    where = "router.escalate"
+    if not _fields(where, escalate, ESCALATE, problems):
+        return
+    if "after_reminders" not in escalate and \
+            "undelivered_minutes" not in escalate:
+        problems.append("%s needs after_reminders or undelivered_minutes"
+                        % where)
+    for key, low in (("after_reminders", 1), ("undelivered_minutes", 30)):
+        if _is(escalate.get(key), int) and escalate[key] < low:
+            problems.append("%s.%s must be at least %d" % (where, key, low))
+    for key in ("label", "to"):
+        if isinstance(escalate.get(key), str) and not escalate[key].strip():
+            problems.append("%s.%s must not be empty" % (where, key))
+
+
+def _check_code_owner_ask(merge, problems):
+    """merge.code_owner_ask (agent-forge #153): the issue the Merger
+    opens for a pull request it holds for a code owner."""
+    where = "merge.code_owner_ask"
+    ask = merge["code_owner_ask"]
+    _fields(where, ask, CODE_OWNER_ASK, problems)
+    if merge.get("code_owners") is not True:
+        problems.append("%s needs merge.code_owners" % where)
+    if isinstance(ask.get("title"), str) and "{pr}" not in ask["title"]:
+        problems.append("%s.title must name the pull request: {pr}" % where)
+    labels = ask.get("labels")
     if isinstance(labels, list) and not all(
             isinstance(l, str) and l.strip() for l in labels):
         problems.append("%s.labels must be a list of label names" % where)
@@ -1116,6 +1194,9 @@ def _check_checks(checks, data, problems, where="checks"):
                 continue
             if "name" not in step:
                 problems.append("%s: missing 'name'" % at)
+            if _is(step.get("timeout_minutes"), int) and \
+                    step["timeout_minutes"] < 1:
+                problems.append("%s.timeout_minutes must be at least 1" % at)
             run = step.get("run")
             if not (isinstance(run, list) and run
                     and all(isinstance(a, str) for a in run)):
@@ -1164,6 +1245,10 @@ def _check_checks(checks, data, problems, where="checks"):
             and checks["cpu_share"] not in CPU_SHARES:
         problems.append("%s.cpu_share must be one of %s"
                         % (where, ", ".join(CPU_SHARES)))
+    if isinstance(checks.get("order"), str) \
+            and checks["order"] not in CHECK_ORDERS:
+        problems.append("%s.order must be one of %s"
+                        % (where, ", ".join(CHECK_ORDERS)))
     if isinstance(checks.get("side_by_side"), dict):
         block = checks["side_by_side"]
         if _fields(where + ".side_by_side", block, SIDE_BY_SIDE, problems) \
@@ -1420,6 +1505,22 @@ def _check_test_ahead(ahead, checks, problems):
                             "(%d)" % (where, depth + 1))
     if _is(ahead.get("later_first"), int) and ahead["later_first"] < 0:
         problems.append("%s.later_first must be at least 0" % where)
+    if ahead.get("layers_need_own_green") is False \
+            and ahead.get("stacks") is not True:
+        problems.append("%s.layers_need_own_green false needs stacks: only "
+                        "a stack's layers board with their base" % where)
+    if ahead.get("own_green_to_board") is False \
+            and ahead.get("trains") != "live":
+        problems.append("%s.own_green_to_board false needs trains \"live\": "
+                        "only a cut train is boarded" % where)
+    if _is(ahead.get("train_slots"), int):
+        # Amendment of 2026-11-12: slots only the Merger's predictions
+        # may use; at least one must be left for the heads' own runs.
+        slots = checks.get("slots") if isinstance(checks, dict) else None
+        slots = slots if _is(slots, int) else DEFAULT_CHECK_SLOTS
+        if not 0 <= ahead["train_slots"] < slots:
+            problems.append("%s.train_slots must be at least 0 and less "
+                            "than checks.slots (%d)" % (where, slots))
     if _is(ahead.get("unstable_after_recuts"), int) and \
             ahead["unstable_after_recuts"] < 1:
         problems.append("%s.unstable_after_recuts must be at least 1" % where)
@@ -1457,16 +1558,14 @@ def _check_test_ahead(ahead, checks, problems):
 
 def _check_fast_lane(checks, problems, section="checks"):
     """checks.fast_lane: a slot of its own for heads whose chosen steps
-    have taken at most max_seconds here. Only `depends` chooses steps,
-    so without it nothing could be cheap."""
+    have taken at most max_seconds here. Without `depends` a head's
+    chosen steps are every step that applies, scoped steps by their
+    scope (agent-forge #261)."""
     where = section + ".fast_lane"
     lane = checks["fast_lane"]
     _fields(where, lane, FAST_LANE, problems)
     if _is(lane.get("max_seconds"), int) and lane["max_seconds"] < 1:
         problems.append("%s.max_seconds must be at least 1" % where)
-    if checks.get("depends") is not True:
-        problems.append("%s needs %s.depends: without it every head "
-                        "runs every step, and none is cheap" % (where, section))
 
 
 def _check_warm(checks, problems, section="checks"):
