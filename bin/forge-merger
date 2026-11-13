@@ -1824,13 +1824,6 @@ def cuts_trains(pr):
     return pr.get("number") in NIGHTLY_FIXES | MAIN_RED_FIXES
 
 
-def labelled_keep(pr):
-    """Whether `pr` carries labels.keep_trains."""
-    return bool(KEEP_LABEL) and KEEP_LABEL in [
-        (n or {}).get("name") for n in
-        ((pr.get("labels") or {}).get("nodes") or [])]
-
-
 def urgent(pr):
     """Whether `pr` carries `labels.urgent`, or fixes a red nightly or
     a red default branch."""
@@ -8515,15 +8508,15 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         "head": pr["headRefOid"], "reason": suspected}
         # Merged on its own, one outside the first train would move the
         # default branch under that train's started run. A red default
-        # branch's or nightly's fix, or one the trains are kept through
-        # (labels.keep_trains), goes all the same; one labelled urgent
-        # waits for its train like any other (2026-11-13).
+        # branch's or nightly's fix goes all the same. One labelled urgent
+        # or labels.keep_trains waits for its train like any other: only
+        # a bypass merge goes in front of trains, and keep_trains says
+        # that such a merge doesn't cut them (Alex, 2026-11-13).
         ahead_of = train_in_the_way(
             last_ahead if last_ahead is not None else load_json(
                 os.path.join(state_dir, AHEAD_FILE), {}), pr, check_state) \
             if decision["action"] == "MERGE" and TRAINS == "live" \
-            and not train_failed and not cuts_trains(pr) \
-            and not labelled_keep(pr) else None
+            and not train_failed and not cuts_trains(pr) else None
         if ahead_of:
             decision = {"action": "WAIT", "pr": pr["number"],
                         "head": pr["headRefOid"],
