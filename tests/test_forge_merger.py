@@ -6613,6 +6613,37 @@ class CodeOwners(RepoCase):
         m.configure(project())
         self.assertIs(m.CODE_OWNERS, False)
 
+    def test_the_same_owned_lines_are_asked_one_at_a_time(self):
+        # agent-forge #264: #7 changes what #6 changes; #8 another file.
+        m.configure(project(code_owners=True, code_owner_sequence=True))
+        record, _ = self.tick([self.owned_pr(6), self.owned_pr(7),
+                               self.owned_pr(8, name="owned/y.json")],
+                              live=True)
+        self.assertEqual(record["held"], {
+            "6": "waits for code owner @TheOwner: owned/x.json",
+            "7": "waits for #6: both change owned/x.json lines 0-0, which "
+                 "a code owner must approve; one at a time",
+            "8": "waits for code owner @TheOwner: owned/y.json"})
+
+    def test_sequencing_is_off_by_default(self):
+        record, _ = self.tick([self.owned_pr(6), self.owned_pr(7)],
+                              live=True)
+        self.assertEqual(record["held"]["7"],
+                         "waits for code owner @TheOwner: owned/x.json")
+
+    def test_only_overlapping_lines_wait(self):
+        lines = {6: {"c.json": [(10, 12)]}, 7: {"c.json": [(13, 20)]},
+                 8: {"c.json": [(12, 12)]}, 9: {"c.json": [(1, 30)]}}
+        waits = {n: ("h%d" % n, "waits for code owner") for n in lines}
+        waits[10] = ("h10", None)
+        with mock.patch.object(m, "owned_lines",
+                               lambda repo, pr, *a, **k: lines[pr["number"]]):
+            got = m.sequence_owned(None, [{"number": n} for n in waits],
+                                   waits, [], "main")
+        self.assertEqual(got, {
+            8: ("h8", m.SEQUENCE_REASON % (6, "c.json", 12, 12)),
+            9: ("h9", m.SEQUENCE_REASON % (6, "c.json", 10, 12))})
+
     def test_off_by_default(self):
         m.configure(project())
         record, _ = self.tick([self.owned_pr()], live=True)
@@ -10200,3 +10231,224 @@ class OwnGreenWaitAfterUpdates(RepoCase):
         self.head = self.repo.commit("f.txt", "more\n", "more")
         self.assertIsNotNone(self.wait({self.approved: [], self.head: [],
                                         self.first: [status()]}))
+
+
+class CodeOwnerAsk(unittest.TestCase):
+    """agent-forge #153: a pull request held for a code owner opens an
+    ask issue, closed when the hold ends at that head."""
+
+    def setUp(self):
+        m.configure(project(code_owners=True, code_owner_ask={
+            "labels": ["Status:waiting-owner"]}))
+        self.addCleanup(m.configure, project())
+        self.dir = tempfile.mkdtemp()
+        self.lines = []
+        self.github = FakeGitHub({})
+
+    def asks(self, waits, open_heads):
+        m.code_owner_asks(self.dir, self.github, waits, open_heads,
+                          self.lines.append)
+        return m.load_json(os.path.join(self.dir, m.CODE_OWNER_ASK_NAME), {})
+
+    def test_a_hold_opens_one_labelled_issue(self):
+        why = "waits for code owner @alex: .github/CODEOWNERS"
+        asks = self.asks({5: ("a" * 40, why), 6: ("b" * 40, None)},
+                         {5: "a" * 40, 6: "b" * 40})
+        self.assertEqual(asks, {"5": {"head": "a" * 40, "issue": 900,
+                                      "labeled": ["Status:waiting-owner"]}})
+        (method, path, fields), label = self.github.writes
+        self.assertEqual(fields["title"], "#5 waits for a code owner's approval")
+        self.assertIn(why, fields["body"])
+        self.assertEqual(label[2], {"labels[]": "Status:waiting-owner"})
+        # Once per head: the next tick opens nothing more.
+        self.asks({5: ("a" * 40, why)}, {5: "a" * 40})
+        self.assertEqual(len(self.github.writes), 2)
+
+    def test_an_unjudged_pr_keeps_its_ask(self):
+        self.asks({5: ("a" * 40, "waits")}, {5: "a" * 40})
+        self.assertEqual(set(self.asks({}, {5: "a" * 40})), {"5"})
+
+    def test_approval_new_head_or_close_ends_it(self):
+        for waits, heads, said in (
+                ({5: ("a" * 40, None)}, {5: "a" * 40}, "no longer waits"),
+                ({}, {5: "c" * 40}, "has a new head"),
+                ({}, {}, "was closed")):
+            self.github = FakeGitHub({})
+            m.save_json(os.path.join(self.dir, m.CODE_OWNER_ASK_NAME),
+                        {"5": {"head": "a" * 40, "issue": 9,
+                               "labeled": ["Status:waiting-owner"]}})
+            self.assertEqual(self.asks(waits, heads), {})
+            comment, close = self.github.writes
+            self.assertIn(said, comment[2]["body"])
+            self.assertEqual(close[:2], ("PATCH", "repos/example/widget/issues/9"))
+
+    def test_a_refused_create_is_tried_again(self):
+        self.github.refuse = "nope"
+        self.assertEqual(self.asks({5: ("a" * 40, "waits")}, {5: "a" * 40}),
+                         {})
+        self.assertIn("CODE-OWNER-ASK refused", self.lines[0])
+
+    def test_config(self):
+        data = example()
+        data["merge"] = {"code_owner_ask": {"title": "x", "labels": [""]}}
+        problems = config.check(data)
+        for said in ("needs merge.code_owners", "must name the pull request",
+                     "must be a list of label names"):
+            self.assertTrue(any(said in p for p in problems), problems)
+class InstanceMainRed(unittest.TestCase):
+    """agent-forge #154: an instance's own main-red issue puts the pull
+    requests that close it first, as the main context's does."""
+
+    def setUp(self):
+        data = example()
+        data["merge"] = {"gate": GATE, "own_head_green": False,
+                         "test_ahead": False}
+        data["checks"] = dict(data.get("checks", {}), instances={
+            "mac": {"context": "vm/mac", "poster": "Helper",
+                    "main_red_issue": {"labels": ["bug"]}},
+            "quiet": {"context": "vm/quiet"}})
+        self.project = config.Project(data, None)
+        m.configure(self.project)
+        self.addCleanup(m.configure, project())
+        self.addCleanup(setattr, m, "MAIN_RED_FIXES", frozenset())
+
+    def github(self, nodes):
+        github = mock.Mock()
+        github.api.return_value = {"data": {"repository": {"issues": {
+            "nodes": nodes}}}}
+        return github
+
+    def test_only_an_instance_with_an_issue_has_a_rule(self):
+        (title, labels, poster), = m.INSTANCE_RED
+        self.assertEqual(labels, ("bug",))
+        self.assertEqual(poster, self.project.bot_login("Helper"))
+        self.assertTrue(title.match(
+            "The default branch is red for vm/mac at 0123abcdef"))
+        self.assertFalse(title.match(
+            "The default branch is red for vm/quiet at 0123abcdef"))
+        self.assertFalse(title.match(
+            "The default branch is red for vm/mac at 0123abcdef!"))
+
+    def test_the_issues_are_the_posters_with_the_title(self):
+        login = self.project.slug("Helper")
+        github = self.github([
+            {"number": 7, "title": "The default branch is red for vm/mac "
+             "at 0123abcdef", "author": {"login": login}},
+            {"number": 8, "title": "The default branch is red for vm/mac "
+             "at 0123abcdef", "author": {"login": "someoneelse"}},
+            {"number": 9, "title": "Something else",
+             "author": {"login": login}}])
+        self.assertEqual(m.instance_red_issues(github), {7})
+        args = github.api.call_args[0]
+        self.assertIn("labels[]=bug", args)
+        self.assertIn("owner=example", args)
+
+    def test_github_unread_means_none(self):
+        github = mock.Mock()
+        github.api.side_effect = RuntimeError("down")
+        self.assertEqual(m.instance_red_issues(github), set())
+
+    def test_a_pr_that_closes_it_outside_code_is_a_fix(self):
+        prs = [{"number": 1, "title": "Fix the Mac", "body": "Fixes #7"},
+               {"number": 2, "title": "x", "body": "`Fixes #7`"},
+               {"number": 3, "title": "Closes #7", "body": None},
+               {"number": 4, "title": "y", "body": "Fixes #70"}]
+        self.assertEqual(m.red_fixes_of(prs, {7}), frozenset({1, 3}))
+        self.assertEqual(m.red_fixes_of(prs, set()), frozenset())
+
+
+class ManualMode(unittest.TestCase):
+    """agent-forge #274: merge.mode manual."""
+
+    def setUp(self):
+        m.configure(project(mode="manual"))
+        self.addCleanup(m.configure, project())
+        self.dir = tempfile.mkdtemp()
+        self.lines = []
+
+    def test_the_configuration(self):
+        self.assertTrue(m.MANUAL)
+        m.configure(project())
+        self.assertFalse(m.MANUAL)
+        data = example()
+        data["merge"] = {"mode": "sometimes"}
+        self.assertIn("merge.mode must be auto or manual",
+                      config.check(data))
+
+    def test_hand_merges_are_recorded_as_merges(self):
+        when = datetime.datetime(2026, 10, 7, 10, tzinfo=datetime.timezone.utc)
+        github = FakeGitHub({SLUG + "/pulls?state=closed": [
+            {"number": 7, "merged_at": "2026-10-07T10:30:00Z",
+             "merged_by": {"login": "leaddevwidgetagent"}},
+            {"number": 6, "merged_at": "2026-10-07T09:30:00Z"},
+            {"number": 5, "merged_at": None},
+            {"number": 8, "merged_at": "2026-10-07T10:20:00Z",
+             "user": {"login": "someone"}}]})
+        # The first run starts the clock.
+        self.assertEqual(m.record_hand_merges(self.dir, github,
+                                              self.lines.append, when), [])
+        got = m.record_hand_merges(self.dir, github, self.lines.append,
+                                   when + datetime.timedelta(hours=1))
+        self.assertEqual([(r["at"], r["decisions"][0]["pr"],
+                           r["decisions"][0]["by"]) for r in got],
+                         [("2026-10-07T10:20:00Z", 8, "someone"),
+                          ("2026-10-07T10:30:00Z", 7, "leaddevwidgetagent")])
+        with open(os.path.join(self.dir, "merger.jsonl")) as handle:
+            self.assertEqual(len(handle.readlines()), 2)
+        # Each once.
+        self.assertEqual(m.record_hand_merges(self.dir, github,
+                                              self.lines.append, when), [])
+        self.assertIn("2 hand merge(s) recorded: #8, #7", self.lines[1])
+
+
+    def test_ready_lists_what_holds_it(self):
+        m.configure(project(mode="manual", ci_workflow=""))
+        head = "a" * 40
+        prs = [{"number": 5, "headRefOid": head, "isDraft": False,
+                "body": "Blocked-by: #9\n"}, {"number": 9}]
+        green = [{"context": m.STATUS_CONTEXT, "state": "success",
+                  "creator": {"login": m.STATUS_CREATOR}}]
+        github = FakeGitHub({SLUG + "/commits/": green})
+        behind = {"answer": 1}
+
+        def git(repo, *args, run=None):
+            code = behind["answer"] if args[0] == "merge-base" else 0
+            return subprocess.CompletedProcess(args, code, "", "")
+        with mock.patch.object(m, "fetch_prs", return_value=prs), \
+                mock.patch.object(m, "fetch_open_issues", return_value=set()), \
+                mock.patch.object(m, "have_head"), \
+                mock.patch.object(m, "git", git):
+            self.assertEqual(m.merge_ready("/r", github, 5), [
+                "it is not current with main: merge main into it first",
+                "Blocked-by #9, still open"])
+            prs[0]["body"], behind["answer"] = "", 0
+            self.assertEqual(m.merge_ready("/r", github, 5), [])
+            self.assertEqual(m.merge_ready("/r", github, 6),
+                             ["#6 is not an open pull request"])
+class TrainAheadStall(unittest.TestCase):
+    """A head waiting for train 1's run is timed from that run's start,
+    not from when it began waiting: the wait is the train's."""
+
+    START = datetime.datetime(2026, 10, 7, 12, 0, 0,
+                              tzinfo=datetime.timezone.utc)
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp()
+        m.configure(project(stall_run_factor=0))
+        self.addCleanup(m.configure, project())
+
+    def stalled(self, minutes, started):
+        waiting = {"pr": 5, "head": "h" * 40, "action": "WAIT",
+                   "train_top": "t" * 40}
+        check = {"ahead_started": {"t" * 40: started}} if started else {}
+        m.stalled_for(self.state, waiting, self.START, check)
+        return m.stalled_for(
+            self.state, waiting,
+            self.START + datetime.timedelta(minutes=minutes), check)
+
+    def test_timed_from_the_trains_run(self):
+        self.assertIsNone(self.stalled(45, "2026-10-07T12:20:00Z"))
+        self.assertEqual(self.stalled(50, "2026-10-07T12:20:00Z"), 50)
+
+    def test_no_run_start_known_is_timed_as_before(self):
+        self.assertEqual(self.stalled(30, None), 30)

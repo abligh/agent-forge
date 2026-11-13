@@ -47,6 +47,7 @@ class CronRun(unittest.TestCase):
         self.env = dict(self.r.env, FORGE_CRON_CHECKOUT=self.cron,
                         FORGE_CRON_LOGDIR=self.logs,
                         FORGE_CRON_LOCK_WAIT_S="1",
+                        FORGE_CRON_PIN_WAIT_S="0",
                         FORGE_CRON_PATH="/opt/tool/bin")
         self.err = []
 
@@ -164,6 +165,89 @@ class CronRun(unittest.TestCase):
         with open(os.path.join(self.cron, ".agent-forge", "pin"), "w") as h:
             h.write("0" * 40)
         self.assertEqual(self.run_installed(install), 0)
+
+    def test_a_job_waits_for_forge_install_after_a_pin_bump(self):
+        # agent-forge #262: an hourly job that fired between a pin bump
+        # and forge-install's next run lost its hour.
+        install, old = self.install_at()
+        self.r.git(install, "-c", "user.name=t", "-c", "user.email=t@t",
+                   "commit", "-q", "--allow-empty", "-m", "v1")
+        new = self.r.git(install, "rev-parse", "HEAD").stdout.strip()
+        self.r.git(install, "checkout", "-q", old)
+        self.pin("%s v1\n" % new)
+        clock, naps = [0.0], []
+
+        def nap(seconds):
+            naps.append(seconds)
+            clock[0] += seconds
+            if len(naps) == 3:
+                # forge-install moves the installation meanwhile.
+                self.r.git(install, "checkout", "-q", new)
+        got = tool.main(["report"], dict(self.env, FORGE_CRON_PIN_WAIT_S="600"),
+                        lambda repo, app: "x", clock=lambda: clock[0],
+                        nap=nap, err=self.err.append, install=install)
+        self.assertEqual(got, 0)
+        log = self.log()
+        self.assertIn("PIN-WAIT: PIN-MISMATCH", log)
+        self.assertIn("PIN-WAITED 30s", log)
+        self.assertIn("cwd=", log)
+
+    def test_a_job_waits_no_longer_than_its_bound(self):
+        install, sha = self.install_at()
+        self.pin("%s v0.1.0\n" % ("0" * 40))
+        clock = [0.0]
+
+        def nap(seconds):
+            clock[0] += seconds
+        got = tool.main(["report"], dict(self.env, FORGE_CRON_PIN_WAIT_S="60"),
+                        lambda repo, app: "x", clock=lambda: clock[0],
+                        nap=nap, err=self.err.append, install=install)
+        self.assertEqual(got, 2)
+        log = self.log()
+        self.assertIn("PIN-WAIT:", log)
+        self.assertIn("PIN-MISMATCH", log.split("PIN-WAIT:")[1].split(
+            "\n", 1)[1])
+        self.assertNotIn("cwd=", log)
+        self.assertGreaterEqual(clock[0], 60)
+
+    def test_a_waiting_job_holds_no_installation_lock(self):
+        install, sha = self.install_at()
+        self.pin("%s v0.1.0\n" % ("0" * 40))
+        lock = install + ".lock"
+        free = []
+
+        def nap(seconds):
+            with open(lock, "a") as handle:
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    free.append(True)
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                except OSError:
+                    free.append(False)
+            clock[0] += seconds
+        clock = [0.0]
+        tool.main(["report"], dict(self.env, FORGE_CRON_PIN_WAIT_S="30"),
+                  lambda repo, app: "x", clock=lambda: clock[0], nap=nap,
+                  err=self.err.append, install=install)
+        self.assertTrue(free)
+        self.assertTrue(all(free))
+
+    def test_a_pending_install_is_waited_for_too(self):
+        install, sha = self.install_at()
+        self.pin("%s v0.1.0\n" % sha)
+        marker = install + ".install-wanted"
+        open(marker, "w").close()
+        clock = [0.0]
+
+        def nap(seconds):
+            clock[0] += seconds
+            if os.path.exists(marker):
+                os.unlink(marker)
+        got = tool.main(["report"], dict(self.env, FORGE_CRON_PIN_WAIT_S="600"),
+                        lambda repo, app: "x", clock=lambda: clock[0],
+                        nap=nap, err=self.err.append, install=install)
+        self.assertEqual(got, 0)
+        self.assertIn("PIN-WAIT: INSTALL-PENDING", self.log())
 
     def test_a_pin_that_isnt_a_full_sha_runs_nothing(self):
         install, sha = self.install_at()

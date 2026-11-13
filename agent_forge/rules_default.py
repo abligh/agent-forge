@@ -66,6 +66,11 @@ Then:
 4. the build check's status (`checks.context`) is `failure` or `error`
    on the head: the author's;
 5. it is `pending` or absent on the head: nobody's;
+23. with `merge.mode` `manual` (agent-forge #274), after rule 5: green,
+   and nothing it names holds it (a `Blocked-by:` item open, a
+   `Defer-until:` to come, a `Status:waiting-*` label): the author's,
+   "check it with forge-merger --ready N, then merge it, or say why
+   not"; held, nobody's. Rules 6 to 8 don't apply then;
 6. no request for changes stands, a reviewer's newest review is
    `APPROVED`, covers the head, and nothing has been said after it (by
    `forge-merger`'s own test): nobody's, it is the Merger's;
@@ -160,7 +165,9 @@ key):
     among the last 30 label events fetched; none found wakes nobody)
     before the newest nightly run that published its builds started,
     red or green: the owner's, "check it on that build now", naming the
-    run, its commit and when it ended. A label that old means the fixes
+    run, its commit and when it ended, and on a red run what was red
+    ("the run is red: build-and-test (test-slow)", from forge-nightly's
+    record; agent-forge #241). A label that old means the fixes
     were in the build. It
     applies whatever the issue's `Defer-until:` says: no rule above
     reads one on an issue (only rule 15's offer does). The event is the
@@ -368,6 +375,8 @@ RED_FIRST = None
 DEFAULT_FALLBACK_HOURS = 2
 # `router.nightly_wake` (designs/0040), {"label"}, or None: off.
 NIGHTLY_WAKE = None
+# merge.mode manual (agent-forge #274): rule 23.
+MANUAL = False
 # `router.issue_blocked_by`: "body" (the default), or "agents": an
 # issue's `Blocked-by:` lines may be in a comment by the owner or an
 # agent (`issue_blocker_state`).
@@ -433,8 +442,9 @@ def configure(project, merger_tool):
     global MERGE_NOTICE, merged_window
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
     global UNREVIEWED, QUIET_LABELS, IN_PROGRESS, RED_FIRST, PROJECT
-    global NIGHTLY_WAKE, ISSUE_BLOCKED_BY, BLOCKER_WRITERS
+    global NIGHTLY_WAKE, ISSUE_BLOCKED_BY, BLOCKER_WRITERS, MANUAL
     merger = merger_tool
+    MANUAL = project.section("merge").get("mode") == "manual"
     PROJECT = project
     labels = project.section("labels")
     MERGER = merger.ACT_AS
@@ -810,6 +820,14 @@ def route_pr(pr, roster, when=None):
     # Rule 5.
     if state != "success":
         return nobody(n, 5, "%s is %s" % (STATUS_CONTEXT, state or "absent"))
+    # Rule 23 (agent-forge #274): with merge.mode manual, a green pull
+    # request nothing holds is its author's to merge.
+    if MANUAL:
+        if waits(pr, when or merger.now_utc()):
+            return nobody(n, 23, "green, and waits for what it names")
+        return turn(n, author, 23, status.get("createdAt") or head,
+                    "is green at %s: check it with forge-merger --ready %d, "
+                    "then merge it, or say why not" % (head[:7], n))
     # Rule 6.
     if (not standing and newest is not None
             and newest.get("state") == "APPROVED"
@@ -1676,7 +1694,12 @@ def published_nightly(project, environ=None, now=None):
     if not (isinstance(run, int) and not isinstance(run, bool)
             and isinstance(sha, str) and sha and started and ended):
         return None
-    return {"run": run, "sha": sha, "started": started, "ended": ended}
+    found = {"run": run, "sha": sha, "started": started, "ended": ended}
+    red = built.get("red")
+    if isinstance(red, list) and red and all(
+            isinstance(r, str) for r in red):
+        found["red"] = red
+    return found
 
 
 def attach_published_nightly(github, repo, prs, issues):
@@ -1734,12 +1757,15 @@ def nightly_turn(issue, roster, ctx):
     if labelled is None or labelled >= built["started"]:
         return None
     n = issue["number"]
+    red = built.get("red")
     return turn(n, owner, 22, built["ended"],
                 "waits for a nightly check, and nightly run %s (%s, builds "
-                "published at %s) includes its fixes: check it on that "
+                "published at %s) includes its fixes%s: check it on that "
                 "build now." % (
                     built["run"], built["sha"][:7],
-                    since_text(built["ended"], ctx.when)),
+                    since_text(built["ended"], ctx.when),
+                    "; the run is red: %s, so check it was not what this "
+                    "issue fixes" % "; ".join(red) if red else ""),
                 reminder=ONCE)
 
 

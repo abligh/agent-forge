@@ -335,7 +335,9 @@ the wait is timed from the later of the top's start and the wait's, so
 a top that is running isn't called a stall, and one that hangs still
 is, `STALL_AFTER` after it started. A slot running the top's tree at
 another commit (an earlier prediction, which keeps the check from
-starting the top) counts as the top's start. With
+starting the top) counts as the top's start. A head kept off train 1
+while its run goes on (it would spend that run, "waits for its train")
+is timed from that run's start the same way. With
 `merge.stall_run_factor` (default 1.5), a wait on checks is timed
 against that many times the median of the build check's recent runs
 when that is longer than `STALL_AFTER`, which stays the floor.
@@ -672,6 +674,8 @@ the head as a reviewer's must. Owners are `@login`s; a team's or an
 email's path waits for good, since the Merger can't check it. A path
 whose changes can't be listed waits too. It is a hold, not a
 hand-back: nothing is said, and the author isn't asked to do anything.
+With `merge.code_owner_ask`, the hold opens an issue for the owner,
+once per pull request and head, closed when the hold ends.
 
 **With `merge.yield_ignores_conflicts`, a conflict with `main` doesn't
 count toward the yield** (default false). A conflict is mostly what
@@ -932,6 +936,22 @@ STALL_RETELL = datetime.timedelta(minutes=DEFAULT_STALL_RETELL_MINUTES)
 STALL_TO_OWNER = datetime.timedelta(
     minutes=DEFAULT_STALL_OWNER_AFTER_MINUTES)
 STALL_TITLE = DEFAULT_STALL_TITLE
+# merge.mode (agent-forge #274): "manual" merges nothing and records the
+# hand merges, so forge-stats and forge-flow count them.
+MANUAL = False
+HAND_MERGES_NAME = "hand-merges.json"
+# merge.code_owner_ask (agent-forge #153): (title, labels) of the issue
+# opened for a pull request held for a code owner, or None for none.
+CODE_OWNER_ASK = None
+DEFAULT_CODE_OWNER_ASK_TITLE = "#{pr} waits for a code owner's approval"
+CODE_OWNER_ASK_NAME = "code-owner-asks.json"
+# merge.code_owner_sequence (agent-forge #264): of the pull requests
+# held for a code owner that change the same lines of an owned path,
+# only the oldest is asked; the rest wait for it.
+CODE_OWNER_SEQUENCE = False
+SEQUENCE_REASON = "waits for #%d: both change %s lines %d-%d, which a " \
+    "code owner must approve; one at a time"
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@", re.M)
 STALL_LABELS = ()
 WAITING_OWNER = DEFAULT_WAITING_OWNER
 # labels.urgent: the label that puts a pull request first, or None.
@@ -969,6 +989,15 @@ NIGHTLY_FIXES = frozenset()
 # default branch is red (designs/0011, amendment), taken as urgent and
 # put first; read from its state.json by `main`.
 MAIN_RED_FIXES = frozenset()
+# checks.instances.<name>.main_red_issue (agent-forge #154): each
+# instance's (title regex, labels, poster login), for its own open
+# issue saying the default branch is red for its context.
+INSTANCE_RED = ()
+INSTANCE_RED_TITLE = "The default branch is red for {context} at {sha}"
+INSTANCE_RED_QUERY = (
+    "query($owner:String!,$name:String!,$labels:[String!]){"
+    "repository(owner:$owner,name:$name){issues(states:OPEN,first:50,"
+    "labels:$labels){nodes{number title author{login}}}}}")
 STALL_ALERT_NAME = "stall-alert.json"
 # `merge.test_ahead`: whether the next pull requests' commits are
 # predicted for the build check to test ahead, and how many behind the
@@ -1308,6 +1337,8 @@ def configure(project):
         for _name, context, poster, scope
         in config.gated_instances(project.data))
     BUILD_HOST = project.host
+    global INSTANCE_RED
+    INSTANCE_RED = tuple(instance_red_rules(project))
     GATE = tuple(tuple(argv) for argv in merge.get("gate", DEFAULT_GATE))
     OWN_HEAD_GREEN = merge.get("own_head_green", True)
     CI_WORKFLOW = merge.get("ci_workflow", "ci")
@@ -1322,6 +1353,14 @@ def configure(project):
         "owner_after_minutes", DEFAULT_STALL_OWNER_AFTER_MINUTES))
     STALL_TITLE = alert.get("title", DEFAULT_STALL_TITLE)
     STALL_LABELS = tuple(alert.get("labels", ()))
+    global MANUAL
+    MANUAL = merge.get("mode", "auto") == "manual"
+    global CODE_OWNER_ASK, CODE_OWNER_SEQUENCE
+    CODE_OWNER_SEQUENCE = merge.get("code_owner_sequence", False) is True
+    ask = merge.get("code_owner_ask")
+    CODE_OWNER_ASK = None if ask is None else (
+        ask.get("title", DEFAULT_CODE_OWNER_ASK_TITLE),
+        tuple(ask.get("labels", ())))
     WAITING_OWNER = project.section("labels").get("waiting_on_owner",
                                                   DEFAULT_WAITING_OWNER)
     URGENT_LABEL = project.section("labels").get("urgent")
@@ -3001,7 +3040,9 @@ def stalled_for(state_dir, waiting, when, check_state=None, repo=None,
     build check started a run of the batch's top, or of any commit with
     the top's tree (`batch_top_started`, given `repo`): the check runs a
     tree once, and a later prediction with the same tree waits for it.
-    Neither started, it is timed as before."""
+    Neither started, it is timed as before. A head waiting for train 1's
+    run (TRAIN_AHEAD_REASON, `train_top`) is timed from that run's start
+    the same way."""
     path = os.path.join(state_dir, "waiting.json")
     if waiting is None:
         if os.path.exists(path):
@@ -3036,7 +3077,19 @@ def stalled_for(state_dir, waiting, when, check_state=None, repo=None,
             limit = QUEUED_STALL_AFTER
         else:
             since = max(began, started)
-    if waiting.get("action") == "WAIT":
+    if waiting.get("action") == "WAIT" and waiting.get("train_top"):
+        # Waiting for train 1's run, not its own: timed from that run's
+        # start against a top's limit, as the train's own wait is.
+        started = (check_state or {}).get("ahead_started") or {}
+        try:
+            top = parse_time((started if isinstance(started, dict) else {})
+                             .get(waiting["train_top"]))
+        except (TypeError, ValueError):
+            top = None
+        if top is not None:
+            limit, since = stall_limit(check_state, top=True), \
+                max(since, top)
+    elif waiting.get("action") == "WAIT":
         top = batch_top_started(state_dir, waiting, check_state, repo, run)
         if top is not None:
             limit, since = stall_limit(check_state, top=True), \
@@ -3259,6 +3312,150 @@ def end_stall(state_dir, github, alert, decisions, out):
         os.remove(path)
 
 
+MERGED_PATH = ("repos/%s/pulls?state=closed&sort=updated&direction=desc"
+               "&per_page=50&base=%s")
+
+
+def record_hand_merges(state_dir, github, out, when):
+    """merge.mode manual (agent-forge #274): append a MERGE record to
+    merger.jsonl, at its merge time, for each pull request merged since
+    the last run, so what counts the Merger's merges counts these. The
+    first run only starts the clock: nothing before it is recorded."""
+    path = os.path.join(state_dir, HAND_MERGES_NAME)
+    seen = load_json(path, {})
+    since = seen.get("since") if isinstance(seen, dict) else None
+    if not since:
+        save_json(path, {"since": iso(when)})
+        out("MANUAL: merge.mode is manual; counting hand merges from now")
+        return []
+    merged = sorted(
+        (pr["merged_at"], pr["number"], (pr.get("merged_by") or {}).get(
+            "login") or (pr.get("user") or {}).get("login"))
+        for pr in github.api(MERGED_PATH % (REPO_SLUG, MAIN)) or []
+        if isinstance(pr, dict) and pr.get("merged_at")
+        and pr["merged_at"] > since)
+    records = [{"at": at, "queue": [], "held": {}, "manual": True,
+                "decisions": [{"pr": number, "action": "MERGE",
+                               "result": "done", "by": who}]}
+               for at, number, who in merged]
+    if records:
+        with open(os.path.join(state_dir, "merger.jsonl"), "a") as handle:
+            for record in records:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+        save_json(path, {"since": merged[-1][0]})
+    out("MANUAL: merge.mode is manual; %d hand merge(s) recorded%s" % (
+        len(records), ": " + ", ".join("#%d" % n for _, n, _ in merged)
+        if merged else ""))
+    return records
+
+
+def merge_ready(repo, github, number, run=sh):
+    """Why pull request `number` isn't ready to merge by hand, as a
+    list, empty when it is (agent-forge #274): open and not a draft,
+    `checks.context` green (by its poster) and the CI workflow passed on
+    the head, the default branch's tip in its history, no `Blocked-by:`
+    item open, and, with merge.code_owners, an owner's word."""
+    prs = fetch_prs(github)
+    pr = next((p for p in prs if p["number"] == number), None)
+    if pr is None:
+        return ["#%d is not an open pull request" % number]
+    head, why = pr["headRefOid"], []
+    if pr.get("isDraft"):
+        why.append("it is a draft")
+    state, said = status_state(github.api(
+        "repos/%s/commits/%s/statuses?per_page=100" % (REPO_SLUG, head))
+        or [])
+    if state != "success":
+        why.append("%s is %s%s" % (STATUS_CONTEXT, state or "absent",
+                                   ": " + said if said else ""))
+    if CI_WORKFLOW:
+        problem = ci_problem(github.api(
+            "repos/%s/actions/runs?head_sha=%s&per_page=100"
+            % (REPO_SLUG, head)).get("workflow_runs") or [])
+        if problem:
+            why.append(problem)
+    git(repo, "fetch", "-q", "origin", MAIN, run=run)
+    main_ref = "refs/remotes/origin/" + MAIN
+    have_head(repo, pr, run)
+    if git(repo, "merge-base", "--is-ancestor", main_ref, head,
+           run=run).returncode != 0:
+        why.append("it is not current with %s: merge %s into it first"
+                   % (MAIN, MAIN))
+    open_numbers = {p["number"] for p in prs} | fetch_open_issues(github)
+    blocking = sorted(blockers_of(pr) & open_numbers)
+    if blocking:
+        why.append("Blocked-by %s, still open" % ", ".join(
+            "#%d" % n for n in blocking))
+    if CODE_OWNERS:
+        rules = codeowners_rules(repo, main_ref, run)
+        held = rules and code_owner_wait(repo, pr, rules, main_ref, run)
+        if held:
+            why.append(held)
+    return why
+def code_owner_asks(state_dir, github, waits, open_heads, out):
+    """merge.code_owner_ask (agent-forge #153): one issue for each pull
+    request held for a code owner at a head, so an owner working from a
+    list of asks sees it. `waits` maps the pull requests judged this tick
+    to (head, why held or None); `open_heads` maps every open pull
+    request to its head. An ask is closed when its pull request is no
+    longer open, has another head, or was judged and isn't held; one not
+    judged this tick (no longer a candidate for another reason) stays.
+    What GitHub refuses is tried again next tick."""
+    path = os.path.join(state_dir, CODE_OWNER_ASK_NAME)
+    asks = load_json(path, {})
+    title, labels = CODE_OWNER_ASK
+    for key, ask in sorted(asks.items()):
+        number = int(key)
+        head, why = waits.get(number, (ask["head"], "unjudged"))
+        if open_heads.get(number) == ask["head"] == head and why:
+            continue
+        ended = ("#%d was closed" % number if number not in open_heads
+                 else "#%d has a new head" % number
+                 if open_heads[number] != ask["head"]
+                 else "#%d no longer waits for a code owner" % number)
+        github.write("POST", "repos/%s/issues/%d/comments"
+                     % (REPO_SLUG, ask["issue"]),
+                     body="%s.\n\n%s" % (ended, SIGNATURE))
+        ok, refused = github.write(
+            "PATCH", "repos/%s/issues/%d" % (REPO_SLUG, ask["issue"]),
+            state="closed")
+        out("CODE-OWNER-ASK-CLOSED: #%d for #%d" % (ask["issue"], number)
+            if ok else "CODE-OWNER-ASK-CLOSED: #%d for #%d could not be "
+            "closed: %s" % (ask["issue"], number, refused))
+        # Forgotten even when refused, as a stall's issue is: a person
+        # can close it.
+        del asks[key]
+    for number, (head, why) in sorted(waits.items()):
+        if not why or str(number) in asks:
+            continue
+        body = {"title": title.replace("{pr}", str(number)),
+                "body": "The Merger holds #%d at %s: it %s.\n\nIt merges "
+                "once a code owner approves at this head, and closes this "
+                "issue then, or when the head changes.\n\n%s"
+                % (number, head, why, SIGNATURE)}
+        issue, refused = github.create("repos/%s/issues" % REPO_SLUG, **body)
+        if issue is None:
+            out("CODE-OWNER-ASK refused: #%d: %s" % (number, refused))
+            continue
+        out("CODE-OWNER-ASK: opened #%d for #%d at %s"
+            % (issue, number, head[:10]))
+        asks[str(number)] = {"head": head, "issue": issue, "labeled": []}
+    for key, ask in sorted(asks.items()):
+        labeled = ask.setdefault("labeled", list(labels))
+        for label in labels:
+            if label in labeled:
+                continue
+            ok, refused = github.write("POST", label_path(ask["issue"]),
+                                       **{"labels[]": label})
+            if ok:
+                labeled.append(label)
+            else:
+                out("CODE-OWNER-ASK-LABEL refused: %s on #%d: %s"
+                    % (label, ask["issue"], refused))
+    if asks or os.path.exists(path):
+        save_json(path, asks)
+
+
 def tell_stall(state_dir, github, stalled, decisions, when, send, out,
                reason=None):
     """A stall opens its own issue and messages STALL_TELL, again every
@@ -3356,8 +3553,13 @@ def parse_time(stamp):
 def load_router():
     """bin/forge-router as a module, loaded when needed: it loads this
     file itself, so it can't be imported at the top."""
+    return load_tool("forge-router")
+
+
+def load_tool(name):
+    """bin/<name> as a module."""
     loader = importlib.machinery.SourceFileLoader(
-        "forge_router", os.path.join(BIN, "forge-router"))
+        name.replace("-", "_"), os.path.join(BIN, name))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -4301,6 +4503,60 @@ def code_owner_wait(repo, pr, rules, main_ref, run=sh, regenerated=None):
     more = sum(len(p) for p in waiting.values()) - 1
     return "waits for code owner %s: %s%s" % (
         who, paths[0], " and %d more" % more if more else "")
+
+
+def owned_lines(repo, pr, rules, main_ref, run=sh):
+    """{path: [(first, last), ...]}: the default branch's lines each
+    code-owned path `pr` changes since `main_ref` covers (a pure
+    insertion as the line it follows), or None if git can't say."""
+    got = git(repo, "diff", "-U0", "--no-color", "%s...%s"
+              % (main_ref, pr["headRefOid"]), run=run)
+    if got.returncode != 0:
+        return None
+    found, path = {}, None
+    for line in got.stdout.splitlines():
+        if line.startswith("--- "):
+            name = line[4:]
+            path = name[2:] if name.startswith("a/") else None
+        elif line.startswith("+++ ") and path is None:
+            name = line[4:]
+            path = name[2:] if name.startswith("b/") else None
+        elif line.startswith("@@") and path and owners_of(path, rules):
+            m = HUNK_RE.match(line)
+            if m:
+                start, count = int(m.group(1)), int(m.group(2) or 1)
+                found.setdefault(path, []).append(
+                    (start, start + max(count, 1) - 1))
+    return found
+
+
+def sequence_owned(repo, prs, waits, rules, main_ref, run=sh):
+    """merge.code_owner_sequence (agent-forge #264): {number: (head,
+    why)} for each pull request held for a code owner (`waits`) that
+    changes lines of an owned path an older such pull request also
+    changes. It waits for the oldest, so the owner is asked once."""
+    by_number = {pr["number"]: pr for pr in prs}
+    held = sorted(n for n, (_head, why) in waits.items() if why)
+    lines = {}
+    for number in held:
+        lines[number] = owned_lines(repo, by_number[number], rules,
+                                    main_ref, run) or {}
+    out = {}
+    for i, number in enumerate(held):
+        for older in held[:i]:
+            if older in out:
+                continue
+            clash = [(path, max(a, c), min(b, d))
+                     for path, ranges in sorted(lines[number].items())
+                     for a, b in ranges
+                     for c, d in lines[older].get(path, ())
+                     if a <= d and c <= b]
+            if clash:
+                path, first, last = clash[0]
+                out[number] = (waits[number][0],
+                               SEQUENCE_REASON % (older, path, first, last))
+                break
+    return out
 
 
 def conflicts_with(repo, head, queue, run=sh):
@@ -5639,6 +5895,71 @@ def main_red_fixes(check_state):
     return frozenset(n for n in fixes if isinstance(n, int)
                      and not isinstance(n, bool)) \
         if isinstance(fixes, list) else frozenset()
+
+
+def instance_red_rules(project):
+    """(title regex, labels, poster login) for each build-check instance
+    that files its own main-red issue (checks.instances.<name>.
+    main_red_issue), as forge-pr-check titles and posts it."""
+    instances = project.section("checks").get("instances") or {}
+    for name in sorted(instances):
+        block, _host = config.instance_checks(project.data, name)
+        issue = block.get("main_red_issue")
+        if not isinstance(issue, dict):
+            continue
+        context = block.get("context", DEFAULT_CONTEXT)
+        title = re.escape(issue.get("title", INSTANCE_RED_TITLE)) \
+            .replace(re.escape("{sha}"), "[0-9a-f]+") \
+            .replace(re.escape("{context}"), re.escape(context))
+        labels = list(issue.get("labels", [])) + (
+            [issue["label"]] if issue.get("label") else [])
+        poster = block.get("poster", project.section("merge").get(
+            "merger", "Merger"))
+        yield (re.compile("^%s$" % title), tuple(labels),
+               project.bot_login(poster))
+
+
+def instance_red_issues(github, rules=None):
+    """The numbers of the open issues an instance's check filed saying
+    the default branch is red for its context (agent-forge #154): its
+    labels, its title, by its poster. Empty when none is configured, or
+    GitHub can't be read: then they only don't go first."""
+    rules = INSTANCE_RED if rules is None else rules
+    owner, name = REPO_SLUG.split("/")
+    found = set()
+    for title, labels, poster in rules:
+        args = ["graphql", "-f", "query=" + INSTANCE_RED_QUERY,
+                "-F", "owner=" + owner, "-F", "name=" + name]
+        for label in labels:
+            args += ["-f", "labels[]=" + label]
+        try:
+            nodes = github.api(*args)["data"]["repository"]["issues"]["nodes"]
+        except (RuntimeError, KeyError, TypeError, ValueError):
+            continue
+        login = (poster or "").replace("[bot]", "").lower()
+        for node in nodes or ():
+            if title.match(node.get("title") or "") and (
+                    (node.get("author") or {}).get("login", "")
+                    .replace("[bot]", "").lower() == login):
+                found.add(node["number"])
+    return found
+
+
+def red_fixes_of(prs, issues):
+    """The pull requests among `prs` whose title or body (outside code)
+    closes one of `issues`, as forge-pr-check's red_fixes reads them."""
+    if not issues:
+        return frozenset()
+    keywords = load_tool("forge-closing-keywords")
+    pattern = keywords.closing_re(REPO_SLUG)
+    fixes = set()
+    for pr in prs:
+        text = keywords.blank_code("%s\n%s" % (pr.get("title") or "",
+                                               pr.get("body") or ""))
+        named = {int(next(g for g in m if g)) for m in pattern.findall(text)}
+        if named & set(issues):
+            fixes.add(pr["number"])
+    return frozenset(fixes)
 
 
 def base_red_only(check_state, records, base):
@@ -7057,6 +7378,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                    run=run).stdout.strip()
     prs = fetch_prs(github)
     open_numbers = {pr["number"] for pr in prs} | fetch_open_issues(github)
+    if INSTANCE_RED:
+        # An instance's red default branch: its fixes go first too.
+        global MAIN_RED_FIXES
+        MAIN_RED_FIXES = MAIN_RED_FIXES | red_fixes_of(
+            prs, instance_red_issues(github))
     candidates, approvals, held, spoken = [], {}, {}, []
     when = now()
     heads = {pr["headRefName"]: pr["number"] for pr in prs
@@ -7076,12 +7402,22 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     rules = None
     if CODE_OWNERS:
         rules = codeowners_rules(repo, "refs/remotes/origin/" + MAIN, run)
+        owner_waits = {}
         for pr in list(candidates):
             why = rules and code_owner_wait(repo, pr, rules, main_tip, run,
                                             regenerated)
+            owner_waits[pr["number"]] = (pr["headRefOid"], why or None)
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
+        if CODE_OWNER_SEQUENCE:
+            for number, (head, why) in sequence_owned(
+                    repo, prs, owner_waits, rules, main_tip, run).items():
+                held[str(number)] = why
+                owner_waits[number] = (head, None)
+        if live and CODE_OWNER_ASK:
+            code_owner_asks(state_dir, github, owner_waits,
+                            {p["number"]: p["headRefOid"] for p in prs}, out)
     greens = load_greens(state_dir) if OWN_HEAD_GREEN else {}
     # merge.test_ahead.own_green_to_board false: held only for their own
     # green, they may still board a train when one is cut.
@@ -7537,7 +7873,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         "head": pr["headRefOid"],
                         "reason": TRAIN_AHEAD_REASON % (
                             "#%d..#%d" % (ahead_of[0]["pr"],
-                                          ahead_of[-1]["pr"]))}
+                                          ahead_of[-1]["pr"])),
+                        # Timed as the train's top's run (stalled_for).
+                        "train_top": ahead_of[-1].get("sha")}
         if (RESOLVE_SLOTS and decision["action"] == "HAND-BACK"
                 and decision.get("to") == "author"
                 and decision.get("reason", "").startswith(CONFLICT_REASON)
@@ -8186,6 +8524,10 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
     parser.add_argument("--checkout", default=environ.get(
         "FORGE_CRON_CHECKOUT"), help="the checkout kept at the default "
         "branch (default $FORGE_CRON_CHECKOUT)")
+    parser.add_argument("--ready", type=int, metavar="PR", default=None,
+                        help="say whether pull request PR may be merged by "
+                        "hand now, and exit 0 if so, 1 if not (merge.mode "
+                        "manual; agent-forge #274)")
     parser.add_argument("--check-state", default=None,
                         help="the build check's state directory, read for "
                         "merge.queued_stall_minutes (default "
@@ -8206,6 +8548,20 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
         out("NO-CONFIG: %s" % err)
         return 2
     configure(project)
+    if args.ready is not None:
+        token = environ.get("GH_TOKEN") or mint(project, READ_AS or ACT_AS)
+        if not token:
+            out("NO-TOKEN: no GH_TOKEN, and no token could be minted")
+            return 2
+        try:
+            why = merge_ready(repo, GitHub(token, run), args.ready, run)
+        except (RuntimeError, KeyError, TypeError, ValueError) as err:
+            out("FAILED: %s" % err)
+            return 2
+        out("NOT READY #%d: %s" % (args.ready, "; ".join(why)) if why
+            else "READY #%d: merge it with gh pr merge %d --match-head-commit"
+            " <its head>" % (args.ready, args.ready))
+        return 1 if why else 0
     NIGHTLY_FIXES = nightly.fixes(project, environ)
     state_dir = args.state_dir or locks.state_dir(project.name, "merger",
                                                   environ)
@@ -8229,6 +8585,17 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
                 os.path.expanduser(args.check_state) if args.check_state
                 else locks.state_dir(project.name, "pr-check", environ))
         MAIN_RED_FIXES = main_red_fixes(check_state)
+        if MANUAL:
+            if args.dry_run:
+                out("MANUAL: merge.mode is manual; nothing to merge")
+                return 0
+            try:
+                record_hand_merges(state_dir, GitHub(token, run), out,
+                                   now_utc())
+            except (RuntimeError, KeyError, TypeError, ValueError) as err:
+                out("FAILED: %s" % err)
+                return 2
+            return 0
         # Only a live tick, and only with a stall alert, is given the
         # relay: a dry run messages nobody.
         send = ((sender or relay_sender)(project, environ)

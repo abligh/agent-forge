@@ -364,6 +364,27 @@ class Graphs(Base):
         self.assertEqual((got["approval_median"], got["approval_n"]),
                          (18, 2))
 
+    def test_the_hour_under_way_comes_last_and_partial(self):
+        rows = self.flow(now=T("2026-11-04T11:20:00Z")).graph_hours()
+        self.assertEqual(len(rows), 25)
+        self.assertEqual(rows[-2]["hour"], "2026-11-04T10:00Z")
+        self.assertNotIn("partial", rows[-2])
+        last = rows[-1]
+        self.assertEqual((last["hour"], last["until"], last["partial"]),
+                         ("2026-11-04T11:00Z", "2026-11-04T11:20Z", True))
+
+    def test_only_the_merges_chart_draws_the_partial_hour_lighter(self):
+        rows = [{"hour": "2026-11-04T%02d:00Z" % h, "records": True,
+                 "merges": 3, "runs_per_merge": 2.0} for h in range(9, 11)]
+        rows.append({"hour": "2026-11-04T11:00Z", "until":
+                     "2026-11-04T11:20Z", "partial": True, "records": True,
+                     "merges": 1, "runs_per_merge": 9.0})
+        merges = tool.flow_graphs(rows)
+        self.assertEqual(merges.count('class="partial"'), 1)
+        self.assertIn("11:00\u201311:20 so far", merges)
+        self.assertNotIn("9.0", tool.efficiency_graphs(rows))
+        self.assertNotIn('class="partial"', tool.efficiency_graphs(rows))
+
     def test_an_hour_without_ticks_inside_the_records_is_a_gap(self):
         records = [rec("08:10:00"), rec("10:05:00", [1], [d("WAIT", 1)])]
         rows = self.flow(records=records).graph_hours()

@@ -15,6 +15,7 @@ a run.
 
     forge-pr-check [--post] [--instance NAME] [--checkout DIR]
                    [--state-dir DIR] [--merger-dir DIR]
+    forge-pr-check --relabel-host OLD [--instance NAME] [--checkout DIR]
     forge-pr-check --worker SHA --pr N [--slot K] [--post]
                    [--ahead | --main [--warm]] [...]
 
@@ -66,6 +67,7 @@ for the memory limit and CPU weight, and, with
 | `--state-dir DIR` | `~/.local/state/agent-forge/<project>/pr-check` (`pr-check-<name>` for an instance) | Where the queue, the verdicts and the logs live. Passed on to workers and chained ticks. |
 | `--merger-dir DIR` | `~/.local/state/agent-forge/<project>/merger` | The Merger's state directory: its `next.json` names the pull request to check first and its `ahead.json` lists its predictions. Read with `checks.merger_first`, `merge.test_ahead`, `checks.merger_cpu_weight` or `checks.docker_slices`. |
 | `--instance NAME` | `$FORGE_PR_CHECK_INSTANCE`, else none | Run `checks.instances.NAME`, with its own context, steps, host and state directory. An unknown name is refused (`NO-INSTANCE`, exit 2). |
+| `--relabel-host OLD` | none | After moving the state to this host with the same toolchain: count every verdict recorded on host OLD as this host's, then exit (`RELABELLED: <n> verdict(s)`). A verdict otherwise counts only on the host that recorded it. |
 | `--checkout DIR` | `$FORGE_CRON_CHECKOUT` | The cron checkout, kept at the default branch. The steps and configuration come from it. With neither, `NO-REPO`, exit 2. |
 
 ## Environment
@@ -201,6 +203,13 @@ less `keep_ignored`), merged with the default branch's tip under
   `CPUQuota` is that many CPUs, or the run's `CHECK_CPUS` share with
   `"share"`, set as each step starts; `UNCAPPED-CPU` if systemd refuses.
 * A step is stopped after `step_timeout_minutes` (default 30).
+* Each step's scope is named `forgestep-<step>-<random>.scope`. When
+  the step ends, by any route, anything still in its scope (a test
+  binary or session bus helper that left the step's process group) is
+  killed and the scope stopped, logged as `SCOPE-LEFT <unit> <n> tasks
+  after step <step>; stopped`, and the step's result has
+  `scope_left`. One such scope once outlived its timed-out step by 2.5
+  days (agent-forge #263).
 * A step with `env_file` gets that file's `KEY=VALUE` lines in its
   environment: secrets such as a test account's tokens, which the
   check can't take from CI. The file must be the check user's and mode

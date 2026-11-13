@@ -295,14 +295,37 @@ def decisive_jobs(jobs, name):
             or (j.get("name") or "").startswith(name + " (")]
 
 
-def run_record(run):
+def run_record(run, jobs=None):
     """What nightly.json keeps of the last green run, and of the last
     run that published its builds. `started` is when the run began, so
     the router can tell which labelled issues' fixes it holds
-    (designs/0040)."""
-    return {"run": run["id"], "sha": run["head_sha"],
-            "started": run.get("run_started_at") or run.get("created_at"),
-            "ended": run["updated_at"]}
+    (designs/0040). Given the run's `jobs`, a red one's record also
+    says what was red (agent-forge #241)."""
+    record = {"run": run["id"], "sha": run["head_sha"],
+              "started": run.get("run_started_at") or run.get("created_at"),
+              "ended": run["updated_at"]}
+    red = red_parts(jobs or [])
+    if red:
+        record["red"] = red
+    return record
+
+
+# The most red jobs a published record names.
+RED_PARTS = 6
+
+
+def red_parts(jobs):
+    """What was red in a run, "job (step, step)" or the job alone, for
+    each job that ended neither green nor skipped, at most RED_PARTS."""
+    parts = []
+    for job in jobs:
+        if job.get("conclusion") in GREEN + ("skipped", None):
+            continue
+        steps = [s.get("name") or "?" for s in job.get("steps") or ()
+                 if s.get("conclusion") == "failure"]
+        parts.append("%s (%s)" % (job.get("name") or "?", ", ".join(steps))
+                     if steps else job.get("name") or "?")
+    return parts[:RED_PARTS]
 
 
 def published(jobs, release_jobs, got):
@@ -791,7 +814,8 @@ class Tick:
         sha = run["head_sha"]
         if published(every, self.cfg.get("release_jobs"), got):
             # Red or green, its builds are out: rule 22 (designs/0040).
-            saved["published"] = run_record(run)
+            saved["published"] = run_record(run, None if got == "green"
+                                            else every)
             if got != "green":
                 self.out("PUBLISHED run %s at %s" % (run["id"], sha[:10]))
         number = saved.get("issue")

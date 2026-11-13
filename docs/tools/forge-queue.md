@@ -143,8 +143,12 @@ with the same confirmed delivery as `forge-router`:
 
 A non-zero exit is `(red)`, as are a kill by a signal and a timeout. A
 message the relay didn't take is tried again every
-`relay.remind_seconds` (default 7200): by the runner, which stays until
-it lands, and, once the runner is gone, by `recover`.
+`relay.remind_seconds` (default 7200): by the runner, up to 12 times,
+and, once the runner is gone, by `recover`. A runner loads what delivery
+needs before its job starts, so an upgrade underneath can't split it;
+if delivery still fails with an import error, the runner can never
+deliver from that process, and leaves it to `recover` at once
+(`runner_gave_up` in the status; agent-forge #289).
 
 **Listing.** `list` prints one line per job: state, ticket, agent,
 name, commit (or directory), and times. An ended job whose message
