@@ -857,6 +857,21 @@ class SimCheck:
     def busy(self, sha):
         return any(r["sha"] == sha for r in self.running + self.queue)
 
+    def top_done(self, top):
+        """Whether the Merger's top `top` needs no run, as
+        forge-pr-check's next_ahead judges it: it, or a run of its tree
+        (a re-cut makes the same prediction under a new commit), has a
+        verdict, or is running (`busy_trees`: a slot checking the tree
+        now), or the top itself is queued."""
+        tree = top["tree"]
+        return top["sha"] in self.state["results"] or self.busy(
+            top["sha"]) or any(
+            r.get("tree") == tree and not r.get("covered")
+            and not r.get("matched")
+            for r in self.state["results"].values()) or any(
+            r.get("tree") == tree for r in self.running
+            if not r.get("background"))
+
     def length(self, pr, top):
         """A run's length in minutes, as a timedelta."""
         if callable(self.minutes):
@@ -884,8 +899,7 @@ class SimCheck:
         entries, batches = self.ahead()
         for batch in batches:
             top = batch[-1]
-            if top["sha"] not in self.state["results"] \
-                    and not self.busy(top["sha"]):
+            if not self.top_done(top):
                 self.queue.insert(sum(1 for r in self.queue if r["top"]),
                                   {"sha": top["sha"], "tree": top["tree"],
                                    "pr": top["pr"], "top": True})
@@ -929,13 +943,15 @@ class SimCheck:
         entries, batches = self.ahead()
         tops = [b[-1] for b in batches]
         if self.stop_spent:
-            wanted = {t["sha"] for t in tops}
+            # As merger_spent: a prediction is spent when none of the
+            # Merger's entries has its tree any more, not its commit.
+            wanted = {e["tree"] for e in entries}
             heads = {p["head"] for p in w.prs.values()
                      if p["state"] == "OPEN"}
             for run in list(self.running):
                 if run.get("background"):
                     continue
-                if (run["top"] and run["sha"] not in wanted) or (
+                if (run["top"] and run["tree"] not in wanted) or (
                         not run["top"] and run["sha"] not in heads):
                     self.running.remove(run)
                     self.stopped += 1
@@ -989,11 +1005,10 @@ class SimCheck:
         # The batch's top, then the later tops: the first `later_first`
         # of them before an ordinary head, the rest only when no head
         # wants the slot.
-        done = set(self.state["results"]) | {r["sha"] for r in self.running}
         allowed = tops[:1] + (tops[1:] if not heads
                               else tops[1:1 + self.later_first])
         for t in allowed:
-            if t["sha"] not in done:
+            if not self.top_done(t):
                 return {"sha": t["sha"], "tree": t["tree"], "pr": t["pr"],
                         "top": True}
         return heads[0] if heads else None

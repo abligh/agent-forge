@@ -12,6 +12,8 @@ their gated instance) lived there and nowhere else.
 
 AGENT_FORGE_SIM_LONG=1 adds a longer, busier run."""
 
+import datetime
+import json
 import os
 import tempfile
 import unittest
@@ -116,6 +118,53 @@ class Morning(unittest.TestCase):
         print("\nbusy day: " + figures(got))
 
 
+class TopsByTree(unittest.TestCase):
+    """SimCheck keeps a train's run across a re-cut that makes the same
+    prediction under a new commit, as forge-pr-check does (its
+    next_ahead and merger_spent go by tree, #391 item 2)."""
+
+    def predict(self, world, merger_dir, top):
+        base = world.main()
+        first = world.og("commit-tree", world.tree(base), "-p", base,
+                         "-m", "first")
+        entries = [{"pr": 1, "sha": first, "tree": world.tree(first),
+                    "head": first},
+                   {"pr": 2, "sha": top, "tree": world.tree(top),
+                    "head": top}]
+        with open(os.path.join(merger_dir, "ahead.json"), "w") as handle:
+            json.dump({"entries": entries, "batch": {
+                "size": 2, "trees": [e["tree"] for e in entries]}}, handle)
+
+    def recut(self, **check):
+        with tempfile.TemporaryDirectory() as root:
+            world = ms.World(root)
+            merger_dir = os.path.join(root, "merger")
+            os.makedirs(merger_dir)
+            sim = ms.SimCheck(world, merger_dir, **check)
+            tree = world.write_tree(world.tree(world.main()),
+                                    {"two.txt": "2\n"})
+            one = world.og("commit-tree", tree, "-p", world.main(),
+                           "-m", "cut")
+            again = world.og("commit-tree", tree, "-p", world.main(),
+                             "-m", "cut again")
+            self.assertNotEqual(one, again)
+            self.predict(world, merger_dir, one)
+            sim.step()
+            self.assertEqual([r["sha"] for r in sim.running], [one])
+            world.now += datetime.timedelta(minutes=1)
+            self.predict(world, merger_dir, again)
+            sim.step()
+            return sim, one
+
+    def test_a_recut_with_the_same_tree_keeps_the_run(self):
+        sim, one = self.recut()
+        self.assertEqual([r["sha"] for r in sim.running], [one])
+        self.assertEqual(sim.top_runs, 1)
+
+    def test_in_the_checks_own_order_too_and_it_is_not_spent(self):
+        sim, one = self.recut(later_first=1, stop_spent=True)
+        self.assertEqual([r["sha"] for r in sim.running], [one])
+        self.assertEqual((sim.top_runs, sim.stopped), (1, 0))
 class Trains(unittest.TestCase):
     """merge.test_ahead.train_merge, as GitHub takes it: the train's
     commits pushed to the simulated remote, its pull request opened and
