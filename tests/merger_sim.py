@@ -1180,8 +1180,12 @@ class Monitor:
                 order = [n for n, _ in train["members"]]
                 if m["pr"] not in order:
                     continue
+                # One its author pushed to (or that was resolved,
+                # fixed or closed) after the train started has left it,
+                # as rule 1 allows: no longer ahead of anyone.
                 ahead = [n for n in order[:order.index(m["pr"])]
-                         if n not in before]
+                         if n not in before
+                         and not self.touched(n, train["since"])]
                 if ahead:
                     self.say(5, "#%d merged ahead of #%d, before it in the "
                              "train #%d..#%d (%s)" % (
