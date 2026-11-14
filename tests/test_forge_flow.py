@@ -1122,6 +1122,80 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class CheckQueue(Base):
+    """The build check's queue, as pr-check/state.json holds it."""
+
+    def write_waiting(self, waiting):
+        write_state(self.root)
+        with open(os.path.join(self.root, "pr-check", "state.json"),
+                  "w") as h:
+            json.dump({"results": {}, "waiting": waiting}, h)
+
+    def test_running_held_and_the_rest_oldest_first(self):
+        self.write_waiting({
+            sha("a"): {"pr": 10, "since": "2026-11-04T10:00:00Z",
+                       "started": "2026-11-04T10:50:00Z"},
+            sha("b"): {"pr": 11, "since": "2026-11-04T10:30:00Z",
+                       "lane_scoped": ["slow"]},
+            sha("c"): {"pr": 12, "since": "2026-11-04T10:10:00Z",
+                       "approved": True},
+            sha("d"): {"pr": 13, "since": "2026-11-04T10:05:00Z",
+                       "held": "waits for the batch's top"},
+            sha("e"): {"pr": 14, "since": "2026-11-04T10:01:00Z",
+                       "errors": 3},
+            sha("f"): {"pr": 0, "since": "2026-11-04T09:00:00Z",
+                       "main": True}})
+        got = tool.check_queue(self.root, NOW)
+        self.assertEqual(got["ordered_by"], "oldest first")
+        self.assertEqual([i["pr"] for i in got["running"]], [10])
+        self.assertEqual([i["pr"] for i in got["queue"]], [12, 11, 0])
+        self.assertEqual(got["queue"][0]["waited"], 50)
+        self.assertEqual(got["queue"][1]["scoped"], ["slow"])
+        self.assertEqual([i["pr"] for i in got["held"]], [13])
+        self.assertEqual([i["pr"] for i in got["given_up"]], [14])
+
+    def test_an_unapproved_queued_head_is_orange_not_red(self):
+        self.write_waiting({
+            sha("b"): {"pr": 11, "since": "2026-11-04T10:30:00Z"},
+            sha("c"): {"pr": 50, "since": "2026-11-04T10:40:00Z"}})
+        flow = tool.Flow(self.root, NOW, 4, ())
+        self.assertEqual(flow.status(50)[0], "red")
+        flow.queue = tool.check_queue(self.root, NOW)
+        colour, why = flow.status(50)
+        self.assertEqual(colour, "orange")
+        self.assertIn("2nd of 2 waiting", why)
+        flow.queue["running"] = flow.queue["queue"][1:]
+        self.assertIn("running", flow.status(50)[1])
+
+    def test_the_page_lists_it_in_order(self):
+        self.write_waiting({
+            sha("b"): {"pr": 11, "since": "2026-11-04T10:30:00Z"},
+            sha("c"): {"pr": 12, "since": "2026-11-04T10:10:00Z",
+                       "approved": True}})
+        flow = tool.Flow(self.root, NOW, 4, ())
+        flow.queue = tool.check_queue(self.root, NOW)
+        page = tool.page(tool.compute(flow, "widget", "o/widget"))
+        self.assertIn("Build check queue", page)
+        self.assertLess(page.index("/pull/12"), page.index("/pull/11"))
+        self.assertEqual(tool.queue_html({}), "")
+
+    def test_a_head_in_a_train_is_held_for_its_top(self):
+        q = {"queue": [{"pr": 11, "sha": "b"}, {"pr": 12, "sha": "c"}],
+             "held": []}
+        got = tool.covered_by_trains(q, [
+            {"train": 0, "prs": [12], "state": "testing"},
+            {"train": None, "prs": [11], "state": "predicted"}])
+        self.assertEqual([i["pr"] for i in got["queue"]], [11])
+        self.assertEqual(got["held"][0]["pr"], 12)
+        self.assertIn("in train 0 (testing)", got["held"][0]["held"])
+
+    def test_ordinals(self):
+        self.assertEqual([tool.ordinal(n) for n in (1, 2, 3, 4, 11, 12,
+                                                    13, 21, 22, 111)],
+                         ["1st", "2nd", "3rd", "4th", "11th", "12th",
+                          "13th", "21st", "22nd", "111th"])
+
+
 class LegacyStateNames(unittest.TestCase):
     def test_history_reads_the_held_state_by_its_old_name(self):
         line = json.dumps({"hour": "2026-11-05T10:00Z",
