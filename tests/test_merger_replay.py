@@ -199,6 +199,61 @@ class Replay(unittest.TestCase):
         self.assertIn("inferred:", text)
 
 
+class AfterTheSimulatedCheck(unittest.TestCase):
+    """--approve-after-green and --fix-after-red (#391 item 3): the
+    reviewer and the authors answer the simulated check, not the
+    trace's clock."""
+
+    SETTINGS = {"merge": {"test_ahead": {
+        "batch": 4, "batches": 2, "trains": "live", "stacks": True,
+        "stop_spent": True, "later_first": 1}},
+        "checks": {"max_wait_minutes": 30}}
+
+    def test_no_approval_or_fix_comes_from_the_trace(self):
+        t = trace_of_day()
+        s = mr.scenario(t, approve_after=5, fix_after=3)
+        self.assertFalse([e for e in s if e[1] in ("approve", "author_fix")])
+        self.assertTrue(all(e[2][-1] is False for e in s
+                            if e[1] == "arrive"))
+        self.assertTrue([e for e in mr.scenario(t) if e[1] == "approve"])
+
+    def test_approvals_follow_the_green_and_fixes_the_red(self):
+        t = trace_of_day()
+        seen = {}
+
+        def inspect(sim):
+            w = sim.world
+            seen["events"] = list(w.events)
+            seen["green"] = {
+                sha: [st for st in reversed(sts)
+                      if st["context"] == ms.CONTEXT
+                      and st["state"] == "success"]
+                for sha, sts in w.statuses.items()}
+        got = mr.replay(t, self.SETTINGS, idle=5, inspect=inspect,
+                        approve_after=5, fix_after=3)
+        self.assertEqual(got["broken"], [])
+        self.assertEqual(got["merged"], 5, got)
+        approvals = [e for e in seen["events"] if e["what"] == "approve"]
+        # #6 the trace never approved, and nor does the reviewer here.
+        self.assertNotIn(6, {e["pr"] for e in approvals})
+        self.assertEqual({e["pr"] for e in approvals}, {1, 2, 3, 4, 5})
+        fixes = [e for e in seen["events"] if e["what"] == "fix"]
+        self.assertEqual([e["pr"] for e in fixes], [5])
+        # Approved no sooner than the check's run and five minutes.
+        self.assertGreaterEqual(got["median_open_to_approval_minutes"],
+                                5 + t["run_minutes"]["head"] // 2)
+        self.assertIsNotNone(got["median_approval_to_merge_minutes"])
+
+    def test_the_report_splits_the_waits(self):
+        t = trace_of_day()
+        real = mr.reality(t)
+        self.assertIn("median_open_to_approval_minutes", real)
+        self.assertIn("median_approval_to_merge_minutes", real)
+        text = mr.table([("reality", real)])
+        self.assertIn("median open to approval, min", text)
+        self.assertIn("median approval to merge, min", text)
+
+
 class CheckOrder(unittest.TestCase):
     """SimCheck in forge-pr-check's order: a later batch's top goes
     before an ordinary head only as `later_first` allows."""
