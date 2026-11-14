@@ -3,7 +3,8 @@
 
     python3 -m tests.merger_trace --merger merger.jsonl \\
         --verdicts verdicts.log [--since ISO] [--until ISO] \\
-        [--urgent N,N] [--slots N] > trace.json
+        [--urgent N,N] [--slots N] [--repo DIR [--main-ref REF]] \\
+        > trace.json
 
 It reads what a check host keeps, and nothing else:
 
@@ -33,13 +34,22 @@ The trace (`version` 1) is JSON:
                                       approved m or null], ...],
                      "red": m or null, "fixed": m or null,
                      "conflicts": [n, ...], "run_minutes": x or null,
-                     "merged": m or null}},
+                     "merged": m or null,
+                     "files": {"<path>": [[line, count], ...]}}},
      "background": [{"at": m, "minutes": x, "main": bool}],
      "run_minutes": {"head": x, "top": x},
      "resolve_minutes": x,
      "real": {"merges": [[n, m], ...], "head_runs": n, "top_runs": n,
               "main_runs": n, "stopped_runs": n, "background_runs": n},
      "inferred": ["...", ...]}
+
+`files`, with `--repo` (a clone holding the heads), is what the pull
+request's last head the build check saw changes: per file, the ranges
+of the merge base's lines its diff replaces (`count` 0: lines inserted
+after `line`). The replay builds real commits from them, so two pull
+requests conflict where their changes meet, as git would decide, not
+only where the logs said they did. A head the clone doesn't have
+leaves `files` out.
 
 Minutes count from `start`. A real project's trace names its pull
 requests and nothing else, but keep it out of any repository all the
@@ -51,6 +61,7 @@ import datetime
 import json
 import re
 import statistics
+import subprocess
 import sys
 
 VERDICT = re.compile(
@@ -125,6 +136,41 @@ def read_runs(lines, since=None, until=None):
             and (not until or r["end"] < until)]
 
 
+DIFF_FILE = re.compile(r"^diff --git a/(.*) b/(.*)$")
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
+
+
+def hunks_of(repo, sha, main_ref="origin/main", run=subprocess.run):
+    """{path: [[line, count], ...]}: the merge base's lines `sha`
+    replaces in each file it changes against `main_ref`, from
+    `git diff -U0`; None when the clone doesn't know `sha`."""
+    def git(*args):
+        got = run(["git", "-C", repo] + list(args), capture_output=True,
+                  text=True)
+        return got.stdout if got.returncode == 0 else None
+    full = git("rev-parse", "--verify", "-q", sha + "^{commit}")
+    if not full:
+        return None
+    base = git("merge-base", full.strip(), main_ref)
+    if not base:
+        return None
+    diff = git("diff", "-U0", "--no-renames", "--no-color", base.strip(),
+               full.strip())
+    if diff is None:
+        return None
+    files, path = {}, None
+    for line in diff.splitlines():
+        got = DIFF_FILE.match(line)
+        if got:
+            path = got.group(2)
+            continue
+        got = HUNK.match(line)
+        if got and path is not None:
+            count = 1 if got.group(2) is None else int(got.group(2))
+            files.setdefault(path, []).append([int(got.group(1)), count])
+    return files
+
+
 def minute_of(start, when):
     return max(0, int((when - start).total_seconds() // 60))
 
@@ -135,8 +181,9 @@ def median(values, default=None):
 
 
 def extract(merger_lines, verdict_lines, since=None, until=None,
-            urgent=(), slots=None):
-    """The trace (see the module's docstring) of the window."""
+            urgent=(), slots=None, files_of=None):
+    """The trace (see the module's docstring) of the window.
+    `files_of(sha)`, when given, is a head's `files` (`hunks_of`)."""
     records = read_records(merger_lines, since, until)
     if not records:
         raise ValueError("no Merger records in the window")
@@ -335,6 +382,23 @@ def extract(merger_lines, verdict_lines, since=None, until=None,
                                "minutes": round(r["ran"] / 60, 1),
                                "main": False})
     background.sort(key=lambda b: b["at"])
+    if files_of is not None:
+        last = {}
+        for r in sorted(runs, key=lambda r: r["end"]):
+            if not r["top"] and not r["main"]:
+                last[r["pr"]] = r["sha"]
+        missing = 0
+        for key, pr in prs.items():
+            sha = last.get(int(key))
+            files = files_of(sha) if sha else None
+            if files is None:
+                missing += 1
+            else:
+                pr["files"] = files
+        inferred.append(
+            "each pull request's files are its last head the build check "
+            "saw%s" % ("; %d have none (no head, or not in the clone)"
+                       % missing if missing else ""))
     head = median([r["ran"] / 60 for r in runs
                    if not r["top"] and not r["main"] and r["ran"]], 20)
     top = median([r["ran"] / 60 for r in runs if r["top"] and r["ran"]],
@@ -380,12 +444,19 @@ def main(argv=None):
     parser.add_argument("--urgent", default="",
                         help="the urgent pull requests, N,N")
     parser.add_argument("--slots", type=int, help="the build check's slots")
+    parser.add_argument("--repo", help="a clone holding the heads: record "
+                        "each pull request's changed lines")
+    parser.add_argument("--main-ref", default="origin/main",
+                        help="the default branch in --repo")
     args = parser.parse_args(argv)
     since = parse_time(args.since) if args.since else None
     until = parse_time(args.until) if args.until else None
     urgent = [int(n) for n in args.urgent.split(",") if n.strip()]
     with open(args.merger) as m, open(args.verdicts) as v:
-        trace = extract(m, v, since, until, urgent, args.slots)
+        trace = extract(m, v, since, until, urgent, args.slots,
+                        files_of=(lambda sha: hunks_of(
+                            args.repo, sha, args.main_ref))
+                        if args.repo else None)
     json.dump(trace, sys.stdout, indent=1, sort_keys=True)
     sys.stdout.write("\n")
     return 0

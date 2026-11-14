@@ -332,7 +332,7 @@ class World:
         self.note("approve", pr=number)
 
     def open(self, number, base=None, mac=False, red=False, urgent=False,
-             approve=True, clash=None, hot=False, shared=()):
+             approve=True, clash=None, hot=False, shared=(), contents=None):
         """Opens #`number`, on main or on the pull request `base`, with a
         change of its own (a file of its own, so nothing conflicts), and
         a line of its own in each of the `shared` files, so that it
@@ -342,7 +342,8 @@ class World:
         break the build together (a field one adds, an initializer
         without it in the other). `hot`: it also writes `hot.txt`, as
         every other hot one does, so each that merges makes the others
-        conflict with main."""
+        conflict with main. `contents`, {path: text}: whole files it
+        writes too (a replay's real changed lines, `merger_replay`)."""
         branch = "b%d" % number
         start = self.main() if base is None else self.prs[base]["head"]
         files = {"p%d.txt" % number: "v1\n"}
@@ -352,6 +353,8 @@ class World:
             files["clash-%s-%d.txt" % (clash, number)] = "v1\n"
         if hot:
             files["hot.txt"] = "#%d\n" % number
+        # Whole files of its own making (a replay's real changed lines).
+        files.update(contents or {})
         if mac:
             files["mac/p%d.txt" % number] = "v1\n"
         if red:
