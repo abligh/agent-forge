@@ -168,8 +168,15 @@ for `router.forget_minutes` so an item that flaps is woken once.
 line per item. Notices and relooks follow under
 `For your information (not your turn):` and
 `Worth another look (not your turn):`. A reminder's line ends
-`(reminder)`. A pull request that fixes the red nightly is listed
-first, and its line ends `(fixes the red nightly: first)`.
+`(reminder)`. Items are listed by tier, then by number, oldest first
+([designs/0054](../designs/0054-urgent-issues-and-bugs-go-first.md)):
+urgent ones (an issue the owner labelled `labels.urgent`, a pull
+request carrying it or closing such an issue), whose lines end
+`(urgent: first)`; then the pull requests that fix the red nightly,
+whose lines end `(fixes the red nightly: first)`; then bugs
+(`labels.bug`, or a pull request closing one); then the rest. The
+rules decide the tiers (their `rank`); rules without one keep only the
+red nightly's fixes first.
 
 **Delivery.** Each message is posted as plain text to
 `<relay.url>/agent/<session name>`, with the headers `X-Webhook-Token`,
