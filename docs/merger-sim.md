@@ -37,6 +37,10 @@ Merger's writes, GitHub's answers and the build check's verdicts meet.
     what waits for own runs queued behind many others);
   - it matches a head to a green run of its tree, covers a batch
     member once its top is green, and holds one while the top runs;
+  - it goes by tree for the Merger's tops too, as `next_ahead` and
+    `merger_spent` do: a top whose tree has a verdict or is running
+    gets no run of its own. A re-cut that makes the same prediction
+    under a new commit keeps the run it has, and isn't stopped as spent;
   - it notices a new head `notice` minutes after it appears;
   - it runs the gated instance (`vm/mac`, for paths under `mac/`) in a
     queue of its own, `mac_slots` slots taking `mac_minutes`;
