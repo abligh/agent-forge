@@ -137,18 +137,33 @@ beside what really happened:
 
 - merges, an hour and in each hour;
 - build runs, and how many were train tops;
-- runs a merge, and the median time from approval to merge;
+- runs a merge, and the median times from opening to approval and
+  from approval to merge;
 - how busy the slots were, and runs stopped as spent;
 - started trains re-cut, and rule breaks.
 
 Settings the simulated GitHub can't serve (`code_owners`, the `gate`
 tools) are left out and said so. `--json` gives everything as JSON.
 
+The trace's approval times include the real wait for the real build
+check, so by default the real queue is part of the input, and a change
+to the check can't show in the wait for approval. Two options take
+that clock away from the trace:
+
+- `--approve-after-green MINUTES`: each pull request the trace
+  approved is approved that long after the simulated check goes green
+  on its head, and again after a new head loses the approval. A pull
+  request the trace never approved stays unapproved.
+- `--fix-after-red MINUTES`: a red pull request's author pushes the
+  fix that long after the simulated check says red, not at the
+  trace's time.
+
 Reality and the replay differ in what the replay can't know, so
 compare settings with each other first, and with reality second.
 The replay can't know:
 - a host's faults, and the Merger's own outages;
-- the reviewers' pace past their first approval;
+- the reviewers' pace past their first approval (with
+  `--approve-after-green`, a fixed delay stands in for it);
 - a train going red without one red pull request in it.
 
 A quiet minute, one in which nothing the Merger reads has changed
