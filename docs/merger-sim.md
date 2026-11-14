@@ -135,6 +135,19 @@ example, a conflict with the default branch is put down to the pull
 request merged last before it. A real project's trace is that project's
 history: keep it out of any repository.
 
+**A heavier day than any real one** comes from overlaying traces:
+
+    python3 -m tests.merger_overlay a.json b.json [--copies N] \
+        [--shift MINUTES] > heavier.json
+
+Each trace after the first, or each copy of one with `--copies`, has
+its pull requests renumbered past the ones before it and its minutes
+moved `--shift` later (0 by default: the days on top of each other).
+Their `files` keep their paths, so where two days' pull requests
+change the same lines the replay finds them conflicting, and conflicts
+grow with the load. A trace taken without `--repo` adds no conflicts
+across days, and the result's `inferred` says so.
+
 **2. Replay it**, with the project's `merge` section (and `checks`'
 `slots` and `max_wait_minutes`) as JSON:
 
