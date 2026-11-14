@@ -84,6 +84,7 @@ No watched figure comes from GitHub.
 | `main_red` | Any red build check of the default branch. |
 | `nightly_red_hours` | The hours since the last green nightly ended are over `limit`, or, without one, above 0. |
 | `main_cpu` | A default-branch run's CPU seconds, median (or one `step`'s), are over `limit` or over `ratio` times the baseline's. |
+| `cache_over_limit` | Any build-check slot ended a prune still over `checks.cache_limit` (forge-pr-check's `CACHE-OVER-LIMIT` lines in its `verdicts.log`). Past the limit the prune removes every incremental session, so every run builds from nothing. It takes no rules. |
 | `hand_backs_per_merge` | Hand-backs per merge are over `limit` or over `ratio` times the baseline's. |
 | `prs_per_slot` | Pull requests merged per green run are under `limit`, or under the baseline's over `ratio`. |
 | `reviewer_busy` | The busiest reviewer's share of the window busy, in percent, is over `limit`. |

@@ -29,6 +29,13 @@ configuration's `stats_watch.figures`:
                    cost every check pays grows unseen as tests are added
                    (designs/0024, third amendment); CPU time, unlike run
                    time, is little moved by how busy the host is
+    cache_over_limit  the build check's slots that ended a prune still
+                   over `checks.cache_limit` (forge-pr-check's
+                   CACHE-OVER-LIMIT lines in its verdicts.log): any.
+                   Past the limit the prune removes every incremental
+                   session, so each run then builds from nothing
+                   (designs/0024, fifth amendment); the value shown is
+                   the worst slot's excess
 
 From `forge-flow`'s figures (designs/0045), read in this process from
 the same state directory:
@@ -51,7 +58,8 @@ samples are the approved pull requests that waited in the queue during
 the window, and its hours are only those in which the queue held at
 least one, so a quiet spell, with little or nothing to merge, is never
 a fault (designs/0024, second amendment).
-main_red is a count, not a statistic, so one red is enough, and
+main_red and cache_over_limit are counts, not statistics, so one is
+enough, and
 nightly_red_hours is a reading of forge-nightly's state at the end of
 the window, so `min_samples` doesn't apply to it either.
 
@@ -140,6 +148,8 @@ WHAT = {
     "main_red": ("red build checks of the default branch", "red"),
     "nightly_red_hours": ("the hours since the last green nightly", "h"),
     "main_cpu": ("a default-branch run's CPU time, median", "CPU-s"),
+    "cache_over_limit": ("build-check slots over their cache limit",
+                         "over"),
     "hand_backs_per_merge": ("hand-backs told (all pull requests) ÷ merges",
                              "per merge"),
     "prs_per_slot": ("pull requests merged per green run", "per run"),
@@ -151,6 +161,10 @@ FLOW = ("hand_backs_per_merge", "prs_per_slot", "reviewer_busy")
 FLOORS = ("merge_rate", "prs_per_slot")
 # The figures a busy host slows down: their issues say how busy it was.
 CONTENDED = ("check_run", "check_wait", "pr_turnaround", "main_cpu")
+# forge-pr-check's line for a slot left over checks.cache_limit after a
+# prune; an instance's name may follow the word.
+OVER_RE = re.compile(r"^(\S+) CACHE-OVER-LIMIT (?:\S+ )?(slot \d+): (\d+) "
+                     r"bytes over the limit of (\d+)")
 FIGURE_RE = re.compile(r"^Figure: ([a-z_]+)\s*$", re.MULTILINE)
 OUT, IN, UNJUDGED = "out", "in", "unjudged"
 
@@ -193,6 +207,47 @@ def forge_stats(environ):
             raise RuntimeError("forge-stats: %s" % " ".join(lines))
         return json.loads(lines[0])
     return stats
+
+
+def cache_over(path):
+    """A function (since, until) -> {"cache_over_limit": (worst, slots)}
+    from forge-pr-check's verdicts.log at `path`: the most any slot was
+    left over checks.cache_limit after a prune in [since, until), in G,
+    and how many slots were. A log that isn't there reads as none."""
+    over = []
+    try:
+        with open(path, errors="replace") as handle:
+            for line in handle:
+                if "CACHE-OVER-LIMIT" not in line:
+                    continue
+                match = OVER_RE.match(line)
+                if match:
+                    try:
+                        when = parse_time(match.group(1))
+                    except ValueError:
+                        continue
+                    over.append((when, match.group(2),
+                                 int(match.group(3)) / (1 << 30)))
+    except OSError:
+        pass
+
+    def figure(since, until):
+        seen = {}
+        for when, slot, size in over:
+            if since <= when < until:
+                seen[slot] = max(seen.get(slot, 0), size)
+        return {"cache_over_limit": (max(seen.values(), default=0),
+                                     len(seen))}
+    return figure
+
+
+def pr_check_log(environ):
+    """forge-pr-check's verdicts.log for the project."""
+    checkout = environ.get("FORGE_CRON_CHECKOUT")
+    project = config.load(None, environ, cwd=os.path.expanduser(
+        checkout) if checkout else None)
+    return os.path.join(locks.state_dir(project.name, "pr-check", environ,
+                                        create=False), "verdicts.log")
 
 
 def forge_flow(environ):
@@ -280,6 +335,8 @@ def show(figure, value):
         return "%.1f an hour" % value
     if figure == "main_cpu":
         return "%.0f CPU-s" % value
+    if figure == "cache_over_limit":
+        return "%.0fG over" % value
     if figure in ("hand_backs_per_merge", "prs_per_slot"):
         return "%.2f %s" % (value, unit)
     if unit == "%":
@@ -296,6 +353,11 @@ def judge(figure, rules, window, baseline, min_samples):
         if value:
             return OUT, "%s in the window" % show(figure, value)
         return IN, "no red build checks of the default branch"
+    if figure == "cache_over_limit":
+        if n:
+            return OUT, "%d slot%s ended a prune over the cache limit, the "\
+                "worst %s" % (n, "" if n == 1 else "s", show(figure, value))
+        return IN, "no slot ended a prune over the cache limit"
     if figure == "nightly_red_hours":
         if value is None:
             return UNJUDGED, "no nightly judged by forge-nightly"
@@ -534,6 +596,7 @@ def find_issues(token, project, label, call):
 def main(argv=None, out=print, err=None, environ=None, now=None,
          call=github.api_call, sign=github.openssl_sign, stats=None,
          mint=None, flow=None, send=None, loadavg=os.getloadavg,
+         cache=None,
          cpus=os.cpu_count):
     err = err or (lambda line: print(line, file=sys.stderr))
     environ = os.environ if environ is None else environ
@@ -566,6 +629,10 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
             flow = flow or forge_flow(environ)
             window.update(flow(start, now))
             baseline.update(flow(start - watch.baseline, start))
+        if "cache_over_limit" in watched:
+            cache = cache or cache_over(pr_check_log(environ))
+            window.update(cache(start, now))
+            baseline.update(cache(start - watch.baseline, start))
         shorts = {}
         for hours in sorted({r["short_hours"] for r in watched.values()
                              if isinstance(r, dict) and "short_hours" in r}):
@@ -573,6 +640,8 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
             shorts[hours] = figures(stats(since, now), hours, watched)
             if any(f in watched for f in FLOW):
                 shorts[hours].update(flow(since, now))
+            if "cache_over_limit" in watched:
+                shorts[hours].update(cache(since, now))
     except (RuntimeError, OSError, ValueError,
             config.ConfigError) as error:
         err("%s: skipping this hour: %s" % (PROG, error))

@@ -254,3 +254,23 @@ busy, and run time and CPU seconds both rise with contention.
 
 All three are off until configured, except the context, which only
 adds lines to an issue.
+
+## Fifth amendment (2026-11-14): a slot over its cache limit
+
+* Status: approved (Alex Bligh, 2026-11-14, in the terminal: "yes please")
+
+**Why.** When a slot's build caches outgrow `checks.cache_limit`,
+forge-pr-check's prune removes incremental sessions oldest first until
+they fit. If they never fit, it removes all of them, after every run,
+and every run then builds each changed crate from nothing. In one
+project a slot's working set grew past the limit over a few days. The
+prune went from about 50 sessions a run to every one, CPU per run
+doubled, and nothing said why for four days. The prune had logged
+`CACHE-OVER-LIMIT` at every run all along.
+
+**What.** A figure, `cache_over_limit`, read from forge-pr-check's
+`verdicts.log`: the slots with a `CACHE-OVER-LIMIT` line in the
+window, and the worst one's excess in G. Any slot is out of line, as
+for `main_red`; it takes no rules and `min_samples` doesn't apply. The
+issue closes once a whole window passes with none. Off until listed in
+`stats_watch.figures`.
