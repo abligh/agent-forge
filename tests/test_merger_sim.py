@@ -165,6 +165,8 @@ class TopsByTree(unittest.TestCase):
         sim, one = self.recut(later_first=1, stop_spent=True)
         self.assertEqual([r["sha"] for r in sim.running], [one])
         self.assertEqual((sim.top_runs, sim.stopped), (1, 0))
+
+
 class Trains(unittest.TestCase):
     """merge.test_ahead.train_merge, as GitHub takes it: the train's
     commits pushed to the simulated remote, its pull request opened and
