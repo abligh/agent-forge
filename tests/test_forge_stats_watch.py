@@ -6,7 +6,7 @@ import os
 import tempfile
 import unittest
 
-from agent_forge import github
+from agent_forge import config, github
 from tests.helpers import EXAMPLE, example, load_tool
 
 tool = load_tool("forge-stats-watch")
@@ -194,6 +194,39 @@ class Judge(unittest.TestCase):
         self.assertEqual(got["nightly_red_hours"], (30, 1))
         self.assertEqual(tool.figures(stats(), 6)["nightly_red_hours"],
                          (None, 0))
+
+    def test_check_cpu_per_merge(self):
+        # agent-forge #394: 6.5 CPU-hours a merge on a bad day, 5.1 on
+        # a good one.
+        got = dict(stats(), check=dict(stats()["check"], cpu_all={
+            "seconds": 6.5 * 3600 * 20, "runs": 50}),
+            queue=dict(stats()["queue"], merges=20))
+        self.assertEqual(tool.figures(got, 6)["check_cpu_per_merge"],
+                         (6.5 * 3600, 20))
+        self.assertEqual(tool.judge(
+            "check_cpu_per_merge", {"ratio": 1.2}, (6.5 * 3600, 20),
+            (5.1 * 3600, 200), 5), (tool.OUT, "23400 CPU-s (6.5 CPU-hours) "
+            "a merge, over 1.2 x the baseline's 18360 CPU-s (5.1 "
+            "CPU-hours) a merge"))
+        # Under five merges, no judgement; none merged, no value.
+        self.assertEqual(tool.judge(
+            "check_cpu_per_merge", {"limit": 1}, (6.5 * 3600, 4),
+            (None, 0), 5)[0], tool.UNJUDGED)
+        quiet = dict(got, queue=dict(stats()["queue"], merges=0))
+        self.assertEqual(tool.figures(quiet, 6)["check_cpu_per_merge"],
+                         (None, 0))
+        self.assertEqual(tool.figures(stats(), 6)["check_cpu_per_merge"][0],
+                         None)
+
+    def test_runs_per_merge_comes_from_forge_flow(self):
+        self.assertIn("runs_per_merge", tool.FLOW)
+        self.assertEqual(tool.judge("runs_per_merge", {"limit": 2},
+                                    (2.5, 20), (None, 0), 5),
+                         (tool.OUT, "2.50 per merge, over the limit of "
+                          "2.00 per merge"))
+        for name in ("runs_per_merge", "check_cpu_per_merge"):
+            self.assertEqual(config.STATS_WATCH_FIGURES[name],
+                             ("limit", "ratio", "short_hours"))
 
     def test_main_cpu_for_the_run_or_one_step(self):
         cpu = {"total": {"n": 8, "median": 4000.0},

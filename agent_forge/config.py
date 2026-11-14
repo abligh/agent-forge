@@ -100,13 +100,15 @@ STATS_WATCH_FIGURES = {
     "main_red": (),
     "nightly_red_hours": ("limit",),
     "main_cpu": ("limit", "ratio", "step", "short_hours"),
+    "check_cpu_per_merge": ("limit", "ratio", "short_hours"),
     # forge-pr-check's CACHE-OVER-LIMIT lines (designs/0024, fifth
     # amendment): any slot over is out of line.
     "cache_over_limit": (),
     # From forge-flow (designs/0045).
     "hand_backs_per_merge": ("limit", "ratio", "short_hours"),
     "prs_per_slot": ("limit", "ratio", "short_hours"),
-    "reviewer_busy": ("limit", "short_hours")}
+    "reviewer_busy": ("limit", "short_hours"),
+    "runs_per_merge": ("limit", "ratio", "short_hours")}
 # forge-nightly (designs/0028): a red nightly is a red main.
 NIGHTLY = {"workflow": str, "job": str, "owners": dict, "labels": list,
            "retry_hours": int, "escalate_hours": list, "as": str,

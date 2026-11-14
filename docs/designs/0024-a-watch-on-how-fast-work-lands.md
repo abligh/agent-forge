@@ -274,3 +274,31 @@ window, and the worst one's excess in G. Any slot is out of line, as
 for `main_red`; it takes no rules and `min_samples` doesn't apply. The
 issue closes once a whole window passes with none. Off until listed in
 `stats_watch.figures`.
+
+## Sixth amendment (2026-11-14): what the gate costs a merge
+
+* Status: asked for by Alex Bligh (agent-forge #394, filed from
+  FleetResearcher's research into merge speed)
+
+**Why.** None of the figures is the cost of the gate per change
+landed, which showed one project's trouble earliest. Over five days
+its check CPU per merged pull request went from 5.1 to 6.5 CPU-hours
+while merges fell from 254 to 180 a day. `main_cpu` watches only the
+default branch's runs; `slots_busy` and `check_wait` move late, once
+the slots are full.
+
+**What.** Two figures, each with `limit`, `ratio` and `short_hours`,
+judged only from `min_samples` merges (default 5), so a quiet night
+doesn't alarm:
+
+* `check_cpu_per_merge`, from forge-stats: the CPU seconds of every
+  build-check run that finished in the window, of every kind (its
+  `step_cpu` in `state.json`), over the pull requests merged in it. A
+  run stopped before its verdict records no CPU, so it isn't counted.
+* `runs_per_merge`, from forge-flow: build-check runs started in the
+  window, of every kind, stopped ones too, over the merges. It is
+  forge-flow's "builds per merge".
+
+forge-stats' report gives every run's CPU in the window and per merge.
+Both figures are off until listed in `stats_watch.figures`. With the
+split gate (designs/0055), each is to be given per tier.

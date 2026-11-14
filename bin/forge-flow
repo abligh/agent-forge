@@ -1732,7 +1732,8 @@ class Flow:
                                          got["merges"]),
                 "prs_per_slot": (slots["prs_per_slot"], slots["slots"]),
                 "reviewer_busy": (100 * max(busy) if busy else None,
-                                  len(busy))}
+                                  len(busy)),
+                "runs_per_merge": (got["runs_per_merge"], got["merges"])}
 
 
 # ------------------------------------------------------------- history
