@@ -116,6 +116,49 @@ class Morning(unittest.TestCase):
         print("\nbusy day: " + figures(got))
 
 
+class Trains(unittest.TestCase):
+    """merge.test_ahead.train_merge, as GitHub takes it: the train's
+    commits pushed to the simulated remote, its pull request opened and
+    merged, the members marked merged (#391)."""
+
+    def test_a_green_train_of_three_merges_as_one(self):
+        m = ms.load_merger()
+        # Boarding before their own greens, and those runs slower than
+        # the train's: its green comes first, and the three go in on it.
+        m.configure(ms.project({"own_head_green": False}, batch=3,
+                               batches=1, train_merge=True))
+        with tempfile.TemporaryDirectory() as root:
+            sim = ms.Sim(m, root, [(0, "open", (n,)) for n in (1, 2, 3)],
+                         own_minutes=30)
+            got = sim.run(120)
+            trains = sim.github.trains
+        self.assertEqual(got.broken, [], figures(got))
+        self.assertEqual(got.merged, 3, figures(got))
+        self.assertEqual([t["members"] for t in trains.values()],
+                         [[1, 2, 3]], "\n".join(got.lines))
+        self.assertEqual([t["state"] for t in trains.values()], ["MERGED"])
+        self.assertTrue(any("TRAIN-MERGE #1..#3: merged 3 as #8000" in l
+                            for l in got.lines), "\n".join(got.lines))
+
+    def test_a_push_to_the_network_fails_the_run(self):
+        origin = "/sim/origin.git"
+        self.assertEqual(
+            ms.local_git(["git", "-C", "w", "push", "-q", "-f", ms.REMOTE,
+                          "a:refs/heads/b"], origin),
+            ["git", "-C", "w", "push", "-q", "-f", origin, "a:refs/heads/b"])
+        for remote in ("https://github.com/other/repo.git",
+                       "ssh://git@example.com/repo.git",
+                       "git@github.com:example/widget.git"):
+            with self.assertRaises(ms.NetworkUsed, msg=remote):
+                ms.local_git(["git", "-C", "w", "push", remote, "a:b"],
+                             origin)
+            with self.assertRaises(ms.NetworkUsed, msg=remote):
+                ms.local_git(["git", "fetch", remote], origin)
+        # Not a remote at all: left as it is.
+        self.assertEqual(ms.local_git(["git", "log", "x@{1}:y"], origin),
+                         ["git", "log", "x@{1}:y"])
+
+
 class Rules(unittest.TestCase):
     """The monitor itself: a break it should see, it sees."""
 
