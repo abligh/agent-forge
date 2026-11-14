@@ -946,6 +946,16 @@ class SimCheck:
             # As merger_spent: a prediction is spent when none of the
             # Merger's entries has its tree any more, not its commit.
             wanted = {e["tree"] for e in entries}
+            # The top a member left mid-run (the Merger's left_top):
+            # those below it merge on its green.
+            try:
+                with open(os.path.join(self.merger_dir,
+                                       "ahead.json")) as handle:
+                    kept = json.load(handle).get("left_top")
+            except (OSError, ValueError):
+                kept = None
+            if isinstance(kept, dict) and kept.get("tree"):
+                wanted.add(kept["tree"])
             heads = {p["head"] for p in w.prs.values()
                      if p["state"] == "OPEN"}
             for run in list(self.running):
