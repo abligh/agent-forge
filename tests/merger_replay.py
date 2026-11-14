@@ -54,10 +54,59 @@ KEPT = {"merger", "ci_workflow", "stall_minutes", "test_ahead",
         "hand_back_once_per_head"}
 
 
+# Where a trace's real paths live in the simulated repository, apart
+# from the simulation's own files.
+REAL = "repo/"
+
+
 class ReplayWorld(ms.World):
     """The World, with the arrivals a trace describes: a pull request
     stacked on one not yet open opens that one first, unapproved, and
-    one stacked on one already merged or closed opens on main."""
+    one stacked on one already merged or closed opens on main. With
+    `changed` ({number: the trace's `files`}), each such pull request
+    also replaces the lines its real head replaced, in files under REAL
+    that `with_files` put on main first: git then decides which of them
+    conflict."""
+
+    changed = {}
+
+    def with_files(self, changed):
+        """Main gains every file `changed` names, long enough for every
+        range in it, each line its own."""
+        self.changed = changed
+        lengths = {}
+        for files in changed.values():
+            for path, ranges in files.items():
+                end = max(line + count for line, count in ranges)
+                lengths[path] = max(lengths.get(path, 0), end + 5)
+        if not lengths:
+            return
+        main = self.main()
+        tree = self.write_tree(self.tree(main), {
+            REAL + path: "".join("%s %d\n" % (path, k)
+                                 for k in range(1, n + 1))
+            for path, n in lengths.items()})
+        sha = self.og("commit-tree", tree, "-p", main, "-m", "real files")
+        self.og("update-ref", "refs/heads/main", sha, main)
+        self.wg("fetch", "-q", "origin")
+
+    def real_contents(self, number, start):
+        """{path: text}: the REAL files at `start` with #`number`'s
+        ranges replaced by lines of its own."""
+        out = {}
+        for path, ranges in (self.changed.get(number) or {}).items():
+            text = self.og("cat-file", "-p", "%s:%s%s" % (start, REAL, path),
+                           check=False)
+            lines = text.split("\n") if text else []
+            for line, count in sorted(ranges, reverse=True):
+                mine = ["#%d %s %d" % (number, path, k)
+                        for k in range(max(count, 1))]
+                if count == 0:
+                    lines[line:line] = mine
+                else:
+                    lines[line - 1:line - 1 + count] = mine
+            out[REAL + path] = "\n".join(lines) + "\n"
+        return out
 
     def arrive(self, number, base=None, mac=False, red=False,
                urgent=False, shared=(), approve=True):
@@ -74,7 +123,9 @@ class ReplayWorld(ms.World):
                 under = self.prs[base]
             if under["state"] != "OPEN":
                 base = None
-        self.open(number, base, mac, red, urgent, approve, shared=shared)
+        start = self.main() if base is None else self.prs[base]["head"]
+        self.open(number, base, mac, red, urgent, approve, shared=shared,
+                  contents=self.real_contents(number, start))
 
     def approve(self, number):
         pr = self.prs.get(number)
@@ -314,8 +365,11 @@ def replay(trace, base_config=None, changes=None, merger=None, idle=10,
                      max_wait=checks.get("max_wait_minutes"),
                      stop_spent=bool(ahead.get("stop_spent")),
                      background=trace.get("background") or ())
+        sim.world.with_files({int(k): p["files"]
+                              for k, p in trace["prs"].items()
+                              if p.get("files")})
         conflicting = [int(k) for k, p in trace["prs"].items()
-                       if p.get("conflicts")]
+                       if p.get("conflicts") or p.get("files")]
         sim.each_minute.append(Resolver(sim.world, conflicting,
                                         trace.get("resolve_minutes") or 60))
         if fix_after is not None:

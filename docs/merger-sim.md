@@ -119,15 +119,20 @@ done before it goes live. It takes two steps.
         --slots 7 --urgent 123,456 > trace.json
 
 The trace is per pull request: when it opened and was approved, its
-pushes, its base when stacked, whether it waited for the gated
-instance, whether its first head was red and when it was fixed, the
-pull requests it conflicted with, its run length, its hand-backs, and
-when it really merged. It also carries the day's other work in the
-build check's slots (the default branch's runs, and runs of pull
-requests never approved), and the day's real figures. What the logs
-can't say is inferred and listed in its `inferred`. For example, a
-conflict with the default branch is put down to the pull request
-merged last before it. A real project's trace is that project's
+pushes, its base when stacked, whether it waited for the gated instance,
+whether its first head was red and when it was fixed, the pull requests
+it conflicted with, its run length, its hand-backs, and when it really
+merged. With `--repo DIR` (a clone holding the heads, and `--main-ref`,
+default `origin/main`), it also records each pull request's changed
+lines: per file, the ranges of the merge base its last checked head
+replaces. The replay writes those ranges into real files on its own
+main, so two pull requests conflict where their lines meet, as git
+decides, not only where the logs said they did. It also carries the
+day's other work in the build check's slots (the default branch's runs,
+and runs of pull requests never approved), and the day's real figures.
+What the logs can't say is inferred and listed in its `inferred`. For
+example, a conflict with the default branch is put down to the pull
+request merged last before it. A real project's trace is that project's
 history: keep it out of any repository.
 
 **2. Replay it**, with the project's `merge` section (and `checks`'
