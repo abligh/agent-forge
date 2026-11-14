@@ -149,6 +149,8 @@ class Replay(unittest.TestCase):
         self.assertEqual(got["settings"]["slots"], 3)
         self.assertEqual(got["dropped"], [])
         self.assertGreaterEqual(got["background_runs"], 1)
+        # #391's summary: red tops and departures from started trains.
+        self.assertEqual((got["red_tops"], got["left_trains"]), (0, 0), got)
 
     def test_the_day_replayed_with_train_merge(self):
         # #391: a train merges as one pull request in a replay too.

@@ -384,6 +384,9 @@ def report(trace, sim, result, slots, wall, dropped, merge, checks):
         if waits else None,
         "slot_busy": round(sim.check.busy_minutes
                            / max(1, slots * trace["minutes"]), 3),
+        "red_tops": sum(1 for r in sim.check.state["results"].values()
+                        if r.get("ahead") and r.get("ok") is False),
+        "left_trains": result.left,
         "broken": result.broken, "recuts": len(result.recuts),
         "ticks": sim.ticks, "wall_seconds": round(wall, 1)}
 
@@ -423,7 +426,10 @@ ROWS = (("merged", "merges"), ("per_hour", "merges an hour"),
         ("median_approval_to_merge_minutes",
          "median approval to merge, min"),
         ("slot_busy", "slots busy"), ("stopped", "runs stopped as spent"),
-        ("recuts", "started trains re-cut"), ("broken", "rule breaks"),
+        ("red_tops", "train tops red"),
+        ("recuts", "started trains re-cut"),
+        ("left_trains", "left a started train unmerged"),
+        ("broken", "rule breaks"),
         ("wall_seconds", "wall time, s"))
 
 

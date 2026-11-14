@@ -150,7 +150,8 @@ beside what really happened:
 - runs a merge, and the median times from opening to approval and
   from approval to merge;
 - how busy the slots were, and runs stopped as spent;
-- started trains re-cut, and rule breaks.
+- train tops found red, started trains re-cut, pull requests that
+  left a started train and never merged at its tree, and rule breaks.
 
 Settings the simulated GitHub can't serve (`code_owners`, the `gate`
 tools) are left out and said so. `--json` gives everything as JSON.
