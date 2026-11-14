@@ -201,6 +201,29 @@ class CheckOrder(unittest.TestCase):
         check.state["results"]["a" * 40] = {"ok": True, "tree": "ta"}
         return check.pick(tops, ms.START)["pr"]
 
+    def check_with(self, train_slots, tops):
+        check = ms.SimCheck(self.world, "/nonexistent", slots=2,
+                            later_first=0, train_slots=train_slots)
+        check.running = [{"sha": "r" * 40, "tree": "tr", "pr": 9,
+                          "top": False, "done": ms.START}]
+        check.queue = [{"sha": "h" * 40, "tree": "t", "pr": 1,
+                        "top": False, "queued": ms.START}]
+        # The batch's top has its verdict: only a later top waits.
+        check.state["results"]["a" * 40] = {"ok": True, "tree": "ta"}
+        return check.pick(tops, ms.START, check.own_full(tops))
+
+    def test_train_slots_keep_a_slot_for_a_waiting_prediction(self):
+        # A later top waits behind a head with later_first 0; with
+        # train_slots the head can't have the last slot.
+        tops = [{"sha": "a" * 40, "tree": "ta", "pr": 2},
+                {"sha": "b" * 40, "tree": "tb", "pr": 3}]
+        self.assertEqual(self.check_with(0, tops)["pr"], 1)
+        self.assertEqual(self.check_with(1, tops)["pr"], 3)
+
+    def test_with_no_prediction_waiting_nothing_is_kept(self):
+        self.assertEqual(self.check_with(
+            1, [{"sha": "a" * 40, "tree": "ta", "pr": 2}])["pr"], 1)
+
     def test_none_first_waits_for_a_spare_slot(self):
         self.assertEqual(self.picked(0), 1)
 

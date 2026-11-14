@@ -225,6 +225,7 @@ def replay(trace, base_config=None, changes=None, merger=None, idle=10,
                      later_first=ahead.get("later_first", 0),
                      max_wait=checks.get("max_wait_minutes"),
                      stop_spent=bool(ahead.get("stop_spent")),
+                     train_slots=ahead.get("train_slots") or 0,
                      background=trace.get("background") or ())
         conflicting = [int(k) for k, p in trace["prs"].items()
                        if p.get("conflicts")]

@@ -47,6 +47,11 @@ Merger's writes, GitHub's answers and the build check's verdicts meet.
   5. the other heads, oldest first;
   6. the remaining later tops, only in a slot no head wants.
 
+  With `train_slots` too (read from `merge.test_ahead` in a replay),
+  up to that many slots are kept for the Merger's predictions, only as
+  many as are running or waiting to start; heads and the background
+  fill the rest.
+
   With `stop_spent`, a run of a top the Merger no longer predicts, or
   of a head no pull request has any more, stops. `background` is
   other work in the same slots, queued at its minute.
