@@ -225,6 +225,32 @@ class Rules(unittest.TestCase):
         self.assertTrue(ok, why)
         self.sim.monitor.check()
 
+    def started(self):
+        """A train of #1 then #2, started now."""
+        w = self.world
+        w.open(1)
+        w.open(2)
+        self.sim.monitor.trains["t" * 40] = {
+            "members": [(1, "t1"), (2, "t2")], "since": ms.iso(w.now),
+            "tree": "t2", "done": False}
+        w.now += ms.datetime.timedelta(minutes=1)
+
+    def rule5(self):
+        return [l for l in self.sim.monitor.broken if "rule 5" in l]
+
+    def test_merging_past_one_ahead_in_the_train_is_a_break(self):
+        self.started()
+        self.merge(2)
+        self.assertEqual(len(self.rule5()), 1, self.sim.monitor.broken)
+
+    def test_not_past_one_whose_author_pushed_after_it_started(self):
+        # 2026-11-13 replayed: #10942 left its train on a push, and the
+        # rest of it merged as a train of two.
+        self.started()
+        self.world.push(1)
+        self.merge(2)
+        self.assertEqual(self.rule5(), [])
+
     def test_a_tree_nothing_tested_is_a_break(self):
         self.world.open(1)
         self.merge(1)
