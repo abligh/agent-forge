@@ -379,7 +379,7 @@ class Check(unittest.TestCase):
             "stats_watch.figures.main_red must be an object",
             "stats_watch.figures.speed: unknown figure (one of check_run, "
             "check_wait, pr_turnaround, merge_time, merge_rate, "
-            "slots_busy, main_red, nightly_red_hours, main_cpu, "
+            "slots_busy, main_red, nightly_red_hours, main_cpu, cache_over_limit, "
             "hand_backs_per_merge, prs_per_slot, reviewer_busy)"])
         self.assertEqual(self.problems(stats_watch={}),
                          ["stats_watch: missing 'owner'"])

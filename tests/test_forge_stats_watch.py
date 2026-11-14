@@ -173,6 +173,12 @@ class Judge(unittest.TestCase):
         self.assertEqual(self.judge("main_red", (1, 1))[0], tool.OUT)
         self.assertEqual(self.judge("main_red", (0, 0))[0], tool.IN)
 
+    def test_cache_over_limit_trips_on_any_slot(self):
+        self.assertEqual(self.judge("cache_over_limit", (108.7, 2), None, {}), (
+            tool.OUT, "2 slots ended a prune over the cache limit, the "
+            "worst 109G over"))
+        self.assertEqual(self.judge("cache_over_limit", (0, 0), None, {})[0], tool.IN)
+
     def test_nightly_red_hours(self):
         def judge(window, rules):
             return tool.judge("nightly_red_hours", rules, window,
@@ -694,6 +700,19 @@ class ForgeFlow(unittest.TestCase):
         self.assertEqual(self.gh.writes[0][2]["title"], "forge-stats-watch: "
                          "reviewer_busy 95%, over the limit of 90%")
 
+    def test_an_injected_cache_reading_is_judged(self):
+        self.watch({"cache_over_limit": {}})
+
+        def cache(since, until):
+            return {"cache_over_limit": (107.5, 1)}
+        self.assertEqual(tool.main([], self.out.append, self.err.append,
+                                   self.env, NOW, call=self.gh,
+                                   stats=self.stats, mint=self.mint,
+                                   cache=cache), 0)
+        self.assertEqual(self.gh.writes[0][2]["title"], "forge-stats-watch: "
+                         "cache_over_limit 1 slot ended a prune over the "
+                         "cache limit, the worst 108G over")
+
     def test_figures_not_watched_never_run_forge_flow(self):
         def flow(since, until):
             raise AssertionError("forge-flow ran")
@@ -701,6 +720,43 @@ class ForgeFlow(unittest.TestCase):
                                    self.env, NOW, call=self.gh,
                                    stats=self.stats, mint=self.mint,
                                    flow=flow), 0)
+
+
+class CacheOverLimit(unittest.TestCase):
+    """cache_over_limit, from forge-pr-check's CACHE-OVER-LIMIT lines
+    (designs/0024, fifth amendment)."""
+
+    def figure(self, text, since, until):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "verdicts.log")
+            with open(path, "w") as handle:
+                handle.write(text)
+            return tool.cache_over(path)(since, until)
+
+    def test_the_worst_slot_and_how_many_in_the_window(self):
+        g = 1 << 30
+        text = "".join(
+            "%s CACHE-OVER-LIMIT %s: %d bytes over the limit of %d after "
+            "pruning; whole profiles go only past 1.5 times it\n"
+            % (when, slot, over, 230 * g)
+            for when, slot, over in (
+                ("2026-10-21T05:00:00Z", "slot 1", 500 * g),  # before
+                ("2026-10-21T07:00:00Z", "slot 2", 100 * g),
+                ("2026-10-21T08:00:00Z", "slot 2", 110 * g),
+                ("2026-10-21T09:00:00Z", "slot 4", 90 * g)))
+        text += "2026-10-21T09:30:00Z VERDICT #2 bbbbbbbbbb: green\n"
+        got = self.figure(text, NOW - 6 * HOUR, NOW)
+        self.assertEqual(got, {"cache_over_limit": (110.0, 2)})
+
+    def test_an_instances_line_counts_too(self):
+        got = self.figure(
+            "2026-10-21T11:00:00Z CACHE-OVER-LIMIT mac slot 1: 1073741824 "
+            "bytes over the limit of 2\n", NOW - HOUR, NOW)
+        self.assertEqual(got, {"cache_over_limit": (1.0, 1)})
+
+    def test_no_log_reads_as_none_over(self):
+        self.assertEqual(tool.cache_over("/nonexistent/verdicts.log")(
+            NOW - HOUR, NOW), {"cache_over_limit": (0, 0)})
 
 
 class ForgeStats(unittest.TestCase):
