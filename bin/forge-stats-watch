@@ -29,6 +29,12 @@ configuration's `stats_watch.figures`:
                    cost every check pays grows unseen as tests are added
                    (designs/0024, third amendment); CPU time, unlike run
                    time, is little moved by how busy the host is
+    check_cpu_per_merge  the CPU seconds of every build-check run that
+                   finished in the window, of every kind, over the pull
+                   requests merged in it: over `limit` (CPU seconds),
+                   or over `ratio` x the baseline's; its samples are the
+                   merges. The cost of the gate per change landed; it
+                   climbs before the slots fill (agent-forge #394)
     cache_over_limit  the build check's slots that ended a prune still
                    over `checks.cache_limit` (forge-pr-check's
                    CACHE-OVER-LIMIT lines in its verdicts.log): any.
@@ -44,6 +50,10 @@ the same state directory:
                    divided by the merges: over `limit`, or over
                    `ratio` x the baseline's; its samples are the
                    merges
+    runs_per_merge  build-check runs started in the window (of every
+                   kind, stopped ones too) over the merges: over
+                   `limit`, or over `ratio` x the baseline's; its
+                   samples are the merges
     prs_per_slot   pull requests merged per green run they rested on:
                    under `limit`, or under the baseline's over `ratio`;
                    its samples are those runs
@@ -148,16 +158,20 @@ WHAT = {
     "main_red": ("red build checks of the default branch", "red"),
     "nightly_red_hours": ("the hours since the last green nightly", "h"),
     "main_cpu": ("a default-branch run's CPU time, median", "CPU-s"),
+    "check_cpu_per_merge": ("the build check's CPU time ÷ merges",
+                            "CPU-s a merge"),
     "cache_over_limit": ("build-check slots over their cache limit",
                          "over"),
     "hand_backs_per_merge": ("hand-backs told (all pull requests) ÷ merges",
                              "per merge"),
     "prs_per_slot": ("pull requests merged per green run", "per run"),
+    "runs_per_merge": ("build-check runs ÷ merges", "per merge"),
     "reviewer_busy": ("the busiest reviewer's time busy", "%"),
 }
 # The figures forge-flow computes (designs/0045), and those judged as
 # floors: out of line when too low.
-FLOW = ("hand_backs_per_merge", "prs_per_slot", "reviewer_busy")
+FLOW = ("hand_backs_per_merge", "prs_per_slot", "reviewer_busy",
+        "runs_per_merge")
 FLOORS = ("merge_rate", "prs_per_slot")
 # The figures a busy host slows down: their issues say how busy it was.
 CONTENDED = ("check_run", "check_wait", "pr_turnaround", "main_cpu")
@@ -308,6 +322,8 @@ def figures(stats, hours, watched=None):
     ran = (check.get("ran") or {}).get("n", 0)
     waiting = queue.get("waiting", 0)
     red_hours = (stats.get("nightly") or {}).get("red_hours")
+    every = check.get("cpu_all") or {}
+    merges = queue.get("merges", 0)
     return {
         "check_run": minutes(check.get("ran") or {}, "median"),
         "check_wait": minutes(check.get("waited") or {}, "p90"),
@@ -320,6 +336,9 @@ def figures(stats, hours, watched=None):
                      (check.get("runs") or {}).get("main", 0)),
         "nightly_red_hours": (red_hours, 0 if red_hours is None else 1),
         "main_cpu": (cpu.get("median"), cpu.get("n", 0)),
+        "check_cpu_per_merge": (
+            every["seconds"] / merges if merges and every.get("runs")
+            else None, merges),
     }
 
 
@@ -335,9 +354,12 @@ def show(figure, value):
         return "%.1f an hour" % value
     if figure == "main_cpu":
         return "%.0f CPU-s" % value
+    if figure == "check_cpu_per_merge":
+        return "%.0f CPU-s (%.1f CPU-hours) a merge" % (value, value / 3600)
     if figure == "cache_over_limit":
         return "%.0fG over" % value
-    if figure in ("hand_backs_per_merge", "prs_per_slot"):
+    if figure in ("hand_backs_per_merge", "prs_per_slot",
+                  "runs_per_merge"):
         return "%.2f %s" % (value, unit)
     if unit == "%":
         return "%.0f%%" % value

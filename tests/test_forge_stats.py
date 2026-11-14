@@ -157,6 +157,19 @@ class MainCpu(unittest.TestCase):
                          "test 200 s, vet 10 s")
 
 
+    def test_every_run_s_cpu(self):
+        # Every kind of run in the window with step_cpu: a, b, c and d
+        # (agent-forge #394); e is outside it, f and g lack a field.
+        self.assertEqual(tool.all_cpu_stats(self.RESULTS, SINCE, UNTIL),
+                         {"seconds": 9630.0, "runs": 4})
+        self.assertEqual(tool.all_cpu_stats({}, SINCE, UNTIL),
+                         {"seconds": 0.0, "runs": 0})
+        self.assertEqual(tool.all_cpu_stats({"x": {
+            "finished": "2026-10-12T00:30:00Z",
+            "step_cpu": {"a": True, "b": "7", "c": 5}}}, SINCE, UNTIL),
+            {"seconds": 5.0, "runs": 1})
+
+
 class Scoped(unittest.TestCase):
     # designs/0048: the scoped steps' time, from each verdict's
     # scoped_seconds.

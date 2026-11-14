@@ -1732,7 +1732,8 @@ class Flow:
                                          got["merges"]),
                 "prs_per_slot": (slots["prs_per_slot"], slots["slots"]),
                 "reviewer_busy": (100 * max(busy) if busy else None,
-                                  len(busy))}
+                                  len(busy)),
+                "runs_per_merge": (got["runs_per_merge"], got["merges"])}
 
 
 # ------------------------------------------------------------- history
@@ -2035,7 +2036,7 @@ animation:puff 2.4s ease-out infinite}
 .siding .cars{opacity:.85}
 .rtrain{margin:0 0 8px}.rtrain .lab{font-size:13px;color:var(--ink2);
 margin:0 0 3px}.rtrain .cars{row-gap:12px}
-.rtrain .engine .puff{animation:none!important;opacity:.3}
+.rtrain.gone .engine .puff{display:none}
 .t-partly .engine .lamp{fill:var(--amber)}
 .rtrain .car.m-left,.rtrain .car.m-recut,.rtrain .car.m-waiting{
 background:none}.rtrain .car.m-left{border-color:var(--axis)}
@@ -2617,13 +2618,13 @@ def pri_legend():
             "way</span>")
 
 
-# A recent train's engine, by its outcome: the class that lights its
-# lamp, and what it says. It never steams: the train is gone.
+# A finished recent train's engine, by its outcome: the class that
+# lights its lamp, and what it says. It has no steam: the train is gone.
+# One still running is drawn as it is now (`recent_engine`).
 OUTCOME_ENGINE = {"merged": ("t-green", "merged: green lamp, flag out"),
                   "partly merged": ("t-partly", "partly merged: amber lamp"),
                   "red": ("t-red", "red: red lamp"),
-                  "re-cut": ("t-wait", "re-cut: lamp unlit"),
-                  "running": ("t-testing", "still running: amber lamp")}
+                  "re-cut": ("t-recut", "re-cut: lamp unlit, no steam")}
 # A member's outcome in a recent train: its colour class and its name.
 MEMBER_SAYS = (("merged", "merged"), ("culprit", "the culprit: red on its "
                "own, handed back"), ("left", "left the train"),
@@ -2635,6 +2636,28 @@ TRAIN_OUTCOMES = ("merged", "partly merged", "red", "re-cut", "running")
 def duration_text(minutes):
     return "%d min" % minutes if minutes < 120 else "%.1f h" % (
         minutes / 60)
+
+
+def recent_engine(data, t):
+    """(class, what it says, finished) for a recent train's engine. A
+    finished one by its outcome, with no steam. One still running as the
+    train it goes on as in "Trains now" (the same top, members a part of
+    its own) is drawn, else by its top's run: testing while that runs,
+    otherwise waiting for a slot."""
+    if t["outcome"] != "running":
+        cls, says = OUTCOME_ENGINE.get(t["outcome"], ("t-recut", None))
+        return cls, says, True
+    prs = set(t["prs"])
+    for live in data.get("trains") or ():
+        if live.get("train") is not None and live.get("prs") and \
+                live["prs"][-1] == t["prs"][-1] and set(live["prs"]) <= prs:
+            cls = train_class(live.get("state") or "")
+            break
+    else:
+        tops = t.get("tops") or []
+        cls = "t-testing" if tops and tops[-1]["res"] == "running" \
+            else "t-wait"
+    return cls, "still running, " + ENGINE_SAYS[cls], False
 
 
 def recent_html(data):
@@ -2670,7 +2693,7 @@ def recent_html(data):
                             "".join(inner),
                             '<i class="tail" aria-hidden="true"></i>'
                             if van else ""))
-        cls, says = OUTCOME_ENGINE.get(t["outcome"], ("t-wait", None))
+        cls, says, gone = recent_engine(data, t)
         tops = t.get("tops") or []
         last = tops[-1] if tops else None
         top = ""
@@ -2680,9 +2703,10 @@ def recent_html(data):
                                        if last.get("ran") else "")
         n, c = len(t["prs"]), len(t["carriages"])
         rows.append(
-            '<div class="rtrain %s"><p class="lab"><span class="ob o-%s">%s'
-            "</span> cut %s · %d PR%s in %d carriage%s · %s%s%s · %s</p>"
+            '<div class="rtrain %s%s"><p class="lab"><span class="ob o-%s">'
+            "%s</span> cut %s · %d PR%s in %d carriage%s · %s%s%s · %s</p>"
             '<div class="cars">%s%s%s</div></div>' % (cls,
+                " gone" if gone else "",
                 t["outcome"].replace(" ", "-"), esc(t["outcome"]),
                 esc(t["cut"]), n, "" if n == 1 else "s", c,
                 "" if c == 1 else "s", duration_text(t["minutes"]),
