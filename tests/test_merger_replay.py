@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import unittest
 
+from tests import merger_overlay as mo
 from tests import merger_replay as mr
 from tests import merger_sim as ms
 from tests import merger_trace as mt
@@ -291,6 +292,46 @@ class RealLines(unittest.TestCase):
             w.merge_tree(w.prs[1]["head"], w.prs[2]["head"]))
         self.assertIsNotNone(
             w.merge_tree(w.prs[1]["head"], w.prs[3]["head"]))
+
+
+class Overlay(unittest.TestCase):
+    """#391 item 4: days overlaid into a heavier one, whose pull
+    requests' lines meet across days."""
+
+    def test_the_second_day_is_renumbered_and_moved(self):
+        t = trace_of_day()
+        top = max(int(n) for n in t["prs"])
+        got = mo.overlay([t, t], shift=30)
+        self.assertEqual(len(got["prs"]), 2 * len(t["prs"]))
+        one, two = t["prs"]["2"], got["prs"][str(2 + top)]
+        self.assertEqual(two["opened"], one["opened"] + 30)
+        self.assertEqual(two["base"], one["base"] + top)
+        self.assertEqual(two["approved"], [m + 30 for m in one["approved"]])
+        self.assertEqual(got["prs"][str(3 + top)]["conflicts"],
+                         [n + top for n in t["prs"]["3"]["conflicts"]])
+        self.assertEqual(len(got["real"]["merges"]),
+                         2 * len(t["real"]["merges"]))
+        self.assertEqual(got["minutes"], t["minutes"] + 30)
+        self.assertTrue(any("no files" in l for l in got["inferred"]))
+
+    def test_two_days_lines_conflict_across_days(self):
+        t = trace_of_day()
+        t["prs"]["5"]["files"] = {"core.rs": [[10, 4]]}
+        top = max(int(n) for n in t["prs"])
+        heavier = mo.overlay([t, t], shift=5)
+        self.assertFalse(heavier["prs"][str(5 + top)].get("conflicts"))
+        # Twice the load: time for all of it to go in.
+        heavier["minutes"] = 300
+        seen = {}
+        got = mr.replay(heavier, Replay.SETTINGS, idle=5,
+                        inspect=lambda sim: seen.update(
+                            events=list(sim.world.events)))
+        self.assertEqual(got["broken"], [])
+        self.assertEqual(got["merged"], 2 * mr.replay(
+            t, Replay.SETTINGS, idle=5)["merged"], got)
+        # The second day's #5 changes the first day's #5's lines.
+        self.assertIn(5 + top, {e["pr"] for e in seen["events"]
+                                if e["what"] == "resolve"})
 
 
 class AfterTheSimulatedCheck(unittest.TestCase):
