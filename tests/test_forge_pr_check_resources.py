@@ -332,6 +332,25 @@ class PruneCaches(unittest.TestCase):
     def path(self, *parts):
         return os.path.join(self.root, *parts)
 
+    def test_what_is_left_is_counted_in_the_one_walk(self):
+        # The total comes from the pruning walk itself (no second walk):
+        # what pass 1 and 2 removed isn't in it, nor is a link.
+        make(os.path.join(self.deps, "t-1a2b"), 100, 3, executable=True)
+        make(os.path.join(self.deps, "libx-1a2b.rlib"), 7, 3)
+        make(os.path.join(self.inc, "old-1", "s", "a.bin"), 30, 9)
+        make(os.path.join(self.inc, "new-1", "s", "a.bin"), 5, 0)
+        make(self.path("debug", ".fingerprint", "x", "f"), 3, 0)
+        os.symlink(os.path.join(self.deps, "libx-1a2b.rlib"),
+                   self.path("debug", "link"))
+        gone = pc.prune_caches([self.root], None, NOW)
+        self.assertEqual((gone["executables"], gone["incremental"]), (1, 1))
+        left = sum(st.st_size for _, st in pc.files_under(self.root))
+        self.assertEqual((gone["left"], left), (15, 15))
+        with mock.patch.object(pc, "files_under",
+                               side_effect=AssertionError("walked twice")):
+            self.assertEqual(pc.prune_caches([self.root], None, NOW)["left"],
+                             15)
+
     def test_stale_test_executables_go(self):
         old = make(self.path("debug", "deps", "t-aaa"), 10, 3, True)
         new = make(self.path("debug", "deps", "t-bbb"), 10, 0.1, True)
