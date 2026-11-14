@@ -5629,7 +5629,7 @@ def files_under(root):
                 st = os.lstat(path)
             except OSError:
                 continue
-            if not os.path.islink(path):
+            if not stat.S_ISLNK(st.st_mode):
                 yield path, st
 
 
@@ -5698,6 +5698,10 @@ def prune_caches(roots, limit, now, main_since=None, main_until=None):
         gone[kind] += 1
         gone["freed"] += size
 
+    # The total is taken in the same walk, after each directory's own
+    # pruning, one lstat a file: a second walk to sum the caches cost
+    # minutes in a large workspace (millions of files).
+    total = 0
     for root in roots:
         for top, dirs, files in os.walk(root):
             name = os.path.basename(top)
@@ -5716,7 +5720,13 @@ def prune_caches(roots, limit, now, main_since=None, main_until=None):
                     dirs.remove(entry)
                     gone["incremental"] += 1
                     gone["freed"] += size
-    total = sum(st.st_size for root in roots for _, st in files_under(root))
+            for entry in files:
+                try:
+                    st = os.lstat(os.path.join(top, entry))
+                except OSError:
+                    continue  # pruned just now, or gone meanwhile
+                if not stat.S_ISLNK(st.st_mode):
+                    total += st.st_size
     if limit is not None:
         for units, keep in ((lambda: incremental_sessions(roots), limit),
                             (lambda: top_directories(roots),
