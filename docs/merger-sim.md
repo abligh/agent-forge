@@ -10,12 +10,22 @@ Merger's writes, GitHub's answers and the build check's verdicts meet.
 ## What it runs against
 
 - **Real git.** A bare `origin` and the Merger's own checkout, so every
-  tree, merge and conflict is git's.
+  tree, merge and conflict is git's. Every push the Merger makes to the
+  project's GitHub remote goes to `origin` instead. Any other network
+  address given to a git command that reaches a remote fails the run
+  (`NetworkUsed`): nothing a simulation runs leaves the host. The
+  Merger commits as `IDENTITY` when its own `RESOLVE_IDENTITY` is unset,
+  so train commits and resolutions are made as they are in production.
 - **`SimGitHub`.** It answers what the Merger reads and does what it
   writes, the way GitHub does where it matters:
   - `update-branch` makes a new merge commit, with the tree the Merger
     predicted but a new sha;
   - a squash merge lands one commit on `main`;
+  - with `train_merge`, the train's pull request is opened from the
+    branch the Merger pushed and merged as a merge commit. Every open
+    pull request whose head that puts in `main` is marked merged,
+    bottom first, at the tree of the train commit that took it in
+    (`SimGitHub.trains`);
   - a merged branch's stacked pull requests are retargeted to `main`
     (`World.auto_retarget`);
   - statuses are kept per commit.
@@ -113,16 +123,34 @@ done before it goes live. It takes two steps.
         --slots 7 --urgent 123,456 > trace.json
 
 The trace is per pull request: when it opened and was approved, its
-pushes, its base when stacked, whether it waited for the gated
-instance, whether its first head was red and when it was fixed, the
-pull requests it conflicted with, its run length, its hand-backs, and
-when it really merged. It also carries the day's other work in the
-build check's slots (the default branch's runs, and runs of pull
-requests never approved), and the day's real figures. What the logs
-can't say is inferred and listed in its `inferred`. For example, a
-conflict with the default branch is put down to the pull request
-merged last before it. A real project's trace is that project's
+pushes, its base when stacked, whether it waited for the gated instance,
+whether its first head was red and when it was fixed, the pull requests
+it conflicted with, its run length, its hand-backs, and when it really
+merged. With `--repo DIR` (a clone holding the heads, and `--main-ref`,
+default `origin/main`), it also records each pull request's changed
+lines: per file, the ranges of the merge base its last checked head
+replaces. The replay writes those ranges into real files on its own
+main, so two pull requests conflict where their lines meet, as git
+decides, not only where the logs said they did. It also carries the
+day's other work in the build check's slots (the default branch's runs,
+and runs of pull requests never approved), and the day's real figures.
+What the logs can't say is inferred and listed in its `inferred`. For
+example, a conflict with the default branch is put down to the pull
+request merged last before it. A real project's trace is that project's
 history: keep it out of any repository.
+
+**A heavier day than any real one** comes from overlaying traces:
+
+    python3 -m tests.merger_overlay a.json b.json [--copies N] \
+        [--shift MINUTES] > heavier.json
+
+Each trace after the first, or each copy of one with `--copies`, has
+its pull requests renumbered past the ones before it and its minutes
+moved `--shift` later (0 by default: the days on top of each other).
+Their `files` keep their paths, so where two days' pull requests
+change the same lines the replay finds them conflicting, and conflicts
+grow with the load. A trace taken without `--repo` adds no conflicts
+across days, and the result's `inferred` says so.
 
 **2. Replay it**, with the project's `merge` section (and `checks`'
 `slots` and `max_wait_minutes`) as JSON:
@@ -141,18 +169,34 @@ beside what really happened:
 
 - merges, an hour and in each hour;
 - build runs, and how many were train tops;
-- runs a merge, and the median time from approval to merge;
+- runs a merge, and the median times from opening to approval and
+  from approval to merge;
 - how busy the slots were, and runs stopped as spent;
-- started trains re-cut, and rule breaks.
+- train tops found red, started trains re-cut, pull requests that
+  left a started train and never merged at its tree, and rule breaks.
 
 Settings the simulated GitHub can't serve (`code_owners`, the `gate`
 tools) are left out and said so. `--json` gives everything as JSON.
+
+The trace's approval times include the real wait for the real build
+check, so by default the real queue is part of the input, and a change
+to the check can't show in the wait for approval. Two options take
+that clock away from the trace:
+
+- `--approve-after-green MINUTES`: each pull request the trace
+  approved is approved that long after the simulated check goes green
+  on its head, and again after a new head loses the approval. A pull
+  request the trace never approved stays unapproved.
+- `--fix-after-red MINUTES`: a red pull request's author pushes the
+  fix that long after the simulated check says red, not at the
+  trace's time.
 
 Reality and the replay differ in what the replay can't know, so
 compare settings with each other first, and with reality second.
 The replay can't know:
 - a host's faults, and the Merger's own outages;
-- the reviewers' pace past their first approval;
+- the reviewers' pace past their first approval (with
+  `--approve-after-green`, a fixed delay stands in for it);
 - a train going red without one red pull request in it.
 
 A quiet minute, one in which nothing the Merger reads has changed
