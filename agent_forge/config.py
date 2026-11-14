@@ -172,7 +172,8 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "merger_first": bool, "depends": bool, "depends_minutes": int,
           "tracer": str, "cpu_weight": int, "cpu_quota": (int, str, type(None)),
           "fast_lane": dict,
-          "merge_default": bool, "cache_limit": str, "results_max": str,
+          "merge_default": bool, "cache_limit": str,
+          "cache_prune_minutes": int, "results_max": str,
           "reuse": dict,
           "fresh": dict, "first_authors": list, "max_wait_minutes": int,
           "main": str, "main_red_issue": dict, "drop_env": list,
@@ -210,7 +211,7 @@ STEP_ALERT = {"growth": (int, float), "min_seconds": int, "window_days": int,
 INSTANCE_OWN = ("host", "context", "steps", "poster")
 INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight", "cpu_quota",
                       "step_timeout_minutes", "caches", "cache_limit",
-                      "results_max",
+                      "cache_prune_minutes", "results_max",
                       "keep_ignored", "drop_env", "merge_default",
                       "red_comment", "max_wait_minutes", "host_fault_text",
                       "cache_fault_text", "step_alert", "cpu_share",
@@ -1097,6 +1098,10 @@ def _check_checks(checks, data, problems, where="checks"):
     if _is(checks.get("cpu_weight"), int) \
             and not 0 <= checks["cpu_weight"] <= 10000:
         problems.append("%s.cpu_weight must be 0 (none) or 1 to 10000" % where)
+    if _is(checks.get("cache_prune_minutes"), int) \
+            and checks["cache_prune_minutes"] < 0:
+        problems.append("%s.cache_prune_minutes must be 0 (after every run) "
+                        "or more" % where)
     quota = checks.get("cpu_quota")
     if (_is(quota, int) and quota < 1) or (
             isinstance(quota, str) and quota != "share"):
