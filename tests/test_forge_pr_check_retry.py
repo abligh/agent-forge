@@ -5,6 +5,7 @@ running prediction the Merger no longer predicts, and `retry_red`
 once more before the red stands."""
 
 import datetime
+import json
 import os
 import pathlib
 import tempfile
@@ -59,6 +60,19 @@ class Spent(unittest.TestCase):
                                entry(8, SHA_Q, TREE_3),
                                entry(9, SHA_C, TREE_2)], batch=1, later=(2,))
         self.assertEqual(self.spent([SHA_P, SHA_Q, SHA_C]), set())
+
+    def test_the_top_a_member_left_is_kept(self):
+        # left_top_covers (agent-forge #296): the members below the one
+        # that left merge on this run's green, so it must finish.
+        write_ahead(self.dir, [entry(7, SHA_P, TREE_1)])
+        path = os.path.join(self.dir, "ahead.json")
+        with open(path) as handle:
+            said = json.load(handle)
+        said["left_top"] = {"sha": SHA_Q, "tree": TREE_3,
+                            "entries": [entry(7, SHA_P, TREE_1)]}
+        with open(path, "w") as handle:
+            json.dump(said, handle)
+        self.assertEqual(self.spent([SHA_P, SHA_Q, SHA_C]), {SHA_C})
 
     def test_nothing_is_spent_without_a_fresh_list(self):
         write_ahead(self.dir, [])

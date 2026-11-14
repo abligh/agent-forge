@@ -208,6 +208,26 @@ class Trains(unittest.TestCase):
                          ["git", "log", "x@{1}:y"])
 
 
+class LeftTop(unittest.TestCase):
+    """left_top_covers with stop_spent: when a member leaves a started
+    train, those below it merge on the old top's green, which the check
+    must not stop as spent."""
+
+    def test_the_members_below_a_leaver_merge_on_the_old_tops_green(self):
+        m = ms.load_merger()
+        m.configure(ms.project({"own_head_green": False}, batch=4,
+                               batches=1, train_merge=True))
+        scenario = [(0, "open", (n,)) for n in (1, 2, 3, 4)] + [
+            (5, "push", (4,)), (7, "review", (4,))]
+        with tempfile.TemporaryDirectory() as root:
+            sim = ms.Sim(m, root, scenario, own_minutes=40, later_first=1,
+                         stop_spent=True)
+            got = sim.run(120)
+        self.assertEqual(got.broken, [], figures(got))
+        self.assertTrue(any("TRAIN-UNDER-LEFT #1..#3" in l
+                            for l in got.lines), "\n".join(got.lines))
+
+
 class Rules(unittest.TestCase):
     """The monitor itself: a break it should see, it sees."""
 

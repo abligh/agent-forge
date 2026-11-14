@@ -101,7 +101,9 @@ stopped this way: it is no pull request's head to begin with.
 commit and tree are in none of `ahead.json`'s entries (later batches'
 included) has been spent by a re-cut: no head or batch will be matched
 to it. Its run is stopped as a superseded head's is, logged
-`STOPPED-SPENT`, and its slot is freed. Nothing is stopped while
+`STOPPED-SPENT`, and its slot is freed. The old top the Merger keeps as
+`left_top` (`left_top_covers`) is not spent: the members below the one
+that left merge on its green. Nothing is stopped while
 `ahead.json` is stale, unreadable or empty.
 
 With it too, once the Merger has folded the trains in front of a later
@@ -2780,6 +2782,22 @@ def merger_ahead(merger_dir, when, repo=None):
         return []
 
 
+def merger_left_top(merger_dir):
+    """ahead.json's `left_top` ({"sha", "tree"}, the Merger's
+    merge.test_ahead.left_top_covers): the old top of a train a member
+    left after its run started, whose green the members below it merge
+    on; or None. Read only after merger_ahead found the file fresh."""
+    try:
+        with open(os.path.join(merger_dir, "ahead.json")) as handle:
+            kept = json.load(handle).get("left_top")
+        if isinstance(kept, dict) and isinstance(kept.get("tree"), str) \
+                and kept["tree"] and isinstance(kept.get("sha"), str):
+            return {"sha": kept["sha"], "tree": kept["tree"]}
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
 def merger_batch(merger_dir, when, repo=None):
     """designs/0032: the Merger's batch, the predictions one run covers,
     its top last, or [] when there is none of two or more, or ahead.json
@@ -2876,6 +2894,15 @@ def merger_spent(merger_dir, when, running, repo=None, run=sh):
         return set()
     shas = {e["sha"] for e in entries}
     trees = {e["tree"] for e in entries}
+    # merge.test_ahead.left_top_covers (agent-forge #296): the top a
+    # member left mid-run still covers the members below it, which merge
+    # on its green (TRAIN-UNDER-LEFT). Stopped as spent, that green never
+    # came: one project had 608 departures from started trains and not
+    # one such merge.
+    kept = merger_left_top(merger_dir)
+    if kept is not None:
+        shas.add(kept["sha"])
+        trees.add(kept["tree"])
     spent = set()
     for sha, where in running.items():
         if sha in shas:
