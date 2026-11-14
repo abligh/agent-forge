@@ -593,7 +593,10 @@ branch's last green run in the slot didn't write go first, then `incremental` di
 untouched for 7 days, then the oldest files until the slot's caches
 hold at most the limit. Links are never followed. What went is logged
 as `CACHE-PRUNED`; a failure to prune is logged and changes nothing
-else. Without it, nothing is pruned.
+else. A slot pruned less than `checks.cache_prune_minutes` ago (60),
+whose prune left its caches at most three quarters of the limit, skips
+it: the walk takes minutes in a large workspace. Without it, nothing
+is pruned.
 
 **With `checks.warm`, an idle slot catches up with the default
 branch.** When no head waits to start, and more than one slot is free,
@@ -855,6 +858,14 @@ VERSION_TIMEOUT_S = 60
 # checks.cache_limit: the most a slot's caches may hold, in bytes, after
 # a run prunes them (`prune_caches`); None: never pruned.
 CACHE_LIMIT = None
+# checks.cache_prune_minutes: a slot whose last prune was less than this
+# long ago, and left its caches at most CACHE_ROOMY of the limit, skips
+# the next. A prune walks every file in the caches, minutes for a large
+# workspace's, and the slot waits for it (`prune_slot_caches`); 0:
+# after every run.
+DEFAULT_CACHE_PRUNE_MINUTES = 60
+CACHE_PRUNE_EVERY = datetime.timedelta(minutes=DEFAULT_CACHE_PRUNE_MINUTES)
+CACHE_ROOMY = 0.75
 # checks.warm: globs of paths whose change on the default branch, since
 # the head a slot's caches were last built at, makes that slot build the
 # default branch's head again when it is idle (`warm_slot`); None: off.
@@ -1170,6 +1181,7 @@ def configure(project, instance=None):
     global FLAKE_ISSUE
     global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, LATER_FIRST, TRAIN_SLOTS, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT, WARM_PATHS, WARM_EVERY
+    global CACHE_PRUNE_EVERY
     global RESULTS_MAX
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     global TRACE_MATCHED_MAIN, CHAIN_WRITES_ONLY, DIRS_BY_NAMES, OUTPUTS
@@ -1298,6 +1310,8 @@ def configure(project, instance=None):
     DROP_PREFIXES = tuple(d[:-1] for d in drop if d.endswith("*"))
     CACHE_LIMIT = size_bytes(checks["cache_limit"]) \
         if "cache_limit" in checks else None
+    CACHE_PRUNE_EVERY = datetime.timedelta(minutes=checks.get(
+        "cache_prune_minutes", DEFAULT_CACHE_PRUNE_MINUTES))
     RESULTS_MAX = size_bytes(checks["results_max"]) \
         if "results_max" in checks else DEFAULT_RESULTS_MAX
     WARM_PATHS = tuple(checks["warm"]["paths"]) if "warm" in checks else None
@@ -5812,15 +5826,32 @@ def cache_folders():
     return list(dict.fromkeys(folders))
 
 
-def prune_slot_caches(state_dir, slot, out=print):
-    """With CACHE_LIMIT, prune the slot's caches after a run, and log
-    what went as CACHE-PRUNED. Never raises: a failure is logged, and
-    the run's verdict stands."""
+def prune_due(state, slot, when):
+    """Whether the slot's caches are pruned after this run: not when its
+    last prune was less than CACHE_PRUNE_EVERY before `when` (epoch
+    seconds) and left them at most CACHE_ROOMY of CACHE_LIMIT."""
+    last = (state.get("cache_pruned") or {}).get(str(slot))
+    if not isinstance(last, dict):
+        return True
+    try:
+        ago = when - float(last["at"])
+        roomy = float(last["left"]) <= CACHE_ROOMY * CACHE_LIMIT
+    except (KeyError, TypeError, ValueError):
+        return True
+    return not (0 <= ago < CACHE_PRUNE_EVERY.total_seconds() and roomy)
+
+
+def prune_slot_caches(state_dir, slot, out=print, clock=time.time):
+    """With CACHE_LIMIT, prune the slot's caches after a run, unless
+    `prune_due` says it can wait, and log what went as CACHE-PRUNED.
+    Never raises: a failure is logged, and the run's verdict stands."""
     folders = cache_folders()
     if CACHE_LIMIT is None or not folders:
         return None
     try:
         state = load(state_dir)
+        if not prune_due(state, slot, clock()):
+            return None
         since = state.get("cache_main", {}).get(str(slot))
         until = state.get("cache_main_end", {}).get(str(slot))
         if since is not None and until is not None and until < since:
@@ -5828,7 +5859,12 @@ def prune_slot_caches(state_dir, slot, out=print):
         gone = prune_caches(
             [os.path.join(state_dir, slot_name(folder, slot))
              for folder in folders],
-            CACHE_LIMIT, time.time(), since, until)
+            CACHE_LIMIT, clock(), since, until)
+        with state_lock(state_dir):
+            state = load(state_dir)
+            state.setdefault("cache_pruned", {})[str(slot)] = {
+                "at": clock(), "left": gone.get("left")}
+            save(state_dir, state)
     except Exception as err:
         log(state_dir, "CACHE-PRUNE-FAILED %s: %s: %s"
             % (slot_label(slot), type(err).__name__, err), now_utc(), out)

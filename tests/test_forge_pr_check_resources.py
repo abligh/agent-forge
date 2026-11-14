@@ -568,6 +568,74 @@ class PruneSlotCaches(StateCase):
                       self.lines[-1])
 
 
+class PruneWhenDue(StateCase):
+    """checks.cache_prune_minutes: a slot pruned recently, with room to
+    spare, skips the walk; near the limit it prunes after every run."""
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (("CACHE_LIMIT", 100),
+                            ("CACHES", {"CARGO_TARGET_DIR": "cargo-target"}),
+                            ("CACHE_PRUNE_EVERY",
+                             pc.datetime.timedelta(minutes=60))):
+            patch = mock.patch.object(pc, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        os.makedirs(os.path.join(self.state_dir, "cargo-target-2"))
+        self.walks = []
+
+    def prune(self, at, left):
+        def walk(*args):
+            self.walks.append(at)
+            return {"freed": 0, "over": 0, "left": left}
+        with mock.patch.object(pc, "prune_caches", walk):
+            return pc.prune_slot_caches(self.state_dir, 2, self.lines.append,
+                                        clock=lambda: at)
+
+    def test_a_roomy_slot_skips_the_walk_for_an_hour(self):
+        self.prune(1000.0, 75)
+        self.assertEqual(pc.load(self.state_dir)["cache_pruned"],
+                         {"2": {"at": 1000.0, "left": 75}})
+        self.assertIsNone(self.prune(1000.0 + 59 * 60, 75))
+        self.prune(1000.0 + 60 * 60, 75)
+        self.assertEqual(self.walks, [1000.0, 1000.0 + 3600])
+
+    def test_near_the_limit_every_run_prunes(self):
+        self.prune(1000.0, 76)
+        self.prune(1060.0, 76)
+        self.assertEqual(self.walks, [1000.0, 1060.0])
+
+    def test_zero_prunes_after_every_run(self):
+        with mock.patch.object(pc, "CACHE_PRUNE_EVERY",
+                               pc.datetime.timedelta(0)):
+            self.prune(1000.0, 0)
+            self.prune(1001.0, 0)
+        self.assertEqual(self.walks, [1000.0, 1001.0])
+
+    def test_each_slot_by_its_own_record(self):
+        self.write_state({"cache_pruned": {"1": {"at": 1000.0, "left": 0}}})
+        self.prune(1001.0, 0)
+        self.assertEqual(self.walks, [1001.0])
+
+    def test_a_clock_gone_back_or_a_bad_record_prunes(self):
+        for record in ({"at": 2000.0, "left": 0}, {"at": "x", "left": 0},
+                       {"left": 0}, {"at": 1000.0, "left": None}, "junk"):
+            self.assertTrue(pc.prune_due(
+                {"cache_pruned": {"2": record}}, 2, 1500.0), record)
+
+    def test_configured(self):
+        data = example()
+        self.assertEqual(config.check(data), [])
+        data["checks"]["cache_prune_minutes"] = 0
+        self.assertEqual(config.check(data), [])
+        pc.configure(config.Project(data, None))
+        self.addCleanup(pc.configure, config.Project(example(), None))
+        self.assertEqual(pc.CACHE_PRUNE_EVERY, pc.datetime.timedelta(0))
+        data["checks"]["cache_prune_minutes"] = -1
+        self.assertEqual(config.check(data), [
+            "checks.cache_prune_minutes must be 0 (after every run) or more"])
+
+
 class CachesInTheWorker(RepoCase):
 
     def setUp(self):
