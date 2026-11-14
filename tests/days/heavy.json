@@ -1,0 +1,4622 @@
+{
+ "background": [
+  {
+   "at": 0,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 45,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 90,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 135,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 180,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 225,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 270,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 315,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 360,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 405,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 450,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 495,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 540,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 585,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 630,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 675,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 720,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 765,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 810,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 855,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 900,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 945,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 990,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 1035,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 1080,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 1125,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 1170,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 1215,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 1260,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 1305,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 1350,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 1395,
+   "main": true,
+   "minutes": 20.0
+  }
+ ],
+ "inferred": [
+  "a made-up heavy day (tests/merger_days.py)"
+ ],
+ "mac_minutes": 25,
+ "minutes": 1440,
+ "prs": {
+  "1": {
+   "approved": [
+    88
+   ],
+   "base": null,
+   "conflicts": [
+    8
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 10,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "10": {
+   "approved": [
+    281
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 104,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "100": {
+   "approved": [
+    812
+   ],
+   "base": null,
+   "conflicts": [
+    95
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 718,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "101": {
+   "approved": [
+    861
+   ],
+   "base": 98,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [
+    [
+     892,
+     908
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 719,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "102": {
+   "approved": [
+    951
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 722,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "103": {
+   "approved": [
+    834
+   ],
+   "base": null,
+   "conflicts": [
+    107
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 737,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "104": {
+   "approved": [
+    967
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 738,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "105": {
+   "approved": [
+    980
+   ],
+   "base": 99,
+   "conflicts": [
+    106
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 752,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "106": {
+   "approved": [
+    813
+   ],
+   "base": null,
+   "conflicts": [
+    105
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 756,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "107": {
+   "approved": [
+    859
+   ],
+   "base": null,
+   "conflicts": [
+    103
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 756,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "108": {
+   "approved": [
+    823
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 757,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "109": {
+   "approved": [
+    835
+   ],
+   "base": 100,
+   "conflicts": [
+    115
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 766,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "11": {
+   "approved": [
+    288
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 108,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "110": {
+   "approved": [
+    793
+   ],
+   "base": 93,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 769,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "111": {
+   "approved": [
+    906
+   ],
+   "base": 104,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 770,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "112": {
+   "approved": [
+    964
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 771,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "113": {
+   "approved": [
+    943
+   ],
+   "base": null,
+   "conflicts": [
+    119
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 772,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "114": {
+   "approved": [
+    806
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 773,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "115": {
+   "approved": [
+    888
+   ],
+   "base": null,
+   "conflicts": [
+    109,
+    120
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 773,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "116": {
+   "approved": [
+    910
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 778,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "117": {
+   "approved": [
+    829
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 778,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "118": {
+   "approved": [
+    827
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 790,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "119": {
+   "approved": [
+    830
+   ],
+   "base": null,
+   "conflicts": [
+    113
+   ],
+   "fixed": null,
+   "gaps": [
+    [
+     866,
+     878
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 790,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "12": {
+   "approved": [
+    296
+   ],
+   "base": 5,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 125,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "120": {
+   "approved": [
+    866
+   ],
+   "base": 117,
+   "conflicts": [
+    115,
+    128
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 790,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "121": {
+   "approved": [
+    949
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 793,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "122": {
+   "approved": [
+    833
+   ],
+   "base": 109,
+   "conflicts": [
+    127
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 796,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "123": {
+   "approved": [
+    1003
+   ],
+   "base": 81,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 798,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "124": {
+   "approved": [
+    925
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 806,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "125": {
+   "approved": [
+    917
+   ],
+   "base": 83,
+   "conflicts": [
+    129
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 808,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "126": {
+   "approved": [
+    876
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 813,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "127": {
+   "approved": [
+    880
+   ],
+   "base": 92,
+   "conflicts": [
+    122
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 819,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "128": {
+   "approved": [
+    930
+   ],
+   "base": null,
+   "conflicts": [
+    120
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 834,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "129": {
+   "approved": [
+    846
+   ],
+   "base": null,
+   "conflicts": [
+    125
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 835,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "13": {
+   "approved": [
+    306
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 131,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "130": {
+   "approved": [
+    893
+   ],
+   "base": null,
+   "conflicts": [
+    132
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 838,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "131": {
+   "approved": [
+    938
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [
+    [
+     1004,
+     1032
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 845,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "132": {
+   "approved": [
+    1040
+   ],
+   "base": null,
+   "conflicts": [
+    130
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 846,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "133": {
+   "approved": [
+    881
+   ],
+   "base": null,
+   "conflicts": [
+    137,
+    140
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 847,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "134": {
+   "approved": [
+    1010
+   ],
+   "base": null,
+   "conflicts": [
+    138
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 850,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "135": {
+   "approved": [
+    1054
+   ],
+   "base": 116,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 856,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "136": {
+   "approved": [
+    941
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 859,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "137": {
+   "approved": [
+    965
+   ],
+   "base": null,
+   "conflicts": [
+    133
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 862,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "138": {
+   "approved": [
+    881
+   ],
+   "base": 114,
+   "conflicts": [
+    134
+   ],
+   "fixed": 959,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 866,
+   "pushes": [
+    959
+   ],
+   "red": 866,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "139": {
+   "approved": [
+    1052
+   ],
+   "base": null,
+   "conflicts": [
+    143
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 870,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "14": {
+   "approved": [
+    163
+   ],
+   "base": 3,
+   "conflicts": [
+    22
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 136,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "140": {
+   "approved": [
+    987
+   ],
+   "base": null,
+   "conflicts": [
+    133
+   ],
+   "fixed": null,
+   "gaps": [
+    [
+     1077,
+     1095
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 874,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "141": {
+   "approved": [
+    1080
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 874,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "142": {
+   "approved": [
+    1013
+   ],
+   "base": 127,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 877,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "143": {
+   "approved": [
+    1009
+   ],
+   "base": null,
+   "conflicts": [
+    139
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 880,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "144": {
+   "approved": [
+    945
+   ],
+   "base": null,
+   "conflicts": [
+    151
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 883,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "145": {
+   "approved": [
+    913
+   ],
+   "base": null,
+   "conflicts": [
+    150
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 889,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "146": {
+   "approved": [
+    1033
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 895,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "147": {
+   "approved": [
+    1116
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 897,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "148": {
+   "approved": [
+    1072
+   ],
+   "base": 121,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 907,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "149": {
+   "approved": [
+    1062
+   ],
+   "base": null,
+   "conflicts": [
+    152
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 910,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "15": {
+   "approved": [
+    180
+   ],
+   "base": null,
+   "conflicts": [
+    21
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 157,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "150": {
+   "approved": [
+    1161
+   ],
+   "base": null,
+   "conflicts": [
+    145
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 923,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "151": {
+   "approved": [
+    966
+   ],
+   "base": null,
+   "conflicts": [
+    144,
+    158
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 930,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "152": {
+   "approved": [
+    1000
+   ],
+   "base": null,
+   "conflicts": [
+    149
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 935,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "153": {
+   "approved": [
+    1103
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 942,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "154": {
+   "approved": [
+    1023
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [
+    [
+     1092,
+     1116
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 951,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "155": {
+   "approved": [
+    1177
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 954,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "156": {
+   "approved": [
+    1162
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 960,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "157": {
+   "approved": [
+    1024
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [
+    [
+     1133,
+     1144
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 963,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "158": {
+   "approved": [
+    1051
+   ],
+   "base": null,
+   "conflicts": [
+    151
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 968,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "159": {
+   "approved": [
+    1182
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 975,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "16": {
+   "approved": [
+    283
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 170,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "160": {
+   "approved": [
+    993
+   ],
+   "base": 134,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [
+    [
+     1087,
+     1107
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 977,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "161": {
+   "approved": [
+    1004
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 977,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "162": {
+   "approved": [
+    1123
+   ],
+   "base": 154,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 990,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "163": {
+   "approved": [
+    1129
+   ],
+   "base": null,
+   "conflicts": [
+    165
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1002,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "164": {
+   "approved": [
+    1128
+   ],
+   "base": 130,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1003,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "165": {
+   "approved": [
+    1211
+   ],
+   "base": null,
+   "conflicts": [
+    163
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1013,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "166": {
+   "approved": [
+    1182
+   ],
+   "base": 143,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1016,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "167": {
+   "approved": [
+    1146
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1019,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "168": {
+   "approved": [
+    1246
+   ],
+   "base": 134,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [
+    [
+     1301,
+     1309
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1024,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "169": {
+   "approved": [
+    1272
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1035,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "17": {
+   "approved": [
+    365
+   ],
+   "base": 13,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 181,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "170": {
+   "approved": [
+    1051
+   ],
+   "base": null,
+   "conflicts": [
+    173
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1038,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "171": {
+   "approved": [
+    1137
+   ],
+   "base": null,
+   "conflicts": [
+    175
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1038,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "172": {
+   "approved": [
+    1129
+   ],
+   "base": 164,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1047,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "173": {
+   "approved": [
+    1202
+   ],
+   "base": null,
+   "conflicts": [
+    170
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1055,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "174": {
+   "approved": [
+    1257
+   ],
+   "base": null,
+   "conflicts": [
+    178
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1061,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "175": {
+   "approved": [
+    1076
+   ],
+   "base": null,
+   "conflicts": [
+    171,
+    177
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1065,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "176": {
+   "approved": [
+    1235
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1067,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "177": {
+   "approved": [
+    1103
+   ],
+   "base": null,
+   "conflicts": [
+    175
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1071,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "178": {
+   "approved": [
+    1127
+   ],
+   "base": null,
+   "conflicts": [
+    174
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1083,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "179": {
+   "approved": [
+    1267
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1085,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "18": {
+   "approved": [
+    399
+   ],
+   "base": null,
+   "conflicts": [
+    25
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 181,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "180": {
+   "approved": [
+    1224
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1089,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "181": {
+   "approved": [
+    1182
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1093,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "182": {
+   "approved": [
+    1194
+   ],
+   "base": null,
+   "conflicts": [
+    187
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1096,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "183": {
+   "approved": [
+    1228
+   ],
+   "base": null,
+   "conflicts": [
+    184
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1097,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "184": {
+   "approved": [
+    1182
+   ],
+   "base": null,
+   "conflicts": [
+    183
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1099,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "185": {
+   "approved": [
+    1214
+   ],
+   "base": 182,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1101,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "186": {
+   "approved": [
+    1185
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": 1223,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1107,
+   "pushes": [
+    1223
+   ],
+   "red": 1107,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "187": {
+   "approved": [
+    1293
+   ],
+   "base": null,
+   "conflicts": [
+    182
+   ],
+   "fixed": null,
+   "gaps": [
+    [
+     1328,
+     1342
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1107,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "188": {
+   "approved": [
+    1227
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1108,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "189": {
+   "approved": [
+    1178
+   ],
+   "base": null,
+   "conflicts": [
+    194
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1109,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "19": {
+   "approved": [
+    254
+   ],
+   "base": 7,
+   "conflicts": [
+    20
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 199,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "190": {
+   "approved": [
+    1123
+   ],
+   "base": 157,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1113,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "191": {
+   "approved": [
+    1268
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1123,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "192": {
+   "approved": [
+    1329
+   ],
+   "base": null,
+   "conflicts": [
+    198
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1125,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "193": {
+   "approved": [
+    1340
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1128,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "194": {
+   "approved": [
+    1313
+   ],
+   "base": null,
+   "conflicts": [
+    189
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1139,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "195": {
+   "approved": [
+    1203
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1144,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "196": {
+   "approved": [
+    1304
+   ],
+   "base": null,
+   "conflicts": [
+    202
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1144,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "197": {
+   "approved": [
+    1168
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1154,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "198": {
+   "approved": [
+    1243
+   ],
+   "base": null,
+   "conflicts": [
+    192
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1154,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "199": {
+   "approved": [
+    1361
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1155,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "2": {
+   "approved": [
+    203
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 15,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "20": {
+   "approved": [
+    351
+   ],
+   "base": null,
+   "conflicts": [
+    19
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 243,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "200": {
+   "approved": [
+    1186
+   ],
+   "base": 174,
+   "conflicts": [
+    201
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1155,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "201": {
+   "approved": [
+    1202
+   ],
+   "base": null,
+   "conflicts": [
+    200
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1163,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "202": {
+   "approved": [
+    1223
+   ],
+   "base": 172,
+   "conflicts": [
+    196
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1164,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "203": {
+   "approved": [
+    1263
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1164,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "204": {
+   "approved": [
+    1194
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1165,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "205": {
+   "approved": [
+    1375
+   ],
+   "base": 178,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1169,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "206": {
+   "approved": [
+    1411
+   ],
+   "base": null,
+   "conflicts": [
+    210
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1171,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "207": {
+   "approved": [
+    1234
+   ],
+   "base": 171,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1174,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "208": {
+   "approved": [
+    1242
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1175,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "209": {
+   "approved": [
+    1277
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1177,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "21": {
+   "approved": [
+    424
+   ],
+   "base": null,
+   "conflicts": [
+    15,
+    29
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 244,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "210": {
+   "approved": [
+    1218
+   ],
+   "base": null,
+   "conflicts": [
+    206,
+    215
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1181,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "211": {
+   "approved": [
+    1197
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1181,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "212": {
+   "approved": [
+    1349
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1185,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "213": {
+   "approved": [
+    1424
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": 1251,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1187,
+   "pushes": [
+    1251
+   ],
+   "red": 1187,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "214": {
+   "approved": [
+    1239
+   ],
+   "base": 210,
+   "conflicts": [],
+   "fixed": 1304,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1187,
+   "pushes": [
+    1304
+   ],
+   "red": 1187,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "215": {
+   "approved": [
+    1284
+   ],
+   "base": null,
+   "conflicts": [
+    210
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1189,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "216": {
+   "approved": [
+    1221
+   ],
+   "base": 184,
+   "conflicts": [
+    217
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1196,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "217": {
+   "approved": [
+    1365
+   ],
+   "base": null,
+   "conflicts": [
+    216
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1197,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "218": {
+   "approved": [
+    1247
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1198,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "219": {
+   "approved": [
+    1307
+   ],
+   "base": 181,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1200,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "22": {
+   "approved": [
+    391
+   ],
+   "base": null,
+   "conflicts": [
+    14
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 247,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "220": {
+   "approved": [
+    1238
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1210,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "221": {
+   "approved": [
+    1377
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1219,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "222": {
+   "approved": [
+    1412
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": 1272,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1227,
+   "pushes": [
+    1272
+   ],
+   "red": 1227,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "223": {
+   "approved": [
+    1397
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1236,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "224": {
+   "approved": [
+    1280
+   ],
+   "base": null,
+   "conflicts": [
+    225
+   ],
+   "fixed": null,
+   "gaps": [
+    [
+     1396,
+     1416
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1250,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "225": {
+   "approved": [
+    1329
+   ],
+   "base": null,
+   "conflicts": [
+    224,
+    229
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1253,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "226": {
+   "approved": [
+    1439
+   ],
+   "base": 197,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1268,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "227": {
+   "approved": [
+    1369
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1286,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "228": {
+   "approved": [
+    1407
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1298,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "229": {
+   "approved": [
+    1429
+   ],
+   "base": null,
+   "conflicts": [
+    225
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1314,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "23": {
+   "approved": [
+    286
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 248,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "230": {
+   "approved": [
+    1439
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1316,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "231": {
+   "approved": [
+    1439
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1324,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "232": {
+   "approved": [
+    1405
+   ],
+   "base": null,
+   "conflicts": [
+    233
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1331,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "233": {
+   "approved": [
+    1439
+   ],
+   "base": null,
+   "conflicts": [
+    232
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1357,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "234": {
+   "approved": [
+    1439
+   ],
+   "base": null,
+   "conflicts": [
+    237
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1367,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "235": {
+   "approved": [
+    1439
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1376,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "236": {
+   "approved": [
+    1438
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1384,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "237": {
+   "approved": [
+    1439
+   ],
+   "base": 223,
+   "conflicts": [
+    234
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1404,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "238": {
+   "approved": [
+    1439
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1412,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "239": {
+   "approved": [
+    1439
+   ],
+   "base": 228,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1421,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "24": {
+   "approved": [
+    350
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 248,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "240": {
+   "approved": [
+    1439
+   ],
+   "base": 239,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 1439,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "25": {
+   "approved": [
+    440
+   ],
+   "base": 22,
+   "conflicts": [
+    18
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 253,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "26": {
+   "approved": [
+    470
+   ],
+   "base": 7,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 254,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "27": {
+   "approved": [
+    370
+   ],
+   "base": 10,
+   "conflicts": [
+    31
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 256,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "28": {
+   "approved": [
+    435
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 259,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "29": {
+   "approved": [
+    340
+   ],
+   "base": null,
+   "conflicts": [
+    21
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 265,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "3": {
+   "approved": [
+    230
+   ],
+   "base": 2,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [
+    [
+     339,
+     366
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 36,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "30": {
+   "approved": [
+    515
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [
+    [
+     587,
+     604
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 305,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "31": {
+   "approved": [
+    480
+   ],
+   "base": 14,
+   "conflicts": [
+    27
+   ],
+   "fixed": null,
+   "gaps": [
+    [
+     487,
+     503
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 308,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "32": {
+   "approved": [
+    433
+   ],
+   "base": 27,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 319,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "33": {
+   "approved": [
+    392
+   ],
+   "base": 23,
+   "conflicts": [
+    36
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 321,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "34": {
+   "approved": [
+    524
+   ],
+   "base": null,
+   "conflicts": [
+    35
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 328,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "35": {
+   "approved": [
+    363
+   ],
+   "base": null,
+   "conflicts": [
+    34,
+    37
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 346,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "36": {
+   "approved": [
+    373
+   ],
+   "base": 30,
+   "conflicts": [
+    33,
+    43
+   ],
+   "fixed": 438,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 363,
+   "pushes": [
+    438
+   ],
+   "red": 363,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "37": {
+   "approved": [
+    475
+   ],
+   "base": 36,
+   "conflicts": [
+    35,
+    39
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 381,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "38": {
+   "approved": [
+    478
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 390,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "39": {
+   "approved": [
+    554
+   ],
+   "base": null,
+   "conflicts": [
+    37,
+    44
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 404,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "4": {
+   "approved": [
+    216
+   ],
+   "base": null,
+   "conflicts": [
+    6
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 41,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "40": {
+   "approved": [
+    558
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 407,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "41": {
+   "approved": [
+    664
+   ],
+   "base": 37,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 444,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "42": {
+   "approved": [
+    636
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 445,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "43": {
+   "approved": [
+    669
+   ],
+   "base": null,
+   "conflicts": [
+    36
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 454,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "44": {
+   "approved": [
+    563
+   ],
+   "base": 32,
+   "conflicts": [
+    39
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 459,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "45": {
+   "approved": [
+    699
+   ],
+   "base": null,
+   "conflicts": [
+    48
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 479,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "46": {
+   "approved": [
+    549
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 481,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "47": {
+   "approved": [
+    719
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 483,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "48": {
+   "approved": [
+    518
+   ],
+   "base": 46,
+   "conflicts": [
+    45
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 483,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "49": {
+   "approved": [
+    660
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 486,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "5": {
+   "approved": [
+    130
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 73,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "50": {
+   "approved": [
+    649
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 487,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "51": {
+   "approved": [
+    547
+   ],
+   "base": null,
+   "conflicts": [
+    55
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 488,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "52": {
+   "approved": [
+    552
+   ],
+   "base": 48,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 488,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "53": {
+   "approved": [
+    690
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 489,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "54": {
+   "approved": [
+    612
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 495,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "55": {
+   "approved": [
+    668
+   ],
+   "base": null,
+   "conflicts": [
+    51
+   ],
+   "fixed": null,
+   "gaps": [
+    [
+     756,
+     768
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 508,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "56": {
+   "approved": [
+    656
+   ],
+   "base": 44,
+   "conflicts": [
+    58
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 514,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "57": {
+   "approved": [
+    577
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 517,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "58": {
+   "approved": [
+    733
+   ],
+   "base": null,
+   "conflicts": [
+    56
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 528,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "59": {
+   "approved": [
+    659
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 531,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "6": {
+   "approved": [
+    120
+   ],
+   "base": null,
+   "conflicts": [
+    4
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 87,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "60": {
+   "approved": [
+    637
+   ],
+   "base": null,
+   "conflicts": [
+    62,
+    64
+   ],
+   "fixed": null,
+   "gaps": [
+    [
+     657,
+     675
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 536,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "61": {
+   "approved": [
+    689
+   ],
+   "base": 59,
+   "conflicts": [
+    66
+   ],
+   "fixed": 660,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 542,
+   "pushes": [
+    660
+   ],
+   "red": 542,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "62": {
+   "approved": [
+    648
+   ],
+   "base": null,
+   "conflicts": [
+    60
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 546,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "63": {
+   "approved": [
+    696
+   ],
+   "base": null,
+   "conflicts": [
+    65,
+    68
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 547,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "64": {
+   "approved": [
+    567
+   ],
+   "base": null,
+   "conflicts": [
+    60
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 550,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "65": {
+   "approved": [
+    755
+   ],
+   "base": null,
+   "conflicts": [
+    63
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 551,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "66": {
+   "approved": [
+    685
+   ],
+   "base": null,
+   "conflicts": [
+    61
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 551,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "67": {
+   "approved": [
+    717
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [
+    [
+     738,
+     763
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 553,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "68": {
+   "approved": [
+    590
+   ],
+   "base": null,
+   "conflicts": [
+    63
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 554,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "69": {
+   "approved": [
+    645
+   ],
+   "base": 38,
+   "conflicts": [
+    70
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 555,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "7": {
+   "approved": [
+    274
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [
+    [
+     353,
+     376
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 92,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "70": {
+   "approved": [
+    646
+   ],
+   "base": null,
+   "conflicts": [
+    69
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 555,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "71": {
+   "approved": [
+    741
+   ],
+   "base": 38,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 560,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "72": {
+   "approved": [
+    669
+   ],
+   "base": 51,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 571,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "73": {
+   "approved": [
+    674
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 583,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "74": {
+   "approved": [
+    652
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 591,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "75": {
+   "approved": [
+    679
+   ],
+   "base": null,
+   "conflicts": [
+    76
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 597,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "76": {
+   "approved": [
+    659
+   ],
+   "base": 74,
+   "conflicts": [
+    75
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 605,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "77": {
+   "approved": [
+    788
+   ],
+   "base": 55,
+   "conflicts": [
+    83
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 613,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "78": {
+   "approved": [
+    661
+   ],
+   "base": 76,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 614,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "79": {
+   "approved": [
+    697
+   ],
+   "base": 45,
+   "conflicts": [
+    80
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 616,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "8": {
+   "approved": [
+    236
+   ],
+   "base": null,
+   "conflicts": [
+    1
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 101,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "80": {
+   "approved": [
+    631
+   ],
+   "base": null,
+   "conflicts": [
+    79
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 620,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "81": {
+   "approved": [
+    812
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 622,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "82": {
+   "approved": [
+    781
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 634,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "83": {
+   "approved": [
+    867
+   ],
+   "base": null,
+   "conflicts": [
+    77,
+    85
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 640,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "84": {
+   "approved": [
+    806
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [
+    [
+     911,
+     935
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 642,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "85": {
+   "approved": [
+    799
+   ],
+   "base": null,
+   "conflicts": [
+    83
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 644,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "86": {
+   "approved": [
+    807
+   ],
+   "base": 63,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 644,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "87": {
+   "approved": [
+    841
+   ],
+   "base": null,
+   "conflicts": [
+    94
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 646,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "88": {
+   "approved": [
+    790
+   ],
+   "base": 87,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 652,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "89": {
+   "approved": [
+    763
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 668,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "9": {
+   "approved": [
+    176
+   ],
+   "base": 8,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 102,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "90": {
+   "approved": [
+    789
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 671,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "91": {
+   "approved": [
+    821
+   ],
+   "base": 74,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 680,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "92": {
+   "approved": [
+    769
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 683,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "93": {
+   "approved": [
+    786
+   ],
+   "base": 70,
+   "conflicts": [
+    94
+   ],
+   "fixed": null,
+   "gaps": [
+    [
+     827,
+     839
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 694,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "94": {
+   "approved": [
+    712
+   ],
+   "base": 84,
+   "conflicts": [
+    87,
+    93
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 695,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "95": {
+   "approved": [
+    760
+   ],
+   "base": null,
+   "conflicts": [
+    100
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 696,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "96": {
+   "approved": [
+    781
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 698,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "97": {
+   "approved": [
+    834
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 699,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "98": {
+   "approved": [
+    887
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 709,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "99": {
+   "approved": [
+    917
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": 790,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 717,
+   "pushes": [
+    790
+   ],
+   "red": 717,
+   "run_minutes": 20.0,
+   "urgent": false
+  }
+ },
+ "real": {
+  "background_runs": 0,
+  "head_runs": 0,
+  "main_runs": 0,
+  "merges": [],
+  "stopped_runs": 0,
+  "top_runs": 0
+ },
+ "resolve_minutes": 30.0,
+ "run_minutes": {
+  "head": 20.0,
+  "top": 21.0
+ },
+ "slots": 5,
+ "start": "2026-01-05T00:00:00Z",
+ "version": 1
+}

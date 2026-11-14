@@ -210,3 +210,40 @@ row. The result is the same, which a test checks. Most of the time
 left is the Merger's own git calls, about two hundred a tick with two
 hundred pull requests, so a busy day (about 200 pull
 requests, 1,440 minutes) takes six to eight minutes on one core.
+
+## Comparing two versions on the library's days
+
+A change to which pull request the Merger takes next, or to what the
+build check runs first, is judged on the same days as every other such
+change (the rule is in CLAUDE.md):
+
+    make replay-compare BEFORE=origin/main AFTER=.
+    python3 -m tests.merger_compare --before REF --after REF \
+        [--day KIND|TRACE ...] [--config FILE] [--set K=V ...] \
+        [--approve-after-green MINUTES] [--fix-after-red MINUTES]
+
+Each version is checked out in a temporary git worktree (`.` is the
+working tree as it is) and replays each day with the same settings and
+the same `PYTHONHASHSEED`. A replay is the same every time it runs: the
+simulation dates every commit with one fixed date, not the clock, so no
+SHA, and no order that follows one, changes from run to run (#413). A
+version from before that may vary a little between runs. The output is a
+Markdown table to paste into the pull request: merges, approval to merge
+(median and p90), hand-backs, build runs a merge, red train tops and
+rule breaks, before and after, for each day. A figure an older version
+doesn't report shows as `-`.
+
+The days are the library's, `tests/days/*.json`, made by
+`tests/merger_days.py` from a seed and a few figures, so they hold no
+project's pull requests, names or times:
+
+- `ordinary`: a working day, about 120 pull requests on 5 slots;
+- `heavy`: twice the arrivals on the same slots, so the queue fills;
+- `bad`: an ordinary day with three times the reds, the conflicts and
+  the pushes after approval;
+- `smoke`: three hours and a dozen pull requests, small enough for the
+  test suite, which replays it.
+
+They have no reality to compare with: the table compares the versions.
+A project's own recorded day (`tests/merger_trace.py`) can be passed
+as `--day FILE` too, kept where the project keeps its own data.

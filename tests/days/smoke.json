@@ -1,0 +1,268 @@
+{
+ "background": [
+  {
+   "at": 0,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 45,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 90,
+   "main": true,
+   "minutes": 20.0
+  },
+  {
+   "at": 135,
+   "main": true,
+   "minutes": 20.0
+  }
+ ],
+ "inferred": [
+  "a made-up smoke day (tests/merger_days.py)"
+ ],
+ "mac_minutes": 25,
+ "minutes": 180,
+ "prs": {
+  "1": {
+   "approved": [
+    41
+   ],
+   "base": null,
+   "conflicts": [
+    6
+   ],
+   "fixed": null,
+   "gaps": [
+    [
+     97,
+     120
+    ]
+   ],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 16,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "10": {
+   "approved": [
+    136
+   ],
+   "base": null,
+   "conflicts": [
+    12
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 126,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "11": {
+   "approved": [
+    169
+   ],
+   "base": null,
+   "conflicts": [
+    3
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 145,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "12": {
+   "approved": [
+    179
+   ],
+   "base": null,
+   "conflicts": [
+    10
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 166,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "2": {
+   "approved": [
+    41
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 24,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "3": {
+   "approved": [
+    46
+   ],
+   "base": null,
+   "conflicts": [
+    11
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 30,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "4": {
+   "approved": [
+    51
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 34,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "5": {
+   "approved": [
+    83
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 53,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "6": {
+   "approved": [
+    88
+   ],
+   "base": null,
+   "conflicts": [
+    1
+   ],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 65,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "7": {
+   "approved": [
+    119
+   ],
+   "base": null,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 97,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "8": {
+   "approved": [
+    136
+   ],
+   "base": 5,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 115,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  },
+  "9": {
+   "approved": [
+    145
+   ],
+   "base": 6,
+   "conflicts": [],
+   "fixed": null,
+   "gaps": [],
+   "handed_back": [],
+   "mac": false,
+   "merged": null,
+   "opened": 120,
+   "pushes": [],
+   "red": null,
+   "run_minutes": 20.0,
+   "urgent": false
+  }
+ },
+ "real": {
+  "background_runs": 0,
+  "head_runs": 0,
+  "main_runs": 0,
+  "merges": [],
+  "stopped_runs": 0,
+  "top_runs": 0
+ },
+ "resolve_minutes": 30.0,
+ "run_minutes": {
+  "head": 20.0,
+  "top": 21.0
+ },
+ "slots": 2,
+ "start": "2026-01-05T00:00:00Z",
+ "version": 1
+}
