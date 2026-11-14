@@ -141,9 +141,21 @@ def project(merge=None, **ahead):
     return config.Project(data, None)
 
 
+# Every commit the simulation makes is dated this, not by the wall
+# clock, so its SHA is the same each time a day is replayed (#413). It
+# is one date for all, as the wall clock's nearly was: the simulation
+# runs many simulated minutes in a wall-clock second, so a commit made
+# again on a later tick kept its SHA, as the Merger's own predictions
+# do (AHEAD_DATE), and the simulation's results rest on that. It is
+# after the simulated day, as the wall clock's dates were.
+GIT_DATE = "@%d +0000" % int(datetime.datetime(
+    2026, 11, 14, tzinfo=datetime.timezone.utc).timestamp())
+
+
 def git_env():
     return dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
                 GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t",
+                GIT_AUTHOR_DATE=GIT_DATE, GIT_COMMITTER_DATE=GIT_DATE,
                 GIT_CONFIG_NOSYSTEM="1",
                 GIT_CONFIG_GLOBAL=os.devnull)
 
@@ -410,8 +422,12 @@ class World:
         import random
         self.resolver = (random.Random(seed), author, reviewer)
 
+    # The Merger's comments on pull requests: its hand-backs.
+    hand_backs = 0
+
     def handed_back(self, number, body):
         """The Merger commented `body` on #`number`."""
+        self.hand_backs += 1
         if self.resolver is None or number not in self.prs:
             return
         rng, author, reviewer = self.resolver

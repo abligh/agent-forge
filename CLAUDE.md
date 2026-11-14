@@ -35,6 +35,13 @@ setup and [docs/tools/](docs/tools/) each tool's reference.
   so a reviewer does.
 * **No tool merges or approves on its own judgment.** The Merger merges
   what reviewers approved, and nothing else does either.
+* **A change to the order carries a replay.** A pull request that
+  changes which pull request the Merger takes next, or what the build
+  check runs first, includes `make replay-compare BEFORE=origin/main
+  AFTER=.`'s table: the library's days replayed before and after it
+  (docs/merger-sim.md). A reviewer refuses one without it. A fix of a
+  fault (a rule that didn't do what it says) is not a new order and
+  needs none.
 
 ## Running the checks
 
