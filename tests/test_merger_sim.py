@@ -230,6 +230,31 @@ class LeftTop(unittest.TestCase):
                             for l in got.lines), "\n".join(got.lines))
 
 
+class TailKeepsItsPlace(unittest.TestCase):
+    """designs/0056, item 2: with live trains, the members after one
+    that leaves a started train keep their place; a newcomer approved
+    meanwhile goes behind them."""
+
+    def test_the_tail_merges_before_a_newcomer(self):
+        m = ms.load_merger()
+        m.configure(ms.project({"own_head_green": False}, batch=5,
+                               batches=1, train_merge=True))
+        scenario = [(0, "open", (n,)) for n in (1, 2, 3, 4, 5)] + [
+            (5, "push", (2,)), (5, "open", (6,)), (7, "review", (2,))]
+        with tempfile.TemporaryDirectory() as root:
+            sim = ms.Sim(m, root, scenario, own_minutes=40, later_first=1,
+                         stop_spent=True)
+            got = sim.run(240)
+            merged = [x["pr"] for x in sim.world.merges]
+        self.assertEqual(got.broken, [], figures(got))
+        self.assertTrue(any("TRAIN-LEFT #2" in l for l in got.lines),
+                        "\n".join(got.lines))
+        self.assertIn(6, merged, "\n".join(got.lines))
+        for n in (1, 3, 4, 5):
+            self.assertLess(merged.index(n), merged.index(6),
+                            "\n".join(got.lines))
+
+
 class Rules(unittest.TestCase):
     """The monitor itself: a break it should see, it sees."""
 
