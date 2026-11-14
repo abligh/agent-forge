@@ -150,6 +150,24 @@ class Replay(unittest.TestCase):
         self.assertEqual(got["dropped"], [])
         self.assertGreaterEqual(got["background_runs"], 1)
 
+    def test_the_day_replayed_with_train_merge(self):
+        # #391: a train merges as one pull request in a replay too.
+        t = trace_of_day()
+        seen = {}
+        got = mr.replay(t, {"merge": {"own_head_green": False,
+                                      "test_ahead": {
+            "batch": 4, "batches": 2, "trains": "live", "stacks": True,
+            "stop_spent": True, "later_first": 1, "train_merge": True}},
+            "checks": {"max_wait_minutes": 30}}, idle=5,
+            inspect=lambda sim: seen.update(trains=dict(sim.github.trains)))
+        self.assertEqual(got["broken"], [])
+        self.assertEqual(got["merged"], 5, got)
+        # This morning's pull requests come one at a time, so its trains
+        # are short, but each of the five went in through one.
+        merged = sorted(n for tr in seen["trains"].values()
+                        if tr["state"] == "MERGED" for n in tr["members"])
+        self.assertEqual(merged, [1, 2, 3, 4, 5], seen["trains"])
+
     def test_settings_left_out_are_said(self):
         merge, checks, dropped = mr.settings(
             {"merge": {"code_owners": True, "test_ahead": {"batch": 2}},
