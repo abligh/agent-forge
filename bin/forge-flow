@@ -88,7 +88,12 @@ trains: an engine, then each carriage, a base and the stacked layers
 boarding with it, a box) and the stacks now (the last Merger record's
 `stacked on #N` holds, each a tree rooted at its base, with where the
 base waits and a status dot for each layer: green can merge, orange
-testing underway, red cannot merge). Pull requests the Merger puts
+testing underway, red cannot merge; a pull request not approved yet
+whose own head waits in the build check's queue or runs there is
+orange, with its place). Then the build check's queue now
+(pr-check/state.json's `waiting`): what runs, and what waits in the
+order the build check takes it, from forge-pr-check's own next_head
+(oldest first without a configuration). Pull requests the Merger puts
 first are marked urgent (labels.urgent) or elevated (a red nightly's
 or default branch's fix, from nightly/nightly.json and
 pr-check/state.json, or right of way).
@@ -527,6 +532,127 @@ def carriages_of(entries, below):
     return [[e["pr"] for e in car] for car in out]
 
 
+def _since(entry):
+    return str(entry.get("since") or "")
+
+
+def check_queue(state_dir, now, project=None, checkout=None):
+    """The build check's queue now, from pr-check/state.json: what is
+    running (`running`), what waits in the order its next ticks take it
+    (`queue`), what it holds (`held`, with why) and what it gave up on
+    (`given_up`). The order is forge-pr-check's own next_head, configured
+    from `project`, with the Merger's first pull request, blocked ones
+    and resolve slots as it reads them; without a configuration, or if
+    that fails, oldest first (`ordered_by` says which). The Merger's
+    predictions, which take slots before most heads, are not in it.
+    Each entry: pr (0 for the default branch), sha, since, waited
+    (minutes), approved, urgent, held, scoped (its slow steps)."""
+    state = load_json(os.path.join(state_dir, "pr-check", "state.json"),
+                      {}) or {}
+    waiting = state.get("waiting")
+    if not isinstance(waiting, dict):
+        waiting = {}
+    waiting = {s: w for s, w in waiting.items() if isinstance(w, dict)}
+
+    def item(sha):
+        w = waiting[sha]
+        try:
+            waited = round((now - parse_time(w["since"])).total_seconds()
+                           / 60)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            waited = None
+        return {"pr": w.get("pr") or 0, "sha": sha[:10],
+                "since": w.get("since"), "waited": waited,
+                "started": w.get("started"),
+                "approved": bool(w.get("approved")),
+                "urgent": bool(w.get("urgent")),
+                "author": w.get("author"),
+                "held": w.get("held"),
+                "scoped": list(w.get("lane_scoped") or [])}
+    running = [s for s, w in waiting.items() if w.get("started")]
+    gave_up = [s for s, w in waiting.items() if not w.get("started") and (
+        w.get("errors", 0) >= 3 or w.get("faults", 0) >= 3)]
+    held = [s for s, w in waiting.items() if w.get("held")
+            and s not in running and s not in gave_up]
+    rest = [s for s in waiting if s not in running and s not in gave_up
+            and s not in held]
+    ordered, by = None, "oldest first"
+    if project is not None and rest:
+        try:
+            ordered = _check_order(waiting, rest, now, project, state_dir,
+                                   checkout)
+            by = "the build check's own order"
+        except Exception:  # noqa: BLE001 - the page falls back, not fails
+            ordered = None
+    if ordered is None:
+        ordered = sorted(rest, key=lambda s: (
+            waiting[s].get("errors", 0), not waiting[s].get("urgent"),
+            bool(waiting[s].get("main")), _since(waiting[s]), s))
+    return {"at": stamp(now), "ordered_by": by,
+            "running": [item(s) for s in sorted(
+                running, key=lambda s: str(waiting[s].get("started")))],
+            "queue": [item(s) for s in ordered],
+            "held": [item(s) for s in sorted(held, key=lambda s: _since(
+                waiting[s]))],
+            "given_up": [item(s) for s in gave_up]}
+
+
+def _check_order(waiting, rest, now, project, state_dir, checkout):
+    """`rest` in the order forge-pr-check's next_head picks them, one
+    pick after another as if each started."""
+    pc = _load_tool("forge-pr-check")
+    pc.configure(project)
+    merger_dir = os.path.join(state_dir, "merger")
+    first_pr = pc.merger_first(merger_dir, now)
+    blocked = pc.merger_blocked(merger_dir, now)
+    unblocks = pc.merger_unblocks(merger_dir, now) \
+        if hasattr(pc, "merger_unblocks") else set()
+    slotted, slot_queued = pc.merger_resolutions(merger_dir, now) \
+        if hasattr(pc, "merger_resolutions") else (set(), set())
+    try:
+        predicted = {e["pr"] for e in pc.merger_ahead(merger_dir, now,
+                                                       checkout)}
+    except Exception:  # noqa: BLE001 - only an ordering hint
+        predicted = set()
+    state = {"waiting": {s: dict(waiting[s]) for s in rest}}
+    for w in state["waiting"].values():
+        w.pop("started", None)
+    taken, out = set(slot_queued), []
+    while True:
+        pick = pc.next_head(state, taken, first_pr, now, (), False,
+                            blocked, predicted, unblocks, slotted)
+        if pick is None:
+            break
+        out.append(pick[0])
+        taken.add(pick[0])
+    out += [s for s in rest if s not in out]
+    return out
+
+
+
+def covered_by_trains(queue, trains):
+    """`queue` (check_queue) with the heads of pull requests in a train
+    the Merger cut moved from `queue` to `held`: the build check holds
+    such a head while its train's top is checked for it (designs/0032),
+    but doesn't keep that hold in state.json."""
+    where = {}
+    for t in trains or ():
+        if t.get("train") is None:
+            continue
+        for pr in t.get("prs") or ():
+            where.setdefault(pr, t)
+    keep = []
+    for i in queue.get("queue") or []:
+        t = where.get(i["pr"])
+        if t is None:
+            keep.append(i)
+            continue
+        i = dict(i, held="in train %d (%s): its top's run is checked "
+                 "for it" % (t["train"], t.get("state")))
+        queue.setdefault("held", []).append(i)
+    queue["queue"] = keep
+    return queue
+
 class Flow:
     """Every record, parsed once and indexed by time."""
 
@@ -534,6 +660,8 @@ class Flow:
                  approvals=None, labelled=None):
         self.now = now
         self.state_dir = state_dir
+        # The build check's queue (check_queue), when main() read it.
+        self.queue = None
         # The open pull requests carrying labels.urgent, from GitHub
         # (--github), or None to infer them from ahead.json.
         self.labelled = labelled
@@ -990,6 +1118,9 @@ class Flow:
                 where = "back with the author"
             elif root in (last.get("queue") or ()):
                 where = "in the queue"
+            elif self.check_place(root) is not None:
+                where = "not approved yet; its own check: %s" \
+                    % self.check_place(root)
             else:
                 where = "not a candidate (not approved, its own check " \
                         "not green, or not open)"
@@ -1209,6 +1340,21 @@ class Flow:
                            if heads.get(n) == b[0]}
         return self._backs.get(pr)
 
+    def check_place(self, pr):
+        """Where `pr`'s head is in the build check's queue (check_queue):
+        "running", "Nth of M waiting", "held: why", or None."""
+        q = self.queue or {}
+        if any(i["pr"] == pr for i in q.get("running") or ()):
+            return "running"
+        waiting = q.get("queue") or []
+        for n, i in enumerate(waiting, 1):
+            if i["pr"] == pr:
+                return "%s of %d waiting" % (ordinal(n), len(waiting))
+        for i in q.get("held") or ():
+            if i["pr"] == pr:
+                return "held: %s" % i["held"]
+        return None
+
     def status(self, pr, trains=None, snap=None):
         """(colour, why) for `pr` at the last tick, for a stack's status
         dot: green, it can merge (eligible, or a layer whose own check
@@ -1263,6 +1409,12 @@ class Flow:
             if own == "running":
                 return ORANGE, "eligible, its own check running"
             return GREEN, "eligible: in the Merger's queue"
+        place = self.check_place(pr)
+        if place is not None:
+            return ORANGE, ("not approved yet: its own check is %s in the "
+                            "build check's queue" % place
+                            if place != "running" else
+                            "not approved yet: its own check is running")
         return RED, ("not a candidate (not approved, its own check not "
                      "green, or not open)")
 
@@ -1853,6 +2005,13 @@ minmax(200px,1fr));gap:10px;margin:0 0 10px}
 .tile .l{color:var(--ink2);font-size:13px}
 .now{font-size:14px}.now b{font-variant-numeric:tabular-nums}
 """
+
+
+def ordinal(n):
+    """1st, 2nd, 3rd, 4th, ..., 11th, 12th, 13th, 21st."""
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd",
+                                                3: "rd"}.get(n % 10, "th")
+    return "%d%s" % (n, suffix)
 
 
 def esc(value):
@@ -2541,6 +2700,54 @@ def singles_html(data):
                 for o in singles)))
 
 
+def queue_html(data):
+    """The build check's queue now, in the order it starts heads."""
+    q = data.get("check_queue")
+    if not q:
+        return ""
+
+    def who(i):
+        return "default branch" if not i["pr"] else pr_link(data, i["pr"])
+
+    def waited(i):
+        return minutes_text(i["waited"]) if i.get("waited") is not None \
+            else "-"
+
+    def notes(i):
+        bits = []
+        if i.get("approved"):
+            bits.append("approved")
+        if i.get("urgent"):
+            bits.append("urgent")
+        if i.get("scoped"):
+            bits.append("slow steps: " + ", ".join(i["scoped"]))
+        return esc("; ".join(bits))
+    rows = [[str(n), who(i), esc(i["sha"]), waited(i), notes(i)]
+            for n, i in enumerate(q.get("queue") or [], 1)]
+    running = ", ".join("%s (%s)" % (who(i), esc(i["sha"]))
+                        for i in q.get("running") or []) or "none"
+    held = "".join("<li>%s %s: %s</li>" % (who(i), esc(i["sha"]),
+                                          esc(i.get("held")))
+                   for i in q.get("held") or [])
+    gone = ", ".join(who(i) for i in q.get("given_up") or [])
+    return ("<section><h2>Build check queue</h2><p class=\"now\">"
+            "<b>%d</b> heads waiting, <b>%d</b> running: %s.</p>%s%s%s"
+            "<p class=\"note\">From pr-check/state.json at %s, in %s: "
+            "the next free slot takes the first that isn't running. The "
+            "Merger's predictions (train tops) and the default branch's "
+            "runs aren't pull requests' heads and often go first, so a "
+            "slot can go to one of them instead. <i>Waited</i> is since "
+            "this head was queued. A head pushed over leaves the queue, "
+            "and its new head joins at the back.</p></section>"
+            % (len(rows), len(q.get("running") or []), running,
+               table(["#", "pull request", "head", "waited", "notes"], rows)
+               if rows else "<p class=\"note\">Nothing waiting.</p>",
+               "<details><summary>Held (%d)</summary><ul>%s</ul></details>"
+               % (len(q.get("held") or []), held) if held else "",
+               "<p class=\"note\">Given up on: %s</p>" % gone if gone
+               else "", esc(q.get("at")), esc(q.get("ordered_by"))))
+
+
 def stacks_html(data):
     stacks = data.get("stacks") or []
     if not stacks:
@@ -2664,6 +2871,7 @@ def page(data):
                         [[esc(a), esc(b)] for a, b in where])))
     out.append(recent_html(data))
     out.append(trains_html(data))
+    out.append(queue_html(data))
     out.append(stacks_html(data))
     # 3. Efficiency.
 
@@ -2838,6 +3046,7 @@ def compute(flow, project_name, repo=None, recent=RECENT_TRAINS):
             "trains": flow.trains(), "ahead_at": flow.ahead.get("at"),
             "recent_trains": flow.recent_trains(recent),
             "priority": flow.priorities(),
+            "check_queue": flow.queue,
             "repo": repo}
 
 
@@ -2909,6 +3118,9 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
             except (RuntimeError, github.MintError, OSError) as error:
                 err("%s: urgent labels inferred, not read: %s"
                     % (PROG, error))
+    flow.queue = covered_by_trains(check_queue(
+        state_dir, now, project, os.path.expanduser(args.checkout)
+        if args.checkout else None), flow.trains())
     data = compute(flow, name, project.repo if project else None,
                    args.recent_trains)
     write(os.path.join(args.out, "flow.json"),
