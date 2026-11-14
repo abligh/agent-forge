@@ -30,6 +30,9 @@ defaults to the last `--hours` (24) up to now.
   run's total over its steps, and each step's, for the runs that
   finished in the window. The default branch's runs are the steady
   series: a pull request's run may test only what it changed;
+- the CPU time of every run that finished in the window, of every kind
+  (`cpu_all`: CPU-seconds and runs, from the same `step_cpu`); a run
+  stopped before its verdict records none, so it isn't counted;
 - the scoped steps' time (`scoped_seconds`, designs/0048): on how many
   runs that finished in the window they ran, and how long they took
   there, together on each run and in all. Shown only when some did.
@@ -618,6 +621,30 @@ def main_cpu_stats(results, since, until):
             "steps": {k: summary(v) for k, v in sorted(steps.items())}}
 
 
+def all_cpu_stats(results, since, until):
+    """{"seconds": total, "runs": n}: the CPU seconds over all steps of
+    every run that finished in the window, of every kind, from the
+    check's `results`. A run without `step_cpu` is left out."""
+    seconds, runs = 0.0, 0
+    for result in (results or {}).values():
+        if not isinstance(result, dict):
+            continue
+        cpu = result.get("step_cpu")
+        if not isinstance(cpu, dict) or not cpu:
+            continue
+        try:
+            when = parse_time(result["finished"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if not since <= when < until:
+            continue
+        seconds += sum(v for v in cpu.values()
+                       if isinstance(v, (int, float))
+                       and not isinstance(v, bool))
+        runs += 1
+    return {"seconds": round(seconds, 2), "runs": runs}
+
+
 def scoped_stats(results, since, until):
     """{"runs": summary, "seconds": total} of the scoped steps' time
     (designs/0048: each verdict's `scoped_seconds`) over the runs that
@@ -742,6 +769,12 @@ def report(name, since, until, check, queue, approval, authors,
                         check["busy_seconds"] / 3600))
     if check.get("main_cpu") is not None:
         lines.append(cpu_text(check["main_cpu"]))
+    if check.get("cpu_all") is not None and check["cpu_all"]["runs"]:
+        lines.append("  every run's CPU: %.1f CPU-hours in %d runs%s" % (
+            check["cpu_all"]["seconds"] / 3600, check["cpu_all"]["runs"],
+            "; %.1f CPU-hours a merge" % (
+                check["cpu_all"]["seconds"] / 3600 / queue["merges"])
+            if queue.get("merges") else ""))
     if check.get("scoped") is not None and scoped_text(check["scoped"]):
         lines.append(scoped_text(check["scoped"]))
     lines += ["", "Merge queue"]
@@ -845,6 +878,7 @@ def main(argv=None, out=print, environ=None, now=None,
     check = check_stats(verdicts, since, until, slots)
     results = read_results(pr_dir)
     check["main_cpu"] = main_cpu_stats(results, since, until)
+    check["cpu_all"] = all_cpu_stats(results, since, until)
     check["scoped"] = scoped_stats(results, since, until)
     queue = queue_stats(records, since, until)
     approval, authors = None, {}

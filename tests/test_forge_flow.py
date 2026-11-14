@@ -539,6 +539,9 @@ class Presence(Base):
         self.assertEqual(watch["reviewer_busy"], (75.0, 1))
         self.assertEqual(watch["hand_backs_per_merge"], (1.0, 2))
         self.assertEqual(watch["prs_per_slot"], (2.0, 1))
+        got = flow.figures(T("2026-11-04T10:00:00Z"), NOW)
+        self.assertEqual(watch["runs_per_merge"],
+                         (got["runs_per_merge"], got["merges"]))
 
 
 class Snapshot(Base):
