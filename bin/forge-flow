@@ -68,7 +68,10 @@ target about 2).
    each merged pull request instead, kept in `approvals.json` in
    `--out` so each is asked once. A graph of both each hour.
 6. Capacity: slot-hours by what they went on, against the slots times
-   the window; the median wait for a slot and run time; how busy each
+   the window; the CPU the build check used (pr-check/state.json's
+   step_cpu, as CPUs busy on average) against the host's physical cores
+   and logical CPUs, and CPU per head run, each window and each of the
+   last 7 days; the median wait for a slot and run time; how busy each
    agent was, reviewers first. Graphs of the run time of heads and of
    batch runs, mean and median, in 6-hour buckets over 7 days.
 7. Policy: who holds right of way and since when, the share of the
@@ -125,6 +128,7 @@ import json
 import math
 import os
 import re
+import statistics
 import sys
 import urllib.parse
 
@@ -653,6 +657,53 @@ def covered_by_trains(queue, trains):
     queue["queue"] = keep
     return queue
 
+
+def read_cpu_runs(state_dir):
+    """[(start, CPU-seconds, kind)] of the build check's runs, from
+    pr-check/state.json's results, oldest first. kind: "head" for a pull
+    request's head, "ahead" for a Merger prediction, "main" for the
+    default branch. A result without step_cpu is left out."""
+    got = load_json(os.path.join(state_dir, "pr-check", "state.json"), {})
+    results = (got or {}).get("results") if isinstance(got, dict) else None
+    out = []
+    for entry in (results or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        cpu = entry.get("step_cpu")
+        if not isinstance(cpu, dict) or not cpu:
+            continue
+        try:
+            at = parse_time(entry["started"])
+            total = sum(float(v) for v in cpu.values())
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        kind = "ahead" if entry.get("ahead") else (
+            "head" if entry.get("pr") and not entry.get("main") else "main")
+        out.append((at, total, kind))
+    out.sort(key=lambda r: r[0])
+    return out
+
+
+def host_cpus(root="/sys/devices/system/cpu"):
+    """(logical CPUs, physical cores) of this host; cores counts each
+    distinct thread_siblings_list once, or is the CPU count when that
+    can't be read."""
+    cpus = os.cpu_count() or 0
+    seen = set()
+    try:
+        for name in os.listdir(root):
+            if not re.match(r"cpu\d+$", name):
+                continue
+            try:
+                with open(os.path.join(root, name, "topology",
+                                       "thread_siblings_list")) as h:
+                    seen.add(h.read().strip())
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return cpus, (len(seen) or cpus)
+
 class Flow:
     """Every record, parsed once and indexed by time."""
 
@@ -662,6 +713,12 @@ class Flow:
         self.state_dir = state_dir
         # The build check's queue (check_queue), when main() read it.
         self.queue = None
+        # Each build-check run's CPU (pr-check/state.json's results:
+        # step_cpu), by start: (start, CPU-seconds, kind).
+        self.cpu_runs = read_cpu_runs(state_dir)
+        self.cpu_times = [r[0] for r in self.cpu_runs]
+        # What the host has: logical CPUs and physical cores.
+        self.host_cpus, self.host_cores = host_cpus()
         # The open pull requests carrying labels.urgent, from GitHub
         # (--github), or None to infer them from ahead.json.
         self.labelled = labelled
@@ -858,6 +915,7 @@ class Flow:
         out.update(self._rework(merges, runs, since, until))
         out["approval_to_merge"] = self._latency(merges)
         out.update(self._capacity(runs, hours))
+        out["cpu"] = self.cpu_demand(since, until)
         out["busy"] = self._busy(since, until)
         out.update(self._policy(ticks, hours))
         out["hand_backs_per_hour"] = ratio(out["hand_backs"]["told"], hours,
@@ -949,6 +1007,32 @@ class Flow:
                                          else v)
                                      for k, v in spread(remote).items()}
         return out
+
+    def cpu_demand(self, since, until):
+        """The build check's CPU demand over [since, until): the CPU the
+        runs started in it took, over its length, as CPUs busy on
+        average (`cpus`), against the host's logical CPUs and physical
+        cores; and the median CPU-seconds of a pull request's head run
+        (`head_cpu_median`). A run counts where it started."""
+        got = self.cpu_runs[bisect.bisect_left(self.cpu_times, since):
+                            bisect.bisect_left(self.cpu_times, until)]
+        seconds = (min(until, self.now) - since).total_seconds()
+        heads = sorted(c for _, c, kind in got if kind == "head")
+        return {"runs": len(got),
+                "cpus": round(sum(c for _, c, _ in got) / seconds, 1)
+                if seconds > 0 else None,
+                "host_cpus": self.host_cpus, "host_cores": self.host_cores,
+                "head_runs": len(heads),
+                "head_cpu_median": round(statistics.median(heads))
+                if heads else None}
+
+    def cpu_days(self, days=HISTORY_DAYS):
+        """cpu_demand() for each of the last `days` UTC days, oldest
+        first, the last running to now."""
+        today = self.now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return [dict(self.cpu_demand(a, min(a + DAY, self.now)),
+                     day=stamp(a)[:10])
+                for a in (today - k * DAY for k in range(days - 1, -1, -1))]
 
     def _capacity(self, runs, hours):
         by = collections.Counter()
@@ -2343,6 +2427,25 @@ def latency_graphs(rows):
         hour_ticks(rows))
 
 
+def cpu_text(got):
+    """"41.0 of 48 cores (96 CPUs)", a window's CPU demand."""
+    if not got or got.get("cpus") is None:
+        return "-"
+    return "%s of %s cores (%s CPUs)" % (num(got["cpus"], 1),
+                                         got.get("host_cores"),
+                                         got.get("host_cpus"))
+
+
+def cpu_days_html(days):
+    rows = [[esc(d["day"]), str(d["runs"]), cpu_text(d),
+             "%s CPU-s" % num(d.get("head_cpu_median"), 0)]
+            for d in days if d.get("runs")]
+    if not rows:
+        return "<p class=\"note\">No CPU records.</p>"
+    return table(["day (UTC)", "runs", "CPU used", "per head run, median"],
+                 rows)
+
+
 def build_graphs(rows):
     """Run time of the build check, mean and median, 6-hour buckets."""
     slots = ["%s %s-%s%s" % (r["since"][5:10], r["since"][11:13],
@@ -2965,6 +3068,11 @@ def page(data):
     rows.append(["used of available"] + [
         "%.1f of %.1f" % (w[k]["slot_hours_used"],
                           w[k]["slot_hours_available"]) for k in names])
+    rows.append(["CPU the build check used, CPUs busy on average"] + [
+        cpu_text(w[k].get("cpu")) for k in names])
+    rows.append(["CPU per head run, median"] + [
+        "%s CPU-s" % num((w[k].get("cpu") or {}).get("head_cpu_median"), 0)
+        for k in names])
     rows.append(["head wait for a slot, median"] + [
         num(w[k]["head_wait_seconds"]["median"], 0) + " s" for k in names])
     rows.append(["run time, median"] + [
@@ -2988,11 +3096,23 @@ def page(data):
                "<h2 style=\"margin-top:12px\">Busy, last 6 h</h2>%s"
                "<p class=\"note\">Busy is the share of the time an agent was "
                "listed that she was busy, not idle or in a shell.</p>"
+               "<h2 style=\"margin-top:12px\">CPU used by the build check, last 7 days</h2>%s"
+               "<p class=\"note\">The CPU-seconds the build check's runs "
+               "took (pr-check/state.json's step_cpu), each counted where "
+               "it started, over the time, as CPUs busy on average, against "
+               "the host's physical cores and logical CPUs. It counts merging's "
+               "runs (predictions, the default branch) but not what else the "
+               "host runs. It is what was used, not what was wanted: heads "
+               "still queued wanted more. Near the core count the host is "
+               "full: two threads of a core share it, so every run slows and "
+               "fewer finish, and more slots only queue. Rising CPU per head "
+               "run (CPU-seconds) is the work growing.</p>"
                "<h2 style=\"margin-top:12px\">Build time, last 7 days</h2>%s"
                "</section>"
                % (table(head[:1] + head[1:], rows), w["24h"]["slots"],
                   table(["agent", "", "6 h", "7 d"], busy) if busy
                   else "<p>No presence records.</p>",
+                  cpu_days_html(data.get("cpu_days") or []),
                   build_graphs(data.get("build_times") or [])))
     # 7. Policy.
     row = snap.get("right_of_way") or {}
@@ -3041,7 +3161,7 @@ def compute(flow, project_name, repo=None, recent=RECENT_TRAINS):
     return {"project": project_name, "generated": stamp(flow.now),
             "windows": windows, "hours": flow.hourly(), "now":
             flow.snapshot(), "graph_hours": flow.graph_hours(),
-            "build_times": flow.build_times(), "stacks": flow.stacks(),
+            "build_times": flow.build_times(), "cpu_days": flow.cpu_days(), "stacks": flow.stacks(),
             "singles": flow.singles(),
             "trains": flow.trains(), "ahead_at": flow.ahead.get("at"),
             "recent_trains": flow.recent_trains(recent),

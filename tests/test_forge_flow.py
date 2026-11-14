@@ -1196,6 +1196,59 @@ class CheckQueue(Base):
                           "13th", "21st", "22nd", "111th"])
 
 
+class CpuDemand(Base):
+    """The build check's CPU against the host's, from step_cpu."""
+
+    def test_demand_per_window_and_day(self):
+        write_state(self.root)
+        with open(os.path.join(self.root, "pr-check", "state.json"),
+                  "w") as h:
+            json.dump({"waiting": {}, "results": {
+                sha("a"): {"pr": 10, "started": "2026-11-04T10:10:00Z",
+                           "step_cpu": {"test-rust": 3000, "vet": 600}},
+                sha("b"): {"pr": 11, "started": "2026-11-04T10:40:00Z",
+                           "step_cpu": {"test-rust": 1800}},
+                sha("c"): {"pr": 12, "ahead": True,
+                           "started": "2026-11-04T10:50:00Z",
+                           "step_cpu": {"test-rust": 1800}},
+                sha("d"): {"pr": 0, "main": True,
+                           "started": "2026-11-04T09:00:00Z",
+                           "step_cpu": {"test-rust": 9000}},
+                sha("e"): {"pr": 13, "started": "2026-11-04T10:20:00Z"}}},
+                h)
+        flow = tool.Flow(self.root, NOW, 4, ())
+        flow.host_cpus, flow.host_cores = 8, 4
+        got = flow.cpu_demand(NOW - tool.HOUR, NOW)
+        self.assertEqual(got["runs"], 3)
+        self.assertEqual(got["cpus"], 2.0)          # 7200 CPU-s in 3600 s
+        self.assertEqual(got["head_runs"], 2)
+        self.assertEqual(got["head_cpu_median"], 2700)
+        days = flow.cpu_days(2)
+        self.assertEqual([d["day"] for d in days],
+                         ["2026-11-03", "2026-11-04"])
+        self.assertEqual(days[1]["runs"], 4)
+        self.assertEqual(tool.cpu_text(got), "2.0 of 4 cores (8 CPUs)")
+        page = tool.page(tool.compute(flow, "widget"))
+        self.assertIn("CPU used by the build check, last 7 days", page)
+        self.assertIn("2.0 of 4 cores (8 CPUs)", page)
+
+    def test_no_records_is_no_figure(self):
+        write_state(self.root)
+        flow = tool.Flow(self.root, NOW, 4, ())
+        self.assertEqual(flow.cpu_demand(NOW - tool.HOUR, NOW)["cpus"], 0.0)
+        self.assertEqual(tool.cpu_text(None), "-")
+        self.assertIn("No CPU records", tool.cpu_days_html([]))
+
+    def test_host_cpus_counts_cores_once(self):
+        root = os.path.join(self.tmp.name, "cpu")
+        for n, sib in enumerate(["0,2", "1,3", "0,2", "1,3"]):
+            os.makedirs(os.path.join(root, "cpu%d" % n, "topology"))
+            with open(os.path.join(root, "cpu%d" % n, "topology",
+                                   "thread_siblings_list"), "w") as h:
+                h.write(sib + "\n")
+        self.assertEqual(tool.host_cpus(root)[1], 2)
+
+
 class LegacyStateNames(unittest.TestCase):
     def test_history_reads_the_held_state_by_its_old_name(self):
         line = json.dumps({"hour": "2026-11-05T10:00Z",
