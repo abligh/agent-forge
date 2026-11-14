@@ -1401,6 +1401,21 @@ Two instances on one host share `forge-cron-run`'s per-tool lock, so
 their ticks run one after the other. Ticks return at once, so neither
 waits long. Their state, slots and workers stay separate.
 
+## Changing the order or the capacity
+
+The order the Merger takes pull requests in and what the build check
+runs first come from many settings that act on each other
+(`merge.age_first`, `right_of_way`, `yield_after_hand_back`,
+`test_ahead` and its keys, `checks.slots`, `approved_first`,
+`merger_first`, `first_authors` and more). Change one of them at a time
+in a project, and read `forge-stats` over a whole
+`stats_watch.window_hours` window before the next. With several
+changes a day, no change's effect on the merge rate can be read from
+the figures: the stretch in which only it changed is an hour or two,
+and a busy day's merges move more than that by chance. Before
+changing a rule itself, replay it (docs/merger-sim.md, "Comparing two
+versions on the library's days").
+
 ## The pin
 
 `.agent-forge/pin`, beside the configuration, holds the agent-forge

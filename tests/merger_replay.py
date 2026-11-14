@@ -423,6 +423,8 @@ def report(trace, sim, result, slots, wall, dropped, merge, checks):
     return {
         "median_open_to_approval_minutes": median(to_approval),
         "median_approval_to_merge_minutes": median(to_merge),
+        "p90_approval_to_merge_minutes": p90(to_merge),
+        "hand_backs": w.hand_backs,
         "settings": {"test_ahead": merge.get("test_ahead"),
                      "slots": slots,
                      "max_wait_minutes": checks.get("max_wait_minutes")},
@@ -448,6 +450,14 @@ def report(trace, sim, result, slots, wall, dropped, merge, checks):
 
 def median(values):
     return round(statistics.median(values), 1) if values else None
+
+
+def p90(values):
+    """The 90th percentile, nearest rank, or None."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    return round(float(ordered[max(0, -(-9 * len(ordered) // 10) - 1)]), 1)
 
 
 def reality(trace):
@@ -480,6 +490,8 @@ ROWS = (("merged", "merges"), ("per_hour", "merges an hour"),
         ("median_open_to_approval_minutes", "median open to approval, min"),
         ("median_approval_to_merge_minutes",
          "median approval to merge, min"),
+        ("p90_approval_to_merge_minutes", "p90 approval to merge, min"),
+        ("hand_backs", "hand-backs"),
         ("slot_busy", "slots busy"), ("stopped", "runs stopped as spent"),
         ("red_tops", "train tops red"),
         ("recuts", "started trains re-cut"),
