@@ -10,12 +10,22 @@ Merger's writes, GitHub's answers and the build check's verdicts meet.
 ## What it runs against
 
 - **Real git.** A bare `origin` and the Merger's own checkout, so every
-  tree, merge and conflict is git's.
+  tree, merge and conflict is git's. Every push the Merger makes to the
+  project's GitHub remote goes to `origin` instead. Any other network
+  address given to a git command that reaches a remote fails the run
+  (`NetworkUsed`): nothing a simulation runs leaves the host. The
+  Merger commits as `IDENTITY` when its own `RESOLVE_IDENTITY` is unset,
+  so train commits and resolutions are made as they are in production.
 - **`SimGitHub`.** It answers what the Merger reads and does what it
   writes, the way GitHub does where it matters:
   - `update-branch` makes a new merge commit, with the tree the Merger
     predicted but a new sha;
   - a squash merge lands one commit on `main`;
+  - with `train_merge`, the train's pull request is opened from the
+    branch the Merger pushed and merged as a merge commit. Every open
+    pull request whose head that puts in `main` is marked merged,
+    bottom first, at the tree of the train commit that took it in
+    (`SimGitHub.trains`);
   - a merged branch's stacked pull requests are retargeted to `main`
     (`World.auto_retarget`);
   - statuses are kept per commit.
