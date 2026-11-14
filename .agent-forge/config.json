@@ -40,8 +40,13 @@
   "relay": {
     "url": "http://127.0.0.1:8788"
   },
+  "labels": {
+    "urgent": "urgent",
+    "bug": "bug"
+  },
   "router": {
-    "idle_offer": {}
+    "idle_offer": {},
+    "owners": {"triage": "XMPPEngineer"}
   },
   "machinery": {
     "Merger": {
