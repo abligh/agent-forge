@@ -758,7 +758,8 @@ class SimCheck:
     def __init__(self, world, merger_dir, slots=4, minutes=8,
                  mac_slots=1, mac_minutes=12, notice=2, later_first=None,
                  max_wait=None, stop_spent=False, background=(),
-                 first_pr=None, layer_minutes=None, own_minutes=None):
+                 first_pr=None, layer_minutes=None, own_minutes=None,
+                 train_slots=0):
         """`minutes` is a run's length, or a function of (pull request
         number, whether the run is a top) giving it. With `later_first`
         (a number), runs start in `forge-pr-check`'s order rather than
@@ -773,7 +774,11 @@ class SimCheck:
         each queued at its minute (a default-branch run first, anything
         else as an ordinary head). `layer_minutes` and `own_minutes`,
         when `minutes` is a number, are a layer's own run's and any
-        other own run's length (both default `minutes`)."""
+        other own run's length (both default `minutes`). With
+        `later_first`, `train_slots` n keeps up to n slots for the
+        Merger's predictions, as forge-pr-check's train_slots does: only
+        as many as are running or waiting to start, and heads (and the
+        background) fill only the rest."""
         self.world = world
         self.merger_dir = merger_dir
         self.slots, self.minutes = slots, minutes
@@ -782,6 +787,7 @@ class SimCheck:
         self.own_minutes = minutes if own_minutes is None else own_minutes
         self.later_first, self.max_wait = later_first, max_wait
         self.stop_spent = stop_spent
+        self.train_slots = train_slots
         self.background = sorted(background, key=lambda b: b["at"])
         self.first_pr = first_pr or (lambda: None)
         self.stopped = 0
@@ -974,7 +980,7 @@ class SimCheck:
         # which is next.
         self.queue = [r for r in self.queue if not r["top"]]
         while len(self.running) < self.slots:
-            run = self.pick(tops, now)
+            run = self.pick(tops, now, self.own_full(tops))
             if run is None:
                 break
             if run in self.queue:
@@ -996,8 +1002,28 @@ class SimCheck:
             self.busy_minutes += len(self.running)
         self.mac()
 
-    def pick(self, tops, now):
-        """The next run to start, as forge-pr-check picks it, or None."""
+    def own_full(self, tops):
+        """Whether heads have every slot train_slots leaves them: kept,
+        min(train_slots, slots - 1, the predictions running or waiting
+        to start), are the predictions' alone."""
+        if not self.train_slots:
+            return False
+        running = sum(1 for r in self.running if r["top"])
+        waiting = sum(1 for t in tops if not self.top_done(t))
+        kept = min(self.train_slots, self.slots - 1, running + waiting)
+        own = sum(1 for r in self.running if not r["top"])
+        return own >= self.slots - kept
+
+    def pick(self, tops, now, own_full=False):
+        """The next run to start, as forge-pr-check picks it, or None.
+        With `own_full`, only a prediction: the heads have their share
+        (train_slots)."""
+        if own_full:
+            for t in tops:
+                if not self.top_done(t):
+                    return {"sha": t["sha"], "tree": t["tree"],
+                            "pr": t["pr"], "top": True}
+            return None
         main = [r for r in self.queue if r.get("main")]
         if main:
             return main[0]
