@@ -960,6 +960,30 @@ class RecentTrains(Base):
         self.assertEqual([(t["prs"], t["outcome"]) for t in got], [
             ([3], "running"), ([2], "merged"), ([1], "merged")])
 
+    def test_one_still_running_is_drawn_as_it_is_now(self):
+        running = {"outcome": "running", "prs": [7, 8], "tops": []}
+        for state, cls in (("testing", "t-testing"), ("green", "t-green"),
+                           ("red", "t-red"), ("waiting for a slot",
+                                              "t-wait")):
+            # It goes on as the live train with the same top, after #7
+            # merged.
+            data = {"trains": [{"train": 1, "prs": [5, 6], "state": "red"},
+                               {"train": 2, "prs": [8], "state": state}]}
+            self.assertEqual(tool.recent_engine(data, running), (
+                cls, "still running, " + tool.ENGINE_SAYS[cls], False))
+        # Not among the live trains: by its top's run.
+        self.assertEqual(tool.recent_engine({}, dict(running, tops=[
+            {"res": "running"}]))[0], "t-testing")
+        self.assertEqual(tool.recent_engine({}, dict(running, tops=[
+            {"res": "green"}]))[0], "t-wait")
+        self.assertEqual(tool.recent_engine({}, running)[0], "t-wait")
+        # A live train with another top isn't it.
+        self.assertEqual(tool.recent_engine({"trains": [
+            {"train": 1, "prs": [7], "state": "green"}]}, running)[0],
+            "t-wait")
+        self.assertEqual(tool.recent_engine({}, {"outcome": "merged"}), (
+            "t-green", "merged: green lamp, flag out", True))
+
     def test_the_page_tells_them(self):
         data = {"recent_trains": self.flow_of().recent_trains()}
         html = tool.recent_html(data)
@@ -968,13 +992,16 @@ class RecentTrains(Base):
         # with the top in the guard's van.
         self.assertEqual(html.count('<svg class="engine"'), 5)
         self.assertEqual(html.count('class="carriage van"'), 5)
+        # The finished ones have no steam (agent-forge #379); a re-cut
+        # one is not drawn as waiting for a slot.
         for cls, says in (("t-green", "merged: green lamp"),
                           ("t-partly", "partly merged: amber lamp"),
-                          ("t-wait", "re-cut: lamp unlit"),
-                          ("t-testing", "still running")):
-            self.assertIn('<div class="rtrain %s">' % cls, html)
+                          ("t-recut", "re-cut: lamp unlit, no steam")):
+            self.assertIn('<div class="rtrain %s gone">' % cls, html)
             self.assertIn('aria-label="engine, %s' % says, html)
-        self.assertIn(".rtrain .engine .puff{animation:none", tool.css_vars())
+        self.assertIn(".rtrain.gone .engine .puff{display:none}",
+                      tool.css_vars())
+        self.assertEqual(html.count(" gone\">"), 4)
         self.assertIn('<span class="ob o-partly-merged">partly merged'
                       "</span> cut 2026-11-04T10:00Z", html)
         self.assertIn("3 PRs in 2 carriages · 10 min to 10:10Z", html)

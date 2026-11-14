@@ -202,6 +202,15 @@ hollowed out Cargo's incremental sessions, and rustc crashed. A missing
 directory only makes it build that part afresh, so pruning costs time,
 never a wrong verdict.
 
+A prune walks every file in the slot's caches, and the slot waits for
+it: on one project, 7 million files, about two and a half minutes after
+every run, nearly a fifth of the check's time. So a slot whose last
+prune was less than `cache_prune_minutes` ago (60), and left its caches
+at most three quarters of `cache_limit`, skips the prune after a run.
+Near the limit it prunes after every run, as `0` always does. Each
+slot's last prune, when and what it left, is kept in `state.json`'s
+`cache_pruned`.
+
 ### Warming a slot's caches
 
 Each slot keeps its own caches, and they are only as new as the last
@@ -1277,6 +1286,7 @@ unaffected: their lines stay body-only, as the Merger reads them
 | `steps` | one step, `make test` | What runs on each head, in order: `{"name": ..., "run": [argv], "only_if": path, "always": bool, "version": [argv], "reads_base": bool, "outputs": [path], "after": [name], "alone": bool, "light": bool, "caches": {...}, "pull_requests": {...}, "env_file": path}`, `only_if` a file the head must have; `outputs`, paths inside the worktree the step leaves behind that the tracer may not see it write (`reuse.chain_writes_only`); with `depends`, `always` runs the step whatever changed, for a cheap step or one that depends on more than files (a statically linked tool the tracer can't see). `after`, `alone`, `light` and `caches` say how the step runs beside others, and mean nothing without `side_by_side`. They are left out of the step's input digest. |
 | `caches` | none | `{variable: directory name}`: each slot's own build cache, kept in the state directory, such as `{"CARGO_TARGET_DIR": "cargo-target"}`. |
 | `cache_limit` | none | The most a slot's `caches` may hold after a run, as a size such as `40G` (`K`, `M`, `G` or `T`); with it each run prunes its slot's caches (see below). Without it nothing is pruned. |
+| `cache_prune_minutes` | 60 | With `cache_limit`: a slot whose last prune was less than this many minutes ago, and left its caches at most three quarters of `cache_limit`, skips the prune after a run (see below). `0` prunes after every run. |
 | `warm` | none: off | `{"paths": [glob, ...], "minutes": 60}`: an idle slot whose caches were built at an older default-branch head, before changes to these paths, builds the head again (see "Warming a slot's caches"). `paths` is required. |
 | `slots` | `2` | Checks run at once (`$FORGE_PR_CHECK_SLOTS` overrides). |
 | `memory_max` | `16G` | Each step's memory limit, in systemd's syntax, or `off`; `null` starts no scope and says nothing (`$FORGE_PR_CHECK_MEMORY_MAX` overrides). |
@@ -1337,7 +1347,7 @@ platform. Without an instance, `forge-pr-check` runs as before.
 | Keys | Where they come from |
 | --- | --- |
 | `host`, `context`, `steps`, `poster` | The block. `context` and `steps` are required. `host` falls back to the top-level `host`, and `poster` to `checks.poster`. |
-| `slots`, `memory_max`, `cpu_weight`, `cpu_quota`, `step_timeout_minutes`, `caches`, `cache_limit`, `results_max`, `keep_ignored`, `drop_env`, `merge_default`, `red_comment`, `max_wait_minutes`, `host_fault_text`, `cache_fault_text`, `step_alert`, `cpu_share`, `side_by_side`, `warm`, `approved_first` | The block, else `checks`, else the default. |
+| `slots`, `memory_max`, `cpu_weight`, `cpu_quota`, `step_timeout_minutes`, `caches`, `cache_limit`, `cache_prune_minutes`, `results_max`, `keep_ignored`, `drop_env`, `merge_default`, `red_comment`, `max_wait_minutes`, `host_fault_text`, `cache_fault_text`, `step_alert`, `cpu_share`, `side_by_side`, `warm`, `approved_first` | The block, else `checks`, else the default. |
 | `depends`, `tracer`, `depends_minutes`, `fast_lane`, `reuse`, `fresh`, `main` | The block only, else the default: they describe the first host's tracer. |
 | `main_red_issue` | The block only, never inherited: the instance's own issue while its newest default-branch verdict is red (designs/0034), titled by default `The default branch is red for <context> at <sha>`. Its `poster`'s App then needs `issues: write`. While such an issue is open (an open issue with the block's labels, by its `poster`, titled as above), `forge-merger` puts the pull requests whose title or body closes it first, as it does the main context's fixes; it reads them from GitHub, since the instance's state is on its own host (agent-forge #154). |
 | `first_authors`, `merger_first`, `merger_cpu_weight`, `docker_slices`, `flake_issue` | `checks` only, and refused in a block: they belong to the context the Merger requires. `merge.test_ahead` doesn't apply to an instance either. |
