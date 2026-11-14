@@ -757,11 +757,36 @@ def decide(ctx):
     return kept
 
 
-def order(decision):
-    """Pull requests that fix a red nightly first, then items by number,
-    then those about no item, each in decided order."""
-    return (decision.item not in merger.NIGHTLY_FIXES, decision.item is None,
-            decision.item or 0)
+def default_rank(node, ctx):
+    """An item's tier for rules without `rank`: a pull request that
+    fixes a red nightly first, then the rest."""
+    return 1 if node.get("number") in merger.NIGHTLY_FIXES else 3
+
+
+def order(decisions, ctx):
+    """`decisions` sorted: by the rules' `rank` of their item
+    (designs/0054: urgent, a red nightly's fixes, bugs, the rest), then
+    by number, oldest first; those about no item last, each in decided
+    order."""
+    rank = getattr(RULES, "rank", None) or default_rank
+    nodes = {n["number"]: n for n in ctx.prs + ctx.issues}
+    ranks = {}
+    for d in decisions:
+        if d.item is not None and d.item not in ranks:
+            node = nodes.get(d.item)
+            ranks[d.item] = rank(node, ctx) if node is not None \
+                else default_rank({"number": d.item}, ctx)
+    decisions.sort(key=lambda d: (d.item is None, ranks.get(d.item, 3),
+                                  d.item or 0))
+
+
+def urgent_mark(item, ctx):
+    """What ends an item's line to say why it is first: "" for most."""
+    mark = getattr(RULES, "first_mark", None)
+    if mark is not None:
+        return mark(item, ctx)
+    return " (fixes the red nightly: first)" \
+        if item in merger.NIGHTLY_FIXES else ""
 
 
 def nobody_line(d):
@@ -978,7 +1003,7 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
     tally = RULES.summary(ctx)
     if only:
         decisions = [d for d in decisions if d.item in only]
-    decisions.sort(key=order)
+    order(decisions, ctx)
     state = merger.load_json(state_path, {})
     items = state.get("items")
     if not isinstance(items, dict):
@@ -1028,8 +1053,7 @@ def run(github, roster, state_dir, send, post=None, only=None, out=print,
             would.append((d, d.line, "withheld: not an agent"))
             continue
         line = d.line + (" (reminder)" if why == "reminder" else "") + (
-            " (fixes the red nightly: first)"
-            if d.item in merger.NIGHTLY_FIXES else "")
+            urgent_mark(d.item, ctx) if d.item is not None else "")
         # Woken some other way, or by the router this replaces: recorded
         # as woken now, and reminded from now.
         if seed or (d.woken is not None and why == "new"):

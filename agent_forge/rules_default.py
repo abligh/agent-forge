@@ -197,8 +197,10 @@ agents with nothing to do (off without it):
     lines name is closed or merged (a number naming nothing is left
     out, as for rule 14), and no open pull request by the agent
     references it (a closing reference, `#N` or its URL in the body).
-    With `router.red_first`, red-build issues come first (oldest first
-    among themselves), and the offer says "Red builds go first".
+    Issues go by tier (designs/0054): urgent (`labels.urgent`, put on
+    by the owner) first, then with `router.red_first` red-build issues
+    (and the offer says "Red builds go first"), then bugs (`labels.bug`),
+    then the rest; oldest first within each.
     With `red_first.everyone` (designs/0051), an idle developer (as
     rule 16 reads one) is offered instead an open step issue of a red
     nightly (`nightly.step_issues`), whoever owns it, oldest first and
@@ -327,7 +329,8 @@ import os
 import re
 
 from agent_forge import locks, nightly, state
-from agent_forge.router import ONCE, Action, Decision, Lookup, Reminder
+from agent_forge.router import (ONCE, Action, AddLabel, Decision, Lookup,
+                                 Reminder)
 
 # The Merger's hand-back names the head it judged, in both its forms.
 HAND_BACK_RE = re.compile(r"^Not merging ([0-9a-f]{7,40}):", re.MULTILINE)
@@ -376,6 +379,15 @@ OWNERS = None
 UNREVIEWED = None
 # `router.red_first` (designs/0039), {"fallback_hours"}, or None: off.
 RED_FIRST = None
+# `labels.urgent` (designs/0054), or None: off. An issue carrying it
+# goes first when the owner put it on; a pull request goes first when
+# it carries it or closes such an issue, and each_run puts it on one
+# that closes such an issue.
+URGENT = None
+# `labels.bug` (designs/0054), or None: off. An item carrying it, or a
+# pull request closing an open issue carrying it, comes after a red
+# nightly's fixes and before the rest.
+BUG = None
 DEFAULT_FALLBACK_HOURS = 2
 # `router.nightly_wake` (designs/0040), {"label"}, or None: off.
 NIGHTLY_WAKE = None
@@ -436,6 +448,12 @@ OWNER_LABEL_EVENTS = """
                   ... on UnlabeledEvent { createdAt label { name } } }
         }"""
 # Read as lists; `commits` and `headCommit` keep their nodes.
+# With `labels.urgent`: who put which label on, so that only the
+# owner's urgent label counts (designs/0054).
+URGENT_LABEL_EVENTS = """
+        urgentLabels: timelineItems(last:50, itemTypes:[LABELED_EVENT]) {
+          nodes { ... on LabeledEvent { label { name } actor { login } } }
+        }"""
 flatten = ("labels", "reviews", "comments", "files")
 
 
@@ -450,6 +468,7 @@ def configure(project, merger_tool):
     global UNREVIEWED, QUIET_LABELS, IN_PROGRESS, RED_FIRST, PROJECT
     global NIGHTLY_WAKE, ISSUE_BLOCKED_BY, BLOCKER_WRITERS, MANUAL
     global GREEN_APPROVES
+    global URGENT, BUG
     merger = merger_tool
     MANUAL = project.section("merge").get("mode") == "manual"
     GREEN_APPROVES = project.section("merge").get("approval") == "green"
@@ -507,8 +526,11 @@ def configure(project, merger_tool):
                                                      "body")
     BLOCKER_WRITERS = frozenset(
         {OWNER} | {project.slug(n).lower() for n in project.agents})
+    URGENT = labels.get("urgent") or None
+    BUG = labels.get("bug") or None
     graphql["Issue"] = ISSUE_FIELDS + (
-        OWNER_LABEL_EVENTS if OWNERS or NIGHTLY_WAKE else "")
+        OWNER_LABEL_EVENTS if OWNERS or NIGHTLY_WAKE else "") + (
+        URGENT_LABEL_EVENTS if URGENT else "")
 
 
 # --- who is who -------------------------------------------------------------
@@ -952,6 +974,93 @@ def closing_of(pr):
     return {n.get("number") for n in nodes or [] if isinstance(n, dict)}
 
 
+# --- what goes first (designs/0054) -------------------------------------------
+
+
+def owner_marked_urgent(issue):
+    """Whether `issue` carries `labels.urgent` and the owner put it on:
+    the last time the label went on, the owner did it."""
+    if not URGENT or URGENT not in labels_of(issue):
+        return False
+    events = issue.get("urgentLabels") or {}
+    nodes = events.get("nodes") if isinstance(events, dict) else events
+    last = None
+    for node in nodes or []:
+        if isinstance(node, dict) \
+                and (node.get("label") or {}).get("name") == URGENT:
+            last = node
+    return last is not None and (strip_bot(
+        (last.get("actor") or {}).get("login")) or "").lower() == OWNER
+
+
+def urgent_issues(ctx):
+    """The open issues the owner marked `labels.urgent`."""
+    return {i["number"] for i in ctx.issues if owner_marked_urgent(i)}
+
+
+def bug_issues(ctx):
+    """The open issues carrying `labels.bug`."""
+    return {i["number"] for i in ctx.issues
+            if BUG and BUG in labels_of(i)}
+
+
+def is_pr(item):
+    return item.get("__typename") == "PullRequest" \
+        or "headRefOid" in item
+
+
+def urgent_item(item, ctx):
+    """designs/0054: an issue the owner marked urgent, or a pull request
+    carrying the label or closing such an issue."""
+    if not URGENT:
+        return False
+    if is_pr(item):
+        return URGENT in labels_of(item) \
+            or bool(closing_of(item) & urgent_issues(ctx))
+    return owner_marked_urgent(item)
+
+
+def rank(item, ctx):
+    """An item's tier, lowest first (designs/0054): 0 urgent, 1 a pull
+    request fixing the red nightly or (with `router.red_first`) a red
+    build, 2 a bug, or a pull request closing one, 3 the rest. Within a
+    tier, oldest first."""
+    if urgent_item(item, ctx):
+        return 0
+    if is_pr(item):
+        if item.get("number") in merger.NIGHTLY_FIXES:
+            return 1
+        if BUG and (BUG in labels_of(item)
+                    or closing_of(item) & bug_issues(ctx)):
+            return 2
+        return 3
+    if red_build(item) is not None:
+        return 1
+    return 2 if BUG and BUG in labels_of(item) else 3
+
+
+def first_mark(number, ctx):
+    """What ends a wake's line for an item that goes first, else ""."""
+    node = next((n for n in ctx.prs + ctx.issues
+                 if n.get("number") == number), None)
+    if node is not None and urgent_item(node, ctx):
+        return " (urgent: first)"
+    if number in merger.NIGHTLY_FIXES:
+        return " (fixes the red nightly: first)"
+    return ""
+
+
+def each_run(ctx):
+    """designs/0054: put `labels.urgent` on each open pull request that
+    closes an issue the owner marked urgent, so the Merger and the build
+    check take it first too."""
+    if not URGENT:
+        return ()
+    urgent = urgent_issues(ctx)
+    return [AddLabel(pr["number"], URGENT) for pr in ctx.prs
+            if closing_of(pr) & urgent and URGENT not in labels_of(pr)]
+
+
 def last_activity(pr):
     """The newest of the head's commit date, the body's last edit (or
     the pull request's creation) and anything its author said."""
@@ -1324,9 +1433,10 @@ def owned_issues(agent, ctx):
             held += 1
         elif issue["number"] not in in_hand:
             actionable.append(issue)
-    # With `router.red_first`, red-build issues first (designs/0039).
-    actionable.sort(key=lambda i: (red_build(i) is None,
-                                   i.get("createdAt") or "", i["number"]))
+    # designs/0054: urgent, then (with `router.red_first`, designs/0039)
+    # red builds, then bugs, then the rest; oldest first in each.
+    actionable.sort(key=lambda i: (rank(i, ctx), i.get("createdAt") or "",
+                                   i["number"]))
     return actionable, held, waiting
 
 
