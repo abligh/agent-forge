@@ -3,6 +3,7 @@
 
     python3 -m tests.merger_replay TRACE [--config FILE] [--set K=V ...]
         [--compare K=V[,K=V...]] [--idle N] [--json]
+        [--approve-after-green MINUTES] [--fix-after-red MINUTES]
 
 TRACE comes from `tests/merger_trace.py`. `--config` is a JSON file
 with the project's `merge` section (and, optionally, `checks`' `slots`
@@ -17,7 +18,18 @@ doing: the real Merger's ticks, a model of the build check in the
 trace's slots (with the day's other runs, the default branch's and
 those of pull requests never approved, in them too), and its authors
 answering a conflict with the default branch `resolve_minutes` after it
-appears."""
+appears.
+
+The trace's approval times include the real wait for the real build
+check, so by default the real queue is built into the input. With
+`--approve-after-green MINUTES`, a pull request the trace approved is
+approved instead that long after the simulated check's context goes
+green on its head, and again after a new head loses the approval: a
+change to the check then shows in the wait for approval too. With
+`--fix-after-red MINUTES`, a red pull request's author pushes the fix
+that long after the simulated check says red, rather than at the
+trace's time. Either way the report gives open-to-approval and
+approval-to-merge separately."""
 
 import argparse
 import copy
@@ -42,10 +54,59 @@ KEPT = {"merger", "ci_workflow", "stall_minutes", "test_ahead",
         "hand_back_once_per_head"}
 
 
+# Where a trace's real paths live in the simulated repository, apart
+# from the simulation's own files.
+REAL = "repo/"
+
+
 class ReplayWorld(ms.World):
     """The World, with the arrivals a trace describes: a pull request
     stacked on one not yet open opens that one first, unapproved, and
-    one stacked on one already merged or closed opens on main."""
+    one stacked on one already merged or closed opens on main. With
+    `changed` ({number: the trace's `files`}), each such pull request
+    also replaces the lines its real head replaced, in files under REAL
+    that `with_files` put on main first: git then decides which of them
+    conflict."""
+
+    changed = {}
+
+    def with_files(self, changed):
+        """Main gains every file `changed` names, long enough for every
+        range in it, each line its own."""
+        self.changed = changed
+        lengths = {}
+        for files in changed.values():
+            for path, ranges in files.items():
+                end = max(line + count for line, count in ranges)
+                lengths[path] = max(lengths.get(path, 0), end + 5)
+        if not lengths:
+            return
+        main = self.main()
+        tree = self.write_tree(self.tree(main), {
+            REAL + path: "".join("%s %d\n" % (path, k)
+                                 for k in range(1, n + 1))
+            for path, n in lengths.items()})
+        sha = self.og("commit-tree", tree, "-p", main, "-m", "real files")
+        self.og("update-ref", "refs/heads/main", sha, main)
+        self.wg("fetch", "-q", "origin")
+
+    def real_contents(self, number, start):
+        """{path: text}: the REAL files at `start` with #`number`'s
+        ranges replaced by lines of its own."""
+        out = {}
+        for path, ranges in (self.changed.get(number) or {}).items():
+            text = self.og("cat-file", "-p", "%s:%s%s" % (start, REAL, path),
+                           check=False)
+            lines = text.split("\n") if text else []
+            for line, count in sorted(ranges, reverse=True):
+                mine = ["#%d %s %d" % (number, path, k)
+                        for k in range(max(count, 1))]
+                if count == 0:
+                    lines[line:line] = mine
+                else:
+                    lines[line - 1:line - 1 + count] = mine
+            out[REAL + path] = "\n".join(lines) + "\n"
+        return out
 
     def arrive(self, number, base=None, mac=False, red=False,
                urgent=False, shared=(), approve=True):
@@ -62,7 +123,9 @@ class ReplayWorld(ms.World):
                 under = self.prs[base]
             if under["state"] != "OPEN":
                 base = None
-        self.open(number, base, mac, red, urgent, approve, shared=shared)
+        start = self.main() if base is None else self.prs[base]["head"]
+        self.open(number, base, mac, red, urgent, approve, shared=shared,
+                  contents=self.real_contents(number, start))
 
     def approve(self, number):
         pr = self.prs.get(number)
@@ -79,7 +142,63 @@ class ReplayWorld(ms.World):
         pr = self.prs.get(number)
         if pr is not None and pr["state"] == "OPEN" and pr["red"]:
             self.fix(number)
-            self.review(number)
+            if not getattr(self, "approver", None):
+                self.review(number)
+
+
+def check_state(world, sha):
+    """The simulated check's latest state on `sha`, or None."""
+    return next((st["state"] for st in world.statuses.get(sha, ())
+                 if st["context"] == ms.CONTEXT), None)
+
+
+class Approver:
+    """--approve-after-green: the reviewer approves each of `numbers`
+    (the pull requests the trace approved) `delay` minutes after the
+    check's context goes green on the head it has, whenever that head
+    lacks an approval."""
+
+    def __init__(self, world, numbers, delay):
+        self.world, self.numbers = world, set(numbers)
+        self.delay = datetime.timedelta(minutes=delay)
+        self.green_since = {}
+
+    def __call__(self):
+        w = self.world
+        for n in self.numbers:
+            pr = w.prs.get(n)
+            if pr is None or pr["state"] != "OPEN" \
+                    or pr["approved"] == pr["version"]:
+                continue
+            key = (n, pr["head"])
+            if check_state(w, pr["head"]) != "success":
+                continue
+            since = self.green_since.setdefault(key, w.now)
+            if w.now - since >= self.delay:
+                w.review(n)
+
+
+class Fixer:
+    """--fix-after-red: the author of each of `numbers` (the red pull
+    requests the trace fixed) pushes the fix `delay` minutes after the
+    check says red on its head; it is approved again at once, unless
+    `Approver` approves."""
+
+    def __init__(self, world, numbers, delay):
+        self.world, self.numbers = world, set(numbers)
+        self.delay = datetime.timedelta(minutes=delay)
+        self.red_since = {}
+
+    def __call__(self):
+        w = self.world
+        for n in self.numbers:
+            pr = w.prs.get(n)
+            if pr is None or pr["state"] != "OPEN" or not pr["red"] \
+                    or check_state(w, pr["head"]) != "failure":
+                continue
+            since = self.red_since.setdefault((n, pr["head"]), w.now)
+            if w.now - since >= self.delay:
+                w.author_fix(n)
 
 
 def shared_files(number, conflicts):
@@ -87,8 +206,11 @@ def shared_files(number, conflicts):
                  for other in conflicts)
 
 
-def scenario(trace):
-    """[(minute, World method, args)] for the trace's pull requests."""
+def scenario(trace, approve_after=None, fix_after=None):
+    """[(minute, World method, args)] for the trace's pull requests.
+    With `approve_after`, none is approved at the trace's times
+    (`Approver` does it); with `fix_after`, no fix comes at them
+    (`Fixer`)."""
     s = []
     prs = trace["prs"]
     for key, pr in prs.items():
@@ -101,6 +223,21 @@ def scenario(trace):
                 bool(pr.get("urgent")),
                 shared_files(n, pr.get("conflicts") or ()))
         first = pr["approved"][0] if pr.get("approved") else None
+        if approve_after is not None and first is not None:
+            # Opened unapproved; its pushes before the trace's approval
+            # are the author's still, and are kept.
+            s.append((pr["opened"], "arrive", args + (False,)))
+            for m in pr.get("pushes") or ():
+                if m < first:
+                    s.append((m, "author_push", (n,)))
+            for left, _back in pr.get("gaps") or ():
+                s.append((left, "author_push", (n,)))
+            for at, pushed, _approved in pr.get("handed_back") or ():
+                s.append((pushed if pushed is not None else at,
+                          "author_push", (n,)))
+            if pr.get("fixed") is not None and fix_after is None:
+                s.append((pr["fixed"], "author_fix", (n,)))
+            continue
         if first is not None and first <= pr["opened"]:
             s.append((first, "arrive", args))
         else:
@@ -119,7 +256,7 @@ def scenario(trace):
                       "author_push", (n,)))
             if approved is not None:
                 s.append((approved, "approve", (n,)))
-        if pr.get("fixed") is not None:
+        if pr.get("fixed") is not None and fix_after is None:
             s.append((pr["fixed"], "author_fix", (n,)))
     # An arrival before what is stacked on it; otherwise by minute.
     order = {"arrive": 0, "author_push": 1, "author_fix": 2, "approve": 3}
@@ -199,11 +336,12 @@ class Resolver:
 
 
 def replay(trace, base_config=None, changes=None, merger=None, idle=10,
-           inspect=None):
+           inspect=None, approve_after=None, fix_after=None):
     """Replays `trace` with the settings `base_config` and `changes`
     give: a dict of the figures (see `report`). `inspect(sim)`, when
     given, is called once the day is over, before the simulation's
-    repositories go."""
+    repositories go. `approve_after` and `fix_after`: minutes, as
+    --approve-after-green and --fix-after-red."""
     merge, checks, dropped = settings(base_config, changes)
     m = merger or ms.load_merger()
     m.configure(project(merge))
@@ -219,7 +357,8 @@ def replay(trace, base_config=None, changes=None, merger=None, idle=10,
 
     started = time.monotonic()
     with tempfile.TemporaryDirectory() as root:
-        sim = ms.Sim(m, root, scenario(trace), world=ReplayWorld,
+        sim = ms.Sim(m, root, scenario(trace, approve_after, fix_after),
+                     world=ReplayWorld,
                      slots=slots, minutes=length,
                      mac_minutes=trace.get("mac_minutes") or 25,
                      later_first=ahead.get("later_first", 0),
@@ -227,10 +366,22 @@ def replay(trace, base_config=None, changes=None, merger=None, idle=10,
                      stop_spent=bool(ahead.get("stop_spent")),
                      train_slots=ahead.get("train_slots") or 0,
                      background=trace.get("background") or ())
+        sim.world.with_files({int(k): p["files"]
+                              for k, p in trace["prs"].items()
+                              if p.get("files")})
         conflicting = [int(k) for k, p in trace["prs"].items()
-                       if p.get("conflicts")]
+                       if p.get("conflicts") or p.get("files")]
         sim.each_minute.append(Resolver(sim.world, conflicting,
                                         trace.get("resolve_minutes") or 60))
+        if fix_after is not None:
+            sim.each_minute.append(Fixer(sim.world, [
+                int(k) for k, p in trace["prs"].items()
+                if p.get("fixed") is not None], fix_after))
+        if approve_after is not None:
+            sim.world.approver = True
+            sim.each_minute.append(Approver(sim.world, [
+                int(k) for k, p in trace["prs"].items()
+                if p.get("approved")], approve_after))
         result = sim.run(trace["minutes"], whole=True, idle=idle)
         wall = time.monotonic() - started
         if inspect is not None:
@@ -257,8 +408,21 @@ def report(trace, sim, result, slots, wall, dropped, merge, checks):
         approved = (trace["prs"].get(str(n)) or {}).get("approved") or []
         if approved:
             waits.append(at - approved[0])
+    opened, approved_at = {}, {}
+    for e in w.events:
+        minute = int((ms.parse(e["at"]) - start).total_seconds() // 60)
+        if e["what"] == "open":
+            opened.setdefault(e["pr"], minute)
+        elif e["what"] == "approve":
+            approved_at.setdefault(e["pr"], minute)
+    to_approval = [approved_at[n] - opened[n] for n in approved_at
+                   if n in opened]
+    to_merge = [at - approved_at[n] for n, at in merged
+                if n in approved_at]
     hours = trace["minutes"] / 60
     return {
+        "median_open_to_approval_minutes": median(to_approval),
+        "median_approval_to_merge_minutes": median(to_merge),
         "settings": {"test_ahead": merge.get("test_ahead"),
                      "slots": slots,
                      "max_wait_minutes": checks.get("max_wait_minutes")},
@@ -275,8 +439,15 @@ def report(trace, sim, result, slots, wall, dropped, merge, checks):
         if waits else None,
         "slot_busy": round(sim.check.busy_minutes
                            / max(1, slots * trace["minutes"]), 3),
+        "red_tops": sum(1 for r in sim.check.state["results"].values()
+                        if r.get("ahead") and r.get("ok") is False),
+        "left_trains": result.left,
         "broken": result.broken, "recuts": len(result.recuts),
         "ticks": sim.ticks, "wall_seconds": round(wall, 1)}
+
+
+def median(values):
+    return round(statistics.median(values), 1) if values else None
 
 
 def reality(trace):
@@ -289,7 +460,11 @@ def reality(trace):
         approved = (trace["prs"].get(str(n)) or {}).get("approved") or []
         if approved:
             waits.append(at - approved[0])
-    return {"merged": len(merges), "per_hour": round(len(merges) / hours, 2),
+    to_approval = [p["approved"][0] - p["opened"]
+                   for p in trace["prs"].values() if p.get("approved")]
+    return {"merged": len(merges),
+            "median_open_to_approval_minutes": median(to_approval),
+            "median_approval_to_merge_minutes": median(waits), "per_hour": round(len(merges) / hours, 2),
             "hourly": per_hour(merges, 0, trace["minutes"]),
             "runs": runs, "top_runs": real["top_runs"],
             "stopped": real.get("stopped_runs"),
@@ -302,9 +477,14 @@ ROWS = (("merged", "merges"), ("per_hour", "merges an hour"),
         ("runs", "build runs (heads and tops)"),
         ("top_runs", "of them train tops"),
         ("runs_per_merge", "runs a merge"),
-        ("median_wait_minutes", "median approval to merge, min"),
+        ("median_open_to_approval_minutes", "median open to approval, min"),
+        ("median_approval_to_merge_minutes",
+         "median approval to merge, min"),
         ("slot_busy", "slots busy"), ("stopped", "runs stopped as spent"),
-        ("recuts", "started trains re-cut"), ("broken", "rule breaks"),
+        ("red_tops", "train tops red"),
+        ("recuts", "started trains re-cut"),
+        ("left_trains", "left a started train unmerged"),
+        ("broken", "rule breaks"),
         ("wall_seconds", "wall time, s"))
 
 
@@ -351,7 +531,15 @@ def main(argv=None):
     parser.add_argument("--idle", type=int, default=10,
                         help="minutes a quiet stretch may skip ticks")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--approve-after-green", type=int, metavar="MINUTES",
+                        help="approve this long after the simulated "
+                        "check's green, not at the trace's times")
+    parser.add_argument("--fix-after-red", type=int, metavar="MINUTES",
+                        help="fix a red this long after the simulated "
+                        "check's red, not at the trace's time")
     args = parser.parse_args(argv)
+    when = {"approve_after": args.approve_after_green,
+            "fix_after": args.fix_after_red}
     with open(args.trace) as handle:
         trace = json.load(handle)
     base = {}
@@ -360,10 +548,10 @@ def main(argv=None):
             base = json.load(handle)
     first = parse_changes(args.set)
     out = {"reality": reality(trace),
-           "replay": replay(trace, base, first, idle=args.idle)}
+           "replay": replay(trace, base, first, idle=args.idle, **when)}
     if args.compare:
         out["compare"] = replay(trace, base, dict(
-            first, **parse_changes(args.compare)), idle=args.idle)
+            first, **parse_changes(args.compare)), idle=args.idle, **when)
     if args.json:
         json.dump(out, sys.stdout, indent=1)
         sys.stdout.write("\n")

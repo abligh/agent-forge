@@ -10,9 +10,11 @@ import datetime
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 
+from tests import merger_overlay as mo
 from tests import merger_replay as mr
 from tests import merger_sim as ms
 from tests import merger_trace as mt
@@ -138,6 +140,11 @@ class Trace(unittest.TestCase):
 
 class Replay(unittest.TestCase):
 
+    SETTINGS = {"merge": {"test_ahead": {
+        "batch": 4, "batches": 2, "trains": "live", "stacks": True,
+        "stop_spent": True, "later_first": 1}},
+        "checks": {"max_wait_minutes": 30}}
+
     def test_the_day_replayed_keeps_every_rule(self):
         t = trace_of_day()
         got = mr.replay(t, {"merge": {"test_ahead": {
@@ -149,6 +156,26 @@ class Replay(unittest.TestCase):
         self.assertEqual(got["settings"]["slots"], 3)
         self.assertEqual(got["dropped"], [])
         self.assertGreaterEqual(got["background_runs"], 1)
+        # #391's summary: red tops and departures from started trains.
+        self.assertEqual((got["red_tops"], got["left_trains"]), (0, 0), got)
+
+    def test_the_day_replayed_with_train_merge(self):
+        # #391: a train merges as one pull request in a replay too.
+        t = trace_of_day()
+        seen = {}
+        got = mr.replay(t, {"merge": {"own_head_green": False,
+                                      "test_ahead": {
+            "batch": 4, "batches": 2, "trains": "live", "stacks": True,
+            "stop_spent": True, "later_first": 1, "train_merge": True}},
+            "checks": {"max_wait_minutes": 30}}, idle=5,
+            inspect=lambda sim: seen.update(trains=dict(sim.github.trains)))
+        self.assertEqual(got["broken"], [])
+        self.assertEqual(got["merged"], 5, got)
+        # This morning's pull requests come one at a time, so its trains
+        # are short, but each of the five went in through one.
+        merged = sorted(n for tr in seen["trains"].values()
+                        if tr["state"] == "MERGED" for n in tr["members"])
+        self.assertEqual(merged, [1, 2, 3, 4, 5], seen["trains"])
 
     def test_settings_left_out_are_said(self):
         merge, checks, dropped = mr.settings(
@@ -179,6 +206,187 @@ class Replay(unittest.TestCase):
         self.assertEqual(header, ["reality", "replay", "compare"])
         self.assertIn("merges an hour", text)
         self.assertIn("inferred:", text)
+
+
+class RealLines(unittest.TestCase):
+    """#391 item 4: a trace's changed lines, and conflicts git decides
+    from them."""
+
+    def git(self, repo, *args):
+        return subprocess.run(["git", "-C", repo] + list(args), check=True,
+                              capture_output=True, text=True,
+                              env=ms.git_env()).stdout.strip()
+
+    def test_a_heads_changed_lines(self):
+        with tempfile.TemporaryDirectory() as repo:
+            self.git(repo, "init", "-q", "-b", "main")
+            with open(os.path.join(repo, "a.txt"), "w") as handle:
+                handle.write("".join("%d\n" % k for k in range(1, 21)))
+            self.git(repo, "add", ".")
+            self.git(repo, "commit", "-qm", "base")
+            self.git(repo, "branch", "start")
+            self.git(repo, "checkout", "-qb", "pr")
+            with open(os.path.join(repo, "a.txt")) as handle:
+                lines = handle.read().splitlines()
+            lines[4:6] = ["five", "six"]
+            lines[14:14] = ["new"]
+            with open(os.path.join(repo, "a.txt"), "w") as handle:
+                handle.write("\n".join(lines) + "\n")
+            with open(os.path.join(repo, "b.txt"), "w") as handle:
+                handle.write("b\n")
+            self.git(repo, "add", ".")
+            self.git(repo, "commit", "-qm", "change")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.assertEqual(mt.hunks_of(repo, head[:10], "start"),
+                             {"a.txt": [[5, 2], [14, 0]], "b.txt": [[0, 0]]})
+            self.assertIsNone(mt.hunks_of(repo, "f" * 10, "start"))
+
+    def test_the_trace_takes_the_last_heads_lines(self):
+        merger, verdicts = day_logs()
+        asked = []
+
+        def files_of(sha):
+            asked.append(sha)
+            return {"x.rs": [[1, 1]]} if sha == "5b" * 5 else None
+        t = mt.extract(merger, verdicts, T0,
+                       T0 + datetime.timedelta(minutes=90), slots=3,
+                       files_of=files_of)
+        self.assertEqual(t["prs"]["5"]["files"], {"x.rs": [[1, 1]]})
+        self.assertNotIn("5a" * 5, asked)
+        self.assertNotIn("files", t["prs"]["1"])
+        self.assertTrue(any("files" in line for line in t["inferred"]))
+
+    def test_a_day_with_real_lines_keeps_every_rule(self):
+        t = trace_of_day()
+        # #1 and #5 change the same lines (the logs never said they
+        # conflict), #3 other lines of that file.
+        self.assertFalse(t["prs"]["5"].get("conflicts"))
+        t["prs"]["1"]["files"] = {"core.rs": [[10, 4]]}
+        t["prs"]["5"]["files"] = {"core.rs": [[12, 1]]}
+        t["prs"]["3"]["files"] = {"core.rs": [[40, 2]]}
+        seen = {}
+        got = mr.replay(t, Replay.SETTINGS, idle=5, inspect=lambda sim:
+                        seen.update(events=list(sim.world.events)))
+        self.assertEqual(got["broken"], [])
+        self.assertEqual(got["merged"], 5, got)
+        self.assertIn(5, {e["pr"] for e in seen["events"]
+                          if e["what"] == "resolve"})
+
+    def opened(self, changed):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        w = mr.ReplayWorld(tmp.name)
+        w.with_files(changed)
+        for n in changed:
+            w.arrive(n)
+        return w
+
+    def test_overlapping_lines_conflict(self):
+        w = self.opened({1: {"s.rs": [[10, 3]]}, 2: {"s.rs": [[11, 1]]}})
+        self.assertIsNone(w.merge_tree(w.prs[1]["head"], w.prs[2]["head"]))
+
+    def test_lines_apart_in_one_file_do_not(self):
+        w = self.opened({1: {"s.rs": [[10, 3]]}, 2: {"s.rs": [[30, 1]]},
+                         3: {"t.rs": [[10, 3]]}})
+        self.assertIsNotNone(
+            w.merge_tree(w.prs[1]["head"], w.prs[2]["head"]))
+        self.assertIsNotNone(
+            w.merge_tree(w.prs[1]["head"], w.prs[3]["head"]))
+
+
+class Overlay(unittest.TestCase):
+    """#391 item 4: days overlaid into a heavier one, whose pull
+    requests' lines meet across days."""
+
+    def test_the_second_day_is_renumbered_and_moved(self):
+        t = trace_of_day()
+        top = max(int(n) for n in t["prs"])
+        got = mo.overlay([t, t], shift=30)
+        self.assertEqual(len(got["prs"]), 2 * len(t["prs"]))
+        one, two = t["prs"]["2"], got["prs"][str(2 + top)]
+        self.assertEqual(two["opened"], one["opened"] + 30)
+        self.assertEqual(two["base"], one["base"] + top)
+        self.assertEqual(two["approved"], [m + 30 for m in one["approved"]])
+        self.assertEqual(got["prs"][str(3 + top)]["conflicts"],
+                         [n + top for n in t["prs"]["3"]["conflicts"]])
+        self.assertEqual(len(got["real"]["merges"]),
+                         2 * len(t["real"]["merges"]))
+        self.assertEqual(got["minutes"], t["minutes"] + 30)
+        self.assertTrue(any("no files" in l for l in got["inferred"]))
+
+    def test_two_days_lines_conflict_across_days(self):
+        t = trace_of_day()
+        t["prs"]["5"]["files"] = {"core.rs": [[10, 4]]}
+        top = max(int(n) for n in t["prs"])
+        heavier = mo.overlay([t, t], shift=5)
+        self.assertFalse(heavier["prs"][str(5 + top)].get("conflicts"))
+        # Twice the load: time for all of it to go in.
+        heavier["minutes"] = 300
+        seen = {}
+        got = mr.replay(heavier, Replay.SETTINGS, idle=5,
+                        inspect=lambda sim: seen.update(
+                            events=list(sim.world.events)))
+        self.assertEqual(got["broken"], [])
+        self.assertEqual(got["merged"], 2 * mr.replay(
+            t, Replay.SETTINGS, idle=5)["merged"], got)
+        # The second day's #5 changes the first day's #5's lines.
+        self.assertIn(5 + top, {e["pr"] for e in seen["events"]
+                                if e["what"] == "resolve"})
+
+
+class AfterTheSimulatedCheck(unittest.TestCase):
+    """--approve-after-green and --fix-after-red (#391 item 3): the
+    reviewer and the authors answer the simulated check, not the
+    trace's clock."""
+
+    SETTINGS = {"merge": {"test_ahead": {
+        "batch": 4, "batches": 2, "trains": "live", "stacks": True,
+        "stop_spent": True, "later_first": 1}},
+        "checks": {"max_wait_minutes": 30}}
+
+    def test_no_approval_or_fix_comes_from_the_trace(self):
+        t = trace_of_day()
+        s = mr.scenario(t, approve_after=5, fix_after=3)
+        self.assertFalse([e for e in s if e[1] in ("approve", "author_fix")])
+        self.assertTrue(all(e[2][-1] is False for e in s
+                            if e[1] == "arrive"))
+        self.assertTrue([e for e in mr.scenario(t) if e[1] == "approve"])
+
+    def test_approvals_follow_the_green_and_fixes_the_red(self):
+        t = trace_of_day()
+        seen = {}
+
+        def inspect(sim):
+            w = sim.world
+            seen["events"] = list(w.events)
+            seen["green"] = {
+                sha: [st for st in reversed(sts)
+                      if st["context"] == ms.CONTEXT
+                      and st["state"] == "success"]
+                for sha, sts in w.statuses.items()}
+        got = mr.replay(t, self.SETTINGS, idle=5, inspect=inspect,
+                        approve_after=5, fix_after=3)
+        self.assertEqual(got["broken"], [])
+        self.assertEqual(got["merged"], 5, got)
+        approvals = [e for e in seen["events"] if e["what"] == "approve"]
+        # #6 the trace never approved, and nor does the reviewer here.
+        self.assertNotIn(6, {e["pr"] for e in approvals})
+        self.assertEqual({e["pr"] for e in approvals}, {1, 2, 3, 4, 5})
+        fixes = [e for e in seen["events"] if e["what"] == "fix"]
+        self.assertEqual([e["pr"] for e in fixes], [5])
+        # Approved no sooner than the check's run and five minutes.
+        self.assertGreaterEqual(got["median_open_to_approval_minutes"],
+                                5 + t["run_minutes"]["head"] // 2)
+        self.assertIsNotNone(got["median_approval_to_merge_minutes"])
+
+    def test_the_report_splits_the_waits(self):
+        t = trace_of_day()
+        real = mr.reality(t)
+        self.assertIn("median_open_to_approval_minutes", real)
+        self.assertIn("median_approval_to_merge_minutes", real)
+        text = mr.table([("reality", real)])
+        self.assertIn("median open to approval, min", text)
+        self.assertIn("median approval to merge, min", text)
 
 
 class CheckOrder(unittest.TestCase):

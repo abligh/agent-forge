@@ -37,6 +37,47 @@ from agent_forge import config
 from tests.helpers import ROOT, example
 
 SLUG = "example/widget"
+# Where the Merger pushes: the simulation sends it to origin instead.
+REMOTE = "https://github.com/%s.git" % SLUG
+# What the Merger commits trains and resolutions as, when its project
+# hasn't said (the Merger's own RESOLVE_IDENTITY).
+IDENTITY = ("Merger", "merger@sim.invalid")
+# git's subcommands that reach a remote.
+NETWORK = {"push", "fetch", "pull", "clone", "ls-remote", "remote",
+           "archive", "submodule"}
+
+
+class NetworkUsed(AssertionError):
+    """A simulated Merger gave git a remote that isn't on this host."""
+
+
+def local_git(args, origin):
+    """`args`, a git command, with REMOTE sent to `origin`. Raises
+    NetworkUsed when any other argument of a command that reaches a
+    remote names one over the network: nothing a simulation runs may
+    leave the host."""
+    if not args or os.path.basename(args[0]) != "git":
+        return args
+    args = [origin if a == REMOTE else a for a in args]
+    words = [a for a in args[1:] if not a.startswith("-")]
+    # `git -C <dir> ...`: the subcommand is the first word that isn't
+    # the value of an option.
+    i, command = 1, None
+    while i < len(args):
+        if args[i] in ("-C", "-c"):
+            i += 2
+            continue
+        if not args[i].startswith("-"):
+            command = args[i]
+            break
+        i += 1
+    if command in NETWORK:
+        for a in words:
+            if "://" in a and not a.startswith("file://") or \
+                    ("@" in a and ":" in a.split("@", 1)[1]
+                     and not os.path.exists(a)):
+                raise NetworkUsed("git %s to %s" % (command, a))
+    return args
 OWNER = "example"
 REVIEWER = "reviewerwidgetagent"
 AUTHOR = "leaddevwidgetagent"
@@ -291,7 +332,7 @@ class World:
         self.note("approve", pr=number)
 
     def open(self, number, base=None, mac=False, red=False, urgent=False,
-             approve=True, clash=None, hot=False, shared=()):
+             approve=True, clash=None, hot=False, shared=(), contents=None):
         """Opens #`number`, on main or on the pull request `base`, with a
         change of its own (a file of its own, so nothing conflicts), and
         a line of its own in each of the `shared` files, so that it
@@ -301,7 +342,8 @@ class World:
         break the build together (a field one adds, an initializer
         without it in the other). `hot`: it also writes `hot.txt`, as
         every other hot one does, so each that merges makes the others
-        conflict with main."""
+        conflict with main. `contents`, {path: text}: whole files it
+        writes too (a replay's real changed lines, `merger_replay`)."""
         branch = "b%d" % number
         start = self.main() if base is None else self.prs[base]["head"]
         files = {"p%d.txt" % number: "v1\n"}
@@ -311,6 +353,8 @@ class World:
             files["clash-%s-%d.txt" % (clash, number)] = "v1\n"
         if hot:
             files["hot.txt"] = "#%d\n" % number
+        # Whole files of its own making (a replay's real changed lines).
+        files.update(contents or {})
         if mac:
             files["mac/p%d.txt" % number] = "v1\n"
         if red:
@@ -444,6 +488,9 @@ class SimGitHub:
         self.world = world
         self.env = {"GH_TOKEN": "fake"}
         self.writes = []
+        # The pull requests the Merger opened for its trains, by number:
+        # `branch`, `head`, `state`, `members` (merged by it).
+        self.trains = {}
 
     def prefetch(self, paths, workers=8):
         list(paths)
@@ -493,15 +540,26 @@ class SimGitHub:
                     for pr in w.prs.values()
                     if pr["branch"] == branch and pr.get("merged_at")]
         if rest.startswith("pulls/"):
-            pr = w.prs[int(rest.split("/")[1])]
+            number = int(rest.split("/")[1])
+            if number in self.trains:
+                train = self.trains[number]
+                return {"head": {"sha": train["head"],
+                                 "ref": train["branch"],
+                                 "repo": {"full_name": SLUG}},
+                        "base": {"ref": "main"},
+                        "merged": train["state"] == "MERGED"}
+            pr = w.prs[number]
             return {"head": {"sha": pr["head"], "ref": pr["branch"],
                              "repo": {"full_name": SLUG}},
-                    "base": {"ref": pr["base"]}}
+                    "base": {"ref": pr["base"]},
+                    "merged": pr["state"] == "MERGED"}
         if rest.startswith("git/ref/heads/"):
             return {"object": {"sha": w.ref("refs/heads/" + rest[14:])}}
         raise AssertionError("unexpected gh api %r" % (args,))
 
     def create(self, path, **fields):
+        if path == "repos/%s/pulls" % SLUG:
+            return self.open_train(fields)
         ok, why = self.write("POST", path, **fields)
         number = 9000 + len(self.world.issues)
         if ok:
@@ -515,6 +573,14 @@ class SimGitHub:
         parts = rest.split("/")
         if parts[0] == "issues" and parts[2:] == ["comments"]:
             w.handed_back(int(parts[1]), fields.get("body") or "")
+        if parts[0] == "pulls" and len(parts) >= 2 \
+                and int(parts[1]) in self.trains:
+            return self.train_write(method, int(parts[1]), parts[2:],
+                                    fields)
+        if parts[0] == "git" and method == "DELETE":
+            w.og("update-ref", "-d", "refs/" + "/".join(parts[2:]),
+                 check=False)
+            return True, ""
         if parts[0] == "pulls" and len(parts) == 3:
             number, pr = int(parts[1]), w.prs[int(parts[1])]
             if parts[2] == "update-branch":
@@ -530,6 +596,98 @@ class SimGitHub:
             return True, ""
         if parts[0] == "merges":
             return self.restack(fields["base"], fields["head"])
+        return True, ""
+
+    def open_train(self, fields):
+        """POST pulls: the train's pull request, from the branch the
+        Merger pushed to origin."""
+        w = self.world
+        head = w.og("rev-parse", "--verify", "-q",
+                    "refs/heads/" + fields["head"], check=False)
+        if not head:
+            return None, "Validation Failed: no branch %s" % fields["head"]
+        if fields.get("base") != "main":
+            return None, "Validation Failed: base %s" % fields.get("base")
+        number = 8000 + len(self.trains)
+        self.trains[number] = {"branch": fields["head"], "head": head,
+                               "state": "OPEN", "members": []}
+        w.note("train-open", pr=number)
+        return number, ""
+
+    def train_write(self, method, number, rest, fields):
+        train = self.trains[number]
+        if method == "PATCH" and not rest:
+            if fields.get("state") == "closed" and train["state"] == "OPEN":
+                train["state"] = "CLOSED"
+            return True, ""
+        if method == "PUT" and rest == ["merge"]:
+            return self.merge_train(number, train, fields)
+        raise AssertionError("unexpected %s on the train #%d: %r"
+                             % (method, number, rest))
+
+    def merge_train(self, number, train, fields):
+        """PUT pulls/N/merge with merge_method "merge" on a train: a merge
+        commit of its head into main. Every open pull request whose head
+        is then in main is merged, at the tree of the train's commit
+        that took it in (its prediction's), bottom first, as GitHub
+        marks them."""
+        w = self.world
+        if fields.get("merge_method") != "merge":
+            return False, "a train merges as a merge commit"
+        if train["state"] != "OPEN":
+            return False, "Pull Request is not open"
+        if fields.get("sha") != train["head"]:
+            return False, "Head branch was modified"
+        main = w.main()
+        tree = w.merge_tree(main, train["head"])
+        if tree is None:
+            return False, "Pull Request is not mergeable"
+        sha = w.og("commit-tree", tree, "-p", main, "-p", train["head"],
+                   "-m", fields.get("commit_title") or "train")
+        w.og("update-ref", "refs/heads/main", sha, main)
+        train["state"] = "MERGED"
+        # The chain, top down: each commit's second parent is the head
+        # it took in, its tree the prediction that tested it.
+        took, at = [], train["head"]
+        while at and at != main:
+            parents = w.og("rev-list", "--parents", "-n", "1", at).split()
+            if len(parents) < 3:
+                break
+            took.append((parents[2], w.tree(at)))
+            at = parents[1]
+        heads = {head: tree for head, tree in took}
+        for head, tree_at in reversed(took):
+            for pr in w.prs.values():
+                if pr["state"] != "OPEN" or pr["head"] != head:
+                    continue
+                pr["state"] = "MERGED"
+                pr["merged_at"] = iso(w.now)
+                train["members"].append(pr["number"])
+                w.merges.append({"pr": pr["number"], "tree": tree_at,
+                                 "at": iso(w.now), "head": head,
+                                 "train": number})
+                w.note("merge", pr=pr["number"], train=number)
+        # Any other open pull request whose head main now holds is merged
+        # too, as GitHub would mark it, at main's tree.
+        for pr in w.prs.values():
+            if pr["state"] == "OPEN" and pr["head"] not in heads and \
+                    subprocess.run(["git", "-C", w.origin, "merge-base",
+                                    "--is-ancestor", pr["head"], sha],
+                                   env=git_env()).returncode == 0:
+                pr["state"] = "MERGED"
+                pr["merged_at"] = iso(w.now)
+                train["members"].append(pr["number"])
+                w.merges.append({"pr": pr["number"], "tree": tree,
+                                 "at": iso(w.now), "head": pr["head"],
+                                 "train": number})
+                w.note("merge", pr=pr["number"], train=number)
+        if w.auto_retarget:
+            merged = {n for n in train["members"]}
+            for other in w.prs.values():
+                if other["state"] == "OPEN" and any(
+                        other["base"] == w.prs[n]["branch"] for n in merged):
+                    other["base"] = "main"
+                    w.note("retarget", pr=other["number"], by="github")
         return True, ""
 
     def update_branch(self, number, pr, expected):
@@ -1063,8 +1221,12 @@ class Monitor:
                 order = [n for n, _ in train["members"]]
                 if m["pr"] not in order:
                     continue
+                # One its author pushed to (or that was resolved,
+                # fixed or closed) after the train started has left it,
+                # as rule 1 allows: no longer ahead of anyone.
                 ahead = [n for n in order[:order.index(m["pr"])]
-                         if n not in before]
+                         if n not in before
+                         and not self.touched(n, train["since"])]
                 if ahead:
                     self.say(5, "#%d merged ahead of #%d, before it in the "
                              "train #%d..#%d (%s)" % (
@@ -1189,6 +1351,9 @@ class Sim:
         return queue[0] if queue else None
 
     def run_tools(self, args, cwd=None, env=None):
+        """The Merger's `run`: its pushes go to origin, and anything else
+        bound for the network fails the run (NetworkUsed)."""
+        args = local_git(list(args), self.world.origin)
         return subprocess.run(args, cwd=cwd, env=dict(env or os.environ,
                                                       **git_env()),
                               capture_output=True, text=True)
@@ -1230,12 +1395,20 @@ class Sim:
                 continue
             skipped = 0
             self.ticks += 1
-            record = self.m.tick(
-                self.world.work, self.state, self.github, self.run_tools,
-                lambda line: self.lines.append(
-                    "%s %s" % (iso(w.now)[11:16], line)),
-                now=lambda: w.now, sleep=lambda s: None, live=True,
-                check_state=self.check.state)
+            # The Merger's identity, which main() sets from the project:
+            # without one it makes no train commits and no resolutions.
+            identity = self.m.RESOLVE_IDENTITY
+            if identity is None:
+                self.m.RESOLVE_IDENTITY = IDENTITY
+            try:
+                record = self.m.tick(
+                    self.world.work, self.state, self.github,
+                    self.run_tools, lambda line: self.lines.append(
+                        "%s %s" % (iso(w.now)[11:16], line)),
+                    now=lambda: w.now, sleep=lambda s: None, live=True,
+                    check_state=self.check.state)
+            finally:
+                self.m.RESOLVE_IDENTITY = identity
             self.records.append(record)
             if w.scheduled:
                 events = sorted(events + w.scheduled, key=lambda e: e[0])

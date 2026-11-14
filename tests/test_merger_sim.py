@@ -167,6 +167,49 @@ class TopsByTree(unittest.TestCase):
         self.assertEqual((sim.top_runs, sim.stopped), (1, 0))
 
 
+class Trains(unittest.TestCase):
+    """merge.test_ahead.train_merge, as GitHub takes it: the train's
+    commits pushed to the simulated remote, its pull request opened and
+    merged, the members marked merged (#391)."""
+
+    def test_a_green_train_of_three_merges_as_one(self):
+        m = ms.load_merger()
+        # Boarding before their own greens, and those runs slower than
+        # the train's: its green comes first, and the three go in on it.
+        m.configure(ms.project({"own_head_green": False}, batch=3,
+                               batches=1, train_merge=True))
+        with tempfile.TemporaryDirectory() as root:
+            sim = ms.Sim(m, root, [(0, "open", (n,)) for n in (1, 2, 3)],
+                         own_minutes=30)
+            got = sim.run(120)
+            trains = sim.github.trains
+        self.assertEqual(got.broken, [], figures(got))
+        self.assertEqual(got.merged, 3, figures(got))
+        self.assertEqual([t["members"] for t in trains.values()],
+                         [[1, 2, 3]], "\n".join(got.lines))
+        self.assertEqual([t["state"] for t in trains.values()], ["MERGED"])
+        self.assertTrue(any("TRAIN-MERGE #1..#3: merged 3 as #8000" in l
+                            for l in got.lines), "\n".join(got.lines))
+
+    def test_a_push_to_the_network_fails_the_run(self):
+        origin = "/sim/origin.git"
+        self.assertEqual(
+            ms.local_git(["git", "-C", "w", "push", "-q", "-f", ms.REMOTE,
+                          "a:refs/heads/b"], origin),
+            ["git", "-C", "w", "push", "-q", "-f", origin, "a:refs/heads/b"])
+        for remote in ("https://github.com/other/repo.git",
+                       "ssh://git@example.com/repo.git",
+                       "git@github.com:example/widget.git"):
+            with self.assertRaises(ms.NetworkUsed, msg=remote):
+                ms.local_git(["git", "-C", "w", "push", remote, "a:b"],
+                             origin)
+            with self.assertRaises(ms.NetworkUsed, msg=remote):
+                ms.local_git(["git", "fetch", remote], origin)
+        # Not a remote at all: left as it is.
+        self.assertEqual(ms.local_git(["git", "log", "x@{1}:y"], origin),
+                         ["git", "log", "x@{1}:y"])
+
+
 class Rules(unittest.TestCase):
     """The monitor itself: a break it should see, it sees."""
 
@@ -183,6 +226,32 @@ class Rules(unittest.TestCase):
             sha=pr["head"], merge_method="squash")
         self.assertTrue(ok, why)
         self.sim.monitor.check()
+
+    def started(self):
+        """A train of #1 then #2, started now."""
+        w = self.world
+        w.open(1)
+        w.open(2)
+        self.sim.monitor.trains["t" * 40] = {
+            "members": [(1, "t1"), (2, "t2")], "since": ms.iso(w.now),
+            "tree": "t2", "done": False}
+        w.now += ms.datetime.timedelta(minutes=1)
+
+    def rule5(self):
+        return [l for l in self.sim.monitor.broken if "rule 5" in l]
+
+    def test_merging_past_one_ahead_in_the_train_is_a_break(self):
+        self.started()
+        self.merge(2)
+        self.assertEqual(len(self.rule5()), 1, self.sim.monitor.broken)
+
+    def test_not_past_one_whose_author_pushed_after_it_started(self):
+        # 2026-11-13 replayed: #10942 left its train on a push, and the
+        # rest of it merged as a train of two.
+        self.started()
+        self.world.push(1)
+        self.merge(2)
+        self.assertEqual(self.rule5(), [])
 
     def test_a_tree_nothing_tested_is_a_break(self):
         self.world.open(1)
