@@ -16,7 +16,14 @@
     "merger": "Merger",
     "ci_workflow": "",
     "approval": "green",
-    "own_head_green": true
+    "own_head_green": true,
+    "stall_minutes": 30,
+    "stall_alert": {
+      "tell": [
+        "XMPPEngineer"
+      ],
+      "retell_minutes": 30
+    }
   },
   "checks": {
     "context": "build-and-test",
@@ -45,8 +52,29 @@
     "bug": "bug"
   },
   "router": {
-    "idle_offer": {},
-    "owners": {"triage": "XMPPEngineer"}
+    "idle_offer": {
+      "idle_minutes": 3,
+      "shell_minutes": 5,
+      "retell_minutes": 30
+    },
+    "merge_notice": {
+      "window_minutes": 30
+    },
+    "stuck": {
+      "retarget": true,
+      "self_blocked": true,
+      "draft_hours": 2
+    },
+    "red_first": {
+      "fallback_hours": 2
+    },
+    "issue_blocked_by": "agents",
+    "quiet_labels": [
+      "Status:waiting-backlog"
+    ],
+    "owners": {
+      "triage": "XMPPEngineer"
+    }
   },
   "machinery": {
     "Merger": {
