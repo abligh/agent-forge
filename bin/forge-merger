@@ -2729,27 +2729,29 @@ class GitHub:
         return parse_pages(got.stdout)
 
     def prefetch(self, paths, workers=8):
-        """GET each of `paths` at once, side by side, for the next `api`
-        call that asks for it, which takes it (once: a second asks
-        GitHub again). Each `gh api` costs most of a second, nearly all
+        """GET each of `paths` (a path, or a tuple of `gh api`
+        arguments) at once, side by side, for the next `api` call that
+        asks for it, which takes it (once: a second asks GitHub again). Each `gh api` costs most of a second, nearly all
         of it waiting, and a tick asked for the statuses of every gated
         pull request's head one after another: about nine seconds of a
         45-second tick on 2026-11-11 (#301). A GET that fails is left
         for `api` to ask again and report."""
-        paths = [path for path in dict.fromkeys(paths)
-                 if (path,) not in self.fetched]
+        paths = [path for path in dict.fromkeys(
+                     path if isinstance(path, tuple) else (path,)
+                     for path in paths)
+                 if path not in self.fetched]
         if not paths:
             return
 
         def get(path):
-            got = self.run(["gh", "api", path], env=self.env)
+            got = self.run(["gh", "api"] + list(path), env=self.env)
             return path, got
 
         with concurrent.futures.ThreadPoolExecutor(workers) as pool:
             for path, got in pool.map(get, paths):
                 if got.returncode == 0:
                     try:
-                        self.fetched[(path,)] = parse_pages(got.stdout)
+                        self.fetched[path] = parse_pages(got.stdout)
                     except ValueError:
                         pass
 
@@ -2888,8 +2890,7 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
                             detail=UNION_DETAIL % got.reason)
             return back("author", CONFLICT_REASON)
         return {"action": "UPDATE"}
-    state, said = status_state(github.api(
-        "repos/%s/commits/%s/statuses?per_page=100" % (REPO_SLUG, head))
+    state, said = status_state(github.api(*status_path(head))
         or [], head_context())
     if state in (None, "pending"):
         return {"action": "WAIT", "reason": "%s is %s" % (
@@ -3539,8 +3540,7 @@ def merge_ready(repo, github, number, run=sh):
     head, why = pr["headRefOid"], []
     if pr.get("isDraft"):
         why.append("it is a draft")
-    state, said = status_state(github.api(
-        "repos/%s/commits/%s/statuses?per_page=100" % (REPO_SLUG, head))
+    state, said = status_state(github.api(*status_path(head))
         or [])
     if state != "success":
         why.append("%s is %s%s" % (STATUS_CONTEXT, state or "absent",
@@ -4652,9 +4652,14 @@ def newest_status(statuses, context, creator):
 
 
 def status_path(commit):
-    """The API path of `commit`'s statuses, as `instance_verdict` asks
-    for them and the tick prefetches them."""
-    return "repos/%s/commits/%s/statuses?per_page=100" % (REPO_SLUG, commit)
+    """The `gh api` arguments for every one of `commit`'s statuses, as
+    each reader asks for them and the tick prefetches them. Every page:
+    REST lists 100 at most, newest first, and another App's status
+    posted every few minutes (a liveness check) pushed a head's only
+    build verdict off the first page in about 16 hours, so the Merger
+    called a green head's check absent and held it."""
+    return ("--paginate",
+            "repos/%s/commits/%s/statuses?per_page=100" % (REPO_SLUG, commit))
 
 
 def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
@@ -4671,7 +4676,7 @@ def instance_verdict(repo, pr, main_tip, github, context, creator, run=sh):
     commit, first, depth, layer_heads = pr["headRefOid"], None, 0, []
     while commit and depth < GATE_DEPTH:
         depth += 1
-        state, said = newest_status(github.api(status_path(commit)),
+        state, said = newest_status(github.api(*status_path(commit)),
                                     context, creator)
         if state not in (None, "pending"):
             return state, said, commit
@@ -4730,9 +4735,8 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
     seen = []
     for sha in dict.fromkeys(s for s in shas if s):
         if sha not in cache:
-            cache[sha] = status_state(github.api(
-                "repos/%s/commits/%s/statuses?per_page=100"
-                % (REPO_SLUG, sha)) or [], head_context())[0]
+            cache[sha] = status_state(github.api(*status_path(sha)) or [],
+                                      head_context())[0]
         if cache[sha] == "success":
             return None
         seen.append((sha, cache[sha]))

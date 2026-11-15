@@ -863,7 +863,8 @@ class Decide(RepoCase):
     def test_it_reads_the_heads_commit_statuses(self):
         self.decide()
         self.assertEqual(self.github.calls[0], (
-            "%s/commits/%s/statuses?per_page=100" % (SLUG, self.head),))
+            "--paginate",
+            "%s/commits/%s/statuses?per_page=100" % (SLUG, self.head)))
 
     def test_update_when_behind_main(self):
         self.advance_main("m3.txt")
@@ -1358,6 +1359,37 @@ class GitHubApi(unittest.TestCase):
         self.assertEqual(sorted(asked), ["a", "b"])
         self.assertEqual(github.api("a"), {"p": "a"})
         self.assertEqual(sorted(asked), ["a", "a", "b"])
+
+    def test_prefetched_argument_tuples_are_answered_once(self):
+        asked = []
+
+        def run(args, cwd=None, env=None):
+            asked.append(tuple(args[2:]))
+            return subprocess.CompletedProcess(args, 0, "[1][2]", "")
+        github = m.GitHub("tok", run)
+        github.prefetch([m.status_path("abc"), m.status_path("abc")])
+        self.assertEqual(asked, [m.status_path("abc")])
+        self.assertEqual(github.api(*m.status_path("abc")), [1, 2])
+        self.assertEqual(asked, [m.status_path("abc")])
+
+    def test_a_green_past_the_first_page_of_statuses_is_read(self):
+        # Another App's liveness status every ten minutes put the one
+        # green build verdict on page 3 of the head's statuses within
+        # 40 hours, and the Merger held an approved, green pull request
+        # with the check "absent". gh prints each page as its own array.
+        def status(context):
+            return {"context": context, "state": "success",
+                    "creator": {"login": m.STATUS_CREATOR}}
+        pages = [[status("liveness")] * 100, [status("liveness")] * 100,
+                 [status("liveness")] * 34 + [status(m.STATUS_CONTEXT)]]
+
+        def run(args, cwd=None, env=None):
+            self.assertEqual(args[2], "--paginate")
+            return subprocess.CompletedProcess(
+                args, 0, "".join(json.dumps(p) for p in pages), "")
+        github = m.GitHub("tok", run)
+        self.assertEqual(m.status_state(github.api(*m.status_path("abc"))),
+                         ("success", ""))
 
     def test_a_failed_prefetch_is_asked_again_and_reported(self):
         def run(args, cwd=None, env=None):
