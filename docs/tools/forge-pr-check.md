@@ -309,7 +309,9 @@ A post GitHub refuses changes neither the verdict nor the exit status
 steps, host, poster, state directory (`pr-check-<name>`) and lines
 that carry its name (`GREEN mac #7 ...`). With `pull_requests` it runs
 only the heads it applies to (`scope.json`; `SCOPE-UNKNOWN` while the
-files can't be read). With `gate`, the Merger waits for its context.
+files can't be read). With `main_paths`, a default-branch head that
+changes none of its `paths` gets the last verdict (`CARRIED`) instead
+of a run. With `gate`, the Merger waits for its context.
 With `lock`, a run takes the host's shared lock directory first.
 
 ## State and logs
