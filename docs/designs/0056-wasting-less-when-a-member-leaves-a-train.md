@@ -28,6 +28,10 @@ every prediction at and after its place. Those runs are then wasted.
    `batch` grows by one each time a train merges whole, and halves when
    a started train loses a member, between a floor and the configured
    `batch`. New key `merge.test_ahead.window`, off by default.
+5. **A train whose run hasn't started takes new members.** Added
+   after step 1 counted lone merges: half of them went alone because
+   a train of one held a train's place. New key
+   `merge.test_ahead.grow_unstarted`, off by default.
 
 No new rule about queue order is proposed. Every new key is off
 unless set.
@@ -189,6 +193,40 @@ predictions. When they are rare, trains grow back to `batch`. The
 record carries `window` each tick, and `forge-flow` shows it beside
 the trains.
 
+### 5. A train whose run hasn't started takes new members
+
+*Added 2026-11-15, from step 1's figures (#417).*
+
+On the library's ordinary day, with the settings above, 52 of 111
+merges went alone, as trains of one. At those merges the Merger
+usually had two to four other pull requests eligible. Its record says
+why they stayed out: `every train is full`, 304 times in the day, and
+`conflicts onto train 2` 120 times. Departures from started trains
+happened 3 times.
+
+The cause is rule 3 of `cut_trains`. With `trains: "live"`, the trains
+the last tick cut are kept as cut (rule 1), and new pull requests are
+cut only into **new** trains, while there are fewer than `batches`.
+So a train of one, cut when it was the only candidate, keeps one of
+the two trains' places until it merges, even while its top's run
+hasn't started. Pull requests approved a minute later wait for it.
+
+New key `merge.test_ahead.grow_unstarted` (default false). With it:
+
+* the **last** kept train whose top's run the build check hasn't
+  started (`started(sha, tree)`, as rule 2 already asks) takes new
+  members after its last one, by rule 3's usual test (merges cleanly,
+  touches no file the train touches, within `batch`);
+* trains whose runs have started never change: no run is thrown away;
+* only the last unstarted train grows, so no newcomer goes in front of
+  a member already cut (rule 1 holds);
+* the grown train's new top is a new prediction, so the check runs it
+  in place of the old top, which hadn't started.
+
+What it costs: a top that hadn't started is predicted again, which is
+cheap. A top that the check was about to start may wait one tick
+longer for its new prediction.
+
 ## Measuring
 
 `forge-flow` and the replay report already give departures from
@@ -210,9 +248,11 @@ carries `make replay-compare`'s table.
    request), and departures by place plus lone runs in the replay
    report and `forge-flow`. Until those are counted, the library's days
    can't show what items 3 and 4 change.
-2. `merge.test_ahead.window`.
-3. `merge.resolve.board_unreviewed`, with the `RESOLUTION-REVIEW` ask.
-4. Only if Alex asks: `merge.resolve.keep_approval_paths`.
+2. `merge.test_ahead.grow_unstarted` (item 5), judged on the lone
+   merges first.
+3. `merge.test_ahead.window`.
+4. `merge.resolve.board_unreviewed`, with the `RESOLUTION-REVIEW` ask.
+5. Only if Alex asks: `merge.resolve.keep_approval_paths`.
 
 ## Acceptance
 
@@ -223,6 +263,8 @@ carries `make replay-compare`'s table.
   * the tail keeps its place after a departure;
   * the window halves on a departure and grows on a whole train's
     merge;
+  * a train of one whose run hasn't started takes a newcomer; one
+    whose run has started doesn't;
   * a resolution that meets the rule boards and merges only after its
     new approval; one that changes a line outside the conflicted hunks
     doesn't board.
