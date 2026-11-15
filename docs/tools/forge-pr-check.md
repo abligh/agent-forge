@@ -245,8 +245,11 @@ logs `FLAKE`.
   No verdict is recorded (`HOST-FAULT`); the head keeps its place and
   is tried on cron's next tick.
 * **A stale cache.** A red matching `cache_fault_text` clears the
-  slot's `incremental` directories and runs the head again at once
-  (`CACHE-FAULT`); a second match stands.
+  slot's `incremental` directories and those crates' `.fingerprint`
+  directories, and runs the head again at once (`CACHE-FAULT`); a
+  second match stands. The failing crates' sessions are moved to
+  `cache-fault/` in the state directory, for comparison; the newest
+  three are kept.
 * **A head that can't be checked out** goes behind every other.
 * After 3 failures to prepare, or 3 host faults, a head is given up on
   and posted `error`, until `labels.rerun` tries it again.

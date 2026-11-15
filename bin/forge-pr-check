@@ -81,9 +81,17 @@ its author would otherwise be sent to fix what isn't hers.
 red whose failed step's tail holds every string of one of its entries
 records no verdict, and `verdicts.log` says `CACHE-FAULT`. While the
 slot's lock is still held, every directory directly in an
-`incremental` directory under the slot's caches is removed, and the
-head runs again at once in the same slot. That isn't `labels.rerun`'s
-rerun, nor a host fault. If it matches again, the red stands.
+`incremental` directory under the slot's caches is removed, and so is
+each of those crates' `.fingerprint/<crate>-*` directories: without
+them, cargo takes the crates' last build as fresh and links its objects
+again, so a fault in a library rather than its incremental state
+faulted the rerun too. The sessions of the crates the tail names as
+failing (`could not compile `<crate>``) are moved, not removed, to
+`cache-fault/<time>-<sha>-<slot>/` in the state directory, so that a
+faulty cache can be compared with a good one later; the newest three
+are kept. The head then runs again at once in the same slot. That
+isn't `labels.rerun`'s rerun, nor a host fault. If it matches again,
+the red stands.
 
 **A run of a head that is no longer its pull request's is stopped.**
 When a tick finds a slot running a head that no open pull request has
@@ -4302,13 +4310,9 @@ def cache_fault(results):
     return None
 
 
-def clear_incremental(state_dir, slot):
-    """Remove every directory directly in an `incremental` directory
-    under the slot's caches (`cache_folders`), the unit the pruning
-    removes whole, and return how many went. Only what resolves inside
-    a cache of this slot's, under state_dir, is removed: a cache that
-    is a link, or a link inside one, is left alone. Called with the
-    slot's lock held, so no run is using the caches."""
+def slot_cache_roots(state_dir, slot):
+    """The real paths of the slot's caches (`cache_folders`) that are
+    directories directly in state_dir, not links."""
     top = os.path.realpath(state_dir)
     roots = []
     for folder in cache_folders():
@@ -4317,6 +4321,26 @@ def clear_incremental(state_dir, slot):
         if os.path.isdir(root) and not os.path.islink(root) \
                 and os.path.dirname(real) == top:
             roots.append(real)
+    return roots
+
+
+def unit_crate(name):
+    """The crate a cargo unit directory (`<crate>-<hash>`, in
+    `incremental` or `.fingerprint`) belongs to, with `-` read as `_`:
+    an incremental directory carries the crate's name (`my_crate`), a
+    fingerprint the package's (`my-crate`)."""
+    return name.rsplit("-", 1)[0].replace("-", "_")
+
+
+def clear_incremental(state_dir, slot, crates=None):
+    """Remove every directory directly in an `incremental` directory
+    under the slot's caches (`cache_folders`), the unit the pruning
+    removes whole, and return how many went. Only what resolves inside
+    a cache of this slot's, under state_dir, is removed: a cache that
+    is a link, or a link inside one, is left alone. Called with the
+    slot's lock held, so no run is using the caches. The crates whose
+    state went are added to `crates`, when given."""
+    roots = slot_cache_roots(state_dir, slot)
     gone = 0
     for path in incremental_sessions(roots):
         real = os.path.realpath(path)
@@ -4327,6 +4351,98 @@ def clear_incremental(state_dir, slot):
         except OSError:
             continue
         gone += 1
+        if crates is not None:
+            crates.add(unit_crate(os.path.basename(real)))
+    return gone
+
+
+CACHE_FAULT_KEEP = 3
+
+
+def faulting_crates(tail):
+    """The crates (`-` read as `_`) cargo names in `tail` as failing to
+    compile (`could not compile `<crate>``); empty when it names none."""
+    return {name.replace("-", "_")
+            for name in re.findall(r"could not compile `([^`]+)`", tail)}
+
+
+def quarantine_sessions(state_dir, slot, crates, label, when):
+    """Move the slot's incremental sessions of `crates` to
+    <state_dir>/cache-fault/<when>-<label>/, so that a faulty cache can
+    be compared with a good one later, and return that directory and
+    how many sessions moved (None and 0 when none did). A move is a rename: a session that can't
+    be renamed there (another filesystem) stays, for clear_incremental.
+    Only the newest CACHE_FAULT_KEEP quarantines are kept."""
+    if not crates:
+        return None, 0
+    roots = slot_cache_roots(state_dir, slot)
+    base = os.path.join(state_dir, "cache-fault")
+    dest = os.path.join(base, "%s-%s" % (when.strftime("%Y%m%dT%H%M%SZ"),
+                                         label))
+    moved = 0
+    for path in incremental_sessions(roots):
+        real = os.path.realpath(path)
+        if not any(real.startswith(root + os.sep) for root in roots) \
+                or unit_crate(os.path.basename(real)) not in crates:
+            continue
+        # The profile keeps sessions of one crate from two profiles
+        # apart: <dest>/<profile path in the cache>/<session>.
+        root = next(r for r in roots if real.startswith(r + os.sep))
+        target = os.path.join(dest, os.path.basename(root),
+                              os.path.relpath(real, root))
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            os.rename(real, target)
+        except OSError:
+            continue
+        moved += 1
+    try:
+        kept = sorted(d for d in os.listdir(base)
+                      if os.path.isdir(os.path.join(base, d))
+                      and not os.path.islink(os.path.join(base, d)))
+    except OSError:
+        kept = []
+    for old in kept[:-CACHE_FAULT_KEEP]:
+        shutil.rmtree(os.path.join(base, old), ignore_errors=True)
+    if not moved:
+        shutil.rmtree(dest, ignore_errors=True)
+        return None, 0
+    return dest, moved
+
+
+def clear_fingerprints(state_dir, slot, crates):
+    """Remove the slot's `.fingerprint/<crate>-<hash>` directories of
+    `crates`, and return how many went. Without them cargo would take
+    the crates' last build as fresh and link its objects again: a
+    cache fault that lives in a library, not in its incremental state,
+    would then fault the rerun too (two heads in one slot on
+    2026-11-15). With them gone, cargo builds those crates, and what
+    depends on them, again. Same safety rules as clear_incremental."""
+    if not crates:
+        return 0
+    roots = slot_cache_roots(state_dir, slot)
+    gone = 0
+    for root in roots:
+        for top, dirs, _ in os.walk(root):
+            if os.path.basename(top) != ".fingerprint":
+                # Neither holds a fingerprint directory, and `deps`
+                # may hold millions of files.
+                dirs[:] = [d for d in dirs
+                           if d not in ("deps", "incremental")]
+                continue
+            for d in dirs:
+                path = os.path.join(top, d)
+                if os.path.islink(path) or unit_crate(d) not in crates:
+                    continue
+                real = os.path.realpath(path)
+                if not real.startswith(root + os.sep):
+                    continue
+                try:
+                    shutil.rmtree(real)
+                except OSError:
+                    continue
+                gone += 1
+            dirs.clear()
     return gone
 
 
@@ -7666,7 +7782,14 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             # No verdict: the slot's incremental state goes while its
             # lock is held, and the head runs again now, in this slot.
             # Not labels.rerun's rerun, and not a host fault.
-            cleared = clear_incremental(state_dir, slot)
+            failing = faulting_crates(next(
+                (r["tail"] for r in results if r["name"] == stale[0]), ""))
+            kept, moved = quarantine_sessions(state_dir, slot, failing,
+                                       "%s-%s" % (sha[:10], slot),
+                                       now_utc())
+            crates = set(failing) if kept else set()
+            cleared = moved + clear_incremental(state_dir, slot, crates)
+            prints = clear_fingerprints(state_dir, slot, crates)
             for path in files.values():
                 try:
                     os.unlink(path)
@@ -7674,11 +7797,15 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                     pass
             files.clear()
             log(state_dir, "CACHE-FAULT%s %s %s in %s: %s: its tail has %s; "
-                "no verdict; cleared %d incremental directories, and run "
-                "again now" % (" AHEAD" if ahead else "", name, sha[:10],
-                               slot_label(slot), stale[0],
-                               json.dumps(list(stale[1]), ensure_ascii=False),
-                               cleared), now_utc(), out)
+                "no verdict; cleared %d incremental directories and %d "
+                "fingerprints%s, and run again now"
+                % (" AHEAD" if ahead else "", name, sha[:10],
+                   slot_label(slot), stale[0],
+                   json.dumps(list(stale[1]), ensure_ascii=False),
+                   cleared, prints,
+                   "; kept %s's sessions in %s" % (", ".join(sorted(failing)),
+                                                    kept) if kept else ""),
+                now_utc(), out)
         if stale is not None:
             log(state_dir, "CACHE-FAULT%s %s %s in %s: %s: its tail has %s "
                 "again, after its cache was cleared; the red stands"
