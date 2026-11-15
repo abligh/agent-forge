@@ -42,6 +42,13 @@ configuration's `stats_watch.figures`:
                    session, so each run then builds from nothing
                    (designs/0024, fifth amendment); the value shown is
                    the worst slot's excess
+    red_train_tops_per_merge  the Merger's predictions (a train's or
+                   batch's top) whose run went red, over the merges:
+                   over `limit`, or over `ratio` x the baseline's; its
+                   samples are the merges. With checks.quick
+                   (designs/0055) each is a red the quick check on
+                   the heads let through: when it climbs, move a step
+                   from the "train" tier to "both"
 
 From `forge-flow`'s figures (designs/0045), read in this process from
 the same state directory:
@@ -162,6 +169,7 @@ WHAT = {
                             "CPU-s a merge"),
     "cache_over_limit": ("build-check slots over their cache limit",
                          "over"),
+    "red_train_tops_per_merge": ("red train tops ÷ merges", "per merge"),
     "hand_backs_per_merge": ("hand-backs told (all pull requests) ÷ merges",
                              "per merge"),
     "prs_per_slot": ("pull requests merged per green run", "per run"),
@@ -339,6 +347,9 @@ def figures(stats, hours, watched=None):
         "check_cpu_per_merge": (
             every["seconds"] / merges if merges and every.get("runs")
             else None, merges),
+        "red_train_tops_per_merge": (
+            (check.get("red") or {}).get("prediction", 0) / merges
+            if merges else None, merges),
     }
 
 
@@ -359,7 +370,7 @@ def show(figure, value):
     if figure == "cache_over_limit":
         return "%.0fG over" % value
     if figure in ("hand_backs_per_merge", "prs_per_slot",
-                  "runs_per_merge"):
+                  "runs_per_merge", "red_train_tops_per_merge"):
         return "%.2f %s" % (value, unit)
     if unit == "%":
         return "%.0f%%" % value

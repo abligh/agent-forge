@@ -77,7 +77,14 @@ lane's slot is not counted) and whether there is a `nightly` section
   over `checks.slots` times the window. Near 100% means heads queue;
 * the default branch's CPU seconds per run, and per step, from the
   check's `state.json` (`main_cpu`);
-* the scoped steps' time, when some ran (`scoped_seconds`).
+* the scoped steps' time, when some ran (`scoped_seconds`);
+* with `checks.quick`, the two tiers apart (`tiers`): runs, reds, slot
+  time and waits of the quick runs and of the full ones, from the
+  `tier=` each verdict line ends with
+  ([designs/0055](../designs/0055-a-quick-check-on-heads-the-full-check-on-trains.md));
+* red train tops per merge (`red_train_tops_per_merge`): the Merger's
+  predictions whose run went red, over the merges. Each is a red no
+  head's own check found.
 
 **The merge queue**, from `merger/merger.jsonl`:
 
