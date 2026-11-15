@@ -439,6 +439,16 @@ class Offer(unittest.TestCase):
                          "is your turn: %s. Act on it, or say on it why not."
                          % decided["line"])
 
+    def test_a_blocked_red_is_no_turn_to_remind_of(self):
+        # A red pull request whose base is open (Blocked-by:) was its
+        # author's turn, and rule 15 reminded her of it every retell.
+        red = pr_node(41, author=LEADDEV, statuses=[{
+            "context": "vm/build-and-test", "state": "FAILURE",
+            "createdAt": T1, "creator": {"login": "mergerwidgetagent"}}])
+        red["body"] = "Blocked-by: #40\n"
+        ctx = context(prs=[red, pr_node(40, author=UIDEV)])
+        self.assertEqual(rules.turns_of("LeadDev", ctx), [])
+
     def test_no_reminder_of_a_turn_not_yet_woken_for(self):
         issues = [owned(30), owned(31, comments=[comment(REVIEWER, T2)])]
         ctx = context(issues=issues, previous={"at": T2, "items": {}},

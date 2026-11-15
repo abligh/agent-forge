@@ -64,7 +64,12 @@ Then:
    so neither the Merger's merges of main nor another reviewer's
    approval lift it;
 4. the build check's status (`checks.context`) is `failure` or `error`
-   on the head: the author's;
+   on the head: the author's, unless a `Blocked-by:` line in its body
+   names an item still open (the `blockers` lookup): then nobody's,
+   suppressed "red, and blocked by #N: the Merger holds it". A head
+   built on a base that predates a fix is red until the base merges,
+   and the author can't act on that; once every named item has closed,
+   the red is the author's again, woken then, as a new turn;
 5. it is `pending` or absent on the head: nobody's;
 23. with `merge.mode` `manual` (agent-forge #274), after rule 5: green,
    and nothing it names holds it (a `Blocked-by:` item open, a
@@ -120,7 +125,7 @@ Issues:
     someone notices. A line written after its item closed doesn't
     wake, and a number that names nothing is left out. Pull requests
     don't need it: the Merger holds a blocked one and takes it up
-    itself. What the named items are now is the `blockers` lookup.
+    itself, and rule 4 leaves a blocked red with it. What the named items are now is the `blockers` lookup.
     With `router.issue_blocked_by: "agents"`, an issue's lines may also
     be in a comment by the project's owner or by any agent in the
     configuration: the newest such text with a `Blocked-by:` line
@@ -844,7 +849,11 @@ def route_pr(pr, roster, when=None):
                         roster.who(author_of(newest)),
                         newest.get("databaseId")))
     state = ((status or {}).get("state") or "").lower()
-    # Rule 4.
+    # Rule 4. A blocked red is the Merger's to hold (rule 14: "the
+    # Merger holds a blocked one"), not a turn that rule 15 repeats.
+    if state in ("failure", "error") and blocked(pr):
+        return nobody(n, 4, "red, and blocked by %s: the Merger holds it"
+                      % ", ".join("#%d" % b for b in open_blockers(pr)))
     if state in ("failure", "error"):
         return turn(n, author, 4, status.get("createdAt") or head,
                     "%s is %s at %s" % (STATUS_CONTEXT, state, head[:7]))
@@ -1402,6 +1411,16 @@ def blocked(issue):
     if not isinstance(known, dict):
         return True
     return any((known.get(b) or {}).get("state") == "OPEN" for b in named)
+
+
+def open_blockers(item):
+    """The numbers an item's `Blocked-by:` lines name that are still
+    open, or not known, as `blocked` reads them: oldest first."""
+    known = item.get("blockedBy")
+    named = sorted(blockers_of(item))
+    if not isinstance(known, dict):
+        return named
+    return [b for b in named if (known.get(b) or {}).get("state") == "OPEN"]
 
 
 def owned_issues(agent, ctx):
@@ -2259,12 +2278,13 @@ BLOCKER_FIELD = ("    n%d: issueOrPullRequest(number:%d) {\n"
 def attach_blockers(github, repo, prs, issues):
     """Give each open issue a `blockedBy` map, {number: {"state",
     "closedAt"} or None}, for the numbers its `Blocked-by:` lines name,
-    and each draft too when rule 0c is on. An open item is known from
+    and each pull request whose body names any (rule 4 holds a blocked
+    red; rule 0c and `waits` read it too). An open item is known from
     the listing; the rest are asked for in one more query, only when
     there are any. None: names nothing."""
     owner, name = repo.split("/")
     open_now = {i["number"] for i in prs + issues}
-    covered = issues + [p for p in prs if DRAFT_HOURS and p.get("isDraft")]
+    covered = issues + [p for p in prs if merger.blockers_of(p)]
     named = {i["number"]: blockers_of(i) for i in covered}
     ask = sorted(set().union(*named.values()) - open_now) if named else []
     def look_up(numbers):
