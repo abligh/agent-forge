@@ -1431,6 +1431,7 @@ platform. Without an instance, `forge-pr-check` runs as before.
 | `main_red_issue` | The block only, never inherited: the instance's own issue while its newest default-branch verdict is red (designs/0034), titled by default `The default branch is red for <context> at <sha>`. Its `poster`'s App then needs `issues: write`. While such an issue is open (an open issue with the block's labels, by its `poster`, titled as above), `forge-merger` puts the pull requests whose title or body closes it first, as it does the main context's fixes; it reads them from GitHub, since the instance's state is on its own host (agent-forge #154). |
 | `first_authors`, `merger_first`, `merger_cpu_weight`, `docker_slices`, `flake_issue`, `quick` | `checks` only, and refused in a block: they belong to the context the Merger requires. `merge.test_ahead` doesn't apply to an instance either. |
 | `pull_requests` | The block only, and refused in `checks`, whose context the Merger requires on every head: `{"paths": [glob, ...], "label": name}`, either left out but not both. See below. |
+| `main_paths` | The block only, and refused in `checks`: `true` scopes the default branch's heads by `pull_requests.paths` too (default `false`; see below). Needs `paths` and `main` `every` or `newest`. |
 | `gate` | The block only, and refused in `checks`: `true` makes the Merger wait for this instance's context too, on each pull request the instance applies to (default `false`; see below). |
 | `lock` | The block only: the host's own exclusive lock, a directory that agents sharing the machine take with `mkdir`, as `{"dir": path, "wait_minutes": n}` (`wait_minutes` default 60). Before its first step a run takes it and writes `owner` inside (`forge-pr-check <instance> #<pr> <sha> pid <pid> since <time>`), so an agent waiting on it sees who holds it. It lets go when the run ends, however it ends, and only while the owner file still names it. While someone else holds it the run waits, then after `wait_minutes` gives up as a `HOST-FAULT`, naming the holder. That fault isn't counted toward a head's `error`, since the host is busy rather than broken. |
 
@@ -1475,6 +1476,23 @@ its pending status is ended with a green `not run: this pull request
 changes no path this check runs`. A label put on later queues the
 head on the next tick. Without `pull_requests` every head is run, as
 before.
+
+**`main_paths`: which default-branch heads an instance runs.** With
+`main` `every` or `newest`, an instance runs every new default-branch
+head, even one that changes nothing its `pull_requests` covers. With
+`main_paths: true`, a head is run only when the paths that changed
+since the last default-branch head with a verdict here (`git diff
+--name-only` in the cron checkout) match one of `paths`. Any other head
+gets that head's verdict, marked `carried` in `state.json`, with no
+`tree` so no head's tree is ever matched against it. It logs
+`CARRIED <name> main <sha>: <verdict> as at <sha>, which changes none
+of this check's paths` and posts `green as at <sha>: no change in this
+check's paths since` (or the red, `red(<steps>) as at <sha>: …`), tried
+again on later ticks while GitHub refuses it. A red therefore stays red
+until a head that changes those paths is run. `main_red_issue` is
+neither commented on nor closed by a carried verdict, and `labels.rerun`
+on that issue runs the current head, carried or not. A head whose
+changes git can't list, or with no earlier verdict here, is run.
 
 Two instances on one host share `forge-cron-run`'s per-tool lock, so
 their ticks run one after the other. Ticks return at once, so neither

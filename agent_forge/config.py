@@ -189,7 +189,8 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "side_by_side": dict, "merger_cpu_weight": int,
           "docker_slices": dict, "pull_requests": dict, "warm": dict,
           "approved_first": bool, "scoped_minutes": int,
-          "gate": bool, "flake_issue": dict, "order": str, "quick": dict}
+          "gate": bool, "flake_issue": dict, "order": str, "quick": dict,
+          "main_paths": bool}
 # checks.flake_issue (agent-forge #287): an issue for each step a
 # prediction's retry (merge.test_ahead.retry_red) turned green.
 FLAKE_ISSUE = {"labels": list, "owner": str}
@@ -230,7 +231,10 @@ INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
 # And from the block alone, never `checks`: a context the Merger requires
 # can't leave heads unrun (designs/0034). `gate`: the Merger also waits
 # for the instance's context on the pull requests it applies to.
-INSTANCE_ONLY = ("pull_requests", "gate")
+# `main_paths`: the default branch's heads are scoped by
+# pull_requests.paths too, so a head that changes none of them since
+# the last one run is given that one's verdict instead of a run.
+INSTANCE_ONLY = ("pull_requests", "gate", "main_paths")
 # An instance's host's own exclusive lock, which agents sharing the
 # machine take with `mkdir` (agent-forge issue 54): {dir, wait_minutes}.
 # Instance-only, and checked here rather than as a `checks` key.
@@ -1167,6 +1171,20 @@ def _check_checks(checks, data, problems, where="checks"):
         else:
             _check_pull_requests(checks["pull_requests"], problems,
                                  where + ".pull_requests")
+    if checks.get("main_paths") is True:
+        if where == "checks":
+            problems.append("checks.main_paths: only an instance may set "
+                            "it, since the Merger's context checks every "
+                            "default-branch head it needs")
+        elif not (checks.get("pull_requests") or {}).get("paths"):
+            problems.append("%s.main_paths needs %s.pull_requests.paths: "
+                            "they are what a default-branch head must "
+                            "change to be run" % (where, where))
+        elif checks.get("main", "needed") not in ("every", "newest"):
+            problems.append("%s.main_paths needs %s.main \"every\" or "
+                            "\"newest\": otherwise default-branch heads "
+                            "are run only when a record needs them"
+                            % (where, where))
     if "gate" in checks and where == "checks":
         problems.append("checks.gate: only an instance may set it; the "
                         "Merger always requires checks.context")
