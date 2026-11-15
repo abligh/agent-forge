@@ -24,7 +24,10 @@ defaults to the last `--hours` (24) up to now.
 - the time each run spent waiting for a slot, and running;
 - how busy the slots were: the run time of runs that finished in the
   window, over `checks.slots` times the window. The fast lane's runs
-  count, but not its slot, so near 100% means heads queue;
+  count, but not its slot, so near 100% means heads queue. With
+  `checks.quick` (designs/0055), its slots count too, as its runs do:
+  without them a project checking every head in the quick tier reads
+  over 100% however idle its slots are;
 - the CPU time of the default branch's runs (`main_cpu`, from the
   check's `state.json`, which records each step's CPU seconds): each
   run's total over its steps, and each step's, for the runs that
@@ -126,6 +129,8 @@ SPENT_RE = re.compile(r"^(\S+) STOPPED-SPENT ")
 TIER_RE = re.compile(r" tier=(quick|full)\s*$")
 TIER_NAMES = ("quick", "full")
 DEFAULT_SLOTS = 2
+# forge-pr-check's default for checks.quick.slots.
+DEFAULT_QUICK_SLOTS = 1
 BATCH = 40
 
 CAUSES = (
@@ -182,8 +187,10 @@ def read_lines(path):
         return []
 
 
-def check_stats(lines, since, until, slots):
-    """The build check's figures from verdicts.log's lines."""
+def check_stats(lines, since, until, slots, quick_slots=0):
+    """The build check's figures from verdicts.log's lines. `slots` is
+    checks.slots, `quick_slots` checks.quick.slots (0 without the quick
+    tier): both are the capacity the busy share is over."""
     runs = collections.Counter()
     red = collections.Counter()
     waited, ran, pr_total = [], [], []
@@ -249,7 +256,7 @@ def check_stats(lines, since, until, slots):
         busy += r
         if kind == "pull request":
             pr_total.append(w + r)
-    capacity = slots * (until - since).total_seconds()
+    capacity = (slots + quick_slots) * (until - since).total_seconds()
     hits = [k for k in predictions if k in used]
     return {"runs": dict(runs), "red": dict(red), "matched": matched,
             "predictions": {
@@ -261,7 +268,8 @@ def check_stats(lines, since, until, slots):
             "stopped_spent": spent,
             "waited": summary(waited), "ran": summary(ran),
             "pull_request_seen_to_verdict": summary(pr_total),
-            "slots": slots, "busy_seconds": busy,
+            "slots": slots, "quick_slots": quick_slots,
+            "busy_seconds": busy,
             "busy_share": round(busy / capacity, 3) if capacity else None,
             "tiers": {name: dict(got, waited=summary(got["waited"]),
                                  ran=summary(got["ran"]))
@@ -839,8 +847,10 @@ def report(name, since, until, check, queue, approval, authors,
         lines.append("  predictions stopped once the Merger no longer "
                      "predicted them: %d" % check["stopped_spent"])
     if check["busy_share"] is not None:
-        lines.append("  slots busy: %.0f%% of %d slots (%.1f slot-hours)"
-                     % (100 * check["busy_share"], check["slots"],
+        quick = check.get("quick_slots") or 0
+        lines.append("  slots busy: %.0f%% of %d slots%s (%.1f slot-hours)"
+                     % (100 * check["busy_share"], check["slots"] + quick,
+                        " (%d quick)" % quick if quick else "",
                         check["busy_seconds"] / 3600))
     if check.get("main_cpu") is not None:
         lines.append(cpu_text(check["main_cpu"]))
@@ -942,6 +952,9 @@ def main(argv=None, out=print, environ=None, now=None,
     # The fast lane is left out: it runs only cheap heads, so counting
     # it would hide ordinary slots that are full.
     slots = checks.get("slots", DEFAULT_SLOTS)
+    quick = checks.get("quick")
+    quick_slots = (quick.get("slots", DEFAULT_QUICK_SLOTS)
+                   if isinstance(quick, dict) else 0)
     pr_dir = locks.state_dir(project.name, "pr-check", environ)
     merger_dir = locks.state_dir(project.name, "merger", environ)
     verdicts = read_lines(os.path.join(pr_dir, "verdicts.log"))
@@ -955,7 +968,7 @@ def main(argv=None, out=print, environ=None, now=None,
     if not verdicts and not records and not want_actions:
         out("NO-RECORDS: nothing in %s or %s" % (pr_dir, merger_dir))
         return 2
-    check = check_stats(verdicts, since, until, slots)
+    check = check_stats(verdicts, since, until, slots, quick_slots)
     results = read_results(pr_dir)
     check["main_cpu"] = main_cpu_stats(results, since, until)
     check["cpu_all"] = all_cpu_stats(results, since, until)
