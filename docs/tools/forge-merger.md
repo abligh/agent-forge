@@ -312,7 +312,12 @@ build check posts green at once and the Merger merges on its next
 tick. A conflict with those ahead leaves a pull request out of the
 predictions. Before predicting, each pull request's approval and gate
 tools are checked once per head (`CHECKED-AHEAD`, `checked.json`), so
-one that fails is handed back before its batch.
+one that fails is handed back before its batch. That check reads the
+first `depth` of the queue, and a train can take more, so nothing
+boards a train unless its approval names its head, or a commit its
+head only brings up to date (`TRAIN-WAIT #n: <head> was pushed after
+its approval of <commit>; it boards once an approval covers its
+head`): the check hands it back when it reaches it.
 
 * **Batches** (`batch` above 1,
   [designs/0032](../designs/0032-merge-in-batches.md)): only the

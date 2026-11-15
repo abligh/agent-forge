@@ -12,7 +12,7 @@ from agent_forge import config
 from tests.helpers import example
 from tests import test_forge_merger as base
 from tests.test_forge_merger import (
-    GATE, REVIEWER, SLUG, FakeGitHub, RepoCase, ci_run, m, pr, project,
+    GATE, REVIEWER, SLUG, T1, FakeGitHub, RepoCase, ci_run, m, pr, project,
     review, status, tools_run)
 
 QUICK = "vm/build-and-test/quick"
@@ -205,6 +205,45 @@ class TickTrains(RepoCase):
         self.assertEqual(self.entries(), [])
         self.assertNotIn("MERGE", [d["action"] for d in record["decisions"]])
 
+    def pushed_pr(self, number=6):
+        """An approved pull request with an author's push after its
+        approval."""
+        self.repo.branch("pushed", "origin/main")
+        approved = self.repo.commit("o.txt", "other\n", "other")
+        head = self.repo.commit("o.txt", "pushed\n", "a later push")
+        self.repo.publish_pr(number, head)
+        self.repo.branch("feature", "feature")
+        return pr(number, T1, head=head,
+                  reviews=[review(REVIEWER, oid=approved)])
+
+    def test_a_push_beyond_the_checked_depth_does_not_board(self):
+        # CHECKED-AHEAD reads only the first `depth` of the queue behind
+        # the front (here 1: #7). #6, behind that, was pushed after its
+        # approval and has a quick green on the new head: it waits off
+        # the train, and isn't handed back from the middle of a started
+        # one later.
+        with mock.patch.object(m, "AHEAD_DEPTH", 1):
+            record, lines = self.quick_tick(
+                [self.item(), self.other_pr(7), self.pushed_pr(8)])
+        boarded = {e["pr"] for e in self.entries()}
+        self.assertIn(5, boarded)
+        self.assertNotIn(8, boarded)
+        self.assertFalse(any(line.startswith("CHECKED-AHEAD #8")
+                             for line in lines), lines)
+        self.assertTrue(any(line.startswith("TRAIN-WAIT #8: ")
+                            and "pushed after its approval" in line
+                            for line in lines), lines)
+
+    def test_without_the_guard_it_would_have_boarded(self):
+        # The same tick with boarding_wait answering None boards #8:
+        # what the test above guards against.
+        with mock.patch.object(m, "AHEAD_DEPTH", 1), \
+                mock.patch.object(m, "boarding_wait",
+                                  lambda *a, **k: None):
+            self.quick_tick(
+                [self.item(), self.other_pr(7), self.pushed_pr(8)])
+        self.assertIn(8, {e["pr"] for e in self.entries()})
+
     def test_a_red_default_branchs_fix_leads_the_next_train(self):
         prs = [self.item(), self.other_pr()]
         with mock.patch.object(m, "MAIN_RED_FIXES", frozenset({6})):
@@ -285,3 +324,47 @@ class TreeVerdict(unittest.TestCase):
         state = {"results": {"h": {"tree": "t", "ok": False,
                                    "tier": "quick"}}}
         self.assertIs(m.tree_verdict(state, "t"), False)
+
+
+class BoardingWait(RepoCase):
+    """A train boards a pull request only when its approval covers its
+    head. CHECKED-AHEAD reads only the first `depth` of the queue, and a
+    train takes more: in a replayed day behind the train gate, a head
+    pushed after its approval had its quick green before that check
+    reached it, boarded at the tenth place, and left its started train a
+    tick later."""
+
+    def wait(self, head, approved=None):
+        number = 7
+        self.repo.publish_pr(number, head)
+        return m.boarding_wait(
+            self.repo.path, {"number": number, "headRefOid": head},
+            {"commit": {"oid": approved or self.approved}},
+            self.repo.main_tip())
+
+    def test_the_approved_head_boards(self):
+        self.assertIsNone(self.wait(self.approved))
+
+    def test_a_merge_of_main_since_the_approval_boards(self):
+        self.advance_main()
+        self.assertIsNone(self.wait(self.repo.merge("origin/main")))
+
+    def test_a_push_since_the_approval_waits(self):
+        head = self.repo.commit("f.txt", "changed\n", "a later push")
+        why = self.wait(head)
+        self.assertIsNotNone(why)
+        self.assertIn("pushed after its approval", why)
+        self.assertIn(head[:10], why)
+
+    def test_a_push_and_then_a_merge_of_main_waits(self):
+        self.repo.commit("f.txt", "changed\n", "a later push")
+        self.advance_main()
+        self.assertIsNotNone(self.wait(self.repo.merge("origin/main")))
+
+    def test_an_approval_naming_no_commit_waits(self):
+        self.repo.publish_pr(7, self.approved)
+        self.assertEqual(
+            m.boarding_wait(self.repo.path,
+                            {"number": 7, "headRefOid": self.approved},
+                            {}, self.repo.main_tip()),
+            "its approval names no commit")

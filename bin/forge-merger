@@ -4382,6 +4382,25 @@ def with_layers(queue, layers_of, last, size):
                  if n not in batch and (n in owed or n in plain)]
 
 
+def boarding_wait(repo, pr, approval, main_tip, run=sh):
+    """Why `pr` may not board a train this tick, or None: its approval
+    must name its head, or a commit its head only brings up to date
+    (`own_push`: the Merger's updates and restacks, or an author's own
+    merge of the default branch). Anything else is a push since the
+    approval, which CHECKED-AHEAD hands back when it reaches it."""
+    approved = ((approval or {}).get("commit") or {}).get("oid")
+    head = pr.get("headRefOid")
+    if not approved:
+        return "its approval names no commit"
+    if approved == head:
+        return None
+    have_head(repo, pr, run)
+    if own_push(repo, approved, head, main_tip, run):
+        return None
+    return "%s was pushed after its approval of %s" % (head[:10],
+                                                      approved[:10])
+
+
 def have_head(repo, pr, run=sh):
     """Fetch `pr`'s head unless the checkout has it already: only the
     pull requests a tick decided on were fetched."""
@@ -9022,6 +9041,24 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 pr for pr in order(unproven, prs)
                 if str(pr["number"]) not in reds
                 and not handed_back(said, pr, approval_of(pr) or {}, when)]
+            # Only an approval that covers the head boards. CHECKED-AHEAD
+            # reads the first `depth` of the queue, but a train takes
+            # more: behind the train gate (designs/0055) a pushed head's
+            # quick green came before its turn in that check, and it
+            # boarded at the tenth place, to be handed back, and leave
+            # its started train, a tick later.
+            unboarded = {}
+            for pr in boarding:
+                why = boarding_wait(repo, pr, approvals.get(pr["number"])
+                                    or approval_of(pr), main_tip, run)
+                if why:
+                    unboarded[pr["number"]] = why
+            if unboarded:
+                boarding = [pr for pr in boarding
+                            if pr["number"] not in unboarded]
+                for number, why in sorted(unboarded.items()):
+                    out("TRAIN-WAIT #%d: %s; it boards once an approval "
+                        "covers its head" % (number, why))
             cut = lambda before: cut_trains(
                 repo, train_base, train_carriages(boarding, layers_of),
                 before, {pr["number"]: pr["headRefOid"] for pr in prs},
