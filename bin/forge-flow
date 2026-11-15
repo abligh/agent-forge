@@ -101,6 +101,12 @@ first are marked urgent (labels.urgent) or elevated (a red nightly's
 or default branch's fix, from nightly/nightly.json and
 pr-check/state.json, or right of way).
 
+With checks.quick (designs/0055, step 3), whose verdict lines end
+`tier=quick` or `tier=full`, each pull request has two contexts: the
+build check's queue says, for each head, what the quick check said of
+it and what the full one did (its train's state when it is in one),
+and each carriage's title says what the quick check said of its head.
+
 Also for designs/0047: approvals an hour (the first tick that listed
 each pull request), and pull requests per green batch top or train.
 
@@ -279,6 +285,14 @@ def read_starts(lines, until):
     return runs
 
 
+def line_tier(line):
+    """designs/0055: "quick" or "full", the tier a verdicts.log line
+    ends with (forge-pr-check writes one only with checks.quick), or
+    None."""
+    got = stats.TIER_RE.search(line)
+    return got.group(1) if got else None
+
+
 def read_verdicts(lines, until):
     """(ends, events) from verdicts.log. `ends` is {(kind, pr, sha10):
     [end]}, how runs ended, kind head, ahead or main; `events` is {(pr,
@@ -302,7 +316,8 @@ def read_verdicts(lines, until):
                 "t": at, "res": got.group(5),
                 "steps": (got.group(6) or "").strip("()"),
                 "waited": int(got.group(7)) if got.group(7) else None,
-                "ran": int(got.group(8)) if got.group(8) else 0})
+                "ran": int(got.group(8)) if got.group(8) else 0,
+                "tier": line_tier(line)})
             if kind == "head" and got.group(5) == "green":
                 events[(pr, sha)].append((at, ("head", pr, sha)))
             continue
@@ -312,7 +327,8 @@ def read_verdicts(lines, until):
             if at < until:
                 ends[("main", None, got.group(3)[:10])].append({
                     "t": at, "res": got.group(2).lower(), "steps": "",
-                    "waited": int(got.group(4)), "ran": int(got.group(5))})
+                    "waited": int(got.group(4)), "ran": int(got.group(5)),
+                    "tier": line_tier(line)})
             continue
         got = MAIN_MATCHED_RE.match(line)
         if got:
@@ -658,6 +674,31 @@ def covered_by_trains(queue, trains):
     return queue
 
 
+def with_contexts(queue, flow, trains):
+    """designs/0055: `queue` (check_queue) with each pull request's head
+    given its two contexts, while the records carry tiers: `quick`, what
+    the quick check said of the head, and `full`, its train's state when
+    it is in one, else what a full run said of the head. Unchanged
+    without tiers."""
+    if not flow.tiered or not queue:
+        return queue
+    in_train = {}
+    for t in trains or ():
+        if t.get("train") is None:
+            continue
+        for pr in t.get("prs") or ():
+            in_train.setdefault(pr, t)
+    for part in ("running", "queue", "held", "given_up"):
+        for i in queue.get(part) or ():
+            if not i.get("pr"):
+                continue
+            i["quick"] = flow.context(i["pr"], i["sha"], "quick")
+            t = in_train.get(i["pr"])
+            i["full"] = ("train %s: %s" % (t["train"], t["state"]) if t
+                         else flow.context(i["pr"], i["sha"], "full"))
+    return queue
+
+
 def read_cpu_runs(state_dir):
     """[(start, CPU-seconds, kind)] of the build check's runs, from
     pr-check/state.json's results, oldest first. kind: "head" for a pull
@@ -729,6 +770,11 @@ class Flow:
             pr_dir, "worker.log")), now)
         ends, self.events = read_verdicts(read_lines(os.path.join(
             pr_dir, "verdicts.log")), now)
+        # designs/0055: the verdicts by run, and whether any has a tier
+        # (checks.quick on), for each pull request's two contexts.
+        self.ends = ends
+        self.tiered = any(e.get("tier") for got in ends.values()
+                          for e in got)
         match_runs(self.runs, ends, now)
         self.arrived = {}
         for run in self.runs:
@@ -1316,8 +1362,24 @@ class Flow:
                 "carriages": carriages_of(cars, below),
                 "top": top[:10], "state": state,
                 "since": stamp(run["t"]) if run else None,
-                "urgent": bool(urgent & {e["pr"] for e in cars})})
+                "urgent": bool(urgent & {e["pr"] for e in cars}),
+                # designs/0055: each member's quick check on its own
+                # head; the train's state is its full check.
+                "quick": {e["pr"]: self.context(e["pr"], e.get("head"),
+                                                "quick")
+                          for e in cars} if self.tiered else None})
         return out
+
+    def context(self, pr, head, tier):
+        """designs/0055: what the build check's run of `tier` ("quick"
+        or "full") last said of pull request `pr`'s head `head`: green,
+        red, matched (posted from an earlier run's verdict) or stopped;
+        None when no run of that tier has ended on it."""
+        if not head:
+            return None
+        got = [e for e in self.ends.get(("head", pr, str(head)[:10])) or ()
+               if e.get("tier") == tier]
+        return got[-1]["res"] if got else None
 
     # ------------------------------------------------- status, priority
 
@@ -2741,6 +2803,18 @@ def recent_html(data):
             % ("".join(rows), key, len(recent)))
 
 
+def quick_title(train, pr):
+    """designs/0055: a carriage's title's note of its pull request's two
+    contexts, quick on its head and full on the train's top; nothing
+    without tiers."""
+    quick = train.get("quick")
+    if quick is None:
+        return ""
+    return esc("; quick check on its head: %s; full check on the "
+               "train's top: %s" % (quick.get(pr) or "none yet",
+                                    train.get("state")))
+
+
 def trains_html(data):
     trains = data.get("trains") or []
     if not trains:
@@ -2757,10 +2831,11 @@ def trains_html(data):
                 '<span class="car%s" title="%s">%s%s</span>' % (
                     " top" if pr == top_pr and t["train"] is not None
                     else "",
-                    "the top, %s, is tested for the whole train"
-                    % esc(t["top"]) if pr == top_pr and t["train"]
-                    is not None else "carriage %d of %d"
-                    % (c + 1, len(carriages)),
+                    ("the top, %s, is tested for the whole train"
+                     % esc(t["top"]) if pr == top_pr and t["train"]
+                     is not None else "carriage %d of %d"
+                     % (c + 1, len(carriages)))
+                    + quick_title(t, pr),
                     pr_link(data, pr), pri_html(data, pr)) for pr in car)
             boxes.append('<span class="carriage%s" title="%s">%s%s</span>'
                          % (" van" if van else "",
@@ -2856,7 +2931,14 @@ def queue_html(data):
         if i.get("scoped"):
             bits.append("slow steps: " + ", ".join(i["scoped"]))
         return esc("; ".join(bits))
-    rows = [[str(n), who(i), esc(i["sha"]), waited(i), notes(i)]
+    tiered = data.get("tiered")
+
+    def contexts(i):
+        # designs/0055: quick on the head, full on its train.
+        return esc("quick %s · full %s" % (i.get("quick") or "-",
+                                           i.get("full") or "-"))
+    rows = [[str(n), who(i), esc(i["sha"]), waited(i)]
+            + ([contexts(i)] if tiered else []) + [notes(i)]
             for n, i in enumerate(q.get("queue") or [], 1)]
     running = ", ".join("%s (%s)" % (who(i), esc(i["sha"]))
                         for i in q.get("running") or []) or "none"
@@ -2874,7 +2956,8 @@ def queue_html(data):
             "this head was queued. A head pushed over leaves the queue, "
             "and its new head joins at the back.</p></section>"
             % (len(rows), len(q.get("running") or []), running,
-               table(["#", "pull request", "head", "waited", "notes"], rows)
+               table(["#", "pull request", "head", "waited"]
+                     + (["checks"] if tiered else []) + ["notes"], rows)
                if rows else "<p class=\"note\">Nothing waiting.</p>",
                "<details><summary>Held (%d)</summary><ul>%s</ul></details>"
                % (len(q.get("held") or []), held) if held else "",
@@ -3198,6 +3281,7 @@ def compute(flow, project_name, repo=None, recent=RECENT_TRAINS):
             "recent_trains": flow.recent_trains(recent),
             "priority": flow.priorities(),
             "check_queue": flow.queue,
+            "tiered": flow.tiered,
             "repo": repo}
 
 
@@ -3269,9 +3353,10 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
             except (RuntimeError, github.MintError, OSError) as error:
                 err("%s: urgent labels inferred, not read: %s"
                     % (PROG, error))
-    flow.queue = covered_by_trains(check_queue(
+    trains = flow.trains()
+    flow.queue = with_contexts(covered_by_trains(check_queue(
         state_dir, now, project, os.path.expanduser(args.checkout)
-        if args.checkout else None), flow.trains())
+        if args.checkout else None), trains), flow, trains)
     data = compute(flow, name, project.repo if project else None,
                    args.recent_trains)
     write(os.path.join(args.out, "flow.json"),

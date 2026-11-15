@@ -35,7 +35,17 @@ defaults to the last `--hours` (24) up to now.
   stopped before its verdict records none, so it isn't counted;
 - the scoped steps' time (`scoped_seconds`, designs/0048): on how many
   runs that finished in the window they ran, and how long they took
-  there, together on each run and in all. Shown only when some did.
+  there, together on each run and in all. Shown only when some did;
+- with `checks.quick` (designs/0055), the two tiers apart (`tiers`):
+  for the quick runs on heads and the full runs (trains and the default
+  branch), the runs, their slot time, the reds and the waits for a
+  slot, from the `tier=` each verdict line ends with. Shown only when
+  some line has one;
+- red train tops per merge (`red_train_tops_per_merge`, designs/0055):
+  the Merger's predictions (a train's or batch's top) whose run went
+  red, over the merges in the window. Each is a red no head's own check
+  found, and a hand-back to come, so it says which side of the load a
+  project is on: climbing, the quick tier misses too much.
 
 **The merge queue** (`merger.jsonl`):
 - merges in the window, and per hour;
@@ -110,6 +120,9 @@ COVERED_RE = re.compile(r"batch #\d+\.\.#(\d+) tested green as "
 RETRIED_RE = re.compile(r"^(\S+) RETRIED AHEAD \S+ ([0-9a-f]{10}): .*: "
                         r"(green|red again)")
 SPENT_RE = re.compile(r"^(\S+) STOPPED-SPENT ")
+# designs/0055: with checks.quick, a verdict line ends with its run's tier.
+TIER_RE = re.compile(r" tier=(quick|full)\s*$")
+TIER_NAMES = ("quick", "full")
 DEFAULT_SLOTS = 2
 BATCH = 40
 
@@ -177,6 +190,7 @@ def check_stats(lines, since, until, slots):
     predictions = {}
     used = set()
     retried, retried_green, spent = 0, 0, 0
+    tiers = {}
     for line in lines:
         hit = RETRIED_RE.match(line)
         if hit and since <= parse_time(hit.group(1)) < until:
@@ -214,6 +228,14 @@ def check_stats(lines, since, until, slots):
                 continue
             w, r = int(got.group(7)), int(got.group(8))
         runs[kind] += 1
+        tier = TIER_RE.search(line)
+        if tier:
+            got_tier = tiers.setdefault(tier.group(1), {
+                "runs": 0, "red": 0, "seconds": 0, "waited": []})
+            got_tier["runs"] += 1
+            got_tier["red"] += colour == "red"
+            got_tier["seconds"] += r
+            got_tier["waited"].append(w)
         if kind == "prediction":
             predictions[(got.group(3).lstrip("#"), got.group(4)[:10])] = r
         if colour == "red":
@@ -236,7 +258,32 @@ def check_stats(lines, since, until, slots):
             "waited": summary(waited), "ran": summary(ran),
             "pull_request_seen_to_verdict": summary(pr_total),
             "slots": slots, "busy_seconds": busy,
-            "busy_share": round(busy / capacity, 3) if capacity else None}
+            "busy_share": round(busy / capacity, 3) if capacity else None,
+            "tiers": {name: dict(got, waited=summary(got["waited"]))
+                      for name, got in sorted(tiers.items())} or None}
+
+
+def red_train_tops_per_merge(check, queue):
+    """designs/0055: red predictions (a train's or batch's top) over the
+    merges in the window; None without a merge."""
+    merges = queue.get("merges", 0)
+    if not merges:
+        return None
+    return round((check.get("red") or {}).get("prediction", 0) / merges, 3)
+
+
+def tiers_text(tiers):
+    """The report's lines for the two tiers (designs/0055), or none."""
+    lines = []
+    for name in TIER_NAMES:
+        got = (tiers or {}).get(name)
+        if not got:
+            continue
+        lines.append("  %s runs: %d, %d red; %.1f slot-hours; waited for a "
+                     "slot: %s" % (name, got["runs"], got["red"],
+                                   got["seconds"] / 3600,
+                                   spread(got["waited"])))
+    return lines
 
 
 def queue_stats(records, since, until):
@@ -777,6 +824,11 @@ def report(name, since, until, check, queue, approval, authors,
             if queue.get("merges") else ""))
     if check.get("scoped") is not None and scoped_text(check["scoped"]):
         lines.append(scoped_text(check["scoped"]))
+    lines += tiers_text(check.get("tiers"))
+    if check.get("red_train_tops_per_merge") is not None:
+        lines.append("  red train tops per merge: %.2f (%d red)" % (
+            check["red_train_tops_per_merge"],
+            (check.get("red") or {}).get("prediction", 0)))
     lines += ["", "Merge queue"]
     held = queue["held_seconds"] / 3600
     lines.append("  merges: %d (%.1f an hour; %s)"
@@ -881,6 +933,7 @@ def main(argv=None, out=print, environ=None, now=None,
     check["cpu_all"] = all_cpu_stats(results, since, until)
     check["scoped"] = scoped_stats(results, since, until)
     queue = queue_stats(records, since, until)
+    check["red_train_tops_per_merge"] = red_train_tops_per_merge(check, queue)
     approval, authors = None, {}
     presence = read_lines(os.path.join(
         locks.state_dir(project.name, "router", environ), "presence.jsonl"))

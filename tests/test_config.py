@@ -393,7 +393,8 @@ class Check(unittest.TestCase):
             "check_wait, pr_turnaround, merge_time, merge_rate, "
             "slots_busy, main_red, nightly_red_hours, main_cpu, "
             "check_cpu_per_merge, cache_over_limit, hand_backs_per_merge, "
-            "prs_per_slot, reviewer_busy, runs_per_merge)"])
+            "prs_per_slot, reviewer_busy, runs_per_merge, "
+            "red_train_tops_per_merge)"])
         self.assertEqual(self.problems(stats_watch={}),
                          ["stats_watch: missing 'owner'"])
         self.assertEqual(self.problems(stats_watch=[]),
