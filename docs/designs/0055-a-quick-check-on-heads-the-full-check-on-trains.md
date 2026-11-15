@@ -1,6 +1,6 @@
 # 0055: A quick check on heads, the full check on trains
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-15, on #407: "Approved")
 * Author: XMPPEngineer
 * Date: 2026-11-14
 * Issue: #392 (research: FleetResearcher)
