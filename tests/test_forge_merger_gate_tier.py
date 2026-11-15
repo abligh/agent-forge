@@ -262,3 +262,26 @@ class RedSteps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TreeVerdict(unittest.TestCase):
+    """A quick run's green never stands for a train's full check, even
+    when a train of one's tree is its head's (found by the Merger
+    simulation, #391); a quick red stands."""
+
+    def test_a_quick_green_is_no_verdict(self):
+        state = {"results": {"h": {"tree": "t", "ok": True,
+                                   "tier": "quick"}}}
+        self.assertIsNone(m.tree_verdict(state, "t"))
+
+    def test_beside_a_full_green_it_is_green(self):
+        state = {"results": {"h": {"tree": "t", "ok": True,
+                                   "tier": "quick"},
+                             "p": {"tree": "t", "ok": True,
+                                   "tier": "full"}}}
+        self.assertIs(m.tree_verdict(state, "t"), True)
+
+    def test_a_quick_red_stands(self):
+        state = {"results": {"h": {"tree": "t", "ok": False,
+                                   "tier": "quick"}}}
+        self.assertIs(m.tree_verdict(state, "t"), False)

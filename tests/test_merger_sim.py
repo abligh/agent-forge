@@ -191,6 +191,48 @@ class Trains(unittest.TestCase):
         self.assertTrue(any("TRAIN-MERGE #1..#3: merged 3 as #8000" in l
                             for l in got.lines), "\n".join(got.lines))
 
+    def test_the_train_gate_merges_only_trains(self):
+        # designs/0055: heads are judged by the quick check, and nothing
+        # merges on it alone: each pull request goes in with a train, on
+        # the full check's green on the train's top. The red one is
+        # found by its quick run and never merges.
+        m = ms.load_merger()
+        m.configure(ms.project(quick=True, batch=3, batches=1))
+        scenario = [(0, "open", (n,)) for n in (1, 2, 3, 4)]
+        scenario += [(1, "open", (5, None, False, True))]
+        with tempfile.TemporaryDirectory() as root:
+            sim = ms.Sim(m, root, scenario, quick_minutes=3)
+            got = sim.run(180)
+            check = sim.check
+            heads = {n: p["head"] for n, p in sim.world.prs.items()}
+            statuses = sim.world.statuses
+            merges = sim.world.merges
+        self.assertEqual(got.broken, [], figures(got))
+        self.assertEqual(got.merged, 4, figures(got))
+        self.assertTrue(all(m_.get("train") is not None for m_ in merges),
+                        merges)
+        self.assertGreaterEqual(check.quick_runs, 5)
+        self.assertNotIn(5, [m_["pr"] for m_ in merges])
+        # Every head's own verdict is on the quick context, none on the
+        # full one.
+        for n in (1, 5):
+            contexts = {s["context"] for s in statuses[heads[n]]}
+            self.assertIn(ms.QUICK, contexts)
+            self.assertNotIn(ms.CONTEXT, contexts)
+
+    def test_a_quick_green_covers_no_train(self):
+        # A quick verdict on a top's tree neither makes the top done nor
+        # lets the default branch take the tree.
+        w = ms.World.__new__(ms.World)
+        w.now = ms.START
+        check = ms.SimCheck(w, "/nonexistent", quick_minutes=3)
+        check.state["results"]["a"] = {"tree": "T", "ok": True,
+                                       "tier": "quick"}
+        self.assertFalse(check.green("T"))
+        self.assertFalse(check.top_done({"sha": "b", "tree": "T"}))
+        check.state["results"]["c"] = {"tree": "T", "ok": True}
+        self.assertTrue(check.green("T"))
+
     def test_a_push_to_the_network_fails_the_run(self):
         origin = "/sim/origin.git"
         self.assertEqual(

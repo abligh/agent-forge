@@ -52,7 +52,7 @@ KEPT = {"merger", "ci_workflow", "stall_minutes", "test_ahead",
         "hold_conflicting", "yield_after_hand_back", "yield_cap",
         "yield_ignores_conflicts", "update_once", "right_of_way",
         "age_first", "early_conflicts", "stacks", "own_head_green",
-        "hand_back_once_per_head"}
+        "hand_back_once_per_head", "gate_tier"}
 
 
 # Where a trace's real paths live in the simulated repository, apart
@@ -289,9 +289,16 @@ def settings(base_config, changes):
     return merge, checks, dropped
 
 
-def project(merge):
+def project(merge, checks=None):
     data = example()
     data["merge"] = merge
+    quick = (checks or {}).get("quick")
+    if isinstance(quick, dict):
+        # The real keys only: `minutes` is the replay's own (a quick
+        # run's length).
+        data["checks"]["quick"] = dict(
+            {k: v for k, v in quick.items() if k != "minutes"},
+            context=ms.QUICK)
     data.setdefault("labels", {})["urgent"] = ms.URGENT
     data["checks"]["instances"] = {"mac": {
         "context": ms.GATED, "poster": "Merger", "gate": True,
@@ -345,7 +352,7 @@ def replay(trace, base_config=None, changes=None, merger=None, idle=10,
     --approve-after-green and --fix-after-red."""
     merge, checks, dropped = settings(base_config, changes)
     m = merger or ms.load_merger()
-    m.configure(project(merge))
+    m.configure(project(merge, checks))
     ahead = merge.get("test_ahead") or {}
     slots = checks.get("slots") or trace.get("slots") or 4
     minutes = trace["run_minutes"]
@@ -366,6 +373,7 @@ def replay(trace, base_config=None, changes=None, merger=None, idle=10,
                      max_wait=checks.get("max_wait_minutes"),
                      stop_spent=bool(ahead.get("stop_spent")),
                      train_slots=ahead.get("train_slots") or 0,
+                     quick_minutes=quick_minutes(checks, minutes),
                      background=trace.get("background") or ())
         sim.world.with_files({int(k): p["files"]
                               for k, p in trace["prs"].items()
@@ -389,6 +397,18 @@ def replay(trace, base_config=None, changes=None, merger=None, idle=10,
             inspect(sim)
         return report(trace, sim, result, slots, wall, dropped,
                       merge, checks)
+
+
+def quick_minutes(checks, minutes):
+    """A quick run's length, with checks.quick set (designs/0055):
+    checks.quick.minutes, or by default half a head's run in the trace;
+    None without the quick check."""
+    quick = checks.get("quick")
+    if not isinstance(quick, dict):
+        return None
+    if quick.get("minutes") is not None:
+        return quick["minutes"]
+    return max(1, round((minutes.get("head") or 8) / 2))
 
 
 def per_hour(merges, start_minute=0, minutes=1440):
@@ -435,6 +455,9 @@ def report(trace, sim, result, slots, wall, dropped, merge, checks):
         "per_hour": round(len(merged) / hours, 2),
         "hourly": per_hour(merged, 0, trace["minutes"]),
         "runs": result.runs, "top_runs": result.top_runs,
+        "quick_runs": sim.check.quick_runs,
+        "full_runs_per_merge": round((result.runs - sim.check.quick_runs)
+                                     / max(len(merged), 1), 2),
         "runs_per_merge": round(result.runs / max(len(merged), 1), 2),
         "background_runs": sim.check.background_runs,
         "stopped": sim.check.stopped,
