@@ -1164,6 +1164,10 @@ class Monitor:
         self.boarded = set()
         self.batches = {}
         self.recuts = []
+        # Members that left a started train ("TRAIN-LEFT"), by place:
+        # the first, a middle or the last member (designs/0056).
+        self.departures = {"first": 0, "middle": 0, "last": 0}
+        self.departed = set()
         # Members that left a started train, judged once it is known
         # whether they merged at the tree their train tested after all:
         # a member can be out of the predictions for a tick while its
@@ -1199,6 +1203,7 @@ class Monitor:
 
     def check(self):
         w, check = self.sim.world, self.sim.check
+        self.count_departures()
         entries, batches = check.ahead()
         # Still predicted at the tree its train tested: aboard, though a
         # last member alone is no batch to the build check.
@@ -1310,6 +1315,25 @@ class Monitor:
                 self.say(2, "#%d merged a tree no green run covered"
                          % m["pr"])
         self.seen_merges = len(w.merges)
+
+    def count_departures(self):
+        """Counts by place each member the Merger said this minute left
+        a started train (`TRAIN-LEFT #n`), once per train."""
+        minute = iso(self.sim.world.now)[11:16]
+        for line in self.sim.lines:
+            if not line.startswith(minute + " TRAIN-LEFT #"):
+                continue
+            number = int(line.split("#", 1)[1].split(":", 1)[0])
+            for top, train in self.trains.items():
+                order = [n for n, _ in train["members"]]
+                if train["done"] or number not in order \
+                        or (top, number) in self.departed:
+                    continue
+                self.departed.add((top, number))
+                at = order.index(number)
+                self.departures["first" if at == 0 else
+                                "last" if at == len(order) - 1
+                                else "middle"] += 1
 
     def pushed_ahead(self, minute, since):
         """Whether the Merger said this minute that one of its trains

@@ -246,7 +246,10 @@ class TailKeepsItsPlace(unittest.TestCase):
                          stop_spent=True)
             got = sim.run(240)
             merged = [x["pr"] for x in sim.world.merges]
+            departures = sim.monitor.departures
         self.assertEqual(got.broken, [], figures(got))
+        self.assertEqual(departures, {"first": 0, "middle": 1, "last": 0},
+                         "\n".join(got.lines))
         self.assertTrue(any("TRAIN-LEFT #2" in l for l in got.lines),
                         "\n".join(got.lines))
         self.assertIn(6, merged, "\n".join(got.lines))
@@ -284,6 +287,15 @@ class Rules(unittest.TestCase):
 
     def rule5(self):
         return [l for l in self.sim.monitor.broken if "rule 5" in l]
+
+    def test_a_departure_is_counted_by_place_once(self):
+        self.started()
+        minute = ms.iso(self.world.now)[11:16]
+        self.sim.lines += [minute + " TRAIN-LEFT #2: pushed abc mid-train",
+                           minute + " TRAIN-LEFT #2: pushed abc mid-train"]
+        self.sim.monitor.count_departures()
+        self.assertEqual(self.sim.monitor.departures,
+                         {"first": 0, "middle": 0, "last": 1})
 
     def test_merging_past_one_ahead_in_the_train_is_a_break(self):
         self.started()

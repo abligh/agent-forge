@@ -138,6 +138,15 @@ class Trace(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())["slots"], 3)
 
 
+class LoneMerges(unittest.TestCase):
+    """designs/0056: merges not in a train of two or more."""
+
+    def test_own_runs_and_trains_of_one_are_lone(self):
+        merges = [{"pr": 1}, {"pr": 2, "train": 10}, {"pr": 3, "train": 11},
+                  {"pr": 4, "train": 11}]
+        self.assertEqual(mr.lone_merges(merges), 2)
+
+
 class Replay(unittest.TestCase):
 
     SETTINGS = {"merge": {"test_ahead": {
