@@ -4,10 +4,13 @@ nothing merges on its own: only a train does, on the full check's green
 on its top. A red train's hand-back names the failed steps, and those
 the head's quick check doesn't run."""
 
+import os
 import unittest
+from unittest import mock
 
 from agent_forge import config
 from tests.helpers import example
+from tests import test_forge_merger as base
 from tests.test_forge_merger import (
     GATE, REVIEWER, SLUG, FakeGitHub, RepoCase, ci_run, m, pr, project,
     review, status, tools_run)
@@ -133,6 +136,83 @@ class OwnGreenWait(unittest.TestCase):
         # it, and the quick context is posted then too.
         self.assertEqual(self.wait(status()), m.GREEN_WAIT_REASON % (
             QUICK, "absent", "hhhhhhhhhh"))
+
+
+class TickTrains(RepoCase):
+    """A whole tick under "train": a lone candidate goes in as a train
+    of one, predicted as soon as its quick check is green, and a red
+    default branch's fix leads the next train. Tick's helpers, without
+    running its tests again."""
+
+    item = base.Decide.item
+    tick = base.Tick.tick
+    other_pr = base.Tick.other_pr
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(m.configure, project())
+        m.configure(train_project())
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, self.head)
+        for name, value in (("RESOLVE_IDENTITY", ("Merger", "m@example")),
+                            ("CI_WORKFLOW", "")):
+            patch = mock.patch.object(m, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        origin = self.repo.origin
+
+        def run(args, cwd=None, env=None):
+            if "push" in args:
+                args = [origin if a.startswith("https://github.com/")
+                        else a for a in args]
+            return tools_run()(args, cwd, env)
+        self.run_git = run
+
+    def quick_tick(self, prs, **kwargs):
+        extra = dict({SLUG + "/commits/": [status(context=QUICK)]},
+                     **kwargs.pop("extra", {}))
+        return self.tick(prs, conclusions=(), live=True, run=self.run_git,
+                         extra=extra, **kwargs)
+
+    def entries(self):
+        return (m.load_json(os.path.join(self.state, m.AHEAD_FILE), {})
+                .get("entries") or [])
+
+    def test_a_lone_candidate_merges_as_a_train_of_one(self):
+        record, _ = self.quick_tick([self.item()])
+        # Its quick green made it a candidate: the train of one is
+        # predicted now, for a full run, and nothing merged on its own.
+        [entry] = self.entries()
+        self.assertEqual(entry["pr"], 5)
+        self.assertEqual([(d["pr"], d["action"], d.get("reason"))
+                          for d in record["decisions"]],
+                         [(5, "WAIT", m.TRAIN_ONLY_REASON % (
+                             QUICK, "vm/build-and-test"))])
+        record, lines = self.quick_tick(
+            [self.item()], minutes=1, check_state={"results": {
+                entry["sha"]: {"tree": entry["tree"], "ok": True}}},
+            extra={SLUG + "/pulls/5": {"merged": True}})
+        self.assertEqual([(d["pr"], d["action"], d.get("train"))
+                          for d in record["decisions"]],
+                         [(5, "MERGE", True)])
+        self.assertTrue(any(line.startswith("TRAIN-MERGE #5..#5")
+                            for line in lines), lines)
+
+    def test_without_a_quick_green_nothing_is_predicted(self):
+        record, _ = self.tick([self.item()], conclusions=(), live=True,
+                              run=self.run_git)
+        self.assertEqual(self.entries(), [])
+        self.assertNotIn("MERGE", [d["action"] for d in record["decisions"]])
+
+    def test_a_red_default_branchs_fix_leads_the_next_train(self):
+        prs = [self.item(), self.other_pr()]
+        with mock.patch.object(m, "MAIN_RED_FIXES", frozenset({6})):
+            record, _ = self.quick_tick(prs)
+        self.assertEqual(self.entries()[0]["pr"], 6)
+        self.assertEqual(record["decisions"][0]["pr"], 6)
+        self.assertEqual(record["decisions"][0]["action"], "WAIT")
+        self.assertNotIn("MERGE", [d["action"] for d in record["decisions"]])
 
 
 class RedSteps(unittest.TestCase):

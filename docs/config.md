@@ -959,10 +959,15 @@ without them, and refuses `checks.quick` without it. With it:
 * **Only trains merge.** A candidate whose quick check is green waits
   (`WAIT`: "… merges only in a train, on `checks.context` green on the
   train's top"); `train_merge` merges it with its train, a lone one as
-  a train of one, on the full check's green on the top. Nothing merges
-  on the quick context alone, not even a red default branch's fix or
-  an urgent pull request, and nothing merges one at a time when GitHub
-  refuses a train: the members wait for the next. Branch protection
+  a train of one, on the full check's green on the top; its train is
+  predicted, for the full check to run first, in the tick its quick
+  check turns green. Nothing merges on the quick context alone, and
+  nothing merges one at a time when GitHub refuses a train: the members
+  wait for the next. A red default branch's fix, or a nightly's, which
+  under `"head"` merges on its own, instead leads train 1, which is
+  cut again for it as for any other such fix (`TRAIN-RECUT`). One
+  labelled urgent, or elevated, boards the next train first, as
+  always. Branch protection
   goes on requiring `checks.context`, which only a train's pull
   request carries.
 * **A red train's suspect is told the steps.** The hand-back of a
