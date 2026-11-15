@@ -15,7 +15,7 @@ from tests.test_forge_pr_check import SHA_A, FakeRun, done, pc
 
 LINK = ["rust-lld: error:", "undefined symbol"]
 STALE = ("rust-lld: error: undefined symbol: core::fmt::write\n"
-         "error: could not compile `widget`\n")
+         "error: could not compile `widget` (lib test)\n")
 
 
 def configured(texts=(LINK,), instance=None):
@@ -150,8 +150,9 @@ class CacheFaultWorker(base.StateCase):
         self.assertEqual([p[1] for p in posts], ["pending", "success"])
         self.assertIn('CACHE-FAULT #7 aaaaaaaaaa in slot 1: test: its tail '
                       'has ["rust-lld: error:", "undefined symbol"]; no '
-                      'verdict; cleared 1 incremental directories, and run '
-                      'again now', self.logged())
+                      'verdict; cleared 1 incremental directories and 0 '
+                      'fingerprints; kept widget\'s sessions in ', self.logged())
+        self.assertIn(', and run again now', self.logged())
 
     def test_a_second_match_stands_red(self):
         self.queue()
@@ -180,3 +181,115 @@ class CacheFaultWorker(base.StateCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClearFingerprints(base.StateCase):
+
+    def setUp(self):
+        super().setUp()
+        configured()
+        self.addCleanup(pc.configure, config.Project(example(), None))
+        self.target = os.path.join(self.state_dir, "cargo-target")
+
+    def make(self, *parts):
+        path = os.path.join(*parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pathlib.Path(path).write_text("x")
+        return path
+
+    def test_the_cleared_crates_fingerprints_go(self):
+        self.make(self.target, "debug", "incremental", "my_widget-1a2b",
+                  "s-1", "q")
+        gone = [self.make(self.target, p, ".fingerprint", d, "lib")
+                for p, d in (("debug", "my-widget-0f0f"),
+                             ("release", "my-widget-1e1e"),
+                             (os.path.join("wasm32-wasip1", "debug"),
+                              "my-widget-2d2d"))]
+        kept = [self.make(self.target, "debug", ".fingerprint", d, "lib")
+                for d in ("serde-0f0f", "my-widget-extra-3c3c")]
+        other = self.make(self.state_dir, "cargo-target-2", "debug",
+                          ".fingerprint", "my-widget-0f0f", "lib")
+        crates = set()
+        self.assertEqual(pc.clear_incremental(self.state_dir, 1, crates), 1)
+        self.assertEqual(crates, {"my_widget"})
+        self.assertEqual(pc.clear_fingerprints(self.state_dir, 1, crates), 3)
+        for path in gone:
+            self.assertFalse(os.path.exists(path), path)
+        for path in kept + [other]:
+            self.assertTrue(os.path.exists(path), path)
+
+    def test_nothing_without_crates(self):
+        kept = self.make(self.target, "debug", ".fingerprint", "w-1", "lib")
+        self.assertEqual(pc.clear_fingerprints(self.state_dir, 1, set()), 0)
+        self.assertTrue(os.path.exists(kept))
+
+    def test_a_link_is_left_alone(self):
+        outside = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, outside)
+        kept = self.make(outside, "w-1", "lib")
+        fp = os.path.join(self.target, "debug", ".fingerprint")
+        os.makedirs(fp)
+        os.symlink(os.path.join(outside, "w-1"), os.path.join(fp, "w-1"))
+        self.assertEqual(pc.clear_fingerprints(self.state_dir, 1, {"w"}), 0)
+        self.assertTrue(os.path.exists(kept))
+
+
+class Quarantine(base.StateCase):
+
+    def setUp(self):
+        super().setUp()
+        configured()
+        self.addCleanup(pc.configure, config.Project(example(), None))
+        self.target = os.path.join(self.state_dir, "cargo-target")
+
+    def make(self, *parts):
+        path = os.path.join(*parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pathlib.Path(path).write_text("x")
+        return path
+
+    def when(self, second=0):
+        import datetime
+        return datetime.datetime(2026, 1, 2, 3, 4, second,
+                                 tzinfo=datetime.timezone.utc)
+
+    def test_the_crates_named_in_the_tail(self):
+        self.assertEqual(pc.faulting_crates(
+            "error: could not compile `my-widget` (lib test) due to 1\n"
+            "error: could not compile `other`\n"), {"my_widget", "other"})
+        self.assertEqual(pc.faulting_crates("rust-lld: error: x\n"), set())
+
+    def test_the_failing_crates_sessions_move(self):
+        session = self.make(self.target, "debug", "incremental", "w-1",
+                            "s-1", "q")
+        stays = self.make(self.target, "debug", "incremental", "v-1", "s-1",
+                          "q")
+        dest, moved = pc.quarantine_sessions(self.state_dir, 1, {"w"},
+                                             "abc-1", self.when())
+        self.assertEqual(moved, 1)
+        self.assertEqual(dest, os.path.join(
+            self.state_dir, "cache-fault", "20260102T030400Z-abc-1"))
+        self.assertFalse(os.path.exists(session))
+        self.assertTrue(os.path.exists(os.path.join(
+            dest, "cargo-target", "debug", "incremental", "w-1", "s-1", "q")))
+        self.assertTrue(os.path.exists(stays))
+
+    def test_nothing_named_moves_nothing(self):
+        kept = self.make(self.target, "debug", "incremental", "w-1", "q")
+        self.assertEqual(pc.quarantine_sessions(self.state_dir, 1, set(),
+                                                "a-1", self.when()), (None, 0))
+        self.assertEqual(pc.quarantine_sessions(self.state_dir, 1, {"x"},
+                                                "a-1", self.when()), (None, 0))
+        self.assertTrue(os.path.exists(kept))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, "cache-fault", "20260102T030400Z-a-1")))
+
+    def test_only_the_newest_three_are_kept(self):
+        for second in range(5):
+            self.make(self.target, "debug", "incremental", "w-1", "q")
+            pc.quarantine_sessions(self.state_dir, 1, {"w"}, "a-1",
+                                   self.when(second))
+        self.assertEqual(sorted(os.listdir(os.path.join(
+            self.state_dir, "cache-fault"))),
+            ["20260102T030402Z-a-1", "20260102T030403Z-a-1",
+             "20260102T030404Z-a-1"])
