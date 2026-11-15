@@ -780,6 +780,7 @@ import base64
 import datetime
 import concurrent.futures
 import fnmatch
+import gzip
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -1300,6 +1301,17 @@ TRAIN_ONLY_REASON = ("%s is green; with merge.gate_tier \"train\" it "
                      "merges only in a train, on %s green on the train's "
                      "top")
 RED_STEPS_NOTE = " The run failed %s."
+# With merge.gate_tier "train" a train's run is the only place a red
+# that the quick check misses shows, and its status is on the train's
+# top, which the author never sees: the hand-back quotes the end of
+# each failed step's log (forge-pr-check's logs/<sha>/<step>.log.gz),
+# up to RED_TAIL_STEPS steps, RED_TAIL_LINES lines and RED_TAIL_CHARS
+# characters each.
+RED_TAIL_STEPS = 2
+RED_TAIL_LINES = 30
+RED_TAIL_CHARS = 4000
+# A log line is "<seconds> <1 or 2, the stream> <the line>".
+LOG_STAMP_RE = re.compile(r"^[0-9.]+ [12] ")
 TRAIN_STEPS_NOTE = (" The head's quick check (%s) doesn't run %s (tier "
                     "\"train\"): run %s yourself before you push again.")
 # merge.approval (2026-11-13): "reviewer", the default, needs a
@@ -7348,7 +7360,8 @@ def hand_back_red_suspect(state_dir, entry, green, queue, approvals, reds,
             if green > 1 else " and the one ahead of it in the batch"
             if green else ""), MAIN,
             RED_SUSPECT_RERUN % RERUN_LABEL if RERUN_LABEL else "")
-        + red_steps_note(check_state, entry.get("sha")))
+        + red_steps_note(check_state, entry.get("sha"),
+                         entry.get("tree")))
     decision["suspect"] = True
     record["decisions"].append(decision)
     if str(entry["pr"]) not in reds:
@@ -7363,23 +7376,71 @@ def hand_back_red_suspect(state_dir, entry, green, queue, approvals, reds,
         save_json(os.path.join(state_dir, RED_SUSPECT_FILE), reds)
 
 
-def red_steps_note(check_state, sha):
+def red_result(check_state, sha, tree=None):
+    """The build check's red result for the prediction `sha`, or, when
+    it has none by that commit, for one with the same `tree`: the check
+    runs a prediction's tree on a commit of its own, so its result can
+    be filed under another sha than the Merger's entry. None when
+    neither is there."""
+    results = (check_state or {}).get("results") or {}
+    result = results.get(sha)
+    if isinstance(result, dict) and result.get("failed"):
+        return result
+    if not tree:
+        return None
+    for got in results.values():
+        if isinstance(got, dict) and got.get("tree") == tree \
+                and got.get("failed"):
+            return got
+    return None
+
+
+def step_log_tail(check_state, result, step):
+    """The end of step's log for result, its stamps taken off, or ""
+    when the log can't be read."""
+    top, logs = (check_state or {}).get("dir"), result.get("logs")
+    if not top or not logs:
+        return ""
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", step).lstrip(".") or "_"
+    try:
+        with gzip.open(os.path.join(top, logs, name + ".log.gz"), "rt",
+                       errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except (OSError, EOFError, ValueError):
+        return ""
+    text = "\n".join(LOG_STAMP_RE.sub("", line)
+                     for line in lines[-RED_TAIL_LINES:]).rstrip()
+    if len(text) > RED_TAIL_CHARS:
+        text = "[…]\n" + text[-RED_TAIL_CHARS:]
+    return text
+
+
+def red_steps_note(check_state, sha, tree=None):
     """designs/0055, with merge.gate_tier "train": the steps the build
-    check's run of `sha` failed, and which of them the head's quick
-    check doesn't run (tier "train"), so that the author knows to run
-    those locally. "" otherwise, or when the run names none."""
+    check's run of `sha` (or of a commit with its `tree`) failed, which
+    of them the head's quick check doesn't run (tier "train"), so that
+    the author knows to run those locally, and the end of each one's
+    log. "" otherwise, or when the run names none."""
     if GATE_TIER != "train" or not sha:
         return ""
-    result = ((check_state or {}).get("results") or {}).get(sha)
-    failed = result.get("failed") if isinstance(result, dict) else None
-    if not failed:
+    result = red_result(check_state, sha, tree)
+    if result is None:
         return ""
+    failed = result["failed"]
     names = ", ".join(failed)
     train = [step for step in failed if STEP_TIERS.get(step) == "train"]
-    return RED_STEPS_NOTE % names + (
+    note = RED_STEPS_NOTE % names + (
         TRAIN_STEPS_NOTE % (head_context(), ", ".join(train),
                             "it" if len(train) == 1 else "them")
         if train else "")
+    for step in failed[:RED_TAIL_STEPS]:
+        text = step_log_tail(check_state, result, step)
+        if text:
+            runs = [len(r) for r in re.findall(r"`+", text)]
+            mark = "`" * max([3] + [n + 1 for n in runs])
+            note += "\n\n**%s**, the end of its output:\n\n%s\n%s\n%s" % (
+                step, mark, text, mark)
+    return note
 
 
 def merged_one(record):
@@ -9331,6 +9392,8 @@ def load_check_state(state_dir):
             running.append({"pr": int(parts[0][1:]), "sha": parts[1],
                             "started": parts[2]})
     got["running"] = running
+    # Where the logs that the results name live (red_steps_note).
+    got["dir"] = state_dir
     return got
 
 
