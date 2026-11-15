@@ -66,6 +66,23 @@ Merger's writes, GitHub's answers and the build check's verdicts meet.
   of a head no pull request has any more, stops. `background` is
   other work in the same slots, queued at its minute.
 
+  With `quick_minutes`, the quick check and the train gate (designs/0055:
+  `checks.quick` and `merge.gate_tier: "train"`, which `project(quick=True)`
+  sets, with `train_merge`):
+  - every head's own run is a quick run of `quick_minutes`, and every
+    status on a head (its verdict, a match, a cover, queued) goes to the
+    quick context, `QUICK`;
+  - a head isn't held while its batch's top runs;
+  - the Merger's tops stay full runs, and a batch of one is a batch:
+    a lone pull request's train of one is its only full run;
+  - a quick green never covers a train, makes a top done, or lets the
+    default branch take a tree, so rule 2 holds the gate to the full
+    check. A quick red stands.
+
+  The quick check is modelled as finding every red the full one does,
+  and as running in the same slots, not in `checks.quick.slots` of its
+  own.
+
 ## The rules
 
 `Monitor` checks these after every tick. A break is a line in
@@ -202,7 +219,15 @@ The replay can't know:
 - a host's faults, and the Merger's own outages;
 - the reviewers' pace past their first approval (with
   `--approve-after-green`, a fixed delay stands in for it);
-- a train going red without one red pull request in it.
+- a train going red without one red pull request in it;
+- with the quick check, a red only the full suite finds (every red is
+  found by the quick run), the quick check's own slots, and step tiers
+  step by step: a quick run is one length, `checks.quick.minutes`, by
+  default half a head's run in the trace.
+
+With `checks.quick` in `--config` and `merge.gate_tier: "train"` (and
+`test_ahead.train_merge`), a day is replayed behind the train gate. The
+report adds `quick_runs` and `full_runs_per_merge`.
 
 A quiet minute, one in which nothing the Merger reads has changed
 since a tick that did nothing, is skipped, at most `--idle` (10) in a

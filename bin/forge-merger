@@ -6201,11 +6201,15 @@ def tree_verdict(check_state, tree):
     """The build check's verdict on `tree` from its state: True when a
     run of it, or a match to one, is green, False when it has only red
     ones, None when it has none. A batch's cover of a tree is not a run
-    of it, so it doesn't count."""
+    of it, so it doesn't count. Nor is a quick run's green (designs/0055,
+    tier "quick"): it ran only the head's steps, so it can't stand for a
+    train's full check, even when a train of one's tree is its head's.
+    A quick red stands: the steps it failed are the full check's too."""
     oks = [r.get("ok") is True
            for r in ((check_state or {}).get("results") or {}).values()
            if isinstance(r, dict) and r.get("tree") == tree
-           and not r.get("covered")]
+           and not r.get("covered")
+           and not (r.get("tier") == "quick" and r.get("ok") is True)]
     return any(oks) if oks else None
 
 

@@ -186,6 +186,26 @@ class Replay(unittest.TestCase):
                         if tr["state"] == "MERGED" for n in tr["members"])
         self.assertEqual(merged, [1, 2, 3, 4, 5], seen["trains"])
 
+    def test_the_day_replayed_behind_the_train_gate(self):
+        # designs/0055: heads judged by quick runs, only trains merge,
+        # each on its top's full green; a lone pull request goes in as a
+        # train of one.
+        t = trace_of_day()
+        seen = {}
+        got = mr.replay(t, {"merge": {"gate_tier": "train",
+                                      "test_ahead": {
+            "batch": 4, "batches": 2, "trains": "live", "stacks": True,
+            "stop_spent": True, "later_first": 1, "train_merge": True}},
+            "checks": {"max_wait_minutes": 30,
+                       "quick": {"slots": 1, "minutes": 3}}}, idle=5,
+            inspect=lambda sim: seen.update(merges=list(sim.world.merges)))
+        self.assertEqual(got["broken"], [])
+        self.assertEqual(got["merged"], 5, got)
+        self.assertEqual(got["dropped"], [])
+        self.assertGreaterEqual(got["quick_runs"], 5, got)
+        self.assertTrue(all(m_.get("train") is not None
+                            for m_ in seen["merges"]), seen["merges"])
+
     def test_settings_left_out_are_said(self):
         merge, checks, dropped = mr.settings(
             {"merge": {"code_owners": True, "test_ahead": {"batch": 2}},

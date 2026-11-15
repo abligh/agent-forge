@@ -84,6 +84,9 @@ AUTHOR = "leaddevwidgetagent"
 POSTER = "mergerwidgetagent[bot]"
 CONTEXT = "vm/build-and-test"
 GATED = "vm/mac"
+# checks.quick's context (designs/0055): with merge.gate_tier "train" a
+# head is judged by it, and only trains merge.
+QUICK = "vm/build-and-test/quick"
 URGENT = "Urgent"
 START = datetime.datetime(2026, 10, 7, 8, 0, 0, tzinfo=datetime.timezone.utc)
 
@@ -118,10 +121,13 @@ def merger_source(tag):
     return got.stdout if got.returncode == 0 else None
 
 
-def project(merge=None, **ahead):
+def project(merge=None, quick=False, **ahead):
     """The configuration the simulation runs the Merger with: batches,
     trains, stacks and a gated instance, as a busy project has them.
-    `merge` adds or replaces other `merge` keys."""
+    `merge` adds or replaces other `merge` keys. With `quick`, the
+    quick check on heads and the train gate (designs/0055): checks.quick
+    with QUICK as its context, merge.gate_tier "train" and train_merge,
+    which the train gate needs; run SimCheck with `quick_minutes`."""
     data = example()
     data["merge"] = {
         "merger": "Merger", "ci_workflow": "", "stall_minutes": 600,
@@ -133,6 +139,10 @@ def project(merge=None, **ahead):
         "stacks": {"wait_hours": 24, "predict_restacked": True},
     }
     data["merge"].update(merge or {})
+    if quick:
+        data["merge"]["gate_tier"] = "train"
+        data["merge"]["test_ahead"]["train_merge"] = True
+        data["checks"]["quick"] = {"context": QUICK, "slots": 1}
     data.setdefault("labels", {})["urgent"] = URGENT
     data["checks"]["instances"] = {"mac": {
         "context": GATED, "poster": "Merger", "gate": True,
@@ -769,13 +779,23 @@ class SimCheck:
     starts) takes `layer_minutes` (default `minutes`): longer, it shows
     what waits for layers' own runs. Any other pull request's own run
     takes `own_minutes` (default `minutes`): longer, it shows what waits
-    for own runs queued behind many others."""
+    for own runs queued behind many others.
+
+    With `quick_minutes` (designs/0055, checks.quick with merge.gate_tier
+    "train"), every head's own run is the quick check: it takes
+    `quick_minutes`, and it and every other status on a head (matched,
+    covered, held, queued) go to QUICK, not CONTEXT. The Merger's tops
+    stay full runs. A quick verdict never covers a train, makes a top
+    done, or lets the default branch take a tree (`green` counts full
+    runs only); a quick run may match a full run's tree, as the real one
+    does. The quick check is modelled as finding every red the full one
+    does: a red only the full suite finds is not."""
 
     def __init__(self, world, merger_dir, slots=4, minutes=8,
                  mac_slots=1, mac_minutes=12, notice=2, later_first=None,
                  max_wait=None, stop_spent=False, background=(),
                  first_pr=None, layer_minutes=None, own_minutes=None,
-                 train_slots=0):
+                 train_slots=0, quick_minutes=None):
         """`minutes` is a run's length, or a function of (pull request
         number, whether the run is a top) giving it. With `later_first`
         (a number), runs start in `forge-pr-check`'s order rather than
@@ -801,6 +821,11 @@ class SimCheck:
         self.layer_minutes = minutes if layer_minutes is None \
             else layer_minutes
         self.own_minutes = minutes if own_minutes is None else own_minutes
+        self.quick_minutes = quick_minutes
+        # Where a head's statuses go: the quick check's context, or the
+        # full one's.
+        self.head_context = CONTEXT if quick_minutes is None else QUICK
+        self.quick_runs = 0
         self.later_first, self.max_wait = later_first, max_wait
         self.stop_spent = stop_spent
         self.train_slots = train_slots
@@ -851,7 +876,7 @@ class SimCheck:
         # As forge-pr-check's merger_batch: a batch of one is no batch,
         # unless it is a red batch's suspects or later batches follow.
         least = 1 if batch.get("suspects") is True or said.get("later") \
-            else 2
+            or self.quick else 2
         if size < least:
             return entries, []
         batches, at = [entries[:size]], size
@@ -872,8 +897,10 @@ class SimCheck:
             and all(n < 2 for n in clashes.values())
 
     def green(self, tree):
+        """Whether a full run found `tree` green: a quick one never
+        covers a train or a merge."""
         return any(r.get("ok") is True and r.get("tree") == tree
-                   and not r.get("covered")
+                   and not r.get("covered") and r.get("tier") != "quick"
                    for r in self.state["results"].values())
 
     def busy(self, sha):
@@ -886,16 +913,26 @@ class SimCheck:
         verdict, or is running (`busy_trees`: a slot checking the tree
         now), or the top itself is queued."""
         tree = top["tree"]
-        return top["sha"] in self.state["results"] or self.busy(
-            top["sha"]) or any(
+        own = self.state["results"].get(top["sha"])
+        # A quick run of the same commit (a train of one whose top is its
+        # head) is no run of the top: forge-pr-check runs it in full.
+        return (own is not None and own.get("tier") != "quick") \
+            or any(r["sha"] == top["sha"] and (r["top"] or not self.quick)
+                   for r in self.running + self.queue) or any(
             r.get("tree") == tree and not r.get("covered")
-            and not r.get("matched")
+            and not r.get("matched") and r.get("tier") != "quick"
             for r in self.state["results"].values()) or any(
             r.get("tree") == tree for r in self.running
-            if not r.get("background"))
+            if not r.get("background") and (r["top"] or not self.quick))
+
+    @property
+    def quick(self):
+        return self.quick_minutes is not None
 
     def length(self, pr, top):
         """A run's length in minutes, as a timedelta."""
+        if self.quick and not top:
+            return datetime.timedelta(minutes=self.quick_minutes)
         if callable(self.minutes):
             return datetime.timedelta(minutes=self.minutes(pr, top))
         layer = not top and self.world.prs.get(
@@ -911,13 +948,7 @@ class SimCheck:
         now = w.now
         for run in [r for r in self.running if r["done"] <= now]:
             self.running.remove(run)
-            ok = self.verdict(run["tree"])
-            self.state["results"][run["sha"]] = {
-                "tree": run["tree"], "ok": ok, "pr": run["pr"],
-                "ahead": run["top"], "finished": iso(now)}
-            if not run["top"]:
-                self.post(run["sha"], "success" if ok else "failure",
-                          "green" if ok else "red: test")
+            self.record(run, now)
         entries, batches = self.ahead()
         for batch in batches:
             top = batch[-1]
@@ -942,13 +973,21 @@ class SimCheck:
             self.running.remove(run)
             if run.get("background"):
                 continue
-            ok = self.verdict(run["tree"])
-            self.state["results"][run["sha"]] = {
-                "tree": run["tree"], "ok": ok, "pr": run["pr"],
-                "ahead": run["top"], "finished": iso(now)}
-            if not run["top"]:
-                self.post(run["sha"], "success" if ok else "failure",
-                          "green" if ok else "red: test")
+            self.record(run, now)
+
+    def record(self, run, now):
+        """A finished run's verdict, kept as forge-pr-check keeps it, and
+        posted on a head: a quick run's carries its tier."""
+        ok = self.verdict(run["tree"])
+        result = {"tree": run["tree"], "ok": ok, "pr": run["pr"],
+                  "ahead": run["top"], "finished": iso(now)}
+        if self.quick and not run["top"]:
+            result["tier"] = "quick"
+            self.quick_runs += 1
+        self.state["results"][run["sha"]] = result
+        if not run["top"]:
+            self.post(run["sha"], "success" if ok else "failure",
+                      "green" if ok else "red: test", self.head_context)
 
     def step_in_order(self):
         """`step`, in forge-pr-check's order (see __init__)."""
@@ -1082,7 +1121,8 @@ class SimCheck:
             if same:
                 self.state["results"][sha] = {"tree": tree, "ok": True,
                                               "matched": same[0]}
-                self.post(sha, "success", "green: matched %s" % same[0][:10])
+                self.post(sha, "success", "green: matched %s" % same[0][:10],
+                          self.head_context)
                 continue
             held = False
             for batch in batches:
@@ -1096,15 +1136,19 @@ class SimCheck:
                         "tree": tree, "ok": True, "covered": span}
                     self.post(sha, "success",
                               "green: covered by batch %s (tested as %s)"
-                              % (span, top["sha"][:10]))
+                              % (span, top["sha"][:10]), self.head_context)
+                elif self.quick:
+                    # With the quick check a head isn't held for its
+                    # batch's top: reviewers would wait for a full run.
+                    break
                 else:
                     self.post(sha, "pending", "held for the Merger's batch "
-                              "%s" % span)
+                              "%s" % span, self.head_context)
                 held = True
                 break
             if held:
                 continue
-            self.post(sha, "pending", "queued")
+            self.post(sha, "pending", "queued", self.head_context)
             self.queue.append({"sha": sha, "tree": tree, "pr": pr["number"],
                                "top": False})
 

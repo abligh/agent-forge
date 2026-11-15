@@ -398,3 +398,25 @@ class Tick(StateCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TrainOfOne(unittest.TestCase):
+    """With the quick check on, a batch of one is a batch: a head gets
+    only a quick run, so its train's top is its only full run, and a
+    lone pull request would otherwise wait for one for ever (found by
+    the Merger simulation, #391)."""
+
+    def setUp(self):
+        from tests.test_forge_pr_check import SHA_P, entry, write_ahead
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.entries = [entry(7, SHA_P, TREE_1)]
+        write_ahead(self.dir, self.entries, batch=1)
+
+    def test_without_the_quick_check_one_is_no_batch(self):
+        self.assertEqual(pc.merger_batch(self.dir, T0), [])
+
+    def test_with_it_one_is(self):
+        quick_on(self)
+        self.assertEqual(pc.merger_batch(self.dir, T0), self.entries)

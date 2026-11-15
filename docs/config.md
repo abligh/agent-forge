@@ -1396,11 +1396,15 @@ full one and no record or log line names a tier.
   is without `quick`: its quick run is its reviewers' signal.
 * **The full check,** the `"train"` and `"both"` steps posted as
   `context`, runs on the Merger's predictions (`merge.test_ahead`) and
-  on the default branch's heads (`main`).
+  on the default branch's heads (`main`). A batch of one is a batch
+  here: a lone pull request's train of one is the only full run it
+  gets.
 * **A full green covers the quick context.** A head matched to a green
   full run of its tree, or covered by its batch's green top, is posted
   green on `context` and on `quick.context` ("covered by the full
-  check"). A quick green never covers `context`.
+  check"). A quick green never covers `context`, and the Merger never
+  takes one for a train's verdict, even when a train of one's tree is
+  its head's.
 * **Reuse is per tier.** A head's quick run is matched to an earlier
   green of its tree, quick or full; a full run only ever to a full one.
   `reuse`, `depends`, `merge_default`, the caches and `scoped_minutes`
