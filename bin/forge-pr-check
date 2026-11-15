@@ -6970,11 +6970,19 @@ def estimate(state_dir, checkout, busy=(), run=sh, tip=None):
 
 def lane_cost(entry, costs):
     """A waiting head's estimated seconds, the sum of its chosen steps'
-    costs, or None when it has no estimate or a step has no cost."""
+    costs, or None when it has no estimate or a step has no cost. With
+    checks.quick (designs/0055, step 3) a head runs as a quick run, so
+    only its chosen steps of the quick tier ("head" and "both") count:
+    a "train" step it would never run neither costs nor, without a
+    cost of its own yet, makes it expensive."""
     steps = entry.get("lane_steps")
     if not isinstance(steps, list) or entry.get("main") \
-            or entry.get("lane_scoped") \
-            or any(name not in costs for name in steps):
+            or entry.get("lane_scoped"):
+        return None
+    if QUICK_CONTEXT is not None:
+        steps = [name for name in steps
+                 if TIERS.get(name, "both") in ("head", "both")]
+    if any(name not in costs for name in steps):
         return None
     return sum(costs[name] for name in steps)
 

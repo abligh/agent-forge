@@ -542,6 +542,67 @@ class UnblockedRule(unittest.TestCase):
         self.assertEqual(d["line"], "#30 unblocked: #1 closed")
 
 
+class BlockedRed(unittest.TestCase):
+    """Rule 4: a red pull request whose body's `Blocked-by:` names an
+    open item is the Merger's to hold, not its author's turn."""
+
+    def node(self, body="Blocked-by: #5\n", state="FAILURE"):
+        node = pr_node(statuses=[status(state, T1)])
+        node["body"] = body
+        return node
+
+    def decide(self, node, *pages, issues=()):
+        github = FakeGitHub(response([node], list(issues)), *pages)
+        prs, _ = r.fetch(github)
+        return rules.route_pr(prs[0], ROSTER), github
+
+    def test_blocked_by_an_open_item_is_nobodys(self):
+        d, github = self.decide(self.node(), issues=[issue_node(number=5)])
+        self.assertIsNone(d["who"])
+        self.assertEqual(d["rule"], 4)
+        self.assertEqual(d["why"],
+                         "red, and blocked by #5: the Merger holds it")
+        # The open blocker is known from the listing: no second query.
+        self.assertEqual(len(github.calls), 1)
+
+    def test_blocked_by_an_open_pull_request_is_nobodys(self):
+        base = pr_node(number=5)
+        github = FakeGitHub(response([self.node(), base], []))
+        prs, _ = r.fetch(github)
+        mine = [p for p in prs if p["number"] == 41][0]
+        self.assertIsNone(rules.route_pr(mine, ROSTER)["who"])
+
+    def test_once_the_blocker_has_closed_the_red_is_the_authors(self):
+        d, github = self.decide(self.node(),
+                                blockers_page(n5=("MERGED", T1)))
+        self.assertEqual((d["who"], d["rule"], d["event"]),
+                         ("LeadDev", 4, T1))
+        self.assertEqual(len(github.calls), 2)
+
+    def test_a_number_naming_nothing_does_not_hold(self):
+        # As for an issue (rule 14), a number GitHub can't resolve is
+        # left out, so a mistyped line doesn't hide a red for ever.
+        github = GitHubFailingOn(5, response([self.node()], []))
+        prs, _ = r.fetch(github)
+        d = rules.route_pr(prs[0], ROSTER)
+        self.assertEqual((d["who"], d["rule"]), ("LeadDev", 4))
+
+    def test_without_a_line_a_red_is_the_authors(self):
+        d, github = self.decide(self.node(body="Fixes #9\n"))
+        self.assertEqual((d["who"], d["rule"]), ("LeadDev", 4))
+        self.assertEqual(len(github.calls), 1)
+
+    def test_a_line_in_code_does_not_hold(self):
+        d, _ = self.decide(self.node(body="```\nBlocked-by: #5\n```\n"),
+                           issues=[issue_node(number=5)])
+        self.assertEqual((d["who"], d["rule"]), ("LeadDev", 4))
+
+    def test_a_blocked_green_is_still_reviewed(self):
+        d, _ = self.decide(self.node(state="SUCCESS"),
+                           issues=[issue_node(number=5)])
+        self.assertEqual((d["who"], d["rule"]), ("Reviewer", 8))
+
+
 class IssueRules(unittest.TestCase):
 
     def assertTurn(self, decision, who, rule, event=None):

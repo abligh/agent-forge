@@ -190,6 +190,19 @@ a red nightly or default branch, as above) or the holder of right of
 way in the last Merger record. In `flow.json` as `priority`
 (`{"<pr>": {"level", "why"}}`).
 
+**Two contexts** ([designs/0055](../designs/0055-a-quick-check-on-heads-the-full-check-on-trains.md),
+step 3). With `checks.quick`, whose verdict lines end with their run's
+`tier=`, each pull request has two contexts: the quick one on its head,
+and the full one on its train. The build check's queue gets a
+*checks* column, `quick <what the quick check said of the head> · full
+<its train's state, when it is in a train, else what a full run said
+of the head>`, `-` where nothing has; each carriage's title in *Trains
+now* says what the quick check said of its pull request's head (the
+train's own state is the full check's). In `flow.json` as `tiered`,
+each queue entry's `quick` and `full`, and each train's `quick`
+(`{"<pr>": result}`). Without tiers in the records, none of this is
+shown.
+
 `forge-stats-watch` reads three of these figures in its own process
 (`hand_backs_per_merge`, `prs_per_slot`, `reviewer_busy`).
 
