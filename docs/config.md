@@ -970,6 +970,14 @@ without them, and refuses `checks.quick` without it. With it:
   always. Branch protection
   goes on requiring `checks.context`, which only a train's pull
   request carries.
+* **A train boards only what its approval covers.** A quick green
+  comes soon after a push, and a train takes more than the `depth` of
+  the queue whose approvals `CHECKED-AHEAD` reads, so a head pushed
+  after its approval could board deep in a train and be handed back,
+  leaving the started train, a tick later. Every pull request now
+  boards only when its approval names its head, or a commit its head
+  only brings up to date (`TRAIN-WAIT`, in
+  [forge-merger](tools/forge-merger.md)), under either tier.
 * **A red train's suspect is told the steps.** The hand-back of a
   suspect a red train's search finds red on its own says which steps
   the run failed, and which of them the quick check doesn't run (tier
