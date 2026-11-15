@@ -4,7 +4,10 @@ nothing merges on its own: only a train does, on the full check's green
 on its top. A red train's hand-back names the failed steps, and those
 the head's quick check doesn't run."""
 
+import gzip
 import os
+import shutil
+import tempfile
 import unittest
 from unittest import mock
 
@@ -284,6 +287,38 @@ class RedSteps(unittest.TestCase):
         self.assertEqual(self.note([]), "")
         m.configure(project())
         self.assertEqual(self.note(["test"]), "")
+
+    def test_found_by_tree_under_another_commit(self):
+        # The build check runs a prediction's tree on a commit of its
+        # own, so its result is filed under another sha than the entry.
+        state = {"results": {"c" * 40: {"ok": False, "failed": ["build"],
+                                        "tree": "t" * 40}}}
+        self.assertEqual(m.red_steps_note(state, "p" * 40, "t" * 40),
+                         " The run failed build.")
+        self.assertEqual(m.red_steps_note(state, "p" * 40, "u" * 40), "")
+        self.assertEqual(m.red_steps_note(state, "p" * 40), "")
+
+    def test_quotes_the_end_of_each_failed_steps_log(self):
+        top = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, top)
+        os.makedirs(os.path.join(top, "logs", "c" * 40))
+        lines = ["%d.0 1 line %d" % (n, n) for n in range(50)]
+        lines.append("50.0 2 error: public docs link a private item")
+        with gzip.open(os.path.join(top, "logs", "c" * 40,
+                                    "doc_rust.log.gz"), "wt") as handle:
+            handle.write("\n".join(lines) + "\n")
+        state = {"dir": top, "results": {"c" * 40: {
+            "ok": False, "failed": ["doc rust", "test"], "tree": "t" * 40,
+            "logs": os.path.join("logs", "c" * 40)}}}
+        note = m.red_steps_note(state, "p" * 40, "t" * 40)
+        self.assertIn("**doc rust**, the end of its output:\n\n```\n",
+                      note)
+        self.assertIn("error: public docs link a private item\n```", note)
+        self.assertIn("line 21\n", note)
+        self.assertNotIn("line 20\n", note)
+        self.assertNotIn("50.0 2", note)
+        # No log for test: named, not quoted.
+        self.assertNotIn("**test**", note)
 
     def test_the_suspects_hand_back_carries_it(self):
         entry = {"pr": 5, "head": "h" * 40, "sha": "p" * 40}

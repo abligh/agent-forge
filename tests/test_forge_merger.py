@@ -9225,9 +9225,11 @@ class Main0026(unittest.TestCase):
             json.dump({"waiting": {"h": {}}}, f)
         self.run_main({"queued_stall_minutes": 90},
                       ["--check-state", check])
-        # With the build check's running slots, none here.
+        # With the build check's running slots, none here, and where
+        # its logs are.
         self.assertEqual(self.ticks[0]["check_state"],
-                         {"waiting": {"h": {}}, "running": []})
+                         {"waiting": {"h": {}}, "running": [],
+                          "dir": check})
         # Without batches (designs/0050 makes them the default).
         self.run_main({"test_ahead": False}, ["--check-state", check])
         self.assertNotIn("check_state", self.ticks[0])

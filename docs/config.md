@@ -981,7 +981,13 @@ without them, and refuses `checks.quick` without it. With it:
 * **A red train's suspect is told the steps.** The hand-back of a
   suspect a red train's search finds red on its own says which steps
   the run failed, and which of them the quick check doesn't run (tier
-  `"train"`), so the author runs those before pushing again.
+  `"train"`), so the author runs those before pushing again. It quotes
+  the end of each failed step's log too (the first two steps, 30 lines
+  and 4,000 characters each, from forge-pr-check's
+  `logs/<sha>/<step>.log.gz`): the run's status is on the train's top,
+  which the author never sees. The run is found by the prediction's
+  commit or, since the build check runs a prediction's tree on a commit
+  of its own, by its tree.
 
 Hand merges (`forge-merger --ready`) still need `checks.context` on
 the head, as branch protection does.
