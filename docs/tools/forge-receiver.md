@@ -66,7 +66,9 @@ Its settings are the `receiver` section of `.agent-forge/config.json`
 ([config.md, Keys](../config.md#keys) lists them): `address`, `port`,
 `path`, `secret_file`, `max_body`, `ticks`, `actions`, `route` and
 `run_timeout`. It also reads `repo`, `default_branch`,
-`checks.context` (which `status` events count) and `merge.merger` (the
+`checks.context` and `checks.quick`'s context (which `status` events
+count: under `merge.gate_tier` "train" a pull request's head gets only
+the quick one, designs/0055) and `merge.merger` (the
 App it maps a commit to its pull requests as). A short example:
 
     "receiver": {
@@ -114,7 +116,7 @@ work only when:
 | --- | --- |
 | `pull_request` | The action leaves a new head: `opened`, `reopened`, `synchronize` or `ready_for_review`. |
 | `pull_request_review` | An approval was submitted. |
-| `status` | The status for `checks.context` went `success`. |
+| `status` | The status for `checks.context`, or `checks.quick`'s context, went `success`. |
 | `check_suite` | A suite `completed` with conclusion `success`. |
 | `push` | To the default branch. |
 | `issues`, `issue_comment` | Any delivery naming an item. |
@@ -126,7 +128,7 @@ work only when:
 **Routing.** With `route` set, the item each `issues`, `issue_comment`,
 `pull_request` and `pull_request_review` delivery names is routed too,
 and so is each pull request a `completed` `check_suite` lists, whatever
-its conclusion. A `status` for `checks.context` names a commit; the
+its conclusion. A `status` for either context names a commit; the
 worker maps it to its open pull requests with one API call, as the
 Merger's App (`LOOKUP-FAILED` or `NO-TOKEN` when that fails). Without
 `route`, nothing is routed and no token is minted.

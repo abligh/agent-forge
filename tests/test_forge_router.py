@@ -1756,3 +1756,75 @@ class Escalate(StateCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuickHeadContext(unittest.TestCase):
+    """With checks.quick and merge.gate_tier "train" (designs/0055), a
+    pull request's head gets only the quick check's context, so rules
+    4 and 5 read it there; a head with none of it (a train's own pull
+    request, whose top the full check runs) is read by checks.context."""
+
+    QUICK = "vm/build-and-test/quick"
+
+    def setUp(self):
+        patch = mock.patch.object(rules, "HEAD_CONTEXT", self.QUICK)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def decide(self, *statuses):
+        github = FakeGitHub(response([pr_node(statuses=list(statuses))], []))
+        prs, _ = r.fetch(github)
+        return rules.route_pr(prs[0], ROSTER)
+
+    def test_a_quick_green_goes_to_its_reviewer(self):
+        d = self.decide(status("SUCCESS", context=self.QUICK))
+        self.assertEqual((d["who"], d["rule"]), ("Reviewer", 8))
+
+    def test_a_quick_red_is_its_authors(self):
+        d = self.decide(status("FAILURE", context=self.QUICK))
+        self.assertEqual((d["who"], d["rule"]), ("LeadDev", 4))
+        self.assertIn(self.QUICK + " is failure", d["line"])
+
+    def test_the_quick_context_wins_over_an_older_full_one(self):
+        d = self.decide(status("SUCCESS"),
+                        status("PENDING", T2, context=self.QUICK))
+        self.assertEqual((d["who"], d["rule"]), (None, 5))
+        self.assertEqual(d["why"], self.QUICK + " is pending")
+
+    def test_a_head_with_only_the_full_context_is_read_by_it(self):
+        d = self.decide(status("FAILURE"))
+        self.assertEqual((d["who"], d["rule"]), ("LeadDev", 4))
+        self.assertIn("vm/build-and-test is failure", d["line"])
+
+    def test_with_neither_it_waits_on_the_quick_context(self):
+        d = self.decide()
+        self.assertEqual((d["who"], d["rule"]), (None, 5))
+        self.assertEqual(d["why"], self.QUICK + " is absent")
+
+    def test_another_apps_quick_status_doesnt_count(self):
+        d = self.decide(status("SUCCESS", creator="someone",
+                               context=self.QUICK))
+        self.assertEqual((d["who"], d["rule"]), (None, 5))
+
+
+class QuickHeadContextConfigured(unittest.TestCase):
+    """configure() takes the head's context from forge-merger."""
+
+    def tearDown(self):
+        r.configure(config.Project(example(), None))
+
+    def test_it_follows_the_merger(self):
+        from tests.test_forge_merger_gate_tier import train_project
+        merger = load_tool("forge-merger")
+        project = train_project({"context": "ci/quick"})
+        merger.configure(project)
+        rules.configure(project, merger)
+        self.assertEqual(rules.HEAD_CONTEXT, "ci/quick")
+        self.assertEqual(rules.STATUS_CONTEXT, merger.STATUS_CONTEXT)
+
+    def test_without_the_train_gate_it_is_the_full_context(self):
+        merger = load_tool("forge-merger")
+        project = config.Project(example(), None)
+        merger.configure(project)
+        rules.configure(project, merger)
+        self.assertEqual(rules.HEAD_CONTEXT, rules.STATUS_CONTEXT)

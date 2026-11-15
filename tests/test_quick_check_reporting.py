@@ -96,6 +96,65 @@ class Watch(unittest.TestCase):
                         (0.25, 8), (None, 0), 5)[0], watch.IN)
 
 
+class QuickRun(unittest.TestCase):
+    """quick_run and quick_run_cpu: the quick check's run time and CPU
+    time on heads, judged as ceilings (designs/0275 Goal 1 needs them)."""
+
+    def test_each_tier_s_run_times(self):
+        got = stats.check_stats(TIERED, SINCE, UNTIL, 2)["tiers"]
+        self.assertEqual((got["quick"]["ran"]["n"],
+                          got["quick"]["ran"]["max"]), (2, 120))
+        self.assertEqual(got["full"]["ran"]["n"], 3)
+
+    def test_quick_cpu_counts_quick_runs_in_the_window(self):
+        results = {
+            "a": {"tier": "quick", "finished": "2026-10-12T00:10:00Z",
+                  "step_cpu": {"check-head": 400.0, "x": 200}},
+            "b": {"tier": "quick", "finished": "2026-10-12T00:20:00Z",
+                  "step_cpu": {"check-head": 900}},
+            "c": {"tier": "full", "finished": "2026-10-12T00:20:00Z",
+                  "step_cpu": {"test": 9000}},
+            "d": {"tier": "quick", "finished": "2026-10-13T00:00:00Z",
+                  "step_cpu": {"check-head": 1}},
+            "e": {"tier": "quick", "finished": "2026-10-12T00:30:00Z"},
+            "f": {"tier": "quick", "finished": "2026-10-12T00:40:00Z",
+                  "step_cpu": {"check-head": True}}}
+        got = stats.quick_cpu_stats(results, SINCE, UNTIL)
+        self.assertEqual(got["n"], 3)
+        self.assertEqual(got["max"], 900)
+        self.assertEqual(stats.quick_cpu_stats({}, SINCE, UNTIL)["n"], 0)
+
+    def test_the_figures_and_their_rules(self):
+        for name in ("quick_run", "quick_run_cpu"):
+            self.assertEqual(config.STATS_WATCH_FIGURES[name],
+                             ("limit", "ratio", "short_hours"))
+            self.assertNotIn(name, watch.FLOORS)
+        self.assertIn("quick_run", watch.CONTENDED)
+        check = stats.check_stats(TIERED, SINCE, UNTIL, 2)
+        check["quick_cpu"] = stats.summary([600.0, 900.0, 1200.0])
+        got = watch.figures({"check": check, "queue": {}}, 6)
+        self.assertEqual(got["quick_run"], (
+            check["tiers"]["quick"]["ran"]["median"] / 60, 2))
+        self.assertEqual(got["quick_run_cpu"], (900.0, 3))
+
+    def test_absent_without_checks_quick(self):
+        got = watch.figures({"check": {}, "queue": {}}, 6)
+        self.assertEqual(got["quick_run"], (None, 0))
+        self.assertEqual(got["quick_run_cpu"], (None, 0))
+
+    def test_judged_as_ceilings(self):
+        self.assertEqual(
+            watch.judge("quick_run", {"limit": 4}, (5.0, 20), (None, 0), 5),
+            (watch.OUT, "5.0 min, over the limit of 4.0 min"))
+        self.assertEqual(
+            watch.judge("quick_run", {"limit": 4}, (3.0, 20), (None, 0),
+                        5)[0], watch.IN)
+        self.assertEqual(
+            watch.judge("quick_run_cpu", {"limit": 1200}, (1500.0, 20),
+                        (None, 0), 5),
+            (watch.OUT, "1500 CPU-s, over the limit of 1200 CPU-s"))
+
+
 FLOW_VERDICTS = flow_tests.VERDICTS + [
     "2026-11-04T10:45:00Z VERDICT #20 aaaaaaaaaa: green waited=5s "
     "ran=60s tier=quick",

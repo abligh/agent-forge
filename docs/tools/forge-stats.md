@@ -79,9 +79,11 @@ lane's slot is not counted) and whether there is a `nightly` section
   check's `state.json` (`main_cpu`);
 * the scoped steps' time, when some ran (`scoped_seconds`);
 * with `checks.quick`, the two tiers apart (`tiers`): runs, reds, slot
-  time and waits of the quick runs and of the full ones, from the
-  `tier=` each verdict line ends with
-  ([designs/0055](../designs/0055-a-quick-check-on-heads-the-full-check-on-trains.md));
+  time, waits and the spread of run times (`ran`) of the quick runs and
+  of the full ones, from the `tier=` each verdict line ends with
+  ([designs/0055](../designs/0055-a-quick-check-on-heads-the-full-check-on-trains.md)),
+  and each quick run's CPU seconds over its steps (`quick_cpu`, from
+  `state.json`'s `step_cpu`);
 * red train tops per merge (`red_train_tops_per_merge`): the Merger's
   predictions whose run went red, over the merges. Each is a red no
   head's own check found.

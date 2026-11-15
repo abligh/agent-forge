@@ -153,6 +153,10 @@ ITEM_OF = {
 REPO_SLUG = ""
 MAIN_REF = "refs/heads/main"
 STATUS_CONTEXT = DEFAULT_CONTEXT
+# Every context a status event may route or tick by: checks.context and,
+# with checks.quick (designs/0055), the quick check's, which is all a
+# pull request's head gets under merge.gate_tier "train".
+STATUS_CONTEXTS = (DEFAULT_CONTEXT,)
 # The App the commit lookup reads as.
 ACT_AS = "Merger"
 ADDRESS = "127.0.0.1"
@@ -178,14 +182,19 @@ def configure(project):
     """Set the module's settings from `project`, a loaded configuration:
     its `receiver` section, `checks.context`, `merge.merger`, the
     repository and its default branch."""
-    global REPO_SLUG, MAIN_REF, STATUS_CONTEXT, ACT_AS, ADDRESS, PORT
+    global REPO_SLUG, MAIN_REF, STATUS_CONTEXT, STATUS_CONTEXTS, ACT_AS
+    global ADDRESS, PORT
     global PATH, MAX_BODY, SECRET_FILE, TICKS, TOOL_ORDER, ROUTE
     global RUN_TIMEOUT, ACTIONS
     receiver = project.section("receiver")
     REPO_SLUG = project.repo
     MAIN_REF = "refs/heads/" + project.default_branch
-    STATUS_CONTEXT = project.section("checks").get("context",
-                                                   DEFAULT_CONTEXT)
+    checks = project.section("checks")
+    STATUS_CONTEXT = checks.get("context", DEFAULT_CONTEXT)
+    quick = checks.get("quick")
+    STATUS_CONTEXTS = (STATUS_CONTEXT,) + (
+        (quick.get("context", STATUS_CONTEXT + "/quick"),)
+        if isinstance(quick, dict) else ())
     ACT_AS = project.section("merge").get("merger", "Merger")
     ADDRESS = receiver.get("address", "127.0.0.1")
     PORT = receiver.get("port", 8789)
@@ -282,8 +291,8 @@ def keys_for(event, payload):
             keys += ticks(event)
         return keys, None if keys else "nothing to route or tick"
     if event == "status":
-        if payload.get("context") != STATUS_CONTEXT:
-            return [], "not %s" % STATUS_CONTEXT
+        if payload.get("context") not in STATUS_CONTEXTS:
+            return [], "not %s" % " or ".join(STATUS_CONTEXTS)
         sha = payload.get("sha")
         if not (isinstance(sha, str) and SHA_RE.match(sha)):
             return [], "no commit"
