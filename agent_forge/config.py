@@ -185,7 +185,7 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "side_by_side": dict, "merger_cpu_weight": int,
           "docker_slices": dict, "pull_requests": dict, "warm": dict,
           "approved_first": bool, "scoped_minutes": int,
-          "gate": bool, "flake_issue": dict, "order": str}
+          "gate": bool, "flake_issue": dict, "order": str, "quick": dict}
 # checks.flake_issue (agent-forge #287): an issue for each step a
 # prediction's retry (merge.test_ahead.retry_red) turned green.
 FLAKE_ISSUE = {"labels": list, "owner": str}
@@ -221,7 +221,8 @@ INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight", "cpu_quota",
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main", "main_red_issue")
 INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
-                        "merger_cpu_weight", "docker_slices", "flake_issue")
+                        "merger_cpu_weight", "docker_slices", "flake_issue",
+                        "quick")
 # And from the block alone, never `checks`: a context the Merger requires
 # can't leave heads unrun (designs/0034). `gate`: the Merger also waits
 # for the instance's context on the pull requests it applies to.
@@ -244,6 +245,11 @@ MAIN_RED_ISSUE = {"label": str, "labels": list, "title": str}
 SIZE_RE = re.compile(r"^[1-9][0-9]*[KMGT]?$")
 # checks.fast_lane: a slot for heads whose chosen steps are cheap.
 FAST_LANE = {"max_seconds": int}
+# checks.quick (designs/0055): a quick check on every pull request's
+# head, its own context and slots; checks.steps[].tier says which runs
+# run each step.
+QUICK = {"context": str, "slots": int}
+STEP_TIERS = ("head", "train", "both")
 # checks.warm: an idle slot builds the default branch's head again when
 # its caches were built at a head older by changes to these paths.
 WARM = {"paths": list, "minutes": int}
@@ -256,7 +262,8 @@ FRESH = {"wait_minutes": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool,
         "version": list, "reads_base": bool, "outputs": list,
         "after": list, "alone": bool, "light": bool, "caches": dict,
-        "pull_requests": dict, "env_file": str, "timeout_minutes": int}
+        "pull_requests": dict, "env_file": str, "timeout_minutes": int,
+        "tier": str}
 # checks.tracer's values (docs/designs/0005).
 TRACERS = ("preload", "strace")
 # Shared with tools not here yet: only these keys are checked.
@@ -1126,6 +1133,8 @@ def _check_checks(checks, data, problems, where="checks"):
                                 "(\"<name>.slice\")" % (where, key))
     if isinstance(checks.get("fast_lane"), dict):
         _check_fast_lane(checks, problems, where)
+    if isinstance(checks.get("quick"), dict) and where == "checks":
+        _check_quick(checks, data, problems)
     if isinstance(checks.get("warm"), dict):
         _check_warm(checks, problems, where)
     if isinstance(checks.get("reuse"), dict):
@@ -1214,6 +1223,17 @@ def _check_checks(checks, data, problems, where="checks"):
             if _is(step.get("timeout_minutes"), int) and \
                     step["timeout_minutes"] < 1:
                 problems.append("%s.timeout_minutes must be at least 1" % at)
+            if isinstance(step.get("tier"), str):
+                # designs/0055
+                if step["tier"] not in STEP_TIERS:
+                    problems.append("%s.tier must be one of %s"
+                                    % (at, ", ".join(STEP_TIERS)))
+                elif step["tier"] != "both" and not (
+                        where == "checks"
+                        and isinstance(checks.get("quick"), dict)):
+                    problems.append("%s.tier %r needs checks.quick: "
+                                    "without it every run is a full one"
+                                    % (at, step["tier"]))
             run = step.get("run")
             if not (isinstance(run, list) and run
                     and all(isinstance(a, str) for a in run)):
@@ -1583,6 +1603,36 @@ def _check_fast_lane(checks, problems, section="checks"):
     _fields(where, lane, FAST_LANE, problems)
     if _is(lane.get("max_seconds"), int) and lane["max_seconds"] < 1:
         problems.append("%s.max_seconds must be at least 1" % where)
+
+
+def _check_quick(checks, data, problems):
+    """checks.quick (designs/0055): the quick check's context and slots.
+    Its heads get no full run of their own, only the Merger's
+    predictions do, so it needs merge.test_ahead; and its context must
+    be a context of its own."""
+    quick = checks["quick"]
+    _fields("checks.quick", quick, QUICK, problems)
+    if _is(quick.get("slots"), int) and quick["slots"] < 1:
+        problems.append("checks.quick.slots must be at least 1")
+    context = quick.get("context")
+    if isinstance(context, str):
+        others = [checks.get("context")] + [
+            b.get("context") for b in (checks.get("instances") or {}).values()
+            if isinstance(b, dict)]
+        if not context.strip():
+            problems.append("checks.quick.context must not be empty")
+        elif context in others:
+            problems.append("checks.quick.context %r is another check's "
+                            "context" % context)
+    if test_ahead(data) is None:
+        problems.append("checks.quick needs merge.test_ahead: with it a "
+                        "head gets no full run of its own, so only the "
+                        "Merger's predictions run the full check")
+    steps = checks.get("steps")
+    if isinstance(steps, list) and steps and all(
+            isinstance(s, dict) and s.get("tier") == "train" for s in steps):
+        problems.append("checks.quick: every step's tier is \"train\", so "
+                        "a quick run would run nothing")
 
 
 def _check_warm(checks, problems, section="checks"):

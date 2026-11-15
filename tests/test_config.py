@@ -1014,6 +1014,72 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(checks={"fast_lane": 60}), [
             "checks.fast_lane must be an object"])
 
+    def test_quick(self):
+        # designs/0055.
+        steps = [{"name": "build", "run": ["make"], "tier": "head"},
+                 {"name": "test", "run": ["make", "test"], "tier": "train"},
+                 {"name": "lint", "run": ["make", "lint"], "tier": "both"},
+                 {"name": "docs", "run": ["make", "docs"]}]
+        self.assertEqual(self.problems(checks={
+            "steps": steps, "quick": {}}), [])
+        self.assertEqual(self.problems(checks={
+            "steps": steps, "quick": {"context": "ci/quick", "slots": 2}}),
+            [])
+        self.assertEqual(self.problems(checks={
+            "quick": {"slots": 0, "lanes": 1}}), [
+            "checks.quick: unknown key 'lanes'",
+            "checks.quick.slots must be at least 1"])
+        self.assertEqual(self.problems(checks={
+            "quick": {"context": "vm/build-and-test"},
+            "context": "vm/build-and-test"}), [
+            "checks.quick.context 'vm/build-and-test' is another check's "
+            "context"])
+        self.assertEqual(self.problems(checks={"quick": {"context": " "}}), [
+            "checks.quick.context must not be empty"])
+        self.assertEqual(self.problems(checks={"quick": 1}), [
+            "checks.quick must be an object"])
+
+    def test_quick_needs_test_ahead(self):
+        # A head gets no full run of its own: only predictions run it.
+        data = example()
+        data["checks"]["quick"] = {}
+        data.setdefault("merge", {})["test_ahead"] = False
+        self.assertEqual(config.check(data), [
+            "checks.quick needs merge.test_ahead: with it a head gets no "
+            "full run of its own, so only the Merger's predictions run "
+            "the full check"])
+
+    def test_quick_with_only_train_steps_runs_nothing(self):
+        self.assertEqual(self.problems(checks={"quick": {}, "steps": [
+            {"name": "test", "run": ["make"], "tier": "train"}]}), [
+            "checks.quick: every step's tier is \"train\", so a quick run "
+            "would run nothing"])
+
+    def test_step_tiers(self):
+        self.assertEqual(self.problems(checks={"steps": [
+            {"name": "a", "run": ["a"], "tier": "both"}]}), [])
+        self.assertEqual(self.problems(checks={"quick": {}, "steps": [
+            {"name": "a", "run": ["a"], "tier": "quick"},
+            {"name": "b", "run": ["b"], "tier": 1}]}), [
+            "checks.steps[0].tier must be one of head, train, both",
+            "checks.steps[1].tier must be a string"])
+        self.assertEqual(self.problems(checks={"steps": [
+            {"name": "a", "run": ["a"], "tier": "head"}]}), [
+            "checks.steps[0].tier 'head' needs checks.quick: without it "
+            "every run is a full one"])
+
+    def test_quick_is_the_first_contexts_only(self):
+        data = example()
+        data["checks"]["quick"] = {}
+        data["checks"]["instances"] = {"mac": {
+            "context": "mac/build", "quick": {},
+            "steps": [{"name": "m", "run": ["m"], "tier": "head"}]}}
+        self.assertEqual(config.check(data), [
+            "checks.instances.mac.quick: only checks may set it, since it "
+            "belongs to the context the Merger requires",
+            "checks.instances.mac.steps[0].tier 'head' needs checks.quick: "
+            "without it every run is a full one"])
+
     def test_fast_lane_without_depends(self):
         # agent-forge #261: a head's chosen steps are then every step
         # that applies, scoped ones by their scope.
