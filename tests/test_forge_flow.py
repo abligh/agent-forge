@@ -212,6 +212,21 @@ class Figures(Base):
         self.assertEqual(self.got["green_batch_tops"],
                          {"green": 1, "all": 1, "part": 0, "none": 0})
 
+    def test_a_trains_members_rest_on_the_train(self):
+        records = [rec("10:20:00", [1, 2, 3], [
+            d("MERGE", n, head=sha(c), result="done", train=True,
+              train_pr=50) for n, c in ((1, "a"), (2, "b"), (3, "c"))]),
+            rec("10:40:00", [4], [d("MERGE", 4, head=sha("d"),
+                                     result="done", train=True,
+                                     train_pr=51)])]
+        got = self.flow(records=records).figures(
+            T("2026-11-04T10:00:00Z"), NOW)
+        slots = got["merge_slots"]
+        self.assertEqual((got["merges"], slots["slots"],
+                          slots["prs_per_slot"], slots["unknown"]),
+                         (4, 2, 2.0, 0))
+        self.assertEqual(slots["sizes"], {"1": 1, "2-3": 1, "4+": 0})
+
     def test_runs_per_merged_pull_request_count_its_batch_runs(self):
         per = self.got["runs_per_merged_pr"]
         self.assertEqual((per["mean"], per["heads_mean"],

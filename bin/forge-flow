@@ -792,7 +792,8 @@ class Flow:
             for d in record.get("decisions") or []:
                 if d.get("action") == "MERGE" and d.get("pr") in done:
                     self.merges.append({"t": at, "pr": d.get("pr"),
-                                        "head": d.get("head") or ""})
+                                        "head": d.get("head") or "",
+                                        "train_pr": d.get("train_pr")})
                 elif d.get("action") == "HAND-BACK" and \
                         d.get("result") == "done":
                     key = (d.get("pr"), d.get("head"))
@@ -838,7 +839,13 @@ class Flow:
 
     def basis(self, merge):
         """The green run a merge rested on: ("head", pr, sha10),
-        ("ahead", top, sha10), or ("unknown", pr, head10)."""
+        ("ahead", top, sha10), ("train", train_pr, ""), or ("unknown",
+        pr, head10). A member merged inside a train pull request
+        (`train_merge`) rests on that train: its own head has no run
+        of its own to find, and each member counted as a slot of one
+        (2026-11-15: pull requests per slot read exactly 1 every hour)."""
+        if merge.get("train_pr") is not None:
+            return ("train", merge["train_pr"], "")
         def last(key):
             found = [b for t, b in self.events.get(key, ())
                      if t <= merge["t"]]
