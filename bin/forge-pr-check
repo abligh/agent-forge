@@ -1139,6 +1139,13 @@ MAIN_EVERY = False
 MAIN_NEWEST = False
 # checks.main_red_issue (designs/0011): {"label", "title"}, or None.
 MAIN_RED_ISSUE = None
+# checks.instances.<name>.main_paths: with main "every" or "newest", a
+# default-branch head that changes none of pull_requests.paths since
+# the last one with a verdict here isn't run. It is given that one's
+# verdict instead (CARRIED_TEXT), so its status isn't left pending, and
+# a red stays red until a head that changes those paths is run.
+MAIN_PATHS = False
+CARRIED_TEXT = "%s as at %s: no change in this check's paths since"
 # checks.instances.<name>.pull_requests (designs/0034): (paths, label),
 # the heads this instance runs: those whose pull request changes a path
 # one of `paths` matches, or carries `label`. None runs every head.
@@ -1224,7 +1231,7 @@ def configure(project, instance=None):
     global TRACE_MATCHED_MAIN, CHAIN_WRITES_ONLY, DIRS_BY_NAMES, OUTPUTS
     global MATCH_MAIN_UNRECORDED
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
-    global MAIN_NEWEST
+    global MAIN_NEWEST, MAIN_PATHS
     global RED_COMMENT, RERUN_LABEL, HOST_FAULT_EXTRA, STEP_ALERT
     global OTHER_CONTEXTS
     global CACHE_FAULT_TEXT
@@ -1342,6 +1349,9 @@ def configure(project, instance=None):
     scope = checks.get("pull_requests") if instance is not None else None
     PULL_REQUESTS = (tuple(scope.get("paths", ())), scope.get("label")) \
         if scope else None
+    # The configuration refuses it without paths or "every"/"newest".
+    MAIN_PATHS = instance is not None and checks.get("main_paths") is True \
+        and MAIN_EVERY and bool(PULL_REQUESTS and PULL_REQUESTS[0])
     RED_COMMENT = bool(checks.get("red_comment", False))
     STEP_ALERT = None
     if "step_alert" in checks:
@@ -2491,6 +2501,56 @@ def queue_main(state, head, when, state_dir, busy=(), needs=False):
             since = min(since, entry.get("since", since))
             del state["waiting"][other]
     state["waiting"][sha] = {"pr": 0, "since": since, "main": True}
+    return True
+
+
+def main_carry(state, head, checkout, run=sh):
+    """checks.instances.<name>.main_paths: (base, record) when the
+    default branch's head `head` (sha, tree) is to be given the verdict
+    of `base`, the last default-branch head with a verdict here, rather
+    than run: it changes none of pull_requests.paths since then. None
+    when it is to be queued as usual: it has a verdict or is queued
+    already, no head has a verdict yet, or git can't say what changed.
+    Outside the lock: it reads git."""
+    if not MAIN_PATHS or head is None or not checkout:
+        return None
+    sha = head[0]
+    if sha in state["results"] or sha in state["waiting"]:
+        return None
+    base = last_main(state, sha)
+    record = state["results"].get(base) if base else None
+    if not isinstance(record, dict) or not isinstance(record.get("ok"), bool):
+        return None
+    got = run(["git", "-C", checkout, "diff", "--name-only", base, sha, "--"])
+    if got.returncode != 0:
+        return None
+    if touches((got.stdout or "").splitlines(), PULL_REQUESTS[0]):
+        return None
+    return base, record
+
+
+def carry_main(state, sha, base, record, when, state_dir, busy=(),
+               out=print):
+    """Under the lock: record `base`'s verdict for the default branch's
+    head sha (main_carry), as a verdict of its own marked `carried`,
+    which no tree is matched against (it has no `tree`) and which
+    labels.rerun runs again like any red. Older default-branch heads
+    still waiting are dropped, as queue_main drops them. Whether it was
+    recorded."""
+    if sha in state["results"] or sha in state["waiting"]:
+        return False
+    for other, entry in list(state["waiting"].items()):
+        if entry.get("main") and other not in busy \
+                and not entry.get("rerun"):
+            del state["waiting"][other]
+    stamp = iso(when)
+    state["results"][sha] = {
+        "pr": 0, "main": True, "ok": record["ok"],
+        "failed": list(record.get("failed") or []), "carried": base,
+        "started": stamp, "finished": stamp, "posted": False}
+    log(state_dir, "CARRIED %s %s: %s as at %s, which changes none of "
+        "this check's paths" % (MAIN, sha[:10], verdict_word(record),
+                                base[:10]), when, out)
     return True
 
 
@@ -4049,6 +4109,9 @@ def final_status(r):
     the first step reused and where it ran. With
     checks.merge_default, it names the tip the head was merged with, or
     the paths that conflict with it."""
+    if r.get("carried"):
+        return ("success" if r["ok"] else "failure",
+                CARRIED_TEXT % (verdict_word(r), r["carried"][:10]))
     selection = r.get("selection") or {}
     ran, skipped = selection.get("ran", {}), selection.get("skipped", [])
     # labels.rerun (designs/0022): a second verdict says the head was
@@ -4381,6 +4444,11 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         on_issue = main_rerun_labelled(seen, head_of_main, token, run)
         main_issue = {sha for _, sha, _, _ in on_issue}
         labelled += on_issue
+    # checks.instances.<name>.main_paths: whether the default branch's
+    # head is given the last verdict instead of a run, read outside the
+    # lock. One labels.rerun asks to run again through the issue is run.
+    carry = main_carry(seen, head_of_main, checkout, run) \
+        if head_of_main and head_of_main[0] not in main_issue else None
     labellers, others = {}, {}
     if labelled:
         for pr, sha, draft, repo in labelled:
@@ -4418,13 +4486,28 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         # that would otherwise never end.
         unrun = [(pr, sha) for pr, sha in dropped if sha in state["waiting"]]
         note_heads(state, heads, when, state_dir, out, post)
-        if head_of_main and (DEPENDS or MAIN_EVERY) and queue_main(
+        carried = carry is not None and carry_main(
+            state, head_of_main[0], carry[0], carry[1], when, state_dir,
+            busy, out)
+        if not carried and head_of_main and (DEPENDS or MAIN_EVERY) \
+                and queue_main(
                 state, head_of_main, when, state_dir, busy, needs):
             out("QUEUED %s %s: a %srun of every step%s"
                 % (MAIN, head_of_main[0][:10], "traced " if DEPENDS else "",
                    "" if not needs else "; stale: " + ", ".join(needs)))
         if post is not None:
             repost(state, heads, post, out)
+            # A carried verdict is posted here, and again on later ticks
+            # while GitHub refuses it and the head is still the tip.
+            r = state["results"].get(head_of_main[0]) \
+                if head_of_main else None
+            if r and r.get("carried") and r.get("posted") is not True:
+                r["posted"] = post_verdict(post, head_of_main[0], r)
+                if r["posted"]:
+                    out("POSTED %s %s: %s" % (MAIN, head_of_main[0][:10],
+                                              CARRIED_TEXT % (
+                                                  verdict_word(r),
+                                                  r["carried"][:10])))
         prune(state, when)
         save(state_dir, state)
         prune_results(state_dir, state, when)
