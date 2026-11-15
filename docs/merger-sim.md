@@ -229,9 +229,11 @@ simulation dates every commit with one fixed date, not the clock, so no
 SHA, and no order that follows one, changes from run to run (#413). A
 version from before that may vary a little between runs. The output is a
 Markdown table to paste into the pull request: merges, approval to merge
-(median and p90), hand-backs, build runs a merge, red train tops and
-rule breaks, before and after, for each day. A figure an older version
-doesn't report shows as `-`.
+(median and p90), hand-backs, build runs a merge, red train tops,
+departures from started trains by place (the first, a middle or the last
+member that left, as the Merger's `TRAIN-LEFT` says), merges not in a
+train of two or more, and rule breaks, before and after, for each day
+(designs/0056). A figure an older version doesn't report shows as `-`.
 
 The days are the library's, `tests/days/*.json`, made by
 `tests/merger_days.py` from a seed and a few figures, so they hold no

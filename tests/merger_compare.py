@@ -35,6 +35,10 @@ FIGURES = (("merged", "merges"),
            ("hand_backs", "hand-backs"),
            ("runs_per_merge", "build runs a merge"),
            ("red_tops", "train tops red"),
+           ("departures_first", "left a started train: first"),
+           ("departures_middle", "left a started train: middle"),
+           ("departures_last", "left a started train: last"),
+           ("lone_merges", "merged alone, not in a train"),
            ("broken", "rule breaks"))
 DEFAULT_DAYS = ("ordinary", "heavy", "bad")
 # Both sides replay with the same string hashing, so that nothing but

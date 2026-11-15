@@ -32,6 +32,7 @@ trace's time. Either way the report gives open-to-approval and
 approval-to-merge separately."""
 
 import argparse
+import collections
 import copy
 import datetime
 import json
@@ -444,8 +445,21 @@ def report(trace, sim, result, slots, wall, dropped, merge, checks):
         "red_tops": sum(1 for r in sim.check.state["results"].values()
                         if r.get("ahead") and r.get("ok") is False),
         "left_trains": result.left,
+        "departures_first": sim.monitor.departures["first"],
+        "departures_middle": sim.monitor.departures["middle"],
+        "departures_last": sim.monitor.departures["last"],
+        "lone_merges": lone_merges(w.merges),
         "broken": result.broken, "recuts": len(result.recuts),
         "ticks": sim.ticks, "wall_seconds": round(wall, 1)}
+
+
+def lone_merges(merges):
+    """The merges not in a train of two or more: a pull request merged
+    on its own run, or as a train pull request of one (designs/0056)."""
+    trains = collections.Counter(m["train"] for m in merges
+                                 if m.get("train") is not None)
+    return sum(1 for m in merges if m.get("train") is None
+               or trains[m["train"]] < 2)
 
 
 def median(values):
@@ -496,6 +510,10 @@ ROWS = (("merged", "merges"), ("per_hour", "merges an hour"),
         ("red_tops", "train tops red"),
         ("recuts", "started trains re-cut"),
         ("left_trains", "left a started train unmerged"),
+        ("departures_first", "left a started train: first"),
+        ("departures_middle", "left a started train: middle"),
+        ("departures_last", "left a started train: last"),
+        ("lone_merges", "merged alone, not in a train"),
         ("broken", "rule breaks"),
         ("wall_seconds", "wall time, s"))
 
