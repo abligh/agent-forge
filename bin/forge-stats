@@ -39,8 +39,10 @@ defaults to the last `--hours` (24) up to now.
 - with `checks.quick` (designs/0055), the two tiers apart (`tiers`):
   for the quick runs on heads and the full runs (trains and the default
   branch), the runs, their slot time, the reds and the waits for a
-  slot, from the `tier=` each verdict line ends with. Shown only when
-  some line has one;
+  slot, from the `tier=` each verdict line ends with, and the spread
+  of their run times (`ran`). Shown only when some line has one; and
+  each quick run's CPU time over its steps (`quick_cpu`), from the
+  same `step_cpu` as `cpu_all`;
 - red train tops per merge (`red_train_tops_per_merge`, designs/0055):
   the Merger's predictions (a train's or batch's top) whose run went
   red, over the merges in the window. Each is a red no head's own check
@@ -231,11 +233,13 @@ def check_stats(lines, since, until, slots):
         tier = TIER_RE.search(line)
         if tier:
             got_tier = tiers.setdefault(tier.group(1), {
-                "runs": 0, "red": 0, "seconds": 0, "waited": []})
+                "runs": 0, "red": 0, "seconds": 0, "waited": [],
+                "ran": []})
             got_tier["runs"] += 1
             got_tier["red"] += colour == "red"
             got_tier["seconds"] += r
             got_tier["waited"].append(w)
+            got_tier["ran"].append(r)
         if kind == "prediction":
             predictions[(got.group(3).lstrip("#"), got.group(4)[:10])] = r
         if colour == "red":
@@ -259,7 +263,8 @@ def check_stats(lines, since, until, slots):
             "pull_request_seen_to_verdict": summary(pr_total),
             "slots": slots, "busy_seconds": busy,
             "busy_share": round(busy / capacity, 3) if capacity else None,
-            "tiers": {name: dict(got, waited=summary(got["waited"]))
+            "tiers": {name: dict(got, waited=summary(got["waited"]),
+                                 ran=summary(got["ran"]))
                       for name, got in sorted(tiers.items())} or None}
 
 
@@ -692,6 +697,29 @@ def all_cpu_stats(results, since, until):
     return {"seconds": round(seconds, 2), "runs": runs}
 
 
+def quick_cpu_stats(results, since, until):
+    """designs/0055: summary of each quick run's CPU seconds over its
+    steps, for the quick runs (`tier` "quick") that finished in the
+    window. A run without `step_cpu` is left out."""
+    took = []
+    for result in (results or {}).values():
+        if not isinstance(result, dict) or result.get("tier") != "quick":
+            continue
+        cpu = result.get("step_cpu")
+        if not isinstance(cpu, dict) or not cpu:
+            continue
+        try:
+            when = parse_time(result["finished"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if since <= when < until:
+            took.append(round(sum(
+                v for v in cpu.values()
+                if isinstance(v, (int, float))
+                and not isinstance(v, bool)), 2))
+    return summary(took)
+
+
 def scoped_stats(results, since, until):
     """{"runs": summary, "seconds": total} of the scoped steps' time
     (designs/0048: each verdict's `scoped_seconds`) over the runs that
@@ -931,6 +959,7 @@ def main(argv=None, out=print, environ=None, now=None,
     results = read_results(pr_dir)
     check["main_cpu"] = main_cpu_stats(results, since, until)
     check["cpu_all"] = all_cpu_stats(results, since, until)
+    check["quick_cpu"] = quick_cpu_stats(results, since, until)
     check["scoped"] = scoped_stats(results, since, until)
     queue = queue_stats(records, since, until)
     check["red_train_tops_per_merge"] = red_train_tops_per_merge(check, queue)

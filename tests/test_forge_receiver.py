@@ -299,6 +299,31 @@ class KeysTest(unittest.TestCase):
             "context": "vm/build-and-test", "sha": SHA}),
             ([], "not build"))
 
+    def test_the_quick_check_s_context_routes_and_ticks_too(self):
+        # designs/0055: under merge.gate_tier "train" a head gets only
+        # checks.quick's context, so its status must reach the Router
+        # and its green must tick the Merger.
+        data = example()
+        data["checks"]["quick"] = {"context": "build/quick"}
+        rc.configure(config.Project(data, None))
+        self.assertEqual(rc.keys_for("status", {
+            "context": "build/quick", "sha": SHA, "state": "success"}),
+            ([("commit", SHA), ("tool", MERGER)], None))
+        self.assertEqual(rc.keys_for("status", {
+            "context": "vm/build-and-test", "sha": SHA})[0],
+            [("commit", SHA)])
+        self.assertEqual(rc.keys_for("status", {
+            "context": "ci", "sha": SHA}),
+            ([], "not vm/build-and-test or build/quick"))
+
+    def test_the_quick_context_defaults_under_checks_context(self):
+        data = example()
+        data["checks"]["quick"] = {}
+        rc.configure(config.Project(data, None))
+        self.assertEqual(rc.keys_for("status", {
+            "context": "vm/build-and-test/quick", "sha": SHA})[0],
+            [("commit", SHA)])
+
     def test_without_a_route_nothing_is_routed(self):
         configure(route=None)
         self.assertEqual(rc.keys_for("issues", {"issue": {"number": 3}}),

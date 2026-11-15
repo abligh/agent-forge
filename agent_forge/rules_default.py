@@ -63,8 +63,11 @@ Then:
    the author's. A request stands until its reviewer's next verdict,
    so neither the Merger's merges of main nor another reviewer's
    approval lift it;
-4. the build check's status (`checks.context`) is `failure` or `error`
-   on the head: the author's, unless a `Blocked-by:` line in its body
+4. the build check's status is `failure` or `error` on the head: the
+   head's context is `checks.context`, or, with `checks.quick` and
+   `merge.gate_tier` "train" (designs/0055), the quick check's, which
+   is all a head gets there (a head with none of it, a train's own pull
+   request, is read by `checks.context`); the author's, unless a `Blocked-by:` line in its body
    names an item still open (the `blockers` lookup): then nobody's,
    suppressed "red, and blocked by #N: the Merger holds it". A head
    built on a base that predates a fix is red until the base merges,
@@ -352,6 +355,11 @@ WAITING_OWNER = "Status:waiting-owner"
 WAITING_EXTERNAL = "Status:waiting-external"
 OWNER_PREFIX = "Owner:"
 STATUS_CONTEXT = "vm/build-and-test"
+# The context a pull request's head is judged by: checks.quick's under
+# merge.gate_tier "train" (designs/0055), else STATUS_CONTEXT. A head
+# with none of it (a train's own pull request, whose top the full check
+# runs) is read by STATUS_CONTEXT instead.
+HEAD_CONTEXT = "vm/build-and-test"
 # `router.idle_offer`, with its defaults filled in, or None: off.
 IDLE_OFFER = None
 # A label saying its issue is being worked on (designs/0038).
@@ -466,7 +474,8 @@ def configure(project, merger_tool):
     """Set the rules' settings from `project`. `merger_tool`, already
     configured for it, is bin/forge-merger."""
     global merger, MERGER, OWNER, WAITING_OWNER, WAITING_EXTERNAL
-    global OWNER_PREFIX, STATUS_CONTEXT, IDLE_OFFER, wants_directory, \
+    global OWNER_PREFIX, STATUS_CONTEXT, HEAD_CONTEXT, IDLE_OFFER, \
+        wants_directory, \
         wants_previous
     global MERGE_NOTICE, merged_window
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
@@ -486,6 +495,7 @@ def configure(project, merger_tool):
                                   "Status:waiting-external")
     OWNER_PREFIX = labels.get("owner_prefix", "Owner:")
     STATUS_CONTEXT = merger.STATUS_CONTEXT
+    HEAD_CONTEXT = merger.head_context()
     offer = project.section("router").get("idle_offer")
     IDLE_OFFER = None if offer is None else {
         "idle_minutes": offer.get("idle_minutes", DEFAULT_IDLE_MINUTES),
@@ -715,21 +725,27 @@ def last_by(items, logins, stamp="createdAt"):
 
 
 def status_of(pr):
-    """The newest Merger-posted vm/build-and-test context on the head
-    commit, or None."""
+    """The newest Merger-posted HEAD_CONTEXT context on the head commit,
+    or, when there is none, its newest STATUS_CONTEXT one (a train's
+    own pull request, whose top the full check runs); None when there
+    is neither."""
     nodes = (pr.get("headCommit") or {}).get("nodes") or []
     commit = (nodes[-1] or {}).get("commit") if nodes else None
     if not commit or commit.get("oid") != pr.get("headRefOid"):
         return None
-    status = None
-    for ctx in ((commit.get("status") or {}).get("contexts")) or []:
-        creator = strip_bot((ctx.get("creator") or {}).get("login"))
-        if (ctx.get("context") == STATUS_CONTEXT
-                and creator == strip_bot(merger.STATUS_CREATOR)
-                and (status is None or (ctx.get("createdAt") or "")
-                     > (status.get("createdAt") or ""))):
-            status = ctx
-    return status
+    contexts = ((commit.get("status") or {}).get("contexts")) or []
+    for wanted in dict.fromkeys((HEAD_CONTEXT, STATUS_CONTEXT)):
+        status = None
+        for ctx in contexts:
+            creator = strip_bot((ctx.get("creator") or {}).get("login"))
+            if (ctx.get("context") == wanted
+                    and creator == strip_bot(merger.STATUS_CREATOR)
+                    and (status is None or (ctx.get("createdAt") or "")
+                         > (status.get("createdAt") or ""))):
+                status = ctx
+        if status is not None:
+            return status
+    return None
 
 
 def commit_of(review):
@@ -856,10 +872,11 @@ def route_pr(pr, roster, when=None):
                       % ", ".join("#%d" % b for b in open_blockers(pr)))
     if state in ("failure", "error"):
         return turn(n, author, 4, status.get("createdAt") or head,
-                    "%s is %s at %s" % (STATUS_CONTEXT, state, head[:7]))
+                    "%s is %s at %s" % (status.get("context")
+                                        or HEAD_CONTEXT, state, head[:7]))
     # Rule 5.
     if state != "success":
-        return nobody(n, 5, "%s is %s" % (STATUS_CONTEXT, state or "absent"))
+        return nobody(n, 5, "%s is %s" % (HEAD_CONTEXT, state or "absent"))
     # Rule 23 (agent-forge #274): with merge.mode manual, a green pull
     # request nothing holds is its author's to merge.
     if MANUAL:

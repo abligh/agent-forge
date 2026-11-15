@@ -1435,7 +1435,16 @@ their top's full green (see "`merge.gate_tier`").
   the quick tier lets too much through, and a step belongs in
   `"both"`. `forge-flow`'s build-check queue gives each head its quick
   context and its full one (its train's state when it is in a train),
-  and each carriage of a train its head's quick result.
+  and each carriage of a train its head's quick result. `stats_watch`
+  can also watch the quick check's own cost: `quick_run`, its median
+  run time in minutes, and `quick_run_cpu`, its median CPU seconds,
+  each with `limit`, `ratio` and `short_hours`.
+* **The Router and forge-receiver read the head's context.** Under
+  `"train"` a pull request's head gets only the quick context, so the
+  default rules' 4 and 5 read it there (a head with none of it, a
+  train's own pull request, is read by `checks.context`), and a
+  `status` event for it is routed and ticks the Merger like one for
+  `checks.context`.
 
 ### `checks.instances`
 
