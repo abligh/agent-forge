@@ -313,7 +313,8 @@ journal as it is. **Nobody's** turn has no event or line, and says why
 in `suppressed`.
 
 **A lookup attaches what it finds to the items it covers**, as the
-default rules' `blockers` gives each issue a `blockedBy` map, and their
+default rules' `blockers` gives each issue, and each pull request whose
+body has a `Blocked-by:` line, a `blockedBy` map, and their
 `bases` tells a stacked pull request whether an open one has its base
 as its head (`baseOpen`, for `router.stuck`), rather than into
 `ctx`: a rule reads it with the item, and the item can be routed on
