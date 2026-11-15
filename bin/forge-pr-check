@@ -879,6 +879,9 @@ WARM_EVERY = datetime.timedelta(minutes=DEFAULT_WARM_MINUTES)
 # untouched for longer than this.
 STALE_EXECUTABLE = datetime.timedelta(days=1)
 STALE_INCREMENTAL = datetime.timedelta(days=7)
+# A live unit's `.dwo` this much older than `stale` goes whatever links
+# to it: no incremental session that old is kept (STALE_INCREMENTAL).
+STALE_DWO_EXTRA = (STALE_INCREMENTAL - STALE_EXECUTABLE).total_seconds()
 # How long the default branch's last green run is taken to have written
 # for, when its end wasn't recorded (state from before `cache_main_end`).
 MAIN_RUN_WINDOW = datetime.timedelta(hours=3)
@@ -5788,16 +5791,41 @@ def prune_deps(top, files, stale, mains, remove):
             remove(path, st.st_size, "executables")
             if not os.path.exists(path):
                 live.discard(entry)
-    for name, entries in dwo.items():
-        if name in live:
+    newest = {}
+    for entry in files:
+        if entry.endswith(".dwo") or entry.endswith(".d"):
             continue
+        name = unit(entry[3:] if entry.startswith("lib") else entry)
+        if name in live:
+            try:
+                when = os.lstat(os.path.join(top, entry)).st_mtime
+            except OSError:
+                continue
+            newest[name] = max(newest.get(name, 0), when)
+    for name, entries in dwo.items():
         for entry in entries:
             path = os.path.join(top, entry)
             try:
                 st = os.lstat(path)
             except OSError:
                 continue
-            if not os.path.islink(path) and st.st_mtime < stale:
+            if os.path.islink(path) or st.st_mtime >= stale:
+                continue
+            if name not in live:
+                remove(path, st.st_size, "dwo")
+            elif st.st_mtime < stale - STALE_DWO_EXTRA or (
+                    st.st_nlink == 1 and st.st_mtime
+                    < newest.get(name, 0) - STALE_EXECUTABLE.total_seconds()):
+                # A live unit's split debug info from an earlier build:
+                # each rebuild of a library writes its codegen units'
+                # `.dwo` under new names, and the old ones stay beside
+                # the library for ever. One no incremental session
+                # links to any more (a reused unit is a hard link), and
+                # a day older than the unit's newest file, or one older
+                # than any incremental session is kept, is no build's.
+                # On 2026-11-15 one `deps` held 4.7 million of them, and
+                # ext4's directory index was full: every write there
+                # failed with "No space left on device".
                 remove(path, st.st_size, "dwo")
 
 

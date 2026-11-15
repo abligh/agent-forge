@@ -427,11 +427,33 @@ class PruneCaches(unittest.TestCase):
         metas = make(self.path("debug", "deps", "m-eee.x.rcgu.dwo"), 2, 3)
         live = make(self.path("debug", "deps", "t-fff"), 5, 0.1, True)
         lives = make(self.path("debug", "deps", "t-fff.x.rcgu.dwo"), 2, 3)
+        # Reused by the unit's incremental session: a hard link.
+        os.makedirs(self.inc, exist_ok=True)
+        os.link(lives, os.path.join(self.inc, "t-fff.x.rcgu.dwo"))
         gone = pc.prune_caches([self.root], None, NOW)
         self.assertFalse(os.path.exists(orphan))
         for kept in (recent, lib, libs, meta, metas, live, lives):
             self.assertTrue(os.path.exists(kept), kept)
         self.assertEqual(gone["dwo"], 1)
+
+    def test_a_live_units_superseded_split_debug_info_goes(self):
+        # Each rebuild of a library writes its `.dwo` under new names;
+        # on 2026-11-15 a `deps` held 4.7 million, and ext4's directory
+        # index was full.
+        lib = make(self.path("debug", "deps", "libl-ddd.rlib"), 5, 0.1)
+        older = make(self.path("debug", "deps", "l-ddd.a.rcgu.dwo"), 2, 3)
+        recent = make(self.path("debug", "deps", "l-ddd.b.rcgu.dwo"), 2, 0.5)
+        linked = make(self.path("debug", "deps", "l-ddd.c.rcgu.dwo"), 2, 3)
+        os.makedirs(self.inc, exist_ok=True)
+        os.link(linked, os.path.join(self.inc, "l-ddd.c.rcgu.dwo"))
+        ancient = make(self.path("debug", "deps", "l-ddd.d.rcgu.dwo"), 2, 8)
+        os.link(ancient, os.path.join(self.inc, "l-ddd.d.rcgu.dwo"))
+        gone = pc.prune_caches([self.root], None, NOW)
+        for went in (older, ancient):
+            self.assertFalse(os.path.exists(went), went)
+        for kept in (lib, recent, linked):
+            self.assertTrue(os.path.exists(kept), kept)
+        self.assertEqual(gone["dwo"], 2)
 
     def test_untouched_incremental_directories_go(self):
         make(self.path("debug", "incremental", "a-1", "s", "f"), 5, 10)
