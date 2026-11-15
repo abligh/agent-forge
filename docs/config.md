@@ -111,7 +111,7 @@ caches, each step gets:
 | Variable | What it is |
 | --- | --- |
 | `CHECK_RESULTS` | An empty directory of the step's own, for results such as per-shard timings: `results/<head>/<step>` in the state directory, kept as long as the verdict, which names it (`results`). More than 10 MB from one step and none of it is kept (`RESULTS-DROPPED` in `verdicts.log`). |
-| `CHECK_CPUS` | The run's share of the CPUs: those the check may run on, divided by the slots (the fast lane too) holding a run when it starts, itself included; never less than the CPUs divided by `slots` (plus one with `fast_lane`), and at least 1. A run keeps its share to the end. A test runner sizes its processes or threads from it, so slots running at once fit the host. |
+| `CHECK_CPUS` | The run's share of the CPUs: those the check may run on, divided by the slots (the fast lane and the quick slots too) holding a run when it starts, itself included; never less than the CPUs divided by `slots` (plus one with `fast_lane`, and plus `quick.slots`), and at least 1. A run keeps its share to the end. A test runner sizes its processes or threads from it, so slots running at once fit the host. |
 
 A value the host already sets wins.
 
@@ -1299,6 +1299,7 @@ unaffected: their lines stay body-only, as the Merger reads them
 | `docker_slices` | none: off | `{"front": "<name>.slice", "other": "<name>.slice"}`, two slices the host has made: each step gets `CHECK_DOCKER_SLICE`, `front` in the run the next merge waits on (as `merger_cpu_weight` decides) and `other` in the rest, for its containers' `docker run --cgroup-parent`. A step that starts no containers ignores it. |
 | `step_timeout_minutes` | `30` | When a step is stopped. A step's own `timeout_minutes` (in `steps`, at least 1) overrides it for that step, for one whose wall time follows the host's load; its red line says `timed out after <its seconds>s`. |
 | `steps[].pull_requests` | none | `{"paths": [glob, ...], "label": name}`, either left out but not both: a scoped step, which runs on a pull request's head only when the head changes a path a glob matches (since its merge base, `*` crossing `/`) or the pull request carries the label, whatever `depends` would choose; `reuse` still applies. Scoped steps run after every other step, only once those are green, and the verdict's `scoped` says, for each, `ran: <why>`, `skipped: out of scope`, `skipped: an earlier step failed` or `red: over the scoped budget`. A Merger's prediction runs one when its changes match or a pull request it contains carries the label; a default-branch head, with `main` `every` or `newest`, when its changes since the last default-branch head checked here match, and never with `needed`. The fast lane never takes a head that would run one, and a head is matched or covered only by a verdict that ran every scoped step it would. For the nightly's slow steps, on the pull requests that can break them. Refused in an instance's steps, whose `pull_requests` scopes the whole instance, and a step that isn't scoped can't name one in `after`. designs/0048. |
+| `steps[].tier` | `"both"` | Which runs run the step, with `quick` ([designs/0055](designs/0055-a-quick-check-on-heads-the-full-check-on-trains.md)): `"head"`, only the quick check on pull requests' heads; `"train"`, only the full check (the Merger's predictions and the default branch); `"both"`, both. `pull_requests` and `depends` then narrow each run's steps as ever. Left out of the step's input digest. Anything but `"both"` is refused without `quick`, and in an instance's steps. |
 | `steps[].env_file` | none | A file on the check host, absolute or starting `~`, of `KEY=VALUE` lines (blank lines and `#` comments allowed; a value runs to the line's end) added to that step's environment only: secrets a step needs, such as a test account's tokens, which the check can't take from CI's own secrets. The file must be owned by the check's user and readable by nobody else (mode 0600); if not, or it can't be read or parsed, the step isn't run and is red, its tail saying why without naming a value. A missing file is logged and the step runs without it, so the step's own skip-if-unset applies. Values are never written to a log, comment, state or the step's digest; the path is in the digest. Any head that runs the step can read the values, so scope it with `pull_requests` to the code that needs them. |
 | `scoped_minutes` | `60` | How long a head's scoped steps may run together (`steps[].pull_requests`). One still running then is stopped, and one not yet started isn't run; either is red, `over the scoped budget`. Each also keeps `step_timeout_minutes`. The verdict keeps their time as `scoped_seconds`. Not in an instance block. designs/0048. |
 | `merger_first` | `false` | Start first a waiting head of the pull request the Merger waits on (its `next.json`, read while under 10 minutes old), since the next merge waits on its verdict; every other head is then started oldest first, as without it. It only orders: a free slot is never kept empty for the Merger, whose wait may be on something no check here ends. `merge.test_ahead` turns it on, and refuses `false`. |
@@ -1320,6 +1321,9 @@ unaffected: their lines stay body-only, as the Merger reads them
 | `tracer` | `preload` | How `depends` traces: `preload`, an `LD_PRELOAD` library built from lib/forge-trace.c with the host's C compiler (no root, cheap, blind to statically linked programs), or `strace` (everything, slower; needs strace installed). Go is the common case `preload` can't see: its toolchain and test binaries are statically linked, so a Go step would record almost nothing it reads and be skipped wrongly. A Go project uses `strace`. |
 | `fast_lane` | none | `{"max_seconds": 60}`: one more slot, for heads whose chosen steps are cheap (designs/0006; see below). Without `depends`, a head's chosen steps are every step that applies, scoped steps (`pull_requests`) by their scope (agent-forge #261). |
 | `fast_lane.max_seconds` | `60` | The most a head's chosen steps may together have taken here for it to be cheap. At least 1. |
+| `quick` | none: off | `{"context": name, "slots": n}`: a quick check on every pull request's head, and the full check only where the Merger asks for it ([designs/0055](designs/0055-a-quick-check-on-heads-the-full-check-on-trains.md), step 1; see "A quick check on heads"). Refused without `merge.test_ahead`, in an instance's block, and when every step's `tier` is `"train"`. |
+| `quick.context` | `<context>/quick` | The status a quick run posts, by `poster`. Not `context` nor an instance's. |
+| `quick.slots` | `1` | Quick slots beside the full ones, each counted in `CHECK_CPUS` like the fast lane. At least 1. |
 | `merge_default` | `false` | Check a pull request's head merged with the default branch's tip, the tree GitHub's update makes, instead of the head alone (designs/0007; see below). |
 | `reuse` | none | `{"max_age_days": 7}`: don't run a step on inputs a green run here already passed (designs/0009; see below). Refused without `depends`. |
 | `reuse.max_age_days` | `7` | How long a step's green verdict stands for the same inputs, counted from the run that ran it. At least 1. |
@@ -1333,6 +1337,41 @@ unaffected: their lines stay body-only, as the Merger reads them
 
 Only these keys are checked; the section may hold others, for tools
 not here yet.
+
+### A quick check on heads
+
+With `checks.quick`
+([designs/0055](designs/0055-a-quick-check-on-heads-the-full-check-on-trains.md)),
+the check has two tiers. Without it, nothing changes: every run is a
+full one and no record or log line names a tier.
+
+* **A pull request's head gets a quick run,** of its `"head"` and
+  `"both"` steps, posted as `quick.context`, and no full run of its
+  own. Every status the check posts on a head, pending, error or
+  verdict, goes to that context, but for a full green's (below). A
+  quick slot only ever takes a head (`STARTED-QUICK … in quick slot
+  1`); a quick run may also take a free full slot, but only when none
+  of the Merger's predictions wants it.
+  A head isn't held for its prediction's or its batch top's run, as it
+  is without `quick`: its quick run is its reviewers' signal.
+* **The full check,** the `"train"` and `"both"` steps posted as
+  `context`, runs on the Merger's predictions (`merge.test_ahead`) and
+  on the default branch's heads (`main`).
+* **A full green covers the quick context.** A head matched to a green
+  full run of its tree, or covered by its batch's green top, is posted
+  green on `context` and on `quick.context` ("covered by the full
+  check"). A quick green never covers `context`.
+* **Reuse is per tier.** A head's quick run is matched to an earlier
+  green of its tree, quick or full; a full run only ever to a full one.
+  `reuse`, `depends`, `merge_default`, the caches and `scoped_minutes`
+  apply to both tiers, each on its own steps.
+* **The record says the tier.** Each verdict in `state.json` has
+  `"tier": "quick"` or `"full"`, and its `verdicts.log` line ends
+  `tier=quick` or `tier=full`.
+
+The Merger still requires `context` on a head to merge it until
+`merge.gate: "train"` (the design's step 2) lets it merge on a train's
+full green instead; until then, set `quick` only to try it.
 
 ### `checks.instances`
 
@@ -1350,7 +1389,7 @@ platform. Without an instance, `forge-pr-check` runs as before.
 | `slots`, `memory_max`, `cpu_weight`, `cpu_quota`, `step_timeout_minutes`, `caches`, `cache_limit`, `cache_prune_minutes`, `results_max`, `keep_ignored`, `drop_env`, `merge_default`, `red_comment`, `max_wait_minutes`, `host_fault_text`, `cache_fault_text`, `step_alert`, `cpu_share`, `side_by_side`, `warm`, `approved_first` | The block, else `checks`, else the default. |
 | `depends`, `tracer`, `depends_minutes`, `fast_lane`, `reuse`, `fresh`, `main` | The block only, else the default: they describe the first host's tracer. |
 | `main_red_issue` | The block only, never inherited: the instance's own issue while its newest default-branch verdict is red (designs/0034), titled by default `The default branch is red for <context> at <sha>`. Its `poster`'s App then needs `issues: write`. While such an issue is open (an open issue with the block's labels, by its `poster`, titled as above), `forge-merger` puts the pull requests whose title or body closes it first, as it does the main context's fixes; it reads them from GitHub, since the instance's state is on its own host (agent-forge #154). |
-| `first_authors`, `merger_first`, `merger_cpu_weight`, `docker_slices`, `flake_issue` | `checks` only, and refused in a block: they belong to the context the Merger requires. `merge.test_ahead` doesn't apply to an instance either. |
+| `first_authors`, `merger_first`, `merger_cpu_weight`, `docker_slices`, `flake_issue`, `quick` | `checks` only, and refused in a block: they belong to the context the Merger requires. `merge.test_ahead` doesn't apply to an instance either. |
 | `pull_requests` | The block only, and refused in `checks`, whose context the Merger requires on every head: `{"paths": [glob, ...], "label": name}`, either left out but not both. See below. |
 | `gate` | The block only, and refused in `checks`: `true` makes the Merger wait for this instance's context too, on each pull request the instance applies to (default `false`; see below). |
 | `lock` | The block only: the host's own exclusive lock, a directory that agents sharing the machine take with `mkdir`, as `{"dir": path, "wait_minutes": n}` (`wait_minutes` default 60). Before its first step a run takes it and writes `owner` inside (`forge-pr-check <instance> #<pr> <sha> pid <pid> since <time>`), so an agent waiting on it sees who holds it. It lets go when the run ends, however it ends, and only while the owner file still names it. While someone else holds it the run waits, then after `wait_minutes` gives up as a `HOST-FAULT`, naming the holder. That fault isn't counted toward a head's `error`, since the host is busy rather than broken. |

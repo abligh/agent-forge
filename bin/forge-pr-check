@@ -453,6 +453,21 @@ steps take over SLOW_LANE times `max_seconds` is not stopped, but
 logged `SLOW-LANE` with each step's time. `worker.log` names the lane
 (`=== ... fast lane ===`); what is posted is the same.
 
+**`checks.quick` (`{"context": ..., "slots": 1}`) splits the check in
+two tiers** (designs/0055, step 1; off without it). A pull request's
+head gets a quick run (`--quick`) of the steps whose
+`checks.steps[].tier` is "head" or "both", posted as the quick context
+(default `<checks.context>/quick`), and no full run of its own; the
+Merger's predictions and the default branch's heads get full runs, of
+the "train" and "both" steps, posted as `checks.context` as ever. The
+quick slots (`worker-quick.lock`, `wt-quick`, `<cache>-quick`, then
+`-quick-2` and on) take only heads, and count in CHECK_CPUS like the
+fast lane; a head may also take a free full slot no prediction wants.
+A head matched to a full green, or covered by its batch's, gets both
+contexts green, the quick one "covered by the full check"; a full run
+never takes a quick verdict (`tested`'s `quick`). Verdicts carry
+`tier` and their log lines end `tier=quick` or `tier=full`.
+
 **With `checks.merge_default`, a pull request's head is checked merged
 with the default branch's tip** (designs/0007; default off), the tip
 as the cron checkout last fetched it. Unless the head already contains
@@ -813,7 +828,8 @@ ENV_FILES = {}
 # Step keys that say how a step is run beside others, not what it
 # tests: left out of its input digest, so setting them reuses nothing
 # less.
-SCHEDULING_KEYS = ("after", "alone", "light", "caches", "pull_requests")
+SCHEDULING_KEYS = ("after", "alone", "light", "caches", "pull_requests",
+                   "tier")
 # designs/0048: the scoped steps, {name: (globs, label)}, from each
 # step's `pull_requests`, and the time they have together on a head.
 SCOPED = {}
@@ -1075,6 +1091,24 @@ ALWAYS = frozenset()
 # steps have together taken at most FAST_LANE_S here; None is off.
 DEFAULT_FAST_LANE_S = 60
 FAST_LANE_S = None
+# checks.quick (designs/0055): a quick check on every pull request's
+# head, posted as QUICK_CONTEXT, in QUICK_SLOTS slots of its own; the
+# full check, STATUS_CONTEXT, runs only where the Merger asks (its
+# predictions) and on the default branch. None: off, one tier as ever.
+QUICK_CONTEXT = None
+DEFAULT_QUICK_SLOTS = 1
+QUICK_SLOTS = 0
+# A quick slot's number: QUICK_SLOT + 1 for the first, and so on.
+QUICK_SLOT = 1000
+# Each step's checks.steps[].tier, "head", "train" or "both": a quick run
+# runs the "head" and "both" steps, a full run the "train" and "both".
+TIERS = {}
+# Whether this process's run is a quick one (the worker's --quick).
+RUN_QUICK = False
+# The configured step list, whatever a run's tier: what the steps
+# digest is taken over, so the tiers' verdicts compare.
+ALL_STEPS = DEFAULT_STEPS
+COVERED_TEXT = "covered by the full check"
 # The project's quiet directory (`quiet.dir`): while a hold in it is
 # live on this host, a tick starts no run (agent_forge/quiet.py).
 QUIET_DIR = None
@@ -1198,6 +1232,7 @@ def configure(project, instance=None):
     global PULL_REQUESTS, HOST_LOCK, APPROVED_FIRST, REVIEWER_LOGINS, ORDER
     global ARMED_LABEL
     global SCOPED, SCOPED_S
+    global QUICK_CONTEXT, QUICK_SLOTS, TIERS, ALL_STEPS
     INSTANCE = instance
     if instance is None:
         checks, HOST = project.section("checks"), project.host
@@ -1211,6 +1246,17 @@ def configure(project, instance=None):
                         project.section("merge").get("merger", "Merger"))
     STEPS = [(s["name"], list(s["run"]), s.get("only_if"))
              for s in checks["steps"]] if "steps" in checks else DEFAULT_STEPS
+    ALL_STEPS = STEPS
+    # designs/0055; the configuration refuses checks.quick in an
+    # instance's block, and a tier other than "both" without it.
+    quick = checks.get("quick") if instance is None else None
+    QUICK_CONTEXT = quick.get("context", STATUS_CONTEXT + "/quick") \
+        if isinstance(quick, dict) else None
+    QUICK_SLOTS = quick.get("slots", DEFAULT_QUICK_SLOTS) \
+        if QUICK_CONTEXT is not None else 0
+    TIERS = {s["name"]: s.get("tier", "both")
+             for s in checks.get("steps", [])} \
+        if QUICK_CONTEXT is not None else {}
     ALWAYS = frozenset(s["name"] for s in checks.get("steps", [])
                        if s.get("always"))
     VERSIONS = {s["name"]: list(s["version"])
@@ -1566,15 +1612,56 @@ try_lock = locks.try_lock
 
 def slot_name(name, slot):
     """`name` for slot 1, which keeps the one-slot names, name-lane for
-    the fast lane, else name-N."""
+    the fast lane, name-quick, name-quick-2 and on for the quick slots
+    (designs/0055), else name-N."""
     if slot == LANE:
         return name + "-lane"
+    if is_quick_slot(slot):
+        n = slot - QUICK_SLOT
+        return name + "-quick" + ("" if n == 1 else "-%d" % n)
     return name if slot == 1 else "%s-%d" % (name, slot)
 
 
 def slot_label(slot):
     """How the logs name a slot."""
+    if is_quick_slot(slot):
+        return "quick slot %d" % (slot - QUICK_SLOT)
     return "the fast lane" if slot == LANE else "slot %d" % slot
+
+
+def is_quick_slot(slot):
+    """Whether `slot` is one of checks.quick's slots (designs/0055)."""
+    return slot > QUICK_SLOT
+
+
+def quick_slots():
+    """checks.quick's slots, none when it is off."""
+    return [QUICK_SLOT + n for n in range(1, QUICK_SLOTS + 1)] \
+        if QUICK_CONTEXT is not None else []
+
+
+def tier_steps(quick, steps=None):
+    """designs/0055: the steps a run of its tier runs, of `steps`
+    (default the configured list): a quick run's are the "head" and
+    "both" steps, a full run's the "train" and "both". Every step
+    without checks.quick."""
+    steps = ALL_STEPS if steps is None else steps
+    if QUICK_CONTEXT is None:
+        return list(steps)
+    keep = ("head", "both") if quick else ("train", "both")
+    return [s for s in steps if TIERS.get(s[0], "both") in keep]
+
+
+def tier_note(record):
+    """What a verdicts.log line adds to say the run's tier (designs/0055):
+    nothing without checks.quick."""
+    return "" if QUICK_CONTEXT is None else " tier=" + run_tier(record)
+
+
+def run_tier(record):
+    """A verdict's tier, "quick" or "full" (designs/0055): a record from
+    before checks.quick, or without it, is a full run's."""
+    return "quick" if record.get("tier") == "quick" else "full"
 
 
 def lock_path(state_dir, slot=1):
@@ -2938,7 +3025,8 @@ def preempt_victim(state, fields, first_pr):
     first on purpose, or one this host's queue doesn't list."""
     best = None
     for slot, got in fields.items():
-        if slot == LANE or not got or got[4] or not got[0] or not got[3]:
+        if slot == LANE or is_quick_slot(slot) or not got or got[4] \
+                or not got[0] or not got[3]:
             continue
         entry = state["waiting"].get(got[1])
         if got[0] == first_pr or entry is None or put_first(entry):
@@ -3073,8 +3161,11 @@ def steps_digest(steps=None, always=None):
     record stands for another commit's only while the steps that made it
     are still the ones run. The steps marked `always` count too, when
     there are any, so a list without them digests as it always has."""
-    listed = [[name, list(args), only_if]
-              for name, args, only_if in (STEPS if steps is None else steps)]
+    if steps is None:
+        # With checks.quick, a run's STEPS are its tier's: the digest is
+        # of the whole list, so a quick run can take a full verdict.
+        steps = STEPS if QUICK_CONTEXT is None else ALL_STEPS
+    listed = [[name, list(args), only_if] for name, args, only_if in steps]
     always = ALWAYS if always is None else always
     if always:
         listed.append(["always", sorted(always)])
@@ -3129,19 +3220,22 @@ def relabel_host(state_dir, old, new=None):
     return changed
 
 
-def tested(state, tree, when, ok=None, accept=None):
+def tested(state, tree, when, ok=None, accept=None, quick=False):
     """The sha of the newest verdict on `tree` from this host and step
     list, green only when `ok`, and only one `accept(record)` takes when
     given, or None. A verdict that finished more than MATCH_MAX_AGE
     before `when`, or after it, doesn't count: the step digest can't see
     a toolchain upgrade. Nor does a batch's cover (designs/0032): no
-    run checked that tree."""
+    run checked that tree. Reuse is per tier (designs/0055): a quick
+    run's verdict counts only for another `quick` one, which may take
+    a full run's too."""
     host, steps = socket.gethostname(), steps_digest()
     best = None
     for sha, r in state["results"].items():
         age = verdict_age(r, when)
         if (tree and r.get("tree") == tree and r.get("host") == host
                 and r.get("steps") == steps and not r.get("covered")
+                and (quick or r.get("tier") != "quick")
                 and (ok is None or r.get("ok") is ok)
                 and (accept is None or accept(r))
                 and age is not None
@@ -3176,8 +3270,11 @@ def next_ahead(state, ahead, busy=(), when=None, busy_trees=(), batch=(),
         if tested(state, entry["tree"], when, ok=False) is not None \
                 and tested(state, entry["tree"], when, ok=True) is None:
             return None
-        own = (entry.get("same_as_head") and not batch and not state[
-            "results"].get(entry.get("head"), {}).get("covered"))
+        # With checks.quick the head's own run is a quick one, which
+        # checks less than its prediction (designs/0055).
+        own = (entry.get("same_as_head") and not batch
+               and QUICK_CONTEXT is None and not state[
+                   "results"].get(entry.get("head"), {}).get("covered"))
         if (own or sha in busy
                 or entry["tree"] in busy_trees
                 or sha in state["results"]
@@ -3240,9 +3337,9 @@ TOKEN_REUSE_S = 30 * 60
 
 def make_poster(run=sh, out=print, project=None, call=None,
                 timer=time.monotonic):
-    """A post(sha, state, description) that writes STATUS_CONTEXT on sha
-    as POSTER's App and returns whether GitHub took it. Safe to call
-    from another thread.
+    """A post(sha, state, description, context=None) that writes
+    `context` (default STATUS_CONTEXT) on sha as POSTER's App and
+    returns whether GitHub took it. Safe to call from another thread.
 
     With `project`, the token is minted and the status written in this
     process (agent_forge.github, through `call`); otherwise through
@@ -3269,7 +3366,8 @@ def make_poster(run=sh, out=print, project=None, call=None,
                 held.update(token=got, at=timer())
             return got
 
-    def post(sha, state, description):
+    def post(sha, state, description, context=None):
+        context = context or STATUS_CONTEXT
         tok = token()
         if tok is None:
             out("POST-FAILED %s %s: could not mint %s's token"
@@ -3279,7 +3377,7 @@ def make_poster(run=sh, out=print, project=None, call=None,
         if project is not None:
             status, body = github.rest(
                 tok, "POST", "/repos/%s/statuses/%s" % (REPO_SLUG, sha),
-                {"state": state, "context": STATUS_CONTEXT,
+                {"state": state, "context": context,
                  "description": description}, call or github.api_call)
             if status != 201:
                 out("POST-FAILED %s %s: HTTP %s %s"
@@ -3287,7 +3385,7 @@ def make_poster(run=sh, out=print, project=None, call=None,
                 return False
             return True
         got = gh(["-X", "POST", "repos/%s/statuses/%s" % (REPO_SLUG, sha),
-                  "-f", "state=" + state, "-f", "context=" + STATUS_CONTEXT,
+                  "-f", "state=" + state, "-f", "context=" + context,
                   "-f", "description=" + description], tok, run)
         if got.returncode != 0:
             out("POST-FAILED %s %s: %s" % (sha[:10], state,
@@ -3295,6 +3393,41 @@ def make_poster(run=sh, out=print, project=None, call=None,
             return False
         return True
     return post
+
+
+def tiered_poster(post, state_dir):
+    """designs/0055: with checks.quick, `post` as what posts on a pull
+    request's head: a status given no context goes to QUICK_CONTEXT,
+    the head's own, unless sha is a default-branch head, whose runs are
+    full. Without checks.quick, `post` itself."""
+    if QUICK_CONTEXT is None or post is None:
+        return post
+
+    def tiered(sha, state, description, context=None):
+        if context is None:
+            known = load(state_dir)
+            main = (known["waiting"].get(sha) or {}).get("main") or (
+                known["results"].get(sha) or {}).get("main")
+            context = STATUS_CONTEXT if main else QUICK_CONTEXT
+        return post(sha, state, description, context=context)
+    return tiered
+
+
+def post_verdict(post, sha, record):
+    """Post record's verdict on sha and return whether GitHub took it.
+    With checks.quick (designs/0055), a quick run's goes to
+    QUICK_CONTEXT, a full run's to STATUS_CONTEXT, and a full green
+    posts the quick context green too ("covered by the full check"): a
+    quick green never stands for the full check."""
+    if QUICK_CONTEXT is None:
+        return post(sha, *final_status(record))
+    if run_tier(record) == "quick":
+        return post(sha, *final_status(record), context=QUICK_CONTEXT)
+    posted = post(sha, *final_status(record), context=STATUS_CONTEXT)
+    if record.get("ok") is True:
+        posted = post(sha, "success", COVERED_TEXT,
+                      context=QUICK_CONTEXT) and posted
+    return posted
 
 
 def make_writer(project, out=print, call=None):
@@ -4164,23 +4297,26 @@ def repost(state, heads, post, out=print):
                   if sha in open_shas and r.get("posted") is not True)
     for _, sha in todo[:POST_BATCH]:
         r = state["results"][sha]
-        r["posted"] = post(sha, *final_status(r))
+        r["posted"] = post_verdict(post, sha, r)
         if r["posted"]:
             out("POSTED #%d %s: %s" % (r["pr"], sha[:10], verdict_word(r)))
 
 
 def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
-                 ahead=False, main=False, warm=False):
+                 ahead=False, main=False, warm=False, quick=False):
     """Start the check detached; see the module docstring on the cron
     lock. Its output goes to worker.log. A prediction (`ahead`) posts
     nothing, but a posting one still chains the next tick. `main` is a
     default-branch head's traced full run (checks.depends); `warm`, one
-    run again only to warm `slot`'s caches (checks.warm)."""
+    run again only to warm `slot`'s caches (checks.warm); `quick`, a
+    pull request's head's quick run (checks.quick, designs/0055)."""
     wlog = open(os.path.join(state_dir, "worker.log"), "a")
     wlog.write("=== %s worker %s %s %s%s ===\n"
                % (iso(now_utc()), who(pr, main), sha,
-                  "fast lane" if slot == LANE else "slot %d" % slot,
-                  " ahead" if ahead else " warm" if warm else ""))
+                  "fast lane" if slot == LANE else slot_label(slot)
+                  if is_quick_slot(slot) else "slot %d" % slot,
+                  " ahead" if ahead else " warm" if warm else
+                  " quick" if quick else ""))
     wlog.flush()
     # The installation's and the generation's locks forge-cron-run
     # handed this tick go on to the worker, which outlives it: neither
@@ -4194,6 +4330,7 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
         + (["--ahead"] if ahead else [])
         + (["--main"] if main or warm else [])
         + (["--warm"] if warm else [])
+        + (["--quick"] if quick else [])
         + (["--merger-dir", MERGER_DIR_ARG] if MERGER_DIR_ARG else [])
         + (["--instance", INSTANCE] if INSTANCE is not None else []),
         cwd=state_dir, stdin=subprocess.DEVNULL, stdout=wlog,
@@ -4223,7 +4360,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     slots = slots or slots_from_env()
     lane = FAST_LANE_S is not None and bool(checkout)
     holders = {slot: running(state_dir, slot)
-               for slot in list(range(1, slots + 1)) + ([LANE] if lane else [])}
+               for slot in list(range(1, slots + 1)) + ([LANE] if lane else [])
+               + quick_slots()}
     fields = {slot: holder_fields(h) for slot, h in holders.items()}
     busy = {f[1] for f in fields.values() if f}
     head_of_main = main_head(checkout, run) \
@@ -4387,7 +4525,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         elif got:
             out("RUNNING #%d %s since %s%s; %d waiting"
                 % (got[0], got[1][:10], got[2],
-                   " in the fast lane" if slot == LANE else "",
+                   " in the fast lane" if slot == LANE else
+                   " in " + slot_label(slot) if is_quick_slot(slot) else "",
                    len(queued - busy)))
         else:
             out("BUSY: %s is held; %d waiting"
@@ -4401,14 +4540,18 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 covered=covered)
         queued.discard(sha)
     free = [slot for slot, holder in holders.items()
-            if holder is None and slot != LANE]
+            if holder is None and slot != LANE and not is_quick_slot(slot)]
     lane_free = lane and holders[LANE] is None
+    # designs/0055: the quick slots, which only heads' quick runs take.
+    quick_free = [slot for slot in quick_slots() if holders[slot] is None]
+    # With checks.quick a pull request's head runs quick, wherever it runs.
+    as_quick = {"quick": True} if QUICK_CONTEXT is not None else {}
     if TEST_AHEAD and STOP_SPENT and merger_dir and not free \
             and not any(stopped_now) \
             and not (QUIET_DIR and quiet.live(QUIET_DIR, when)):
         preempt_front(state_dir, fields, batch, busy, when, checkout, run,
                       merger_dir, stop, out)
-    if not free and not lane_free:
+    if not free and not lane_free and not quick_free:
         return 0
     holds = quiet.live(QUIET_DIR, when) if QUIET_DIR else []
     if holds:
@@ -4445,7 +4588,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         else 0
     later_all = merger_later(merger_dir, when, checkout) if reserve else []
     own_running = sum(1 for slot, holder in holders.items()
-                      if slot != LANE and holder is not None
+                      if slot != LANE and not is_quick_slot(slot)
+                      and holder is not None
                       and not is_prediction(fields[slot]))
     # Fill every free slot, not one per tick: a tick's start rate was the
     # queue's ceiling (see the module docstring). What a pass starts is
@@ -4460,18 +4604,21 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         free[:] = ranked
 
     first_pass = True
-    while free or lane_free:
-        predicted = pick = fast = None
+    while free or lane_free or quick_free:
+        predicted = pick = fast = quick_pick = None
         held = {}
         with state_lock(state_dir):
             state = load(state_dir)
             cheap = cheap_heads(state) if lane else {}
             # A head whose own prediction, the same tree, is running waits
             # for its verdict rather than checking the tree a second time.
+            # Not with checks.quick (designs/0055): a head's quick run is
+            # its reviewers' signal, and no full run's to wait for.
             twins = twin_heads(state, fields.values(), checkout, run) \
-                if TEST_AHEAD else {}
+                if TEST_AHEAD and QUICK_CONTEXT is None else {}
             # And one in the Merger's batch waits for its top (designs/0032).
-            batched = batch_heads(state, batch, checkout, busy, when, run)
+            batched = batch_heads(state, batch, checkout, busy, when, run) \
+                if QUICK_CONTEXT is None else {}
             twins.update(batched)
             if first_pass:
                 say_held = held_said(state, twins, batched, batch, when)
@@ -4501,6 +4648,19 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                     save(state_dir, state)
             # What the lane just took is as good as running.
             taken = set(busy) | set(twins) | ({fast[0]} if fast else set())
+            if quick_free:
+                # designs/0055: a quick slot takes the next pull request's
+                # head; the default branch's runs are full runs.
+                mains = {s for s, w in state["waiting"].items()
+                         if w.get("main")}
+                quick_pick = next_head(
+                    state, taken | set(held) | slot_queued | mains,
+                    first_pr, when, cheap, urgent, blocked, predicted_prs,
+                    unblocks, slotted)
+                if quick_pick is not None:
+                    state["waiting"][quick_pick[0]]["started"] = iso(when)
+                    save(state_dir, state)
+                    taken.add(quick_pick[0])
             # A head of the Merger's own pull request held for its batch's
             # top: the top's run is the one the next merge waits on, so it
             # goes first, as the head itself would (2026-10-29: #5586 waited
@@ -4547,7 +4707,11 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                     # have it, the Merger's own included.
                     preferring = bool(batch) and (state.get(
                         "preempting") or {}).get("for") == batch[-1]["sha"]
-                    if front_held or preferring or own_full \
+                    # designs/0055: a head's quick run takes a full slot
+                    # only when no prediction wants it.
+                    quick_head = QUICK_CONTEXT is not None and (
+                        pick is None or pick[1] != 0)
+                    if quick_head or front_held or preferring or own_full \
                             or not merger_head_waits(
                             state, first_pr, taken, when) and (
                             pick is None or not SPARE_ONLY and not (
@@ -4592,12 +4756,26 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         first_pass = False
         if fast is not None:
             sha, pr = fast
-            spawn(state_dir, sha, pr, post is not None, LANE, checkout)
+            spawn(state_dir, sha, pr, post is not None, LANE, checkout,
+                  **as_quick)
             out("STARTED #%d %s in the fast lane, its steps ~%ds here; "
                 "%d waiting" % (pr, sha[:10], cheap[sha], len(queued - taken)))
             busy.add(sha)
             lane_free = False
+        if quick_pick is not None:
+            sha, pr = quick_pick
+            slot = quick_free.pop(0)
+            spawn(state_dir, sha, pr, post is not None, slot, checkout,
+                  quick=True)
+            out("STARTED-QUICK #%d %s in %s; %d waiting"
+                % (pr, sha[:10], slot_label(slot), len(queued - taken)))
+            busy.add(sha)
+        else:
+            # Nothing more for a quick slot this tick.
+            quick_free = []
         if not free:
+            if quick_free:
+                continue
             return 0
         if predicted is not None:
             sha, pr = predicted
@@ -4642,8 +4820,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             if fast is None and starting:
                 out("STARTING: %d just started, not yet running; %d waiting"
                     % (starting, len(queued - taken) - starting))
-            elif fast is None and len(free) == slots and (lane_free or not lane) \
-                    and not held:
+            elif fast is None and quick_pick is None and len(free) == slots \
+                    and (lane_free or not lane) and not held:
                 out("IDLE: no open head is waiting" if not queued else
                     "IDLE: %d waiting, each given up on after %d failures"
                     % (len(queued), MAX_ERRORS))
@@ -4662,11 +4840,12 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             own_running += 1
             continue
         if checkout:
-            spawn(state_dir, sha, pr, post is not None, free[0], checkout)
+            spawn(state_dir, sha, pr, post is not None, free[0], checkout,
+                  **as_quick)
         else:
-            spawn(state_dir, sha, pr, post is not None, free[0])
-        out("STARTED #%d %s%s; %d waiting%s"
-            % (pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
+            spawn(state_dir, sha, pr, post is not None, free[0], **as_quick)
+        out("STARTED%s #%d %s%s; %d waiting%s"
+            % ("-QUICK" if as_quick else "", pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
                len(queued - taken) - 1,
                ", first: the Merger waits on it" if pr == first_pr else
                ", first: it is approved"
@@ -4818,14 +4997,17 @@ def conflicted(state_dir, sha, pr, merge, started, finished, post,
             "seconds": 0, "step_seconds": {}, "base": merge["base"],
             "conflicts": merge["conflicts"],
         }
+        if QUICK_CONTEXT is not None:
+            record["tier"] = "quick" if RUN_QUICK else "full"
         mark_rerun(state, sha, record)
         state["results"][sha] = record
         save(state_dir, state)
-    log(state_dir, "VERDICT #%d %s: %s conflicts with %s at %s: %s"
+    log(state_dir, "VERDICT #%d %s: %s conflicts with %s at %s: %s%s"
         % (pr, sha[:10], verdict_word(record), MAIN, merge["base"][:10],
-           ", ".join(merge["conflicts"]) or "?"), finished, out)
+           ", ".join(merge["conflicts"]) or "?", tier_note(record)),
+        finished, out)
     if post is not None:
-        posted = post(sha, *final_status(record))
+        posted = post_verdict(post, sha, record)
         with state_lock(state_dir):
             state = load(state_dir)
             if sha in state["results"]:
@@ -4844,14 +5026,16 @@ def tree_of(wt, sha, run=sh):
 def flakes_of(state, sha, record):
     """The commits whose red verdict, on this host and step list, this
     green record's identical tree contradicts: a red that was not the
-    tree's. Nothing for a record without a tree."""
+    tree's. Nothing for a record without a tree. Only a run of the same
+    tier (designs/0055) ran the same steps."""
     if not record["ok"] or not record.get("tree"):
         return []
     return sorted(other for other, r in state["results"].items()
                   if other != sha and not r.get("ok")
                   and r.get("tree") == record["tree"]
                   and r.get("host") == record["host"]
-                  and r.get("steps") == record["steps"])
+                  and r.get("steps") == record["steps"]
+                  and run_tier(r) == run_tier(record))
 
 
 def matched(state_dir, sha, pr, same, tree, started, post, out=print,
@@ -4884,23 +5068,29 @@ def matched(state_dir, sha, pr, same, tree, started, post, out=print,
             record["main"] = True
         if covered:
             record["covered"] = covered
+        if QUICK_CONTEXT is not None:
+            # A head matched to a full verdict has the full check's
+            # green, and the quick context with it (designs/0055).
+            record["tier"] = run_tier(source)
         mark_rerun(state, sha, record)
         state["results"][sha] = record
         save(state_dir, state)
     if main:
         log(state_dir, "MAIN-GREEN %s %s: matched; its tree tested green as "
-            "%s %s, not run again" % (MAIN, sha[:10], record["matched_as"],
-                                      same[:10]), started, out)
+            "%s %s, not run again%s" % (MAIN, sha[:10], record["matched_as"],
+                                        same[:10], tier_note(record)),
+            started, out)
     elif covered:
         log(state_dir, "COVERED #%d %s: the top of the Merger's batch %s "
-            "tested green as %s; not run" % (pr, sha[:10], covered,
-                                             same[:10]), started, out)
+            "tested green as %s; not run%s" % (pr, sha[:10], covered,
+                                               same[:10], tier_note(record)),
+            started, out)
     else:
         log(state_dir, "MATCHED #%d %s: its tree tested green as %s %s; not "
-            "run again" % (pr, sha[:10], record["matched_as"], same[:10]),
-            started, out)
+            "run again%s" % (pr, sha[:10], record["matched_as"], same[:10],
+                             tier_note(record)), started, out)
     if post is not None:
-        posted = post(sha, *final_status(record))
+        posted = post_verdict(post, sha, record)
         with state_lock(state_dir):
             state = load(state_dir)
             if sha in state["results"]:
@@ -4952,7 +5142,8 @@ def online_cpus():
 
 def check_cpus(online=None, slots=None, busy=None):
     """CHECK_CPUS: the online CPUs shared between the slots, the fast
-    lane counting as one more, and at least 1. With `busy`, the slots
+    lane and each quick slot (designs/0055) counting as one more, and at
+    least 1. With `busy`, the slots
     holding a run as this one starts (counting itself), it is shared
     between those instead, never less than the all-slots share: a run
     alone gets the whole host."""
@@ -4960,6 +5151,8 @@ def check_cpus(online=None, slots=None, busy=None):
     slots = slots_from_env() if slots is None else slots
     if FAST_LANE_S is not None:
         slots += 1
+    # designs/0055: each quick slot counts like the fast lane.
+    slots += len(quick_slots())
     share = max(1, online // max(1, slots))
     if busy is None:
         return share
@@ -4995,9 +5188,10 @@ def cpu_share(state_dir, env, environ=None):
 
 
 def busy_slots(state_dir, slots=None):
-    """How many slots, the fast lane too, hold a run now."""
+    """How many slots, the fast lane and the quick slots too, hold a
+    run now."""
     slots = slots_from_env() if slots is None else slots
-    names = list(range(1, slots + 1))
+    names = list(range(1, slots + 1)) + quick_slots()
     if FAST_LANE_S is not None:
         names.append(LANE)
     return sum(running(state_dir, slot) is not None for slot in names)
@@ -6360,8 +6554,12 @@ def settled_heads(state, checkout, busy=(), when=None, run=sh,
         return run(["git", "-C", checkout, "merge-base", "--is-ancestor",
                     a, b]).returncode == 0
     # The scoped steps are judged by what each head needs (designs/0048).
-    every = covers({"ran": [name for name, _, _ in STEPS
-                            if name not in SCOPED], "base": tip}, older)
+    # With checks.quick a head's run is a quick one, which a full green
+    # covers too (designs/0055).
+    quick = QUICK_CONTEXT is not None
+    every = covers({"ran": [name for name, _, _ in tier_steps(quick, STEPS)
+                            if name not in SCOPED], "base": tip}, older,
+                   tiered=quick)
     key = records_key(state_dir, tip) \
         if FRESH_WAIT is not None and state_dir else None
     members = {e["tree"] for e in batch[:-1]}
@@ -6377,11 +6575,15 @@ def settled_heads(state, checkout, busy=(), when=None, run=sh,
             n for n, _, _ in applicable_at(checkout, sha, run)]) \
             if SCOPED and tree else None
         same = tested(state, tree, when, ok=True,
-                      accept=scoped_too(every, need)) if tree else None
+                      accept=scoped_too(every, need),
+                      quick=quick) if tree else None
         steps = estimated(entry, tip, key)
+        if steps is not None and quick:
+            steps = [n for n in steps if TIERS.get(n, "both") != "train"]
         if same is None and tree and steps is not None:
             same = tested(state, tree, when, ok=True, accept=scoped_too(
-                covers({"ran": steps, "base": tip}, older), need))
+                covers({"ran": steps, "base": tip}, older, tiered=quick),
+                need), quick=quick)
         covered = None
         if same is None and tree in members:
             top = batch[-1]["tree"]
@@ -6588,7 +6790,7 @@ def cheap_heads(state, costs=None):
     return cheap
 
 
-def covers(selection, older=None):
+def covers(selection, older=None, tiered=False):
     """accept(record) for `tested`: whether an earlier verdict ran every
     step this head would, under the same base or an older one. A verdict
     that ran every step covers any head; a narrower one only a head that
@@ -6601,14 +6803,21 @@ def covers(selection, older=None):
     the Merger's second prediction and on: predicted on top of the
     prediction before it, it was run against the default branch before
     that merged, while the head the Merger updates later, with the same
-    tree, is based on the merge itself."""
+    tree, is based on the merge itself.
+
+    `tiered` (designs/0055): `selection` is a quick run's, and a full
+    run's verdict need not have run its "head" steps, which no full run
+    does: a full green covers the quick check."""
     def accept(record):
         earlier = record.get("selection") or {}
         if "ran" not in earlier:
             return True
         if "ran" not in (selection or {}):
             return False
-        if not set(selection["ran"]) <= set(earlier["ran"]):
+        wanted = set(selection["ran"])
+        if tiered and run_tier(record) == "full":
+            wanted = {n for n in wanted if TIERS.get(n, "both") != "head"}
+        if not wanted <= set(earlier["ran"]):
             return False
         base, theirs = selection["base"], earlier.get("base")
         return theirs == base or (
@@ -7003,7 +7212,30 @@ class Phases:
 
 def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
            post=None, chain=None, slot=1, memory_max=None, ahead=False,
-           main=False, report=None, front=None, warm=False, flake=None):
+           main=False, report=None, front=None, warm=False, flake=None,
+           quick=False):
+    """`run_worker` as a run of its tier (designs/0055): with
+    checks.quick, a `quick` run runs the "head" and "both" steps and
+    posts QUICK_CONTEXT; any other, a full run, runs the "train" and
+    "both" steps. Without checks.quick, every step, as ever."""
+    global STEPS, RUN_QUICK
+    if QUICK_CONTEXT is None:
+        quick = False
+    saved = STEPS, RUN_QUICK
+    STEPS, RUN_QUICK = (tier_steps(quick, STEPS), quick) \
+        if QUICK_CONTEXT is not None else saved
+    try:
+        return run_worker(repo, state_dir, sha, pr, run, out, clock, post,
+                          chain, slot, memory_max, ahead, main, report,
+                          front, warm, flake, quick)
+    finally:
+        STEPS, RUN_QUICK = saved
+
+
+def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
+               post=None, chain=None, slot=1, memory_max=None, ahead=False,
+               main=False, report=None, front=None, warm=False, flake=None,
+               quick=False):
     """Check sha, pull request pr's head, now, in this process, in
     `slot`, each step limited to memory_max (None: no limit). With
     `ahead`, sha is the Merger's prediction for pr: checked out without
@@ -7045,11 +7277,12 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
     # The wall clock, which the caches' mtimes are read against.
     begun = time.time()
     held = try_lock(lock_path(state_dir, slot),
-                    "#%d %s %s pid=%d%s" % (pr, sha, iso(started),
-                                            os.getpid(),
-                                            " ahead" if ahead else
-                                            " main warm" if warm else
-                                            " main" if main else ""))
+                    "#%d %s %s pid=%d%s%s" % (pr, sha, iso(started),
+                                              os.getpid(),
+                                              " ahead" if ahead else
+                                              " main warm" if warm else
+                                              " main" if main else "",
+                                              " quick" if quick else ""))
     if held is None:
         out("BUSY: another check holds the worker lock"
             + ("" if slot == 1 else " for " + slot_label(slot)))
@@ -7179,12 +7412,13 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 "or reused")
         if tree and not ahead and not main and not force:
             with state_lock(state_dir):
+                    # A quick run takes a full verdict too (designs/0055).
                 same = tested(load(state_dir), tree, started, ok=True,
                               accept=scoped_too(covers(
                                   selection, lambda a, b: run(
                                       ["git", "-C", wt, "merge-base",
                                        "--is-ancestor", a, b]).returncode
-                                  == 0), scoped))
+                                  == 0, tiered=quick), scoped), quick=quick)
             if same is not None and same != sha:
                 settled = True
                 return matched(state_dir, sha, pr, same, tree, started,
@@ -7225,11 +7459,11 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             pending.start()
             first_post = post
 
-            def post(*args):
+            def post(*args, **kwargs):
                 # Every later post, the verdict's or a host fault's,
                 # lands after the pending one.
                 pending.join()
-                return first_post(*args)
+                return first_post(*args, **kwargs)
         env = step_env(state_dir, slot=slot)
         steps, wrap, tracer, files = None, None, None, {}
         composed = None
@@ -7510,6 +7744,8 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 record["merger_weight"] = True
             if ahead:
                 record["ahead"] = True
+            if QUICK_CONTEXT is not None:
+                record["tier"] = "quick" if quick else "full"
             if main:
                 record["main"] = True
                 if ok:
@@ -7546,11 +7782,11 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                    slot_label(slot), verdict_word(record),
                    record["seconds"]), finished, out)
         elif main:
-            log(state_dir, "%s %s %s: %s waited=%ds ran=%ds"
+            log(state_dir, "%s %s %s: %s waited=%ds ran=%ds%s"
                 % ("MAIN-GREEN" if ok else "MAIN-RED", MAIN, sha[:10],
                    verdict_word(record),
                    (started - parse(seen)).total_seconds(),
-                   record["seconds"]), finished, out)
+                   record["seconds"], tier_note(record)), finished, out)
             if report is not None:
                 report(sha, ok, [(r["name"], r.get("tail", ""))
                                  for r in results if r["rc"] != 0], None)
@@ -7565,12 +7801,13 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                     except OSError:
                         pass
         else:
-            log(state_dir, "VERDICT%s %s %s: %s waited=%ds ran=%ds%s"
+            log(state_dir, "VERDICT%s %s %s: %s waited=%ds ran=%ds%s%s"
                 % (" AHEAD" if ahead else "", name, sha[:10],
                    verdict_word(record),
                    (started - parse(seen)).total_seconds(),
                    record["seconds"], " merger_weight"
-                   if record.get("merger_weight") else ""), finished, out)
+                   if record.get("merger_weight") else "",
+                   tier_note(record)), finished, out)
             if report is not None and not ok and not ahead:
                 report(sha, ok, [(r["name"], r.get("tail", ""))
                                  for r in results if r["rc"] != 0], None)
@@ -7608,7 +7845,7 @@ def worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             if pending is not None:
                 pending.join()
                 phases.mark("post-pending")
-            posted = post(sha, *final_status(record))
+            posted = post_verdict(post, sha, record)
             phases.mark("post")
         # The steps' own time is in step_seconds; what the run spent
         # around them is kept beside it (agent-forge #13).
@@ -7696,6 +7933,10 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
                         "--slot only to bring the slot's caches up to it "
                         "(checks.warm): untraced, posted nowhere, and kept "
                         "apart from its verdict")
+    parser.add_argument("--quick", action="store_true",
+                        help="with --worker: a quick run of the head, its "
+                        "\"head\" and \"both\" steps, posted as "
+                        "checks.quick.context (designs/0055)")
     parser.add_argument("--relabel-host", metavar="OLD",
                         help="after moving the state to this host: count "
                         "every verdict recorded on host OLD as this "
@@ -7760,6 +8001,8 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
         return 0
     post = make_poster(run, out, project) if args.post and not args.warm \
         else None
+    # With checks.quick, what a head gets is its quick context's.
+    post = tiered_poster(post, state_dir)
     if args.worker:
         chain = (lambda: start_next_tick(
             checkout=repo, state_dir=args.state_dir,
@@ -7794,7 +8037,8 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
                       post=post, chain=chain, slot=args.slot,
                       memory_max=memory_max_from_env(environ),
                       ahead=args.ahead, main=args.main, report=report,
-                      front=front, warm=args.warm, flake=flake)
+                      front=front, warm=args.warm, flake=flake,
+                      quick=args.quick)
     token = mint(run)
     if token is None:
         out("NO-TOKEN: could not mint %s's token" % POSTER)

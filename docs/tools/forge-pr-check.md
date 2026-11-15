@@ -17,7 +17,7 @@ a run.
                    [--state-dir DIR] [--merger-dir DIR]
     forge-pr-check --relabel-host OLD [--instance NAME] [--checkout DIR]
     forge-pr-check --worker SHA --pr N [--slot K] [--post]
-                   [--ahead | --main [--warm]] [...]
+                   [--ahead | --main [--warm] | --quick] [...]
 
 Without `--worker` it is a **tick**: it queues the open heads, posts
 `pending` on new ones, and starts a detached worker for each head it
@@ -63,6 +63,7 @@ for the memory limit and CPU weight, and, with
 | `--slot K` | `1` | With `--worker`: the slot to run in. `0` is the fast lane. |
 | `--ahead` | off | With `--worker`: SHA is the Merger's predicted commit for pull request `--pr` (`merge.test_ahead`), checked and recorded but never posted. |
 | `--main` | off | With `--worker`: SHA is the default branch's head, run with every step (under the tracer with `checks.depends`, writing its dependency record). |
+| `--quick` | off | With `--worker`: a quick run of a pull request's head (`checks.quick`): only its `"head"` and `"both"` steps, posted as `checks.quick.context`. |
 | `--warm` | off | With `--worker`; implies `--main`. Build SHA again in `--slot` only to bring the slot's caches up to it (`checks.warm`): untraced, posted nowhere, kept apart from its verdict. |
 | `--state-dir DIR` | `~/.local/state/agent-forge/<project>/pr-check` (`pr-check-<name>` for an instance) | Where the queue, the verdicts and the logs live. Passed on to workers and chained ticks. |
 | `--merger-dir DIR` | `~/.local/state/agent-forge/<project>/merger` | The Merger's state directory: its `next.json` names the pull request to check first and its `ahead.json` lists its predictions. Read with `checks.merger_first`, `merge.test_ahead`, `checks.merger_cpu_weight` or `checks.docker_slices`. |
@@ -96,6 +97,7 @@ every `FORGE_` variable and `checks.drop_env`, plus the variables in
   [The fast lane](../config.md#the-fast-lane),
   [Pruning the build caches](../config.md#pruning-the-build-caches),
   [Warming a slot's caches](../config.md#warming-a-slots-caches),
+  [A quick check on heads](../config.md#a-quick-check-on-heads),
   [Checking the merge with the default branch](../config.md#checking-the-merge-with-the-default-branch),
   [Reusing a step's verdict](../config.md#reusing-a-steps-verdict) and
   [Keeping the records fresh](../config.md#keeping-the-records-fresh).
@@ -320,8 +322,8 @@ In the state directory (`--state-dir`):
 | `state.lock` | Held around every write of `state.json`. |
 | `verdicts.log` | One line per verdict, refusal, give-up and report. |
 | `worker.log` | Each worker's output: every step's exit status and time, and under a failed step its last 40 lines, failure lines first, each prefixed `    \| `. |
-| `worker.lock`, `worker-N.lock`, `worker-lane.lock` | Each slot's lock and its holder. |
-| `wt`, `wt-N`, `wt-lane` | Each slot's worktree. |
+| `worker.lock`, `worker-N.lock`, `worker-lane.lock`, `worker-quick.lock` | Each slot's lock and its holder (`-quick`, `-quick-2` and on: `checks.quick`'s slots). |
+| `wt`, `wt-N`, `wt-lane`, `wt-quick` | Each slot's worktree. |
 | `tmp`, `tmp-N` | Each slot's `TMPDIR`. |
 | cache directories | Each slot's `checks.caches` (`<name>`, `<name>-N`, `<name>-lane`). |
 | `logs/<head>/<step>.log.gz` | Each step's whole output, a time on every line; kept 14 days. |
@@ -353,5 +355,6 @@ to `~/cron-logs/forge-pr-check.log` through `forge-cron-run`.
 * [forge-quiet](forge-quiet.md), which holds the host quiet.
 * [designs/0005](../designs/0005-steps-that-run-only-for-what-changed.md),
   [designs/0021](../designs/0021-a-second-check-instance.md),
-  [designs/0029](../designs/0029-a-heads-steps-run-side-by-side.md) and
-  [designs/0032](../designs/0032-merge-in-batches.md).
+  [designs/0029](../designs/0029-a-heads-steps-run-side-by-side.md),
+  [designs/0032](../designs/0032-merge-in-batches.md) and
+  [designs/0055](../designs/0055-a-quick-check-on-heads-the-full-check-on-trains.md).
