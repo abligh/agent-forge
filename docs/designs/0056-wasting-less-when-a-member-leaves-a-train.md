@@ -31,7 +31,8 @@ every prediction at and after its place. Those runs are then wasted.
 5. **A train whose run hasn't started takes new members.** Added
    after step 1 counted lone merges: half of them went alone because
    a train of one held a train's place. New key
-   `merge.test_ahead.grow_unstarted`, off by default.
+   `merge.test_ahead.grow_unstarted`, off by default. A prototype
+   replayed worse, so it waits.
 
 No new rule about queue order is proposed. Every new key is off
 unless set.
@@ -227,6 +228,23 @@ What it costs: a top that hadn't started is predicted again, which is
 cheap. A top that the check was about to start may wait one tick
 longer for its new prediction.
 
+**A prototype did worse (2026-11-15).** With the last kept train
+re-opened while its top hadn't started, the library's days replayed,
+against main:
+
+| | ordinary | heavy | bad |
+| --- | --- | --- | --- |
+| Merged | 111 → 107 | 150 → 143 | 94 → 92 |
+| Approval to merge, median | 44 → 42 min | 92.5 → 104 min | 75 → 71.5 min |
+| Approval to merge, p90 | 129 → 155 min | 341 → 375 min | 251 → 268 min |
+| Merged alone | 52 → 44 | 51 → 41 | 55 → 46 |
+| Hand-backs | 76 → 43 | 92 → 46 | 90 → 53 |
+| Rule breaks | 0 → 0 | 0 → 1 | 0 → 0 |
+
+Fewer merges went alone, but fewer merged, and the slowest waited
+longer. So item 5 is not proposed until it is known why growing costs
+merges, and a version that does better is replayed.
+
 ## Measuring
 
 `forge-flow` and the replay report already give departures from
@@ -248,11 +266,10 @@ carries `make replay-compare`'s table.
    request), and departures by place plus lone runs in the replay
    report and `forge-flow`. Until those are counted, the library's days
    can't show what items 3 and 4 change.
-2. `merge.test_ahead.grow_unstarted` (item 5), judged on the lone
-   merges first.
-3. `merge.test_ahead.window`.
-4. `merge.resolve.board_unreviewed`, with the `RESOLUTION-REVIEW` ask.
-5. Only if Alex asks: `merge.resolve.keep_approval_paths`.
+2. `merge.test_ahead.window`.
+3. `merge.resolve.board_unreviewed`, with the `RESOLUTION-REVIEW` ask.
+4. Only if Alex asks: `merge.resolve.keep_approval_paths`.
+5. Item 5, only once a version replays better than main.
 
 ## Acceptance
 
