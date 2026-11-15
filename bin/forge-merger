@@ -1287,6 +1287,21 @@ GATED = ()
 # head. A head the Merger's own merge of the default branch made is
 # judged by the approved commit, as `covers_head` judges the approval.
 OWN_HEAD_GREEN = True
+# merge.gate_tier (designs/0055 step 2): "head", the default, merges a
+# pull request on checks.context green on its head. "train" reads
+# checks.quick's context (HEAD_CONTEXT) wherever the head's green was
+# read, and merges only trains (`train_merge`), on checks.context on
+# the train's top; a lone candidate is a train of one. STEP_TIERS:
+# checks.steps' tiers by name, for the red hand-back.
+GATE_TIER = "head"
+HEAD_CONTEXT = None
+STEP_TIERS = {}
+TRAIN_ONLY_REASON = ("%s is green; with merge.gate_tier \"train\" it "
+                     "merges only in a train, on %s green on the train's "
+                     "top")
+RED_STEPS_NOTE = " The run failed %s."
+TRAIN_STEPS_NOTE = (" The head's quick check (%s) doesn't run %s (tier "
+                    "\"train\"): run %s yourself before you push again.")
 # merge.approval (2026-11-13): "reviewer", the default, needs a
 # reviewer agent's approval; "green", for a project with no second
 # reviewer, takes the head's own green check as the approval.
@@ -1367,6 +1382,7 @@ def configure(project):
     global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR, LAYERS_OWN_GREEN
     global LEFT_TOP_COVERS
     global OWN_GREEN_TO_BOARD, APPROVAL
+    global GATE_TIER, HEAD_CONTEXT, STEP_TIERS, GREENS_FILE
     merge, checks = project.section("merge"), project.section("checks")
     REPO_SLUG = project.repo
     MAIN = project.default_branch
@@ -1389,6 +1405,16 @@ def configure(project):
     GATE = tuple(tuple(argv) for argv in merge.get("gate", DEFAULT_GATE))
     OWN_HEAD_GREEN = merge.get("own_head_green", True)
     APPROVAL = merge.get("approval", "reviewer")
+    GATE_TIER = merge.get("gate_tier", "head")
+    quick = checks.get("quick")
+    HEAD_CONTEXT = (
+        quick.get("context", STATUS_CONTEXT + "/quick")
+        if GATE_TIER == "train" and isinstance(quick, dict) else None)
+    STEP_TIERS = {step["name"]: step.get("tier", "both")
+                  for step in checks.get("steps") or ()
+                  if isinstance(step, dict) and "name" in step}
+    # A quick green isn't a full one: each gate keeps its own greens.
+    GREENS_FILE = "greens-quick.json" if HEAD_CONTEXT else "greens.json"
     CI_WORKFLOW = merge.get("ci_workflow", "ci")
     STALL_AFTER = datetime.timedelta(minutes=merge.get("stall_minutes", 30))
     alert = merge.get("stall_alert")
@@ -2470,13 +2496,20 @@ def paths_text(paths):
     return "Start the re-review with:\n\n%s\n\n" % "\n".join(lines)
 
 
-def status_state(statuses):
-    """(state, description) of the newest `STATUS_CONTEXT` status in
-    `statuses`, as REST's commits/<sha>/statuses lists them (newest
-    first), counting only those STATUS_CREATOR created; (None, "") when
-    there is none."""
+def head_context():
+    """The context a pull request's head is judged by: checks.quick's
+    with merge.gate_tier "train", else checks.context."""
+    return HEAD_CONTEXT or STATUS_CONTEXT
+
+
+def status_state(statuses, context=None):
+    """(state, description) of the newest `context` (default
+    `STATUS_CONTEXT`) status in `statuses`, as REST's
+    commits/<sha>/statuses lists them (newest first), counting only
+    those STATUS_CREATOR created; (None, "") when there is none."""
+    context = context or STATUS_CONTEXT
     for status in statuses:
-        if (status.get("context") == STATUS_CONTEXT
+        if (status.get("context") == context
                 and (status.get("creator") or {}).get("login")
                 == STATUS_CREATOR):
             return (status.get("state") or "unknown",
@@ -2845,13 +2878,13 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
         return {"action": "UPDATE"}
     state, said = status_state(github.api(
         "repos/%s/commits/%s/statuses?per_page=100" % (REPO_SLUG, head))
-        or [])
+        or [], head_context())
     if state in (None, "pending"):
         return {"action": "WAIT", "reason": "%s is %s" % (
-            STATUS_CONTEXT, state or "absent")}
+            head_context(), state or "absent")}
     if state != "success":
         return back("author", "%s is %s%s" % (
-            STATUS_CONTEXT, state, ": " + said if said else ""))
+            head_context(), state, ": " + said if said else ""))
     problem, notes = None, {}
     if CI_WORKFLOW:
         runs = github.api("repos/%s/actions/runs?head_sha=%s&per_page=100"
@@ -2882,6 +2915,11 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
                 notes.update(retry=True, at=iso(now or now_utc()))
             return dict(back("author", problem), text=description(pr),
                         **notes)
+    if GATE_TIER == "train":
+        # designs/0055: nothing merges on the quick check alone; the
+        # train it boards merges it (`train_merge`).
+        return dict({"action": "WAIT", "reason": TRAIN_ONLY_REASON % (
+            head_context(), STATUS_CONTEXT)}, **notes)
     if AHEAD_BATCH > 1 and COVERED_TEXT in said:
         notes["covered"] = True
     return dict({"action": "MERGE"}, **notes)
@@ -4663,7 +4701,7 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
         if sha not in cache:
             cache[sha] = status_state(github.api(
                 "repos/%s/commits/%s/statuses?per_page=100"
-                % (REPO_SLUG, sha)) or [])[0]
+                % (REPO_SLUG, sha)) or [], head_context())[0]
         if cache[sha] == "success":
             return None
         seen.append((sha, cache[sha]))
@@ -4671,7 +4709,7 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
         # The reason names the head (or the approved commit), as before.
         seen = seen[:2]
     sha, state = seen[-1] if seen else ("", None)
-    return GREEN_WAIT_REASON % (STATUS_CONTEXT, state or "absent",
+    return GREEN_WAIT_REASON % (head_context(), state or "absent",
                                 sha[:10] or "its head")
 
 
@@ -7073,7 +7111,7 @@ def red_hand_back(reason):
     """Whether a hand-back's `reason` is the build check's red on the
     head itself."""
     return isinstance(reason, str) and \
-        reason.startswith(STATUS_CONTEXT + " is failure")
+        reason.startswith(head_context() + " is failure")
 
 
 def clear_green_reruns(said, prs, check_state, out):
@@ -7264,7 +7302,8 @@ def clear_red_suspects(state_dir, reds, prs, check_state, repo, github,
 
 
 def hand_back_red_suspect(state_dir, entry, green, queue, approvals, reds,
-                          github, said, live, record, out, main_tip=None):
+                          github, said, live, record, out, main_tip=None,
+                          check_state=None):
     """designs/0044, rule 4: hand back the suspect a red batch's search
     found red on its own (`entry`, its prediction, on top of `green`
     suspects found green), once, and keep it in RED_SUSPECT_FILE, so
@@ -7285,7 +7324,8 @@ def hand_back_red_suspect(state_dir, entry, green, queue, approvals, reds,
             " and the %d pull requests ahead of it in the batch" % green
             if green > 1 else " and the one ahead of it in the batch"
             if green else ""), MAIN,
-            RED_SUSPECT_RERUN % RERUN_LABEL if RERUN_LABEL else ""))
+            RED_SUSPECT_RERUN % RERUN_LABEL if RERUN_LABEL else "")
+        + red_steps_note(check_state, entry.get("sha")))
     decision["suspect"] = True
     record["decisions"].append(decision)
     if str(entry["pr"]) not in reds:
@@ -7298,6 +7338,25 @@ def hand_back_red_suspect(state_dir, entry, green, queue, approvals, reds,
     reds[str(entry["pr"])] = kept
     if live:
         save_json(os.path.join(state_dir, RED_SUSPECT_FILE), reds)
+
+
+def red_steps_note(check_state, sha):
+    """designs/0055, with merge.gate_tier "train": the steps the build
+    check's run of `sha` failed, and which of them the head's quick
+    check doesn't run (tier "train"), so that the author knows to run
+    those locally. "" otherwise, or when the run names none."""
+    if GATE_TIER != "train" or not sha:
+        return ""
+    result = ((check_state or {}).get("results") or {}).get(sha)
+    failed = result.get("failed") if isinstance(result, dict) else None
+    if not failed:
+        return ""
+    names = ", ".join(failed)
+    train = [step for step in failed if STEP_TIERS.get(step) == "train"]
+    return RED_STEPS_NOTE % names + (
+        TRAIN_STEPS_NOTE % (head_context(), ", ".join(train),
+                            "it" if len(train) == 1 else "them")
+        if train else "")
 
 
 def merged_one(record):
@@ -8460,7 +8519,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         decision.update(pr=pr["number"], head=pr["headRefOid"])
         steps = head_base_red(check_state, pr["headRefOid"]) \
             if decision["action"] == "HAND-BACK" and decision.get(
-                "reason", "").startswith(STATUS_CONTEXT + " is failure") \
+                "reason", "").startswith(head_context() + " is failure") \
             else None
         if steps and ((check_state.get("main_red") or {}).get("issue")):
             base = (check_state["results"][pr["headRefOid"]].get("base")
@@ -8468,7 +8527,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             decision = {"action": "WAIT", "pr": pr["number"],
                         "head": pr["headRefOid"],
                         "reason": BASE_RED_REASON % (
-                            STATUS_CONTEXT, ", ".join(steps), MAIN,
+                            head_context(), ", ".join(steps), MAIN,
                             base[:10])}
         elif steps:
             # The tip is green again: the head is brought up to date,
@@ -9108,7 +9167,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 for entry, green in found:
                     hand_back_red_suspect(
                         state_dir, entry, green, ahead_queue, approvals,
-                        reds, github, said, live, record, out, main_tip)
+                        reds, github, said, live, record, out, main_tip,
+                        check_state)
                 if found:
                     save_json(said_path, said)
                 if found and not searching:

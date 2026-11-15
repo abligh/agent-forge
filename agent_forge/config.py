@@ -132,7 +132,11 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_run_factor": (int, float), "resolve_slots": int,
          "resolve_slot_minutes": (int, float), "resolve_slot_on": str,
          "mode": str, "code_owner_ask": dict, "code_owner_sequence": bool,
-         "approval": str}
+         "approval": str, "gate_tier": str}
+# merge.gate_tier (designs/0055): which tier's green gates a merge.
+# "head" is the head's own checks.context, as before; "train" takes
+# checks.quick's context on the head and merges only trains.
+GATE_TIERS = ("head", "train")
 # merge.code_owner_ask (agent-forge #153).
 CODE_OWNER_ASK = {"labels": list, "title": str}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
@@ -708,6 +712,7 @@ def check(data):
             elif merge["approval"] == "green" \
                     and merge.get("own_head_green") is False:
                 problems.append("merge.approval green needs own_head_green")
+        _check_gate_tier(data, problems)
         name = merge.get("merger")
         if isinstance(name, str) and name not in data.get("machinery", {}):
             problems.append("merge.merger %r is not in machinery" % name)
@@ -1633,6 +1638,55 @@ def _check_quick(checks, data, problems):
             isinstance(s, dict) and s.get("tier") == "train" for s in steps):
         problems.append("checks.quick: every step's tier is \"train\", so "
                         "a quick run would run nothing")
+
+
+def _check_gate_tier(data, problems):
+    """merge.gate_tier (designs/0055): "train" merges only trains, on
+    the full check's green on the train's top, and takes the quick
+    check's green on a head where the head's full green was needed.
+    So it needs the quick check, the head's own green, and trains that
+    merge as one. The quick check needs it in turn: its heads get no
+    full run of their own, so under "head" nothing would ever merge."""
+    merge = data.get("merge") or {}
+    checks = data.get("checks") if isinstance(data.get("checks"),
+                                              dict) else {}
+    tier = merge.get("gate_tier", "head")
+    if not isinstance(tier, str):
+        return
+    if tier not in GATE_TIERS:
+        problems.append("merge.gate_tier must be one of %s"
+                        % ", ".join(GATE_TIERS))
+        return
+    quick = checks.get("quick")
+    if tier != "train":
+        if isinstance(quick, dict):
+            problems.append("checks.quick needs merge.gate_tier \"train\": "
+                            "a head gets no full run of its own, so only a "
+                            "train can merge it")
+        return
+    if quick is None:
+        problems.append("merge.gate_tier \"train\" needs checks.quick: "
+                        "it is the head's green")
+    if merge.get("own_head_green") is False:
+        problems.append("merge.gate_tier \"train\" needs own_head_green: a "
+                        "head boards a train on its quick check's green")
+    ahead = test_ahead(data)
+    if ahead is None:
+        problems.append("merge.gate_tier \"train\" needs merge.test_ahead: "
+                        "only a train merges")
+        return
+    if ahead.get("train_merge") is not True:
+        problems.append("merge.gate_tier \"train\" needs "
+                        "merge.test_ahead.train_merge: a train goes in as "
+                        "one, on its top's full check")
+    if ahead.get("trains") != "live":
+        problems.append("merge.gate_tier \"train\" needs "
+                        "merge.test_ahead.trains \"live\"")
+    batch = ahead.get("batch")
+    if _is(batch, int) and batch < 2:
+        problems.append("merge.gate_tier \"train\" needs "
+                        "merge.test_ahead.batch above 1: trains merge only "
+                        "in batches")
 
 
 def _check_warm(checks, problems, section="checks"):

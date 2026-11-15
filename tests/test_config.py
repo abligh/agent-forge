@@ -46,6 +46,18 @@ class Check(unittest.TestCase):
                 data[key] = value
         return config.check(data)
 
+    def quick_problems(self, checks=None, **merge):
+        """config.check with merge.gate_tier "train" and trains that
+        merge as one (designs/0055), as checks.quick needs; `checks`
+        replaces the checks section, and `merge` keys are set."""
+        data = example()
+        if checks is not None:
+            data["checks"] = checks
+        data["merge"]["gate_tier"] = "train"
+        data["merge"]["test_ahead"]["train_merge"] = True
+        data["merge"].update(merge)
+        return config.check(data)
+
     def test_test_ahead_later_first_is_not_negative(self):
         data = example()
         data.setdefault("merge", {})["test_ahead"] = {"later_first": 1}
@@ -1020,21 +1032,21 @@ class Check(unittest.TestCase):
                  {"name": "test", "run": ["make", "test"], "tier": "train"},
                  {"name": "lint", "run": ["make", "lint"], "tier": "both"},
                  {"name": "docs", "run": ["make", "docs"]}]
-        self.assertEqual(self.problems(checks={
+        self.assertEqual(self.quick_problems({
             "steps": steps, "quick": {}}), [])
-        self.assertEqual(self.problems(checks={
+        self.assertEqual(self.quick_problems({
             "steps": steps, "quick": {"context": "ci/quick", "slots": 2}}),
             [])
-        self.assertEqual(self.problems(checks={
+        self.assertEqual(self.quick_problems({
             "quick": {"slots": 0, "lanes": 1}}), [
             "checks.quick: unknown key 'lanes'",
             "checks.quick.slots must be at least 1"])
-        self.assertEqual(self.problems(checks={
+        self.assertEqual(self.quick_problems({
             "quick": {"context": "vm/build-and-test"},
             "context": "vm/build-and-test"}), [
             "checks.quick.context 'vm/build-and-test' is another check's "
             "context"])
-        self.assertEqual(self.problems(checks={"quick": {"context": " "}}), [
+        self.assertEqual(self.quick_problems({"quick": {"context": " "}}), [
             "checks.quick.context must not be empty"])
         self.assertEqual(self.problems(checks={"quick": 1}), [
             "checks.quick must be an object"])
@@ -1044,13 +1056,16 @@ class Check(unittest.TestCase):
         data = example()
         data["checks"]["quick"] = {}
         data.setdefault("merge", {})["test_ahead"] = False
+        data["merge"]["gate_tier"] = "train"
         self.assertEqual(config.check(data), [
+            "merge.gate_tier \"train\" needs merge.test_ahead: only a "
+            "train merges",
             "checks.quick needs merge.test_ahead: with it a head gets no "
             "full run of its own, so only the Merger's predictions run "
             "the full check"])
 
     def test_quick_with_only_train_steps_runs_nothing(self):
-        self.assertEqual(self.problems(checks={"quick": {}, "steps": [
+        self.assertEqual(self.quick_problems({"quick": {}, "steps": [
             {"name": "test", "run": ["make"], "tier": "train"}]}), [
             "checks.quick: every step's tier is \"train\", so a quick run "
             "would run nothing"])
@@ -1058,7 +1073,7 @@ class Check(unittest.TestCase):
     def test_step_tiers(self):
         self.assertEqual(self.problems(checks={"steps": [
             {"name": "a", "run": ["a"], "tier": "both"}]}), [])
-        self.assertEqual(self.problems(checks={"quick": {}, "steps": [
+        self.assertEqual(self.quick_problems({"quick": {}, "steps": [
             {"name": "a", "run": ["a"], "tier": "quick"},
             {"name": "b", "run": ["b"], "tier": 1}]}), [
             "checks.steps[0].tier must be one of head, train, both",
@@ -1071,6 +1086,8 @@ class Check(unittest.TestCase):
     def test_quick_is_the_first_contexts_only(self):
         data = example()
         data["checks"]["quick"] = {}
+        data["merge"]["gate_tier"] = "train"
+        data["merge"]["test_ahead"]["train_merge"] = True
         data["checks"]["instances"] = {"mac": {
             "context": "mac/build", "quick": {},
             "steps": [{"name": "m", "run": ["m"], "tier": "head"}]}}
@@ -1079,6 +1096,45 @@ class Check(unittest.TestCase):
             "belongs to the context the Merger requires",
             "checks.instances.mac.steps[0].tier 'head' needs checks.quick: "
             "without it every run is a full one"])
+
+    def test_gate_tier(self):
+        # designs/0055 step 2: "train" takes the quick check's green on
+        # heads and merges only trains, so it needs all of these.
+        self.assertEqual(self.quick_problems({"quick": {}}), [])
+        data = example()
+        data["merge"]["gate_tier"] = "head"
+        self.assertEqual(config.check(data), [])
+        data["merge"]["gate_tier"] = "quick"
+        self.assertEqual(config.check(data), [
+            "merge.gate_tier must be one of head, train"])
+        data["merge"]["gate_tier"] = 1
+        self.assertEqual(config.check(data), [
+            "merge.gate_tier must be a string"])
+        data["merge"]["gate_tier"] = "train"
+        self.assertEqual(config.check(data), [
+            "merge.gate_tier \"train\" needs checks.quick: it is the "
+            "head's green",
+            "merge.gate_tier \"train\" needs "
+            "merge.test_ahead.train_merge: a train goes in as one, on its "
+            "top's full check"])
+        self.assertEqual(self.quick_problems(
+            {"quick": {}}, own_head_green=False,
+            test_ahead={"train_merge": True, "batch": 1}), [
+            "merge.gate_tier \"train\" needs own_head_green: a head "
+            "boards a train on its quick check's green",
+            "merge.gate_tier \"train\" needs merge.test_ahead.trains "
+            "\"live\"",
+            "merge.gate_tier \"train\" needs merge.test_ahead.batch above "
+            "1: trains merge only in batches"])
+
+    def test_quick_needs_the_train_gate(self):
+        # Answered on #424: a head with only a quick run never gets
+        # checks.context, so under "head" nothing would merge.
+        data = example()
+        data["checks"]["quick"] = {}
+        self.assertEqual(config.check(data), [
+            "checks.quick needs merge.gate_tier \"train\": a head gets no "
+            "full run of its own, so only a train can merge it"])
 
     def test_fast_lane_without_depends(self):
         # agent-forge #261: a head's chosen steps are then every step
