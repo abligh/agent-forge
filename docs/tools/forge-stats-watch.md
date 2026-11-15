@@ -88,6 +88,7 @@ No watched figure comes from GitHub.
 | `hand_backs_per_merge` | Hand-backs per merge are over `limit` or over `ratio` times the baseline's. |
 | `prs_per_slot` | Pull requests merged per green run are under `limit`, or under the baseline's over `ratio`. |
 | `reviewer_busy` | The busiest reviewer's share of the window busy, in percent, is over `limit`. |
+| `red_train_tops_per_merge` | Red train tops (the Merger's predictions whose run went red) per merge are over `limit` or over `ratio` times the baseline's; its samples are the merges. With `checks.quick`, climbing means the quick tier lets too much through ([designs/0055](../designs/0055-a-quick-check-on-heads-the-full-check-on-trains.md)). |
 
 **A shorter window as well.** A figure with `short_hours` (from 1 to
 under `window_hours`) is also judged over its last `short_hours`,
