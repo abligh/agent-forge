@@ -46,6 +46,21 @@ class Stats(unittest.TestCase):
         self.assertEqual(got["quick"]["waited"]["n"], 2)
         self.assertEqual(got["full"]["waited"]["max"], 600)
 
+    def test_the_quick_slots_count_in_the_capacity(self):
+        # Quick runs are in busy_seconds, so the quick slots go in the
+        # capacity too: over 2 slots alone, 2,380 s in a 2-hour window
+        # read as 2,380 / 14,400 however many quick slots ran them.
+        check = stats.check_stats(TIERED, SINCE, UNTIL, 2, 2)
+        self.assertEqual(check["busy_seconds"], 2380)
+        self.assertEqual(check["quick_slots"], 2)
+        self.assertEqual(check["busy_share"], round(2380 / 28800, 3))
+        self.assertEqual(stats.check_stats(TIERED, SINCE, UNTIL, 2)
+                         ["busy_share"], round(2380 / 14400, 3))
+        queue = {"merges": 0, "per_hour": {}, "held_seconds": 0,
+                 "queue_to_merge": stats.summary([]), "hand_backs": {}}
+        text = stats.report("widget", SINCE, UNTIL, check, queue, None, {})
+        self.assertIn("  slots busy: 8% of 4 slots (2 quick)", text)
+
     def test_no_tiers_without_checks_quick(self):
         lines = [line.rsplit(" tier=", 1)[0] for line in TIERED]
         self.assertIsNone(stats.check_stats(lines, SINCE, UNTIL, 2)["tiers"])
