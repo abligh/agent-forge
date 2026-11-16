@@ -788,6 +788,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -1065,6 +1066,13 @@ AHEAD_BATCHES = 1
 # bound by `batches` x `batch`, so a project with big trains can still
 # search with several cut points in its spare slots.
 SEARCH_CUTS = None
+# merge.test_ahead.window (designs/0056 item 4): {"floor", "grow",
+# "shrink"}, or None. With it, new live trains are cut at a length that
+# follows what survives, kept in ahead.json as `window`: it grows by
+# `grow` when a train merges whole and is multiplied by `shrink` when a
+# started train loses a member or a train's top is red, between `floor`
+# and `batch` (Zuul's gate window).
+WINDOW = None
 # merge.test_ahead.fixed_order (designs/0044, rule 3): the batches up to
 # the last whose top's run has started keep their order; nothing but an
 # urgent one or a red default branch's fix goes in front of them.
@@ -1401,7 +1409,7 @@ def configure(project):
     global UNION, RESOLVE_SLOTS, RESOLVE_SLOT_MINUTES, RESOLVE_SLOT_ON
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
     global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES, \
-        SEARCH_CUTS
+        SEARCH_CUTS, WINDOW
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
     global FIXED_ORDER, GREEN_BATCH_FIRST, RED_SUSPECT_OUT, UNSTABLE_AFTER
     global UNSTABLE_BATCHES, TELL_BOARDED
@@ -1476,6 +1484,9 @@ def configure(project):
     AHEAD_BATCH = (ahead or {}).get("batch", 1)
     AHEAD_BATCHES = (ahead or {}).get("batches", 1)
     SEARCH_CUTS = (ahead or {}).get("search_cuts")
+    WINDOW = (ahead or {}).get("window")
+    WINDOW = WINDOW if isinstance(WINDOW, dict) \
+        and isinstance(WINDOW.get("floor"), int) else None
     FIXED_ORDER = (ahead or {}).get("fixed_order", True) is not False
     GREEN_BATCH_FIRST = (ahead or {}).get("green_batch_first") is True
     TELL_BOARDED = (ahead or {}).get("tell_boarded") is True
@@ -5579,7 +5590,7 @@ def last_trains(last):
 def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                trains=None, red=frozenset(), restacks=None, run=sh,
                files=None, note=None, force_merges=True, started=None,
-               acting=None):
+               acting=None, length=None):
     """designs/0047: (entries, sizes, events) for the trains this tick,
     end to end from `main_tip`: the predictions as `predict_ahead` makes
     them, each with `train` (its train's place) and `carriage` (its
@@ -5632,6 +5643,9 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
        fine, waited two hours while newer ones went past, because a
        layer above conflicted and the whole carriage was skipped."""
     trains = AHEAD_BATCHES if trains is None else trains
+    # designs/0056 item 4: new trains are cut at `length` (the window),
+    # AHEAD_BATCH without one; trains already cut keep theirs.
+    length = AHEAD_BATCH if length is None else length
     files = {} if files is None else files
     by_number = {pr["number"]: pr for c in carriages for pr in c}
     events, kept = [], []
@@ -5691,7 +5705,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
     for e in (e for t in prior for c in t for e in c):
         was[e.get("pr")], before = before, e.get("sha")
     for k, train in enumerate(prior[:trains]):
-        start = len(entries)
+        start, departed = len(entries), 0
         for carriage in train:
             # What leaves takes the layers on it with it, and only them:
             # a layer beside it, on the same base, stays (an entry from
@@ -5750,6 +5764,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                         % ", ".join("#%d" % a for a in above)
                         if above else "")))
                     gone.update([n] + above)
+                    departed += 1
                     continue
                 entry.update(train=k, carriage=carriage[0].get("pr"))
                 if "on" in e:
@@ -5759,6 +5774,23 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                 parent, graph = entry["sha"], entry.get("graph")
         if len(entries) > start:
             sizes.append(len(entries) - start)
+        if note is not None:
+            # designs/0056 item 4: what became of the trains last cut,
+            # for the window. A train every member of which merged or
+            # closed, none having left it, went in whole; a member
+            # leaving one whose top's run has started is a departure.
+            # The members left in a train that lost one are carried in
+            # ahead.json (`window_lost`), so its later merge isn't whole.
+            top = train[-1][-1] if train and train[-1] else {}
+            lost = set((last or {}).get("window_lost") or ())
+            if departed and (started is None or started(
+                    top.get("sha"), top.get("tree"))):
+                note["departed"] = note.get("departed", 0) + 1
+            if departed or lost & {e.get("pr") for c in train for e in c}:
+                note.setdefault("lost", []).extend(
+                    e["pr"] for e in entries[start:])
+            elif len(entries) == start:
+                note["merged_whole"] = note.get("merged_whole", 0) + 1
     cut = []
     # Urgent ones first, but never ahead of the one the Merger acts on:
     # on 2026-11-11 a nightly's fix headed a train while the Merger
@@ -5794,7 +5826,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             if not members:
                 continue
             size = len(entries) - start
-            if size and size + len(members) > AHEAD_BATCH:
+            if size and size + len(members) > length:
                 waits[members[0]["number"]] = "no room in train %d" % (
                     len(sizes) + 1)
                 continue
@@ -5862,7 +5894,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             kind = urgent(members[0]) if not size else \
                 kind and urgent(members[0])
             parent, graph = top, top_graph
-            if len(entries) - start >= AHEAD_BATCH:
+            if len(entries) - start >= length:
                 break
         if len(entries) == start:
             break
@@ -5879,6 +5911,51 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             train[0]["train"] + 1, " ".join(
                 "#%d" % e["pr"] for e in train))))
     return entries, sizes, events
+
+
+def window_length(last):
+    """designs/0056 item 4: the length new trains are cut at, the
+    window `last` (ahead.json) carries, `batch` at first, kept between
+    merge.test_ahead.window's `floor` and `batch`. `batch` without a
+    window."""
+    if not WINDOW:
+        return AHEAD_BATCH
+    w = (last or {}).get("window")
+    if not isinstance(w, int) or isinstance(w, bool):
+        w = AHEAD_BATCH
+    return max(min(WINDOW["floor"], AHEAD_BATCH), min(AHEAD_BATCH, w))
+
+
+def window_next(w, merged_whole=0, departed=0, red=False):
+    """designs/0056 item 4, after Zuul's gate window: (window, why) for
+    the next cut. A departure from a started train, or a red top,
+    multiplies it by `shrink` (rounded up, at least `floor`); otherwise
+    each train that merged whole adds `grow`, up to `batch`. A tick with
+    both shrinks: what failed says more than what merged."""
+    floor = min(WINDOW["floor"], AHEAD_BATCH)
+    if departed or red:
+        shrink = WINDOW.get("shrink", 0.5)
+        return max(floor, int(math.ceil(w * shrink))), (
+            "a train's top is red" if red else
+            "a member left a started train")
+    if merged_whole:
+        return min(AHEAD_BATCH, w + WINDOW.get("grow", 1) * merged_whole), \
+            "a train merged whole"
+    return w, ""
+
+
+def trains_gone(last, open_numbers):
+    """designs/0056 item 4: how many of the trains `last` (ahead.json)
+    cut went in whole, for a tick that cuts none (nothing boards): each
+    every member of which has merged or closed, and none of which lost
+    a member (`window_lost`)."""
+    lost = set((last or {}).get("window_lost") or ())
+    whole = 0
+    for train in last_trains(last):
+        members = {e.get("pr") for c in train for e in c}
+        if members and not members & (set(open_numbers) | lost):
+            whole += 1
+    return whole
 
 
 def train_batches(entries, sizes, verdict):
@@ -9343,8 +9420,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 files=files, note=note, force_merges=TRAINS == "live",
                 started=lambda sha, tree: ahead_started(check_state, sha,
                                                         tree),
-                acting=waiting_on if acting else None)
+                acting=waiting_on if acting else None,
+                length=window_length(last)
+                if WINDOW and TRAINS == "live" else None)
             files, note = {}, {}
+            red_top = False
             if TRAINS == "live" and not searching and boarding:
                 # designs/0047: trains, cut once and kept.
                 entries, sizes, events = cut(trains_before(last))
@@ -9462,6 +9542,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         entries, (last or {}).get("batch"), verdict,
                         (last or {}).get("later") or (), urgents)
                 if red:
+                    red_top = sizes is not None
                     # A red top: its members are the suspects, and the
                     # search for the red one starts this tick.
                     saved = {"suspects": [{"pr": e["pr"], "head": e["head"]}
@@ -9546,6 +9627,20 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     said_ahead["batch"]["said"] = line
                     if line != ((last or {}).get("batch") or {}).get("said"):
                         out(line)
+            if WINDOW and TRAINS == "live":
+                was = window_length(last)
+                w, why = window_next(
+                    was, note.get("merged_whole", 0) if sizes
+                    else 0 if searching else trains_gone(last, open_numbers),
+                    note.get("departed", 0) if sizes else 0, red_top)
+                said_ahead["window"] = record["window"] = w
+                lost = note.get("lost") if sizes else \
+                    (last or {}).get("window_lost")
+                if lost:
+                    said_ahead["window_lost"] = sorted(lost)
+                if w != was:
+                    out("TRAIN-WINDOW: %d -> %d: %s; new trains are cut at "
+                        "%d" % (was, w, why, w))
             save_json(os.path.join(state_dir, AHEAD_FILE), said_ahead)
     with open(os.path.join(state_dir, name), "a") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")

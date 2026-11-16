@@ -162,10 +162,12 @@ TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "train_merge": bool, "train_branch": str,
               "train_slots": int, "layers_need_own_green": bool,
               "own_green_to_board": bool, "left_top_covers": bool,
-              "search_cuts": int}
+              "search_cuts": int, "window": dict}
 TRAINS = ("dry-run", "live", "off")
 # agent-forge #454: the most prefixes a red batch's search runs at once.
 MOST_SEARCH_CUTS = 8
+# designs/0056 item 4: merge.test_ahead.window's keys and their kinds.
+WINDOW = {"floor": int, "grow": int, "shrink": (int, float)}
 # designs/0050: what testing ahead is when the project says nothing.
 # Trains of up to 4, two in flight, predicted 7 deep; batches x batch
 # is then depth + 1.
@@ -1547,6 +1549,29 @@ def test_ahead(data):
     return out
 
 
+def _check_window(ahead, problems, where):
+    """merge.test_ahead.window (designs/0056 item 4): a train's length
+    follows what survives, between `floor` and `batch`, growing by
+    `grow` when a train merges whole and multiplied by `shrink` when a
+    started train loses a member or its top is red."""
+    window, at = ahead["window"], where + ".window"
+    _fields(at, window, WINDOW, problems)
+    batch = ahead["batch"] if _is(ahead.get("batch"), int) else 1
+    if "floor" not in window:
+        problems.append("%s.floor is required" % at)
+    elif _is(window["floor"], int) and not 1 <= window["floor"] <= batch:
+        problems.append("%s.floor must be at least 1 and at most batch "
+                        "(%d)" % (at, batch))
+    if _is(window.get("grow"), int) and window["grow"] < 1:
+        problems.append("%s.grow must be at least 1" % at)
+    if _is(window.get("shrink"), (int, float)) and \
+            not 0 < window["shrink"] < 1:
+        problems.append("%s.shrink must be above 0 and below 1" % at)
+    if ahead.get("trains") != "live":
+        problems.append("%s needs trains \"live\": only live trains are "
+                        "cut at its length" % at)
+
+
 def _check_test_ahead(ahead, checks, problems):
     """merge.test_ahead: how far ahead the Merger predicts, and how long
     the build check reuses a green verdict for another commit with its
@@ -1584,6 +1609,8 @@ def _check_test_ahead(ahead, checks, problems):
         # slots; not bound by batches x batch.
         problems.append("%s.search_cuts must be at least 1 and at most %d"
                         % (where, MOST_SEARCH_CUTS))
+    if isinstance(ahead.get("window"), dict):
+        _check_window(ahead, problems, where)
     if _is(ahead.get("later_first"), int) and ahead["later_first"] < 0:
         problems.append("%s.later_first must be at least 0" % where)
     if ahead.get("layers_need_own_green") is False \
