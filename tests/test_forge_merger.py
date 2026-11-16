@@ -4431,6 +4431,104 @@ class TickAhead(RepoCase):
         self.assertFalse(any(l.startswith("TRAIN-CUT 1") for l in lines),
                          lines)
 
+    def searching(self, **merge):
+        """A red train #5..#6 whose search has run one tick: its
+        check_state, with keep_trains on and `self.labelled` saying
+        which commits a labelled pull request merged."""
+        m.configure(project(test_ahead={"batch": 2, "batches": 2,
+                                        "trains": "live",
+                                        "train_merge": True}, **merge))
+        self.labelled = {}
+        for patch in (mock.patch.object(m, "KEEP_LABEL", "Merge:keep-trains"),
+                      mock.patch.object(m, "kept_by_label",
+                                        lambda sha, github, cache:
+                                        self.labelled.get(sha))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.prs = [self.item(), self.other_pr()]
+        self.tick(self.prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        red = {"results": {top["sha"]: {"tree": top["tree"], "ok": False}}}
+        self.tick(self.prs, conclusions=(None,), live=True, minutes=1,
+                  check_state=red)
+        self.tick(self.prs, conclusions=(None,), live=True, minutes=2,
+                  check_state=red)
+        self.assertTrue(os.path.exists(os.path.join(self.state,
+                                                    m.SUSPECTS_FILE)))
+        return red
+
+    def shas(self):
+        return [e["sha"] for e in self.ahead_json()["entries"]]
+
+    def test_a_labelled_merge_keeps_a_red_trains_search(self):
+        # agent-forge #444: a labelled pin merged mid-search re-predicted
+        # the suspects on the new tip, and the search's run in flight
+        # was stopped as superseded.
+        red = self.searching()
+        before, base = self.shas(), self.ahead_json()["base"]
+        self.advance_main("pin.txt", "pin\n")
+        tip = self.repo.main_tip()
+        self.labelled[tip] = 11009
+        _, lines = self.tick(self.prs, conclusions=(None,), live=True,
+                             minutes=3, check_state=red)
+        self.assertEqual(self.shas(), before)
+        self.assertEqual((self.ahead_json()["base"],
+                          self.ahead_json()["main"]), (base, tip))
+        self.assertTrue(any(l.startswith("SEARCH-KEPT") for l in lines),
+                        lines)
+        # Said once: the next tick keeps it quietly.
+        _, lines = self.tick(self.prs, conclusions=(None,), live=True,
+                             minutes=4, check_state=red)
+        self.assertEqual(self.shas(), before)
+        self.assertFalse(any(l.startswith("SEARCH-KEPT") for l in lines))
+
+    def test_a_kept_searchs_green_merges_with_main_on_top(self):
+        # Its green members go in as a kept train does: the tested
+        # chain on the search's base, the default branch merged on top.
+        red = self.searching(ci_workflow="")
+        base = self.ahead_json()["base"]
+        self.advance_main("pin.txt", "pin\n")
+        tip = self.repo.main_tip()
+        self.labelled[tip] = 11009
+        self.tick(self.prs, conclusions=(None,), live=True, minutes=3,
+                  check_state=red)
+        first = self.ahead_json()["entries"][0]
+        green = {"results": dict(red["results"], **{first["sha"]: {
+            "tree": first["tree"], "ok": True}})}
+        calls = []
+        with mock.patch.object(m, "train_merge",
+                               lambda repo, state, entries, members, base_,
+                               *args, **kwargs: calls.append(
+                                   ([e["pr"] for e in entries], base_,
+                                    kwargs.get("main"))) or ([], [])):
+            self.tick(self.prs, conclusions=(None,), live=True, minutes=4,
+                      check_state=green)
+        self.assertEqual(calls, [([5], base, tip)])
+
+    def test_any_other_commit_moves_the_search_to_the_new_tip(self):
+        red = self.searching()
+        before = self.shas()
+        self.advance_main("forced.txt", "by hand\n")
+        tip = self.repo.main_tip()
+        self.tick(self.prs, conclusions=(None,), live=True, minutes=3,
+                  check_state=red)
+        self.assertNotEqual(self.shas(), before)
+        self.assertEqual(self.ahead_json()["base"], tip)
+        self.assertNotIn("main", self.ahead_json())
+
+    def test_a_kept_commit_that_conflicts_moves_the_search_too(self):
+        red = self.searching()
+        before = self.shas()
+        self.advance_main("o.txt", "not the other\n")
+        tip = self.repo.main_tip()
+        self.labelled[tip] = 11009
+        _, lines = self.tick(self.prs, conclusions=(None,), live=True,
+                             minutes=3, check_state=red)
+        self.assertNotEqual(self.shas(), before)
+        self.assertEqual(self.ahead_json()["base"], tip)
+        self.assertTrue(any(l.startswith("TRAIN-KEEP") for l in lines),
+                        lines)
+
     def test_trains_before(self):
         trains = {"trains": True, "entries": []}
         kept = {"trains": True, "entries": [{"pr": 5}]}

@@ -9232,8 +9232,12 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 elif AHEAD_STACKS and ahead_queue:
                     ahead_queue, owed = with_layers(
                         ahead_queue, layers_of, last, AHEAD_BATCH)
+                # A red train's search stays on the trains' base while
+                # labels.keep_trains keeps it (agent-forge #444): its
+                # predictions, and the runs on them, go on.
                 entries = predict_ahead(
-                    repo, main_tip, ahead_queue, run, overdue=overdue,
+                    repo, train_base if searching else main_tip,
+                    ahead_queue, run, overdue=overdue,
                     restacks=restacks if PREDICT_RESTACKED else None)
             record["ahead"] = [e["pr"] for e in entries]
             said_ahead = {"at": record["at"], "base": main_tip,
@@ -9246,6 +9250,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     out("TRAIN-KEPT: %s moved to %s; the trains stay on %s "
                         "(labels.keep_trains)" % (MAIN, main_tip[:10],
                                                   train_base[:10]))
+            if searching and train_base != main_tip:
+                # Kept on it by labels.keep_trains (`carried_base`).
+                said_ahead.update(base=train_base, main=main_tip)
+                if (last or {}).get("main") != main_tip:
+                    out("SEARCH-KEPT: %s moved to %s; the red train's "
+                        "search stays on %s (labels.keep_trains)" % (
+                            MAIN, main_tip[:10], train_base[:10]))
             if sizes is None and isinstance(
                     (last or {}).get("kept_trains"), dict):
                 # A red train's search goes on: its trains are kept for
@@ -9348,7 +9359,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     ahead_queue = [pr for pr in ahead_queue
                                    if pr["number"] not in gone]
                     entries = predict_ahead(
-                        repo, main_tip, ahead_queue, run, overdue=overdue,
+                        repo, said_ahead["base"], ahead_queue, run,
+                        overdue=overdue,
                         restacks=restacks if PREDICT_RESTACKED else None)
                     said_ahead["entries"] = entries
                     record["ahead"] = [e["pr"] for e in entries]
