@@ -718,6 +718,10 @@ class StacksAndTrains(Base):
         self.assertNotIn("<script", trains + stacks)
         self.assertIn("No train", tool.trains_html({}))
         self.assertIn("No stacked", tool.stacks_html({}))
+        # designs/0056 item 4: the window, when one is set.
+        self.assertNotIn("New trains are cut at", trains)
+        self.assertIn("New trains are cut at 3",
+                      tool.trains_html(dict(data, window=3)))
         self.assertIn(">#20<", tool.stacks_html(dict(data, repo=None)))
 
 

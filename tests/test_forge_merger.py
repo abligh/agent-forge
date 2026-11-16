@@ -1100,6 +1100,26 @@ class MergedAnotherMember(unittest.TestCase):
         self.assertEqual([e["head"] for e in ready],
                          [self.heads[5], self.heads[6], head])
 
+    def test_new_trains_are_cut_at_the_window_and_departures_noted(self):
+        # designs/0056 item 4: a new train is cut at `length`; a member
+        # leaving a started train is a departure, and the members left
+        # in it are carried as lost.
+        entries, sizes, _ = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), self.carriages(), None,
+            dict(self.heads), set(self.heads), length=2)
+        self.assertEqual(m.train_lists(entries, sizes)[0], [5, 6])
+        self.repo.branch("x6", self.heads[6])
+        pushed = self.repo.commit("x.txt", "x\n", "a push")
+        self.repo.publish_pr(6, pushed)
+        note = {}
+        m.cut_trains(
+            self.repo.path, self.repo.main_tip(), self.carriages(p6=pushed),
+            self.last, {**self.heads, 6: pushed}, set(self.heads),
+            note=note, started=lambda sha, tree: True)
+        self.assertEqual(note["departed"], 1)
+        self.assertEqual(note["lost"], [5, 7])
+        self.assertNotIn("merged_whole", note)
+
     def test_merging_the_first_member_keeps_the_second_silently(self):
         # Its own tree is then the prediction itself.
         head = self.merged_into(6, 5)
@@ -11510,3 +11530,54 @@ class Boarded(unittest.TestCase):
             self.assertEqual(m.boarded_now({}), {10990: "a" * 40,
                                              10999: "b" * 40})
 
+
+
+class Window(unittest.TestCase):
+    """designs/0056 item 4, merge.test_ahead.window: the length new
+    trains are cut at follows what survives, between floor and batch."""
+
+    def setUp(self):
+        patch = mock.patch.multiple(
+            m, AHEAD_BATCH=8,
+            WINDOW={"floor": 2, "grow": 1, "shrink": 0.5})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_it_starts_at_batch_and_stays_within_floor_and_batch(self):
+        self.assertEqual(m.window_length({}), 8)
+        self.assertEqual(m.window_length({"window": 5}), 5)
+        self.assertEqual(m.window_length({"window": 1}), 2)
+        self.assertEqual(m.window_length({"window": 30}), 8)
+        self.assertEqual(m.window_length({"window": True}), 8)
+
+    def test_it_halves_on_a_departure_or_a_red_top_rounding_up(self):
+        self.assertEqual(m.window_next(7, departed=1)[0], 4)
+        self.assertEqual(m.window_next(8, red=True),
+                         (4, "a train's top is red"))
+        self.assertEqual(m.window_next(3, departed=1)[0], 2)
+
+    def test_it_grows_by_grow_for_each_whole_train_up_to_batch(self):
+        self.assertEqual(m.window_next(4, merged_whole=1),
+                         (5, "a train merged whole"))
+        self.assertEqual(m.window_next(7, merged_whole=3)[0], 8)
+
+    def test_a_tick_with_both_shrinks(self):
+        self.assertEqual(m.window_next(6, merged_whole=1, departed=1)[0], 3)
+
+    def test_a_quiet_tick_keeps_it(self):
+        self.assertEqual(m.window_next(5), (5, ""))
+
+    def test_without_a_window_new_trains_are_cut_at_batch(self):
+        with mock.patch.object(m, "WINDOW", None):
+            self.assertEqual(m.window_length({"window": 3}), 8)
+
+    def test_a_train_gone_whole_is_counted_once_not_one_that_lost(self):
+        last = {"trains": True, "batch": {"size": 2}, "later": [
+            {"size": 1}],
+            "entries": [{"pr": 1, "train": 0, "carriage": 1},
+                        {"pr": 2, "train": 0, "carriage": 2},
+                        {"pr": 3, "train": 1, "carriage": 3}]}
+        self.assertEqual(m.trains_gone(last, {3}), 1)
+        self.assertEqual(m.trains_gone(last, set()), 2)
+        self.assertEqual(m.trains_gone(dict(last, window_lost=[2]),
+                                       set()), 1)

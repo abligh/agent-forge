@@ -80,6 +80,34 @@ class Check(unittest.TestCase):
         data["merge"]["test_ahead"]["search_cuts"] = "3"
         self.assertEqual(len(config.check(data)), 1)
 
+    def test_test_ahead_window_needs_a_floor_within_batch_and_live(self):
+        # designs/0056 item 4.
+        data = example()
+        data.setdefault("merge", {})["test_ahead"] = {
+            "depth": 7, "batch": 4, "batches": 2, "trains": "live",
+            "window": {"floor": 2, "grow": 1, "shrink": 0.5}}
+        self.assertEqual(config.check(data), [])
+        window = data["merge"]["test_ahead"]["window"]
+        window["floor"] = 5
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.window.floor must be at least 1 and at most "
+            "batch (4)"])
+        window.update(floor=1, grow=0, shrink=1)
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.window.grow must be at least 1",
+            "merge.test_ahead.window.shrink must be above 0 and below 1"])
+        data["merge"]["test_ahead"]["window"] = {"grow": 1}
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.window.floor is required"])
+        data["merge"]["test_ahead"]["window"] = {"floor": 1, "size": 3}
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.window: unknown key 'size'"])
+        data["merge"]["test_ahead"].update(window={"floor": 1},
+                                           trains="dry-run")
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.window needs trains \"live\": only live "
+            "trains are cut at its length"])
+
     def test_test_ahead_train_slots_leaves_a_slot_for_the_heads(self):
         data = example()
         data["checks"]["slots"] = 4

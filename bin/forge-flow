@@ -2815,6 +2815,17 @@ def quick_title(train, pr):
                                     train.get("state")))
 
 
+def window_note(data):
+    """designs/0056 item 4: the length new trains are cut at, when
+    merge.test_ahead.window sets one (ahead.json's `window`)."""
+    window = data.get("window")
+    if not isinstance(window, int) or isinstance(window, bool):
+        return ""
+    return (" New trains are cut at %d (merge.test_ahead.window: it halves "
+            "when a member leaves a started train or a top is red, and "
+            "grows when a train merges whole)." % window)
+
+
 def trains_html(data):
     trains = data.get("trains") or []
     if not trains:
@@ -2879,8 +2890,9 @@ def trains_html(data):
             "red); <b>!</b> elevated, a fix of a red nightly "
             "(forge-nightly's file) or default branch (the build check's "
             "state.json), or the holder of right of way (the last Merger "
-            "record).</p></section>"
-            % ("".join(rows), train_legend(), esc(data.get("ahead_at"))))
+            "record).%s</p></section>"
+            % ("".join(rows), train_legend(), esc(data.get("ahead_at")),
+               window_note(data)))
 
 
 def stack_items(data, node):
@@ -3278,6 +3290,7 @@ def compute(flow, project_name, repo=None, recent=RECENT_TRAINS):
             "build_times": flow.build_times(), "cpu_days": flow.cpu_days(), "stacks": flow.stacks(),
             "singles": flow.singles(),
             "trains": flow.trains(), "ahead_at": flow.ahead.get("at"),
+            "window": flow.ahead.get("window"),
             "recent_trains": flow.recent_trains(recent),
             "priority": flow.priorities(),
             "check_queue": flow.queue,

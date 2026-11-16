@@ -300,6 +300,52 @@ class TailKeepsItsPlace(unittest.TestCase):
                             "\n".join(got.lines))
 
 
+class Window(unittest.TestCase):
+    """designs/0056, item 4: with merge.test_ahead.window, the window
+    halves when a member leaves a started train, and grows back once a
+    train merges whole; the rest of the train the member left merging
+    isn't a whole train."""
+
+    def test_it_halves_on_a_departure_and_grows_on_a_whole_merge(self):
+        m = ms.load_merger()
+        m.configure(ms.project({"own_head_green": False}, batch=4,
+                               batches=1, train_merge=True,
+                               window={"floor": 1}))
+        # #5 comes later, so the ticks after #2's merge cut a train.
+        scenario = [(0, "open", (n,)) for n in (1, 2, 3, 4)] + [
+            (5, "push", (2,)), (7, "review", (2,)), (50, "open", (5,))]
+        with tempfile.TemporaryDirectory() as root:
+            sim = ms.Sim(m, root, scenario, own_minutes=40, later_first=1,
+                         stop_spent=True)
+            got = sim.run(240)
+        lines = [l for l in got.lines if "TRAIN-WINDOW" in l]
+        self.assertEqual(got.broken, [], figures(got))
+        self.assertTrue(any("TRAIN-LEFT #2" in l for l in got.lines),
+                        "\n".join(got.lines))
+        self.assertIn("TRAIN-WINDOW: 4 -> 2: a member left a started "
+                      "train", "\n".join(lines), "\n".join(got.lines))
+        self.assertTrue(any("TRAIN-MERGE #3..#4" in l for l in got.lines),
+                        "\n".join(got.lines))
+        # #3..#4 were what was left of #2's train: no growth for them;
+        # #2's own train of one merging whole grows it.
+        self.assertEqual(lines[1:], [l for l in lines[1:]
+                                     if "-> 3: a train merged whole" in l],
+                         "\n".join(got.lines))
+        self.assertEqual(len(lines), 2, "\n".join(got.lines))
+        self.assertEqual(got.merged, 5, figures(got))
+
+    def test_without_it_nothing_changes(self):
+        m = ms.load_merger()
+        m.configure(ms.project({"own_head_green": False}, batch=4,
+                               batches=1, train_merge=True))
+        scenario = [(0, "open", (n,)) for n in (1, 2, 3, 4)] + [
+            (5, "push", (2,)), (7, "review", (2,))]
+        with tempfile.TemporaryDirectory() as root:
+            got = ms.Sim(m, root, scenario, own_minutes=40, later_first=1,
+                         stop_spent=True).run(240)
+        self.assertFalse(any("TRAIN-WINDOW" in l for l in got.lines))
+
+
 class Rules(unittest.TestCase):
     """The monitor itself: a break it should see, it sees."""
 
