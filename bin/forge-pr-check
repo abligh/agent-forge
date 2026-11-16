@@ -707,7 +707,10 @@ then; the verdict and its VERDICT line say `merger_weight`, and
 `step_alert` leaves such runs out. With `checks.docker_slices`, each
 step's `CHECK_DOCKER_SLICE` is the `front` or `other` slice, for its
 containers' `docker run --cgroup-parent`. Neither applies to the fast
-lane, the default branch's runs or an instance.
+lane, the default branch's runs or an instance. **With
+`checks.main_cpu_weight`, the default branch's runs get that weight**
+on every step (agent-forge #438), so a busy host doesn't starve the
+run that says whether main is green; their verdict says `main_weight`.
 
 **Without `--post` it posts nothing.** It reads the open pull requests
 as the poster's App either way (`checks.poster`, default the Merger),
@@ -928,6 +931,9 @@ CPU_WEIGHT = DEFAULT_CPU_WEIGHT
 # checks.merger_cpu_weight (designs/0031): the CPUWeight of the steps
 # of the run the next merge waits on (`front`), or None: off.
 MERGER_CPU_WEIGHT = None
+# checks.main_cpu_weight (agent-forge #438): the CPUWeight of the steps
+# of the default branch's runs, or None: they keep cpu_weight.
+MAIN_CPU_WEIGHT = None
 # checks.cpu_quota: a slot's CPU limit, over all of its steps at once.
 # A number of CPUs, "share" (the run's CHECK_CPUS share, taken again as
 # each step starts), or None: off. Each run's step scopes go in the
@@ -1228,7 +1234,7 @@ def configure(project, instance=None):
     global STEPS, CACHES, SLOTS, MEMORY_MAX, STEP_TIMEOUT_S, MERGER_FIRST
     global STEP_TIMEOUTS
     global CPU_WEIGHT, CPU_SHARE, SIDE_BY_SIDE, AFTER, ALONE, LIGHT
-    global MERGER_CPU_WEIGHT, DOCKER_SLICES, CPU_QUOTA
+    global MERGER_CPU_WEIGHT, MAIN_CPU_WEIGHT, DOCKER_SLICES, CPU_QUOTA
     global STEP_CACHES, ENV_FILES
     global FLAKE_ISSUE
     global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, LATER_FIRST, TRAIN_SLOTS, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
@@ -1390,6 +1396,8 @@ def configure(project, instance=None):
     CPU_QUOTA = checks.get("cpu_quota")
     # The Merger waits on the first context's runs only.
     MERGER_CPU_WEIGHT = checks.get("merger_cpu_weight") \
+        if instance is None else None
+    MAIN_CPU_WEIGHT = checks.get("main_cpu_weight") \
         if instance is None else None
     DOCKER_SLICES = dict(checks["docker_slices"]) \
         if instance is None and "docker_slices" in checks else None
@@ -5764,7 +5772,7 @@ def read_env_file(path, uid=None):
 def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
           cpu=children_cpu, logs=None, stream=None, share=None,
           caches=None, side_by_side=None, front=None, deadline=None,
-          env_files=None, out=print, quota=None):
+          env_files=None, out=print, quota=None, main_weight=None):
     """Every step that applies to the head, each run even if an earlier
     one failed, and none retried, each after `prefix` (memory_cap).
     `wrap(name, prefix, argv, env)` gives a traced step's (argv, env).
@@ -5784,7 +5792,9 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
     run now (designs/0031), asked as each step starts: if so, the
     step's scope has MERGER_CPU_WEIGHT and its result `merger_weight`;
     with DOCKER_SLICES, its CHECK_DOCKER_SLICE is the front's or the
-    other's. With `deadline`, a time.monotonic() value (designs/0048's
+    other's. With `main_weight` (checks.main_cpu_weight, on a default
+    branch's run), every step's scope has that CPUWeight and its result
+    `main_weight`. With `deadline`, a time.monotonic() value (designs/0048's
     checks.scoped_minutes), no step runs past it: one is stopped there,
     and one that would start after it isn't run, either red with
     `over_budget` and a tail saying so. With `env_files`, {step: path}
@@ -5796,7 +5806,7 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
     CPUs (quota_cpus) as each step starts. Returns (ok, results), the
     results in the steps' order."""
     chosen = applicable(wt, steps)
-    weights, refused = {}, {}
+    weights, mains, refused = {}, {}, {}
     env_files = ENV_FILES if env_files is None else env_files
 
     def prepare(name, args, extra):
@@ -5814,6 +5824,9 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
         step_prefix = list(prefix)
         if quota is not None and step_prefix:
             quota(quota_cpus(CPU_QUOTA, share, env))
+        if main_weight and step_prefix:
+            step_prefix = weighted(step_prefix, main_weight)
+            mains[name] = True
         if front is not None:
             now_front = front()
             if now_front and MERGER_CPU_WEIGHT and step_prefix:
@@ -5879,6 +5892,8 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
             result["cpu"] = round(usage["cpu"], 2)
         if weights.get(name):
             result["merger_weight"] = True
+        if mains.get(name):
+            result["main_weight"] = True
         if folder is not None:
             result["results_bytes"], dropped = keep_results(folder)
             if dropped is not None:
@@ -7773,7 +7788,9 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                        share=share, caches=step_caches,
                        side_by_side=SIDE_BY_SIDE, out=out,
                        front=None if front is None or slot == LANE
-                       or main else lambda: front(clock()))
+                       or main else lambda: front(clock()),
+                       main_weight=MAIN_CPU_WEIGHT if main
+                       and slot != LANE else None)
             ok, results = check(wt, env, run, steps=steps, **how)
             if scoped_steps and ok:
                 ok, more = check(wt, env, run, steps=scoped_steps,
@@ -7964,6 +7981,9 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 # Its steps, or some, had MERGER_CPU_WEIGHT; step_alert
                 # compares it only with runs that did too (designs/0031).
                 record["merger_weight"] = True
+            if any(r.get("main_weight") for r in results):
+                # A default branch's run with checks.main_cpu_weight.
+                record["main_weight"] = True
             if ahead:
                 record["ahead"] = True
             if QUICK_CONTEXT is not None:

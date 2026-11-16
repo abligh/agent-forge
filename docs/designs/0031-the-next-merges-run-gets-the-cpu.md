@@ -60,7 +60,11 @@ step's scope in **the run the next merge waits on**. That is either:
   `ahead.json` (k = 0), the one the Merger acts on next.
 
 Every other run, including the predictions behind the first, the
-default branch's runs and the fast lane, keeps `cpu_weight`. The weight
+default branch's runs and the fast lane, keeps `cpu_weight`. (Since
+agent-forge #438, `checks.main_cpu_weight` gives the default branch's
+runs a weight of their own: left at `cpu_weight`, they lost so much
+CPU to the front under load that browser waits timed out and the
+default branch went red with no fault in its code.) The weight
 is read when each step starts (with `cpu_share: "step"`, alongside
 `CHECK_CPUS`). So a run that becomes the front of the queue part-way,
 because the one ahead merged, gets the weight from its next step on.
