@@ -5434,18 +5434,22 @@ def lock_owner(folder):
         return "no owner file"
 
 
-def take_host_lock(state_dir, name, sha, when, out=print,
-                   sleep=time.sleep, clock=time.monotonic):
+def take_host_lock(state_dir, name, sha, out=print,
+                   sleep=time.sleep, clock=time.monotonic, now=now_utc):
     """Take HOST_LOCK for the run of `name` at `sha` before its first
     step: `mkdir` its directory and write `owner` (who, what, since),
     the format agents read, so one waiting sees the check as the
-    holder. While another holder has it, wait, looking every
-    HOST_LOCK_POLL_S, up to its `wait_minutes`. The directory once
-    taken, else None after the wait, with why: (folder, why)."""
+    holder. "since" is when the lock was taken, not when the run
+    started: after a wait, the run's start falls inside the previous
+    holder's time (issue 450). While another holder has it, wait,
+    looking every HOST_LOCK_POLL_S, up to its `wait_minutes`, and log
+    LOCK-WAITED once it is taken. The directory once taken, else None
+    after the wait, with why: (folder, why)."""
     folder = os.path.expanduser(HOST_LOCK["dir"])
     wait = 60 * HOST_LOCK.get("wait_minutes", HOST_LOCK_WAIT_MINUTES)
-    deadline = clock() + wait
-    told = False
+    began = clock()
+    deadline = began + wait
+    told = None
     while True:
         try:
             os.mkdir(folder)
@@ -5455,14 +5459,18 @@ def take_host_lock(state_dir, name, sha, when, out=print,
                 return None, "the host's lock %s is held (%s); gave up " \
                     "after %d minutes" % (folder, lock_owner(folder),
                                           wait // 60)
-            if not told:
+            if told is None:
+                told = lock_owner(folder)
                 out("  waiting for the host's lock %s, held: %s"
-                    % (folder, lock_owner(folder)))
-                told = True
+                    % (folder, told))
             sleep(HOST_LOCK_POLL_S)
+    taken = now()
+    if told is not None:
+        log(state_dir, "LOCK-WAITED %d s for %s %s: %s" % (
+            clock() - began, name, sha[:10], told), taken, out)
     owner = "forge-pr-check%s %s %s pid %d since %s" % (
         " " + INSTANCE if INSTANCE else "", name, sha[:10], os.getpid(),
-        iso(when))
+        iso(taken))
     with open(os.path.join(folder, "owner"), "w") as handle:
         handle.write(owner + "\n")
     return folder, None
@@ -7758,8 +7766,7 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                        for name_, folder in own.items()}
                 for step, own in STEP_CACHES.items()}
         if HOST_LOCK is not None:
-            host_lock, why = take_host_lock(state_dir, name, sha,
-                                            now_utc(), out)
+            host_lock, why = take_host_lock(state_dir, name, sha, out)
             if host_lock is None:
                 # The host is busy, not broken: not counted toward
                 # MAX_ERRORS' error.

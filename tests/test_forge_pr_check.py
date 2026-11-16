@@ -1993,7 +1993,7 @@ class HostLock(StateCase):
 
     def test_taken_with_an_owner_file_and_let_go(self):
         folder, why = pc.take_host_lock(self.state_dir, "#7", "a" * 40,
-                                        pc.now_utc())
+                                        lambda line: None)
         self.assertEqual((folder, why), (self.folder, None))
         owner = pc.lock_owner(self.folder)
         self.assertIn("#7 aaaaaaaaaa pid %d since " % os.getpid(), owner)
@@ -2006,7 +2006,7 @@ class HostLock(StateCase):
         ticks = iter([0, 30, 61])
         slept, said = [], []
         folder, why = pc.take_host_lock(
-            self.state_dir, "#7", "a" * 40, pc.now_utc(), said.append,
+            self.state_dir, "#7", "a" * 40, said.append,
             sleep=slept.append, clock=lambda: next(ticks))
         self.assertIsNone(folder)
         self.assertIn("is held (SyncDev timing X); gave up after 1 minutes",
@@ -2022,9 +2022,38 @@ class HostLock(StateCase):
         def sleep(seconds):
             os.rmdir(self.folder)
         folder, _ = pc.take_host_lock(self.state_dir, "#7", "a" * 40,
-                                      pc.now_utc(), lambda line: None,
+                                      lambda line: None,
                                       sleep=sleep)
         self.assertEqual(folder, self.folder)
+
+    def test_after_a_wait_since_is_when_taken_and_the_wait_logged(self):
+        """Issue 450: a run that waited wrote its start as "since",
+        which fell inside the previous holder's time."""
+        os.mkdir(self.folder)
+        pathlib.Path(self.folder, "owner").write_text("SyncDev turn X\n")
+        taken = pc.parse("2026-11-16T10:06:00Z")
+        ticks = iter([0, 0, 340])
+
+        def sleep(seconds):  # the holder lets go
+            shutil.rmtree(self.folder)
+        said = []
+        folder, _ = pc.take_host_lock(
+            self.state_dir, "#7", "a" * 40, said.append, sleep=sleep,
+            clock=lambda: next(ticks), now=lambda: taken)
+        self.assertEqual(folder, self.folder)
+        self.assertIn("since 2026-11-16T10:06:00Z", pc.lock_owner(folder))
+        logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertIn("2026-11-16T10:06:00Z LOCK-WAITED 340 s for #7 "
+                      "aaaaaaaaaa: SyncDev turn X", logged)
+        pc.release_host_lock(folder)
+        self.assertFalse(os.path.exists(self.folder))
+
+    def test_no_wait_logs_nothing(self):
+        folder, _ = pc.take_host_lock(self.state_dir, "#7", "a" * 40,
+                                      lambda line: None)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state_dir, "verdicts.log")))
+        pc.release_host_lock(folder)
 
     def test_a_lock_someone_else_holds_now_is_not_released(self):
         os.mkdir(self.folder)
