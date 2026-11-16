@@ -2967,7 +2967,8 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
     for argv in GATE:
         problem, retry = gate_problem(
             gate_args(argv, repo, number, main_tip, head,
-                      restack[0] if restack else None), env, repo, run)
+                      restack[0] if restack else None,
+                      pr.get("title") or ""), env, repo, run)
         if problem:
             # A gate tool may read the description, so the hand-back is
             # for this one: a new description is a new question.
@@ -2985,16 +2986,20 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
     return dict({"action": "MERGE"}, **notes)
 
 
-def gate_args(argv, repo, number, base, head, below=None):
+def gate_args(argv, repo, number, base, head, below=None, title=""):
     """A gate tool's argument list, filled in: `{pr}`, `{base}` and
     `{head}` in any argument, an argument that is exactly `{below}` by
     the number of the merged stack layer below (designs/0025), or by
-    nothing when there is none, and the tool's path, from this
-    installation for a `forge-` tool and from `repo` otherwise."""
+    nothing when there is none, `{title}` in any argument by the pull
+    request's title (agent-forge #445; filled in last, so a title is
+    never read for another placeholder, and as it is: the list is never
+    given to a shell), and the tool's path, from this installation for
+    a `forge-` tool and from `repo` otherwise."""
     filled = [a.replace("{pr}", str(number)).replace("{base}", base)
               .replace("{head}", head) for a in argv
               if a != "{below}" or below is not None]
     filled = [str(below) if a == "{below}" else a for a in filled]
+    filled = [a.replace("{title}", title or "") for a in filled]
     tool = filled[0]
     if os.sep not in tool and tool.startswith("forge-"):
         filled[0] = os.path.join(BIN, tool)
@@ -4281,7 +4286,8 @@ def checked_ahead(state_dir, repo, pr, approval, main_tip, env, run=sh,
     failed, retry = (None if covered else (approver, why)), False
     for argv in GATE if failed is None else ():
         problem, retry = gate_problem(
-            gate_args(argv, repo, pr["number"], main_tip, pr["headRefOid"]),
+            gate_args(argv, repo, pr["number"], main_tip, pr["headRefOid"],
+                      title=pr.get("title") or ""),
             env, repo, run)
         if problem:
             failed = ("author", problem, True) if retry else \

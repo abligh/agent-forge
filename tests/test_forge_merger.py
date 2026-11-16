@@ -986,6 +986,23 @@ class Decide(RepoCase):
         self.assertEqual(seen, [["--pr", "5", "--below", "4"],
                                 ["--pr", "5", "--below"]])
 
+    def test_the_gate_is_given_the_title_as_one_argument(self):
+        # agent-forge #445: a gate that judges a pull request by its
+        # title gets it whole, shell characters and all.
+        seen = []
+        base = tools_run()
+
+        def run(args, cwd=None, env=None):
+            if os.path.basename(args[0]) == "closing-keywords":
+                seen.append(args[1:])
+            return base(args, cwd, env)
+        item = dict(self.item(), title='a "b" $(c); d {head}')
+        gate = (("tools/closing-keywords", "--title", "{title}"),)
+        with mock.patch.object(m, "GATE", gate):
+            m.decide(item, m.approval_of(item), self.repo.path,
+                     self.repo.main_tip(), FakeGitHub(answers()), {}, run)
+        self.assertEqual(seen, [["--title", 'a "b" $(c); d {head}']])
+
     def test_an_unreviewed_commit_goes_to_the_approver(self):
         head = self.repo.commit("f.txt", "later\n", "unreviewed")
         self.repo.publish_pr(5, head)
@@ -3123,6 +3140,14 @@ class Configure(unittest.TestCase):
                          ["--pr", "7", "--below", "6"])
         self.assertEqual(m.gate_args(argv, "/r", 7, "b", "h")[1:],
                          ["--pr", "7", "--below"])
+
+    def test_the_title_is_one_argument_filled_in_last(self):
+        title = 'a "b" $(c); d {pr} {head}'
+        argv = ["forge-x", "--title", "{title}", "t={title}", "{pr}"]
+        self.assertEqual(m.gate_args(argv, "/r", 7, "b", "h", title=title)
+                         [1:], ["--title", title, "t=" + title, "7"])
+        self.assertEqual(m.gate_args(argv, "/r", 7, "b", "h")[1:],
+                         ["--title", "", "t=", "7"])
 
     def test_a_forge_tool_named_by_path_runs_from_the_checkout(self):
         self.assertEqual(m.gate_args(["tools/forge-x"], "/r", 1, "b", "h"),
