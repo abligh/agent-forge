@@ -272,6 +272,26 @@ failure hands the pull request back for the conflict. With
 `merge.early_conflicts`, a candidate behind the front whose conflict
 this resolves is not handed back early.
 
+**With `merge.resolve.board_unreviewed`, a resolution is tested while
+it is reviewed** (designs/0056 item 3; default off; needs live trains
+merged as one). A head whose only commits since its approval are
+merges of `main`, each the clean merge of its parents or differing from
+git's own (`zdiff3`) merge of them only inside the conflicted hunks, is
+provisionally covered: nothing outside the hunks is new, and nothing
+there merges unreviewed. It isn't handed back to its reviewer. Instead
+the reviewer is asked, once per head, to read only those hunks: a
+comment starting `Not-a-review` and `RESOLUTION-REVIEW #n`, listing
+each file's new lines (`resolution-review.json` in the state directory
+keeps each head judged and the ask said). Meanwhile it is a candidate
+that boards a train, but only as the last member of one that has
+others (never alone, never inside a stack), and it is decided `SKIP`
+at the front: it merges only once an approval covers its head. When
+its train's top is green, the members below it go in as one train on
+that green (`TRAIN-UNDER-REVIEW #a..#b`), as below a member that left;
+one left at the head of the first train leaves it (`TRAIN-LEFT`) to
+wait for its review. The record lists such heads as `unreviewed`, and
+the asks said as `resolution_review`.
+
 **Where that re-review starts.** The hand-back to the approver lists
 the paths whose content in H a reviewer has not seen together with
 `main`'s, so the re-review can start there rather than at the whole pull request. With
@@ -1307,6 +1327,17 @@ RESOLVED_FILE = "resolved.json"
 # by `main` when RESOLVE is.
 RESOLVE_IDENTITY = None
 RESOLVE_MESSAGE = "Merge %s into %s; %s regenerated"
+# merge.resolve.board_unreviewed (designs/0056 item 3): an author's
+# resolution of a conflict with the default branch that changes nothing
+# outside the conflicted hunks boards a train, as its last member, while
+# its reviewer reads those hunks; it merges only on a new approval.
+BOARD_UNREVIEWED = False
+# {pr: {"head", "approved", "hunks"?, "why"?, "asked"?}}: each judged
+# head, and the RESOLUTION-REVIEW ask said for it, once per head.
+REVIEW_FILE = "resolution-review.json"
+# The conflicted file this big is not read for hunks: it waits for its
+# review as before.
+HUNK_MAX_BYTES = 2_000_000
 # merge.resolve.union (designs/0046): globs of the files whose conflicts
 # of additions the Merger resolves by keeping both sides; () is off.
 UNION = ()
@@ -1427,6 +1458,7 @@ def configure(project):
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
     global FIXED_ORDER, GREEN_BATCH_FIRST, RED_SUSPECT_OUT, UNSTABLE_AFTER
     global UNSTABLE_BATCHES, TELL_BOARDED, AREAS, AREA_IGNORE, AREA_TELL
+    global BOARD_UNREVIEWED
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
     global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR, LAYERS_OWN_GREEN
     global LEFT_TOP_COVERS
@@ -1550,7 +1582,10 @@ def configure(project):
                          and stacks.get("predict_restacked") is True)
     UNION = union.globs(merge)
     rules = merge.get("resolve", ())
+    BOARD_UNREVIEWED = False
     if isinstance(rules, dict):
+        BOARD_UNREVIEWED = (rules.get("board_unreviewed") is True
+                            and TRAINS == "live" and TRAIN_MERGE)
         rules = rules.get("regenerate", ())
     RESOLVE = tuple({"paths": frozenset(rule["paths"]),
                      "command": tuple(rule["command"]),
@@ -2277,6 +2312,264 @@ def covers_head(repo, approved, head, main_ref, run=sh, below=(),
     return True, None
 
 
+CONFLICT_OPEN, CONFLICT_BASE, CONFLICT_MID, CONFLICT_CLOSE = (
+    "<<<<<<<", "|||||||", "=======", ">>>>>>>")
+
+
+def conflict_chunks(text):
+    """The text outside the conflicts of a file git merged with
+    conflict markers, as a list of N + 1 chunks around N conflicts, or
+    None when it has none or an unclosed one."""
+    chunks, current, inside = [], [], False
+    for line in text.splitlines(keepends=True):
+        bare = line.rstrip("\r\n")
+        if not inside and bare.startswith(CONFLICT_OPEN) and (
+                len(bare) == 7 or bare[7] == " "):
+            chunks.append("".join(current))
+            current, inside = [], True
+        elif inside and bare.startswith(CONFLICT_CLOSE) and (
+                len(bare) == 7 or bare[7] == " "):
+            inside = False
+        elif not inside:
+            current.append(line)
+    if inside or not chunks:
+        return None
+    chunks.append("".join(current))
+    return chunks
+
+
+def resolved_hunks(merged, resolved):
+    """designs/0056 item 3: where `resolved` holds its own lines in
+    place of each conflict of `merged` (git's merge of the same parents,
+    with conflict markers), as [(first line, count)] in `resolved`,
+    one per conflict; None when `resolved` changes a line outside the
+    conflicts, or `merged` has none. A count of 0 drops the conflict's
+    lines before `first`."""
+    chunks = conflict_chunks(merged)
+    if chunks is None:
+        return None
+    pattern = "((?:[^\n]*\n)*?)".join(re.escape(c) for c in chunks)
+    try:
+        got = re.fullmatch(pattern, resolved)
+    except RecursionError:
+        return None
+    if got is None:
+        return None
+    hunks = []
+    for k in range(1, len(chunks)):
+        if any(line.startswith((CONFLICT_OPEN, CONFLICT_CLOSE))
+               for line in got.group(k).splitlines()):
+            # Conflict markers committed as they are: no resolution.
+            return None
+        start, end = got.span(k)
+        hunks.append((resolved.count("\n", 0, start) + 1,
+                      resolved.count("\n", start, end)))
+    return hunks
+
+
+def blob(repo, commit, path, run=sh):
+    """`path`'s text at `commit` (a commit or tree), or None when it has
+    none, it is too big to read for hunks, or it isn't text."""
+    size = git(repo, "cat-file", "-s", "%s:%s" % (commit, path), run=run)
+    if size.returncode != 0 or not size.stdout.strip().isdigit() \
+            or int(size.stdout.strip()) > HUNK_MAX_BYTES:
+        return None
+    got = git(repo, "cat-file", "-p", "%s:%s" % (commit, path), run=run)
+    if got.returncode != 0 or "\0" in got.stdout:
+        return None
+    return got.stdout
+
+
+def resolution_hunks(repo, approved, head, main_ref, run=sh):
+    """merge.resolve.board_unreviewed (designs/0056 item 3): (hunks,
+    None) when every commit on `head` since `approved` merges the
+    default branch, and each that isn't the clean merge of its parents
+    differs from git's merge of them only inside the conflicted hunks
+    (a `zdiff3` merge's conflict markers): the head is provisionally
+    covered. `hunks` lists what is new, as {"commit", "path", "first",
+    "count"}, which is all its reviewer must read. (None, why) when
+    not."""
+    if not is_ancestor(repo, approved, head, run):
+        return None, "the approved commit is not in the head's history"
+    got = git(repo, "rev-list", "--parents", head, "^" + approved,
+              "^" + main_ref, run=run)
+    if got.returncode != 0:
+        return None, "git rev-list failed"
+    hunks = []
+    for line in got.stdout.splitlines():
+        sha, *parents = line.split()
+        if len(parents) != 2:
+            return None, "%s, after the approval, is not a merge" % sha[:10]
+        if not any(is_ancestor(repo, p, main_ref, run) for p in parents):
+            return None, "%s merges nothing from %s" % (sha[:10], MAIN)
+        merged = git(repo, "-c", "merge.conflictStyle=zdiff3", "merge-tree",
+                     "--write-tree", "--name-only", "--no-messages",
+                     *parents, run=run)
+        tree = git(repo, "rev-parse", sha + "^{tree}", run=run)
+        if merged.returncode not in (0, 1) or tree.returncode != 0:
+            return None, "git could not merge %s's parents" % sha[:10]
+        auto = merged.stdout.split()[0]
+        if auto == tree.stdout.strip():
+            continue
+        conflicted = conflicted_paths(merged.stdout)
+        differs = git(repo, "diff-tree", "-r", "--name-only", auto,
+                      tree.stdout.strip(), run=run)
+        if differs.returncode != 0:
+            return None, "git could not compare %s" % sha[:10]
+        changed = set(differs.stdout.split())
+        outside = sorted(changed - conflicted)
+        if outside:
+            return None, ("%s changes %s, which merged without a conflict"
+                          % (sha[:10], outside[0]))
+        for path in sorted(conflicted):
+            if path not in changed:
+                return None, "%s keeps %s's conflict markers" % (
+                    sha[:10], path)
+            text, mine = blob(repo, auto, path, run), blob(repo, sha, path,
+                                                           run)
+            found = None if text is None or mine is None \
+                else resolved_hunks(text, mine)
+            if found is None:
+                return None, ("%s changes %s outside its conflicted hunks"
+                              % (sha[:10], path))
+            hunks += [{"commit": sha, "path": path, "first": first,
+                       "count": count} for first, count in found]
+    if not hunks:
+        return None, "nothing after the approval resolves a conflict"
+    return hunks, None
+
+
+# {pr: entry}: this tick's provisionally covered heads
+# (merge.resolve.board_unreviewed), set by `tick` before it decides.
+UNREVIEWED = {}
+
+REVIEW_WAIT_REASON = ("a resolution of a conflict with %s waiting for %s's "
+                      "approval of its head; it boards a train as its "
+                      "last member meanwhile")
+
+REVIEW_ASK = (
+    "Not-a-review\n\nRESOLUTION-REVIEW #%d: %s resolves a conflict with "
+    "`%s` since %s's approval of %s. Outside the conflicted hunks it is "
+    "what git merges by itself, so it is tested in a train now, as its "
+    "last member, and merges only once %s approves this head. Only these "
+    "lines are new since the approval:\n\n%s\n\n%s")
+
+
+def unreviewed(pr):
+    """Whether `pr` is provisionally covered at its head this tick."""
+    entry = UNREVIEWED.get(pr["number"]) if BOARD_UNREVIEWED else None
+    return bool(entry) and entry.get("head") == pr.get("headRefOid")
+
+
+def hunks_text(hunks):
+    """A RESOLUTION-REVIEW ask's list of the new lines."""
+    lines = []
+    for h in hunks:
+        where = ("lines %d to %d" % (h["first"], h["first"] + h["count"] - 1)
+                 if h["count"] > 1 else "line %d" % h["first"]
+                 if h["count"] else "the conflict's lines dropped before "
+                 "line %d" % h["first"])
+        lines.append("* `%s`: %s, as of %s" % (h["path"], where,
+                                               h["commit"][:10]))
+    return "\n".join(lines)
+
+
+def find_unreviewed(state_dir, repo, candidates, approvals, main_tip,
+                    regenerated=None, run=sh, name=REVIEW_FILE):
+    """merge.resolve.board_unreviewed (designs/0056 item 3): {number:
+    {"head", "approved", "hunks", ...}} for each candidate whose approval
+    no longer covers its head because the author resolved a conflict
+    with the default branch, and only inside its hunks
+    (`resolution_hunks`). Judged once per head and approved commit, in
+    `name` in the state directory, which keeps the ask said (`asked`)."""
+    path = os.path.join(state_dir, name)
+    saved = load_json(path, {})
+    saved = saved if isinstance(saved, dict) else {}
+    # Kept for pull requests not judged this tick too (held for a
+    # while), so an ask isn't said twice for one head.
+    found, kept = {}, dict(list(saved.items())[-300:])
+    main_ref = "refs/remotes/origin/" + MAIN
+    for pr in candidates:
+        approval = approvals.get(pr["number"]) or {}
+        approved = (approval.get("commit") or {}).get("oid")
+        head = pr["headRefOid"]
+        if not approved or approved == head:
+            continue
+        entry = saved.get(str(pr["number"]))
+        if not (isinstance(entry, dict) and entry.get("head") == head
+                and entry.get("approved") == approved):
+            have_head(repo, pr, run)
+            entry = {"head": head, "approved": approved}
+            if own_push(repo, approved, head, main_tip, run) \
+                    or covers_head(repo, approved, head, main_ref, run,
+                                   (), regenerated)[0] is not False:
+                entry["why"] = "covered"
+            else:
+                hunks, why = resolution_hunks(repo, approved, head,
+                                              main_ref, run)
+                if hunks:
+                    entry["hunks"] = hunks
+                else:
+                    entry["why"] = why
+        kept.pop(str(pr["number"]), None)
+        kept[str(pr["number"])] = entry
+        if entry.get("hunks"):
+            found[pr["number"]] = entry
+    if kept != saved:
+        save_json(path, kept)
+    return found
+
+
+def ask_resolution_reviews(state_dir, github, found, approvals, live, out,
+                           name=REVIEW_FILE):
+    """One RESOLUTION-REVIEW ask per head in `found` (`find_unreviewed`),
+    to the approver, naming only the conflicted hunks. Returns the
+    record's list."""
+    path = os.path.join(state_dir, name)
+    saved = load_json(path, {})
+    said = []
+    for number, entry in sorted(found.items()):
+        kept = saved.get(str(number)) or {}
+        if kept.get("asked") == entry["head"]:
+            continue
+        approval = approvals.get(number) or {}
+        approver = APPROVERS.get(login(approval), "a reviewer")
+        item = {"pr": number, "head": entry["head"],
+                "hunks": len(entry["hunks"])}
+        if live:
+            ok, why = github.write(
+                "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG, number),
+                body=REVIEW_ASK % (number, entry["head"][:10], MAIN,
+                                   approver, entry["approved"][:10],
+                                   approver, hunks_text(entry["hunks"]),
+                                   SIGNATURE))
+            item["result"] = "done" if ok else "refused: " + why
+            if ok:
+                saved.setdefault(str(number), dict(entry))["asked"] = \
+                    entry["head"]
+                save_json(path, saved)
+        said.append(item)
+        out("RESOLUTION-REVIEW #%d: %s resolves a conflict with %s in %d "
+            "hunk%s; it boards as its train's last member, and %s %s for "
+            "its approval" % (number, short(entry["head"]), MAIN,
+                              len(entry["hunks"]),
+                              "" if len(entry["hunks"]) == 1 else "s",
+                              approver, "is asked" if live
+                              else "would be asked"))
+    return said
+
+
+def under_review(entries):
+    """`entries` (a train ready to merge) cut back to the members below
+    its first provisionally covered one, which merges only on a new
+    approval (designs/0056 item 3)."""
+    for k, e in enumerate(entries or ()):
+        found = UNREVIEWED.get(e.get("pr")) if BOARD_UNREVIEWED else None
+        if found and found.get("head") == e.get("head"):
+            return entries[:k]
+    return entries
+
+
 def tokenless_env():
     """The environment with every variable named like a token taken out,
     for code a pull request brings (a rule's own `command` or `check`).
@@ -2946,6 +3239,11 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
                                regenerated)
     if covered is None:
         return {"action": "SKIP", "reason": why}
+    if not covered and unreviewed(pr):
+        # designs/0056 item 3: tested in a train while its reviewer reads
+        # the hunks; it merges only once an approval covers its head.
+        return {"action": "SKIP", "unreviewed": True,
+                "reason": REVIEW_WAIT_REASON % (MAIN, approver)}
     if not covered:
         return dict(back(approver, why),
                     paths=review_paths(repo, approved, head, main_ref, run))
@@ -4325,7 +4623,8 @@ def checked_ahead(state_dir, repo, pr, approval, main_tip, env, run=sh,
     approver = APPROVERS.get(login(approval), "a reviewer")
     if not approved:
         return approver, "the approval names no commit"
-    key = "%s %s %s" % (pr["headRefOid"], approved, description(pr))
+    key = "%s %s %s%s" % (pr["headRefOid"], approved, description(pr),
+                          " unreviewed" if unreviewed(pr) else "")
     path = os.path.join(state_dir, CHECKED_FILE)
     checked = load_json(path, {})
     entry = checked.get(str(pr["number"]))
@@ -4339,6 +4638,9 @@ def checked_ahead(state_dir, repo, pr, approval, main_tip, env, run=sh,
                                tuple(below), regenerated)
     if covered is None:
         return None
+    # designs/0056 item 3: a resolution its reviewer is reading boards
+    # meanwhile; the gates still judge it now.
+    covered = covered or unreviewed(pr)
     failed, retry = (None if covered else (approver, why)), False
     for argv in GATE if failed is None else ():
         problem, retry = gate_problem(
@@ -4516,7 +4818,7 @@ def boarding_wait(repo, pr, approval, main_tip, run=sh):
     head = pr.get("headRefOid")
     if not approved:
         return "its approval names no commit"
-    if approved == head:
+    if approved == head or unreviewed(pr):
         return None
     have_head(repo, pr, run)
     if own_push(repo, approved, head, main_tip, run):
@@ -5752,7 +6054,7 @@ def last_trains(last):
 def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                trains=None, red=frozenset(), restacks=None, run=sh,
                files=None, note=None, force_merges=True, started=None,
-               acting=None, length=None):
+               acting=None, length=None, unreviewed=frozenset()):
     """designs/0047: (entries, sizes, events) for the trains this tick,
     end to end from `main_tip`: the predictions as `predict_ahead` makes
     them, each with `train` (its train's place) and `carriage` (its
@@ -5803,7 +6105,15 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
        it stays behind with the layers above it, and the ones below
        board. On 2026-11-07 two stacks' bottom pull requests, each
        fine, waited two hours while newer ones went past, because a
-       layer above conflicted and the whole carriage was skipped."""
+       layer above conflicted and the whole carriage was skipped.
+
+    `unreviewed` (merge.resolve.board_unreviewed, designs/0056 item 3)
+    are the pull requests whose resolution waits for its review. One
+    boards only as the last member of a train that has others, so the
+    members ahead of it can merge without it; it heads no train, and
+    one left at the head of the first train by the merges ahead of it
+    leaves (`TRAIN-LEFT`) to wait for its review rather than hold every
+    train behind it."""
     trains = AHEAD_BATCHES if trains is None else trains
     # designs/0056 item 4: new trains are cut at `length` (the window),
     # AHEAD_BATCH without one; trains already cut keep theirs.
@@ -5910,6 +6220,14 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                             events.append(("kept", "KEPT #%d: pushed %s, "
                                            "same tree in its place" % (
                                                n, pr["headRefOid"][:10])))
+                if why is None and n in unreviewed and not entries:
+                    # Everything ahead of it merged: it would head the
+                    # first train, and hold every train until reviewed.
+                    events.append(("left", "LEFT #%d: its resolution "
+                                   "waits for its review, and it would "
+                                   "head the first train" % n))
+                    gone.add(n)
+                    continue
                 if why is None and entry is None:
                     entry, failed = predict_one(repo, parent, pr, restacks,
                                                 run, graph)
@@ -5963,7 +6281,8 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
     # while long stacks, ready and touching nothing of theirs, waited
     # for a train (2026-11-12). Equal sizes keep the queue's order.
     pool = sorted(carriages, key=lambda c: (
-        acting is None or c[0]["number"] != acting, not urgent(c[0]),
+        acting is None or c[0]["number"] != acting,
+        any(pr["number"] in unreviewed for pr in c), not urgent(c[0]),
         -len(c)))
     behind = set()
     # Why each carriage left out of the last train it was tried for
@@ -5988,6 +6307,15 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             if not members:
                 continue
             size = len(entries) - start
+            closing = any(pr["number"] in unreviewed for pr in members)
+            if closing and (not size or len(members) > 1):
+                # designs/0056 item 3: only as the last member of a train
+                # that has others, and never inside a stack.
+                waits[members[0]["number"]] = (
+                    "its resolution waits for its review, and boards only "
+                    "behind others" if not size else "its resolution "
+                    "waits for its review, and is in a stack")
+                continue
             if size and size + len(members) > length:
                 waits[members[0]["number"]] = "no room in train %d" % (
                     len(sizes) + 1)
@@ -6056,7 +6384,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
             kind = urgent(members[0]) if not size else \
                 kind and urgent(members[0])
             parent, graph = top, top_graph
-            if len(entries) - start >= length:
+            if len(entries) - start >= length or closing:
                 break
         if len(entries) == start:
             break
@@ -8604,6 +8932,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 spoken.append((pr, approval_of(pr), said_after[0]))
     regenerated = (remembered(state_dir, lambda sha, rule: regenerated_in(
         repo, sha, rule, run)) if RESOLVE else None)
+    # designs/0056 item 3: resolutions that board unreviewed. Judged on
+    # every candidate before the holds below: a hold elsewhere doesn't
+    # change what the reviewer is asked to read.
+    global UNREVIEWED
+    UNREVIEWED = find_unreviewed(
+        state_dir, repo, candidates, approvals, main_tip, regenerated, run,
+        REVIEW_FILE if live else "dry-run-" + REVIEW_FILE) \
+        if BOARD_UNREVIEWED else {}
     rules = None
     if CODE_OWNERS:
         rules = codeowners_rules(repo, "refs/remotes/origin/" + MAIN, run)
@@ -8907,6 +9243,13 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             graph.items()) if node["base"] is not None}
     if stale:
         record["stale"] = stale
+    if UNREVIEWED:
+        record["unreviewed"] = sorted(UNREVIEWED)
+        asked = ask_resolution_reviews(
+            state_dir, github, UNREVIEWED, approvals, live, out,
+            REVIEW_FILE if live else "dry-run-" + REVIEW_FILE)
+        if asked:
+            record["resolution_review"] = asked
     if live:
         closed = close_merged_issues(state_dir, github, when, out)
         if closed:
@@ -8988,9 +9331,26 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                               repo, run,
                               restacks if PREDICT_RESTACKED else None)
         tested_tree = None
+        reviewing = under_review(entries)
+        if entries and len(reviewing) < len(entries):
+            # designs/0056 item 3: its top is green, but a member's
+            # resolution waits for its review. The members below it go
+            # in on the top's green, which covers them as a left top's
+            # does; it waits for its approval.
+            out("TRAIN-UNDER-REVIEW #%d..#%d: its top %s is green, and "
+                "#%d waits for its reviewer; %s" % (
+                    entries[0]["pr"], entries[-1]["pr"],
+                    short(entries[-1].get("sha") or ""),
+                    entries[len(reviewing)]["pr"],
+                    "#%d..#%d merge on that green" % (
+                        reviewing[0]["pr"], reviewing[-1]["pr"])
+                    if reviewing else "nothing is below it"))
+            if reviewing:
+                tested_tree = entries[-1]["tree"]
+            entries = reviewing
         if not entries:
-            entries = left_ready(last_ahead, members, train_base,
-                                 check_state)
+            entries = under_review(left_ready(last_ahead, members,
+                                              train_base, check_state))
             if entries:
                 tested_tree = last_ahead["left_top"]["tree"]
                 out("TRAIN-UNDER-LEFT #%d..#%d: merge on the green of the "
@@ -9633,7 +9993,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                                                         tree),
                 acting=waiting_on if acting else None,
                 length=window_length(last)
-                if WINDOW and TRAINS == "live" else None)
+                if WINDOW and TRAINS == "live" else None,
+                unreviewed=frozenset(UNREVIEWED))
             files, note = {}, {}
             red_top = False
             if TRAINS == "live" and not searching and boarding:

@@ -871,8 +871,10 @@ waits to be told until it is reached.
 ### `merge.resolve`
 
 `[{"paths": [...], "command": [...], "check": [...]}]` (designs/0026),
-or, to set `union` too, an object: `{"regenerate": [the same rules],
-"union": [...]}` (see `merge.resolve.union`, below).
+or, to set `union` or `board_unreviewed` too, an object:
+`{"regenerate": [the same rules], "union": [...], "board_unreviewed":
+true}` (see `merge.resolve.union` and `merge.resolve.board_unreviewed`,
+below).
 When every path of a candidate's conflict with the default branch is in
 one rule's `paths` (generated files), the Merger resolves it rather
 than handing it back (`RESOLVE`): in a scratch worktree of the head it
@@ -917,6 +919,38 @@ merge does, whoever made it. `forge-resolve`, run on the branch, makes
 the same merge for an author. Name only files whose concurrent edits
 are additions, such as lists, tables of contents and changelogs: the
 project's review of this setting is what makes it safe.
+
+### `merge.resolve.board_unreviewed`
+
+`true` or `false`
+([designs/0056](designs/0056-wasting-less-when-a-member-leaves-a-train.md)
+item 3), default `false`. Needs `merge.test_ahead` with `trains`
+`"live"` and `train_merge`. An author's resolution of a conflict with
+the default branch is tested while its reviewer reads it, rather than
+after. A head whose only commits since its approval are merges of the
+default branch, each either the clean merge of its parents or
+differing from git's own merge of them (`git merge-tree`, with
+`zdiff3` conflict markers) only in the lines of its conflicted hunks,
+is provisionally covered:
+
+* it isn't handed back to its reviewer; the Merger asks the reviewer
+  once per head, in a comment starting `Not-a-review` and
+  `RESOLUTION-REVIEW #n`, to read only those hunks, each listed by
+  file and line (`resolution-review.json` keeps each head judged and
+  the ask said);
+* it boards a train, but only as the last member of a train that has
+  others, never alone and never inside a stack;
+* it never merges until a reviewer approves its head: at the front it
+  is `SKIP`, and when its train's top is green the members below it
+  merge as one train on that green (`TRAIN-UNDER-REVIEW #a..#b`). If
+  the merges ahead of it leave it at the head of the first train, it
+  leaves that train (`TRAIN-LEFT`) to wait for its review.
+
+Anything else after the approval (a commit that isn't a merge of the
+default branch, a changed line outside the hunks, another file
+changed, conflict markers committed) is handed back to the reviewer as
+before. The record lists the heads as `unreviewed` and the asks as
+`resolution_review`.
 
 ### `merge.hold_labels`
 
