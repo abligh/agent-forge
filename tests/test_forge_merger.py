@@ -7450,6 +7450,211 @@ class CodeOwners(RepoCase):
         self.assertIn("can't be listed", m.code_owner_wait(
             self.repo.path, self.item(), rules, self.repo.main_tip(), run))
 
+def area_project(agents=None, **merge):
+    """project() with merge.area_reviewers, and the agents `agents`
+    adds to (or changes in) the example's."""
+    data = example()
+    for name, entry in (agents or {}).items():
+        data["agents"][name] = dict(data["agents"].get(name, {}), **entry)
+    data["merge"] = dict({"gate": GATE, "own_head_green": False,
+                          "test_ahead": False, "area_reviewers": True},
+                         **merge)
+    data["merge"]["test_ahead"] = old_defaults(data["merge"]["test_ahead"])
+    return config.Project(data, None)
+
+
+class AreaReviewers(RepoCase):
+    """designs/0058, merge.area_reviewers: a candidate that changes a
+    path a reviewer's `reviews` globs match waits for a reviewer of
+    that area. The example's Reviewer reviews docs/**, tools/** and
+    src/core/**; UIReviewer web/**."""
+
+    item = Decide.item
+    tick = Tick.tick
+    UI = "uireviewerwidgetagent"
+
+    def setUp(self):
+        super().setUp()
+        self.repo.branch("main")
+        self.repo.commit("readme.txt", "main\n", "main")
+        self.repo.push("main")
+        self.repo.branch("feature", "feature")
+        m.configure(area_project())
+        self.addCleanup(m.configure, project())
+
+    def area_pr(self, number=6, name="web/x.txt", author=AUTHOR,
+                reviews=None):
+        self.repo.branch("area%d" % number, "origin/main")
+        os.makedirs(os.path.join(self.repo.path, os.path.dirname(name)
+                                 or "."), exist_ok=True)
+        sha = self.repo.commit(name, "x\n", "change " + name)
+        self.repo.publish_pr(number, sha)
+        self.repo.branch("feature", "feature")
+        self.sha = sha
+        for r in reviews or ():
+            r["commit"]["oid"] = sha
+        return pr(number, T1, head=sha, author=author,
+                  reviews=[review(REVIEWER, oid=sha)] + list(reviews or ()))
+
+    def wait(self, item, run=m.sh):
+        return m.area_wait(self.repo.path, item, m.AREAS,
+                           self.repo.main_tip(), run)
+
+    def test_the_configuration(self):
+        self.assertEqual(sorted((a[0], a[1]) for a in m.AREAS), [
+            (("Reviewer",), ("docs/**", "tools/**", "src/core/**")),
+            (("UIReviewer",), ("web/**",))])
+        self.assertEqual(m.AREA_IGNORE, ())
+        m.configure(project())
+        self.assertIsNone(m.AREAS)
+        m.configure(area_project(area_reviewers=False))
+        self.assertIsNone(m.AREAS)
+        m.configure(area_project(area_reviewers={"ignore": ["web/gen/**"]}))
+        self.assertEqual(m.AREA_IGNORE, ("web/gen/**",))
+
+    def test_off_by_default(self):
+        m.configure(project())
+        record, _ = self.tick([self.area_pr()], live=True)
+        self.assertEqual(record["held"], {})
+        self.assertEqual([d["action"] for d in record["decisions"]],
+                         ["MERGE"])
+
+    def test_an_area_path_waits_for_its_reviewer(self):
+        record, _ = self.tick([self.area_pr()], live=True)
+        self.assertEqual(record["held"], {
+            "6": "waits for UIReviewer (web/**): web/x.txt"})
+        self.assertEqual(record["decisions"], [])
+        # A hold, not a hand-back: nothing is said.
+        self.assertEqual(self.github.writes, [])
+
+    def test_the_areas_approval_lets_it_merge(self):
+        item = self.area_pr(reviews=[review(self.UI, at=T2)])
+        record, _ = self.tick([item], live=True)
+        self.assertEqual(record["held"], {})
+        self.assertEqual([d["action"] for d in record["decisions"]],
+                         ["MERGE"])
+
+    def test_one_review_can_be_both_approvals(self):
+        # Only the specialist reviewed: hers is the general approval too.
+        item = self.area_pr()
+        item["reviews"] = [review(self.UI, oid=self.sha)]
+        self.assertIsNone(self.wait(item))
+        self.assertIsNotNone(m.approval_of(item))
+
+    def test_an_approval_that_does_not_cover_the_head_is_not_enough(self):
+        item = self.area_pr()
+        item["reviews"].append(review(self.UI, oid=self.approved, at=T2))
+        self.assertEqual(self.wait(item),
+                         "waits for UIReviewer (web/**): web/x.txt")
+
+    def test_main_merged_in_since_the_approval_keeps_it(self):
+        item = self.area_pr()
+        approved = self.sha
+        self.repo.branch("main")
+        self.repo.commit("m.txt", "main moved\n", "main moves")
+        self.repo.push("main")
+        self.repo.branch("area6", approved)
+        head = self.repo.merge("origin/main")
+        self.repo.publish_pr(6, head)
+        self.repo.branch("feature", "feature")
+        item["headRefOid"] = head
+        self.assertIsNotNone(self.wait(item))
+        item["reviews"].append(review(self.UI, oid=approved, at=T2))
+        self.assertIsNone(self.wait(item))
+
+    def test_a_later_change_request_takes_it_back(self):
+        item = self.area_pr(reviews=[review(self.UI, at=T2),
+                                     review(self.UI, "CHANGES_REQUESTED",
+                                            at=T3)])
+        self.assertIsNotNone(self.wait(item))
+
+    def test_a_later_comment_leaves_the_approval_standing(self):
+        item = self.area_pr(reviews=[review(self.UI, at=T2),
+                                     review(self.UI, "COMMENTED", at=T3)])
+        self.assertIsNone(self.wait(item))
+
+    def test_the_author_never_clears_her_own_area(self):
+        item = self.area_pr(author=self.UI, reviews=[review(self.UI, at=T2)])
+        self.assertEqual(self.wait(item),
+                         "waits for UIReviewer (web/**): web/x.txt")
+
+    def test_another_areas_approval_does_not_count(self):
+        # Reviewer approved, and is a reviewer, but of other paths.
+        item = self.area_pr()
+        self.assertIsNotNone(m.approval_of(item))
+        self.assertIsNotNone(self.wait(item))
+
+    def test_identical_globs_are_one_area(self):
+        m.configure(area_project({"UIReviewer2": {
+            "app_id": 105, "installation_id": 205, "kind": "reviewer",
+            "reviews": ["web/**"]}}))
+        item = self.area_pr()
+        self.assertEqual(self.wait(item),
+                         "waits for UIReviewer or UIReviewer2 (web/**): "
+                         "web/x.txt")
+        item["reviews"].append(review("uireviewer2widgetagent",
+                                      oid=self.sha, at=T2))
+        self.assertIsNone(self.wait(item))
+
+    def test_a_path_in_two_areas_needs_each(self):
+        m.configure(area_project({"WebAudit": {
+            "app_id": 105, "installation_id": 205, "kind": "reviewer",
+            "reviews": ["web/*.txt"]}}))
+        item = self.area_pr()
+        item["reviews"].append(review(self.UI, oid=self.sha, at=T2))
+        self.assertEqual(self.wait(item),
+                         "waits for WebAudit (web/*.txt): web/x.txt")
+        item["reviews"].append(review("webauditwidgetagent", oid=self.sha,
+                                      at=T2))
+        self.assertIsNone(self.wait(item))
+
+    def test_more_paths_are_counted(self):
+        item = self.area_pr()
+        self.repo.branch("area6", self.sha)
+        os.makedirs(os.path.join(self.repo.path, "web"), exist_ok=True)
+        self.repo.commit("web/y.txt", "y\n", "y")
+        head = self.repo.commit("readme.txt", "changed\n", "unreviewed")
+        self.repo.publish_pr(6, head)
+        self.repo.branch("feature", "feature")
+        item["headRefOid"] = head
+        self.assertEqual(self.wait(item),
+                         "waits for UIReviewer (web/**): web/x.txt and "
+                         "1 more")
+
+    def test_an_away_reviewers_stand_in_clears_her_area(self):
+        m.configure(area_project({"UIReviewer": {"away": "Reviewer"}}))
+        item = self.area_pr()
+        self.assertIsNone(self.wait(item))
+
+    def test_ignored_and_unmatched_paths_hold_nothing(self):
+        m.configure(area_project(area_reviewers={"ignore": ["web/**"]}))
+        self.assertIsNone(self.wait(self.area_pr()))
+        m.configure(area_project())
+        self.assertIsNone(self.wait(self.area_pr(7, name="src/x.txt")))
+        self.assertIsNone(self.wait(self.area_pr(8, name="top.txt")))
+
+    def test_paths_that_cannot_be_listed_wait(self):
+        def run(args, cwd=None, env=None):
+            if "diff" in args:
+                return subprocess.CompletedProcess(args, 128, "", "fatal")
+            return m.sh(args, cwd, env)
+        self.assertIn("can't be listed", self.wait(self.area_pr(), run))
+
+    def test_a_held_layer_is_not_ready(self):
+        layer = self.area_pr()
+        approval = layer["reviews"][0]
+        below = {"headRefOid": self.repo.main_tip()}
+        with mock.patch.object(m, "eligible",
+                               lambda *a, **k: (approval, None)), \
+                mock.patch.object(m, "handed_back", lambda *a: False):
+            self.assertIsNone(m.ready_layer(
+                self.repo.path, layer, below, set(), set(), T2, {}))
+            m.configure(project())
+            self.assertIs(m.ready_layer(
+                self.repo.path, layer, below, set(), set(), T2, {}),
+                approval)
+
+
 class OthersText(unittest.TestCase):
     """The hand-back's list of the author's other open pull requests."""
 

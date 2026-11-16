@@ -1233,6 +1233,13 @@ RESOLVE_FILE = "resolve-slots.json"
 # owner until an owner has approved its head.
 CODE_OWNERS = False
 CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
+# merge.area_reviewers (designs/0058): hold one that changes a path a
+# reviewer's `reviews` globs match until a reviewer of that area has
+# approved its head. A list of (names, globs, counts): the reviewers
+# with those identical globs, in the configuration's order, and the
+# names whose approval clears it (their stand-ins too). None when off.
+AREAS = None
+AREA_IGNORE = ()
 # merge.right_of_way: after ROW_AFTER conflict hand-backs, those that
 # conflict with the pull request's clean head are held for ROW_FOR.
 RIGHT_OF_WAY = False
@@ -1386,6 +1393,7 @@ def configure(project):
     `yield_ignores_conflicts` (default false) and `right_of_way`
     (default none: nobody has it; `after_conflicts`, default 2, and
     `minutes`, default 60) and `code_owners` (default false) and
+    designs/0058's `area_reviewers` (default false) and
     `stacks` (default none: a stacked pull request is held; `max_run`,
     default 0, no limit; `wait_hours`, default none: a layer that isn't
     ready when the layer below merges leaves the stack), and design 0026's
@@ -1412,7 +1420,7 @@ def configure(project):
         SEARCH_CUTS, WINDOW
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
     global FIXED_ORDER, GREEN_BATCH_FIRST, RED_SUSPECT_OUT, UNSTABLE_AFTER
-    global UNSTABLE_BATCHES, TELL_BOARDED
+    global UNSTABLE_BATCHES, TELL_BOARDED, AREAS, AREA_IGNORE
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
     global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR, LAYERS_OWN_GREEN
     global LEFT_TOP_COVERS
@@ -1509,6 +1517,7 @@ def configure(project):
     YIELD_IGNORES_CONFLICTS = merge.get("yield_ignores_conflicts",
                                         False) is True
     CODE_OWNERS = merge.get("code_owners", False) is True
+    AREAS, AREA_IGNORE = areas_of(project, merge.get("area_reviewers"))
     EARLY_CONFLICTS = merge.get("early_conflicts", False) is True
     RESOLVE_SLOTS = merge.get("resolve_slots", 0)
     RESOLVE_SLOT_MINUTES = merge.get("resolve_slot_minutes")
@@ -3618,7 +3627,8 @@ def merge_ready(repo, github, number, run=sh):
     list, empty when it is (agent-forge #274): open and not a draft,
     `checks.context` green (by its poster) and the CI workflow passed on
     the head, the default branch's tip in its history, no `Blocked-by:`
-    item open, and, with merge.code_owners, an owner's word."""
+    item open, with merge.code_owners an owner's word, and with
+    merge.area_reviewers each area's reviewer's."""
     prs = fetch_prs(github)
     pr = next((p for p in prs if p["number"] == number), None)
     if pr is None:
@@ -3654,6 +3664,9 @@ def merge_ready(repo, github, number, run=sh):
         held = rules and code_owner_wait(repo, pr, rules, main_ref, run)
         if held:
             why.append(held)
+    held = area_wait(repo, pr, AREAS, main_ref, run)
+    if held:
+        why.append(held)
     return why
 def code_owner_asks(state_dir, github, waits, open_heads, out):
     """merge.code_owner_ask (agent-forge #153): one issue for each pull
@@ -4435,6 +4448,9 @@ def ready_layer(repo, layer, below, open_numbers, numbers, when, said,
                                  "refs/remotes/origin/" + MAIN, run,
                                  regenerated):
         return None
+    if area_wait(repo, layer, AREAS, "refs/remotes/origin/" + MAIN, run,
+                 regenerated):
+        return None
     if green is not None and green(layer, approval):
         return None
     if gated is not None and gated(layer):
@@ -4915,14 +4931,7 @@ def code_owner_wait(repo, pr, rules, main_ref, run=sh, regenerated=None):
               run=run)
     if got.returncode != 0:
         return "waits for a code owner: its changed paths can't be listed"
-    latest = {}
-    for review in pr["reviews"]:
-        who = login(review).lower()
-        if review.get("state") in ("APPROVED", "CHANGES_REQUESTED",
-                                   "DISMISSED") and (
-                who not in latest or review["submittedAt"]
-                > latest[who]["submittedAt"]):
-            latest[who] = review
+    latest = newest_verdicts(pr)
     covered = {}
 
     def approved(owner):
@@ -4950,6 +4959,96 @@ def code_owner_wait(repo, pr, rules, main_ref, run=sh, regenerated=None):
     more = sum(len(p) for p in waiting.values()) - 1
     return "waits for code owner %s: %s%s" % (
         who, paths[0], " and %d more" % more if more else "")
+
+
+def areas_of(project, setting):
+    """merge.area_reviewers (designs/0058) as (areas, ignore globs):
+    (None, ()) unless it is `true` or an object. Reviewers with
+    identical `reviews` globs are one area, as the routing groups them;
+    an `away` reviewer's stand-in clears her area."""
+    if setting is not True and not isinstance(setting, dict):
+        return None, ()
+    areas = {}
+    for name in project.reviewers():
+        globs = tuple(project.agents[name].get("reviews") or ())
+        if globs:
+            areas.setdefault(globs, []).append(name)
+    found = []
+    for globs, names in areas.items():
+        counts = set(names) | {project.stand_in(n) for n in names}
+        found.append((tuple(names), globs, frozenset(counts)))
+    ignore = tuple(setting.get("ignore") or ()) \
+        if isinstance(setting, dict) else ()
+    return found, ignore
+
+
+def newest_verdicts(pr, key=lambda review: login(review).lower()):
+    """{key(review): review}: each reviewer's newest `APPROVED`,
+    `CHANGES_REQUESTED` or `DISMISSED` review of `pr`."""
+    latest = {}
+    for review in pr["reviews"]:
+        who = key(review)
+        if who and review.get("state") in ("APPROVED", "CHANGES_REQUESTED",
+                                           "DISMISSED") and (
+                who not in latest or review["submittedAt"]
+                > latest[who]["submittedAt"]):
+            latest[who] = review
+    return latest
+
+
+def area_wait(repo, pr, areas, main_ref, run=sh, regenerated=None,
+              ignore=None):
+    """merge.area_reviewers (designs/0058): why `pr` waits for an
+    area's reviewer, or None. Each path it changes since `main_ref`
+    that some reviewer's `reviews` globs match (and no `ignore` glob
+    does) needs, from each area that matches it, a reviewer other than
+    its author whose newest verdict is `APPROVED` at a commit that
+    covers the head. `areas` is `areas_of`'s list."""
+    if not areas:
+        return None
+    ignore = AREA_IGNORE if ignore is None else ignore
+    head = pr["headRefOid"]
+    have_head(repo, pr, run)
+    got = git(repo, "diff", "--name-only", "%s...%s" % (main_ref, head),
+              run=run)
+    if got.returncode != 0:
+        return ("waits for an area's reviewer: its changed paths can't "
+                "be listed")
+    names = {slug.lower(): name for slug, name in APPROVERS.items()}
+    latest = newest_verdicts(pr, lambda review: names.get(
+        login(review).lower()))
+    author = names.get(login(pr).lower())
+    covered = {}
+
+    def approved(name):
+        review = latest.get(name)
+        if name == author or not review \
+                or review.get("state") != "APPROVED":
+            return False
+        oid = (review.get("commit") or {}).get("oid")
+        if oid not in covered:
+            covered[oid] = bool(oid) and bool(covers_head(
+                repo, oid, head, main_ref, run,
+                regenerated=regenerated)[0])
+        return covered[oid]
+    waiting, paths = {}, set()
+    for path in got.stdout.split():
+        if any(fnmatch.fnmatchcase(path, g) for g in ignore):
+            continue
+        for i, (members, globs, counts) in enumerate(areas):
+            glob = next((g for g in globs
+                         if fnmatch.fnmatchcase(path, g)), None)
+            if glob is None or any(approved(n) for n in counts):
+                continue
+            waiting.setdefault(i, (members, glob, path))
+            paths.add(path)
+    if not waiting:
+        return None
+    members, glob, path = waiting[min(waiting)]
+    more = len(paths) - 1
+    return "waits for %s (%s): %s%s" % (
+        " or ".join(members), glob, path,
+        " and %d more" % more if more else "")
 
 
 def owned_lines(repo, pr, rules, main_ref, run=sh):
@@ -8461,6 +8560,12 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         if live and CODE_OWNER_ASK:
             code_owner_asks(state_dir, github, owner_waits,
                             {p["number"]: p["headRefOid"] for p in prs}, out)
+    if AREAS:
+        for pr in list(candidates):
+            why = area_wait(repo, pr, AREAS, main_tip, run, regenerated)
+            if why:
+                held[str(pr["number"])] = why
+                candidates.remove(pr)
     greens = load_greens(state_dir) if OWN_HEAD_GREEN else {}
     # merge.test_ahead.own_green_to_board false: held only for their own
     # green, they may still board a train when one is cut.
