@@ -1576,6 +1576,66 @@ class Tick(Decide):
         self.assertEqual([w[1] for w in self.github.writes],
                          [SLUG + "/pulls/6/merge"])
 
+    def test_an_update_github_refuses_but_git_merges_is_pushed(self):
+        # Issue 436: GitHub's update-branch refuses some merges git makes
+        # cleanly. The Merger makes that merge itself, pushes it with a
+        # lease on the head, and says so as for an update: no hand-back.
+        m.RESOLVE_IDENTITY = IDENTITY
+        self.addCleanup(setattr, m, "RESOLVE_IDENTITY", None)
+        run_git(self.repo.path, "push", "-q", "-f", "origin",
+                "%s:refs/heads/b5" % self.head)
+        self.advance_main("n.txt")
+        refuse = lambda method, path: (
+            '{"message":"merge conflict between base and head",'
+            '"status":"422"}' if path.endswith("/update-branch") else None)
+
+        def run(args, cwd=None, env=None):
+            if "push" in args:
+                args = [self.repo.origin if a.startswith("https://github.com/")
+                        else a for a in args]
+            return tools_run()(args, cwd, env)
+        record, lines = self.tick([self.item(), self.other_pr()], live=True,
+                                  refuse=refuse, run=run)
+        self.assertEqual([(d["pr"], d["action"], d["result"])
+                          for d in record["decisions"]],
+                         [(5, "UPDATE", "done")])
+        self.assertTrue(record["decisions"][0]["local"])
+        self.assertIn("merge conflict", record["decisions"][0]["refused"])
+        self.assertIn("UPDATE #5: GitHub refused update-branch as a "
+                      "conflict, and git merged main into it cleanly; pushed",
+                      lines)
+        pushed = run_git(self.repo.origin, "rev-parse", "refs/heads/b5")
+        self.assertEqual(run_git(self.repo.origin, "rev-list", "--parents",
+                                 "-n", "1", pushed).split()[1:],
+                         [self.head, self.repo.main_tip()])
+        self.assertEqual(run_git(self.repo.origin, "log", "-1",
+                                 "--format=%s%n%an", pushed),
+                         "Merge branch 'main' into b5\n" + IDENTITY[0])
+        comments = [w for w in self.github.writes if w[0] == "POST"]
+        self.assertEqual([c[1] for c in comments],
+                         [SLUG + "/issues/5/comments"])
+        self.assertIn("no review is needed again", comments[0][2]["body"])
+
+    def test_a_refused_update_whose_push_fails_is_handed_back(self):
+        # The lease fails (the branch isn't where the Merger judged it),
+        # so it is the old backstop: back to the author, once.
+        m.RESOLVE_IDENTITY = IDENTITY
+        self.addCleanup(setattr, m, "RESOLVE_IDENTITY", None)
+        self.advance_main("n.txt")
+        refuse = lambda method, path: (
+            "merge conflict" if path.endswith("/update-branch") else None)
+
+        def run(args, cwd=None, env=None):
+            if "push" in args:
+                return subprocess.CompletedProcess(args, 1, "", "stale info")
+            return tools_run()(args, cwd, env)
+        record, _ = self.tick([self.item()], live=True, refuse=refuse,
+                              run=run)
+        self.assertEqual([(d["pr"], d["action"]) for d in record["decisions"]],
+                         [(5, "UPDATE"), (5, "HAND-BACK")])
+        self.assertTrue(record["decisions"][0]["local"].startswith("refused"))
+        self.assertEqual(record["decisions"][1]["to"], "author")
+
     def test_a_new_approval_after_a_conflicted_update_tries_again(self):
         self.advance_main("n.txt")
         refuse = lambda method, path: (
