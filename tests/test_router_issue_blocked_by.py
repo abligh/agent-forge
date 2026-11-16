@@ -104,6 +104,22 @@ class FromComments(Case):
                      body="Blocked-by: #6\n")
         self.assertEqual(rules.issue_blocker_state(item), ({8}, T2))
 
+    def test_a_body_edited_after_a_comment_decides(self):
+        # agent-forge #442: the body was ranked oldest whatever its edit
+        # time, so a stale comment's closed blocker left the issue free.
+        item = issue([note(LEADDEV, T1, "Blocked-by: #7")],
+                     body="Blocked-by: #8\nBlocked-by: #9\n",
+                     blocked_by={7: closed(T2), 8: OPEN, 9: OPEN})
+        item["lastEditedAt"] = T3
+        self.assertEqual(rules.issue_blocker_state(item), ({8, 9}, ""))
+        self.assertTrue(rules.blocked(item))
+
+    def test_a_comment_after_the_body_edit_still_decides(self):
+        item = issue([note(LEADDEV, T3, "Blocked-by: #7")],
+                     body="Blocked-by: #8\n", blocked_by={7: OPEN, 8: OPEN})
+        item["lastEditedAt"] = T2
+        self.assertEqual(rules.issue_blocker_state(item), ({7}, T3))
+
     def test_a_comment_without_a_line_changes_nothing(self):
         item = issue([note(LEADDEV, T1, "Blocked-by: #7", id=1),
                       note(OWNER, T2, "Any news?", id=2)])
