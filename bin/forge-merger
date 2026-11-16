@@ -1857,6 +1857,13 @@ def labelled_urgent(pr):
         ((pr.get("labels") or {}).get("nodes") or [])]
 
 
+def keep_labelled(pr):
+    """Whether `pr` carries `labels.keep_trains`."""
+    return bool(KEEP_LABEL) and KEEP_LABEL in [
+        (n or {}).get("name") for n in
+        ((pr.get("labels") or {}).get("nodes") or [])]
+
+
 def cuts_trains(pr):
     """Whether `pr` may cut trains already cut: a red nightly's or
     default branch's fix. One labelled urgent may not: it heads the next
@@ -5488,17 +5495,25 @@ def carried_base(repo, state_dir, last, main_tip, github, run=sh,
         # were predicted on its chain, which is their base now.
         second = git(repo, "rev-parse", "-q", "--verify", sha + "^2",
                      run=run)
-        chain = cache.get("train:" + second.stdout.strip()) \
-            if second.returncode == 0 else None
+        second = second.stdout.strip() if second.returncode == 0 else ""
+        chain = cache.get("train:" + second) if second else None
         if isinstance(chain, str):
             at = next((k for k, e in enumerate(entries)
                        if e.get("sha") == chain), None)
-            if at is None or at + 1 >= len(entries):
+            if at is not None and at + 1 < len(entries):
+                base = chain
+                continue
+            if at is not None:
                 by.append(None)
                 break
-            base = chain
-            continue
-        by.append(kept_by_label(sha, github, cache))
+        # A train outside the kept ones, an urgent one's cut in front
+        # of a red train's search, whose members all carry the label:
+        # its own pull request doesn't, so it was said here when it
+        # merged. Before, it cut every train again, and the search
+        # was lost (agent-forge #452).
+        kept = cache.get("kept:" + second) if second else None
+        by.append(kept if isinstance(kept, int) and kept
+                  else kept_by_label(sha, github, cache))
     if cache != before:
         # The newest few hundred answers are plenty.
         save_json(path, dict(list(cache.items())[-300:]))
@@ -6819,17 +6834,28 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
     top = train_commits(repo, main_tip, entries, prs, run)
     if top is None:
         return fail("git could not make the train's commits")
-    if main and main != main_tip:
+    onto = bool(main and main != main_tip)
+    if onto:
         top = train_onto(repo, top, main, run)
         if top is None:
             return fail("its chain doesn't merge cleanly with %s at %s"
                         % (MAIN, main[:10]))
-        # Its merge moves the default branch off the chain the trains
-        # behind it were predicted on: `carried_base` keeps them on it.
+    kept = KEEP_LABEL and all(keep_labelled(prs.get(n) or {})
+                              for n in numbers)
+    if onto or kept:
         path = os.path.join(state_dir, KEEP_FILE)
         cache = load_json(path, {})
         cache = cache if isinstance(cache, dict) else {}
-        cache["train:" + top] = entries[-1]["sha"]
+        if onto:
+            # Its merge moves the default branch off the chain the trains
+            # behind it were predicted on: `carried_base` keeps them on
+            # it.
+            cache["train:" + top] = entries[-1]["sha"]
+        if kept:
+            # Every member carries labels.keep_trains, and the train's
+            # own pull request doesn't: `carried_base` reads it here
+            # (agent-forge #452).
+            cache["kept:" + top] = numbers[0]
         save_json(path, dict(list(cache.items())[-300:]))
     branch = "%s%d-%d" % (TRAIN_BRANCH, numbers[0], numbers[-1])
     pushed = run(["git", "-C", repo, "push", "-q", "-f",
@@ -7064,30 +7090,27 @@ def suspects_left(saved, queue, record, approvals, said, moved=None):
 
 def with_suspects(queue, saved, prs):
     """`queue` with the suspects of the search `saved` that are open
-    (`prs`) but not in it, a stack's layers held as stacked, each
-    where the search has it: all of them at the first suspect's place,
-    in the search's order. A red train's layers are members of it
-    (`layers_need_own_green` false), and its suspects; missing from the
-    queue, they left the search the tick after it started, which then
-    tested the prefixes of a set the train never was, and found its
-    whole red tree no longer among them (2026-11-12: "red from none")."""
+    (`prs`) first, in the search's order, a stack's layers held as
+    stacked among them, and the rest of `queue` behind them. A red
+    train's layers are members of it (`layers_need_own_green` false),
+    and its suspects; missing from the queue, they left the search the
+    tick after it started, which then tested the prefixes of a set the
+    train never was, and found its whole red tree no longer among them
+    (2026-11-12: "red from none"). Nothing goes in front of them: the
+    pull request the Merger waits on keeps its place in the queue, but
+    one that isn't a suspect, predicted first, left no suspect at the
+    front, and the search ended unsaid; the next tick found the trains'
+    red top again and started it afresh, and the batch changed every
+    tick (agent-forge #452)."""
     if not saved or not queue:
         return queue
     by_number = {pr["number"]: pr for pr in prs}
     order = [by_number[e["pr"]] for e in saved.get("suspects") or ()
              if e["pr"] in by_number]
     numbers = {pr["number"] for pr in order}
-    if not numbers - {pr["number"] for pr in queue}:
+    if not numbers:
         return queue
-    out, placed = [], False
-    for pr in queue:
-        if pr["number"] in numbers:
-            if not placed:
-                out += order
-                placed = True
-            continue
-        out.append(pr)
-    return out if placed else order + out
+    return order + [pr for pr in queue if pr["number"] not in numbers]
 
 
 def suspect_wait(saved, pr, last, check_state, main_tip=None):
@@ -7159,6 +7182,11 @@ def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
         if n:
             out("SUSPECTS #%d..#%d: #%d is red on its own; the search ends"
                 % (entries[0]["pr"], entries[n - 1]["pr"], entries[0]["pr"]))
+        elif saved["suspects"]:
+            out("SUSPECTS #%d..#%d: none is predicted first (#%s is); the "
+                "search ends" % (saved["suspects"][0]["pr"],
+                                 saved["suspects"][-1]["pr"],
+                                 entries[0]["pr"] if entries else "none"))
         if os.path.exists(path):
             os.remove(path)
         return False
