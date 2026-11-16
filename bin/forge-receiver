@@ -14,8 +14,10 @@ latency, not merges or wakes, because cron's runs still happen.
 Its settings are the `receiver` section of the project's configuration,
 read from the cron checkout (`$FORGE_CRON_CHECKOUT`, or `--checkout`)
 at start. docs/config.md lists the keys. **It restarts itself:** every
-WATCH_S it looks at the configuration and at its own file (followed
-through links, so a forge-install of a new release counts), and when
+WATCH_S it looks at the configuration, at its own file and at every
+module of this installation it has loaded (each followed through
+links, so a forge-install of a new release counts, whether it moves a
+link or updates a checkout in place), and when
 either has changed it logs `RESTART:`, lets a run in progress finish,
 and exits 0. The service manager starts the new one, so the unit needs
 `Restart=always` (examples/forge-receiver.service has it). Keys still
@@ -587,6 +589,25 @@ class Watch:
         return None
 
 
+def own_files(me=None, modules=None):
+    """The files this receiver's code came from: its own file, then each
+    loaded module's from this installation (its directory's parent),
+    sorted. A forge-install that updates a checkout in place rewrites
+    only the files that differ, so a release that changes only
+    agent_forge/ left a receiver watching its own file alone on the old
+    code (agent-forge #464)."""
+    me = os.path.abspath(me or __file__)
+    root = os.path.dirname(os.path.dirname(os.path.realpath(me))) + os.sep
+    found = set()
+    for module in list((sys.modules if modules is None else modules)
+                       .values()):
+        path = getattr(module, "__file__", None)
+        if path and os.path.realpath(path).startswith(root):
+            found.add(os.path.abspath(path))
+    found.discard(me)
+    return [me] + sorted(found)
+
+
 def watch_loop(watch, stop, out, on_change, interval=WATCH_S):
     """Until `stop`, look every `interval` s; on a change, say so, call
     `on_change` once and return."""
@@ -704,8 +725,8 @@ def main(argv=None, out=None, environ=None, run=proc.sh):
     debouncer = Debouncer()
     seen = Seen(path=os.path.join(
         locks.state_dir(project.name, "receiver", environ), SEEN_FILE))
-    watch = Watch([os.path.abspath(__file__),
-                   os.path.join(checkout, config.CONFIG_NAME)])
+    watch = Watch(own_files() + [os.path.join(checkout,
+                                              config.CONFIG_NAME)])
     try:
         server = make_server(port, secret, out, debouncer, seen)
     except OSError as err:

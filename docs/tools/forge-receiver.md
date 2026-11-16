@@ -150,10 +150,13 @@ the Merger still does one update or merge per tick, and the router's
 lock and state stop it waking a turn twice.
 
 **Restarting itself.** Every 5 seconds it looks at the configuration
-file and at its own file, followed through links, so a `forge-install`
-of a new release counts. When either has changed, it logs `RESTART:`,
-lets a run in progress finish, and exits 0. Items still waiting out
-their 20 seconds are left to cron.
+file, at its own file and at each module of its installation it has
+loaded (`agent_forge/`), each followed through links. So a
+`forge-install` of a new release counts, whether it moves a link to a
+new version or updates a checkout in place, where only the files that
+differ are rewritten. When any has changed, it logs `RESTART:`, lets a
+run in progress finish, and exits 0. Items still waiting out their 20
+seconds are left to cron.
 
 **Lines worth knowing**, on standard output (the journal):
 
