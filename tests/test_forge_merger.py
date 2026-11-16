@@ -4460,6 +4460,74 @@ class TickAhead(RepoCase):
     def shas(self):
         return [e["sha"] for e in self.ahead_json()["entries"]]
 
+    def moved(self, item):
+        """`item` at a new head of its own, approved."""
+        self.repo.branch("moved", item["headRefOid"])
+        sha = self.repo.commit("moved.txt", "moved\n", "moved")
+        self.repo.publish_pr(item["number"], sha)
+        self.repo.branch("feature", "feature")
+        return pr(item["number"], item["createdAt"], head=sha,
+                  reviews=[review(REVIEWER, oid=sha)])
+
+    def test_a_suspects_new_head_ends_the_search(self):
+        # agent-forge #447: the first suspect's new head kept it in the
+        # search, the second's prediction kept its old head, its tree
+        # was green already, and nothing ran or merged for 13 minutes.
+        red = self.searching()
+        prs = [self.moved(self.prs[0]), self.prs[1]]
+        _, lines = self.tick(prs, conclusions=(None,), live=True,
+                             minutes=3, check_state=red)
+        self.assertTrue(any(l.startswith("SEARCH-ENDED #5: new head")
+                            for l in lines), lines)
+        self.assertFalse(os.path.exists(os.path.join(self.state,
+                                                     m.SUSPECTS_FILE)))
+        ahead = self.ahead_json()
+        self.assertNotEqual((ahead.get("batch") or {}).get("suspects"), True)
+        # Predicted again this tick, from the heads there are.
+        heads = {p["number"]: p["headRefOid"] for p in prs}
+        self.assertTrue(ahead["entries"])
+        for e in ahead["entries"]:
+            self.assertEqual(e["head"], heads[e["pr"]])
+
+    def test_a_green_batch_with_a_moved_member_is_forgotten(self):
+        # Defensively: a batch whose member moved can't merge, and its
+        # green top left forge-pr-check nothing to run (agent-forge #447).
+        m.configure(project(test_ahead={"batch": 2, "batches": 2,
+                                        "trains": "live",
+                                        "train_merge": True}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        green = {"results": {top["sha"]: {"tree": top["tree"], "ok": True}}}
+        prs = [prs[0], self.moved(prs[1])]
+        _, lines = self.tick(prs, conclusions=(None,), live=True,
+                             minutes=1, check_state=green)
+        self.assertTrue(any(l.startswith("BATCH-STALE #5..#6: #6 moved")
+                            for l in lines), lines)
+        ahead = self.ahead_json()
+        self.assertEqual(ahead["entries"][1]["head"], prs[1]["headRefOid"])
+        self.assertNotEqual(ahead["entries"][1]["tree"], top["tree"])
+
+    def test_suspect_moved_and_stale_members(self):
+        saved = {"suspects": [{"pr": 5, "head": "a" * 40},
+                              {"pr": 6, "head": "b" * 40}]}
+        same = [pr(5, head="a" * 40), pr(6, head="b" * 40)]
+        self.assertIsNone(m.suspect_moved(saved, same))
+        # A closed one has left the search; that is suspects_left's.
+        self.assertIsNone(m.suspect_moved(saved, same[:1]))
+        self.assertEqual(m.suspect_moved(saved, [same[0],
+                                                 pr(6, head="c" * 40)]),
+                         (6, "c" * 40))
+        last = {"entries": [{"pr": 5, "head": "a" * 40},
+                            {"pr": 6, "head": "b" * 40},
+                            {"pr": 7, "head": "d" * 40}],
+                "batch": {"size": 2}}
+        self.assertEqual(m.stale_members(last, same), [])
+        self.assertEqual(m.stale_members(last, [pr(5, head="e" * 40),
+                                                pr(7, head="f" * 40)]),
+                         [5])
+        self.assertEqual(m.stale_members({}, same), [])
+
     def test_a_labelled_merge_keeps_a_red_trains_search(self):
         # agent-forge #444: a labelled pin merged mid-search re-predicted
         # the suspects on the new tip, and the search's run in flight
@@ -4727,12 +4795,15 @@ class TickAhead(RepoCase):
                               check_state=red)
         self.assertEqual(record["ahead"][:2], [5, 6])
         self.assertEqual(record["batch"], [5])
-        # #6 is pushed to: it leaves, and the search has #5 alone.
+        # #6 is pushed to: the search's trees held its old head, so the
+        # search ends and the batches are predicted again (agent-forge
+        # #447; before, #6 left and the search had #5 alone).
         six = dict(other, headRefOid=self.head)
-        self.tick([self.item(), six], conclusions=(None,), live=True,
-                  minutes=2, check_state=red)
-        self.assertEqual([e["pr"] for e in m.load_suspects(
-            self.state)["suspects"]], [5])
+        _, lines = self.tick([self.item(), six], conclusions=(None,),
+                             live=True, minutes=2, check_state=red)
+        self.assertIsNone(m.load_suspects(self.state))
+        self.assertTrue(any(l.startswith("SEARCH-ENDED #6: new head")
+                            for l in lines), lines)
 
     def red_alone(self, rerun_label=None):
         """#5 and #6 a batch whose top is red, then #5 red on its own:
