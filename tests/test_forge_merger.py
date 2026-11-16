@@ -7690,6 +7690,185 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ResolvedHunks(unittest.TestCase):
+    """designs/0056 item 3: a resolution's own lines are only where git
+    left conflict markers."""
+
+    MERGED = ("a\n<<<<<<< ours\nmine\n||||||| base\nold\n=======\n"
+              "theirs\n>>>>>>> theirs\nc\nd\n")
+
+    def test_lines_in_place_of_the_conflict(self):
+        self.assertEqual(m.resolved_hunks(self.MERGED,
+                                          "a\nboth\nlines\nc\nd\n"),
+                         [(2, 2)])
+
+    def test_the_conflict_dropped(self):
+        self.assertEqual(m.resolved_hunks(self.MERGED, "a\nc\nd\n"),
+                         [(2, 0)])
+
+    def test_a_line_changed_outside(self):
+        self.assertIsNone(m.resolved_hunks(self.MERGED,
+                                           "a\nboth\nc\nD\n"))
+        self.assertIsNone(m.resolved_hunks(self.MERGED,
+                                           "a\nboth\nxc\nd\n"))
+
+    def test_two_conflicts(self):
+        merged = ("<<<<<<< a\n1\n=======\n2\n>>>>>>> b\nkeep\n"
+                  "<<<<<<< a\n3\n=======\n4\n>>>>>>> b\n")
+        self.assertEqual(m.resolved_hunks(merged, "12\nkeep\n34\n"),
+                         [(1, 1), (3, 1)])
+        self.assertIsNone(m.resolved_hunks(merged, "12\n34\n"))
+
+    def test_markers_committed_as_they_are(self):
+        self.assertIsNone(m.resolved_hunks(
+            self.MERGED, "a\n<<<<<<< HEAD\nmine\n=======\ntheirs\n"
+            ">>>>>>> main\nc\nd\n"))
+
+    def test_no_conflict_or_an_unclosed_one(self):
+        self.assertIsNone(m.resolved_hunks("a\nb\n", "a\nb\n"))
+        self.assertIsNone(m.conflict_chunks("a\n<<<<<<< x\nb\n"))
+
+
+class ResolutionHunks(RepoCase):
+    """designs/0056 item 3: `resolution_hunks` against real merges."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.branch("feature", "feature")
+        self.approved = self.repo.commit("s.txt", "1\nfeature\n3\n4\n",
+                                         "feature's line")
+        self.advance_main("s.txt", "1\nmain\n3\n4\n")
+
+    def resolve(self, text, extra=None):
+        run = subprocess.run(["git", "-C", self.repo.path, "merge", "-q",
+                              "--no-edit", "origin/main"], env=git_env(),
+                             capture_output=True, text=True)
+        self.assertNotEqual(run.returncode, 0)
+        files = dict(extra or {}, **{"s.txt": text})
+        for name, body in files.items():
+            with open(os.path.join(self.repo.path, name), "w") as handle:
+                handle.write(body)
+            run_git(self.repo.path, "add", name)
+        run_git(self.repo.path, "commit", "-q", "--no-edit")
+        return run_git(self.repo.path, "rev-parse", "HEAD")
+
+    def hunks(self, head):
+        return m.resolution_hunks(self.repo.path, self.approved, head,
+                                  "refs/remotes/origin/main")
+
+    def test_a_resolution_inside_its_hunk(self):
+        head = self.resolve("1\nfeature and main\n3\n4\n")
+        hunks, why = self.hunks(head)
+        self.assertIsNone(why)
+        self.assertEqual(hunks, [{"commit": head, "path": "s.txt",
+                                  "first": 2, "count": 1}])
+        self.assertIn("`s.txt`: line 2, as of %s" % head[:10],
+                      m.hunks_text(hunks))
+        # Its approval doesn't cover it: only a review does.
+        self.assertFalse(self.covers(head)[0])
+
+    def test_a_line_changed_outside_the_hunk(self):
+        hunks, why = self.hunks(self.resolve("1\nboth\n3\nfour\n"))
+        self.assertIsNone(hunks)
+        self.assertIn("outside its conflicted hunks", why)
+
+    def test_another_file_changed(self):
+        hunks, why = self.hunks(self.resolve("1\nboth\n3\n4\n",
+                                             {"f.txt": "slipped in\n"}))
+        self.assertIsNone(hunks)
+        self.assertIn("changes f.txt, which merged without a conflict", why)
+
+    def test_conflict_markers_left(self):
+        run = subprocess.run(["git", "-C", self.repo.path, "merge", "-q",
+                              "--no-edit", "origin/main"], env=git_env(),
+                             capture_output=True, text=True)
+        self.assertNotEqual(run.returncode, 0)
+        run_git(self.repo.path, "-c", "core.hooksPath=/dev/null", "commit",
+                "-q", "-a", "--no-edit")
+        hunks, why = self.hunks(run_git(self.repo.path, "rev-parse", "HEAD"))
+        self.assertIsNone(hunks)
+        self.assertIn("outside its conflicted hunks", why)
+
+    def test_a_commit_after_the_resolution(self):
+        self.resolve("1\nboth\n3\n4\n")
+        hunks, why = self.hunks(self.repo.commit("f.txt", "more\n", "more"))
+        self.assertIsNone(hunks)
+        self.assertIn("is not a merge", why)
+
+    def test_found_once_and_asked_once_per_head(self):
+        head = self.resolve("1\nfeature and main\n3\n4\n")
+        self.repo.publish_pr(7, head)
+        item = pr(7, head=head, reviews=[review(REVIEWER,
+                                                oid=self.approved)])
+        approvals = {7: item["reviews"][0]}
+        with tempfile.TemporaryDirectory() as state:
+            found = m.find_unreviewed(state, self.repo.path, [item],
+                                      approvals, self.repo.main_tip())
+            self.assertEqual(sorted(found), [7])
+            self.assertEqual(found[7]["hunks"][0]["first"], 2)
+            github, lines = FakeGitHub({}), []
+            for name, value in (("REPO_SLUG", "example/widget"),
+                                ("BOARD_UNREVIEWED", True)):
+                patch = mock.patch.object(m, name, value)
+                patch.start()
+                self.addCleanup(patch.stop)
+            said = m.ask_resolution_reviews(state, github, found, approvals,
+                                            True, lines.append)
+            self.assertEqual(said, [{"pr": 7, "head": head, "hunks": 1,
+                                     "result": "done"}])
+            body = github.writes[0][2]["body"]
+            self.assertTrue(body.startswith("Not-a-review\n\n"
+                                            "RESOLUTION-REVIEW #7: "))
+            self.assertIn("`s.txt`: line 2", body)
+            self.assertIn("RESOLUTION-REVIEW #7", lines[0])
+            # Found again next tick from what was kept: not asked again.
+            found = m.find_unreviewed(state, self.repo.path, [item],
+                                      approvals, self.repo.main_tip())
+            self.assertEqual(m.ask_resolution_reviews(
+                state, github, found, approvals, True, lines.append), [])
+            self.assertEqual(len(github.writes), 1)
+            # An approval of the head: nothing to find.
+            approvals = {7: review(REVIEWER, oid=head)}
+            self.assertEqual(m.find_unreviewed(
+                state, self.repo.path, [item], approvals,
+                self.repo.main_tip()), {})
+
+    def test_decide_skips_it_and_checked_ahead_lets_it_board(self):
+        head = self.resolve("1\nfeature and main\n3\n4\n")
+        self.repo.publish_pr(7, head)
+        item = pr(7, head=head, reviews=[review(REVIEWER,
+                                                oid=self.approved)])
+        approval = item["reviews"][0]
+        for name, value in (("BOARD_UNREVIEWED", True), ("GATE", ()),
+                            ("UNREVIEWED", {7: {"head": head}})):
+            patch = mock.patch.object(m, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        got = m.decide(item, approval, self.repo.path, self.repo.main_tip(),
+                       FakeGitHub({}), {})
+        self.assertEqual(got["action"], "SKIP")
+        self.assertTrue(got["unreviewed"])
+        self.assertIsNone(m.boarding_wait(self.repo.path, item, approval,
+                                          self.repo.main_tip()))
+        with tempfile.TemporaryDirectory() as state:
+            self.assertIsNone(m.checked_ahead(
+                state, self.repo.path, item, approval,
+                self.repo.main_tip(), {}))
+        # Off, it goes back to its reviewer as before.
+        m.BOARD_UNREVIEWED = False
+        got = m.decide(item, approval, self.repo.path, self.repo.main_tip(),
+                       FakeGitHub({}), {})
+        self.assertEqual(got["action"], "HAND-BACK")
+        self.assertNotEqual(got["to"], "author")
+        self.assertIsNotNone(m.boarding_wait(self.repo.path, item, approval,
+                                             self.repo.main_tip()))
+
+    def test_nothing_after_the_approval(self):
+        hunks, why = self.hunks(self.approved)
+        self.assertIsNone(hunks)
+        self.assertIn("nothing after the approval resolves", why)
+
+
 class StackCoversHead(RepoCase):
     """designs/0025: a clean merge of a merged lower layer's head covers
     the head of the layer above it; a hand-resolved one doesn't."""
@@ -10364,6 +10543,61 @@ class Trains(RepoCase):
         self.assertEqual(m.git(self.repo.path, "rev-parse",
                                entries[3]["sha"] + "^").stdout.strip(),
                          entries[2]["sha"])
+
+    def test_an_unreviewed_resolution_boards_last_behind_others(self):
+        # designs/0056 item 3: it goes behind the others in its train,
+        # closing it, and never heads a train.
+        six = self.change(6, "x.txt", "x\n")
+        seven = self.change(7, "y.txt", "y\n")
+        eight = self.change(8, "z.txt", "z\n")
+        heads = {p["number"]: p["headRefOid"]
+                 for p in (self.item(), six, seven, eight)}
+
+        def cut(carriages, last=None):
+            return m.cut_trains(self.repo.path, self.repo.main_tip(),
+                                carriages, last, heads, set(heads),
+                                unreviewed=frozenset({6}))
+        entries, sizes, _ = cut([[six], [self.item()], [seven]])
+        self.assertEqual(self.numbers(entries, sizes), [[5, 7, 6]])
+        # A full train has no room for it, and it heads none.
+        entries, sizes, _ = cut([[six], [self.item()], [seven], [eight]])
+        self.assertEqual(self.numbers(entries, sizes), [[5, 7, 8]])
+        # Alone, it boards no train.
+        note = {}
+        entries, sizes, _ = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), [[six]], None, heads,
+            set(heads), unreviewed=frozenset({6}), note=note)
+        self.assertEqual(entries, [])
+        self.assertIn("boards only behind others", note["waits"]["6"])
+
+    def test_an_unreviewed_resolution_leaves_the_head_of_the_first(self):
+        six = self.change(6, "x.txt", "x\n")
+        heads = {5: self.item()["headRefOid"], 6: six["headRefOid"]}
+        entries, sizes, _ = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), [[self.item()], [six]],
+            None, heads, set(heads), unreviewed=frozenset({6}))
+        self.assertEqual(self.numbers(entries, sizes), [[5, 6]])
+        # #5 merged: #6 would head the first train.
+        entries, sizes, events = m.cut_trains(
+            self.repo.path, self.repo.main_tip(), [[six]],
+            self.said(entries, sizes), {6: six["headRefOid"]}, {6},
+            unreviewed=frozenset({6}))
+        self.assertEqual(entries, [])
+        self.assertIn(("left", "LEFT #6: its resolution waits for its "
+                       "review, and it would head the first train"), events)
+
+    def test_under_review_cuts_a_ready_train_at_the_resolution(self):
+        entries = [{"pr": 5, "head": "a"}, {"pr": 6, "head": "b"}]
+        for name, value in (("BOARD_UNREVIEWED", True),
+                            ("UNREVIEWED", {6: {"head": "b"}})):
+            patch = mock.patch.object(m, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.assertEqual(m.under_review(entries), entries[:1])
+        # Approved since at another head: not this one.
+        m.UNREVIEWED[6] = {"head": "c"}
+        self.assertEqual(m.under_review(entries), entries)
+        self.assertIsNone(m.under_review(None))
 
     def test_urgent_ones_share_a_train_when_they_merge_cleanly(self):
         # agent-forge #298: two urgent configuration changes to one file

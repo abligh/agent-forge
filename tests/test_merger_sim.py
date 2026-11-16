@@ -346,6 +346,80 @@ class Window(unittest.TestCase):
         self.assertFalse(any("TRAIN-WINDOW" in l for l in got.lines))
 
 
+class BoardUnreviewed(unittest.TestCase):
+    """designs/0056, item 3: with merge.resolve.board_unreviewed, an
+    author's resolution of a conflict with main that changes nothing
+    outside its conflicted hunks boards a train, as its last member,
+    while its reviewer is asked to read the hunks; the members ahead of
+    it merge on the top's green, and it merges only after its new
+    approval. One that changes a line outside the hunks doesn't board
+    until it is approved."""
+
+    def run_scenario(self, outside=False, board=True):
+        m = ms.load_merger()
+        merge = {"own_head_green": False}
+        if board:
+            merge["resolve"] = {"board_unreviewed": True}
+        m.configure(ms.project(merge, batch=4, batches=1,
+                               train_merge=True))
+        shared = ("s.txt",)
+        # #1 and #2 write the same line of s.txt: once #1 merges, #2
+        # conflicts with main and goes back to its author, who resolves
+        # it at minute 60, as #3 and #4 are opened. Its reviewer
+        # approves the resolution at minute 150.
+        scenario = [
+            (0, "open", (1, None, False, False, False, True, None, False,
+                         shared)),
+            (0, "open", (2, None, False, False, False, True, None, False,
+                         shared)),
+            (60, "resolve_by_hand", (2, outside)),
+            (60, "open", (3,)), (60, "open", (4,)),
+            (150, "review", (2,))]
+        with tempfile.TemporaryDirectory() as root:
+            sim = ms.Sim(m, root, scenario, own_minutes=40, later_first=1,
+                         stop_spent=True)
+            got = sim.run(320, whole=True)
+            merges = {x["pr"]: x["at"][11:16] for x in sim.world.merges}
+            order = [x["pr"] for x in sim.world.merges]
+        return got, merges, order
+
+    def test_it_boards_last_and_merges_after_its_approval(self):
+        got, merges, order = self.run_scenario()
+        text = "\n".join(got.lines)
+        self.assertEqual(got.broken, [], figures(got) + "\n" + text)
+        self.assertTrue(any("RESOLUTION-REVIEW #2" in l
+                            for l in got.lines), text)
+        self.assertTrue(any("TRAIN-CUT 1: #3 #4 #2" in l
+                            for l in got.lines), text)
+        self.assertTrue(any("TRAIN-UNDER-REVIEW #3..#2" in l
+                            for l in got.lines), text)
+        self.assertEqual(sorted(merges), [1, 2, 3, 4], text)
+        self.assertLess(order.index(3), order.index(2), text)
+        self.assertLess(order.index(4), order.index(2), text)
+        self.assertGreaterEqual(merges[2], "10:30", text)
+        # #3 and #4 merged on the top's green, before the approval.
+        self.assertLess(merges[4], "10:30", text)
+
+    def test_a_change_outside_the_hunks_does_not_board(self):
+        got, merges, order = self.run_scenario(outside=True)
+        text = "\n".join(got.lines)
+        self.assertEqual(got.broken, [], figures(got) + "\n" + text)
+        self.assertFalse(any("RESOLUTION-REVIEW" in l for l in got.lines),
+                         text)
+        self.assertFalse(any("TRAIN-CUT" in l and "#2" in l
+                             and l < "10:30" for l in got.lines), text)
+        self.assertGreaterEqual(merges[2], "10:30", text)
+
+    def test_without_it_the_resolution_waits_for_its_review(self):
+        got, merges, order = self.run_scenario(board=False)
+        text = "\n".join(got.lines)
+        self.assertEqual(got.broken, [], figures(got) + "\n" + text)
+        self.assertFalse(any("RESOLUTION-REVIEW" in l
+                             or "TRAIN-UNDER-REVIEW" in l
+                             for l in got.lines), text)
+        self.assertGreaterEqual(merges[2], "10:30", text)
+
+
 class Rules(unittest.TestCase):
     """The monitor itself: a break it should see, it sees."""
 

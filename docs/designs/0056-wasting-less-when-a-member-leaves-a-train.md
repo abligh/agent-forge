@@ -1,6 +1,6 @@
 # 0056: Wasting less when a member leaves a train
 
-* Status: approved (Alex Bligh, 2026-11-16, on #416: "approved"), as proposed: `merge.test_ahead.window` is built (step 2); the document-only `keep_approval_paths` is not, unless he asks
+* Status: approved (Alex Bligh, 2026-11-16, on #416: "approved"), as proposed: `merge.test_ahead.window` is built (step 2), and `merge.resolve.board_unreviewed` with its `RESOLUTION-REVIEW` ask (step 3); the document-only `keep_approval_paths` is not, unless he asks
 * Author: XMPPEngineer
 * Date: 2026-11-14
 * Issue: #393 (research: FleetResearcher)

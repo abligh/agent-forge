@@ -351,6 +351,7 @@ class World:
             "body": "", "commit": {"oid": pr["head"]},
             "comments": {"totalCount": 0}})
         pr["approved"] = pr["version"]
+        pr.pop("by_hand", None)
         self.note("approve", pr=number)
 
     def open(self, number, base=None, mac=False, red=False, urgent=False,
@@ -454,7 +455,14 @@ class World:
     def minute(self):
         return int((self.now - START).total_seconds() // 60)
 
-    def resolve(self, number, head=None):
+    def resolve_by_hand(self, number, outside=False):
+        """The author of #`number` resolves its conflict with main by
+        hand now, keeping their own lines (`resolve`). With `outside`,
+        the merge also changes a line of a file that merged without a
+        conflict: more than a resolution."""
+        self.resolve(number, self.prs[number]["head"], outside)
+
+    def resolve(self, number, head=None, outside=False):
         """The author resolves #`number`'s conflict with main. With
         `head` (an author answering a hand-back), by hand, keeping their
         own lines: a merge of main whose tree is main's with the
@@ -468,8 +476,13 @@ class World:
         main = self.main()
         pr["version"] += 1
         if head is not None:
+            if outside:
+                pr["files"]["p%d.txt" % number] = "outside\n"
             tree = self.write_tree(self.tree(main), pr["files"])
             message = "Merge main, resolving by hand"
+            # Its lines are the author's own: none merges until a
+            # reviewer approves them (Monitor rule 6).
+            pr["by_hand"] = True
         else:
             got = subprocess.run(
                 ["git", "-C", self.origin, "merge-tree", "--write-tree",
@@ -1197,7 +1210,11 @@ class Monitor:
        merges while one before it in the train is still unmerged (on
        2026-11-11 a member merged on its own green ahead of an urgent
        one cut in front of it, and the green train's prediction no
-       longer held)."""
+       longer held).
+    6. No pull request merges on its author's resolution of a conflict
+       (`resolve` by hand) that no reviewer has approved. With
+       merge.resolve.board_unreviewed (designs/0056 item 3) such a
+       resolution may board a train (rule 3), but not merge."""
 
     def __init__(self, sim):
         self.sim = sim
@@ -1264,7 +1281,9 @@ class Monitor:
                     # is predicted for this one.
                     continue
                 self.boarded.add((e["pr"], pr["head"]))
-                if pr["approved"] != pr["version"]:
+                if pr["approved"] != pr["version"] and not (
+                        pr.get("by_hand") and getattr(
+                            self.sim.m, "BOARD_UNREVIEWED", False)):
                     self.say(3, "#%d boarded without an approval of its "
                              "latest change" % e["pr"])
                 if w.needs_gate(e["pr"]) \
@@ -1323,6 +1342,12 @@ class Monitor:
                 if red or any(self.touched(n, train["since"])
                               for n, _ in train["members"][:at + 1]):
                     break
+                if (w.prs.get(number) or {}).get("by_hand") and getattr(
+                        self.sim.m, "BOARD_UNREVIEWED", False):
+                    # designs/0056 item 3: an unreviewed resolution, last
+                    # in its train, waits for its review once the
+                    # members ahead of it have merged.
+                    break
                 minute = iso(w.now)[11:16]
                 if any(l.startswith(minute + " SUSPECT-RED")
                        for l in self.sim.lines):
@@ -1353,6 +1378,9 @@ class Monitor:
                 train["done"] = True
         # Rules 2 and 4: what the default branch took.
         for m in w.merges[self.seen_merges:]:
+            if (w.prs.get(m["pr"]) or {}).get("by_hand"):
+                self.say(6, "#%d merged a resolution nobody approved"
+                         % m["pr"])
             if not check.verdict(m["tree"]):
                 self.say(4, "#%d merged a red tree" % m["pr"])
             if not (check.green(m["tree"]) or self.prefix_green(m["tree"])):

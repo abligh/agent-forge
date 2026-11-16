@@ -946,6 +946,28 @@ class Check(unittest.TestCase):
         data["merge"] = {"area_reviewers": False}
         self.assertEqual(config.check(data), [])
 
+    def test_merge_resolve_board_unreviewed(self):
+        # designs/0056 item 3: only with live trains merged as one.
+        data = example()
+        data.setdefault("merge", {})["test_ahead"] = {
+            "depth": 7, "batch": 4, "batches": 2, "trains": "live",
+            "train_merge": True}
+        data["merge"]["resolve"] = {"board_unreviewed": True}
+        self.assertEqual(config.check(data), [])
+        data["merge"]["resolve"] = {"board_unreviewed": False}
+        self.assertEqual(config.check(data), [])
+        data["merge"]["resolve"] = {"board_unreviewed": "yes"}
+        self.assertEqual(config.check(data), [
+            "merge.resolve.board_unreviewed must be true or false"])
+        data["merge"]["resolve"] = {"board_unreviewed": True}
+        data["merge"]["test_ahead"]["train_merge"] = False
+        problem = ("merge.resolve.board_unreviewed needs merge.test_ahead "
+                   "with trains \"live\" and train_merge: an unreviewed "
+                   "resolution boards only as a train's last member")
+        self.assertEqual(config.check(data), [problem])
+        data["merge"]["test_ahead"] = False
+        self.assertEqual(config.check(data), [problem])
+
     def test_merge_age_first(self):
         self.assertEqual(self.problems(merge={
             "age_first": {"after_minutes": 90}}), [])

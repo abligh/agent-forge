@@ -148,9 +148,9 @@ AREA_REVIEWERS = {"ignore": list}
 # merge.code_owner_ask (agent-forge #153).
 CODE_OWNER_ASK = {"labels": list, "title": str}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
-# merge.resolve as an object: designs/0026's rules as `regenerate`, and
-# designs/0046's `union` globs.
-RESOLVE = {"regenerate": list, "union": list}
+# merge.resolve as an object: designs/0026's rules as `regenerate`,
+# designs/0046's `union` globs, and designs/0056's `board_unreviewed`.
+RESOLVE = {"regenerate": list, "union": list, "board_unreviewed": bool}
 SAID_SINCE = {"author": bool, "approvals": bool, "quiet": list}
 BLOCKED_BY = ("body", "everywhere")
 RIGHT_OF_WAY = {"after_conflicts": int, "minutes": int, "while_eligible": bool}
@@ -969,6 +969,20 @@ def _strings(value):
             and all(isinstance(x, str) and x.strip() for x in value))
 
 
+def _check_board_unreviewed(data, problems):
+    """merge.resolve.board_unreviewed (designs/0056 item 3): a
+    resolution boards as its train's last member, and the members ahead
+    of it go in as one train on its top's green, so it needs live trains
+    merged as one."""
+    ahead = test_ahead(data)
+    if ahead is None or ahead.get("trains") != "live" \
+            or ahead.get("train_merge") is not True:
+        problems.append("merge.resolve.board_unreviewed needs "
+                        "merge.test_ahead with trains \"live\" and "
+                        "train_merge: an unreviewed resolution boards only "
+                        "as a train's last member")
+
+
 def _check_merge_0026(merge, data, problems):
     """The `merge` settings of designs/0026."""
     names = set(data.get("agents") or {}) | set(data.get("machinery") or {})
@@ -980,6 +994,8 @@ def _check_merge_0026(merge, data, problems):
                 isinstance(g, str) and g.strip() for g in globs):
             problems.append("merge.resolve.union must be a list of path "
                             "globs")
+        if rules.get("board_unreviewed") is True:
+            _check_board_unreviewed(data, problems)
         rules = rules.get("regenerate")
         where_rules = "merge.resolve.regenerate"
     else:
