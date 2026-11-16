@@ -5248,6 +5248,23 @@ class TickAhead(RepoCase):
         prs, _, _, red = self.red_alone()
         self.assert_still_out(prs, self.rerun(red, "2026-10-07T12:00:30Z"))
 
+    def test_a_quick_green_does_not_release_it(self):
+        # 2026-11-16: a quick tier's green on the head released a suspect
+        # the batch's full run found red, and the next train went red on
+        # the same test.
+        prs, _, _, red = self.red_alone()
+        self.rerun(red, "2026-10-07T12:01:30Z")
+        red["results"][self.head]["tier"] = "quick"
+        self.assert_still_out(prs, red)
+
+    def test_a_full_green_releases_it(self):
+        prs, _, _, red = self.red_alone()
+        self.rerun(red, "2026-10-07T12:01:30Z")
+        red["results"][self.head]["tier"] = "full"
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              minutes=2, check_state=red)
+        self.assertEqual(record["suspects_cleared"], [5])
+
     def test_a_red_rerun_does_not_release_it(self):
         prs, _, _, red = self.red_alone()
         self.assert_still_out(prs, self.rerun(red, "2026-10-07T12:01:30Z",

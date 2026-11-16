@@ -559,7 +559,8 @@ new head it is neither predicted, updated nor merged. A green run of
 the same head also releases it (amendment, 2026-11-04), as
 `labels.rerun` gives one: the build check's verdict on the head, from
 its state, finished after the suspect was found red, merged with that
-tip or a later one. The tick logs `SUSPECT-CLEARED #n: green rerun at
+tip or a later one, and of the full tier: a quick tier's green leaves out
+what the batch found red. The tick logs `SUSPECT-CLEARED #n: green rerun at
 <head>`, says so once on the pull request, and the hand-back is
 forgotten, so it is predicted again under its approval. A suspect
 kept before the amendment, with no time, waits for a new head.
@@ -7929,11 +7930,18 @@ def rerun_green(entry, head, check_state, repo, run=sh):
     the head's own green from before; with the tip it was merged with
     (`base`) known, that tip must be the one it was found red on
     (`main`) or a descendant of it, which `git merge-base --is-ancestor`
-    in `repo` says. A batch's cover is not a run. An entry without `at`,
+    in `repo` says. A batch's cover is not a run, nor is a quick tier's
+    run (`tier` "quick"), which skips what the batch ran. An entry without `at`,
     written before the amendment, is released only by a new head."""
     r = ((check_state or {}).get("results") or {}).get(head)
     if not isinstance(r, dict) or r.get("ok") is not True \
             or r.get("covered") or not entry.get("at"):
+        return None
+    # The red came from a batch's full run, so only a full run of the head
+    # can show it wasn't the head's: a quick tier's green leaves out the
+    # very tests that failed (2026-11-16: a quick green released a suspect
+    # into the next train, which then went red on the same test).
+    if r.get("tier") == "quick":
         return None
     try:
         if parse_time(r.get("finished")) <= parse_time(entry["at"]):
