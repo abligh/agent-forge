@@ -1319,8 +1319,9 @@ run. Logged `ESCALATE`, `ESCALATE-CLOSED`, `ESCALATE-ANSWERED`.
 Where the default rules read an issue's `Blocked-by:` lines. `"body"`,
 the default, reads the issue's body only. With `"agents"`, comments
 by the project's owner or by any agent in `agents` count too, and the
-newest of the body and those comments with a `Blocked-by:` line
-decides: its `Blocked-by: #N` lines are the blockers, and
+newest of the body (by its last edit) and those comments with a
+`Blocked-by:` line decides: its `Blocked-by: #N` lines are the
+blockers, and
 `Blocked-by: none` clears them. Any agent may write or clear the
 lines, not only the issue's owner, so a hold its writer can no longer
 lift (the issue changed hands, or the agent was renamed or retired) is

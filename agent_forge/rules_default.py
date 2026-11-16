@@ -132,7 +132,7 @@ Issues:
     With `router.issue_blocked_by: "agents"`, an issue's lines may also
     be in a comment by the project's owner or by any agent in the
     configuration: the newest such text with a `Blocked-by:` line
-    decides, replacing earlier numbers, and `Blocked-by: none` clears
+    decides (the body by its last edit), replacing earlier numbers, and `Blocked-by: none` clears
     them. "Written" is then that text's time. Anyone on the project can
     so correct a line another wrote, whoever owns the issue now. Pull
     requests still read their body only (the Merger's `merge.blocked_by`).
@@ -1394,13 +1394,19 @@ def issue_blocker_state(issue):
     Otherwise, and for a pull request, it is the Merger's reading."""
     if ISSUE_BLOCKED_BY != "agents" or not is_issue(issue):
         return merger.blockers_of(issue), ""
-    texts = [("", issue.get("body"))] + sorted(
-        ((c.get("createdAt") or "", c.get("body"))
+    # The body ranks by when it was last written, not as the oldest
+    # text: an edit adding lines after a comment's must win (agent-forge
+    # #442). Its `written` stays "" (rule 14 reads the body's own times).
+    body_at = issue.get("lastEditedAt") or issue.get("createdAt") or ""
+    texts = sorted(
+        [(body_at, 0, "", issue.get("body"))] +
+        [(c.get("createdAt") or "", 1, c.get("createdAt") or "",
+          c.get("body"))
          for c in issue.get("comments") or ()
-         if author_of(c) in BLOCKER_WRITERS),
-        key=lambda t: t[0])
+         if author_of(c) in BLOCKER_WRITERS],
+        key=lambda t: (t[0], t[1]))
     named, written = set(), ""
-    for when, text in texts:
+    for _, _, when, text in texts:
         text = merger.markers_of(text)
         if not any(merger.BLOCKED_LINE_RE.match(l)
                    for l in text.splitlines()):
