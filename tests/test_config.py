@@ -65,6 +65,21 @@ class Check(unittest.TestCase):
         data["merge"]["test_ahead"] = {"later_first": -1}
         self.assertEqual(len(config.check(data)), 1)
 
+    def test_test_ahead_search_cuts_is_1_to_8_and_not_bound_by_batch(self):
+        # agent-forge #454: batches 2 x batch 16 fills depth 31, yet a
+        # search may still run 3 cut points.
+        data = example()
+        data.setdefault("merge", {})["test_ahead"] = {
+            "depth": 31, "batch": 16, "batches": 2, "search_cuts": 3}
+        self.assertEqual(config.check(data), [])
+        for bad in (0, 9):
+            data["merge"]["test_ahead"]["search_cuts"] = bad
+            self.assertEqual(config.check(data), [
+                "merge.test_ahead.search_cuts must be at least 1 and at "
+                "most 8"])
+        data["merge"]["test_ahead"]["search_cuts"] = "3"
+        self.assertEqual(len(config.check(data)), 1)
+
     def test_test_ahead_train_slots_leaves_a_slot_for_the_heads(self):
         data = example()
         data["checks"]["slots"] = 4

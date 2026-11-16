@@ -1059,6 +1059,12 @@ AHEAD_BATCH = 1
 # and the build check runs their tops in spare slots. One whose top's
 # run has started is `fixed`; the first that isn't grows at its end.
 AHEAD_BATCHES = 1
+# merge.test_ahead.search_cuts (agent-forge #454): how many of a red
+# batch's suspects' prefixes the search runs at once. None is
+# `batches` - 1, at least one, as before it could be set; it isn't
+# bound by `batches` x `batch`, so a project with big trains can still
+# search with several cut points in its spare slots.
+SEARCH_CUTS = None
 # merge.test_ahead.fixed_order (designs/0044, rule 3): the batches up to
 # the last whose top's run has started keep their order; nothing but an
 # urgent one or a red default branch's fix goes in front of them.
@@ -1394,7 +1400,8 @@ def configure(project):
     global STACKS, STACK_MAX_RUN, STACK_WAIT, RESOLVE, HOLD_LABELS, BLOCKED_BY
     global UNION, RESOLVE_SLOTS, RESOLVE_SLOT_MINUTES, RESOLVE_SLOT_ON
     global SAID_AUTHOR, SAID_APPROVALS, UPDATE_ONCE, CI_NEVER_STARTED
-    global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES
+    global QUEUED_STALL_AFTER, READ_AS, AHEAD_STACKS, AHEAD_BATCHES, \
+        SEARCH_CUTS
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
     global FIXED_ORDER, GREEN_BATCH_FIRST, RED_SUSPECT_OUT, UNSTABLE_AFTER
     global UNSTABLE_BATCHES, TELL_BOARDED
@@ -1468,6 +1475,7 @@ def configure(project):
     AHEAD_DEPTH = (ahead or {}).get("depth", DEFAULT_AHEAD_DEPTH)
     AHEAD_BATCH = (ahead or {}).get("batch", 1)
     AHEAD_BATCHES = (ahead or {}).get("batches", 1)
+    SEARCH_CUTS = (ahead or {}).get("search_cuts")
     FIXED_ORDER = (ahead or {}).get("fixed_order", True) is not False
     GREEN_BATCH_FIRST = (ahead or {}).get("green_batch_first") is True
     TELL_BOARDED = (ahead or {}).get("tell_boarded") is True
@@ -7029,7 +7037,16 @@ def suspect_place(saved, queue):
     return places
 
 
-def suspect_cuts(trees, verdict, slots):
+def search_runs():
+    """How many prefixes a search runs at once: merge.test_ahead's
+    `search_cuts`, else `batches` - 1, at least one (agent-forge #454)."""
+    if isinstance(SEARCH_CUTS, int) and not isinstance(SEARCH_CUTS, bool) \
+            and SEARCH_CUTS >= 1:
+        return SEARCH_CUTS
+    return max(1, AHEAD_BATCHES - 1)
+
+
+def suspect_cuts(trees, verdict, slots, runs=None):
     """(green, red, cuts) for the suspects' prefixes, whose trees are
     `trees` in order (designs/0035, second amendment, section 2):
     `green` the longest prefix whose tree is green (0 for none), `red`
@@ -7037,15 +7054,17 @@ def suspect_cuts(trees, verdict, slots):
     prefix lengths to test now, evenly spaced between them. With
     `slots` (merge.test_ahead.batches) there are that many cut points
     and the last, the whole red set, isn't run; with one slot, one cut,
-    designs/0032's halving. When no prefix is known red the whole set
-    is one of the cuts."""
+    designs/0032's halving. `runs`, when given, is the number of cut
+    points run at once in place of `slots` - 1 (merge.test_ahead's
+    `search_cuts`, agent-forge #454). When no prefix is known red the
+    whole set is one of the cuts."""
     n = len(trees)
     green = max([k for k in range(1, n + 1) if verdict(trees[k - 1])
                  is True], default=0)
     reds = [k for k in range(green + 1, n + 1)
             if verdict(trees[k - 1]) is False]
     red = reds[0] if reds else None
-    runs = max(1, slots - 1)
+    runs = max(1, slots - 1) if runs is None else max(1, runs)
     span = (red or n) - green
     parts = runs + 1 if red else runs
     cuts = sorted({green - (-span * k // parts) for k in range(1, parts + 1)})
@@ -7199,7 +7218,8 @@ def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
     while n < len(entries) and entries[n]["pr"] in numbers:
         n += 1
     trees = [e["tree"] for e in entries[:n]]
-    green, red, cuts = suspect_cuts(trees, verdict, AHEAD_BATCHES)
+    green, red, cuts = suspect_cuts(trees, verdict, AHEAD_BATCHES,
+                                    runs=search_runs())
     if found is not None and red is not None and red == green + 1:
         found.append((entries[red - 1], green))
     if not n or (red == 1 and not green):
@@ -7219,7 +7239,7 @@ def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
                            "suspects": True}
     record["batch"] = [e["pr"] for e in entries[:size]]
     at, said_ahead["later"], record["later"] = size, [], []
-    for k in later[:max(1, AHEAD_BATCHES - 1)]:
+    for k in later[:search_runs()]:
         said_ahead["later"].append({"size": k, "trees": trees[at:at + k]})
         record["later"].append([e["pr"] for e in entries[at:at + k]])
         at += k
