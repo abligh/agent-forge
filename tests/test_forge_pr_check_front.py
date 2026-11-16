@@ -186,6 +186,48 @@ class Check(unittest.TestCase):
         self.assertFalse(any("CHECK_DOCKER_SLICE" in env
                              for _, env in self.calls))
 
+    def test_a_default_branch_run_gets_main_weight(self):
+        # agent-forge #438: main's runs have no front; without a weight
+        # of their own they lost the CPU to the front run under load.
+        _, results = pc.check(self._tmp.name, {}, self.run_, steps=STEPS,
+                              prefix=pc.scope_prefix("16G"),
+                              main_weight=8000)
+        self.assertEqual(self.weights(), [["CPUWeight=8000"]] * 2)
+        self.assertEqual([r.get("main_weight") for r in results],
+                         [True, True])
+        self.assertFalse(any("merger_weight" in r for r in results))
+
+    def test_no_main_weight_no_change(self):
+        _, results = pc.check(self._tmp.name, {}, self.run_, steps=STEPS,
+                              prefix=pc.scope_prefix("16G"))
+        self.assertEqual(self.weights(), [["CPUWeight=1000"]] * 2)
+        self.assertFalse(any("main_weight" in r for r in results))
+
+
+class MainWeightConfig(unittest.TestCase):
+
+    def tearDown(self):
+        pc.configure(config.Project(example(), None))
+
+    def problems(self, **checks):
+        data = example()
+        data["checks"].update(checks)
+        return config.check(data)
+
+    def test_read_from_checks(self):
+        self.assertIsNone(pc.MAIN_CPU_WEIGHT)
+        configured(main_cpu_weight=8000)
+        self.assertEqual(pc.MAIN_CPU_WEIGHT, 8000)
+
+    def test_between_cpu_weight_and_systemds_limit(self):
+        self.assertEqual(self.problems(main_cpu_weight=8000), [])
+        self.assertEqual(self.problems(main_cpu_weight=500), [
+            "checks.main_cpu_weight must be at least cpu_weight (1000) "
+            "and at most 10000"])
+        self.assertEqual(self.problems(main_cpu_weight=20000), [
+            "checks.main_cpu_weight must be at least cpu_weight (1000) "
+            "and at most 10000"])
+
 
 class StepAlert(unittest.TestCase):
 

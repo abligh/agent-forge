@@ -191,6 +191,7 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "host_fault_text": list, "cache_fault_text": list,
           "step_alert": dict, "cpu_share": str,
           "side_by_side": dict, "merger_cpu_weight": int,
+          "main_cpu_weight": int,
           "docker_slices": dict, "pull_requests": dict, "warm": dict,
           "approved_first": bool, "scoped_minutes": int,
           "gate": bool, "flake_issue": dict, "order": str, "quick": dict,
@@ -230,8 +231,8 @@ INSTANCE_INHERITED = ("slots", "memory_max", "cpu_weight", "cpu_quota",
 INSTANCE_BLOCK_ONLY = ("depends", "tracer", "depends_minutes", "fast_lane",
                        "reuse", "fresh", "main", "main_red_issue")
 INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
-                        "merger_cpu_weight", "docker_slices", "flake_issue",
-                        "quick")
+                        "merger_cpu_weight", "main_cpu_weight",
+                        "docker_slices", "flake_issue", "quick")
 # And from the block alone, never `checks`: a context the Merger requires
 # can't leave heads unrun (designs/0034). `gate`: the Merger also waits
 # for the instance's context on the pull requests it applies to.
@@ -1134,6 +1135,13 @@ def _check_checks(checks, data, problems, where="checks"):
             else 1000
         if not max(1, floor) <= checks["merger_cpu_weight"] <= 10000:
             problems.append("%s.merger_cpu_weight must be at least "
+                            "cpu_weight (%d) and at most 10000"
+                            % (where, max(1, floor)))
+    if _is(checks.get("main_cpu_weight"), int):
+        floor = checks["cpu_weight"] if _is(checks.get("cpu_weight"), int) \
+            else 1000
+        if not max(1, floor) <= checks["main_cpu_weight"] <= 10000:
+            problems.append("%s.main_cpu_weight must be at least "
                             "cpu_weight (%d) and at most 10000"
                             % (where, max(1, floor)))
     if isinstance(checks.get("docker_slices"), dict):
