@@ -1613,8 +1613,9 @@ NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
 BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
                         re.MULTILINE | re.IGNORECASE)
 BLOCKED_LINE_RE = re.compile(r"^\**Blocked-by:", re.IGNORECASE)
-UNBLOCK_RE = re.compile(r"^\**Blocked-by:\**\s*(none|nothing)\s*\.?\**$",
-                        re.MULTILINE | re.IGNORECASE)
+UNBLOCK_RE = re.compile(
+    r"^\**Blocked-by:\**\s*\(?(none|nothing)\)?\s*\.?\**$",
+    re.MULTILINE | re.IGNORECASE)
 FENCE_RE = re.compile(r"^\s*(```|~~~).*?(^\s*\1|\Z)", re.MULTILINE | re.DOTALL)
 DEFER_ANY_RE = re.compile(r"^Defer-until:[ \t]*(.+?)[ \t]*$",
                           re.MULTILINE | re.IGNORECASE)

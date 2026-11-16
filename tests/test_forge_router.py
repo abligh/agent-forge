@@ -495,26 +495,44 @@ class UnblockedRule(unittest.TestCase):
                                    issue_node(number=2)])
         self.assertIsNone(d["who"])
 
-    def test_all_closed_is_the_owners_once_with_the_last_close(self):
+    LINE = ("#30 says Blocked-by: #1, #2, but they are all closed or "
+            "merged: carry on with it, and replace the line with what it "
+            "waits for now, or Blocked-by: none.")
+
+    def test_all_closed_is_the_owners_with_the_last_close(self):
         d, github = self.decide(blockers_page(n1=("MERGED", T1),
                                               n2=("CLOSED", T2)))
         self.assertEqual((d["who"], d["rule"], d["event"]),
                          ("LeadDev", 14, T2))
-        self.assertEqual(d["line"], "#30 unblocked: #1, #2 closed")
+        self.assertEqual(d["line"], self.LINE)
+        self.assertEqual(d["reminder"], rules.HOURLY)
         self.assertEqual(len(github.calls), 2)
 
-    def test_a_line_written_after_the_close_does_not_wake(self):
+    def test_a_line_written_after_the_close_still_wakes(self):
+        # Level, not edge: a line naming only closed items is stale
+        # whenever it was written.
         node = issue_node(number=30, labels=["Owner:LeadDev"], body=self.BODY,
                           edited=T3)
         d, _ = self.decide(blockers_page(n1=("MERGED", T1),
                                          n2=("CLOSED", T2)), issues=[node])
-        self.assertIsNone(d["who"])
+        self.assertEqual((d["who"], d["rule"], d["event"]),
+                         ("LeadDev", 14, T2))
 
-    def test_the_owner_speaking_after_the_close_ends_it(self):
+    def test_the_owner_speaking_after_the_close_keeps_the_same_turn(self):
+        # Her comment leaves the line as it was: the same turn, so it is
+        # reminded rather than woken afresh.
         node = issue_node(number=30, labels=["Owner:LeadDev"], body=self.BODY,
                           comments=[comment(LEADDEV, T3)])
         d, _ = self.decide(blockers_page(n1=("MERGED", T1),
                                          n2=("CLOSED", T2)), issues=[node])
+        self.assertEqual((d["who"], d["rule"], d["event"]),
+                         ("LeadDev", 14, T2))
+
+    def test_none_ends_it(self):
+        node = issue_node(number=30, labels=["Owner:LeadDev"],
+                          body="Blocked-by: none\n")
+        github = FakeGitHub(response([], [node]))
+        d, _ = self.decide(github=github)
         self.assertIsNone(d["who"])
 
     def test_no_owner_label_goes_to_the_author(self):
@@ -539,7 +557,10 @@ class UnblockedRule(unittest.TestCase):
         d, _ = self.decide(github=github)
         self.assertEqual((d["who"], d["rule"], d["event"]),
                          ("LeadDev", 14, T1))
-        self.assertEqual(d["line"], "#30 unblocked: #1 closed")
+        self.assertEqual(d["line"],
+                         "#30 says Blocked-by: #1, but it is closed or "
+                         "merged: carry on with it, and replace the line "
+                         "with what it waits for now, or Blocked-by: none.")
 
 
 class BlockedRed(unittest.TestCase):

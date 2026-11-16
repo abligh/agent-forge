@@ -9063,6 +9063,11 @@ class BlockedByEverywhere(unittest.TestCase):
                   comments=[comment(PEER, at=TA, body="Blocked-by: none")])
         self.assertIsNone(self.held(item))
 
+    def test_none_in_brackets_clears_it(self):
+        item = pr(body="Blocked-by: #2",
+                  comments=[comment(PEER, at=TA, body="Blocked-by: (none)")])
+        self.assertIsNone(self.held(item))
+
     def test_a_text_without_the_line_changes_nothing(self):
         item = pr(comments=[comment(PEER, at=TA, body="Blocked-by: #2"),
                             comment(PEER, at=TB, body="any news?")])

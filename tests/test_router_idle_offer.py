@@ -341,14 +341,16 @@ class Actionable(unittest.TestCase):
                                      owned(31, owner="UIDev")]), [])
 
     def test_once_every_blocker_has_closed(self):
-        # Written after the closes, so rule 14 has no turn for it.
+        # Rule 14 holds while the lines name only closed items, however
+        # long ago they were written, so her turn wakes her rather than
+        # an offer; the issue is no longer counted as blocked.
         issue = owned(30, body="Blocked-by: #1\nBlocked-by: #2\n")
         issue["lastEditedAt"] = T2
         self.assertEqual(self.offer(
             [issue],
             pages=[{"data": {"repository": {
                 "n1": {"state": "MERGED", "closedAt": T1},
-                "n2": {"state": "CLOSED", "closedAt": T1}}}}]), ["#30"])
+                "n2": {"state": "CLOSED", "closedAt": T1}}}}]), [])
 
     def test_a_number_naming_nothing_does_not_block(self):
         self.assertEqual(self.offer(

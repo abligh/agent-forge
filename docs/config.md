@@ -963,8 +963,9 @@ A list of label names. A pull request carrying one is held, `labelled
 request's body only. With `"everywhere"`, the body, its comments and
 its reviews (`Not-a-review` comments included) are read, and the
 newest of them with a `Blocked-by:` line decides: every strict
-`Blocked-by: #N` line in it counts, `Blocked-by: none` clears, and a
-line that starts `Blocked-by:` but doesn't parse holds the pull
+`Blocked-by: #N` line in it counts, `Blocked-by: none` (or
+`(none)`) clears, and a line that starts `Blocked-by:` but doesn't
+parse holds the pull
 request, `unparsed Blocked-by line: ...`, since it was meant as a hold.
 
 ### `merge.said_since`
@@ -1305,7 +1306,9 @@ before the newest nightly run that published its builds started, is
 its owner's turn once for that run, "check it on that build now",
 naming the run, its commit and when it ended, and on a red run what was
 red (rule 22; agent-forge #241), whatever its
-`Defer-until:` says. The run is `published` in forge-nightly's
+`Defer-until:` says, and reminded about hourly until the project's
+owner or an agent comments on the issue (what is left, say) or the
+label comes off. The run is `published` in forge-nightly's
 nightly.json on the router's host (one whose `nightly.release_jobs`
 succeeded; without that key, a green run), else `green`, while the
 file is fresh; a record without `started` (written before
@@ -1314,8 +1317,16 @@ while the label stays on, so she takes it off once she has checked,
 and while a further fix is in flight, and puts it back when that fix
 merges.
 An issue carrying the label is also not actionable for the idle offer,
-the merge notice or the hand-over count: it waits, as a waiting label
-makes it wait. Needs the `nightly` section. Off without the key.
+the merge notice or the hand-over count, while it waits: as a waiting
+label makes it wait. Its check is due, and it is actionable again,
+once a run that published its builds started after the label went on
+and neither the project's owner nor an agent has commented on the
+issue since those builds were published. Without that, the owner was
+woken once by rule 22, and the issue then sat as waiting however many
+nightlies came after. A comment after the builds (what is left, such
+as a half that needs another machine) makes it wait again until the
+next such run; a `Defer-until:` still to come, or another waiting
+label, keeps it waiting. Needs the `nightly` section. Off without the key.
 `agent_forge/rules_default.py` (rule 22) has the detail, and
 [designs/0040](designs/0040-a-green-nightly-wakes-what-waits-for-it.md)
 the reasons.
@@ -1394,13 +1405,15 @@ by the project's owner or by any agent in `agents` count too, and the
 newest of the body (by its last edit) and those comments with a
 `Blocked-by:` line decides: its `Blocked-by: #N` lines are the
 blockers, and
-`Blocked-by: none` clears them. Any agent may write or clear the
+`Blocked-by: none` (or `(none)`) clears them. Any agent may write or clear the
 lines, not only the issue's owner, so a hold its writer can no longer
 lift (the issue changed hands, or the agent was renamed or retired) is
 lifted by whoever owns the issue now. A line that names nothing and
 isn't `none` is passed over, and comments by anyone else, the
-project's machinery Apps included, are never read. Rule 14 then counts
-that comment's time as when the lines were written. Pull requests are
+project's machinery Apps included, are never read. Rule 14 wakes the
+owner while every item the deciding lines name is closed or merged,
+then reminds her about hourly until the lines are cleared or name an
+open item. Pull requests are
 unaffected: their lines stay body-only, as the Merger reads them
 (`merge.blocked_by`).
 
