@@ -161,8 +161,11 @@ TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "tell_boarded": bool, "later_first": int,
               "train_merge": bool, "train_branch": str,
               "train_slots": int, "layers_need_own_green": bool,
-              "own_green_to_board": bool, "left_top_covers": bool}
+              "own_green_to_board": bool, "left_top_covers": bool,
+              "search_cuts": int}
 TRAINS = ("dry-run", "live", "off")
+# agent-forge #454: the most prefixes a red batch's search runs at once.
+MOST_SEARCH_CUTS = 8
 # designs/0050: what testing ahead is when the project says nothing.
 # Trains of up to 4, two in flight, predicted 7 deep; batches x batch
 # is then depth + 1.
@@ -1575,6 +1578,12 @@ def _check_test_ahead(ahead, checks, problems):
         elif ahead["batches"] * batch > depth + 1:
             problems.append("%s.batches x batch must be at most depth + 1 "
                             "(%d)" % (where, depth + 1))
+    if _is(ahead.get("search_cuts"), int) and \
+            not 1 <= ahead["search_cuts"] <= MOST_SEARCH_CUTS:
+        # agent-forge #454: prefixes a search runs at once, in spare
+        # slots; not bound by batches x batch.
+        problems.append("%s.search_cuts must be at least 1 and at most %d"
+                        % (where, MOST_SEARCH_CUTS))
     if _is(ahead.get("later_first"), int) and ahead["later_first"] < 0:
         problems.append("%s.later_first must be at least 0" % where)
     if ahead.get("layers_need_own_green") is False \

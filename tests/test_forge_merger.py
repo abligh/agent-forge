@@ -3961,6 +3961,14 @@ class Suspects(unittest.TestCase):
         self.assertEqual(self.cuts(8, red=4, slots=1), (0, 4, [2]))
         self.assertEqual(self.cuts(2, red=2, slots=1), (0, 2, [1]))
 
+    def test_runs_overrides_slots(self):
+        # agent-forge #454: search_cuts, not batches - 1.
+        trees = [str(k) for k in range(1, 9)]
+        verdict = lambda t: False if t == "8" else None
+        self.assertEqual(m.suspect_cuts(trees, verdict, 2, runs=3),
+                         (0, 8, [2, 4, 6]))
+        self.assertEqual(m.suspect_cuts(trees, verdict, 2), (0, 8, [4]))
+
     def test_without_a_known_red_the_whole_set_is_a_cut(self):
         # The tip moved for another reason: every tree is new.
         self.assertEqual(self.cuts(8, slots=3), (0, None, [4, 8]))
@@ -4051,6 +4059,43 @@ class Suspects(unittest.TestCase):
         self.assertEqual(lines, ["SUSPECTS #10..#17: green to none, red "
                                  "from #17; checking #10..#12, #10..#15"])
         self.assertEqual(len(kept["suspects"]), 8)
+
+    def test_search_cuts_runs_more_prefixes_than_batches_allow(self):
+        """agent-forge #454: with batches 2 a search halves, one prefix
+        at a time; search_cuts 3 runs three at once (2, 4 and 6 of 8,
+        the 8th red): the batch's top and two later tops."""
+        m.configure(project(test_ahead={"batch": 16, "batches": 2,
+                                        "depth": 31, "search_cuts": 3}))
+        self.addCleanup(m.configure, project())
+        saved = self.saved(*range(10, 18))
+        going, said, record, lines, _ = self.round(
+            saved, self.entries(*"abcdefgh"), red="h")
+        self.assertTrue(going)
+        self.assertEqual(said["batch"], {"size": 2, "trees": list("ab"),
+                                         "suspects": True})
+        self.assertEqual(said["later"], [{"size": 2, "trees": list("cd")},
+                                         {"size": 2, "trees": list("ef")}])
+        self.assertEqual(lines, ["SUSPECTS #10..#17: green to none, red "
+                                 "from #17; checking #10..#11, #10..#13, "
+                                 "#10..#15"])
+        # With a green prefix it merges as the batch, and all three cuts
+        # past it run as later batches.
+        going, said, _, _, _ = self.round(
+            self.saved(*range(10, 18)), self.entries(*"abcdefgh"),
+            red="h", green="a")
+        self.assertEqual(said["batch"]["size"], 1)
+        self.assertEqual([b["size"] for b in said["later"]], [2, 2, 2])
+
+    def test_without_search_cuts_batches_2_halves(self):
+        m.configure(project(test_ahead={"batch": 16, "batches": 2,
+                                        "depth": 31}))
+        self.addCleanup(m.configure, project())
+        going, said, _, lines, _ = self.round(
+            self.saved(*range(10, 18)), self.entries(*"abcdefgh"), red="h")
+        self.assertEqual(said["batch"]["size"], 4)
+        self.assertNotIn("later", said)
+        self.assertEqual(lines, ["SUSPECTS #10..#17: green to none, red "
+                                 "from #17; checking #10..#13"])
 
     def test_a_shorter_red_stops_the_longer_runs(self):
         m.configure(project(test_ahead={"batch": 8, "batches": 3,
