@@ -886,6 +886,10 @@ RESTACK_DETAIL = ("Merge #%d's final head, %s, into the branch first, then "
 # that name.
 STATUS_CONTEXT = "vm/build-and-test"
 STATUS_CREATOR = ""
+POSTER = None
+"""checks.poster: the App that posts checks.context (None: the Merger)."""
+POSTER_MINT = None
+"""A function minting POSTER's token, or None when there is none."""
 
 # Where the build check runs, for the STALLED line.
 BUILD_HOST = ""
@@ -1380,6 +1384,7 @@ def configure(project):
     `labels.urgent` the label that puts a pull request first."""
     global REPO_SLUG, MAIN, APPROVERS, QUIET_LOGINS, ACT_AS, SIGNATURE
     global STATUS_CONTEXT, STATUS_CREATOR, BUILD_HOST, GATE, CI_WORKFLOW
+    global POSTER, POSTER_MINT
     global STALL_AFTER, STALL_ALERT, STALL_TELL, STALL_RETELL
     global STALL_TO_OWNER, STALL_TITLE, STALL_LABELS, WAITING_OWNER
     global TEST_AHEAD, AHEAD_DEPTH, AHEAD_BATCH, HOLD_CONFLICTING, YIELD_PLACES
@@ -1408,6 +1413,9 @@ def configure(project):
     CHANGERS = frozenset(APPROVERS) | {project.owner}
     STATUS_CONTEXT = checks.get("context", DEFAULT_CONTEXT)
     STATUS_CREATOR = project.bot_login(checks.get("poster", ACT_AS))
+    POSTER = checks.get("poster")
+    POSTER = POSTER if POSTER and POSTER != ACT_AS else None
+    POSTER_MINT = (lambda: mint(project, POSTER)) if POSTER else None
     GATED = tuple(
         (context, project.bot_login(poster or ACT_AS),
          tuple((scope or {}).get("paths", ())) if scope else None,
@@ -6800,6 +6808,19 @@ def train_onto(repo, top, main, run=sh):
     return sha if made.returncode == 0 and len(sha) == 40 else None
 
 
+def poster_github(github):
+    """(github, "") to post checks.context with: `github` itself when
+    the Merger is checks.poster, else one with POSTER's own token, which
+    the default branch's protection may require the status come from
+    (agent-forge #456). (None, why) when that token can't be had."""
+    if not POSTER:
+        return github, ""
+    token = POSTER_MINT() if POSTER_MINT else None
+    if not token:
+        return None, "no token could be minted for %s" % POSTER
+    return GitHub(token, getattr(github, "run", sh)), ""
+
+
 def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
                 github, run=sh, sleep=time.sleep, out=print, note=None,
                 main=None, tested_tree=None):
@@ -6869,15 +6890,18 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
               if isinstance(r, dict) and r.get("ok") is True
               and r.get("tree") == (tested_tree or entries[-1]["tree"])
               and not r.get("covered")]
-    ok, why = github.write(
-        "POST", "repos/%s/statuses/%s" % (REPO_SLUG, top), state="success",
-        context=STATUS_CONTEXT, description=(
-            "green: the Merger's train %s, %s %s%s"
-            % (span, "under a top tested green as" if tested_tree
-               else "its tree tested as",
-               short(tested[0]) if tested else "its top",
-               ", %s's kept commits merged on top" % MAIN
-               if main and main != main_tip else ""))[:140])
+    poster, why = poster_github(github)
+    ok = poster is not None
+    if ok:
+        ok, why = poster.write(
+            "POST", "repos/%s/statuses/%s" % (REPO_SLUG, top),
+            state="success", context=STATUS_CONTEXT, description=(
+                "green: the Merger's train %s, %s %s%s"
+                % (span, "under a top tested green as" if tested_tree
+                   else "its tree tested as",
+                   short(tested[0]) if tested else "its top",
+                   ", %s's kept commits merged on top" % MAIN
+                   if main and main != main_tip else ""))[:140])
     if not ok:
         github.write("DELETE", "repos/%s/git/refs/heads/%s"
                      % (REPO_SLUG, branch))

@@ -1170,6 +1170,67 @@ class TrainSetup(RepoCase):
                              self.git, lambda s: None, self.lines.append)
 
 
+class TrainStatusPoster(TrainSetup):
+    """agent-forge #456: the train's checks.context is posted as
+    checks.poster's App, whose status the default branch's protection
+    may require, not the Merger's."""
+
+    def poster(self, name, token):
+        minted = []
+
+        def mint():
+            minted.append(name)
+            return token
+        for attr, value in (("POSTER", name),
+                            ("POSTER_MINT", mint if name else None)):
+            patch = mock.patch.object(m, attr, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        made = []
+
+        def github(token, run=m.sh):
+            fake = FakeGitHub({})
+            fake.token = token
+            made.append(fake)
+            return fake
+        patch = mock.patch.object(m, "GitHub", github)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return minted, made
+
+    def test_with_a_poster_the_status_goes_out_with_its_token(self):
+        minted, made = self.poster("Platform", "poster-token")
+        self.assertEqual(self.merge(), ([5, 6], []))
+        top = run_git(self.repo.origin, "rev-parse", "forge/train-5-6")
+        self.assertEqual(minted, ["Platform"])
+        self.assertEqual([(w[0], w[1]) for w in made[0].writes],
+                         [("POST", SLUG + "/statuses/" + top)])
+        self.assertEqual(made[0].token, "poster-token")
+        # Everything else is still the Merger's own.
+        self.assertNotIn(("POST", SLUG + "/statuses/" + top),
+                         [(w[0], w[1]) for w in self.github.writes])
+        self.assertIn(("PUT", SLUG + "/pulls/900/merge"),
+                      [(w[0], w[1]) for w in self.github.writes])
+
+    def test_without_a_poster_the_merger_posts_it(self):
+        minted, made = self.poster(None, None)
+        self.assertEqual(self.merge(), ([5, 6], []))
+        top = run_git(self.repo.origin, "rev-parse", "forge/train-5-6")
+        self.assertEqual((minted, made), ([], []))
+        self.assertEqual(self.github.writes[0][:2],
+                         ("POST", SLUG + "/statuses/" + top))
+
+    def test_no_poster_token_fails_the_train(self):
+        self.poster("Platform", None)
+        merged, _ = self.merge()
+        self.assertEqual(merged, [])
+        self.assertTrue(any("no token could be minted for Platform" in line
+                            for line in self.lines), self.lines)
+        self.assertEqual([(w[0], w[1]) for w in self.github.writes],
+                         [("DELETE",
+                           SLUG + "/git/refs/heads/forge/train-5-6")])
+
+
 class TrainMerge(TrainSetup):
     """merge.test_ahead.train_merge (designs/0047, amendment of
     2026-11-11): a green train goes in as one pull request."""
@@ -3116,6 +3177,15 @@ class Configure(unittest.TestCase):
         data["checks"]["poster"] = "Helper"
         m.configure(config.Project(data, None))
         self.assertEqual(m.STATUS_CREATOR, "helperbot[bot]")
+        # A train's status is posted with its token (agent-forge #456).
+        self.assertEqual(m.POSTER, "Helper")
+        self.assertTrue(callable(m.POSTER_MINT))
+
+    def test_the_merger_as_poster_posts_with_its_own_token(self):
+        data = example()
+        data["checks"]["poster"] = "Merger"
+        m.configure(config.Project(data, None))
+        self.assertEqual((m.POSTER, m.POSTER_MINT), (None, None))
 
     def test_no_ci_workflow_needs_no_run(self):
         m.configure(project(ci_workflow=""))
