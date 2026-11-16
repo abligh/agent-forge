@@ -6906,6 +6906,31 @@ def poster_github(github):
     return GitHub(token, getattr(github, "run", sh)), ""
 
 
+def code_owned_members(repo, numbers, prs, main_tip, run=sh):
+    """With merge.code_owners, the members of `numbers` that change a
+    path the default branch's CODEOWNERS gives an owner, since
+    `main_tip` (agent-forge #459); [] without it. A member whose paths
+    can't be listed counts as one."""
+    if not CODE_OWNERS:
+        return []
+    main_ref = "refs/remotes/origin/" + MAIN
+    rules = codeowners_rules(repo, main_ref, run)
+    if not rules:
+        return []
+    owned = []
+    for number in numbers:
+        pr = prs.get(number)
+        if not pr:
+            continue
+        have_head(repo, pr, run)
+        got = git(repo, "diff", "--name-only",
+                  "%s...%s" % (main_tip, pr["headRefOid"]), run=run)
+        if got.returncode != 0 or any(owners_of(path, rules)
+                                      for path in got.stdout.split()):
+            owned.append(number)
+    return owned
+
+
 def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
                 github, run=sh, sleep=time.sleep, out=print, note=None,
                 main=None, tested_tree=None):
@@ -6937,6 +6962,16 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
     if CI_WORKFLOW:
         return fail("merge.ci_workflow is set, and the train's commits "
                     "have no runs of it")
+    owned = code_owned_members(repo, numbers, prs, main_tip, run)
+    if owned:
+        # GitHub wants the code owner's review on the train's own pull
+        # request too, which no owner gives it: it would be refused
+        # (agent-forge #459). Not a failure, so no TRAIN-MERGE line.
+        out("TRAIN-SKIP %s: %s changes code-owned paths, whose owner's "
+            "review GitHub requires on the train's pull request; each "
+            "member merges on its own"
+            % (span, ", ".join("#%d" % n for n in owned)))
+        return [], numbers
     top = train_commits(repo, main_tip, entries, prs, run)
     if top is None:
         return fail("git could not make the train's commits")

@@ -1251,6 +1251,40 @@ class TrainStatusPoster(TrainSetup):
                            SLUG + "/git/refs/heads/forge/train-5-6")])
 
 
+class TrainCodeOwned(TrainSetup):
+    """agent-forge #459: with merge.code_owners, a train holding a
+    member that changes a code-owned path isn't tried: GitHub would
+    want the owner's review on the train's own pull request."""
+
+    def owners(self, on, rules):
+        for attr, value in (("CODE_OWNERS", on),
+                            ("codeowners_rules",
+                             lambda repo, ref, run=m.sh: rules)):
+            patch = mock.patch.object(m, attr, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_a_code_owned_member_skips_the_train(self):
+        self.owners(True, [("g.txt", ["@owner"])])
+        self.assertEqual(self.merge(), ([], [5, 6]))
+        self.assertEqual(self.github.writes, [])
+        self.assertTrue(self.lines[-1].startswith("TRAIN-SKIP #5..#6: #6 "),
+                        self.lines)
+        self.assertFalse(any(line.startswith("TRAIN-MERGE")
+                             for line in self.lines), self.lines)
+        self.assertNotEqual(subprocess.run(
+            ["git", "-C", self.repo.origin, "rev-parse", "-q", "--verify",
+             "forge/train-5-6"], capture_output=True).returncode, 0)
+
+    def test_unowned_members_still_merge_as_a_train(self):
+        self.owners(True, [("docs/", ["@owner"])])
+        self.assertEqual(self.merge(), ([5, 6], []))
+
+    def test_without_code_owners_the_train_is_tried(self):
+        self.owners(False, [("g.txt", ["@owner"])])
+        self.assertEqual(self.merge(), ([5, 6], []))
+
+
 class TrainMerge(TrainSetup):
     """merge.test_ahead.train_merge (designs/0047, amendment of
     2026-11-11): a green train goes in as one pull request."""
