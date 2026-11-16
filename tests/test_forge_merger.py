@@ -4494,6 +4494,32 @@ class TickAhead(RepoCase):
         return pr(item["number"], item["createdAt"], head=sha,
                   reviews=[review(REVIEWER, oid=sha)])
 
+    def test_one_waited_on_outside_the_search_doesnt_end_it(self):
+        # agent-forge #452: the pull request the Merger waited on (an
+        # urgent one, first in the queue) wasn't a suspect but was
+        # predicted first, so no suspect was at the front: the search
+        # ended unsaid, the next tick found the red top and started it
+        # again, and the batch changed every tick, stopping the
+        # search's runs as spent.
+        red = self.searching()
+        seven = self.other_pr(7)
+        seven["createdAt"] = "2026-10-07T09:00:00Z"
+        prs = self.prs + [seven]
+        batches = []
+        for minute in (3, 4, 5):
+            m.save_json(os.path.join(self.state, "next.json"),
+                        {"pr": 7, "action": "WAIT"})
+            record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                      minutes=minute, check_state=red)
+            self.assertTrue(os.path.exists(os.path.join(
+                self.state, m.SUSPECTS_FILE)), lines)
+            self.assertFalse(any(l.startswith("BATCH #5..#6: top red")
+                                 for l in lines), lines)
+            self.assertEqual(record["ahead"][:2], [5, 6])
+            batches.append(record.get("batch"))
+        self.assertEqual(batches[0], batches[1])
+        self.assertEqual(batches[1], batches[2])
+
     def test_a_suspects_new_head_ends_the_search(self):
         # agent-forge #447: the first suspect's new head kept it in the
         # search, the second's prediction kept its old head, its tree
@@ -4678,6 +4704,16 @@ class TickAhead(RepoCase):
         # A layer gone (merged, closed) is left out.
         self.assertEqual(m.with_suspects([five, six], saved, [five, six]),
                          [five, six])
+        # agent-forge #452: one waited on that isn't a suspect (an
+        # urgent one, first in the queue) goes behind the suspects, so a
+        # suspect is predicted first and the search goes on.
+        urgent = {"number": 12}
+        self.assertEqual(m.with_suspects([urgent, five, six], saved,
+                                         [urgent, five, six, layer]),
+                         [five, layer, six, urgent])
+        self.assertEqual(m.with_suspects([urgent, five, six], saved,
+                                         [urgent, five, six]),
+                         [five, six, urgent])
 
     def test_train_boarded(self):
         entries = [{"pr": 5, "head": "a", "tree": "t5"},
@@ -9817,6 +9853,31 @@ class KeepTrains(TrainSetup):
         last = dict(self.last, entries=self.last["entries"], main=tip)
         self.assertEqual(self.carried(last, merge),
                          self.last["entries"][0]["sha"])
+
+    def test_a_labelled_train_outside_the_kept_ones_keeps_them(self):
+        # agent-forge #452: an urgent train cut in front of a red train's
+        # search merged; its own pull request carries no label, so
+        # every train was cut again and the search was lost.
+        self.github = FakeGitHub({SLUG + "/pulls/5": {"merged": True}})
+        queue = [dict(pr, labels={"nodes": [{"name": "Merge:keep-trains"}]})
+                 if pr["number"] == 5 else pr for pr in self.queue]
+        got = m.train_merge(self.repo.path, self.state, self.entries[:1],
+                            queue, self.tip, {"results": {"r": {
+                                "ok": True,
+                                "tree": self.entries[0]["tree"]}}},
+                            self.github, self.git, lambda s: None,
+                            self.lines.append)
+        self.assertEqual(got, ([5], []))
+        top = self.github.writes[0][1].rsplit("/", 1)[1]
+        run_git(self.repo.path, "fetch", "-q", "origin", "forge/train-5-5")
+        merge = run_git(self.repo.path, "commit-tree", top + "^{tree}",
+                        "-p", self.tip, "-p", top, "-m", "Merge train")
+        # The kept trains don't hold that train's chain.
+        last = dict(self.last, entries=self.last["entries"][1:])
+        self.assertEqual(self.carried(last, merge), self.tip)
+        # Unlabelled, it cuts them again, as before.
+        m.save_json(os.path.join(self.state, m.KEEP_FILE), {})
+        self.assertEqual(self.carried(last, merge), merge)
 
     def test_a_train_that_conflicts_with_main_goes_on_its_own(self):
         tip = self.move_main("g.txt", "not the other\n")
