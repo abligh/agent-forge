@@ -581,6 +581,50 @@ class WatchTest(unittest.TestCase):
                       lambda: self.fail("called"), interval=0.01)
 
 
+class OwnFilesTest(unittest.TestCase):
+    """agent-forge #464: an in-place update that changes only a module
+    the receiver imported must restart it too."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        os.makedirs(os.path.join(self.root, "bin"))
+        os.makedirs(os.path.join(self.root, "agent_forge"))
+        self.me = os.path.join(self.root, "bin", "forge-receiver")
+        self.mod = os.path.join(self.root, "agent_forge", "config.py")
+        self.other = os.path.join(tmp.name + "-elsewhere.py")
+        for path in (self.me, self.mod, self.other):
+            with open(path, "w") as handle:
+                handle.write("x")
+        self.addCleanup(lambda: os.path.exists(self.other)
+                        and os.remove(self.other))
+
+    def modules(self):
+        mod = type("M", (), {"__file__": self.mod})
+        other = type("M", (), {"__file__": self.other})
+        builtin = type("M", (), {})
+        return {"agent_forge.config": mod, "json": other, "sys": builtin}
+
+    def test_its_file_first_then_this_installations_modules(self):
+        self.assertEqual(rc.own_files(self.me, self.modules()),
+                         [self.me, self.mod])
+
+    def test_a_module_rewritten_in_place_is_a_change(self):
+        watch = rc.Watch(rc.own_files(self.me, self.modules()))
+        tmp = self.mod + ".new"
+        with open(tmp, "w") as handle:
+            handle.write("y")
+        os.replace(tmp, self.mod)
+        self.assertEqual(watch.changed(), self.mod)
+
+    def test_the_running_receiver_watches_its_package(self):
+        files = rc.own_files()
+        self.assertTrue(any(f.endswith(os.path.join("agent_forge",
+                                                    "config.py"))
+                            for f in files), files)
+
+
 class DebounceTest(unittest.TestCase):
     def test_a_burst_makes_one_key_due_after_its_latest_event(self):
         clock = Clock()
