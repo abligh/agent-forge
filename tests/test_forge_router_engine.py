@@ -432,6 +432,24 @@ class Reminders(EngineCase):
         self.assertEqual(self.posts, [("TeamAnn", "From: Router\nYour turn:\n"
                                        "#41 for Ann (reminder)\n")])
 
+    def test_the_default_rules_hourly_reminder_repeats_every_hour(self):
+        # Rules 14 and 22 (a stale Blocked-by line, a nightly check due):
+        # reminded about hourly, never doubling, for as long as they hold.
+        from agent_forge import rules_default
+        sent = self.times(rules_default.HOURLY, 4 * 3600 + 1800, step_s=300)
+        self.assertEqual(len(sent), 4)
+        gaps = [b - a for a, b in zip([0] + sent, sent)]
+        for gap in gaps:
+            self.assertGreaterEqual(gap, 3600)
+            self.assertLessEqual(gap, 3600 * 1.1 + 300)
+
+    def test_a_turn_no_longer_decided_is_not_reminded(self):
+        self.decide({41: [turn(41, "Ann", reminder=Reminder(600, 600, 0))]})
+        self.run_router()
+        self.decide({41: []})
+        self.run_router(when=later(seconds=1200))
+        self.assertEqual(self.posts, [])
+
     def test_none_is_the_fixed_interval_and_counts_too(self):
         self.decide({41: [turn(41, "Ann")]})
         self.run_router(remind_s=600)

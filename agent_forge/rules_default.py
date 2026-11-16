@@ -119,14 +119,17 @@ Issues:
     owner usually takes the waiting label off when answering, which
     ends rule 10;
 14. its body has `Blocked-by: #N` lines (one number a line, the
-    Merger's notation, outside code), every item they name is closed or
-    merged, and the last of those closed after the body was last
-    written and after the item owner's last comment: the item owner's
-    (`Owner:<Name>`, else the author), "unblocked". The event is that
-    last close, so it is woken once. A merged pull request is nobody's
+    Merger's notation, outside code) and every item they name is closed
+    or merged: the item owner's (`Owner:<Name>`, else the author),
+    "carry on, and replace the line with what it waits for now, or
+    Blocked-by: none". The event is the last close, so it is woken
+    once, then reminded about hourly for as long as the lines stay as
+    they are, whoever has spoken since: it ends when the lines are
+    cleared or name an open item. A merged pull request is nobody's
     turn, so without this a step waiting on others' work waits until
-    someone notices. A line written after its item closed doesn't
-    wake, and a number that names nothing is left out. Pull requests
+    someone notices, and a line left naming closed items hid the issue
+    from the idle offer's counts as blocked work (agent-forge, 2026-11-16:
+    about fifty such lines). A number that names nothing is left out. Pull requests
     don't need it: the Merger holds a blocked one and takes it up
     itself, and rule 4 leaves a blocked red with it. What the named items are now is the `blockers` lookup.
     With `router.issue_blocked_by: "agents"`, an issue's lines may also
@@ -180,9 +183,13 @@ key):
     record; agent-forge #241). A label that old means the fixes
     were in the build. It
     applies whatever the issue's `Defer-until:` says: no rule above
-    reads one on an issue (only rule 15's offer does). The event is the
-    run's end, so it is said once for each such run, never reminded;
-    while the label stays on, a later one wakes her again. The run is
+    reads one on an issue (only rule 15's offer does). Only while
+    neither the project's owner nor an agent has commented on the issue
+    since the run's builds were published: a comment after them (what
+    is left, such as a half that needs another machine) ends it until
+    the next run. The event is the run's end, so it is said once for
+    each such run, then reminded about hourly while that holds; while
+    the label stays on, a later run wakes her again. The run is
     `published` in forge-nightly's nightly.json (a run whose
     `nightly.release_jobs` succeeded; without that key, a green run),
     else `green`, while the file is fresh; one without `started` wakes
@@ -201,7 +208,10 @@ agents with nothing to do (off without it):
     agent's, offered the oldest such issue by creation. An issue is
     actionable when it is labelled `Owner:<Name>`, is waiting neither
     on the owner nor on someone outside (nor, with
-    `router.nightly_wake`, on a nightly: rule 22), every item its `Blocked-by:`
+    `router.nightly_wake`, on a nightly: rule 22, unless its check is
+    due: the newest nightly run that published its builds started after
+    the label went on, and neither the owner nor an agent has commented
+    on the issue since those builds were published), every item its `Blocked-by:`
     lines name is closed or merged (a number naming nothing is left
     out, as for rule 14), and no open pull request by the agent
     references it (a closing reference, `#N` or its URL in the body).
@@ -1184,10 +1194,17 @@ def route_issue(issue, roster, ctx=None):
     return nobody(n, None, "no rule matched")
 
 
+# Rules 14 and 22 go on reminding while what they say stays true: a
+# stale `Blocked-by:` line, or a nightly check due and untouched, is
+# still the owner's to deal with however long ago the first wake was.
+HOURLY = Reminder(3600.0, 3600.0, 0.1)
+
+
 def unblocked_by(issue, owner, comments, roster):
-    """Rule 14: the item owner's turn when the last open item its
-    `Blocked-by:` lines name has closed since the body was written and
-    since the item owner last spoke, else None."""
+    """Rule 14: the item owner's turn while every item its `Blocked-by:`
+    lines name is closed or merged, else None. The event is the last
+    close, so the turn is woken once and then reminded about hourly
+    until the lines are cleared or name something open again."""
     named, said = issue_blocker_state(issue)
     known = {b: info for b, info in (issue.get("blockedBy") or {}).items()
              if b in named and info}
@@ -1195,14 +1212,16 @@ def unblocked_by(issue, owner, comments, roster):
         return None
     event = max((i.get("closedAt") or "" for i in known.values()),
                 default="")
-    who = owner or roster.who(author_of(issue))
-    written = max(issue.get("lastEditedAt") or "",
-                  issue.get("createdAt") or "", said,
-                  last_by(comments, {roster.login_of(who)}))
-    if not event or event <= written:
+    if not event:
         return None
-    return turn(issue["number"], who, 14, event, "unblocked: %s closed" % (
-        ", ".join("#%d" % b for b in sorted(known))))
+    who = owner or roster.who(author_of(issue))
+    names = ", ".join("#%d" % b for b in sorted(known))
+    return turn(issue["number"], who, 14, event,
+                "says Blocked-by: %s, but %s closed or merged: carry on "
+                "with it, and replace the line with what it waits for now, "
+                "or Blocked-by: none." % (
+                    names, "it is" if len(known) == 1 else "they are all"),
+                reminder=HOURLY)
 
 
 def owner_answered(n, issue, owner, comments, roster, rule):
@@ -1468,7 +1487,8 @@ def owned_issues(agent, ctx):
         until = deferred_until(issue)
         if WAITING_OWNER in labels or WAITING_EXTERNAL in labels \
                 or any(l.startswith(WAITING_PREFIX) for l in labels) \
-                or quiet(issue) or awaits_nightly(issue) \
+                or quiet(issue) \
+                or (awaits_nightly(issue) and not nightly_due(issue)) \
                 or (until is not None and until > ctx.when):
             waiting += 1
         elif blocked(issue):
@@ -1948,6 +1968,32 @@ def awaits_nightly(issue):
         NIGHTLY_WAKE["label"] in labels_of(issue)
 
 
+def nightly_due(issue):
+    """Whether an issue carrying `router.nightly_wake`'s label has its
+    check due: the newest nightly run that published its builds started
+    after the label went on (so its fixes are in them, as rule 22 reads
+    it), and nobody in `BLOCKER_WRITERS` (the project's owner and its
+    agents) has commented on the issue since those builds were
+    published. A comment after them says what is left, so the issue
+    waits again until the next nightly. The idle offer (rule 15) counts
+    a due issue as one its owner can act on, not as waiting; rule 22
+    still wakes the owner once per run."""
+    if not awaits_nightly(issue):
+        return False
+    built = issue.get("publishedNightly")
+    if not isinstance(built, dict) or not built.get("started") \
+            or not built.get("ended"):
+        return False
+    labelled = labelled_at(issue, NIGHTLY_WAKE["label"])
+    if labelled is None or labelled >= built["started"]:
+        return False
+    said = [as_stamp(c.get("createdAt"))
+            for c in issue.get("comments") or ()
+            if author_of(c) in BLOCKER_WRITERS]
+    said = [t for t in said if t]
+    return not said or max(said) < built["ended"]
+
+
 def labelled_at(issue, label):
     """When `label` was last put on the issue: its newest `LabeledEvent`
     among those fetched, as GitHub writes a time, or None."""
@@ -1964,9 +2010,12 @@ def nightly_turn(issue, roster, ctx):
     """Rule 22: an open issue carrying `router.nightly_wake`'s label,
     with an owner, not parked, labelled before the newest nightly run
     that published its builds started (so its fixes are in those
-    builds), red or green, is its owner's turn,
-    once for that run: the event is the run's end. A `Defer-until:` on
-    the issue doesn't hold it. None otherwise."""
+    builds), red or green, and that neither the project's owner nor an
+    agent has commented on since those builds were published
+    (`nightly_due`), is its owner's turn: the event is the run's end,
+    so it is woken once for that run, then reminded about hourly until
+    someone comments (what is left, say) or the label comes off. A
+    `Defer-until:` in its body doesn't hold it. None otherwise."""
     if NIGHTLY_WAKE is None or ctx is None or not awaits_nightly(issue):
         return None
     built = issue.get("publishedNightly")
@@ -1976,8 +2025,7 @@ def nightly_turn(issue, roster, ctx):
     owner = issue_owner(issue, roster)
     if not owner or parked(issue):
         return None
-    labelled = labelled_at(issue, NIGHTLY_WAKE["label"])
-    if labelled is None or labelled >= built["started"]:
+    if not nightly_due(issue):
         return None
     n = issue["number"]
     red = built.get("red")
@@ -1989,7 +2037,7 @@ def nightly_turn(issue, roster, ctx):
                     since_text(built["ended"], ctx.when),
                     "; the run is red: %s, so check it was not what this "
                     "issue fixes" % "; ".join(red) if red else ""),
-                reminder=ONCE)
+                reminder=HOURLY)
 
 
 # --- the merge notice (rule 17) -----------------------------------------------

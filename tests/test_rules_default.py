@@ -682,7 +682,7 @@ class Rule22(RedFirstCase):
     def test_labelled_before_the_run_started(self):
         self.assertEqual(self.wakes(waiting_issue()), [router.Decision(
             60, "LeadDev", 22, GREEN["ended"], GREEN_LINE,
-            reminder=router.ONCE)])
+            reminder=rules.HOURLY)])
 
     def test_beside_the_issues_own_decision(self):
         # A comment by someone else is still rule 12's, and rule 22 is
@@ -692,6 +692,16 @@ class Rule22(RedFirstCase):
         got = rules.decide(item, self.ctx(issues=[item]))
         self.assertEqual([(d.agent, d.rule) for d in got],
                          [("LeadDev", 12), ("LeadDev", 22)])
+
+    def test_reminded_hourly_until_someone_comments(self):
+        [got] = self.wakes(waiting_issue())
+        self.assertEqual(got.reminder.interval(0), 3600.0)
+        self.assertEqual(got.reminder.interval(5), 3600.0)
+        # The owner says what is left after the builds were published:
+        # the turn ends, so the reminders stop.
+        item = waiting_issue()
+        item["comments"] = [note(LEADDEV, "2026-10-09T13:45:00Z")]
+        self.assertEqual(self.wakes(item), [])
 
     def test_not_when_labelled_after_it_started(self):
         self.assertEqual(self.wakes(waiting_issue(
@@ -785,10 +795,58 @@ class NightlyWaitIsNotActionable(RedFirstCase):
         [got] = self.offer()
         self.assertTrue(got.line.startswith('#30 "item 30" is yours'),
                         got.line)
+        # Checked on the published builds already: the owner said what
+        # is left after they were published.
+        checked = waiting_issue()
+        checked["comments"] = [note(LEADDEV, "2026-10-09T14:00:00Z")]
         actionable, _, waiting = rules.owned_issues(
-            "LeadDev", self.ctx(issues=[waiting_issue(), plain_issue(30)]))
+            "LeadDev", self.ctx(issues=[checked, plain_issue(30)]))
         self.assertEqual(([i["number"] for i in actionable], waiting),
                          ([30], 1))
+
+    def owned(self, item):
+        actionable, _, waiting = rules.owned_issues(
+            "LeadDev", self.ctx(issues=[item]))
+        return [i["number"] for i in actionable], waiting
+
+    def test_due_once_a_nightly_has_published_since_anyone_spoke(self):
+        # The run published at 13:30Z; the last word was before it.
+        item = waiting_issue()
+        item["comments"] = [note(LEADDEV, "2026-10-09T11:00:00Z")]
+        self.assertTrue(rules.nightly_due(item))
+        self.assertEqual(self.owned(item), ([60], 0))
+        # With nobody's comment at all, it is due too.
+        self.assertEqual(self.owned(waiting_issue()), ([60], 0))
+
+    def test_due_is_offered_to_its_idle_owner(self):
+        due = waiting_issue()
+        due["createdAt"] = "2026-09-01T09:00:00Z"
+        ctx = self.ctx(issues=[due, plain_issue(30)],
+                       directory=listing(entry("WidgetLeadDev")))
+        [got] = [d for d in rules.sweep(ctx) if d.rule == 15]
+        self.assertTrue(got.line.startswith('#60 "item 60" is yours'),
+                        got.line)
+
+    def test_a_strangers_comment_does_not_make_it_wait(self):
+        item = waiting_issue()
+        item["comments"] = [note("someone-else", "2026-10-09T14:00:00Z")]
+        self.assertEqual(self.owned(item), ([60], 0))
+
+    def test_not_due_without_a_published_nightly(self):
+        self.assertFalse(rules.nightly_due(waiting_issue(green=None)))
+        self.assertEqual(self.owned(waiting_issue(green=None)), ([], 1))
+
+    def test_not_due_when_labelled_after_the_run_started(self):
+        item = waiting_issue(labelled="2026-10-09T12:30:00Z")
+        self.assertEqual(self.owned(item), ([], 1))
+
+    def test_a_defer_until_still_to_come_waits(self):
+        item = waiting_issue(body="Defer-until: 2099-01-01T00:00:00Z")
+        self.assertEqual(self.owned(item), ([], 1))
+
+    def test_another_waiting_label_still_waits(self):
+        item = waiting_issue(labels=["Status:waiting-external"])
+        self.assertEqual(self.owned(item), ([], 1))
 
     def test_without_the_key_it_is_actionable(self):
         self.use(red_project(idle_offer={}, nightly=True))
@@ -888,7 +946,7 @@ class GreenNightly(unittest.TestCase):
             60, "LeadDev", 22, red["ended"],
             "#60 waits for a nightly check, and nightly run 80 (beef123, "
             "builds published at 11:10Z) includes its fixes: check it on "
-            "that build now.", reminder=router.ONCE)])
+            "that build now.", reminder=rules.HOURLY)])
 
     def test_rule_22_says_what_was_red(self):
         # agent-forge #241: a red run's wake names what was red.

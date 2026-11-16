@@ -98,6 +98,13 @@ class FromComments(Case):
         self.assertEqual(rules.issue_blocker_state(item), (set(), T2))
         self.assertFalse(rules.blocked(item))
 
+    def test_none_in_brackets_clears_too(self):
+        item = issue([note(LEADDEV, T1, "Blocked-by: #7", id=1),
+                      note(REVIEWER, T2, "Blocked-by: (none)", id=2)],
+                     blocked_by={7: OPEN})
+        self.assertEqual(rules.issue_blocker_state(item), (set(), T2))
+        self.assertFalse(rules.blocked(item))
+
     def test_the_newest_text_replaces_earlier_numbers(self):
         item = issue([note(LEADDEV, T2, "Blocked-by: #8", id=2),
                       note(OWNER, T1, "Blocked-by: #7", id=1)],
@@ -150,11 +157,24 @@ class Unblocked(Case):
         self.assertEqual((d["who"], d["rule"], d["event"]),
                          ("LeadDev", 14, T2))
 
-    def test_a_line_written_after_the_close_does_not_wake(self):
+    def test_a_line_written_after_the_close_still_wakes(self):
         item = issue([note(LEADDEV, T3, "Blocked-by: #7")],
                      blocked_by={7: closed(T2)})
         d = self.route(item)
-        self.assertNotEqual(d.get("rule"), 14)
+        self.assertEqual((d["who"], d["rule"], d["event"]),
+                         ("LeadDev", 14, T2))
+
+    def test_clearing_the_line_ends_the_reminders(self):
+        item = issue([note(LEADDEV, T1, "Blocked-by: #7", id=1),
+                      note(LEADDEV, T3, "Blocked-by: (none)", id=2)],
+                     blocked_by={7: closed(T2)})
+        self.assertNotEqual(self.route(item).get("rule"), 14)
+
+    def test_naming_an_open_item_ends_the_reminders(self):
+        item = issue([note(LEADDEV, T1, "Blocked-by: #7", id=1),
+                      note(LEADDEV, T3, "Blocked-by: #8", id=2)],
+                     blocked_by={7: closed(T2), 8: OPEN})
+        self.assertNotEqual(self.route(item).get("rule"), 14)
 
 
 class Config(unittest.TestCase):
