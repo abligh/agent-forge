@@ -1,6 +1,6 @@
 # 0058: The Merger waits for each area's reviewer
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-16, on #463: "approved"), with its three choices as proposed
 * Author: XMPPEngineer
 * Date: 2026-11-16
 * Issue: #460
