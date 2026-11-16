@@ -136,11 +136,15 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
          "stall_run_factor": (int, float), "resolve_slots": int,
          "resolve_slot_minutes": (int, float), "resolve_slot_on": str,
          "mode": str, "code_owner_ask": dict, "code_owner_sequence": bool,
-         "approval": str, "gate_tier": str}
+         "approval": str, "gate_tier": str,
+         "area_reviewers": (bool, dict)}
 # merge.gate_tier (designs/0055): which tier's green gates a merge.
 # "head" is the head's own checks.context, as before; "train" takes
 # checks.quick's context on the head and merges only trains.
 GATE_TIERS = ("head", "train")
+# merge.area_reviewers (designs/0058).
+# `tell` (step 2) joins it when the Merger acts on it.
+AREA_REVIEWERS = {"ignore": list}
 # merge.code_owner_ask (agent-forge #153).
 CODE_OWNER_ASK = {"labels": list, "title": str}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
@@ -734,6 +738,8 @@ def check(data):
             _check_stall_alert(merge["stall_alert"], data["agents"], problems)
         if isinstance(merge.get("code_owner_ask"), dict):
             _check_code_owner_ask(merge, problems)
+        if merge.get("area_reviewers") not in (None, False):
+            _check_area_reviewers(merge, data, problems)
         if merge.get("code_owner_sequence") is True and \
                 merge.get("code_owners") is not True:
             problems.append("merge.code_owner_sequence needs "
@@ -1054,6 +1060,24 @@ def _check_escalate(escalate, problems):
     for key in ("label", "to"):
         if isinstance(escalate.get(key), str) and not escalate[key].strip():
             problems.append("%s.%s must not be empty" % (where, key))
+
+
+def _check_area_reviewers(merge, data, problems):
+    """merge.area_reviewers (designs/0058): the Merger holds a pull
+    request for the reviewers whose `reviews` globs match its paths, so
+    one of them must have some."""
+    where = "merge.area_reviewers"
+    setting = merge["area_reviewers"]
+    if isinstance(setting, dict):
+        _fields(where, setting, AREA_REVIEWERS, problems)
+        ignore = setting.get("ignore")
+        if isinstance(ignore, list) and not all(
+                isinstance(g, str) and g.strip() for g in ignore):
+            problems.append("%s.ignore must be a list of path globs" % where)
+    agents = data.get("agents") or {}
+    if not any(isinstance(e, dict) and e.get("kind") == "reviewer"
+               and e.get("reviews") for e in agents.values()):
+        problems.append("%s needs a reviewer with reviews" % where)
 
 
 def _check_code_owner_ask(merge, problems):

@@ -926,6 +926,26 @@ class Check(unittest.TestCase):
         self.assertEqual(self.problems(merge={"yield_ignores_conflicts": 1}),
                          ["merge.yield_ignores_conflicts must be true or false"])
 
+    def test_merge_area_reviewers(self):
+        # designs/0058.
+        for value in (True, False, {}, {"ignore": [".agent-forge/**"]}):
+            self.assertEqual(self.problems(merge={"area_reviewers": value}),
+                             [], value)
+        self.assertEqual(self.problems(merge={"area_reviewers": "yes"}), [
+            "merge.area_reviewers must be true or false or an object"])
+        self.assertEqual(self.problems(merge={"area_reviewers": {
+            "ignore": ["", 3], "tell": True}}), [
+            "merge.area_reviewers: unknown key 'tell'",
+            "merge.area_reviewers.ignore must be a list of path globs"])
+        data = example()
+        for entry in data["agents"].values():
+            entry.pop("reviews", None)
+        data["merge"] = {"area_reviewers": True}
+        self.assertEqual(config.check(data), [
+            "merge.area_reviewers needs a reviewer with reviews"])
+        data["merge"] = {"area_reviewers": False}
+        self.assertEqual(config.check(data), [])
+
     def test_merge_age_first(self):
         self.assertEqual(self.problems(merge={
             "age_first": {"after_minutes": 90}}), [])
