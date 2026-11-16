@@ -6927,6 +6927,46 @@ def load_suspects(state_dir):
     return saved
 
 
+def suspect_moved(saved, prs):
+    """(number, head) of the first suspect of the search `saved` that is
+    still open (`prs`) at a head other than the one it was suspected
+    at, or None. The search's trees were predicted on the old heads:
+    on 2026-11-16 the first suspect's update kept it in the search, the
+    second's prediction still held the first's old head, its tree was
+    already green, so no run started and no train could merge, and the
+    queue stood for 13 minutes (agent-forge #447)."""
+    heads = {pr["number"]: pr["headRefOid"] for pr in prs}
+    for e in (saved or {}).get("suspects") or ():
+        head = heads.get(e["pr"])
+        if head is not None and head != e["head"]:
+            return e["pr"], head
+    return None
+
+
+def stale_members(last, queue):
+    """The pull requests of `last`'s batch (ahead.json) that are in
+    `queue` at a head other than the one the batch predicted."""
+    batch = (last or {}).get("batch") or {}
+    entries = ((last or {}).get("entries") or [])[:batch.get("size", 0)]
+    if not entries:
+        return []
+    heads = {pr["number"]: pr["headRefOid"] for pr in queue}
+    return [e.get("pr") for e in entries
+            if heads.get(e.get("pr")) not in (None, e.get("head"))]
+
+
+def forget_batch(state_dir, last):
+    """`last` (ahead.json) without its batch, `later` batches and
+    `left_top`, saved: they were predicted on heads that have moved, so
+    the tick predicts them again from the heads there are."""
+    if not isinstance(last, dict):
+        return last
+    last = {k: v for k, v in last.items()
+            if k not in ("batch", "later", "left_top")}
+    save_json(os.path.join(state_dir, AHEAD_FILE), last)
+    return last
+
+
 def suspect_place(saved, queue):
     """{number: place} of the suspects in `queue` still at the head they
     were suspected at, in their order: they go first, so nothing joins
@@ -8455,6 +8495,21 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             state_dir, queue, trees_of) if merging else set())
     saved = load_suspects(state_dir) \
         if TEST_AHEAD and AHEAD_BATCH > 1 else None
+    moved = suspect_moved(saved, prs) if saved else None
+    if moved:
+        # agent-forge #447: a suspect's new head ends the search; the
+        # trains are predicted again this tick from the heads there are.
+        out("SEARCH-ENDED #%d: new head %s; the search of #%d..#%d ends "
+            "and its batches are predicted again" % (
+                moved[0], short(moved[1]), saved["suspects"][0]["pr"],
+                saved["suspects"][-1]["pr"]))
+        saved = None
+        path = os.path.join(state_dir, SUSPECTS_FILE)
+        if os.path.exists(path):
+            os.remove(path)
+        path = os.path.join(state_dir, AHEAD_FILE)
+        if os.path.exists(path):
+            forget_batch(state_dir, load_json(path, {}))
     if saved:
         # A red batch's suspects lead while the search goes on: nothing
         # joins in front of them or among them (designs/0035, second
@@ -8582,6 +8637,19 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     "top they were cut under, %s" % (
                         entries[0]["pr"], entries[-1]["pr"],
                         short(last_ahead["left_top"].get("sha") or "")))
+        stale = stale_members(last_ahead, members) if not entries else []
+        batch = (last_ahead.get("entries") or [])[
+            :(last_ahead.get("batch") or {}).get("size", 0)] if stale else []
+        if batch and tree_verdict(check_state, batch[-1].get("tree")) \
+                is True:
+            # agent-forge #447: a green batch that can't merge because a
+            # member moved is forgotten, so its green top doesn't leave
+            # forge-pr-check with nothing to run.
+            out("BATCH-STALE #%d..#%d: %s moved since it was predicted; "
+                "predicted again from the heads there are" % (
+                    batch[0]["pr"], batch[-1]["pr"],
+                    ", ".join("#%d" % n for n in stale)))
+            last_ahead = forget_batch(state_dir, last_ahead)
         if entries:
             opened = {}
             merged, _ = train_merge(repo, state_dir, entries, members,
