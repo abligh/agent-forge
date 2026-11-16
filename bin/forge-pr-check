@@ -2160,7 +2160,12 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
         current.add(sha)
         if sha not in state["waiting"]:
             new.append(sha)
-        state["waiting"].setdefault(sha, {"pr": pr, "since": iso(when)})
+        # `since` is the head's place in the queue, which it may inherit
+        # from an older head of its pull request (designs/0052 §1);
+        # `queued` stays when this head itself began to wait, for the
+        # wait it logs (agent-forge #474).
+        state["waiting"].setdefault(sha, {"pr": pr, "since": iso(when),
+                                          "queued": iso(when)})
         state["waiting"][sha]["pr"] = pr
         if author:
             state["waiting"][sha]["author"] = author
@@ -2193,6 +2198,32 @@ def note_heads(state, heads, when, state_dir, out=print, post=None):
     if post is not None:
         for sha in new:
             post(sha, "pending", queued_description(state, sha, when))
+
+
+def own_wait_start(entry, since):
+    """When a waiting head itself began to wait: its `queued`, or, for
+    an entry from before agent-forge #474 or one made elsewhere, its
+    `since`. Never later than `since` would make it look: a `queued`
+    that can't be read falls back to `since`."""
+    queued = entry.get("queued")
+    try:
+        parse(queued)
+    except (TypeError, ValueError):
+        return since
+    return queued
+
+
+def place_note(since, queued, started):
+    """" place=Ns": how long the head's pull request had held its
+    place in the queue, when that is older than the head's own wait
+    (designs/0052 §1); "" otherwise. `forge-stats` reads `waited=`,
+    the head's own wait, for check_wait (agent-forge #474)."""
+    try:
+        place = (started - parse(since)).total_seconds()
+        own = (started - parse(queued)).total_seconds()
+    except (TypeError, ValueError):
+        return ""
+    return " place=%ds" % place if place > own else ""
 
 
 def keep_pr_places(state, open_prs, new, when):
@@ -7920,9 +7951,10 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             return 2
         with state_lock(state_dir):
             state = load(state_dir)
-            seen = state["waiting"].get(sha, {}).get("since", iso(started)) \
-                if warm else \
-                state["waiting"].pop(sha, {}).get("since", iso(started))
+            entry = state["waiting"].get(sha, {}) if warm else \
+                state["waiting"].pop(sha, {})
+            seen = entry.get("since", iso(started))
+            queued = own_wait_start(entry, seen)
             record = {
                 "pr": pr, "slot": slot, "seen": seen, "started": iso(started),
                 "finished": iso(finished), "ok": ok,
@@ -8034,7 +8066,7 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             log(state_dir, "%s %s %s: %s waited=%ds ran=%ds%s"
                 % ("MAIN-GREEN" if ok else "MAIN-RED", MAIN, sha[:10],
                    verdict_word(record),
-                   (started - parse(seen)).total_seconds(),
+                   (started - parse(queued)).total_seconds(),
                    record["seconds"], tier_note(record)), finished, out)
             if report is not None:
                 report(sha, ok, [(r["name"], r.get("tail", ""))
@@ -8050,13 +8082,14 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                     except OSError:
                         pass
         else:
-            log(state_dir, "VERDICT%s %s %s: %s waited=%ds ran=%ds%s%s"
+            log(state_dir, "VERDICT%s %s %s: %s waited=%ds ran=%ds%s%s%s"
                 % (" AHEAD" if ahead else "", name, sha[:10],
                    verdict_word(record),
-                   (started - parse(seen)).total_seconds(),
+                   (started - parse(queued)).total_seconds(),
                    record["seconds"], " merger_weight"
                    if record.get("merger_weight") else "",
-                   tier_note(record)), finished, out)
+                   tier_note(record), place_note(seen, queued, started)),
+                finished, out)
             if report is not None and not ok and not ahead:
                 report(sha, ok, [(r["name"], r.get("tail", ""))
                                  for r in results if r["rc"] != 0], None)
