@@ -928,15 +928,18 @@ class Check(unittest.TestCase):
 
     def test_merge_area_reviewers(self):
         # designs/0058.
-        for value in (True, False, {}, {"ignore": [".agent-forge/**"]}):
+        for value in (True, False, {}, {"ignore": [".agent-forge/**"]},
+                      {"tell": False}, {"tell": True}):
             self.assertEqual(self.problems(merge={"area_reviewers": value}),
                              [], value)
         self.assertEqual(self.problems(merge={"area_reviewers": "yes"}), [
             "merge.area_reviewers must be true or false or an object"])
         self.assertEqual(self.problems(merge={"area_reviewers": {
-            "ignore": ["", 3], "tell": True}}), [
-            "merge.area_reviewers: unknown key 'tell'",
+            "ignore": ["", 3], "tell": True, "wake": 1}}), [
+            "merge.area_reviewers: unknown key 'wake'",
             "merge.area_reviewers.ignore must be a list of path globs"])
+        self.assertTrue(self.problems(merge={"area_reviewers": {
+            "tell": "yes"}}))
         data = example()
         for entry in data["agents"].values():
             entry.pop("reviews", None)

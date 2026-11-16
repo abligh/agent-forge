@@ -586,6 +586,27 @@ class Snapshot(Base):
         self.assertEqual(got["overdue"], 2)
 
 
+    def test_area_and_code_owner_holds_with_how_long_they_stood(self):
+        # designs/0058 step 3.
+        area = "waits for UIReviewer (web/**): web/a.txt and 2 more"
+        records = RECORDS + [
+            rec("10:41:00", [20], held={"20": area}),
+            rec("10:46:00", [20, 21], held={
+                "20": area, "21": "waits for code owner @alex: a.txt"}),
+            rec("10:51:00", [20, 21, 22], held={
+                "20": area, "21": "waits for code owner @alex: a.txt",
+                "22": "waits for Reviewer2 or Reviewer3 (src/**): src/x"})]
+        got = self.flow(records=records).snapshot()
+        self.assertEqual(got["held"], {"area": [20, 22], "code owner": [21]})
+        self.assertEqual(got["held_minutes"], {"area": 5, "code owner": 5})
+        self.assertEqual(tool.hold_kind(
+            "waits for an area's reviewer: its changed paths can't be "
+            "listed"), "area")
+        self.assertEqual(tool.hold_kind(
+            "waits for a code owner: its changed paths can't be listed"),
+            "code owner")
+
+
 class StacksAndTrains(Base):
     """The stacks as trees and the trains now, for the page."""
 

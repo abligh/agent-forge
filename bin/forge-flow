@@ -48,7 +48,9 @@ target about 2).
    eligible`. Minutes in each state, each hour.
 2. Flow: merges, arrivals (pull requests the build check first ran),
    runs, hand-backs and re-cuts, each per hour; the pull requests
-   waiting now, by where they wait. A graph of merges each hour.
+   waiting now, by where they wait, the held ones by kind of hold
+   (`code owner` and designs/0058's `area` among them) with the median
+   minutes those holds have stood. A graph of merges each hour.
 3. Efficiency: (a) build-check runs per merged pull request, from its
    first push to its merge: its head runs and the batch runs it was a
    member of; (b) all runs started in the window per merge; pull
@@ -221,11 +223,16 @@ MAIN_MATCHED_RE = re.compile(r"^(\S+) MAIN-GREEN main ([0-9a-f]+): matched")
 COVERED_RE = re.compile(
     r"^(\S+) COVERED #(\d+) ([0-9a-f]+): the top of the Merger's batch "
     r"#(\d+)\.\.#(\d+) tested green as ([0-9a-f]+)")
-# What a hold says, as the page groups them.
+# What a hold says, as the page groups them: regular expressions, each
+# searched for in the Merger's reason.
 HOLDS = (("stacked", ("stacked on",)),
          ("right of way", ("right of way",)),
          ("conflicts with one ahead", ("ahead of it in the queue",)),
-         ("review after the approval", ("after the approval",)))
+         ("review after the approval", ("after the approval",)),
+         ("code owner", (r"^waits for (a )?code owner",)),
+         # designs/0058: `waits for UIReviewer (web/**): web/a.txt`.
+         ("area", (r"^waits for an area's reviewer",
+                   r"^waits for \S+( or \S+)* \(")))
 
 
 def iso(when):
@@ -529,7 +536,7 @@ def segment(record, pr):
 
 def hold_kind(reason):
     for kind, needles in HOLDS:
-        if any(n in reason for n in needles):
+        if any(re.search(n, reason) for n in needles):
             return kind
     return "other"
 
@@ -1170,6 +1177,19 @@ class Flow:
         for pr, reason in sorted((last.get("held") or {}).items(),
                                  key=lambda kv: int(kv[0])):
             held[hold_kind(reason)].append(int(pr))
+        # How long each hold now has stood, by kind (designs/0058: is a
+        # specialist the slow step?), in minutes, as its median.
+        stood = collections.defaultdict(list)
+        for kind, numbers in held.items():
+            for number in numbers:
+                since = last["_t"]
+                for record in reversed(self.records):
+                    reason = (record.get("held") or {}).get(str(number))
+                    if reason is None or hold_kind(reason) != kind:
+                        break
+                    since = record["_t"]
+                stood[kind].append(
+                    (last["_t"] - since).total_seconds() / 60)
         row = last.get("right_of_way") or {}
         since = None
         if row.get("pr") is not None:
@@ -1186,6 +1206,8 @@ class Flow:
                 "batch": batch, "later": later, "queued": queued,
                 "handed_back": back, "handed_back_causes": reasons,
                 "held": dict(held),
+                "held_minutes": {k: round(statistics.median(v))
+                                 for k, v in stood.items()},
                 "right_of_way": {"pr": row.get("pr"),
                                  "since": stamp(since) if since else None},
                 "overdue": len(last.get("overdue") or {}),
@@ -3087,7 +3109,10 @@ def page(data):
                        if p in snap.get("handed_back_causes", {}) else "")
             for p in snap.get("handed_back", [])) or "-"]]
     for kind, prs in sorted(snap.get("held", {}).items()):
-        where.append(["held: %s" % kind, ", ".join("#%d" % p for p in prs)])
+        stood = snap.get("held_minutes", {}).get(kind)
+        where.append(["held: %s%s" % (
+            kind, "" if stood is None else " (median %d min)" % stood),
+            ", ".join("#%d" % p for p in prs)])
     out.append("<section><h2>2. Flow</h2>%s<p class=\"note\">Counts are "
                "per hour in every window; hover one for the count itself. "
                "Means are means over the Merger's ticks.</p>%s"
