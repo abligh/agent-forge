@@ -701,8 +701,15 @@ check those. A pull request whose changed paths git can't list waits
 too. `held` says `waits for code owner @owner: path`. It is a hold, so
 nothing is posted and the author is asked for nothing. Off by default.
 With `train_merge`, such a pull request merges on its own, never in a
-train's pull request, which GitHub would refuse for want of the
-owner's review on it (`TRAIN-SKIP`; agent-forge #459).
+train's pull request, where GitHub would refuse that pull request for
+want of the owner's review on it (`TRAIN-SKIP`; agent-forge #459).
+That's only when the review is required: when a ruleset on the default
+branch has `require_code_owner_review`, or when GitHub has refused such
+a train for it before (remembered in the Merger's
+`owner-review-required.json`; classic branch protection can't be read
+with an App's token, so it costs one refused train, once). Where the
+rules don't require it, the member, already approved by its owner,
+trains like any other (agent-forge #472).
 
 `code_owner_ask`, `{"labels": [...], "title": ...}` (each optional;
 needs `code_owners`; agent-forge #153), makes that hold visible to an

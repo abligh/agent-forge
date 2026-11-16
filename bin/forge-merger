@@ -7422,6 +7422,32 @@ def code_owned_members(repo, numbers, prs, main_tip, run=sh):
     return owned
 
 
+OWNER_REVIEW_FILE = "owner-review-required.json"
+
+
+def owner_review_required(github, state_dir):
+    """Whether a train holding a code-owned member would need the code
+    owner's review on its own pull request (agent-forge #472): when a
+    ruleset on the default branch requires a code owner's review, or
+    when GitHub has refused such a train for it before, which
+    OWNER_REVIEW_FILE remembers. Classic branch protection can't be
+    read with an App's token, so a repository that requires the review
+    only there pays one refused train, once. A repository whose rules
+    don't ask for the review merges these trains like any other. A
+    failure to read the rulesets counts as yes, as before #472."""
+    try:
+        rules = github.api("repos/%s/rules/branches/%s" % (REPO_SLUG, MAIN))
+    except RuntimeError:
+        return True
+    for rule in rules or []:
+        if (isinstance(rule, dict) and rule.get("type") == "pull_request"
+                and (rule.get("parameters") or {}).get(
+                    "require_code_owner_review")):
+            return True
+    return bool(load_json(os.path.join(state_dir, OWNER_REVIEW_FILE),
+                          {}).get("required"))
+
+
 def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
                 github, run=sh, sleep=time.sleep, out=print, note=None,
                 main=None, tested_tree=None):
@@ -7454,7 +7480,7 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
         return fail("merge.ci_workflow is set, and the train's commits "
                     "have no runs of it")
     owned = code_owned_members(repo, numbers, prs, main_tip, run)
-    if owned:
+    if owned and owner_review_required(github, state_dir):
         # GitHub wants the code owner's review on the train's own pull
         # request too, which no owner gives it: it would be refused
         # (agent-forge #459). Not a failure, so no TRAIN-MERGE line.
@@ -7547,6 +7573,15 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
                      state="closed")
         github.write("DELETE", "repos/%s/git/refs/heads/%s"
                      % (REPO_SLUG, branch))
+        if owned and "code owner" in (why or "").lower():
+            # agent-forge #472: this repository wants the owner's review
+            # on the train's own pull request, so code-owned members
+            # skip trains from now on.
+            try:
+                save_json(os.path.join(state_dir, OWNER_REVIEW_FILE),
+                          {"required": True, "why": why})
+            except OSError:
+                pass
         return fail("GitHub refused to merge #%d: %s" % (number, why))
     github.write("DELETE", "repos/%s/git/refs/heads/%s" % (REPO_SLUG, branch))
     unmerged = list(numbers)
