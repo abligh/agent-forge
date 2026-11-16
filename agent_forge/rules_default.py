@@ -197,6 +197,18 @@ key):
     actionable for rules 15-17 or rule 16's unstarted count: it waits,
     as a waiting label makes it wait, and rule 22 wakes it.
 
+After rule 14, for an issue:
+
+24. an issue with an owner, no waiting label, not waiting for a
+    nightly (rule 22's) and not blocked by an open item, whose newest
+    `Defer-until:` (as the Merger reads it) has passed, and on which
+    neither the project's owner nor an agent has commented since that
+    time: the owner's, "act on it, or set a new one". The event is the
+    deferral's time, so it is woken once and then reminded about
+    hourly until someone comments or the deferral moves. A deferral
+    that lapsed unnoticed held work, and what its issue blocked, for a
+    day and more (agent-forge, 2026-11-16).
+
 With `router.idle_offer` in the configuration, a run also sweeps for
 agents with nothing to do (off without it):
 
@@ -243,7 +255,12 @@ agents with nothing to do (off without it):
     actionable, as above, and isn't labelled `in-progress` (after the
     labels' `status_prefix`). The most is the larger count, then the
     owner of the oldest such issue; the list is oldest first, at most
-    ten.
+    ten. The report ends with what holds each of the idle developer's
+    own issues, oldest first, at most fifteen and then how many more:
+    a waiting or quiet label by name, "awaiting-nightly (no nightly
+    since its last comment)", "Defer-until 11-17 09:00Z", "Blocked-by
+    #M (open)", or "in hand: PR #P", so whoever plans the work can see
+    which of those waits are real.
 
 An agent whose entry says `"offer": false` is never offered work by
 rule 15 nor reported by rule 16.
@@ -293,6 +310,15 @@ not waiting on the owner, is rule 18's:
     without `triage`. The event is the later of its creation and its
     `Owner:` labels' last change, so it is said once and said again if
     its label is taken off.
+
+With `owners.triage`, a run that isn't `--only`'s also sweeps:
+
+25. once a day, `triage`'s list of the open issues with no owner, no
+    waiting label and no quiet label, oldest first with their titles
+    (at most thirty, then how many more), "give each an Owner:<Name>
+    label, or a waiting label"; nothing on a day there are none. The
+    event is the day, so rule 18's one wake per issue, easily lost, is
+    followed by a reminder of all of them each day.
 
 With `router.unreviewed` (designs/0027), which needs `owners.triage`,
 a run that isn't `--only`'s also sweeps for paths no reviewer covers
@@ -725,6 +751,37 @@ def unowned(issue, roster):
     event = max([issue.get("createdAt") or ""] + changed)
     return turn(n, triage, 18, event, "%s: label it %s<Name>" % (
         why, OWNER_PREFIX))
+
+
+# How many issues the daily list of unowned issues names.
+UNOWNED_LIST = 30
+
+
+def unowned_list(ctx):
+    """Rule 25: once a day, `owners.triage`'s list of the open issues
+    with no owner, no waiting label and no quiet label, oldest first,
+    with their titles; nothing when there are none. The event is the
+    day, so it is said once a day."""
+    found = [i for i in sorted(ctx.issues, key=lambda i: (
+                 i.get("createdAt") or "", i["number"]))
+             if is_issue(i) and issue_owner(i, ctx.roster) is None
+             and not quiet(i)
+             and not any(l.startswith(WAITING_PREFIX) or l in (
+                 WAITING_OWNER, WAITING_EXTERNAL) for l in labels_of(i))]
+    if not found:
+        return []
+    listed = "; ".join("#%d%s" % (i["number"], ' "%s"' % i["title"].strip()
+                                   if (i.get("title") or "").strip() else "")
+                       for i in found[:UNOWNED_LIST])
+    more = len(found) - UNOWNED_LIST
+    return [Decision(
+        None, OWNERS["triage"], 25, "unowned %s" % ctx.when.strftime(
+            "%Y-%m-%d"),
+        "%s with no owner, oldest first: %s%s. Give each an %s<Name> "
+        "label, or a waiting label." % (
+            counted(len(found), "open issue", "open issues"), listed,
+            "; and %d more" % more if more > 0 else "", OWNER_PREFIX),
+        reminder=ONCE)]
 
 
 def last_by(items, logins, stamp="createdAt"):
@@ -1191,7 +1248,39 @@ def route_issue(issue, roster, ctx=None):
     unblocked = unblocked_by(issue, owner, comments, roster)
     if unblocked:
         return unblocked
+    # Rule 24.
+    lapsed = deferral_passed(issue, owner, ctx)
+    if lapsed:
+        return lapsed
     return nobody(n, None, "no rule matched")
+
+
+def deferral_passed(issue, owner, ctx):
+    """Rule 24: the owner's turn while the issue's newest `Defer-until:`
+    has passed and neither the project's owner nor an agent has
+    commented since that time, else None. Not for an issue with a
+    waiting label, one waiting for a nightly (rule 22's) or one still
+    blocked by an open item. The event is the deferral's time, so it
+    is woken once and reminded about hourly until someone comments or
+    the deferral is moved."""
+    if ctx is None or not owner:
+        return None
+    if any(l.startswith(WAITING_PREFIX) for l in labels_of(issue)) \
+            or awaits_nightly(issue) or blocked(issue):
+        return None
+    until = deferred_until(issue)
+    if until is None or until > ctx.when:
+        return None
+    stamp = until.astimezone(datetime.timezone.utc).strftime(STAMP)
+    said = [as_stamp(c.get("createdAt"))
+            for c in issue.get("comments") or ()
+            if author_of(c) in BLOCKER_WRITERS]
+    if any(t and t > stamp for t in said):
+        return None
+    d = turn(issue["number"], owner, 24, stamp, "", reminder=HOURLY)
+    d["line"] = "#%d's Defer-until (%s) has passed: act on it, or set a " \
+        "new one." % (issue["number"], since_text(stamp, ctx.when))
+    return d
 
 
 # Rules 14 and 22 go on reminding while what they say stays true: a
@@ -1284,6 +1373,8 @@ def sweep(ctx):
             fallbacks, taken = red_fallbacks(ctx)
             decisions += fallbacks
         decisions += idle_offers(ctx, skip=taken)
+    if OWNERS is not None and OWNERS.get("triage"):
+        decisions += unowned_list(ctx)
     if MERGE_NOTICE is not None:
         decisions += merge_notices(ctx)
     if UNREVIEWED is not None:
@@ -1472,34 +1563,64 @@ def owned_issues(agent, ctx):
     (`router.nightly_wake`'s label) or until a `Defer-until:` time still
     to come, or its own
     open pull request already references them."""
-    mine = ctx.roster.login_of(agent)
-    in_hand = set()
-    for pr in ctx.prs:
-        if author_of(pr) == mine:
-            in_hand |= referenced_by(pr)
     actionable, held, waiting = [], 0, 0
-    for issue in ctx.issues:
-        if issue_owner(issue, ctx.roster) != agent:
-            continue
-        labels = labels_of(issue)
-        # Any waiting label, not only the two named in the offer: a
-        # project's own, such as one for the backlog, is a wait too.
-        until = deferred_until(issue)
-        if WAITING_OWNER in labels or WAITING_EXTERNAL in labels \
-                or any(l.startswith(WAITING_PREFIX) for l in labels) \
-                or quiet(issue) \
-                or (awaits_nightly(issue) and not nightly_due(issue)) \
-                or (until is not None and until > ctx.when):
+    for issue, kind, _ in owned_issue_states(agent, ctx):
+        if kind == "waiting":
             waiting += 1
-        elif blocked(issue):
+        elif kind == "blocked":
             held += 1
-        elif issue["number"] not in in_hand:
+        elif kind is None:
             actionable.append(issue)
     # designs/0054: urgent, then (with `router.red_first`, designs/0039)
     # red builds, then bugs, then the rest; oldest first in each.
     actionable.sort(key=lambda i: (rank(i, ctx), i.get("createdAt") or "",
                                    i["number"]))
     return actionable, held, waiting
+
+
+def owned_issue_states(agent, ctx):
+    """(issue, kind, why) for each of the agent's issues, oldest first:
+    `kind` None for one it can act on, else "waiting", "blocked" or
+    "in hand", and `why` what holds it, as rule 16's report says it."""
+    mine = ctx.roster.login_of(agent)
+    in_hand = {}
+    for pr in sorted(ctx.prs, key=lambda p: p["number"]):
+        if author_of(pr) == mine:
+            for number in referenced_by(pr):
+                in_hand.setdefault(number, pr["number"])
+    found = []
+    for issue in sorted(ctx.issues, key=lambda i: (
+            i.get("createdAt") or "", i["number"])):
+        if issue_owner(issue, ctx.roster) != agent:
+            continue
+        labels = labels_of(issue)
+        # Any waiting label, not only the two named in the offer: a
+        # project's own, such as one for the backlog, is a wait too.
+        waiting = [l for l in labels
+                   if l in (WAITING_OWNER, WAITING_EXTERNAL)
+                   or l.startswith(WAITING_PREFIX)]
+        until = deferred_until(issue)
+        hushed = quiet(issue)
+        if waiting:
+            found.append((issue, "waiting", waiting[0]))
+        elif hushed:
+            found.append((issue, "waiting", hushed))
+        elif awaits_nightly(issue) and not nightly_due(issue):
+            found.append((issue, "waiting", "%s (no nightly since %s)" % (
+                NIGHTLY_WAKE["label"], "its last comment"
+                if issue.get("publishedNightly") else "it was labelled")))
+        elif until is not None and until > ctx.when:
+            found.append((issue, "waiting", "Defer-until %s" % (
+                until.strftime("%m-%d %H:%MZ"))))
+        elif blocked(issue):
+            found.append((issue, "blocked", "Blocked-by %s (open)" % (
+                ", ".join("#%d" % b for b in open_blockers(issue)))))
+        elif issue["number"] in in_hand:
+            found.append((issue, "in hand", "in hand: PR #%d" % (
+                in_hand[issue["number"]])))
+        else:
+            found.append((issue, None, None))
+    return found
 
 
 def turns_of(agent, ctx):
@@ -1658,11 +1779,29 @@ def idle_offers(ctx, skip=()):
             if n) or "no open issues of its own"
         decisions.append(Decision(
             None, report_to, 16, "%s %s" % (agent, stamp),
-            "%s has been idle since %s with nothing it can act on (%s).%s"
+            "%s has been idle since %s with nothing it can act on (%s).%s%s"
             % (agent, since_text(stamp, ctx.when), why,
-               hand_over(agent, ctx)),
+               hand_over(agent, ctx), held_list(agent, ctx)),
             reminder=ONCE))
     return decisions
+
+
+# How many held issues rule 16's report lists before "and K more".
+HELD_LIST = 15
+
+
+def held_list(agent, ctx):
+    """Rule 16's list of what holds each of the agent's issues, oldest
+    first, at most HELD_LIST: " Held: #N why; ...", or "" when none
+    is held."""
+    held = [(i["number"], why) for i, kind, why
+            in owned_issue_states(agent, ctx) if kind is not None]
+    if not held:
+        return ""
+    shown = "; ".join("#%d %s" % h for h in held[:HELD_LIST])
+    more = len(held) - HELD_LIST
+    return " Held: %s%s." % (shown, "; and %d more" % more if more > 0
+                             else "")
 
 
 def hand_over(idle, ctx):

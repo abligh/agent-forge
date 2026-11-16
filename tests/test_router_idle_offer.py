@@ -327,8 +327,13 @@ class Actionable(unittest.TestCase):
         # owner's oldest item before its date.
         self.assertEqual(self.offer([
             owned(30, body="Defer-until: 2099-01-01\n")]), [])
-        self.assertEqual(len(self.offer([
-            owned(30, body="Defer-until: 2000-01-01\n")])), 1)
+        # A passed one is rule 24's turn, which wakes her itself, so no
+        # offer is needed for it.
+        self.assertEqual(self.offer([
+            owned(30, body="Defer-until: 2000-01-01\n")]), [])
+        self.assertEqual(rules.owned_issues("LeadDev", context(
+            issues=[owned(30, body="Defer-until: 2000-01-01\n")]))[0][0]
+            ["number"], 30)
 
     def test_not_waiting_on_anything_else(self):
         # A parked item (Status:waiting-backlog) is a wait too: it was
@@ -565,8 +570,18 @@ class Report(unittest.TestCase):
         self.assertEqual(got, [router.Decision(
             None, "LeadDev", 16, "UIDev " + IDLE,
             "UIDev has been idle since 13:30Z with nothing it can act on (2 "
-            "open pull requests, 1 issue blocked, 1 issue waiting).",
+            "open pull requests, 1 issue blocked, 1 issue waiting). Held: "
+            "#30 Blocked-by #31 (open); #32 Status:waiting-owner; #33 in "
+            "hand: PR #41.",
             reminder=router.ONCE)])
+
+    def test_the_held_list_is_capped(self):
+        issues = [owned(n, owner="UIDev", labels=["Status:waiting-owner"])
+                  for n in range(100, 120)]
+        got = self.sweep(issues, [], entry("WidgetUIDev"))
+        line = got[0].line
+        self.assertIn("#114 Status:waiting-owner; and 5 more.", line)
+        self.assertNotIn("#115", line)
 
     def test_owning_nothing_at_all(self):
         got = self.sweep([], [], entry("WidgetUIDev"))
