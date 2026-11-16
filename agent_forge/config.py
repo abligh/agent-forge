@@ -143,8 +143,7 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
 # checks.quick's context on the head and merges only trains.
 GATE_TIERS = ("head", "train")
 # merge.area_reviewers (designs/0058).
-# `tell` (step 2) joins it when the Merger acts on it.
-AREA_REVIEWERS = {"ignore": list}
+AREA_REVIEWERS = {"ignore": list, "tell": bool}
 # merge.code_owner_ask (agent-forge #153).
 CODE_OWNER_ASK = {"labels": list, "title": str}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
