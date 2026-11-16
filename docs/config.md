@@ -1152,7 +1152,11 @@ your turn: …", naming up to three turns, pull requests first, once per
 idle period (or every `retell_minutes`). Without it, an agent that
 went idle on a turn heard of it again only at the turn's reminder,
 hours later. An idle developer with
-nothing to act on is reported to `report_to`, once per idle period. A
+nothing to act on is reported to `report_to`, once per idle period,
+with what holds each issue she owns (a waiting label, a nightly not yet
+published since its last comment, a `Defer-until:` still to come, an
+open blocker, her own pull request), oldest first and at most fifteen,
+so the report shows which waits are real. A
 directory that can't
 be read, or isn't complete, makes nobody idle. Off without the key;
 `{}` turns it on with the defaults. `agent_forge/rules_default.py`
@@ -1221,7 +1225,11 @@ agent the label names, else the author when the author is an agent,
 else nobody. A label naming no agent is passed over. An issue nobody
 owns, and not waiting on someone outside, is rule 18: `triage`'s turn,
 "label it", said once for when it was opened or its `Owner:` labels
-last changed, or surfaced when `triage` isn't set. `{}` turns on the
+last changed, or surfaced when `triage` isn't set. With `triage`, she
+is also sent once a day a list of every open issue with no owner, no
+waiting label and no quiet label, oldest first with titles (rule 25),
+when there is one, since rule 18's single wake per issue is easily
+lost. `{}` turns on the
 reading alone. Pull requests are unchanged: they are their author's or
 a reviewer's, never by label.
 [designs/0008](designs/0008-every-issue-has-an-owner.md) has the
