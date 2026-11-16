@@ -1260,6 +1260,12 @@ CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
 # names whose approval clears it (their stand-ins too). None when off.
 AREAS = None
 AREA_IGNORE = ()
+# merge.area_reviewers.tell (designs/0058 step 2, default true): each
+# waiting area's first reviewer is woken through the relay, once per pull
+# request, head and area, recorded in AREA_TOLD_FILE ({pr: {"head": sha,
+# "told": [first reviewer, ...]}}). No issue is opened.
+AREA_TELL = False
+AREA_TOLD_FILE = "told-areas.json"
 # merge.right_of_way: after ROW_AFTER conflict hand-backs, those that
 # conflict with the pull request's clean head are held for ROW_FOR.
 RIGHT_OF_WAY = False
@@ -1451,7 +1457,7 @@ def configure(project):
         SEARCH_CUTS, WINDOW
     global AGE_FIRST, PREDICT_RESTACKED, ONCE_PER_HEAD, ROW_WHILE_ELIGIBLE
     global FIXED_ORDER, GREEN_BATCH_FIRST, RED_SUSPECT_OUT, UNSTABLE_AFTER
-    global UNSTABLE_BATCHES, TELL_BOARDED, AREAS, AREA_IGNORE
+    global UNSTABLE_BATCHES, TELL_BOARDED, AREAS, AREA_IGNORE, AREA_TELL
     global BOARD_UNREVIEWED
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
     global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR, LAYERS_OWN_GREEN
@@ -1550,6 +1556,9 @@ def configure(project):
                                         False) is True
     CODE_OWNERS = merge.get("code_owners", False) is True
     AREAS, AREA_IGNORE = areas_of(project, merge.get("area_reviewers"))
+    setting = merge.get("area_reviewers")
+    AREA_TELL = bool(AREAS) and (setting is True or (
+        isinstance(setting, dict) and setting.get("tell", True) is not False))
     EARLY_CONFLICTS = merge.get("early_conflicts", False) is True
     RESOLVE_SLOTS = merge.get("resolve_slots", 0)
     RESOLVE_SLOT_MINUTES = merge.get("resolve_slot_minutes")
@@ -5306,8 +5315,28 @@ def area_wait(repo, pr, areas, main_ref, run=sh, regenerated=None,
     does) needs, from each area that matches it, a reviewer other than
     its author whose newest verdict is `APPROVED` at a commit that
     covers the head. `areas` is `areas_of`'s list."""
+    return area_reason(area_waits(repo, pr, areas, main_ref, run,
+                                  regenerated, ignore))
+
+
+def area_reason(waits):
+    """The hold line for `area_waits`' findings, or None."""
+    if isinstance(waits, str) or not waits:
+        return waits or None
+    members, glob, path, count = waits[0]
+    more = count - 1
+    return "waits for %s (%s): %s%s" % (
+        " or ".join(members), glob, path,
+        " and %d more" % more if more else "")
+
+
+def area_waits(repo, pr, areas, main_ref, run=sh, regenerated=None,
+               ignore=None):
+    """`area_wait`'s findings: [] when `pr` waits for no area, a string
+    when its paths can't be listed, else one (members, glob, first path,
+    paths waiting in all) for each area it waits for, in `areas`' order."""
     if not areas:
-        return None
+        return []
     ignore = AREA_IGNORE if ignore is None else ignore
     head = pr["headRefOid"]
     have_head(repo, pr, run)
@@ -5344,13 +5373,47 @@ def area_wait(repo, pr, areas, main_ref, run=sh, regenerated=None,
                 continue
             waiting.setdefault(i, (members, glob, path))
             paths.add(path)
-    if not waiting:
-        return None
-    members, glob, path = waiting[min(waiting)]
-    more = len(paths) - 1
-    return "waits for %s (%s): %s%s" % (
-        " or ".join(members), glob, path,
-        " and %d more" % more if more else "")
+    return [waiting[i] + (len(paths),) for i in sorted(waiting)]
+
+
+AREA_TOLD_NOTE = ("From: %s\n#%d (%s) waits for your area's approval at "
+                  "%s: %s matches %s%s. The general reviewer's approval "
+                  "doesn't cover it.\nhttps://github.com/%s/pull/%d\n%s")
+
+
+def tell_areas(state_dir, waits, send, out):
+    """merge.area_reviewers.tell (designs/0058 step 2): wake each
+    waiting area's first reviewer (her stand-in when she is `away`,
+    through `send`) once per pull request, head and area. `waits` is
+    {number: (head, title, area_waits list)} for the pull requests held
+    for an area this tick; anything else is forgotten, so a pull request
+    held again later is told again. A message nobody took is tried on
+    the next tick."""
+    path = os.path.join(state_dir, AREA_TOLD_FILE)
+    told = load_json(path, {})
+    kept = {}
+    for number, (head, title, found) in sorted(waits.items()):
+        entry = told.get(str(number)) or {}
+        done = list(entry.get("told") or []) \
+            if entry.get("head") == head else []
+        for members, glob, first, count in found:
+            name = members[0]
+            if name in done:
+                continue
+            more = count - 1
+            problem = send(name, AREA_TOLD_NOTE % (
+                ACT_AS, number, title, head[:10], first, glob,
+                " and %d more path%s" % (more, "" if more == 1 else "s")
+                if more else "", REPO_SLUG, number, SIGNATURE))
+            if problem:
+                out("AREA-TELL #%d %s: %s" % (number, name, problem))
+            else:
+                done.append(name)
+                out("AREA-TOLD #%d %s %s" % (number, head[:10], name))
+        kept[str(number)] = {"head": head, "told": done}
+    if kept != told:
+        os.makedirs(state_dir, exist_ok=True)
+        save_json(path, kept)
 
 
 def owned_lines(repo, pr, rules, main_ref, run=sh):
@@ -8897,11 +8960,19 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             code_owner_asks(state_dir, github, owner_waits,
                             {p["number"]: p["headRefOid"] for p in prs}, out)
     if AREAS:
+        area_held = {}
         for pr in list(candidates):
-            why = area_wait(repo, pr, AREAS, main_tip, run, regenerated)
+            found = area_waits(repo, pr, AREAS, main_tip, run, regenerated)
+            why = area_reason(found)
             if why:
                 held[str(pr["number"])] = why
                 candidates.remove(pr)
+                if not isinstance(found, str):
+                    area_held[pr["number"]] = (
+                        pr["headRefOid"], pr.get("title") or "", found)
+        # No sender, no message: only `main` passes the relay.
+        if live and AREA_TELL and send is not None:
+            tell_areas(state_dir, area_held, send, out)
     greens = load_greens(state_dir) if OWN_HEAD_GREEN else {}
     # merge.test_ahead.own_green_to_board false: held only for their own
     # green, they may still board a train when one is cut.
@@ -10308,7 +10379,8 @@ def main(argv=None, run=sh, out=print, environ=None, mint=mint,
         # Only a live tick, and only with a stall alert, is given the
         # relay: a dry run messages nobody.
         send = ((sender or relay_sender)(project, environ)
-                if STALL_ALERT and not args.dry_run else None)
+                if (STALL_ALERT or AREA_TELL) and not args.dry_run
+                else None)
         try:
             # After a merge, the next pull request is taken at once
             # rather than on the next event or cron tick.

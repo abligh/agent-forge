@@ -655,9 +655,9 @@ merge with `gh pr merge N --match-head-commit <head>`.
 
 ### `merge.area_reviewers`
 
-With `area_reviewers: true`, or `{"ignore": [...]}`
-([designs/0058](designs/0058-the-merger-waits-for-each-areas-reviewer.md),
-step 1), `agents.<name>.reviews` decides what merges as well as who
+With `area_reviewers: true`, or `{"ignore": [...], "tell": ...}`
+([designs/0058](designs/0058-the-merger-waits-for-each-areas-reviewer.md)),
+`agents.<name>.reviews` decides what merges as well as who
 reviews. A candidate that changes, since the default branch, a path
 some reviewer's `reviews` globs match (`fnmatch`, `*` crossing `/`, as
 the routing matches them) is held until a reviewer of that path's
@@ -675,11 +675,16 @@ for Reviewer2 or Reviewer3 (...)` for a shared area. It adds a hold and
 never replaces the general approval, which the area's approval also is,
 so one review can be both. It is independent of `code_owners`; a held
 candidate never boards a train, and a stack's layer is judged as for
-code owners. `forge-merger --ready N` reports it too. Nothing is posted:
-the area's reviewer isn't yet told (`tell`, step 2). `forge-config
-check` refuses it without a reviewer that has `reviews`, and an `ignore`
-entry that isn't a non-empty string. Off by default (`false` or left
-out): `reviews` only routes.
+code owners. `forge-merger --ready N` reports it too. With `tell`
+(default `true`), a live tick wakes each waiting area's first reviewer
+(her stand-in when she is `away`) through the relay, once per pull
+request, head and area (`AREA-TOLD #<pr> <sha> <name>`; kept in the
+state directory's `told-areas.json`), and a message nobody took is
+tried on the next tick. Nothing is posted on GitHub and no issue is
+opened; `false` leaves the hold silent. `forge-config check` refuses it
+without a reviewer that has `reviews`, an `ignore` entry that isn't a
+non-empty string, and a `tell` that isn't a boolean. Off by default
+(`false` or left out): `reviews` only routes.
 
 ### `merge.code_owners`
 

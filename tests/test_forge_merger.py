@@ -7621,6 +7621,81 @@ class AreaReviewers(RepoCase):
                          "waits for UIReviewer (web/**): web/x.txt and "
                          "1 more")
 
+    def test_tell_is_on_by_default_and_can_be_turned_off(self):
+        # designs/0058 step 2.
+        self.assertTrue(m.AREA_TELL)
+        m.configure(area_project(area_reviewers={"tell": False}))
+        self.assertFalse(m.AREA_TELL)
+        m.configure(project())
+        self.assertFalse(m.AREA_TELL)
+
+    def sent(self):
+        messages = []
+
+        def send(name, text):
+            messages.append((name, text))
+        return messages, send
+
+    def test_the_areas_reviewer_is_woken_once_per_head(self):
+        messages, send = self.sent()
+        item = self.area_pr()
+        record, lines = self.tick([item], live=True, send=send)
+        self.assertEqual([n for n, _ in messages], ["UIReviewer"])
+        self.assertIn("#6", messages[0][1])
+        self.assertIn("web/x.txt matches web/**", messages[0][1])
+        self.assertIn("AREA-TOLD #6 %s UIReviewer" % self.sha[:10], lines)
+        # Nothing on GitHub: no comment, no issue.
+        self.assertEqual(self.github.writes, [])
+        self.tick([item], live=True, send=send)
+        self.assertEqual(len(messages), 1)
+        # A new head is told again.
+        self.repo.branch("area6", self.sha)
+        head = self.repo.commit("web/x.txt", "y\n", "again")
+        self.repo.publish_pr(6, head)
+        self.repo.branch("feature", "feature")
+        item["headRefOid"] = head
+        self.tick([item], live=True, send=send)
+        self.assertEqual(len(messages), 2)
+
+    def test_each_waiting_area_is_woken(self):
+        m.configure(area_project({"WebAudit": {
+            "app_id": 105, "installation_id": 205, "kind": "reviewer",
+            "reviews": ["web/*.txt"]}}))
+        messages, send = self.sent()
+        self.tick([self.area_pr()], live=True, send=send)
+        self.assertEqual(sorted(n for n, _ in messages),
+                         ["UIReviewer", "WebAudit"])
+
+    def test_a_message_nobody_took_is_tried_again(self):
+        tries = []
+
+        def send(name, text):
+            tries.append(name)
+            return None if len(tries) > 1 else "relay down"
+        item = self.area_pr()
+        _, lines = self.tick([item], live=True, send=send)
+        self.assertIn("AREA-TELL #6 UIReviewer: relay down", lines)
+        self.tick([item], live=True, send=send)
+        self.tick([item], live=True, send=send)
+        self.assertEqual(tries, ["UIReviewer", "UIReviewer"])
+
+    def test_no_wake_when_approved_dry_or_turned_off(self):
+        messages, send = self.sent()
+        self.tick([self.area_pr(reviews=[review(self.UI, at=T2)])],
+                  live=True, send=send)
+        self.tick([self.area_pr(7)], live=False, send=send)
+        m.configure(area_project(area_reviewers={"tell": False}))
+        self.tick([self.area_pr(8)], live=True, send=send)
+        self.assertEqual(messages, [])
+
+    def test_held_again_later_is_told_again(self):
+        messages, send = self.sent()
+        item = self.area_pr()
+        self.tick([item], live=True, send=send)
+        self.tick([], live=True, send=send)
+        self.tick([item], live=True, send=send)
+        self.assertEqual(len(messages), 2)
+
     def test_an_away_reviewers_stand_in_clears_her_area(self):
         m.configure(area_project({"UIReviewer": {"away": "Reviewer"}}))
         item = self.area_pr()
