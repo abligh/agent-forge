@@ -14,6 +14,7 @@ import io
 import json
 import os
 import subprocess
+import shutil
 import tempfile
 import unittest
 import urllib.error
@@ -1256,10 +1257,12 @@ class TrainCodeOwned(TrainSetup):
     member that changes a code-owned path isn't tried: GitHub would
     want the owner's review on the train's own pull request."""
 
-    def owners(self, on, rules):
+    def owners(self, on, rules, required=True):
         for attr, value in (("CODE_OWNERS", on),
                             ("codeowners_rules",
-                             lambda repo, ref, run=m.sh: rules)):
+                             lambda repo, ref, run=m.sh: rules),
+                            ("owner_review_required",
+                             lambda github, state_dir: required)):
             patch = mock.patch.object(m, attr, value)
             patch.start()
             self.addCleanup(patch.stop)
@@ -1283,6 +1286,89 @@ class TrainCodeOwned(TrainSetup):
     def test_without_code_owners_the_train_is_tried(self):
         self.owners(False, [("g.txt", ["@owner"])])
         self.assertEqual(self.merge(), ([5, 6], []))
+
+    def test_where_owner_review_isnt_required_the_train_merges(self):
+        # agent-forge #472: a repository whose rules don't ask for a
+        # code owner's review merges a code-owned member's train.
+        self.owners(True, [("g.txt", ["@owner"])], required=False)
+        self.assertEqual(self.merge(), ([5, 6], []))
+        self.assertFalse(any(line.startswith("TRAIN-SKIP")
+                             for line in self.lines), self.lines)
+
+
+class TrainCodeOwnedRefused(TrainSetup):
+    """agent-forge #472: a train GitHub refuses for want of the code
+    owner's review is remembered, so later ones skip."""
+
+    def test_the_refusal_is_remembered(self):
+        for attr, value in (("CODE_OWNERS", True),
+                            ("codeowners_rules",
+                             lambda repo, ref, run=m.sh: [("g.txt",
+                                                           ["@owner"])])):
+            patch = mock.patch.object(m, attr, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, state)
+        self.github = FakeGitHub({
+            SLUG + "/rules/branches/": [],
+            SLUG + "/pulls/": {"merged": False}},
+            lambda method, path: ("Waiting on code owner review from @owner"
+                                  if path.endswith("/merge") else None))
+        merged, _ = m.train_merge(self.repo.path, state, self.entries,
+                                  self.queue, self.tip, self.check,
+                                  self.github, self.git, lambda s: None,
+                                  self.lines.append)
+        self.assertEqual(merged, [])
+        self.assertTrue(m.owner_review_required(self.github, state))
+        self.lines.clear()
+        self.assertEqual(m.train_merge(
+            self.repo.path, state, self.entries, self.queue, self.tip,
+            self.check, self.github, self.git, lambda s: None,
+            self.lines.append), ([], [5, 6]))
+        self.assertTrue(self.lines[-1].startswith("TRAIN-SKIP"), self.lines)
+
+
+class OwnerReviewRequired(unittest.TestCase):
+    """agent-forge #472: whether a train with a code-owned member needs
+    the owner's review on its own pull request."""
+
+    def setUp(self):
+        patch = mock.patch.object(m, "REPO_SLUG", "example/widget")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.state = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state)
+
+    def github(self, rules):
+        class Fake:
+            def api(self, path):
+                if isinstance(rules, Exception):
+                    raise rules
+                return rules
+        return Fake()
+
+    def test_a_ruleset_asking_for_it(self):
+        self.assertTrue(m.owner_review_required(self.github(
+            [{"type": "pull_request",
+              "parameters": {"require_code_owner_review": True}}]),
+            self.state))
+
+    def test_a_ruleset_not_asking(self):
+        self.assertFalse(m.owner_review_required(self.github(
+            [{"type": "pull_request",
+              "parameters": {"require_code_owner_review": False}},
+             {"type": "required_status_checks", "parameters": {}}]),
+            self.state))
+
+    def test_a_refusal_remembered(self):
+        m.save_json(os.path.join(self.state, m.OWNER_REVIEW_FILE),
+                    {"required": True})
+        self.assertTrue(m.owner_review_required(self.github([]), self.state))
+
+    def test_a_failure_to_ask_counts_as_yes(self):
+        self.assertTrue(m.owner_review_required(
+            self.github(RuntimeError("gh api: HTTP 502")), self.state))
 
 
 class TrainMerge(TrainSetup):
