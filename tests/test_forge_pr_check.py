@@ -236,7 +236,8 @@ class NoteHeads(StateCase):
         self.note(state, [(7, SHA_A, REPO, False)],
                   when=T0 + datetime.timedelta(minutes=5))
         self.assertEqual(state["waiting"],
-                         {SHA_A: {"pr": 7, "since": pc.iso(T0)}})
+                         {SHA_A: {"pr": 7, "since": pc.iso(T0),
+                                  "queued": pc.iso(T0)}})
 
     def test_a_new_head_gets_a_queued_status_once(self):
         # Without it a head showed nothing until a slot came free, and
@@ -318,8 +319,11 @@ class NextHead(unittest.TestCase):
                               (2, SHA_B, pc.REPO_SLUG, False)],
                       when, tempfile.mkdtemp(), out=lambda *a: None)
         self.assertNotIn(SHA_A, state["waiting"])
+        # Its place is the old head's; its own wait (agent-forge #474)
+        # starts now.
         self.assertEqual(state["waiting"][SHA_C],
-                         {"pr": 1, "since": "2026-10-09T09:00:00Z"})
+                         {"pr": 1, "since": "2026-10-09T09:00:00Z",
+                          "queued": "2026-10-09T11:00:00Z"})
         self.assertEqual(pc.next_head(state), (SHA_C, 1))
 
     def test_a_head_after_a_verdict_waits_from_when_it_came(self):
@@ -1487,6 +1491,29 @@ class Worker(StateCase):
                          (True, [], seen))
         logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
         self.assertIn("VERDICT #7 aaaaaaaaaa: green waited=180s", logged)
+
+    def test_a_head_that_kept_its_place_logs_its_own_wait(self):
+        # agent-forge #474: a later head inherits its pull request's
+        # place (designs/0052 §1), but waited= is its own wait, and the
+        # place's age goes beside it.
+        self.write_state({"waiting": {SHA_A: {
+            "pr": 7, "since": pc.iso(T0 - datetime.timedelta(hours=5)),
+            "queued": pc.iso(T0 - datetime.timedelta(minutes=3))}}})
+        self.assertEqual(self.work(self.run_for()), 0)
+        record = self.state()["results"][SHA_A]
+        self.assertEqual(record["seen"],
+                         pc.iso(T0 - datetime.timedelta(hours=5)))
+        logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertIn("green waited=180s ran=", logged)
+        self.assertIn(" place=18000s", logged)
+
+    def test_an_entry_with_no_queued_logs_from_its_place(self):
+        # One written before #474 waited from its `since`, as before.
+        self.queue()
+        self.assertEqual(self.work(self.run_for()), 0)
+        logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertIn("green waited=180s", logged)
+        self.assertNotIn("place=", logged)
 
     def test_red_names_the_failed_steps_logs_their_tail_and_exits_1(self):
         self.queue()
