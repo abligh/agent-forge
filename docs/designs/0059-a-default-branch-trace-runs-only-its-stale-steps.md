@@ -1,9 +1,9 @@
 # 0059: A default-branch trace runs only its stale steps
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-17, to XMPPEngineer: "agent-forge #479 - approved")
 * Author: XMPPEngineer
 * Date: 2026-11-17
-* Issue: to be filed with this design's approval issue
+* Issue: #479
 
 ## Summary
 
