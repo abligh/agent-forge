@@ -872,8 +872,11 @@ STEP_ENTRIES = {}
 # with a file read beneath it is digested by its entry names;
 # `match_main_unrecorded` (designs/0036), with trace_matched_main, a
 # default-branch head is matched though its tree has no record, and
-# runs traced instead at most once every depends_minutes on the host.
+# runs traced instead at most once every depends_minutes on the host;
+# `trace_stale_only` (designs/0059), with trace_matched_main, that traced
+# run takes only the steps whose records are stale or missing.
 TRACE_MATCHED_MAIN = False
+TRACE_STALE_ONLY = False
 MATCH_MAIN_UNRECORDED = False
 CHAIN_WRITES_ONLY = False
 DIRS_BY_NAMES = False
@@ -1243,6 +1246,7 @@ def configure(project, instance=None):
     global RESULTS_MAX
     global REUSE_AGE, VERSIONS, STEP_ENTRIES, NO_BASE, FRESH_WAIT
     global TRACE_MATCHED_MAIN, CHAIN_WRITES_ONLY, DIRS_BY_NAMES, OUTPUTS
+    global TRACE_STALE_ONLY
     global MATCH_MAIN_UNRECORDED
     global FIRST_AUTHORS, MAX_WAIT, MAIN_EVERY, MAIN_RED_ISSUE, URGENT_LABEL
     global MAIN_NEWEST, MAIN_PATHS
@@ -1316,6 +1320,7 @@ def configure(project, instance=None):
         "max_age_days", DEFAULT_REUSE_DAYS)) if "reuse" in checks else None
     reuse = checks.get("reuse", {})
     TRACE_MATCHED_MAIN = reuse.get("trace_matched_main", False)
+    TRACE_STALE_ONLY = reuse.get("trace_stale_only", False)
     MATCH_MAIN_UNRECORDED = reuse.get("match_main_unrecorded", False)
     CHAIN_WRITES_ONLY = reuse.get("chain_writes_only", False)
     DIRS_BY_NAMES = reuse.get("dirs_by_names", False)
@@ -6648,7 +6653,11 @@ def trace_matched(state_dir, wt, sha, tree, slot, when, run=sh, out=print):
     CHAIN_WRITES_ONLY, also one with no write set), and this slot
     hasn't traced one instead of matching it in the last
     DEPENDS_WAIT; with MATCH_MAIN_UNRECORDED (designs/0036), no slot
-    has. Logged MAIN-TRACE when it does."""
+    has. Logged MAIN-TRACE when it does.
+
+    Returns False where it doesn't, and where it does the steps that
+    need it, a list, or True where every step does (no record answers),
+    for TRACE_STALE_ONLY (designs/0059)."""
     if not (TRACE_MATCHED_MAIN and DEPENDS and MAIN_EVERY):
         return False
     with state_lock(state_dir):
@@ -6672,11 +6681,12 @@ def trace_matched(state_dir, wt, sha, tree, slot, when, run=sh, out=print):
         state.setdefault("main_traced", {})[str(slot)] = iso(when)
         save(state_dir, state)
     log(state_dir, "MAIN-TRACE %s %s: its tree tested green, but %s; "
-        "run traced, not matched"
+        "run traced, not matched%s"
         % (MAIN, sha[:10], "no record answers" if needs is None else
-           "the records of %s are stale or missing" % ", ".join(needs)),
+           "the records of %s are stale or missing" % ", ".join(needs),
+           "; only those run" if TRACE_STALE_ONLY and needs else ""),
         when, out)
-    return True
+    return True if needs is None else needs
 
 
 def busy_trees(shas, checkout, run=sh):
@@ -7352,7 +7362,7 @@ def record_depends(state_dir, wt, sha, tree, files, env, tracer, when,
 
 
 def record_run(state_dir, wt, sha, checked, tree, files, env, tracer, when,
-               selection, composed, name, out=print):
+               selection, composed, name, out=print, every_step=False):
     """With checks.fresh, writes the dependency record of a pull
     request's green traced run (designs/0010), for the tree it checked
     (`checked`: the head, or its merge with the default branch), and
@@ -7367,7 +7377,11 @@ def record_run(state_dir, wt, sha, checked, tree, files, env, tracer, when,
     A step whose trace is implausible makes the whole record unusable,
     as for the default branch. A record of the default branch's own
     for this tree is never replaced; one of another run is added to,
-    its steps kept. The trace files are removed either way."""
+    its steps kept. The trace files are removed either way.
+
+    With `every_step` (a default-branch head's stale steps, designs/0059,
+    run in full with no CHECK_BASE), every step is recorded, not only
+    those that say `"reads_base": false`."""
     kind, _ = tracer
     programs = {step: args[0] for step, args, _ in applicable(wt)}
     inside = [os.path.relpath(env[v], wt) for v in CACHES if v in env
@@ -7376,7 +7390,7 @@ def record_run(state_dir, wt, sha, checked, tree, files, env, tracer, when,
     reads, dirs, writes, sources, implausible = {}, {}, {}, {}, []
     for step, path in files.items():
         entries = None
-        if step in NO_BASE:
+        if step in NO_BASE or every_step:
             entries = trace.read_strace(path, wt) if kind == "strace" \
                 else trace.read_preload(path)
         try:
@@ -7400,7 +7414,8 @@ def record_run(state_dir, wt, sha, checked, tree, files, env, tracer, when,
         return None
     skipped = (selection or {}).get("skipped", ())
     for step in skipped:
-        if step in NO_BASE and composed and step in composed["reads"]:
+        if (step in NO_BASE or every_step) and composed \
+                and step in composed["reads"]:
             reads[step] = composed["reads"][step]
             dirs[step] = composed["dirs"].get(step, [])
             if step in (composed.get("writes") or {}):
@@ -7688,6 +7703,9 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 settled = True
                 return matched(state_dir, sha, pr, same, tree, started,
                                post, out)
+        # designs/0059: the steps a traced default-branch head runs, with
+        # TRACE_STALE_ONLY, where trace_matched named them.
+        stale_only = None
         if main and MAIN_EVERY and tree and not warm and (
                 not DEPENDS or MATCH_MAIN_UNRECORDED or os.path.exists(
                     os.path.join(trace.records_dir(state_dir),
@@ -7701,8 +7719,9 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             with state_lock(state_dir):
                 same = tested(load(state_dir), tree, started, ok=True,
                               accept=scoped_too(None, scoped))
-            if same is not None and same != sha and not trace_matched(
-                    state_dir, wt, sha, tree, slot, started, run, out):
+            traced = same is not None and same != sha and trace_matched(
+                state_dir, wt, sha, tree, slot, started, run, out)
+            if same is not None and same != sha and not traced:
                 settled = True
                 # Posted like any verdict, so every green default-branch
                 # commit carries a status, and a release is only tagged
@@ -7712,6 +7731,8 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 if report is not None:
                     report(sha, True, [], same)
                 return 0
+            if TRACE_STALE_ONLY and isinstance(traced, list):
+                stale_only = traced
         phases.mark("match")
         pending = None
         if post is not None:
@@ -7732,7 +7753,29 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         env = step_env(state_dir, slot=slot)
         steps, wrap, tracer, files = None, None, None, {}
         composed = None
-        if selection is not None and "ran" in selection:
+        if stale_only is not None:
+            # designs/0059: only the stale steps run, each in full (no
+            # CHECK_BASE); the others' records stand, and the head's
+            # record is composed from both, as a fresh run's is.
+            names = [name for name, _, _ in applicable(wt)]
+            chosen = choose_fresh(wt, sha, state_dir, run, names, onto=sha)
+            if "records" in chosen:
+                selection = {"ran": {n: "its record is stale or missing"
+                                     for n in stale_only if n in names},
+                             "skipped": [n for n in names
+                                         if n not in stale_only],
+                             "records": chosen["records"],
+                             "record": chosen["record"]}
+                _, composed = compose(state_dir, selection, slot, started)
+                steps = [s for s in applicable(wt)
+                         if s[0] in selection["ran"]]
+                out("  stale only: %s run; %d records stand"
+                    % (", ".join(sorted(selection["ran"])),
+                       len(selection["skipped"])))
+            else:
+                stale_only = None
+        if stale_only is None and selection is not None \
+                and "ran" in selection:
             depends = selection["depends"]
             if fresh:
                 # Each step's own record, as one file.
@@ -7742,7 +7785,8 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                        CHECK_DEPENDS=depends)
             steps = [s for s in applicable(wt) if s[0] in selection["ran"]]
         digests, reused = {}, {}
-        if REUSE_AGE is not None and steps is not None and not force:
+        if REUSE_AGE is not None and steps is not None and not force \
+                and stale_only is None:
             # designs/0009: a step whose inputs a green run here
             # already tested isn't run again.
             try:
@@ -8071,7 +8115,11 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             if report is not None:
                 report(sha, ok, [(r["name"], r.get("tail", ""))
                                  for r in results if r["rc"] != 0], None)
-            if ok and tracer is not None:
+            if ok and tracer is not None and stale_only is not None:
+                record_run(state_dir, wt, sha, sha, tree, files, env, tracer,
+                           finished, selection, composed, name, out,
+                           every_step=True)
+            elif ok and tracer is not None:
                 record_depends(state_dir, wt, sha, tree, files, env, tracer,
                                finished, out)
             else:

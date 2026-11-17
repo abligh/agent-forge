@@ -308,6 +308,12 @@ records write sets:
   it, the head is matched though its tree has no record, and
   `trace_matched_main` decides whether it runs traced instead, at most
   once every `depends_minutes` on the whole host (designs/0036).
+* **`trace_stale_only`** (with `trace_matched_main`): the traced run of
+  a default-branch head runs only the steps whose records are stale or
+  missing, each in full, and composes the tree's record from their new
+  reads and the standing records of the rest, as a `fresh` run does.
+  `MAIN-TRACE` ends "only those run". Where no record answers at all,
+  every step still runs (designs/0059).
 * **`chain_writes_only`**: a path the tree doesn't have chains only the
   digests of the earlier steps that wrote it: it is in a step's write
   set or its `outputs`, beneath one of them, or a directory with one
@@ -1485,6 +1491,7 @@ unaffected: their lines stay body-only, as the Merger reads them
 | `reuse.max_age_days` | `7` | How long a step's green verdict stands for the same inputs, counted from the run that ran it. At least 1. |
 | `reuse.trace_matched_main` | `false` | Run a default-branch head that would be matched traced instead, when a step's record at its tree is missing or stale, at most once every `depends_minutes` in each slot (designs/0018; see above). Refused unless `main` is `every`. |
 | `reuse.match_main_unrecorded` | `false` | Match a default-branch head to a green run of its tree though the tree has no record, and let `trace_matched_main` trace it instead at most once every `depends_minutes` on the host, not in each slot (designs/0036; see above). Refused unless `trace_matched_main` is on. |
+| `reuse.trace_stale_only` | `false` | Run only the stale or missing steps when `trace_matched_main` traces a default-branch head, composing its record from those and the standing records (designs/0059; see above). Refused unless `trace_matched_main` is on. |
 | `reuse.chain_writes_only` | `false` | A path a step read that the tree lacks chains only the earlier steps that wrote it (their write sets and `outputs`), not every earlier step (designs/0018). |
 | `reuse.dirs_by_names` | `false` | A directory read with a file read beneath it is digested by its entry names, not its tree (designs/0018). |
 | `fresh` | none | `{"wait_minutes": 15}`: every green run writes a dependency record, each step is chosen from its own freshest record, and a head that runs a step only because its record is stale waits for a fresh one (designs/0010; see below). Refused without `depends`. |
