@@ -86,6 +86,18 @@ class Configure(unittest.TestCase):
             depends=True, main="every", reuse={
                 "trace_matched_main": True,
                 "match_main_unrecorded": True})), [])
+        # designs/0059
+        self.assertIn("checks.reuse.trace_stale_only needs "
+                      "checks.reuse.trace_matched_main: it narrows the run "
+                      "that traces a matched head",
+                      config.check(self.data(depends=True, main="every",
+                                             reuse={"trace_stale_only":
+                                                    True})))
+        data = self.data(depends=True, main="every", reuse={
+            "trace_matched_main": True, "trace_stale_only": True})
+        self.assertEqual(config.check(data), [])
+        pc.configure(config.Project(data, None))
+        self.assertIs(pc.TRACE_STALE_ONLY, True)
         data = self.data(depends=True)
         data["checks"]["steps"][0]["outputs"] = ["../up", "", "a/*", 3]
         problems = config.check(data)
@@ -563,6 +575,61 @@ class TraceMatchedMain(DigestCase):
             self.assertEqual(self.work_main(tip), 0)
         self.assertEqual(self.ran(), ["a", "b", "c"])
         self.assertIn("MAIN-TRACE main %s" % tip[:10], self.logged())
+
+    def test_stale_only_runs_just_the_stale_steps(self):
+        # designs/0059: one project's traces each named three of 15
+        # steps and ran all 15.
+        tip, _ = self.green_elsewhere({"B": "b2\n"})
+        with mock.patch.object(pc, "TRACE_STALE_ONLY", True):
+            self.assertEqual(self.work_main(tip), 0)
+        self.assertEqual(self.ran(), ["b"])
+        result = self.state()["results"][tip]
+        self.assertNotIn("matched", result)
+        self.assertTrue(result["ok"])
+        self.assertIn("the records of b are stale or missing; run traced, "
+                      "not matched; only those run", self.logged())
+
+    def test_stale_only_trace_matched_names_the_steps(self):
+        tip, _ = self.green_elsewhere({"B": "b2\n"})
+        tree = git("rev-parse", tip + "^{tree}", cwd=self.seed)
+        git("checkout", "-q", "--detach", "--force", tip, cwd=self.repo)
+        self.assertEqual(pc.trace_matched(self.state_dir, self.repo, tip, tree,
+                                          1, T0 + DAY, pc.sh,
+                                          self.lines.append), ["b"])
+
+    def test_stale_only_records_the_standing_steps_too(self):
+        # A step not run keeps its record's reads in the head's new
+        # record, whether or not it says "reads_base": false.
+        tip, _ = self.green_elsewhere({"B": "b2\n"})
+        tree = git("rev-parse", tip + "^{tree}", cwd=self.seed)
+        git("checkout", "-q", "--detach", "--force", tip, cwd=self.repo)
+        composed = {"reads": {"a": self.reads["a"]}, "dirs": {"a": []},
+                    "writes": {}, "from": {"a": "elsewhere.json"}}
+        selection = {"ran": {"b": "stale"}, "skipped": ["a", "c"]}
+        for every, expected in ((False, None), (True, ["a"])):
+            os.remove(os.path.join(trace.records_dir(self.state_dir),
+                                   tree + ".json"))
+            with mock.patch.object(pc, "NO_BASE", frozenset()):
+                path = pc.record_run(self.state_dir, self.repo, tip, tip, tree,
+                                     {}, {}, ("preload", None), T0 + DAY,
+                                     selection, composed, "main",
+                                     self.lines.append, every_step=every)
+            if expected is None:
+                self.assertIsNone(path)
+                trace.write_record(self.state_dir, tree, tip,
+                                   pc.steps_digest(), pc.iso(T0), "preload",
+                                   {}, {}, source="run")
+            else:
+                with open(path) as handle:
+                    self.assertEqual(sorted(json.load(handle)["reads"]),
+                                     expected)
+
+    def test_without_stale_only_every_step_still_runs(self):
+        tip, _ = self.green_elsewhere({"B": "b2\n"})
+        with mock.patch.object(pc, "TRACE_STALE_ONLY", False):
+            self.assertEqual(self.work_main(tip), 0)
+        self.assertEqual(self.ran(), ["a", "b", "c"])
+        self.assertNotIn("only those run", self.logged())
 
     def test_with_the_switch_once_every_depends_minutes_on_the_host(self):
         tip, _ = self.green_elsewhere({"B": "b2\n"})

@@ -277,7 +277,7 @@ WARM = {"paths": list, "minutes": int}
 # checks.reuse: a step's green verdict reused for unchanged inputs.
 REUSE = {"max_age_days": int, "trace_matched_main": bool,
          "chain_writes_only": bool, "dirs_by_names": bool,
-         "match_main_unrecorded": bool}
+         "match_main_unrecorded": bool, "trace_stale_only": bool}
 # checks.fresh: records from every run, and heads that wait for one.
 FRESH = {"wait_minutes": int}
 STEP = {"name": str, "run": list, "only_if": str, "always": bool,
@@ -1828,7 +1828,8 @@ def _check_reuse(checks, problems, section="checks"):
     dependency record, so it needs `depends`. Its switches
     (designs/0018) are booleans; `trace_matched_main` needs `main`
     "every", the only mode that matches a default-branch head, and
-    `match_main_unrecorded` (designs/0036) needs `trace_matched_main`."""
+    `match_main_unrecorded` (designs/0036) and `trace_stale_only`
+    (designs/0059) need `trace_matched_main`."""
     where = section + ".reuse"
     reuse = checks["reuse"]
     _fields(where, reuse, REUSE, problems)
@@ -1847,6 +1848,11 @@ def _check_reuse(checks, problems, section="checks"):
         problems.append("%s.match_main_unrecorded needs "
                         "%s.trace_matched_main: it is what traces a "
                         "matched head when the records need it"
+                        % (where, where))
+    if reuse.get("trace_stale_only") is True \
+            and reuse.get("trace_matched_main") is not True:
+        problems.append("%s.trace_stale_only needs %s.trace_matched_main: "
+                        "it narrows the run that traces a matched head"
                         % (where, where))
 
 
