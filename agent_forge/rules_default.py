@@ -1606,9 +1606,8 @@ def owned_issue_states(agent, ctx):
         elif hushed:
             found.append((issue, "waiting", hushed))
         elif awaits_nightly(issue) and not nightly_due(issue):
-            found.append((issue, "waiting", "%s (no nightly since %s)" % (
-                NIGHTLY_WAKE["label"], "its last comment"
-                if issue.get("publishedNightly") else "it was labelled")))
+            found.append((issue, "waiting", "%s (%s)" % (
+                NIGHTLY_WAKE["label"], nightly_wait_reason(issue))))
         elif until is not None and until > ctx.when:
             found.append((issue, "waiting", "Defer-until %s" % (
                 until.strftime("%m-%d %H:%MZ"))))
@@ -2131,6 +2130,24 @@ def nightly_due(issue):
             if author_of(c) in BLOCKER_WRITERS]
     said = [t for t in said if t]
     return not said or max(said) < built["ended"]
+
+
+def nightly_wait_reason(issue):
+    """Why an issue carrying `router.nightly_wake`'s label isn't due, as
+    the idle report says it: no nightly has published its builds since
+    the label went on, or one has and an agent commented after them,
+    which reads as the work left waiting for the next nightly. The
+    second names that nightly, so an owner whose work left is a turn on
+    its builds can see the label is the wrong one (see docs/router.md:
+    take it off and set a `Defer-until:` instead)."""
+    built = issue.get("publishedNightly")
+    if isinstance(built, dict) and built.get("started") \
+            and built.get("ended"):
+        labelled = labelled_at(issue, NIGHTLY_WAKE["label"])
+        if labelled is not None and labelled < built["started"]:
+            return "commented after the %s nightly; waits for the next " \
+                "one" % built["started"][:10]
+    return "no nightly since the label went on"
 
 
 def labelled_at(issue, label):

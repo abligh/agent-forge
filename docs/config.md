@@ -1347,7 +1347,14 @@ woken once by rule 22, and the issue then sat as waiting however many
 nightlies came after. A comment after the builds (what is left, such
 as a half that needs another machine) makes it wait again until the
 next such run; a `Defer-until:` still to come, or another waiting
-label, keeps it waiting. Needs the `nightly` section. Off without the key.
+label, keeps it waiting. So the label means "needs a newer nightly":
+when what is left is a turn on builds already published (a half on
+another machine, say), take the label off and set a `Defer-until:` for
+the turn instead. While the label is on, rule 24 doesn't remind about a
+lapsed `Defer-until:`, and the idle report lists the issue as
+`<label> (commented after the <date> nightly; waits for the next one)`,
+or `(no nightly since the label went on)` (agent-forge #482).
+Needs the `nightly` section. Off without the key.
 `agent_forge/rules_default.py` (rule 22) has the detail, and
 [designs/0040](designs/0040-a-green-nightly-wakes-what-waits-for-it.md)
 the reasons.

@@ -848,6 +848,28 @@ class NightlyWaitIsNotActionable(RedFirstCase):
         item = waiting_issue(labels=["Status:waiting-external"])
         self.assertEqual(self.owned(item), ([], 1))
 
+    def why(self, item):
+        [(_, kind, why)] = rules.owned_issue_states(
+            "LeadDev", self.ctx(issues=[item]))
+        return kind, why
+
+    def test_the_report_names_the_nightly_an_owner_commented_after(self):
+        # #482: commented after the 10-09 run's builds were published,
+        # so it waits for the next one, and the report says which.
+        item = waiting_issue()
+        item["comments"] = [note(LEADDEV, "2026-10-09T14:00:00Z")]
+        self.assertEqual(self.why(item), (
+            "waiting", WAITS + " (commented after the 2026-10-09 "
+            "nightly; waits for the next one)"))
+
+    def test_the_report_says_no_nightly_since_the_label_went_on(self):
+        self.assertEqual(self.why(waiting_issue(green=None)), (
+            "waiting", WAITS + " (no nightly since the label went on)"))
+        # Labelled after the run started: that run doesn't count.
+        self.assertEqual(self.why(waiting_issue(
+            labelled="2026-10-09T12:30:00Z")), (
+            "waiting", WAITS + " (no nightly since the label went on)"))
+
     def test_without_the_key_it_is_actionable(self):
         self.use(red_project(idle_offer={}, nightly=True))
         [got] = self.offer()
