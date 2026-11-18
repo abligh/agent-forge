@@ -80,6 +80,27 @@ class Check(unittest.TestCase):
         data["merge"]["test_ahead"]["search_cuts"] = "3"
         self.assertEqual(len(config.check(data)), 1)
 
+    def test_test_ahead_bypass_search_needs_live_trains_that_merge(self):
+        # designs/0060.
+        data = example()
+        data.setdefault("merge", {})["test_ahead"] = {
+            "trains": "live", "train_merge": True, "bypass_search": True}
+        self.assertEqual(config.check(data), [])
+        data["merge"]["test_ahead"]["train_merge"] = False
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.bypass_search needs trains \"live\" and "
+            "train_merge: the bypass is a train that merges as one"])
+        data["merge"]["test_ahead"].update(train_merge=True,
+                                           hand_back_red_suspect=False)
+        self.assertEqual(config.check(data), [
+            "merge.test_ahead.bypass_search needs hand_back_red_suspect: a "
+            "search it ends early hands back the one found red"])
+        data["merge"]["test_ahead"] = {"bypass_search": "yes"}
+        self.assertEqual(len(config.check(data)), 1)
+        data["merge"]["test_ahead"] = {"bypass_search": False,
+                                       "trains": "off"}
+        self.assertEqual(config.check(data), [])
+
     def test_test_ahead_window_needs_a_floor_within_batch_and_live(self):
         # designs/0056 item 4.
         data = example()

@@ -165,7 +165,8 @@ TEST_AHEAD = {"depth": int, "max_age_hours": int, "spare_slots_only": bool,
               "train_merge": bool, "train_branch": str,
               "train_slots": int, "layers_need_own_green": bool,
               "own_green_to_board": bool, "left_top_covers": bool,
-              "search_cuts": int, "window": dict}
+              "search_cuts": int, "window": dict,
+              "bypass_search": bool}
 TRAINS = ("dry-run", "live", "off")
 # agent-forge #454: the most prefixes a red batch's search runs at once.
 MOST_SEARCH_CUTS = 8
@@ -1650,6 +1651,18 @@ def _check_test_ahead(ahead, checks, problems):
                         % (where, MOST_SEARCH_CUTS))
     if isinstance(ahead.get("window"), dict):
         _check_window(ahead, problems, where)
+    if ahead.get("bypass_search") is True:
+        # designs/0060: the bypass train is a train that merges as one,
+        # and the search it ends early hands its culprit back.
+        if ahead.get("trains") != "live" \
+                or ahead.get("train_merge") is not True:
+            problems.append("%s.bypass_search needs trains \"live\" and "
+                            "train_merge: the bypass is a train that "
+                            "merges as one" % where)
+        if ahead.get("hand_back_red_suspect") is False:
+            problems.append("%s.bypass_search needs hand_back_red_suspect: "
+                            "a search it ends early hands back the one "
+                            "found red" % where)
     if _is(ahead.get("later_first"), int) and ahead["later_first"] < 0:
         problems.append("%s.later_first must be at least 0" % where)
     if ahead.get("layers_need_own_green") is False \

@@ -2622,6 +2622,41 @@ class Batch(unittest.TestCase):
         self.assertIsNone(pc.next_ahead(state, entries, busy={SHA_Q},
                                         when=T0, batch=entries[:2]))
 
+    def test_a_train_bypassing_a_search_runs_after_its_tops(self):
+        # merge.test_ahead.bypass_search (designs/0060): a search of #7
+        # and #8, cut at #7 (the batch) and #8 (a later batch), and #11
+        # and #12 cut on the tip, not on the suspects, as `bypass`.
+        write_ahead(self.dir, self.entries[:2], batch=1, later=(1,))
+        self.edit_ahead(batch={"size": 1, "trees": [TREE_1],
+                               "suspects": True})
+        bypass = [entry(11, SHA_C, TREE_2), entry(12, SHA_A, "4" * 40)]
+        self.edit_ahead(bypass={"base": "b" * 40, "size": 2,
+                                "trees": [TREE_2, "4" * 40],
+                                "entries": bypass})
+        marked = [dict(e, bypass=True) for e in bypass]
+        ahead = pc.merger_ahead(self.dir, T0)
+        self.assertEqual(ahead, self.entries[:2] + marked)
+        tops = pc.merger_later(self.dir, T0)
+        self.assertEqual(tops, [self.entries[1], marked[1]])
+        batch = pc.merger_batch(self.dir, T0)
+        state = empty()
+        # The search's own runs first; the bypass top in what is left.
+        self.assertEqual(pc.next_ahead(state, ahead, when=T0, batch=batch,
+                                       later=tops), (SHA_P, 7))
+        self.assertEqual(pc.next_ahead(state, ahead, busy={SHA_P, SHA_Q},
+                                       when=T0, batch=batch, later=tops),
+                         (SHA_A, 12))
+        # Its chain holds only its own train.
+        with mock.patch.object(pc, "now_utc", return_value=T0):
+            self.assertEqual(pc.prediction_prs(self.dir, SHA_A), [11, 12])
+            self.assertEqual(pc.prediction_prs(self.dir, SHA_Q), [7, 8])
+        # One that doesn't hold together is no train.
+        self.edit_ahead(bypass={"base": "b" * 40, "size": 2,
+                                "trees": [TREE_1, "4" * 40],
+                                "entries": bypass})
+        self.assertEqual(pc.merger_ahead(self.dir, T0), self.entries[:2])
+        self.assertEqual(pc.merger_later(self.dir, T0), [self.entries[1]])
+
     def test_later_first_lets_a_later_top_go_before_a_waiting_head(self):
         entries = self.later()
         pick = ("f" * 40, 99)
