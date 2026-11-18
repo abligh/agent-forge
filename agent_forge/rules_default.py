@@ -245,7 +245,10 @@ agents with nothing to do (off without it):
     also told since when its background task has been running;
 16. an idle developer (not a reviewer or a collaborator) with no such
     turn and nothing actionable: `idle_offer.report_to`'s, so whoever
-    plans the work knows, once per idle period. A collaborator works
+    plans the work knows, once a day while what the report says (all
+    but the time) stays the same, and again when it changes (agent-forge
+    #489: room traffic starts a new idle period with every wake, and the
+    same report came every few minutes). A collaborator works
     on the project only when given something: idle with nothing of
     hers to do is where she is meant to be. Not for `report_to` itself, and not
     without `report_to`. With `idle_offer.hand_over_above` (designs/0038),
@@ -369,6 +372,7 @@ Each rule is written as `route_pr` or `route_issue` returning the dict
 import dataclasses
 import datetime
 import fnmatch
+import hashlib
 import os
 import re
 
@@ -1776,13 +1780,26 @@ def idle_offers(ctx, skip=()):
             (held, counted(held, "issue blocked", "issues blocked")),
             (waiting, counted(waiting, "issue waiting", "issues waiting")))
             if n) or "no open issues of its own"
+        said = "(%s).%s%s" % (why, hand_over(agent, ctx),
+                              held_list(agent, ctx))
         decisions.append(Decision(
-            None, report_to, 16, "%s %s" % (agent, stamp),
-            "%s has been idle since %s with nothing it can act on (%s).%s%s"
-            % (agent, since_text(stamp, ctx.when), why,
-               hand_over(agent, ctx), held_list(agent, ctx)),
+            None, report_to, 16, report_event(agent, said, ctx),
+            "%s has been idle since %s with nothing it can act on %s"
+            % (agent, since_text(stamp, ctx.when), said),
             reminder=ONCE))
     return decisions
+
+
+def report_event(agent, said, ctx):
+    """Rule 16's event: the agent, the day and a digest of what the
+    report says but when (agent-forge #489). Room traffic wakes an
+    idle developer whose work all waits, each wake starts a new idle
+    period, and a report keyed on the period was said again every few
+    minutes with nothing in it changed. Keyed on its content, it is
+    said once a day while that stays the same, and again as soon as
+    something in it changes."""
+    digest = hashlib.sha256(said.encode("utf-8")).hexdigest()[:12]
+    return "%s %s %s" % (agent, ctx.when.strftime("%Y-%m-%d"), digest)
 
 
 # How many held issues rule 16's report lists before "and K more".

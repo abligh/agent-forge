@@ -24,6 +24,7 @@ UIDEV = "uidevwidgetagent[bot]"
 # Idle since 13:30Z: half an hour before NOW, past the default 10 minutes.
 IDLE = "2026-10-09T13:30:00Z"
 LATER_IDLE = "2026-10-09T15:00:00Z"
+EARLIER_IDLE = "2026-10-09T13:00:00Z"
 
 
 def project(offer=None):
@@ -568,7 +569,7 @@ class Report(unittest.TestCase):
             [pr(41, author=UIDEV, body="Closes #33"), pr(42, author=UIDEV)],
             entry("WidgetUIDev"))
         self.assertEqual(got, [router.Decision(
-            None, "LeadDev", 16, "UIDev " + IDLE,
+            None, "LeadDev", 16, got[0].event,
             "UIDev has been idle since 13:30Z with nothing it can act on (2 "
             "open pull requests, 1 issue blocked, 1 issue waiting). Held: "
             "#30 Blocked-by #31 (open); #32 Status:waiting-owner; #33 in "
@@ -590,8 +591,24 @@ class Report(unittest.TestCase):
 
     def test_one_report_per_developer(self):
         got = self.sweep([], [], entry("WidgetUIDev"), entry("Helper"))
-        self.assertEqual([d.event for d in got],
-                         ["Helper " + IDLE, "UIDev " + IDLE])
+        self.assertEqual([d.event.split()[:2] for d in got],
+                         [["Helper", "2026-10-09"], ["UIDev", "2026-10-09"]])
+
+    def test_the_same_report_keeps_its_event_across_idle_periods(self):
+        # agent-forge #489: a new idle period with nothing changed is
+        # the same event, so it isn't said again that day.
+        first = self.sweep([], [], entry("WidgetUIDev"))
+        later = self.sweep([], [], entry("WidgetUIDev",
+                                         since=EARLIER_IDLE))
+        self.assertEqual(first[0].event, later[0].event)
+        self.assertNotEqual(first[0].line, later[0].line)
+
+    def test_a_changed_report_is_a_new_event(self):
+        first = self.sweep([], [], entry("WidgetUIDev"))
+        changed = self.sweep([owned(32, owner="UIDev",
+                                    labels=["Status:waiting-owner"])],
+                             [], entry("WidgetUIDev", since=EARLIER_IDLE))
+        self.assertNotEqual(first[0].event, changed[0].event)
 
     def test_not_a_reviewer_or_report_to_itself(self):
         self.assertEqual(self.sweep([], [], entry("WidgetReviewer"),
