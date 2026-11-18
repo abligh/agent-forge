@@ -1,6 +1,6 @@
 # 0060: A train of non-suspects runs during a search
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-18, on #487: "(a)")
 * Author: XMPPEngineer
 * Date: 2026-11-18
 * Issue: #485
@@ -56,7 +56,7 @@ non-suspects only.
    (as `TRAIN-RECUT` does), without the culprit and without what the
    bypass train merged.
 
-## The cost, and the choice it leaves
+## The cost, and the choice made
 
 A green prefix the search found can merge only on the base it was
 tested on. Once a bypass train has merged, those members need one more
@@ -65,7 +65,7 @@ would have cost one more full run (about 15 minutes) for the suspects
 found green, against the 30 minutes and more that the 9 approved pull
 requests waited.
 
-Two choices for the owner:
+Two choices were put to the owner:
 
 * **(a)** The bypass train merges as soon as it is green, and the
   search's green members are re-run afterwards. Most throughput, one
@@ -76,7 +76,7 @@ Two choices for the owner:
   only the bypass train's run time, about 15 minutes, not the whole
   search.
 
-The default proposed is (a), behind the setting, so a project can
+Alex chose (a) on #487. It ships behind the setting, so a project can
 measure it.
 
 ## Not in this design
