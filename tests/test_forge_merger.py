@@ -4917,6 +4917,187 @@ class TickAhead(RepoCase):
             "batch": {"size": 1}, "later": [{"size": 1}],
             "urgent_cut": [6]})
 
+    # merge.test_ahead.bypass_search (designs/0060).
+
+    def own_pr(self, number, name):
+        """An approved pull request changing `name`, a file of its own."""
+        self.repo.branch("own%d" % number, "origin/main")
+        sha = self.repo.commit(name, "own\n", "own %d" % number)
+        self.repo.publish_pr(number, sha)
+        self.repo.branch("feature", "feature")
+        return pr(number, T1, head=sha, reviews=[review(REVIEWER, oid=sha)])
+
+    def bypassing(self, bypass=True):
+        """A red train #5..#6 whose search has started, with
+        bypass_search `bypass`, and #8, approved, changing a file of its
+        own, come since: the search's check_state."""
+        m.configure(project(ci_workflow="", test_ahead={
+            "batch": 2, "batches": 2, "trains": "live",
+            "train_merge": True, "bypass_search": bypass}))
+        self.assertIs(m.BYPASS_SEARCH, bypass)
+        self.prs = [self.item(), self.other_pr()]
+        self.tick(self.prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        red = {"results": {top["sha"]: {"tree": top["tree"], "ok": False}}}
+        self.tick(self.prs, conclusions=(None,), live=True, minutes=1,
+                  check_state=red)
+        self.assertTrue(os.path.exists(os.path.join(self.state,
+                                                    m.SUSPECTS_FILE)))
+        self.eight = self.own_pr(8, "b.txt")
+        return red
+
+    def test_a_train_of_non_suspects_is_cut_on_the_tip(self):
+        red = self.bypassing()
+        tip = self.repo.main_tip()
+        record, lines = self.tick(self.prs + [self.eight],
+                                  conclusions=(None,), live=True, minutes=2,
+                                  check_state=red)
+        self.assertIn("TRAIN-BYPASS: #8", lines)
+        self.assertEqual(record["bypass"], [8])
+        ahead = self.ahead_json()
+        # The search goes on, its suspects first, as before.
+        self.assertIs(ahead["batch"]["suspects"], True)
+        self.assertEqual([e["pr"] for e in ahead["entries"]][:2], [5, 6])
+        bypass = ahead["bypass"]
+        self.assertEqual((bypass["base"], bypass["size"]), (tip, 1))
+        self.assertEqual(bypass["trees"],
+                         [e["tree"] for e in bypass["entries"]])
+        # On the tip, without the suspects: #8's head merged onto it.
+        sha = bypass["entries"][0]["sha"]
+        self.assertEqual(run_git(self.repo.path, "rev-parse", sha + "^1"),
+                         tip)
+        self.assertEqual(run_git(self.repo.path, "rev-parse",
+                                 m.BYPASS_REF + "0"), sha)
+        # Boarded: a candidate as a train's member is.
+        self.assertEqual(m.boarded_members(ahead)[8],
+                         self.eight["headRefOid"])
+        # Said once.
+        _, lines = self.tick(self.prs + [self.eight], conclusions=(None,),
+                             live=True, minutes=3, check_state=red)
+        self.assertNotIn("TRAIN-BYPASS: #8", lines)
+        self.assertEqual(self.ahead_json()["bypass"], bypass)
+
+    def test_without_bypass_search_nothing_bypasses(self):
+        red = self.bypassing(bypass=False)
+        record, lines = self.tick(self.prs + [self.eight],
+                                  conclusions=(None,), live=True, minutes=2,
+                                  check_state=red)
+        self.assertNotIn("bypass", record)
+        self.assertNotIn("bypass", self.ahead_json())
+        self.assertFalse([l for l in lines if "BYPASS" in l])
+
+    def test_bypass_carriages(self):
+        saved = {"suspects": [{"pr": 5, "head": "a" * 40},
+                              {"pr": 6, "head": "b" * 40}]}
+        five, six, eight, nine = (pr(5), pr(6), pr(8),
+                                  pr(9, base="b8"))
+        layers = {8: [(nine, None)]}
+        got = m.bypass_carriages([five, six, eight, nine], saved,
+                                 lambda p: layers.get(p["number"], []))
+        # Suspects stay out, and a layer boards only with its base.
+        self.assertEqual([[p["number"] for p in c] for c in got], [[8, 9]])
+        # A carriage holding a suspect stays out whole.
+        layers[8] = [(six, None)]
+        self.assertEqual(m.bypass_carriages(
+            [five, eight], saved, lambda p: layers.get(p["number"], [])),
+            [])
+
+    def merge_commit(self, second):
+        """The default branch moved by GitHub's merge of `second`."""
+        tip = self.repo.main_tip()
+        tree = run_git(self.repo.path, "rev-parse", second + "^{tree}")
+        sha = run_git(self.repo.path, "commit-tree", tree, "-p", tip, "-p",
+                      second, "-m", "Merge train")
+        run_git(self.repo.path, "branch", "-f", "main", sha)
+        self.repo.push("main")
+        return sha
+
+    def test_search_base(self):
+        base = self.repo.main_tip()
+        self.repo.branch("top", "origin/main")
+        top = self.repo.commit("t.txt", "top\n", "top")
+        self.repo.branch("feature", "feature")
+        saved = {"base": base, "main": base, "bypass_tops": [top]}
+        self.assertEqual(m.search_base(self.repo.path, saved, base, base),
+                         base)
+        tip = self.merge_commit(top)
+        # Moved only by the bypass train's merge: the search stays.
+        self.assertEqual(m.search_base(self.repo.path, saved, tip, tip),
+                         base)
+        self.assertEqual(saved["main"], tip)
+        # Anything else puts it on the tip, as before.
+        self.advance_main("x.txt", "by hand\n")
+        other = self.repo.main_tip()
+        self.assertEqual(m.search_base(self.repo.path, saved, other, other),
+                         other)
+        self.assertEqual(saved, {"base": other, "main": other})
+
+    def test_a_green_bypass_train_merges_and_the_search_stays(self):
+        red = self.bypassing()
+        self.tick(self.prs + [self.eight], conclusions=(None,), live=True,
+                  minutes=2, check_state=red)
+        before, base = self.shas(), self.ahead_json()["base"]
+        top = self.ahead_json()["bypass"]["entries"][-1]
+        green = {"results": dict(red["results"], **{top["sha"]: {
+            "tree": top["tree"], "ok": True}})}
+        calls = []
+
+        def merge(repo, state, entries, members, base_, *args, **kwargs):
+            calls.append(([e["pr"] for e in entries], base_,
+                          kwargs.get("main")))
+            args[5]["top"] = entries[-1]["sha"]
+            return [e["pr"] for e in entries], []
+        with mock.patch.object(m, "train_merge", merge):
+            record, _ = self.tick(self.prs + [self.eight],
+                                  conclusions=(None,), live=True, minutes=3,
+                                  check_state=green)
+        self.assertEqual(calls, [([8], base, None)])
+        self.assertEqual([(d["pr"], d["action"], d.get("bypass"))
+                          for d in record["decisions"]],
+                         [(8, "MERGE", True)])
+        saved = m.load_suspects(self.state)
+        self.assertEqual(saved["bypass_tops"], [top["sha"]])
+        # GitHub's merge moves the default branch; the search stays on
+        # its base, and its runs go on.
+        tip = self.merge_commit(top["sha"])
+        _, lines = self.tick(self.prs, conclusions=(None,), live=True,
+                             minutes=4, check_state=green)
+        # #8 has merged: only the suspects are predicted.
+        self.assertEqual(self.shas(), before[:2])
+        self.assertEqual((self.ahead_json()["base"],
+                          self.ahead_json()["main"]), (base, tip))
+        self.assertTrue(any(l.startswith("SEARCH-KEPT") and "bypass" in l
+                            for l in lines), lines)
+        self.assertNotIn("bypass", self.ahead_json())
+        # #5 is found green on the old base: that green doesn't merge
+        # it. #6 is named red, and the search, with nothing left to
+        # find, ends.
+        first = self.ahead_json()["entries"][0]
+        green["results"][first["sha"]] = {"tree": first["tree"], "ok": True}
+        calls.clear()
+        with mock.patch.object(m, "train_merge", merge):
+            record, lines = self.tick(self.prs, conclusions=(None,),
+                                      live=True, minutes=5,
+                                      check_state=green)
+        self.assertEqual(calls, [])
+        self.assertTrue(any("a bypass train merged); the search ends" in l
+                            for l in lines), lines)
+        self.assertIn("SUSPECT-RED #6: red on its own at %s; handed back, "
+                      "and out of batches until a new head"
+                      % self.prs[1]["headRefOid"][:10], lines)
+        self.assertFalse(os.path.exists(os.path.join(self.state,
+                                                     m.SUSPECTS_FILE)))
+        ahead = self.ahead_json()
+        self.assertEqual(ahead["base"], tip)
+        self.assertNotIn("main", ahead)
+        self.assertEqual([e["pr"] for e in ahead["entries"]], [5])
+        # The kept trains are cut again on the new tip, without #6 and
+        # without #8: #5 runs again there.
+        record, lines = self.tick(self.prs, conclusions=(None,), live=True,
+                                  minutes=6, check_state=green)
+        self.assertEqual(record["trains"], [[5]])
+        self.assertEqual(self.ahead_json()["base"], tip)
+
     def test_suspect_wait(self):
         entries = [{"pr": 5, "head": "a", "tree": "t5"},
                    {"pr": 6, "head": "b", "tree": "t6"}]
