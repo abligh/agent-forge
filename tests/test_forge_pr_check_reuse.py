@@ -589,6 +589,21 @@ class TraceMatchedMain(DigestCase):
         self.assertIn("the records of b are stale or missing; run traced, "
                       "not matched; only those run", self.logged())
 
+    def test_stale_only_runs_the_always_steps_too(self):
+        # One project's first stale-only trace skipped its `npm ci`
+        # step, so the stale steps after it found no node_modules and
+        # the default branch went falsely red.
+        tip, _ = self.green_elsewhere({"B": "b2\n"})
+        # "always" is part of the steps' digest; keep the fixture's.
+        digest = pc.steps_digest()
+        with mock.patch.object(pc, "TRACE_STALE_ONLY", True), \
+                mock.patch.object(pc, "ALWAYS", frozenset({"a"})), \
+                mock.patch.object(pc, "steps_digest", lambda: digest):
+            self.assertEqual(self.work_main(tip), 0)
+        self.assertEqual(self.ran(), ["a", "b"])
+        self.assertIn("  stale only: a, b run; 1 records stand",
+                      self.lines)
+
     def test_stale_only_trace_matched_names_the_steps(self):
         tip, _ = self.green_elsewhere({"B": "b2\n"})
         tree = git("rev-parse", tip + "^{tree}", cwd=self.seed)
