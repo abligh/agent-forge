@@ -349,6 +349,14 @@ a run, but only for a slot no ordinary head would take. Nothing after
 a red top: each later tree contains it. A later top's green counts once
 the Merger makes that batch the batch, by its tree.
 
+**With `merge.test_ahead.bypass_search`, a train bypasses a red
+train's search** (designs/0060). `ahead.json`'s `bypass` names it, by
+`size`, `trees` and its `entries`, predicted on the default branch's
+tip rather than on the suspects. Its entries count as predictions
+after the others, and its top is started after the later batches'
+tops, the search's own runs, in a slot they leave free; the Merger
+merges it as a train once it is green.
+
 An entry is checked out from the object store its worktree shares with
 the Merger's checkout, so nothing is fetched and nothing is pushed; the
 Merger and this tool must therefore use the same checkout (`repo` in
@@ -2973,12 +2981,42 @@ def merger_unblocks(merger_dir, when):
         return set()
 
 
+def well_formed(entries):
+    """The entries of an ahead.json list that name a pull request, a
+    commit and its tree."""
+    return [e for e in entries
+            if isinstance(e.get("pr"), int)
+            and not isinstance(e.get("pr"), bool)
+            and isinstance(e.get("sha"), str) and len(e["sha"]) == 40
+            and isinstance(e.get("tree"), str) and e["tree"]]
+
+
+def bypass_entries(said):
+    """The Merger's train that bypasses a red train's search
+    (ahead.json's `bypass`, merge.test_ahead.bypass_search,
+    designs/0060), each entry marked `bypass`, or [] when there is none
+    or it doesn't hold together: every entry well formed, `size` of
+    them, with the `trees` it names. It is predicted on the default
+    branch's tip, not on the search's suspects."""
+    got = said.get("bypass") if isinstance(said, dict) else None
+    if not isinstance(got, dict) or not isinstance(got.get("entries"),
+                                                   list):
+        return []
+    entries = well_formed(got["entries"])
+    if not entries or len(entries) != len(got["entries"]) \
+            or got.get("size") != len(entries) \
+            or [e["tree"] for e in entries] != got.get("trees"):
+        return []
+    return [dict(e, bypass=True) for e in entries]
+
+
 def merger_ahead(merger_dir, when, repo=None):
     """The Merger's predicted commits from its ahead.json, or [] when
     there are none, it can't be read, it is older than MERGER_FRESH, or
     it was written in a checkout other than `repo`, whose object store
     this tool's worktrees would not share. Malformed entries are
-    dropped."""
+    dropped. A train bypassing a red train's search (`bypass_entries`)
+    comes last."""
     if not merger_dir:
         return []
     try:
@@ -2989,11 +3027,8 @@ def merger_ahead(merger_dir, when, repo=None):
         if repo is not None and git_store(said["repo"]) \
                 != git_store(repo):
             return []
-        return [e for e in said["entries"]
-                if isinstance(e.get("pr"), int)
-                and not isinstance(e.get("pr"), bool)
-                and isinstance(e.get("sha"), str) and len(e["sha"]) == 40
-                and isinstance(e.get("tree"), str) and e["tree"]]
+        entries = well_formed(said["entries"])
+        return entries + bypass_entries(said) if entries else entries
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return []
 
@@ -3064,14 +3099,17 @@ def merger_later(merger_dir, when, repo=None):
     """designs/0035 part 2: the tops of the Merger's later batches, the
     ones after its batch, in order, or [] when there are none, or
     ahead.json can't be read as merger_batch reads it, or a later
-    batch's `trees` aren't those of the entries that follow."""
+    batch's `trees` aren't those of the entries that follow. The top of
+    a train bypassing a red train's search (designs/0060) comes after
+    them: it runs only in a slot the search's own runs leave free."""
     batch = merger_batch(merger_dir, when, repo)
     if not batch:
         return []
     entries = merger_ahead(merger_dir, when, repo)
     try:
         with open(os.path.join(merger_dir, "ahead.json")) as handle:
-            later = json.load(handle).get("later") or []
+            said = json.load(handle)
+        later = said.get("later") or []
         tops, at = [], len(batch)
         for b in later:
             size, trees = b["size"], b["trees"]
@@ -3081,6 +3119,7 @@ def merger_later(merger_dir, when, repo=None):
                 break
             tops.append(entries[at + size - 1])
             at += size
+        tops += bypass_entries(said)[-1:]
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return []
     return tops
@@ -3764,11 +3803,13 @@ def failing_test(text):
 def prediction_prs(merger_dir, sha, repo=None):
     """The pull requests in the Merger's prediction sha, oldest first:
     every entry of ahead.json up to and including sha's, since each
-    prediction holds all those before it. [] when sha isn't there."""
+    prediction holds all those before it; of a bypassing train's
+    (`bypass_entries`), only that train's. [] when sha isn't there."""
     entries = merger_ahead(merger_dir, now_utc(), repo)
     for at, e in enumerate(entries):
         if e["sha"] == sha:
-            return [x["pr"] for x in entries[:at + 1]]
+            return [x["pr"] for x in entries[:at + 1]
+                    if bool(x.get("bypass")) == bool(e.get("bypass"))]
     return []
 
 

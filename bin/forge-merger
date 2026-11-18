@@ -700,6 +700,28 @@ unless it is handed back (`TOLD-BOARDED #<pr> <sha>`, the record's
 `told_boarded`); the Merger's own updates don't repeat it, and one that
 leaves the trains is told again when it reboards.
 
+**With `merge.test_ahead.bypass_search`, one train runs past a red
+train's search** (designs/0060; default off; with `trains: "live"`,
+`train_merge` and `hand_back_red_suspect`). While a search runs, each
+tick cuts at most one train, as the first train is cut, on the default
+branch's tip (not the search's base), from the pull requests boarding
+that are not suspects, nor a layer that boards on one
+(`bypass_carriages`): `TRAIN-BYPASS: #a #b`, ahead.json's `bypass`, its
+predictions under `refs/agent-forge-merger/bypass/`. The build check
+starts its top after the search's own tops, in a slot they leave free.
+Green on the tip it was cut on, it merges as any train does
+(`train_merge`; its record's decisions say `bypass`), and the search,
+recording the train's top in `suspects.json`'s `bypass_tops`, stays on
+its base (`search_base`; `SEARCH-KEPT`), its runs going on. A green
+prefix found there no longer merges, since the default branch has
+moved past the base it was tested on; once nothing is left to find (a
+suspect named red, or every prefix green) the search ends early,
+`SUSPECTS ...: ... a bypass train merged; the search ends`, the named
+one is handed back, and the trains it kept are cut again on the new
+tip, without it and without what the bypass train merged, so its
+green members are run once more there. Any other commit moving the
+default branch puts the search on the tip, as before.
+
 **With `merge.hold_conflicting`, a pull request that conflicts with
 one ahead of it waits for that one instead of going round again**
 (default off). An author with several approved pull requests that
@@ -1088,6 +1110,15 @@ AHEAD_BATCHES = 1
 # bound by `batches` x `batch`, so a project with big trains can still
 # search with several cut points in its spare slots.
 SEARCH_CUTS = None
+# merge.test_ahead.bypass_search (designs/0060): while a red train's
+# search runs, one train of pull requests that are not suspects, nor
+# stacked on one, is cut on the default branch's tip, said in
+# ahead.json as `bypass`, run in a slot the search leaves free and
+# merged as a train when green. The search then stays on its base; its
+# green members are cut again on the new tip when it ends.
+BYPASS_SEARCH = False
+# The bypass train's predictions, as AHEAD_REF's are the search's.
+BYPASS_REF = "refs/agent-forge-merger/bypass/"
 # merge.test_ahead.window (designs/0056 item 4): {"floor", "grow",
 # "shrink"}, or None. With it, new live trains are cut at a length that
 # follows what survives, kept in ahead.json as `window`: it grows by
@@ -1463,7 +1494,7 @@ def configure(project):
     global BOARD_UNREVIEWED
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
     global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR, LAYERS_OWN_GREEN
-    global LEFT_TOP_COVERS
+    global LEFT_TOP_COVERS, BYPASS_SEARCH
     global OWN_GREEN_TO_BOARD, APPROVAL
     global GATE_TIER, HEAD_CONTEXT, STEP_TIERS, GREENS_FILE
     merge, checks = project.section("merge"), project.section("checks")
@@ -1546,6 +1577,7 @@ def configure(project):
     TRAINS_WITHIN = (ahead or {}).get("trains_within", "files")
     TRAIN_MERGE = (ahead or {}).get("train_merge") is True
     LEFT_TOP_COVERS = (ahead or {}).get("left_top_covers") is not False
+    BYPASS_SEARCH = (ahead or {}).get("bypass_search") is True
     LAYERS_OWN_GREEN = (ahead or {}).get("layers_need_own_green") \
         is not False
     OWN_GREEN_TO_BOARD = (ahead or {}).get("own_green_to_board") \
@@ -5852,15 +5884,15 @@ def predict_one(repo, parent, pr, restacks=None, run=sh, graph=None):
     return entry, None
 
 
-def write_ahead_refs(repo, entries, run=sh):
-    """Write `entries`' commits as AHEAD_REF<k> in `repo`, and delete
-    any ref past the last one."""
-    listed = git(repo, "for-each-ref", "--format=%(refname)", AHEAD_REF,
+def write_ahead_refs(repo, entries, run=sh, prefix=AHEAD_REF):
+    """Write `entries`' commits as `prefix`<k> (AHEAD_REF<k>) in `repo`,
+    and delete any ref past the last one."""
+    listed = git(repo, "for-each-ref", "--format=%(refname)", prefix,
                  run=run)
     stale = set(listed.stdout.split()) if listed.returncode == 0 else set()
     for k, entry in enumerate(entries):
-        git(repo, "update-ref", AHEAD_REF + str(k), entry["sha"], run=run)
-        stale.discard(AHEAD_REF + str(k))
+        git(repo, "update-ref", prefix + str(k), entry["sha"], run=run)
+        stale.discard(prefix + str(k))
     for ref in sorted(stale):
         git(repo, "update-ref", "-d", ref, run=run)
 
@@ -7289,12 +7321,15 @@ def boarded_members(last):
     that boarded without its own green stays a candidate while its head
     is the one it boarded with, or that one brought up to date. A red
     train's search writes no trains, but the trains it keeps
-    (`kept_trains`) and the batches it checks still hold them."""
+    (`kept_trains`), the batches it checks and the train that bypasses
+    it (`bypass`, merge.test_ahead.bypass_search) still hold them."""
     if not isinstance(last, dict):
         return {}
     lists = [last] if last.get("trains") else [
         last, last["kept_trains"]] if isinstance(
             last.get("kept_trains"), dict) else []
+    if isinstance(last.get("bypass"), dict):
+        lists = lists + [last["bypass"]]
     return {e["pr"]: e.get("head") for one in lists
             for e in one.get("entries") or ()
             if isinstance(e, dict) and isinstance(e.get("pr"), int)}
@@ -7479,7 +7514,8 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
     GitHub wouldn't. Returns (merged, unmerged): the members GitHub says
     are merged, and the rest, left to the usual path; ([], members)
     when the train didn't go in, with the reason said. `note`, a dict,
-    is given `pr`, the train's own pull request, once it is opened.
+    is given `top`, the commit the train's pull request is pinned to,
+    and `pr`, the train's own pull request, once it is opened.
     `main`, the default branch's tip when the train was kept on
     `main_tip`, an older base (`carried_base`), is merged on top of the
     chain, cleanly or not at all: the tree that goes in is the tested
@@ -7532,6 +7568,8 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
             # (agent-forge #452).
             cache["kept:" + top] = numbers[0]
         save_json(path, dict(list(cache.items())[-300:]))
+    if note is not None:
+        note["top"] = top
     branch = "%s%d-%d" % (TRAIN_BRANCH, numbers[0], numbers[-1])
     pushed = run(["git", "-C", repo, "push", "-q", "-f",
                   "https://github.com/%s.git" % REPO_SLUG,
@@ -7811,6 +7849,71 @@ def with_suspects(queue, saved, prs):
     return order + [pr for pr in queue if pr["number"] not in numbers]
 
 
+def search_base(repo, saved, main_tip, train_base, run=sh):
+    """merge.test_ahead.bypass_search (designs/0060): the commit the
+    search `saved` predicts its suspects on. That is `train_base`, as
+    without it, unless the default branch has moved since the search's
+    `base` was set (from `main`) only by merges of its bypass trains,
+    each a merge commit whose second parent is one of `bypass_tops`:
+    the search then stays on its base, its runs go on, and its green
+    prefix no longer merges (`train_ready` wants the trains' base),
+    so it is run again on the new tip once the search ends. Anything
+    else moving it puts the search on `train_base`, as before. Updates
+    `saved`'s `base`, `main` and `bypass_tops`."""
+    base, since = saved.get("base"), saved.get("main")
+    tops = set(saved.get("bypass_tops") or ())
+    if tops and isinstance(base, str) and isinstance(since, str):
+        if since == main_tip:
+            return base
+        if git(repo, "merge-base", "--is-ancestor", since, main_tip,
+               run=run).returncode == 0:
+            revs = git(repo, "rev-list", "--first-parent",
+                       "%s..%s" % (since, main_tip), run=run)
+            shas = revs.stdout.split() if revs.returncode == 0 else []
+            seconds = []
+            for sha in shas:
+                got = git(repo, "rev-parse", "-q", "--verify", sha + "^2",
+                          run=run)
+                seconds.append(got.stdout.strip() if got.returncode == 0
+                               else "")
+            if shas and all(second in tops for second in seconds):
+                saved["main"] = main_tip
+                return base
+    saved.update(base=train_base, main=main_tip)
+    saved.pop("bypass_tops", None)
+    return train_base
+
+
+def bypass_last(last):
+    """The bypass train of `last` (ahead.json's `bypass`,
+    merge.test_ahead.bypass_search) as an ahead.json of one train, as
+    `cut_trains` and `train_ready` read one, or None."""
+    said = (last or {}).get("bypass") if isinstance(last, dict) else None
+    if not isinstance(said, dict) or not isinstance(said.get("entries"),
+                                                    list):
+        return None
+    entries = [e for e in said["entries"] if isinstance(e, dict)
+               and isinstance(e.get("pr"), int)]
+    if not entries or len(entries) != len(said["entries"]):
+        return None
+    return {"trains": True, "base": said.get("base"), "entries": entries,
+            "batch": {"size": len(entries),
+                      "trees": [e.get("tree") for e in entries]}}
+
+
+def bypass_carriages(boarding, saved, layers_of=None):
+    """merge.test_ahead.bypass_search (designs/0060): the carriages of
+    `boarding` (`train_carriages`) that may board a train bypassing the
+    search `saved`: none holds a suspect, and none is headed by a pull
+    request not on the default branch, a layer that boards only with
+    the one below it, which may be a suspect (`with_suspects`)."""
+    suspects = {e["pr"] for e in (saved or {}).get("suspects") or ()}
+    heads = [pr for pr in boarding if pr["number"] not in suspects
+             and pr.get("baseRefName", MAIN) == MAIN]
+    return [c for c in train_carriages(heads, layers_of)
+            if not any(pr["number"] in suspects for pr in c)]
+
+
 def suspect_wait(saved, pr, last, check_state, main_tip=None):
     """merge.test_ahead.train_merge: SUSPECT_WAIT_REASON when `pr` is a
     suspect of the search `saved` at the head it has and isn't in the
@@ -7857,7 +7960,7 @@ def suspect_wait(saved, pr, last, check_state, main_tip=None):
 
 
 def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
-                  record, out, found=None):
+                  record, out, found=None, bypassed=False):
     """One tick of the search (designs/0035, second amendment): the
     batch and `later` batches written into `said_ahead` for the
     suspects at the front of the predictions `entries`, the runs to
@@ -7866,7 +7969,12 @@ def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
     checked as without batches, or when no suspect is predicted. A
     suspect red on its own, on top of every suspect before it, is
     appended to the list `found` with the number of green ones before
-    it, as (entry, green) (designs/0044, rule 4)."""
+    it, as (entry, green) (designs/0044, rule 4). `bypassed`, when a
+    bypass train has merged since the search's base
+    (merge.test_ahead.bypass_search, designs/0060): its green prefix
+    can't merge on that base, so the search ends as soon as no suspect
+    is left to find, one named red or every prefix green, and its green
+    members are cut again on the new tip."""
     path = os.path.join(state_dir, SUSPECTS_FILE)
     numbers = {e["pr"] for e in saved["suspects"]}
     n = 0
@@ -7877,6 +7985,18 @@ def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
                                     runs=search_runs())
     if found is not None and red is not None and red == green + 1:
         found.append((entries[red - 1], green))
+    if bypassed and green and (red == green + 1 or red is None
+                               and green == n):
+        out("SUSPECTS #%d..#%d: green to #%d, red %s, on a base %s has "
+            "moved past (a bypass train merged); the search ends, and "
+            "the green ones are cut again on the tip" % (
+                entries[0]["pr"], entries[n - 1]["pr"],
+                entries[green - 1]["pr"],
+                "at #%d" % entries[red - 1]["pr"] if red else "nowhere",
+                MAIN))
+        if os.path.exists(path):
+            os.remove(path)
+        return False
     if not n or (red == 1 and not green):
         if n:
             out("SUSPECTS #%d..#%d: #%d is red on its own; the search ends"
@@ -9461,6 +9581,45 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 if STACKS and stack:
                     record["stack"] = [{"pr": e["pr"], "after": e["after"]}
                                        for e in stack["pending"]]
+        ready = train_ready(bypass_last(last_ahead), members, main_tip,
+                            check_state, repo, run,
+                            restacks if PREDICT_RESTACKED else None) \
+            if BYPASS_SEARCH and not entries and not train_failed else None
+        bypassing = under_review(ready)
+        if bypassing:
+            # designs/0060: the train that bypasses a red train's search
+            # is green on the tip it was cut on, and goes in as one.
+            opened = {}
+            merged, _ = train_merge(
+                repo, state_dir, bypassing, members, main_tip, check_state,
+                github, run, sleep, out, opened,
+                tested_tree=ready[-1]["tree"]
+                if len(bypassing) < len(ready) else None)
+            train_failed = not merged
+            if merged:
+                trained = set(merged)
+                heads = {e["pr"]: e["head"] for e in bypassing}
+                prs_by = {pr["number"]: pr for pr in members}
+                for number in merged:
+                    record["decisions"].append(dict({
+                        "action": "MERGE", "pr": number,
+                        "head": heads[number], "result": "done",
+                        "train": True, "bypass": True},
+                        **({"train_pr": opened["pr"]}
+                           if "pr" in opened else {})))
+                    note_closing(state_dir, number, when)
+                    if STACKS:
+                        stack = note_merge(state_dir, stack or {}, dict(
+                            prs_by[number], headRefOid=heads[number]),
+                            prs, when)
+                if STACKS and stack:
+                    record["stack"] = [{"pr": e["pr"], "after": e["after"]}
+                                       for e in stack["pending"]]
+                if saved and "top" in opened:
+                    # The search stays on its base (`search_base`).
+                    saved.setdefault("bypass_tops", []).append(
+                        opened["top"])
+                    save_json(os.path.join(state_dir, SUSPECTS_FILE), saved)
     # merge.resolve_slots: a conflict with main is handed back only while
     # a slot is free; the others wait in `pending` until the tick's end,
     # when the free slots go to those first in `resolve_slot_order`.
@@ -10009,6 +10168,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         state_dir, SUSPECTS_FILE)):
                     os.remove(os.path.join(state_dir, SUSPECTS_FILE))
             searching = bool(saved and saved["suspects"])
+            # merge.test_ahead.bypass_search (designs/0060): a bypass
+            # train's merge leaves the search on its base.
+            on_base = search_base(repo, saved, main_tip, train_base, run) \
+                if searching and BYPASS_SEARCH else train_base
             sizes, events = None, []
             gated_files = {}
             layers_of = (lambda pr: ready_layers(
@@ -10096,7 +10259,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 # labels.keep_trains keeps it (agent-forge #444): its
                 # predictions, and the runs on them, go on.
                 entries = predict_ahead(
-                    repo, train_base if searching else main_tip,
+                    repo, on_base if searching else main_tip,
                     ahead_queue, run, overdue=overdue,
                     restacks=restacks if PREDICT_RESTACKED else None)
             record["ahead"] = [e["pr"] for e in entries]
@@ -10110,13 +10273,17 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     out("TRAIN-KEPT: %s moved to %s; the trains stay on %s "
                         "(labels.keep_trains)" % (MAIN, main_tip[:10],
                                                   train_base[:10]))
-            if searching and train_base != main_tip:
-                # Kept on it by labels.keep_trains (`carried_base`).
-                said_ahead.update(base=train_base, main=main_tip)
+            if searching and on_base != main_tip:
+                # Kept on it by labels.keep_trains (`carried_base`), or
+                # by a bypass train's merge (`search_base`).
+                said_ahead.update(base=on_base, main=main_tip)
                 if (last or {}).get("main") != main_tip:
                     out("SEARCH-KEPT: %s moved to %s; the red train's "
-                        "search stays on %s (labels.keep_trains)" % (
-                            MAIN, main_tip[:10], train_base[:10]))
+                        "search stays on %s (%s)" % (
+                            MAIN, main_tip[:10], on_base[:10],
+                            "labels.keep_trains" if on_base == train_base
+                            else "a bypass train merged; "
+                            "merge.test_ahead.bypass_search"))
             if sizes is None and isinstance(
                     (last or {}).get("kept_trains"), dict):
                 # A red train's search goes on: its trains are kept for
@@ -10183,6 +10350,10 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                                           for e in entries[:red]],
                              "tree": entries[red - 1]["tree"],
                              "at": record["at"], "merged": [], "left": []}
+                    if BYPASS_SEARCH:
+                        # The base its predictions are on, and the tip
+                        # then (`search_base`).
+                        saved.update(base=said_ahead["base"], main=main_tip)
                     out("BATCH #%d..#%d: top red; its %d members are the "
                         "suspects" % (entries[0]["pr"], entries[red - 1]["pr"],
                                       red))
@@ -10203,9 +10374,11 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 record["ahead"] = [e["pr"] for e in entries]
             if searching and entries:
                 found = []
+                bypassed = on_base != train_base
                 searching = suspect_round(
                     state_dir, saved, entries, verdict, last, said_ahead,
-                    record, out, found if RED_SUSPECT_OUT else None)
+                    record, out, found if RED_SUSPECT_OUT else None,
+                    bypassed)
                 for entry, green in found:
                     hand_back_red_suspect(
                         state_dir, entry, green, ahead_queue, approvals,
@@ -10213,18 +10386,56 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         check_state)
                 if found:
                     save_json(said_path, said)
-                if found and not searching:
+                if found and not searching or bypassed and not searching:
                     # The search ended on it, at the front: it leaves
                     # the predictions now, not from its next batch.
                     gone = {e["pr"] for e, _ in found}
                     ahead_queue = [pr for pr in ahead_queue
                                    if pr["number"] not in gone]
+                    if bypassed:
+                        # Its base is behind the tip a bypass train
+                        # made: what is left is predicted on the tip.
+                        said_ahead["base"] = train_base
+                        said_ahead.pop("main", None)
+                        if train_base != main_tip:
+                            said_ahead["main"] = main_tip
                     entries = predict_ahead(
                         repo, said_ahead["base"], ahead_queue, run,
                         overdue=overdue,
                         restacks=restacks if PREDICT_RESTACKED else None)
                     said_ahead["entries"] = entries
                     record["ahead"] = [e["pr"] for e in entries]
+            if BYPASS_SEARCH:
+                # designs/0060: one train of pull requests that are not
+                # suspects, on the default branch's tip, while the
+                # search runs.
+                bypass = []
+                if searching and entries and TRAINS == "live":
+                    bypass, bypass_sizes, _ = cut_trains(
+                        repo, main_tip, bypass_carriages(boarding, saved,
+                                                         layers_of),
+                        bypass_last(last),
+                        {pr["number"]: pr["headRefOid"] for pr in prs},
+                        open_numbers, trains=1,
+                        red={pr["number"] for pr in boarding
+                             if head_red(check_state, pr)},
+                        restacks=restacks if PREDICT_RESTACKED else None,
+                        run=run, files=files, note={},
+                        unreviewed=frozenset(UNREVIEWED))
+                    bypass = bypass[:bypass_sizes[0]] if bypass_sizes \
+                        else []
+                write_ahead_refs(repo, bypass, run, prefix=BYPASS_REF)
+                if bypass:
+                    line = "TRAIN-BYPASS: " + " ".join(
+                        "#%d" % e["pr"] for e in bypass)
+                    said_ahead["bypass"] = {
+                        "base": main_tip, "size": len(bypass),
+                        "trees": [e["tree"] for e in bypass],
+                        "entries": bypass, "said": line}
+                    record["bypass"] = [e["pr"] for e in bypass]
+                    if line != ((last or {}).get("bypass") or {}).get(
+                            "said"):
+                        out(line)
             if AHEAD_BATCH > 1 and entries and not searching:
                 size, red, later = train_batches(entries, sizes, verdict) \
                     if sizes is not None else batch_size(
