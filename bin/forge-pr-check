@@ -7760,10 +7760,15 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
             names = [name for name, _, _ in applicable(wt)]
             chosen = choose_fresh(wt, sha, state_dir, run, names, onto=sha)
             if "records" in chosen:
-                selection = {"ran": {n: "its record is stale or missing"
-                                     for n in stale_only if n in names},
-                             "skipped": [n for n in names
-                                         if n not in stale_only],
+                # A step that says "always" runs too, as in a fresh
+                # run: it leaves behind what the others need (one
+                # project's `npm ci`), which a new worktree hasn't got.
+                ran = {n: "its record is stale or missing"
+                       for n in stale_only if n in names}
+                ran.update((n, "always") for n in names
+                           if n in ALWAYS and n not in ran)
+                selection = {"ran": ran,
+                             "skipped": [n for n in names if n not in ran],
                              "records": chosen["records"],
                              "record": chosen["record"]}
                 _, composed = compose(state_dir, selection, slot, started)
