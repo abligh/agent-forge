@@ -711,7 +711,8 @@ ahead of it that are not themselves held this way, with `git merge-tree
 --write-tree` of the two heads. One that conflicts with one ahead (Q)
 is held, `held` saying `conflicts with #Q, ahead of it in the queue`
 (never behind a Q that conflicts with `main`, which goes back to its
-author):
+author, and never, aboard a train, behind a Q that isn't,
+agent-forge #488):
 it is neither updated, merged, handed back nor predicted. A live tick
 says so on it once per head and Q, signed like a hand-back, asking the
 author to leave it until Q merges; `held-conflicting.json` in the
@@ -4838,7 +4839,7 @@ def have_head(repo, pr, run=sh):
 
 
 def conflicts_ahead(repo, queue, run=sh, main_ref=None, cache=None,
-                    gone=()):
+                    gone=(), boarded=()):
     """{P: Q} for each pull request P in `queue` whose head conflicts
     with the head of a Q ahead of it, Q not itself held this way. The
     first is never held. A comparison git can't make (anything but 0 or
@@ -4847,7 +4848,12 @@ def conflicts_ahead(repo, queue, run=sh, main_ref=None, cache=None,
     neither a Q nor held. Nor is one whose number is in `gone`, already
     handed back at the head it has: it can't merge until its author
     pushes again (on 2026-11-11 one such held 26 others for over an
-    hour).
+    hour). Nor is one whose number is in `boarded`, a member of the
+    trains, held behind a Q that isn't: the train's top tree holds it
+    already, and Q has no run there (agent-forge #488: on 2026-11-18 a
+    pull request handed back as a red suspect came back approved ahead
+    of two boarded members, and took them out of a cut train). Q, once
+    they merge, conflicts with main and goes back to its author.
 
     `cache`, {"<a> <b>": 0 or 1}, remembers each pair of commits' answer:
     two commits merge the same way every time, and asking git again for
@@ -4876,6 +4882,8 @@ def conflicts_ahead(repo, queue, run=sh, main_ref=None, cache=None,
         if main_ref and conflict(main_ref, pr["headRefOid"]):
             continue
         for q in kept:
+            if pr["number"] in boarded and q["number"] not in boarded:
+                continue
             if conflict(q["headRefOid"], pr["headRefOid"]):
                 held[pr["number"]] = q["number"]
                 break
@@ -7292,6 +7300,14 @@ def boarded_members(last):
             if isinstance(e, dict) and isinstance(e.get("pr"), int)}
 
 
+def boarded_numbers(last):
+    """The numbers of the pull requests aboard the trains in `last`
+    (ahead.json, and the trains a search keeps, `boarded_members`). A
+    new head takes one off its train at the next cut; one the Merger
+    brought up to date stays aboard."""
+    return set(boarded_members(last))
+
+
 def train_in_the_way(last, pr, check_state):
     """merge.test_ahead.train_merge: the first train in `last`
     (ahead.json) as its entries, when `pr` is not on it and merging
@@ -9264,7 +9280,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         held_by = conflicts_ahead(
             repo, queue, run, main_tip, pairs,
             {pr["number"] for pr in queue
-             if handed_back(said, pr, approvals[pr["number"]], when)})
+             if handed_back(said, pr, approvals[pr["number"]], when)},
+            boarded_numbers(load_json(os.path.join(
+                state_dir, AHEAD_FILE), {})))
         if live:
             os.makedirs(state_dir, exist_ok=True)
             save_json(pairs_path, pairs.get("used", {}))

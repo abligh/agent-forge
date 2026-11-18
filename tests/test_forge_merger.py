@@ -6207,6 +6207,24 @@ class HoldConflicting(RepoCase):
         self.assertNotIn("old new", pairs)
         self.assertIn(1, pairs.values())
 
+    def test_a_boarded_member_is_not_held_behind_one_off_the_trains(self):
+        # agent-forge #488: the rival boarded; the item ahead of it came
+        # back into the queue later and is on no train.
+        queue = [self.item(), self.rival()]
+        self.assertEqual(m.conflicts_ahead(
+            self.repo.path, queue, boarded={6}), {})
+        self.assertEqual(m.conflicts_ahead(
+            self.repo.path, queue, boarded={5, 6}), {6: 5})
+        self.assertEqual(m.conflicts_ahead(
+            self.repo.path, queue, boarded={5}), {6: 5})
+
+    def test_boarded_numbers_read_kept_trains_too(self):
+        last = {"entries": [{"pr": 5, "head": "a"}],
+                "kept_trains": {"trains": True,
+                                "entries": [{"pr": 6, "head": "b"}]}}
+        self.assertEqual(m.boarded_numbers(last), {5, 6})
+        self.assertEqual(m.boarded_numbers({}), set())
+
     def test_heads_git_cannot_compare_hold_nothing(self):
         def run(args, cwd=None, env=None):
             if "merge-tree" in args:
