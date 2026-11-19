@@ -4648,6 +4648,26 @@ class TickAhead(RepoCase):
         self.assertEqual(record["train_waits"],
                          {"6": "its own head is red"})
 
+    def test_one_red_before_the_merger_updated_it_does_not_board(self):
+        # agent-forge #502: a head red on its own whose author's commit
+        # the Merger then brought up to date lost its red, boarded a
+        # fourteen-member train, and the train's top failed the same
+        # steps; the search cost the train an hour.
+        m.configure(project(own_head_green=True, test_ahead={
+            "batch": 2, "trains": "live", "own_green_to_board": False}))
+        prs = [self.item(), self.other_pr()]
+        pending = [status("pending")]
+        extra = {SLUG + "/commits/" + p["headRefOid"]: pending for p in prs}
+        extra[SLUG + "/commits/" + self.approved] = [status("failure")]
+        self.assertNotEqual(prs[0]["headRefOid"], self.approved)
+        record, _ = self.tick(prs, conclusions=(None,), live=True,
+                              extra=extra, check_state={"results": {
+                                  self.approved: {
+                                      "ok": False, "failed": ["test"]}}})
+        self.assertEqual(record["trains"], [[6]])
+        self.assertEqual(record["train_waits"],
+                         {"5": "its own head is red"})
+
     def red_train(self, train_merge=True):
         """#5 and #6 boarded on one train, then main moves on, so #5 is
         behind it, and the train's top is found red: the second tick's
@@ -12063,6 +12083,40 @@ class WalksPast(RepoCase):
         stray = self.repo.commit("x.txt", "x\n", "stray")
         self.assertFalse(m.walks_past(self.repo.path, stray, tip,
                                       layer_heads=heads))
+
+
+class UpdateWalk(RepoCase):
+    """agent-forge #502: `head_red` with the head's update walk counts a
+    red of the commit the Merger brought up to date."""
+
+    def setUp(self):
+        super().setUp()
+        self.advance_main()
+        self.head = self.repo.merge("origin/main")
+        self.item = pr(5, head=self.head)
+
+    def test_the_walk_passes_merges_of_the_default_branch(self):
+        self.assertEqual(m.update_walk(self.item, self.repo.path,
+                                       self.repo.main_tip()),
+                         [self.head, self.approved])
+        self.assertEqual(m.update_walk(self.item), [self.head])
+
+    def test_a_red_before_the_update_counts_with_the_walk(self):
+        walk = m.update_walk(self.item, self.repo.path, self.repo.main_tip())
+        state = {"results": {self.approved: {"ok": False, "tree": "t"}}}
+        self.assertIs(m.head_red(state, self.item), False)
+        self.assertIs(m.head_red(state, self.item, walk), True)
+
+    def test_its_exceptions_still_apply_along_the_walk(self):
+        walk = m.update_walk(self.item, self.repo.path, self.repo.main_tip())
+        for got in ({"ok": False, "conflicts": ["a.txt"]},
+                    {"ok": False, "failed": ["merge"]},
+                    {"ok": False, "covered": "batch"}):
+            self.assertIs(m.head_red({"results": {self.approved: got}},
+                                     self.item, walk), False, got)
+        self.assertIs(m.head_red({"results": {self.approved: {
+            "ok": False}}, "main_red": {"issue": 3}}, self.item, walk),
+            False)
 
 
 class CodeOwnerAsk(unittest.TestCase):

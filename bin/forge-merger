@@ -5172,20 +5172,7 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
     that one brought up to date as above, it needs no green of its own,
     since the train's top tests it."""
     approved = ((approval or {}).get("commit") or {}).get("oid")
-    head = pr.get("headRefOid")
-    shas = [approved, head]
-    if repo is not None and main_tip and head:
-        commit, depth, layer_heads = head, 0, []
-        while depth < GATE_DEPTH:
-            depth += 1
-            parents = git(repo, "rev-list", "--parents", "-n", "1", commit,
-                          run=run).stdout.split()
-            if len(parents) != 3 or not walks_past(repo, parents[2],
-                                                   main_tip, run,
-                                                   layer_heads):
-                break
-            commit = parents[1]
-            shas.append(commit)
+    shas = [approved] + update_walk(pr, repo, main_tip, run)
     if boarded and boarded in shas[1:]:
         return None
     seen = []
@@ -5202,6 +5189,28 @@ def own_green_wait(pr, approval, github, cache, repo=None, main_tip=None,
     sha, state = seen[-1] if seen else ("", None)
     return GREEN_WAIT_REASON % (head_context(), state or "absent",
                                 sha[:10] or "its head")
+
+
+def update_walk(pr, repo=None, main_tip=None, run=sh):
+    """[head, then (given `repo` and `main_tip`) the commit before each
+    merge of the default branch into it, back to the first commit that
+    isn't one]: the head and the commits it only brought up to date
+    (`own_green_wait`, `head_red`)."""
+    head = pr.get("headRefOid")
+    shas = [head]
+    if repo is not None and main_tip and head:
+        commit, depth, layer_heads = head, 0, []
+        while depth < GATE_DEPTH:
+            depth += 1
+            parents = git(repo, "rev-list", "--parents", "-n", "1", commit,
+                          run=run).stdout.split()
+            if len(parents) != 3 or not walks_past(repo, parents[2],
+                                                   main_tip, run,
+                                                   layer_heads):
+                break
+            commit = parents[1]
+            shas.append(commit)
+    return shas
 
 
 def load_greens(state_dir):
@@ -6530,10 +6539,13 @@ def train_batches(entries, sizes, verdict):
     return size, red, later
 
 
-def head_red(check_state, pr):
+def head_red(check_state, pr, walk=None):
     """Whether the build check's own run of `pr`'s head is red
     (designs/0047: it can't board a train): its verdict, not a batch's
-    cover. Not while the default branch is red, when every head may be,
+    cover. With `walk` (`update_walk`), also of a commit the head only
+    brought up to date: a red head the Merger updated lost its red, so
+    it boarded, and the train's top found the same failure (agent-forge
+    #502: twice in one morning, each costing a red train's search). Not while the default branch is red, when every head may be,
     nor for an urgent one. Nor when it was red only because it
     conflicted with the default branch's tip of then (forge-pr-check's
     `conflicted`: no step ran): whether it merges now is the cut's own
@@ -6543,10 +6555,14 @@ def head_red(check_state, pr):
     merged, and only one train was cut for an hour)."""
     if (check_state or {}).get("main_red", {}).get("issue") or urgent(pr):
         return False
-    got = ((check_state or {}).get("results") or {}).get(pr["headRefOid"])
-    return isinstance(got, dict) and got.get("ok") is False \
-        and not got.get("covered") and not got.get("conflicts") \
-        and got.get("failed") != ["merge"]
+    results = (check_state or {}).get("results") or {}
+    for sha in walk or [pr["headRefOid"]]:
+        got = results.get(sha)
+        if isinstance(got, dict) and got.get("ok") is False \
+                and not got.get("covered") and not got.get("conflicts") \
+                and got.get("failed") != ["merge"]:
+            return True
+    return False
 
 
 def train_line(sizes, entries):
@@ -9154,6 +9170,14 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         if live and AREA_TELL and send is not None:
             tell_areas(state_dir, area_held, send, out)
     greens = load_greens(state_dir) if OWN_HEAD_GREEN else {}
+    walks = {}
+
+    def red_head(pr):
+        """head_red along the head's update walk, read once a tick."""
+        key = (pr["number"], pr["headRefOid"])
+        if key not in walks:
+            walks[key] = update_walk(pr, repo, main_tip, run)
+        return head_red(check_state, pr, walks[key])
     # merge.test_ahead.own_green_to_board false: held only for their own
     # green, they may still board a train when one is cut.
     unproven = []
@@ -10211,7 +10235,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 repo, train_base, train_carriages(boarding, layers_of),
                 before, {pr["number"]: pr["headRefOid"] for pr in prs},
                 open_numbers, red={pr["number"] for pr in boarding
-                                   if head_red(check_state, pr)},
+                                   if red_head(pr)},
                 restacks=restacks if PREDICT_RESTACKED else None, run=run,
                 files=files, note=note, force_merges=TRAINS == "live",
                 started=lambda sha, tree: ahead_started(check_state, sha,
@@ -10243,7 +10267,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         {e["pr"] for e in entries}
                         | {d.get("pr") for d in record["decisions"]}
                         | {pr["number"] for pr in ahead_queue
-                           if head_red(check_state, pr)},
+                           if red_head(pr)},
                         approvals, main_tip, github, said, run)
                     save_json(said_path, said)
             else:
@@ -10418,7 +10442,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                         {pr["number"]: pr["headRefOid"] for pr in prs},
                         open_numbers, trains=1,
                         red={pr["number"] for pr in boarding
-                             if head_red(check_state, pr)},
+                             if red_head(pr)},
                         restacks=restacks if PREDICT_RESTACKED else None,
                         run=run, files=files, note={},
                         unreviewed=frozenset(UNREVIEWED))
