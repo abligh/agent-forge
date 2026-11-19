@@ -6254,9 +6254,19 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                     if n not in open_numbers:
                         continue
                     head = heads.get(n)
-                    why = ("pushed %s mid-train" % head[:10]
-                           if head and head != e.get("head")
-                           else "left the queue")
+                    if head and head != e.get("head"):
+                        have_head(repo, {"number": n, "headRefOid": head},
+                                  run)
+                        # agent-forge #508: the Merger's own update isn't
+                        # the author's push, though it leaves all the
+                        # same, its new head's check not yet green.
+                        why = ("updated by the Merger to %s; out of the "
+                               "queue until its check" % head[:10]
+                               if own_push(repo, e.get("head"), head,
+                                           main_tip, run)
+                               else "pushed %s mid-train" % head[:10])
+                    else:
+                        why = "left the queue"
                 elif pr["headRefOid"] != e.get("head"):
                     have_head(repo, pr, run)
                     tree = git(repo, "rev-parse",
