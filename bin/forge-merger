@@ -7369,6 +7369,18 @@ def boarded_members(last):
             if isinstance(e, dict) and isinstance(e.get("pr"), int)}
 
 
+def searched(saved):
+    """The numbers of the search `saved`'s suspects, which a conflict
+    hold leaves alone as it does boarded members (agent-forge #513). A
+    search that keeps no trains writes only its batches, which
+    `boarded_numbers` doesn't count; on 2026-11-19 a pull request
+    outside the search took right of way over the second suspect, the
+    green prefix couldn't merge as one train, the first merged alone,
+    and its update ended the search 25 minutes in."""
+    return {e["pr"] for e in (saved or {}).get("suspects") or ()
+            if isinstance(e, dict) and isinstance(e.get("pr"), int)}
+
+
 def boarded_numbers(last):
     """The numbers of the pull requests aboard the trains in `last`
     (ahead.json, and the trains a search keeps, `boarded_members`). A
@@ -9468,7 +9480,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             {pr["number"] for pr in queue
              if handed_back(said, pr, approvals[pr["number"]], when)},
             boarded_numbers(load_json(os.path.join(
-                state_dir, AHEAD_FILE), {})))
+                state_dir, AHEAD_FILE), {})) | searched(saved))
         if live:
             os.makedirs(state_dir, exist_ok=True)
             save_json(pairs_path, pairs.get("used", {}))

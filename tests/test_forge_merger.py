@@ -6475,6 +6475,16 @@ class HoldConflicting(RepoCase):
         self.assertEqual(m.conflicts_ahead(
             self.repo.path, queue, boarded={5}), {6: 5})
 
+    def test_a_searchs_suspects_are_not_held(self):
+        # agent-forge #513: a search keeping no trains still protects
+        # its suspects from one outside it.
+        saved = {"suspects": [{"pr": 6, "head": "b"}, {"pr": 9}, "x"]}
+        self.assertEqual(m.searched(saved), {6, 9})
+        self.assertEqual(m.searched(None), set())
+        queue = [self.item(), self.rival()]
+        self.assertEqual(m.conflicts_ahead(
+            self.repo.path, queue, boarded=m.searched(saved)), {})
+
     def test_boarded_numbers_read_kept_trains_too(self):
         last = {"entries": [{"pr": 5, "head": "a"}],
                 "kept_trains": {"trains": True,
