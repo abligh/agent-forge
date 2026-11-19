@@ -87,6 +87,25 @@ class Issues(Case):
         d = rules.route_issue(issue({7: opened()}), ROSTER)
         self.assertNotEqual(d.get("rule"), 26)
 
+    def test_an_answer_after_the_merge_ends_it(self):
+        item = issue({7: opened((12, T2))})
+        item["comments"] = [{"author": {"login": LEADDEV},
+                             "createdAt": T3, "body": "kept: waits for #7"}]
+        self.assertNotEqual(rules.route_issue(item, ROSTER).get("rule"), 26)
+
+    def test_a_comment_before_the_merge_does_not(self):
+        item = issue({7: opened((12, T2))})
+        item["comments"] = [{"author": {"login": LEADDEV},
+                             "createdAt": T1, "body": "on it"}]
+        self.assertEqual(rules.route_issue(item, ROSTER)["rule"], 26)
+
+    def test_a_strangers_comment_does_not(self):
+        item = issue({7: opened((12, T2))})
+        item["comments"] = [{"author": {"login": "someone-else"},
+                             "createdAt": T3, "body": "+1"}]
+        # Rule 12 takes the turn for the comment; rule 26 still stands.
+        self.assertIsNotNone(rules.stale_blocker(item, "LeadDev"))
+
     def test_a_closed_blocker_is_rule_14s(self):
         item = issue({7: {"state": "CLOSED", "closedAt": T2,
                           "mergedRefs": [{"number": 12, "mergedAt": T2}]}})
@@ -103,6 +122,12 @@ class PullRequests(Case):
     def test_without_a_merge_it_stays_the_mergers(self):
         d = rules.route_pr(pull({7: opened()}), ROSTER)
         self.assertEqual((d["who"], d["rule"]), (None, 6))
+
+    def test_an_answer_after_the_merge_ends_it(self):
+        item = pull({7: opened((12, T2))})
+        item["comments"] = [{"author": {"login": LEADDEV},
+                             "createdAt": T3, "body": "kept"}]
+        self.assertEqual(rules.route_pr(item, ROSTER)["rule"], 6)
 
     def test_itself_is_not_a_merge_that_counts(self):
         d = rules.route_pr(pull({7: opened((41, T2))}), ROSTER)

@@ -1459,7 +1459,11 @@ mention or a link, from the issue's timeline) merged after the lines
 were written, it is the item owner's turn: the text names the issue,
 the merged pull request and when it merged, and asks whether the line
 only waited for that code. The event is the newest such merge, so each
-new one asks once, and nothing reminds. On a pull request it speaks
+new one asks once, and nothing reminds. A comment on the item by the
+project's owner or an agent after that merge answers it, and the turn
+ends. Until v0.4.228 it stood while the line did, and the
+idle nudge, which lists the agent's standing turns, re-sent it. On a
+pull request it speaks
 only where rules 4, 5 and 6 give nobody the turn; on an issue, only
 where no other rule does. It costs one GraphQL query a run while any
 open item names an open issue. The Merger's reading of the lines is

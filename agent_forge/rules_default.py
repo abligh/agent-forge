@@ -1345,7 +1345,9 @@ def stale_blocker(item, who):
     owner's turn when one of its `Blocked-by:` lines names an issue that
     is still open, and a pull request referencing that issue merged
     after the line was written; else None. The event is the newest such
-    merge, so each new one asks once, and nothing reminds."""
+    merge, so each new one asks once, and nothing reminds; a comment by
+    the project's owner or an agent after it answers it, and the turn
+    ends (else the idle nudge, which lists standing turns, re-sent it)."""
     if not STALE_BLOCKER:
         return None
     named, written = issue_blocker_state(item)
@@ -1366,6 +1368,14 @@ def stale_blocker(item, who):
     if best is None:
         return None
     b, number, at = best
+    # Answered: the project's owner or an agent spoke on the item after
+    # that merge (leaving the line and saying why, say). Without this the
+    # turn stood while the line did, and the idle nudge re-sent it.
+    said = [as_stamp(c.get("createdAt"))
+            for c in item.get("comments") or ()
+            if author_of(c) in BLOCKER_WRITERS]
+    if any(t and t > at for t in said):
+        return None
     return turn(item["number"], who, 26, at,
                 "says Blocked-by: #%d, which is open, but #%d, which "
                 "references it, merged at %s. If #%d's code in the default "
