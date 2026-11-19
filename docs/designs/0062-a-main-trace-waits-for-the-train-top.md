@@ -8,13 +8,23 @@
 ## Summary
 
 The default branch's traced run (the "main trace", which records what
-each step read so later heads can reuse it) starts as soon as it is
-due, which is usually within a minute of a merge. That is the moment
-the next train's top starts. With `checks.main_cpu_weight` the trace
-runs at the same CPU weight as the train top, so the two compete for
-the host, and the next merge waits on the top. This design lets a due
-main trace wait while a train top runs, with a bound. The setting is
-`checks.main_trace_yields`, off by default.
+each step read so later heads can reuse it) gives way to predictions
+only until it is due: `checks.depends_minutes` (default 30) after the
+merge. From then on it goes before later tops. With
+`checks.main_cpu_weight` it runs at the same CPU weight as the train
+top, so in busy hours, when every slot has a prediction to run, the
+trace starts at that bound beside a top that is already running, and
+the next merge waits on the top. This design lets a due main trace
+wait longer while a train top runs, with a second bound. The setting
+is `checks.main_trace_yields`, off by default.
+
+**Correction (2026-11-19, 12:25Z).** The first version said the trace
+starts "within a minute of a merge". That's true only when slots are
+free. Of 48 main runs from 11-18 to 11-19 on the host below, the median
+waited 165 s, but the top quarter waited 31 to 37 minutes: the
+existing bound. So in busy hours this design is close to raising
+`depends_minutes`, which is configuration and can be measured first.
+See "A simpler first step".
 
 ## The evidence
 
@@ -64,6 +74,18 @@ the new tip's records for up to `main_trace_yield_minutes` longer. They
 can still reuse the previous tip's matched records. On the evidence
 above, about two traces an hour, each overlapping a train top for most
 of its run.
+
+## A simpler first step
+
+Raise `checks.depends_minutes` from 30 to 60 for a day and compare the
+table above. In busy hours it has the same effect as this design. When
+slots are free it costs nothing, since the trace starts at once. It also
+delays the default branch's red check by up to 30 more minutes, which
+is the cost this design's bound was meant to limit. The same setting
+also caps traces at one every `depends_minutes` (`trace_matched_main`,
+`match_main_unrecorded`), so 60 halves the traces too: less
+contention, but the records later heads reuse are refreshed half as
+often. If those costs are acceptable, this design isn't needed.
 
 ## Not in this design
 
