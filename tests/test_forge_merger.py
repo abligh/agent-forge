@@ -1414,6 +1414,45 @@ class TrainMerge(TrainSetup):
                       [(w[0], w[1]) for w in self.github.writes])
         self.assertIn("each member merges on its own", self.lines[-1])
 
+    def refuse_first(self, times, text="HTTP 405: Base branch was modified."
+                     " Review and try the merge again."):
+        left = [times]
+
+        def refuse(method, path):
+            if path.endswith("/merge") and left[0]:
+                left[0] -= 1
+                return text
+            return None
+        return refuse
+
+    def merges_tried(self):
+        return [w for w in self.github.writes
+                if w[0] == "PUT" and w[1].endswith("/merge")]
+
+    def test_base_branch_modified_is_tried_again(self):
+        # agent-forge #508: GitHub refuses a merge it hasn't finished
+        # checking, with the default branch unmoved.
+        self.assertEqual(self.merge(refuse=self.refuse_first(1)),
+                         ([5, 6], []))
+        self.assertEqual(len(self.merges_tried()), 2)
+        self.assertNotIn(("PATCH", SLUG + "/pulls/900"),
+                         [(w[0], w[1]) for w in self.github.writes])
+        self.assertTrue(any("trying #900 again" in line
+                            for line in self.lines))
+
+    def test_it_falls_back_after_its_retries(self):
+        self.assertEqual(
+            self.merge(refuse=self.refuse_first(m.TRAIN_MERGE_RETRIES + 1)),
+            ([], [5, 6]))
+        self.assertEqual(len(self.merges_tried()), m.TRAIN_MERGE_RETRIES + 1)
+        self.assertIn("each member merges on its own", self.lines[-1])
+
+    def test_another_refusal_is_not_tried_again(self):
+        self.assertEqual(self.merge(refuse=self.refuse_first(
+            1, "HTTP 405: Required status check is expected.")),
+            ([], [5, 6]))
+        self.assertEqual(len(self.merges_tried()), 1)
+
     def test_a_layer_is_retargeted_to_main_first(self):
         self.queue[1]["baseRefName"] = "b5"
         self.merge()
