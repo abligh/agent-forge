@@ -1244,6 +1244,14 @@ TRAIN_BRANCH = "forge/train-"
 # is in: TRAIN_POLLS times TRAIN_POLL_S seconds.
 TRAIN_POLLS = 10
 TRAIN_POLL_S = 2
+# GitHub refuses a merge it hasn't finished checking with "Base branch
+# was modified" (agent-forge #508: 11 of about 630 train merges on one
+# host in a week, most seconds after the pull request was opened, the
+# default branch unmoved). The same merge is tried again this often,
+# this far apart, before the train falls back.
+TRAIN_MERGE_RETRIES = 2
+TRAIN_MERGE_RETRY_S = 5
+TRAIN_MERGE_RETRY_TEXT = "base branch was modified"
 # The actions that leave a run in progress or about to start on the
 # pull request: with test_ahead, it keeps its place in the queue.
 IN_FLIGHT = ("UPDATE", "RESOLVE", "UNION", "RESTACK", "STACK-UPDATE",
@@ -7635,10 +7643,18 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
         return fail("could not open its pull request: " + why)
     if note is not None:
         note["pr"] = number
-    ok, why = github.write("PUT", "repos/%s/pulls/%d/merge"
-                           % (REPO_SLUG, number), sha=top,
-                           merge_method="merge",
-                           commit_title="Merge train %s (#%d)" % (span, number))
+    for attempt in range(TRAIN_MERGE_RETRIES + 1):
+        ok, why = github.write("PUT", "repos/%s/pulls/%d/merge"
+                               % (REPO_SLUG, number), sha=top,
+                               merge_method="merge",
+                               commit_title="Merge train %s (#%d)"
+                               % (span, number))
+        if ok or TRAIN_MERGE_RETRY_TEXT not in (why or "").lower() \
+                or attempt == TRAIN_MERGE_RETRIES:
+            break
+        out("TRAIN-MERGE %s: GitHub said %r; trying #%d again in %ds"
+            % (span, (why or "").strip()[:80], number, TRAIN_MERGE_RETRY_S))
+        sleep(TRAIN_MERGE_RETRY_S)
     if not ok:
         github.write("PATCH", "repos/%s/pulls/%d" % (REPO_SLUG, number),
                      state="closed")
