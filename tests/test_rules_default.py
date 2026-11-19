@@ -84,7 +84,7 @@ class Interface(unittest.TestCase):
         self.assertEqual(sorted(rules.graphql), ["Issue", "PullRequest"])
         self.assertEqual([l.name for l in rules.lookups],
                          ["blockers", "bases", "red builds",
-                          "published nightly"])
+                          "published nightly", "stale blockers"])
 
 
 # --- red builds first (designs/0039) ----------------------------------------

@@ -297,7 +297,8 @@ RELAY = {"url": str, "token_file": str, "remind_seconds": int, "room": str}
 ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
           "stuck": dict, "owners": dict, "unreviewed": dict,
           "forget_minutes": int, "quiet_labels": list, "red_first": dict,
-          "nightly_wake": dict, "issue_blocked_by": str, "escalate": dict}
+          "nightly_wake": dict, "issue_blocked_by": str, "escalate": dict,
+          "stale_blocker": bool}
 # router.escalate (designs/0049).
 ESCALATE = {"after_reminders": int, "undelivered_minutes": int,
             "label": str, "to": str}
