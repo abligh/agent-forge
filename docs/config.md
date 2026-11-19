@@ -1351,8 +1351,11 @@ next such run; a `Defer-until:` still to come, or another waiting
 label, keeps it waiting. So the label means "needs a newer nightly":
 when what is left is a turn on builds already published (a half on
 another machine, say), take the label off and set a `Defer-until:` for
-the turn instead. While the label is on, rule 24 doesn't remind about a
-lapsed `Defer-until:`, and the idle report lists the issue as
+the turn instead. If the label stays on, a `Defer-until:` later than
+the newest published nightly's builds still counts: rule 24 wakes the
+owner when it passes, and until then the idle report lists it as
+`Defer-until`. An earlier one doesn't: while the label is on, rule 24
+doesn't remind about it, and the idle report lists the issue as
 `<label> (commented after the <date> nightly; waits for the next one)`,
 or `(no nightly since the label went on)` (agent-forge #482).
 Needs the `nightly` section. Off without the key.

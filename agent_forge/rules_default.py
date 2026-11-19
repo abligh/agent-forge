@@ -1282,17 +1282,21 @@ def deferral_passed(issue, owner, ctx):
     """Rule 24: the owner's turn while the issue's newest `Defer-until:`
     has passed and neither the project's owner nor an agent has
     commented since that time, else None. Not for an issue with a
-    waiting label, one waiting for a nightly (rule 22's) or one still
-    blocked by an open item. The event is the deferral's time, so it
-    is woken once and reminded about hourly until someone comments or
-    the deferral is moved."""
+    waiting label or one still blocked by an open item, nor for one
+    waiting for a nightly (rule 22's) unless the deferral is later
+    than the newest published nightly's builds: an owner who set a time
+    for a turn on those builds is woken at it (agent-forge #482). The
+    event is the deferral's time, so it is woken once and reminded about
+    hourly until someone comments or the deferral is moved."""
     if ctx is None or not owner:
         return None
     if any(l.startswith(WAITING_PREFIX) for l in labels_of(issue)) \
-            or awaits_nightly(issue) or blocked(issue):
+            or blocked(issue):
         return None
     until = deferred_until(issue)
     if until is None or until > ctx.when:
+        return None
+    if awaits_nightly(issue) and not deferred_past_nightly(issue):
         return None
     stamp = until.astimezone(datetime.timezone.utc).strftime(STAMP)
     said = [as_stamp(c.get("createdAt"))
@@ -1663,7 +1667,8 @@ def owned_issue_states(agent, ctx):
             found.append((issue, "waiting", waiting[0]))
         elif hushed:
             found.append((issue, "waiting", hushed))
-        elif awaits_nightly(issue) and not nightly_due(issue):
+        elif awaits_nightly(issue) and not nightly_due(issue) \
+                and not deferred_past_nightly(issue):
             found.append((issue, "waiting", "%s (%s)" % (
                 NIGHTLY_WAKE["label"], nightly_wait_reason(issue))))
         elif until is not None and until > ctx.when:
@@ -2175,6 +2180,21 @@ def awaits_nightly(issue):
     """Whether the issue carries `router.nightly_wake`'s label."""
     return NIGHTLY_WAKE is not None and \
         NIGHTLY_WAKE["label"] in labels_of(issue)
+
+
+def deferred_past_nightly(issue):
+    """Whether an issue carrying `router.nightly_wake`'s label has a
+    `Defer-until:` later than when the newest published nightly's builds
+    were published: its owner set a time for a turn on those builds (a
+    half on another machine, say), so rule 24 wakes it then and the idle
+    report counts it as the `Defer-until:` says, not as waiting for the
+    next nightly (agent-forge #482)."""
+    built = issue.get("publishedNightly")
+    until = deferred_until(issue)
+    if until is None or not isinstance(built, dict) or not built.get("ended"):
+        return False
+    return until.astimezone(datetime.timezone.utc).strftime(STAMP) \
+        > built["ended"]
 
 
 def nightly_due(issue):
