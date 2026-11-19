@@ -332,6 +332,19 @@ class PullRequestRules(unittest.TestCase):
         self.assertTurn(d, "Reviewer", 8, T2)
         self.assertIn("you asked for changes (review 55)", d["line"])
 
+    def test_8_not_while_the_reviewer_has_said_since(self):
+        # agent-forge #515: "waits for the Mac run after 22:00Z".
+        base = dict(reviews=[review(REVIEWER, "CHANGES_REQUESTED", T1, 55,
+                                    oid=OLD)],
+                    statuses=[status("SUCCESS", T2)])
+        d = decide_pr(pr_node(comments=[comment(REVIEWER, T3)], **base))
+        self.assertNobody(d, 8)
+        d = decide_pr(pr_node(comments=[comment(REVIEWER, T1)], **base))
+        self.assertTurn(d, "Reviewer", 8, T2)
+        d = decide_pr(pr_node(comments=[comment(REVIEWER, T2),
+                                        comment(LEADDEV, T3)], **base))
+        self.assertTurn(d, "Reviewer", 8, T3)
+
     def test_3_the_owners_request_is_the_authors_until_answered(self):
         d = decide_pr(pr_node(reviews=[review(OWNER, "CHANGES_REQUESTED",
                                               T1)]))

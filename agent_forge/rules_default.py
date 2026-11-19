@@ -998,8 +998,17 @@ def route_pr_rules(pr, roster, when=None):
         who = roster.who(author_of(request))
         if strip_bot(author_of(request)) not in reviewer_logins:
             return nobody(n, 8, "answered %s's request for changes" % who)
-        return turn(n, who, 8, max(status.get("createdAt") or "", spoke,
-                                   request["submittedAt"]),
+        since = max(status.get("createdAt") or "", spoke,
+                    request["submittedAt"])
+        # agent-forge #515: the reviewer has said something since (that
+        # the request waits for evidence, say): that is its answer until
+        # the author pushes or speaks again.
+        said = max(last_by(comments, {author_of(request)}),
+                   last_by([r for r in reviews if r is not request],
+                           {author_of(request)}, "submittedAt"))
+        if said > since:
+            return nobody(n, 8, "%s has said since it went green" % who)
+        return turn(n, who, 8, since,
                     "needs your review again: you asked for changes "
                     "(review %s), green at %s" % (request.get("databaseId"),
                                                   head[:7]))
