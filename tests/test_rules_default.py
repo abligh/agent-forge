@@ -755,6 +755,24 @@ class Rule22(RedFirstCase):
         self.assertGreater(rules.deferred_until(item), NOW)
         self.assertEqual(len(self.wakes(item)), 1)
 
+    def lapsed(self, until, comment_at="2026-10-09T13:40:00Z"):
+        item = waiting_issue(body="Defer-until: %s" % until)
+        item["comments"] = [note(LEADDEV, comment_at)]
+        ctx = self.ctx(issues=[item])
+        return [d for d in rules.decide(item, ctx) if d.rule == 24]
+
+    def test_rule_24_wakes_a_defer_until_set_after_the_builds(self):
+        # #482: checked at 13:40Z on the 13:30Z builds, with a time set
+        # for the half left on them. Rule 22 is quiet (a comment after
+        # the builds); rule 24 wakes the owner at that time.
+        [got] = self.lapsed("2026-10-09T13:50:00Z")
+        self.assertEqual((got.agent, got.event),
+                         ("LeadDev", "2026-10-09T13:50:00Z"))
+
+    def test_rule_24_still_skips_one_from_before_the_builds(self):
+        self.assertEqual(self.lapsed("2026-10-09T13:00:00Z",
+                                     "2026-10-09T12:50:00Z"), [])
+
     def test_no_green_run_wakes_nobody(self):
         self.assertEqual(self.wakes(waiting_issue(green=None)), [])
         self.assertEqual(self.wakes(waiting_issue(
@@ -869,6 +887,25 @@ class NightlyWaitIsNotActionable(RedFirstCase):
         self.assertEqual(self.why(waiting_issue(
             labelled="2026-10-09T12:30:00Z")), (
             "waiting", WAITS + " (no nightly since the label went on)"))
+
+    def checked(self, until):
+        # Checked on the 13:30Z builds at 13:40Z, with a time set for
+        # what is left on them (#482).
+        item = waiting_issue(body="Defer-until: %s" % until)
+        item["comments"] = [note(LEADDEV, "2026-10-09T13:40:00Z")]
+        return item
+
+    def test_a_defer_until_set_for_the_published_builds_counts(self):
+        self.assertEqual(self.why(self.checked("2026-10-09T15:00:00Z")),
+                         ("waiting", "Defer-until 10-09 15:00Z"))
+        self.assertEqual(self.owned(self.checked("2026-10-09T13:50:00Z")),
+                         ([60], 0))
+
+    def test_one_before_the_builds_still_waits_for_the_next(self):
+        item = self.checked("2026-10-09T13:00:00Z")
+        self.assertEqual(self.why(item), (
+            "waiting", WAITS + " (commented after the 2026-10-09 "
+            "nightly; waits for the next one)"))
 
     def test_without_the_key_it_is_actionable(self):
         self.use(red_project(idle_offer={}, nightly=True))
