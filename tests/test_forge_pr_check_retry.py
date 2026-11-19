@@ -167,6 +167,98 @@ class Retry(base.StateCase):
             self.state_dir, "verdicts.log").read_text())
 
 
+class StopOnRed(base.StateCase):
+    """stop_on_red (agent-forge #506): a prediction's run stops at its
+    first red step."""
+
+    ahead, logged = base.WorkerAhead.ahead, base.WorkerAhead.logged
+    work, queue = base.Worker.work, base.Worker.queue
+    flaky, made = Retry.flaky, Retry.made
+
+    def setUp(self):
+        super().setUp()
+        configured(stop_on_red=True)
+        self.addCleanup(pc.configure, config.Project(example(), None))
+
+    def test_the_steps_after_a_red_one_do_not_run(self):
+        run = self.flaky(1)
+        self.assertEqual(self.ahead(run), 1)
+        self.assertEqual(self.made(run), ["fmt-check", "vet", "test"])
+        r = self.state()["results"][SHA_P]
+        self.assertEqual((r["ok"], r["failed"], r["not_run"]),
+                         (False, ["test"], ["doc-check"]))
+        self.assertIn("STOPPED-ON-RED AHEAD #2 dddddddddd: test red; not "
+                      "run: doc-check", self.logged())
+
+    def test_a_green_run_runs_every_step(self):
+        run = self.flaky(0)
+        self.assertEqual(self.ahead(run), 0)
+        self.assertEqual(self.made(run),
+                         ["fmt-check", "vet", "test", "doc-check"])
+        self.assertNotIn("not_run", self.state()["results"][SHA_P])
+
+    def test_a_retry_that_turns_green_runs_the_rest(self):
+        configured(stop_on_red=True, retry_red=True)
+        run = self.flaky(1)
+        self.assertEqual(self.ahead(run), 0)
+        self.assertEqual(self.made(run),
+                         ["fmt-check", "vet", "test", "test", "doc-check"])
+        r = self.state()["results"][SHA_P]
+        self.assertEqual((r["ok"], r["retried"]),
+                         (True, {"steps": ["test"], "ok": True}))
+        self.assertNotIn("not_run", r)
+
+    def test_a_retry_red_again_leaves_the_rest_unrun(self):
+        configured(stop_on_red=True, retry_red=True)
+        run = self.flaky(2)
+        self.assertEqual(self.ahead(run), 1)
+        self.assertEqual(self.made(run), ["fmt-check", "vet", "test", "test"])
+        self.assertEqual(self.state()["results"][SHA_P]["not_run"],
+                         ["doc-check"])
+
+    def test_a_pull_requests_own_head_runs_every_step(self):
+        self.queue()
+        run = self.flaky(1)
+        self.assertEqual(self.work(run), 1)
+        self.assertEqual(self.made(run),
+                         ["fmt-check", "vet", "test", "doc-check"])
+
+    def test_without_the_switch_every_step_runs(self):
+        configured()
+        run = self.flaky(1)
+        self.assertEqual(self.ahead(run), 1)
+        self.assertEqual(self.made(run),
+                         ["fmt-check", "vet", "test", "doc-check"])
+        self.assertNotIn("STOPPED-ON-RED", self.logged())
+
+
+class SideBySideStop(unittest.TestCase):
+    """run_side_by_side with stop_on_red: nothing starts after a red."""
+
+    def go(self, red, max_steps, stop=True):
+        chosen = [(n, [n], None) for n in ("a", "b", "c")]
+        ran = []
+
+        def prepare(name, args, extra):
+            return (args, {}, None, None)
+
+        def execute(name, args, env, folder, unit=None, usage=None,
+                    on_start=None):
+            ran.append(name)
+            return {"name": name, "rc": 1 if name == red else 0}
+        got = pc.run_side_by_side(chosen, prepare, execute, max_steps,
+                                  stop_on_red=stop)
+        return [r["name"] for r in got], ran
+
+    def test_one_at_a_time_a_red_ends_it(self):
+        self.assertEqual(self.go("a", 1), (["a"], ["a"]))
+        self.assertEqual(self.go("b", 1), (["a", "b"], ["a", "b"]))
+
+    def test_without_it_every_step_runs(self):
+        self.assertEqual(self.go("a", 1, stop=False),
+                         (["a", "b", "c"], ["a", "b", "c"]))
+
+
 class FlakeHook(base.StateCase):
     """checks.flake_issue: the worker hands each step a retry turned
     green, with its red run's tail, to `flake`."""
