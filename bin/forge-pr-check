@@ -1094,6 +1094,9 @@ PREEMPT_HOLD = datetime.timedelta(minutes=5)
 # prediction's red steps are run once more on the same tree before the
 # red stands.
 RETRY_RED = False
+# merge.test_ahead.stop_on_red (agent-forge #506): a prediction's run
+# stops at its first red step; a train or search only needs to be red.
+STOP_ON_RED = False
 # checks.flake_issue (agent-forge #287): with RETRY_RED, a retried step
 # that turns green files an issue, {"labels"} (the owner's label
 # included), or None: off. Which step and test each open issue is for
@@ -1248,7 +1251,7 @@ def configure(project, instance=None):
     global MERGER_CPU_WEIGHT, MAIN_CPU_WEIGHT, DOCKER_SLICES, CPU_QUOTA
     global STEP_CACHES, ENV_FILES
     global FLAKE_ISSUE
-    global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, LATER_FIRST, TRAIN_SLOTS, RETRY_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
+    global TEST_AHEAD, SPARE_ONLY, STOP_SPENT, LATER_FIRST, TRAIN_SLOTS, RETRY_RED, STOP_ON_RED, MATCH_MAX_AGE, DEPENDS, DEPENDS_WAIT, TRACER, ALWAYS
     global FAST_LANE_S, MERGE_DEFAULT, CACHE_LIMIT, WARM_PATHS, WARM_EVERY
     global CACHE_PRUNE_EVERY
     global RESULTS_MAX
@@ -1424,6 +1427,7 @@ def configure(project, instance=None):
     LATER_FIRST = (ahead or {}).get("later_first", 0)
     TRAIN_SLOTS = (ahead or {}).get("train_slots", 0)
     RETRY_RED = (ahead or {}).get("retry_red") is True
+    STOP_ON_RED = (ahead or {}).get("stop_on_red") is True
     FLAKE_ISSUE = None
     if instance is None and isinstance(checks.get("flake_issue"), dict):
         flake = checks["flake_issue"]
@@ -5857,9 +5861,10 @@ def read_env_file(path, uid=None):
 def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
           cpu=children_cpu, logs=None, stream=None, share=None,
           caches=None, side_by_side=None, front=None, deadline=None,
-          env_files=None, out=print, quota=None, main_weight=None):
+          env_files=None, out=print, quota=None, main_weight=None,
+          stop_on_red=False):
     """Every step that applies to the head, each run even if an earlier
-    one failed, and none retried, each after `prefix` (memory_cap).
+    one failed (but see `stop_on_red`), and none retried, each after `prefix` (memory_cap).
     `wrap(name, prefix, argv, env)` gives a traced step's (argv, env).
     With `kept`, the run's results directory, each step gets an empty
     one of its own there as CHECK_RESULTS (`keep_results`). Each
@@ -5888,8 +5893,11 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
     makes the step red without running it, and a missing one is said to
     `out` and the step runs without it. No value is ever written out.
     With `quota` (checks.cpu_quota, slot_quota), it is given the slot's
-    CPUs (quota_cpus) as each step starts. Returns (ok, results), the
-    results in the steps' order."""
+    CPUs (quota_cpus) as each step starts. With `stop_on_red`
+    (merge.test_ahead.stop_on_red, agent-forge #506), the first red step
+    ends the run: the steps still running are stopped and none starts
+    after it, and only the steps that finished have results. Returns
+    (ok, results), the results in the steps' order."""
     chosen = applicable(wt, steps)
     weights, mains, refused = {}, {}, {}
     env_files = ENV_FILES if env_files is None else env_files
@@ -5990,13 +5998,16 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
         for name, args, _ in chosen:
             extra = {} if share is None else {"CHECK_CPUS": str(share())}
             results.append(execute(name, *prepare(name, args, extra)))
+            if stop_on_red and results[-1]["rc"] != 0:
+                break
     else:
         results = run_side_by_side(chosen, prepare, execute, side_by_side,
-                                   share)
+                                   share, stop_on_red=stop_on_red)
     return all(r["rc"] == 0 for r in results), results
 
 
-def run_side_by_side(chosen, prepare, execute, max_steps, share=None):
+def run_side_by_side(chosen, prepare, execute, max_steps, share=None,
+                     stop_on_red=False):
     """designs/0029: `chosen`'s steps, at most max_steps at once, each
     started once every step it names in AFTER has finished (a name
     not in `chosen` is ignored: skipped, reused or not applying). The
@@ -6007,7 +6018,10 @@ def run_side_by_side(chosen, prepare, execute, max_steps, share=None):
     `prepare(name, args, extra)` runs here, so a tracer's files are
     named in order, and `execute` in a thread of its own. Stopped (or
     any other exception), every running step's process group is ended
-    before it goes on up. Returns the results in `chosen`'s order."""
+    before it goes on up. With `stop_on_red`, a red step ends the run
+    the same way: the steps running are stopped and their results
+    dropped, nothing more starts, and only the steps that finished have
+    results. Returns the results in `chosen`'s order."""
     names = [name for name, _, _ in chosen]
     present = set(names)
     waits = {name: [a for a in AFTER.get(name, ())
@@ -6016,6 +6030,7 @@ def run_side_by_side(chosen, prepare, execute, max_steps, share=None):
     last = [(name, args) for name, args, _ in chosen if name in ALONE]
     done, results, running, procs = set(), {}, {}, {}
     finished = queue.Queue()
+    red = []
 
     def start(name, args):
         extra = {}
@@ -6048,9 +6063,11 @@ def run_side_by_side(chosen, prepare, execute, max_steps, share=None):
             raise got
         results[name] = got
         done.add(name)
+        if stop_on_red and got["rc"] != 0:
+            red.append(name)
 
     try:
-        while pending or running:
+        while (pending or running) and not red:
             for name, args in list(pending):
                 if len(running) >= max_steps:
                     break
@@ -6062,13 +6079,20 @@ def run_side_by_side(chosen, prepare, execute, max_steps, share=None):
                 # for ever: every step still runs.
                 start(*pending.pop(0))
             collect()
+        if red:
+            # What was still running is stopped, and its results, cut
+            # short, are not kept.
+            stop_steps(procs, running)
+            running.clear()
         for name, args in last:
+            if red:
+                break
             start(name, args)
             collect()
     except BaseException:
         stop_steps(procs, running)
         raise
-    return [results[name] for name in names]
+    return [results[name] for name in names if name in results]
 
 
 def stop_steps(procs, threads, grace=None):
@@ -7918,7 +7942,8 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                        front=None if front is None or slot == LANE
                        or main else lambda: front(clock()),
                        main_weight=MAIN_CPU_WEIGHT if main
-                       and slot != LANE else None)
+                       and slot != LANE else None,
+                       stop_on_red=STOP_ON_RED and ahead and not main)
             ok, results = check(wt, env, run, steps=steps, **how)
             if scoped_steps and ok:
                 ok, more = check(wt, env, run, steps=scoped_steps,
@@ -7975,34 +8000,62 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
         # tree, before the red stands. A red the second run doesn't repeat
         # was the steps' own flake, and a red top would otherwise send its
         # batch's members into a search that finds nothing.
+        # With `stop_on_red` (agent-forge #506), a retry that turns green
+        # leaves the steps the stop didn't run: they run now, and a red
+        # among them is retried in its turn.
         retried = None
         first_red = []
-        if RETRY_RED and ahead and not ok and stale is None \
+        tried = []
+        planned = list(STEPS if steps is None else steps)
+        pool = planned + list(scoped_steps or [])
+        while RETRY_RED and ahead and not ok and stale is None \
                 and host_fault(results) is None:
             redo = [r["name"] for r in results
-                    if r["rc"] != 0 and not r.get("over_budget")]
-            pool = list(STEPS if steps is None else steps) \
-                + list(scoped_steps or [])
+                    if r["rc"] != 0 and not r.get("over_budget")
+                    and r["name"] not in tried]
             subset = [s for s in pool if s[0] in redo]
-            if subset:
-                named = [s[0] for s in subset]
-                first_red = [(r["name"], r.get("tail", "")) for r in results
-                             if r["rc"] != 0 and r["name"] in named]
-                again_ok, again = check(wt, env, run, steps=subset, **how)
-                for r in again:
-                    r["retried"] = True
-                    out("  %-20s rc=%-3d %4ds (run again)"
-                        % (r["name"], r["rc"], r["seconds"]))
-                by = {r["name"]: r for r in again}
-                results = [by.get(r["name"], r) for r in results]
-                ok = all(r["rc"] == 0 for r in results)
-                retried = {"steps": [s[0] for s in subset], "ok": ok}
-                log(state_dir, "RETRIED AHEAD %s %s: %s red; run once more on "
-                    "the same tree: %s" % (
-                        name, sha[:10], ", ".join(retried["steps"]),
-                        "green, so the red was a flake and the run is green"
-                        if ok else "red again; the red stands"),
-                    now_utc(), out)
+            if not subset:
+                break
+            named = [s[0] for s in subset]
+            tried += named
+            first_red += [(r["name"], r.get("tail", "")) for r in results
+                          if r["rc"] != 0 and r["name"] in named]
+            again_ok, again = check(wt, env, run, steps=subset, **how)
+            for r in again:
+                r["retried"] = True
+                out("  %-20s rc=%-3d %4ds (run again)"
+                    % (r["name"], r["rc"], r["seconds"]))
+            by = {r["name"]: r for r in again}
+            results = [by.get(r["name"], r) for r in results]
+            ok = all(r["rc"] == 0 for r in results)
+            retried = {"steps": list(tried), "ok": ok}
+            log(state_dir, "RETRIED AHEAD %s %s: %s red; run once more on "
+                "the same tree: %s" % (
+                    name, sha[:10], ", ".join(named),
+                    "green, so the red was a flake and the run is green"
+                    if ok else "red again; the red stands"),
+                now_utc(), out)
+            ran = {r["name"] for r in results}
+            rest = [s for s in planned if s[0] not in ran]
+            if not ok or not rest or not how["stop_on_red"]:
+                break
+            ok, more = check(wt, env, run, steps=rest, **how)
+            for r in more:
+                out("  %-20s rc=%-3d %4ds (after the retry)"
+                    % (r["name"], r["rc"], r["seconds"]))
+            results = results + more
+            retried["ok"] = ok
+        not_run = []
+        if how["stop_on_red"] and not ok:
+            ran = {r["name"] for r in results}
+            not_run = [s[0] for s in applicable(wt, planned)
+                       if s[0] not in ran]
+            if not_run:
+                log(state_dir, "STOPPED-ON-RED AHEAD %s %s: %s red; not run: "
+                    "%s" % (name, sha[:10],
+                            ", ".join(r["name"] for r in results
+                                      if r["rc"] != 0),
+                            ", ".join(not_run)), now_utc(), out)
         finished = clock()
         for r in results:
             if "results_dropped" in r:
@@ -8049,6 +8102,7 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 "pr": pr, "slot": slot, "seen": seen, "started": iso(started),
                 "finished": iso(finished), "ok": ok,
                 "failed": [r["name"] for r in results if r["rc"] != 0],
+                **({"not_run": not_run} if not_run else {}),
                 **({"retried": retried} if retried else {}),
                 # Side by side, the steps' own walls overlap: the run's
                 # is how long they took together.
