@@ -3796,12 +3796,14 @@ class PredictRestacked(unittest.TestCase):
 
     def test_one_out_of_the_queue_still_leaves(self):
         # Out of the queue (its new head's Mac check pending, say), it
-        # may not ride: a train holds only what may merge now.
+        # may not ride: a train holds only what may merge now. The
+        # Merger's own update says so, not "pushed" (agent-forge #508).
         seven, last = self.boarded()
         head = self.updated(self.restacked_by_hand())
         _, _, events = self.recut(seven, last, head, queued=False)
-        self.assertEqual(events[0], ("left", "LEFT #6: pushed %s mid-train"
-                                     % head[:10]))
+        self.assertEqual(events[0], (
+            "left", "LEFT #6: updated by the Merger to %s; out of the "
+            "queue until its check" % head[:10]))
 
     def test_a_merge_edited_by_hand_is_a_push(self):
         seven, last = self.boarded()
