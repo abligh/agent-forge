@@ -451,6 +451,8 @@ GREEN_APPROVES = False
 # issue's `Blocked-by:` lines may be in a comment by the owner or an
 # agent (`issue_blocker_state`).
 ISSUE_BLOCKED_BY = "body"
+# `router.stale_blocker` (designs/0061): rule 26, off by default.
+STALE_BLOCKER = False
 # With "agents": the logins whose comments may carry them.
 BLOCKER_WRITERS = frozenset()
 # The project, from `configure`: whose tools' state the red-build and
@@ -521,7 +523,7 @@ def configure(project, merger_tool):
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
     global UNREVIEWED, QUIET_LABELS, IN_PROGRESS, RED_FIRST, PROJECT
     global NIGHTLY_WAKE, ISSUE_BLOCKED_BY, BLOCKER_WRITERS, MANUAL
-    global GREEN_APPROVES
+    global GREEN_APPROVES, STALE_BLOCKER
     global URGENT, BUG
     merger = merger_tool
     MANUAL = project.section("merge").get("mode") == "manual"
@@ -579,6 +581,7 @@ def configure(project, merger_tool):
     NIGHTLY_WAKE = None if wake is None else {"label": wake.get("label")}
     ISSUE_BLOCKED_BY = project.section("router").get("issue_blocked_by",
                                                      "body")
+    STALE_BLOCKER = project.section("router").get("stale_blocker") is True
     BLOCKER_WRITERS = frozenset(
         {OWNER} | {project.slug(n).lower() for n in project.agents})
     URGENT = labels.get("urgent") or None
@@ -864,7 +867,19 @@ def nobody(number, rule, why, kind="turn"):
 
 def route_pr(pr, roster, when=None):
     """The turn for one pull request, as `turn` or `nobody` builds it.
-    `when` is the run's clock, for rule 0c; it defaults to now."""
+    `when` is the run's clock, for rule 0c; it defaults to now. Rule 26
+    (designs/0061) speaks only where rules 4, 5 and 6 give nobody the
+    turn: red or pending and blocked, or the Merger's."""
+    decided = route_pr_rules(pr, roster, when)
+    if decided.get("who") is None and decided.get("rule") in (4, 5, 6):
+        stale = stale_blocker(pr, roster.who(author_of(pr)))
+        if stale:
+            return stale
+    return decided
+
+
+def route_pr_rules(pr, roster, when=None):
+    """`route_pr` without rule 26."""
     n, head = pr["number"], pr.get("headRefOid") or ""
     labels = labels_of(pr)
     # `router.quiet_labels`, before every rule.
@@ -1256,6 +1271,10 @@ def route_issue(issue, roster, ctx=None):
     lapsed = deferral_passed(issue, owner, ctx)
     if lapsed:
         return lapsed
+    # Rule 26 (designs/0061).
+    stale = stale_blocker(issue, owner or roster.who(author_of(issue)))
+    if stale:
+        return stale
     return nobody(n, None, "no rule matched")
 
 
@@ -1315,6 +1334,41 @@ def unblocked_by(issue, owner, comments, roster):
                 "or Blocked-by: none." % (
                     names, "it is" if len(known) == 1 else "they are all"),
                 reminder=HOURLY)
+
+
+def stale_blocker(item, who):
+    """Rule 26 (designs/0061), with `router.stale_blocker`: the item
+    owner's turn when one of its `Blocked-by:` lines names an issue that
+    is still open, and a pull request referencing that issue merged
+    after the line was written; else None. The event is the newest such
+    merge, so each new one asks once, and nothing reminds."""
+    if not STALE_BLOCKER:
+        return None
+    named, written = issue_blocker_state(item)
+    known = item.get("blockedBy") or {}
+    since = written or item.get("lastEditedAt") or item.get("createdAt") \
+        or ""
+    best = None
+    for b in sorted(named):
+        info = known.get(b) or {}
+        if info.get("state") != "OPEN":
+            continue
+        for ref in info.get("mergedRefs") or ():
+            at, number = ref.get("mergedAt") or "", ref.get("number")
+            if not at or at <= since or number == item["number"]:
+                continue
+            if best is None or at > best[2]:
+                best = (b, number, at)
+    if best is None:
+        return None
+    b, number, at = best
+    return turn(item["number"], who, 26, at,
+                "says Blocked-by: #%d, which is open, but #%d, which "
+                "references it, merged at %s. If #%d's code in the default "
+                "branch is all this waits for, remove the line or write "
+                "what it waits for now; if it really waits for #%d to "
+                "close, leave it." % (b, number, at[:16].replace("T", " "),
+                                      b, b))
 
 
 def owner_answered(n, issue, owner, comments, roster, rule):
@@ -2603,7 +2657,70 @@ def attach_bases(github, repo, prs, issues):
         pr["baseOpen"] = True if base in heads else found.get(base)
 
 
+# Rule 26's lookup: the pull requests that reference each open issue a
+# `Blocked-by:` line names, newest events first, merged ones kept.
+REFS_QUERY = """
+query($owner:String!, $name:String!) {
+  repository(owner:$owner, name:$name) {
+%s
+  }
+}"""
+REFS_FIELD = (
+    "    r%d: issue(number:%d) {\n"
+    "      timelineItems(last:50, itemTypes:[CROSS_REFERENCED_EVENT, "
+    "CONNECTED_EVENT]) {\n"
+    "        nodes {\n"
+    "          ... on CrossReferencedEvent { source { ... on PullRequest "
+    "{ number mergedAt } } }\n"
+    "          ... on ConnectedEvent { subject { ... on PullRequest "
+    "{ number mergedAt } } }\n"
+    "        }\n"
+    "      }\n"
+    "    }")
+
+
+def merged_refs(answer):
+    """[{number, mergedAt}] from one issue's timeline answer: the merged
+    pull requests among its references, each once."""
+    seen = {}
+    for node in ((answer or {}).get("timelineItems") or {}).get("nodes") \
+            or ():
+        pr = (node or {}).get("source") or (node or {}).get("subject") or {}
+        if pr.get("number") and pr.get("mergedAt"):
+            seen[pr["number"]] = pr["mergedAt"]
+    return [{"number": k, "mergedAt": v} for k, v in sorted(seen.items())]
+
+
+def attach_stale_blockers(github, repo, prs, issues):
+    """Rule 26's lookup, with `router.stale_blocker`: give each
+    `blockedBy` entry naming an open issue its `mergedRefs`. One query
+    for every such issue; on a failure, none (rule 26 stays silent)."""
+    if not STALE_BLOCKER:
+        return
+    open_issues = {i["number"] for i in issues}
+    covered = [i for i in prs + issues if i.get("blockedBy")]
+    ask = sorted({b for i in covered for b, info in i["blockedBy"].items()
+                  if b in open_issues and info
+                  and info.get("state") == "OPEN"})
+    if not ask:
+        return
+    owner, name = repo.split("/")
+    query = REFS_QUERY % "\n".join(REFS_FIELD % (b, b) for b in ask)
+    try:
+        answer = github.api("graphql", "-f", "query=" + query,
+                            "-F", "owner=" + owner, "-F", "name=" + name
+                            )["data"]["repository"]
+    except Exception:  # noqa: BLE001 - gh's failures vary
+        return
+    refs = {b: merged_refs(answer.get("r%d" % b)) for b in ask}
+    for item in covered:
+        for b, info in item["blockedBy"].items():
+            if b in refs and info:
+                item["blockedBy"][b] = dict(info, mergedRefs=refs[b])
+
+
 lookups = (Lookup("blockers", attach_blockers),
            Lookup("bases", attach_bases),
            Lookup("red builds", attach_red_builds),
-           Lookup("published nightly", attach_published_nightly))
+           Lookup("published nightly", attach_published_nightly),
+           Lookup("stale blockers", attach_stale_blockers))

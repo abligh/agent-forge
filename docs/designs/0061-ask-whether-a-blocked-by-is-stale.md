@@ -1,6 +1,6 @@
 # 0061: Ask whether a Blocked-by is stale
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-19, #495)
 * Author: XMPPEngineer
 * Date: 2026-11-19
 * Issue: #493
@@ -57,8 +57,7 @@ so the rule asks and changes nothing. forge-merger's reading of
    * merged after the line was written: after the body's last edit or
      creation, or after the comment that set the lines
      (`issue_blocker_state`'s `written`);
-   * and is not the item itself, nor a pull request whose own
-     `Blocked-by:` names the item.
+   * and is not the item itself.
 
    It is then the item owner's turn (`Owner:<Name>`, else the author),
    with the event the newest such `mergedAt`. The text reads: "says
