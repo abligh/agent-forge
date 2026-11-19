@@ -4962,6 +4962,21 @@ class TickAhead(RepoCase):
         self.assertTrue(any(l.startswith("TRAIN-KEEP") for l in lines),
                         lines)
 
+    def test_a_search_with_nothing_to_predict_ends(self):
+        # agent-forge #510.
+        saved = {"suspects": [{"pr": 5, "head": "a"}, {"pr": 9, "head": "b"}]}
+        queue = [{"number": 6}, {"number": 7}]
+        line = m.unpredictable_search(saved, [], queue, "f" * 40)
+        self.assertIn("SUSPECTS #5..#9", line)
+        self.assertIn("#6 doesn't merge onto the search's base ffffffffff",
+                      line)
+        self.assertIn("the search ends", line)
+        self.assertIsNone(m.unpredictable_search(saved, [{"pr": 6}], queue,
+                                                 "f" * 40))
+        self.assertIsNone(m.unpredictable_search(saved, [], [], "f" * 40))
+        self.assertIsNone(m.unpredictable_search(None, [], queue, "f" * 40))
+        self.assertIsNone(m.unpredictable_search(saved, [], queue, None))
+
     def test_trains_before(self):
         trains = {"trains": True, "entries": []}
         kept = {"trains": True, "entries": [{"pr": 5}]}
