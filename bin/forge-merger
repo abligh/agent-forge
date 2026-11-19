@@ -7816,6 +7816,22 @@ def suspects_line(entries, n, green, red, cuts):
         ", ".join(span(0, c) for c in cuts) or "nothing")
 
 
+def unpredictable_search(saved, entries, queue, base):
+    """The SUSPECTS line that ends a search whose base nothing in
+    `queue` predicts on (`entries` empty), or None (agent-forge #510).
+    On one host on 2026-11-19 a kept search's next suspect conflicted
+    with the search's base once the default branch had moved past it:
+    every tick predicted nothing, the suspect waited ("not updated while
+    the search runs"), and the queue stood for 19 minutes."""
+    suspects = (saved or {}).get("suspects") or []
+    if not suspects or entries or not queue or base is None:
+        return None
+    return ("SUSPECTS #%d..#%d: #%d doesn't merge onto the search's base "
+            "%s, so nothing can be tested there; the search ends"
+            % (suspects[0]["pr"], suspects[-1]["pr"], queue[0]["number"],
+               base[:10]))
+
+
 def suspects_left(saved, queue, record, approvals, said, moved=None):
     """(saved, line): the search `saved` with the suspects that merged
     this tick (`record`'s decisions) moved to `merged`, and those no
@@ -10302,6 +10318,21 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                     repo, on_base if searching else main_tip,
                     ahead_queue, run, overdue=overdue,
                     restacks=restacks if PREDICT_RESTACKED else None)
+                ended = unpredictable_search(saved, entries, ahead_queue,
+                                             on_base if searching else None)
+                if ended:
+                    # agent-forge #510: nothing predicts on the search's
+                    # base, so no prefix can run and none of its suspects
+                    # is ever updated; the search ends and the queue is
+                    # predicted on the default branch, as with no search.
+                    out(ended)
+                    saved, searching = None, False
+                    if os.path.exists(os.path.join(state_dir,
+                                                   SUSPECTS_FILE)):
+                        os.remove(os.path.join(state_dir, SUSPECTS_FILE))
+                    entries = predict_ahead(
+                        repo, main_tip, ahead_queue, run, overdue=overdue,
+                        restacks=restacks if PREDICT_RESTACKED else None)
             record["ahead"] = [e["pr"] for e in entries]
             said_ahead = {"at": record["at"], "base": main_tip,
                           "repo": git_store(repo),
