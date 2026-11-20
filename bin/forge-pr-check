@@ -8353,6 +8353,15 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 state["waiting"].pop(sha, None)
             save(state_dir, state)
         stopped = clock()
+        if kept and post is not None:
+            # Its status said "running since"; it is queued again, and
+            # says so, or it reads as a run that never ends.
+            try:
+                post(sha, "pending", "queued again at %s: stopped for "
+                     "the Merger's batch top; it keeps its place"
+                     % stopped.strftime("%H:%MZ"))
+            except Exception as err:
+                out("POST-FAILED %s: %s" % (sha[:10], err))
         log(state_dir, "STOPPED %s %s after %ds: %s"
             % (name, sha[:10], (stopped - started).total_seconds(),
                "preempted for the Merger's batch top; back in the queue"
