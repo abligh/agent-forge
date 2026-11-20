@@ -10887,6 +10887,15 @@ class KeepTrains(TrainSetup):
         last = dict(self.last, entries=self.last["entries"], main=tip)
         self.assertEqual(self.carried(last, merge),
                          self.last["entries"][0]["sha"])
+        # agent-forge #526: with only the trains' own merge since, the
+        # top isn't asked again, so a top that wouldn't merge (here,
+        # one this checkout doesn't have) no longer cuts every train.
+        entries = [dict(e) for e in self.last["entries"]]
+        entries[-1]["sha"] = "0" * 40
+        self.lines.clear()
+        self.assertEqual(self.carried(dict(last, entries=entries), merge),
+                         self.last["entries"][0]["sha"])
+        self.assertFalse([l for l in self.lines if "TRAIN-KEEP" in l])
 
     def test_a_labelled_train_outside_the_kept_ones_keeps_them(self):
         # agent-forge #452: an urgent train cut in front of a red train's
