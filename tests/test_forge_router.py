@@ -27,6 +27,7 @@ r.configure(config.Project(example(), None))
 
 LEADDEV = "leaddevwidgetagent[bot]"
 REVIEWER = "reviewerwidgetagent[bot]"
+HELPER = "helperbot[bot]"
 MERGER = "mergerwidgetagent"  # GraphQL leaves "[bot]" off
 OWNER = "example-owner"
 HEAD = "5b257c8" + "0" * 33
@@ -339,6 +340,31 @@ class PullRequestRules(unittest.TestCase):
         d = decide_pr(pr_node(reviews=[review("someone", "CHANGES_REQUESTED",
                                               T1)]))
         self.assertTurn(d, "Reviewer", 8)
+
+    def test_3_a_pushing_agents_request_is_the_authors(self):
+        request = dict(review(HELPER, "CHANGES_REQUESTED", T1, 56),
+                       authorCanPushToRepository=True)
+        d = decide_pr(pr_node(reviews=[request]))
+        self.assertTurn(d, "LeadDev", 3, T1)
+        self.assertIn("Helper asked for changes (review 56)", d["line"])
+
+    def test_8_a_pushing_agents_answered_request_is_theirs(self):
+        # The Merger holds it on that request, as GitHub does, whatever
+        # the reviewer approved since; without this it was nobody's.
+        request = dict(review(HELPER, "CHANGES_REQUESTED", T1, 56, oid=OLD),
+                       authorCanPushToRepository=True)
+        d = decide_pr(pr_node(
+            reviews=[request, review(REVIEWER, "APPROVED", T2)],
+            statuses=[status("SUCCESS", T2)]))
+        self.assertTurn(d, "Helper", 8)
+        self.assertIn("you asked for changes (review 56)", d["line"])
+
+    def test_8_a_pushing_strangers_answered_request_is_nobodys(self):
+        request = dict(review("someone", "CHANGES_REQUESTED", T1, 56,
+                              oid=OLD), authorCanPushToRepository=True)
+        d = decide_pr(pr_node(reviews=[request],
+                              statuses=[status("SUCCESS", T2)]))
+        self.assertEqual((d["who"], d["rule"]), (None, 8))
 
     def test_3_a_request_stands_across_the_mergers_merges_of_main(self):
         # #458: asked for changes at OLD, then main merged in.
