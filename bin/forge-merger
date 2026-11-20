@@ -6070,11 +6070,32 @@ def carried_base(repo, state_dir, last, main_tip, github, run=sh,
     if not all(by):
         return main_tip
     top = (entries or [{}])[-1].get("sha")
-    if not top or git(repo, "merge-tree", "--write-tree", top, main_tip,
-                      run=run).returncode != 0:
-        out("TRAIN-KEEP: %s moved by %s, but the trains' last top doesn't "
-            "merge with it cleanly; every train is cut again"
-            % (MAIN, ", ".join("#%d" % n for n in by)))
+    present = bool(top) and git(repo, "cat-file", "-e", top + "^{commit}",
+                                run=run).returncode == 0
+    merged = git(repo, "merge-tree", "--write-tree", "--name-only", top,
+                 main_tip, run=run) if present else None
+    if merged is None or merged.returncode != 0:
+        # Say what moved it (a kept train's own merge leaves `by`
+        # empty) and why the check failed. `merge-tree` exits 1 on a
+        # conflict, but also on a top that isn't in this checkout, so
+        # that is asked first (agent-forge #526).
+        movers = ", ".join("#%d" % n for n in by) or "the trains' own merge"
+        if not top:
+            why = "the trains have no last top"
+        elif merged is None:
+            why = "that commit isn't in this checkout"
+        elif merged.returncode == 1:
+            files = [l for l in (merged.stdout or "").splitlines()[1:]
+                     if l.strip()]
+            why = "it conflicts in %s" % (", ".join(files[:5]) or
+                                          "files git didn't name")
+        else:
+            why = "git merge-tree exited %d: %s" % (
+                merged.returncode,
+                ((merged.stderr or "").strip().splitlines() or [""])[0])
+        out("TRAIN-KEEP: %s moved by %s, but the trains' last top %s "
+            "doesn't merge with it cleanly (%s); every train is cut again"
+            % (MAIN, movers, (top or "?")[:12], why))
         return main_tip
     return base
 
