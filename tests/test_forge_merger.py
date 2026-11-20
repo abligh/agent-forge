@@ -875,9 +875,18 @@ class Decide(RepoCase):
     def test_a_conflict_with_main_goes_to_the_author(self):
         self.advance_main("f.txt", "main's own line\n")
         got = self.decide(main_tip=self.repo.main_tip())
+        # It names the file, so the author knows where to look first.
         self.assertEqual(got, {"action": "HAND-BACK", "to": "author",
-                               "reason": m.CONFLICT_REASON})
+                               "reason": m.CONFLICT_REASON,
+                               "detail": "It conflicts in `f.txt`."})
         self.assertEqual(self.github.calls, [])
+
+    def test_a_conflict_hand_back_names_at_most_eight_files(self):
+        out = "tree\n" + "\n".join("f%d.txt" % i for i in range(10))
+        self.assertEqual(m.conflict_detail(out),
+                         "It conflicts in %s and 2 more." % ", ".join(
+                             "`f%d.txt`" % i for i in (0, 1, 2, 3, 4, 5, 6, 7)))
+        self.assertIsNone(m.conflict_detail("tree\n"))
 
     def test_a_merge_tree_git_cannot_run_leaves_it_to_github(self):
         self.advance_main("f.txt", "main's own line\n")
@@ -10304,7 +10313,8 @@ class Union(unittest.TestCase):
         m.configure(project())
         got = self.decide()
         self.assertEqual(got["action"], "HAND-BACK")
-        self.assertNotIn("detail", got)
+        # Not union's reason, only the files it conflicts in.
+        self.assertTrue(got["detail"].startswith("It conflicts in `"))
 
     def test_an_author_merge_of_the_same_tree_is_covered(self):
         head = self.hand_merge(UNION_LIST.replace(
