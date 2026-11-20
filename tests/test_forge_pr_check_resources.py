@@ -455,6 +455,50 @@ class PruneCaches(unittest.TestCase):
             self.assertTrue(os.path.exists(kept), kept)
         self.assertEqual(gone["dwo"], 2)
 
+    def test_a_full_deps_directory_loses_split_debug_info_oldest_first(self):
+        # On 2026-11-20 one `deps` held 3.16 million entries though
+        # pruning by age ran on time, and ext4's index was full (#517).
+        lib = make(self.path("debug", "deps", "libl-ddd.rlib"), 5, 0.1)
+        dep_info = make(self.path("debug", "deps", "l-ddd.d"), 1, 0.1)
+        fresh = [make(self.path("debug", "deps", "l-ddd.%s.rcgu.dwo" % n),
+                      2, age) for n, age in (("a", 0.3), ("b", 0.2),
+                                             ("c", 0.1))]
+        linked = make(self.path("debug", "deps", "l-ddd.e.rcgu.dwo"), 2, 0.5)
+        os.makedirs(self.inc, exist_ok=True)
+        os.link(linked, os.path.join(self.inc, "l-ddd.e.rcgu.dwo"))
+        with mock.patch.object(pc, "DEPS_ENTRIES_MAX", 4):
+            gone = pc.prune_caches([self.root], None, NOW)
+        # Unlinked ones go before the older linked one, oldest first.
+        self.assertFalse(os.path.exists(fresh[0]))
+        self.assertFalse(os.path.exists(fresh[1]))
+        for kept in (lib, dep_info, fresh[2], linked):
+            self.assertTrue(os.path.exists(kept), kept)
+        self.assertEqual((gone["dwo"], gone["entries"]), (2, 4))
+
+    def test_linked_split_debug_info_goes_when_nothing_else_is_left(self):
+        lib = make(self.path("debug", "deps", "libl-ddd.rlib"), 5, 0.1)
+        older = make(self.path("debug", "deps", "l-ddd.a.rcgu.dwo"), 2, 0.5)
+        newer = make(self.path("debug", "deps", "l-ddd.b.rcgu.dwo"), 2, 0.2)
+        os.makedirs(self.inc, exist_ok=True)
+        for path in (older, newer):
+            os.link(path, os.path.join(self.inc, os.path.basename(path)))
+        with mock.patch.object(pc, "DEPS_ENTRIES_MAX", 2):
+            gone = pc.prune_caches([self.root], None, NOW)
+        self.assertFalse(os.path.exists(older))
+        for kept in (lib, newer):
+            self.assertTrue(os.path.exists(kept), kept)
+        # The incremental session keeps its own link.
+        self.assertTrue(os.path.exists(os.path.join(self.inc,
+                                                    "l-ddd.a.rcgu.dwo")))
+        self.assertEqual(gone["entries"], 2)
+
+    def test_under_the_bound_nothing_young_goes(self):
+        young = make(self.path("debug", "deps", "l-ddd.a.rcgu.dwo"), 2, 0.1)
+        make(self.path("debug", "deps", "libl-ddd.rlib"), 5, 0.1)
+        gone = pc.prune_caches([self.root], None, NOW)
+        self.assertTrue(os.path.exists(young))
+        self.assertEqual((gone["dwo"], gone["entries"]), (0, 2))
+
     def test_untouched_incremental_directories_go(self):
         make(self.path("debug", "incremental", "a-1", "s", "f"), 5, 10)
         make(self.path("debug", "incremental", "b-2", "f"), 5, 10)

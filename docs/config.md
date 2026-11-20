@@ -184,7 +184,14 @@ slot's caches as it finishes, while it still holds the slot:
    start when no end was recorded), each with its split debug info
    (`<name>.*.dwo`); any `.dwo` older than a day whose unit has
    nothing left in the directory but its `.d`; and any `.o` there
-   older than a day that run didn't write, a Mac's split debug info;
+   older than a day that run didn't write, a Mac's split debug info.
+   Then, while a `deps` directory holds more than a million entries,
+   `.dwo` files oldest first, those no incremental session links to
+   before those one does, until it is under: ext4's directory index
+   fills at about three million names, and every write there then
+   fails with "No space left on device" on a disk with room. Only a
+   debugger or a backtrace's line numbers read split debug info, so
+   no build misses one;
 2. directories directly in an `incremental` directory with nothing in
    them touched for 7 days;
 3. then, until the slot's caches hold at most `cache_limit`, whole
@@ -240,7 +247,7 @@ run records the head it built the slot's caches at (`cache_main_sha`).
 
 Links are never followed, so nothing outside the caches is touched.
 What went is logged in `verdicts.log` as `CACHE-PRUNED`, with the bytes
-freed and left.
+freed and left and the entries in the slot's largest `deps` directory.
 
 ### Checking the merge with the default branch
 
