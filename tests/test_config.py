@@ -591,6 +591,14 @@ class Check(unittest.TestCase):
         self.assertEqual(config.check(data), [
             "router.red_first.everyone needs nightly.step_issues"])
 
+    def test_review_waiting_heads_needs_max_wait(self):
+        self.assertEqual(self.problems(
+            router={"review_waiting_heads": True}),
+            ["router.review_waiting_heads needs checks.max_wait_minutes"])
+        self.assertEqual(self.problems(
+            router={"review_waiting_heads": "yes"}),
+            ["router.review_waiting_heads must be true or false"])
+
     def test_nightly_needs_its_workflow_job_and_triage(self):
         self.assertEqual(self.problems(nightly={"job": " "}), [
             "nightly: missing 'workflow'",

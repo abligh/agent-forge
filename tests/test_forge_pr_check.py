@@ -4215,6 +4215,65 @@ class ApprovedFirst(StateCase):
         self.assertEqual(pc.next_head(state, when=T0, blocked={1, 2, 3}),
                          (SHA_A, 1))
 
+    def approved_kept(self):
+        # designs/0063: #1's head waited 90 minutes on its own; #2's
+        # pull request first waited 300 minutes ago (its kept place),
+        # but this head was pushed a minute ago.
+        state = self.waiting(**{SHA_A: (1, 90), SHA_B: (2, 300)})
+        state["waiting"][SHA_A]["queued"] = state["waiting"][SHA_A]["since"]
+        state["waiting"][SHA_B]["queued"] = pc.iso(
+            T0 - datetime.timedelta(minutes=1))
+        for sha in (SHA_A, SHA_B):
+            state["waiting"][sha]["approved"] = True
+        return state
+
+    def test_an_overdue_approved_head_passes_a_kept_place(self):
+        state = self.approved_kept()
+        with mock.patch.object(pc, "MAX_WAIT",
+                               datetime.timedelta(minutes=30)):
+            self.assertEqual(pc.next_head(state, when=T0), (SHA_A, 1))
+            # Not overdue yet: the kept place goes first, as before.
+            self.assertEqual(pc.next_head(
+                state, when=T0 - datetime.timedelta(minutes=70)), (SHA_B, 2))
+
+    def test_without_max_wait_approved_heads_keep_their_order(self):
+        state = self.approved_kept()
+        with mock.patch.object(pc, "MAX_WAIT", None):
+            self.assertEqual(pc.next_head(state, when=T0), (SHA_B, 2))
+
+    def test_the_longest_own_wait_goes_first_among_overdue_ones(self):
+        state = self.approved_kept()
+        state["waiting"][SHA_C] = {
+            "pr": 3, "approved": True,
+            "since": pc.iso(T0 - datetime.timedelta(minutes=400)),
+            "queued": pc.iso(T0 - datetime.timedelta(minutes=60))}
+        with mock.patch.object(pc, "MAX_WAIT",
+                               datetime.timedelta(minutes=30)):
+            self.assertEqual(pc.next_head(state, when=T0), (SHA_A, 1))
+
+    def test_the_mergers_own_and_predictions_still_go_before_overdue(self):
+        state = self.approved_kept()
+        with mock.patch.object(pc, "MAX_WAIT",
+                               datetime.timedelta(minutes=30)):
+            self.assertEqual(pc.next_head(state, first_pr=2, when=T0),
+                             (SHA_B, 2))
+            self.assertEqual(pc.next_head(state, queued={2}, when=T0),
+                             (SHA_B, 2))
+
+    def test_a_blocked_overdue_head_is_still_last(self):
+        state = self.approved_kept()
+        with mock.patch.object(pc, "MAX_WAIT",
+                               datetime.timedelta(minutes=30)):
+            self.assertEqual(pc.next_head(state, blocked={1}, when=T0),
+                             (SHA_B, 2))
+
+    def test_a_head_without_queued_counts_its_place(self):
+        state = self.approved_kept()
+        del state["waiting"][SHA_A]["queued"]
+        with mock.patch.object(pc, "MAX_WAIT",
+                               datetime.timedelta(minutes=30)):
+            self.assertEqual(pc.next_head(state, when=T0), (SHA_A, 1))
+
     def test_blocked_is_read_from_a_fresh_next_json(self):
         merger = os.path.join(self.state_dir, "merger")
         os.makedirs(merger)

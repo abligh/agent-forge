@@ -636,6 +636,55 @@ class UnblockedRule(unittest.TestCase):
                          "with what it waits for now, or Blocked-by: none.")
 
 
+class ReviewWaitingHeads(unittest.TestCase):
+    """Rule 27 (designs/0063): with router.review_waiting_heads, an
+    unreviewed head whose check has been pending checks.max_wait_minutes
+    is its reviewer's, to arm."""
+
+    NOW = datetime.datetime(2026, 10, 9, 13, 0, tzinfo=datetime.timezone.utc)
+
+    def setUp(self):
+        patcher = mock.patch.object(rules, "REVIEW_WAITING",
+                                    datetime.timedelta(minutes=30))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def decide(self, node):
+        prs, _ = r.fetch(FakeGitHub(response([node], [])))
+        return rules.route_pr(prs[0], ROSTER, self.NOW)
+
+    def node(self, at=T1, **kw):
+        node = pr_node(statuses=[status("PENDING", at)], **kw)
+        node["headCommit"]["nodes"][0]["commit"]["committedDate"] = T0
+        return node
+
+    def test_a_long_pending_unreviewed_head_is_the_reviewers(self):
+        d = self.decide(self.node())
+        self.assertTurn(d, "Reviewer", 27, T1)
+        self.assertIn("its check has waited 120 minutes", d["line"])
+
+    def test_not_before_the_cap(self):
+        d = self.decide(self.node(at="2026-10-09T12:45:00Z"))
+        self.assertEqual((d["who"], d["rule"]), (None, 5))
+
+    def test_not_once_reviewed_at_the_head(self):
+        d = self.decide(self.node(reviews=[review(REVIEWER, "APPROVED",
+                                                  T2)]))
+        self.assertEqual(d["rule"], 5)
+
+    def test_not_when_the_reviewer_has_spoken_since_the_push(self):
+        d = self.decide(self.node(comments=[comment(REVIEWER, T2)]))
+        self.assertEqual(d["rule"], 5)
+
+    def test_off_without_the_key(self):
+        with mock.patch.object(rules, "REVIEW_WAITING", None):
+            d = self.decide(self.node())
+        self.assertEqual((d["who"], d["rule"]), (None, 5))
+
+    def assertTurn(self, d, who, rule, event=None):
+        PullRequestRules.assertTurn(self, d, who, rule, event)
+
+
 class BlockedRed(unittest.TestCase):
     """Rule 4: a red pull request whose body's `Blocked-by:` names an
     open item is the Merger's to hold, not its author's turn."""
