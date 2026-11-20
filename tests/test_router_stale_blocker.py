@@ -2,6 +2,7 @@
 item's owner whether a `Blocked-by:` line naming an open issue is
 stale, once per pull request referencing that issue that merged after
 the line was written."""
+import datetime
 import unittest
 
 from agent_forge import config, rules_default as rules
@@ -15,6 +16,10 @@ LEADDEV = "leaddevwidgetagent[bot]"
 T0, T1, T2, T3 = ("2026-10-09T10:00:00Z", "2026-10-09T11:00:00Z",
                   "2026-10-09T12:00:00Z", "2026-10-09T13:00:00Z")
 OPEN = {"state": "OPEN", "closedAt": None}
+
+
+def parse(at):
+    return datetime.datetime.fromisoformat(at.replace("Z", "+00:00"))
 
 
 def project(on=True):
@@ -105,6 +110,15 @@ class Issues(Case):
                              "createdAt": T3, "body": "+1"}]
         # Rule 12 takes the turn for the comment; rule 26 still stands.
         self.assertIsNotNone(rules.stale_blocker(item, "LeadDev"))
+
+    def test_a_defer_until_still_to_come_holds_it(self):
+        # agent-forge #522: the owner deferred it; merges don't re-ask.
+        item = issue({7: opened((12, T2))},
+                     body="Blocked-by: #7\nDefer-until: 2026-10-10T07:00Z\n")
+        self.assertIsNone(rules.stale_blocker(item, "LeadDev",
+                                              parse(T3)))
+        later = parse("2026-10-10T08:00:00Z")
+        self.assertIsNotNone(rules.stale_blocker(item, "LeadDev", later))
 
     def test_a_closed_blocker_is_rule_14s(self):
         item = issue({7: {"state": "CLOSED", "closedAt": T2,

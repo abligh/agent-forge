@@ -872,7 +872,7 @@ def route_pr(pr, roster, when=None):
     turn: red or pending and blocked, or the Merger's."""
     decided = route_pr_rules(pr, roster, when)
     if decided.get("who") is None and decided.get("rule") in (4, 5, 6):
-        stale = stale_blocker(pr, roster.who(author_of(pr)))
+        stale = stale_blocker(pr, roster.who(author_of(pr)), when)
         if stale:
             return stale
     return decided
@@ -1279,7 +1279,8 @@ def route_issue(issue, roster, ctx=None):
     if lapsed:
         return lapsed
     # Rule 26 (designs/0061).
-    stale = stale_blocker(issue, owner or roster.who(author_of(issue)))
+    stale = stale_blocker(issue, owner or roster.who(author_of(issue)),
+                          ctx.when if ctx is not None else None)
     if stale:
         return stale
     return nobody(n, None, "no rule matched")
@@ -1347,15 +1348,23 @@ def unblocked_by(issue, owner, comments, roster):
                 reminder=HOURLY)
 
 
-def stale_blocker(item, who):
+def stale_blocker(item, who, when=None):
     """Rule 26 (designs/0061), with `router.stale_blocker`: the item
     owner's turn when one of its `Blocked-by:` lines names an issue that
     is still open, and a pull request referencing that issue merged
     after the line was written; else None. The event is the newest such
     merge, so each new one asks once, and nothing reminds; a comment by
     the project's owner or an agent after it answers it, and the turn
-    ends (else the idle nudge, which lists standing turns, re-sent it)."""
+    ends (else the idle nudge, which lists standing turns, re-sent it).
+    Not while the item's `Defer-until:` is still to come at `when`."""
     if not STALE_BLOCKER:
+        return None
+    # A `Defer-until:` still to come is the owner's own answer to when to
+    # look again (agent-forge #522: one asked six times in a day, each
+    # merge that referenced the blocker, while deferred to the morning).
+    until = deferred_until(item)
+    now = when or datetime.datetime.now(datetime.timezone.utc)
+    if until is not None and until > now:
         return None
     named, written = issue_blocker_state(item)
     known = item.get("blockedBy") or {}
