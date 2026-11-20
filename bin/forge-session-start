@@ -73,6 +73,10 @@ Assume nothing you started before this is still running. In short:
 - Check your tools rather than assuming: ToolSearch select:SendMessage,ListAgents.
 - Scratch state you left behind (worktrees, files in /tmp) may be half-finished. Check it before relying on it."""
 
+CONVENTIONS = """\
+Conventions for everything you write:
+- Times are UTC, written with a Z: 22:31Z, 2026-11-20T22:31Z. Never a local zone or offset (BST, CET, GMT+1, +01:00, "local"), in messages, comments, commit messages, issues or logs. Convert any time you quote, including one a person or another agent gave you in their own zone."""
+
 
 def agent_name(cwd, unstamped, run=subprocess.run):
     """The agent name in the worktree at `cwd`'s OWN config, or "" if none.
@@ -182,7 +186,7 @@ def brief(source, agent, items, project=None, now=None, role=None,
     now = now or datetime.datetime.now(datetime.timezone.utc)
     lines = ["Session %s at %s%s." % (source, now.strftime("%Y-%m-%dT%H:%MZ"),
                                       " for " + agent if agent else ""),
-             CHECKLIST, ""]
+             CHECKLIST, "", CONVENTIONS, ""]
     owner = labels_of(project)[0] if project else "Owner:"
     if not agent:
         lines.append("This worktree has no agent identity in its own config "
