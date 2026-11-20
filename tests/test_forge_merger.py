@@ -12173,6 +12173,21 @@ class UpdateWalk(RepoCase):
         self.assertIs(m.head_red(state, self.item), False)
         self.assertIs(m.head_red(state, self.item, walk), True)
 
+    def test_a_green_run_of_the_head_ends_the_walk(self):
+        # The update itself was checked and passed: the red below it
+        # no longer holds it out of the trains.
+        walk = m.update_walk(self.item, self.repo.path, self.repo.main_tip())
+        state = {"results": {self.approved: {"ok": False, "tree": "t"},
+                             self.head: {"ok": True, "failed": []}}}
+        self.assertIs(m.head_red(state, self.item, walk), False)
+
+    def test_a_covered_green_of_the_head_does_not(self):
+        # A batch's cover isn't a run of its own.
+        walk = m.update_walk(self.item, self.repo.path, self.repo.main_tip())
+        state = {"results": {self.approved: {"ok": False, "tree": "t"},
+                             self.head: {"ok": True, "covered": "batch"}}}
+        self.assertIs(m.head_red(state, self.item, walk), True)
+
     def test_its_exceptions_still_apply_along_the_walk(self):
         walk = m.update_walk(self.item, self.repo.path, self.repo.main_tip())
         for got in ({"ok": False, "conflicts": ["a.txt"]},
