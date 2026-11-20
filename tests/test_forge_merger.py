@@ -10838,6 +10838,19 @@ class KeepTrains(TrainSetup):
         self.labelled[tip] = 11009
         self.assertEqual(self.carried(tip=tip), tip)
         self.assertIn("TRAIN-KEEP", self.lines[-1])
+        # agent-forge #526: it says who moved main and why it failed.
+        self.assertIn("#11009", self.lines[-1])
+        self.assertIn("conflicts in g.txt", self.lines[-1])
+
+    def test_a_top_missing_from_the_checkout_says_so(self):
+        tip = self.move_main()
+        self.labelled[tip] = 11009
+        entries = [dict(e) for e in self.last["entries"]]
+        entries[-1]["sha"] = "0" * 40
+        got = self.carried(last=dict(self.last, entries=entries), tip=tip)
+        self.assertEqual(got, tip)
+        self.assertIn("isn't in this checkout", self.lines[-1])
+        self.assertNotIn("conflicts in", self.lines[-1])
 
     def test_only_what_moved_main_since_is_asked(self):
         first = self.move_main()
