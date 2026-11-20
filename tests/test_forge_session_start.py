@@ -104,6 +104,10 @@ class Brief(Checkout):
                      "#18 issue", "#22 PR", "#9 issue Status:waiting-owner"):
             self.assertIn(want, ctx)
 
+    def test_the_brief_says_times_are_utc(self):
+        ctx = self.context()[1]["additionalContext"]
+        self.assertIn("Times are UTC, written with a Z", ctx)
+
     def test_the_agents_own_role_follows(self):
         ctx = self.context()[1]["additionalContext"]
         self.assertIn("Your role (docs/roles.md, ## LeadDev):", ctx)

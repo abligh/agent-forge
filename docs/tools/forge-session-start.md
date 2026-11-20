@@ -114,12 +114,15 @@ the unattributed name.
 2. A fixed checklist: background tasks and monitors are gone; decide
    which open items need re-arming; check tools and scratch state
    rather than assuming.
-3. The agent's open items: one REST call for the open issues and pull
+3. Conventions for everything the agent writes: times are UTC with
+   a `Z` (`22:31Z`), never a local zone or offset, and a quoted time
+   is converted.
+4. The agent's open items: one REST call for the open issues and pull
    requests labelled `<owner_prefix><agent>`, at most 100. Each line
    is `#<number> PR|issue <status labels> <title>`. Items with a
    `session_start.skip_labels` label are left out, and the brief says
    how many, so the list never reads as complete when it isn't.
-4. The agent's role: the body of the `## <agent>` section of the roles
+5. The agent's role: the body of the `## <agent>` section of the roles
    file. One section can brief several agents: `## LeadDev, LeadDev2`.
    The section ends at the next `## ` heading. An agent with no section
    is told so.
