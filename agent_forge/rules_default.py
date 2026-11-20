@@ -58,7 +58,8 @@ Then:
    then), otherwise the author's;
 3. a request for changes stands (a reviewer's or the owner's newest
    verdict, `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED`, is
-   `CHANGES_REQUESTED`, as `forge-merger` reads it) and the author has
+   `CHANGES_REQUESTED`, as `forge-merger` reads it, which counts anyone
+   GitHub says can push to the repository too) and the author has
    not answered it: no author comment after it, and only merges since
    its commit (it covers the head). Or a reviewer's newest review is
    `COMMENTED`, at the head, with no author comment after it. Either is
@@ -90,8 +91,9 @@ Then:
    it, close it, or ask the owner" (agent-forge #374; it was a surface,
    and such pull requests sat for days);
 8. green, and a request for changes stands that the author has
-   answered: the reviewer's who asked, to review again (nobody's when
-   the owner asked). Or green, a reviewer's newest review is an
+   answered: the reviewer's who asked, to review again, or the agent's
+   who asked when it isn't a reviewer but can push, as `forge-merger`
+   counts it (nobody's when the owner or someone else asked). Or green, a reviewer's newest review is an
    approval covering the head, and someone other than the author said
    something after it that holds it (`forge-merger`'s test again): the
    approver's, to approve again or answer it. Otherwise green, and no
@@ -481,7 +483,8 @@ graphql = {
         labels(first:30) { nodes { name } }
         files(first:100) { nodes { path additions deletions } }
         reviews(last:100) {
-          nodes { databaseId author { login } state createdAt submittedAt
+          nodes { databaseId author { login } authorCanPushToRepository
+                  state createdAt submittedAt
                   body commit { oid } comments { totalCount } }
         }
         comments(last:100) {
@@ -1017,7 +1020,12 @@ def route_pr_rules(pr, roster, when=None):
     if standing:
         request = standing[0]
         who = roster.who(author_of(request))
-        if strip_bot(author_of(request)) not in reviewer_logins:
+        # An agent that can push counts too, as for forge-merger, which
+        # holds the pull request on its request just the same: without
+        # its re-review it was nobody's, and sat (agent-forge,
+        # 2026-11-20). The owner, or anyone else, is still nobody's.
+        if strip_bot(author_of(request)) not in reviewer_logins \
+                and not roster.is_agent(who):
             return nobody(n, 8, "answered %s's request for changes" % who)
         since = max(status.get("createdAt") or "", spoke,
                     request["submittedAt"])
