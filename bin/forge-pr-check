@@ -2796,6 +2796,27 @@ def overdue(entry, when):
         return False
 
 
+def own_wait(entry, when):
+    """How long a waiting head itself has waited by `when`, from its
+    `queued` (agent-forge #474), not the place it may have inherited
+    (`since`), as a timedelta; None when that can't be said."""
+    try:
+        return when - parse(entry.get("queued") or entry["since"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def own_overdue(entry, when):
+    """designs/0063: whether a waiting head has itself waited MAX_WAIT
+    or longer by `when`. Never one that failed to prepare, nor a
+    default-branch head, nor without checks.max_wait_minutes."""
+    if MAX_WAIT is None or when is None or entry.get("main") \
+            or entry.get("errors"):
+        return False
+    wait = own_wait(entry, when)
+    return wait is not None and wait >= MAX_WAIT
+
+
 def order(waiting, sha):
     """A head's place in the queue: one that failed to prepare goes
     behind every one that has not, then an urgent one (`labels.urgent`)
@@ -2846,7 +2867,9 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
     own, those of pull requests in `queued` (the Merger's predictions)
     go first, and those in `blocked` (held by the Merger until another
     merges: next.json's `blocked`) last; they still run when nothing
-    better waits (agent-forge #256).
+    better waits (agent-forge #256). Between them, a head that has
+    itself waited checks.max_wait_minutes goes before the rest, the
+    longest own wait first (designs/0063).
 
     With checks.order "merge" (designs/0052), among the other heads,
     overdue ones and the rest alike, those of pull requests in
@@ -2895,10 +2918,20 @@ def next_head(state, busy=(), first_pr=None, when=None, cheap=(),
              if (waiting[s].get("approved") or s in slotted)
              and not waiting[s].get("errors")]
     if ready:
-        sha = min(ready, key=lambda s: (waiting[s]["pr"] != first_pr,
-                                        waiting[s]["pr"] not in queued,
-                                        waiting[s]["pr"] in blocked,
-                                        order(waiting, s)))
+        def approved_key(s):
+            # designs/0063: after the Merger's own and its predictions,
+            # a head that has itself waited max_wait_minutes goes first,
+            # the longest own wait first, so pull requests that keep
+            # pushing can't pass it on their kept places for ever. The
+            # held ones stay last, overdue or not.
+            late = own_overdue(waiting[s], when)
+            return (waiting[s]["pr"] != first_pr,
+                    waiting[s]["pr"] not in queued,
+                    waiting[s]["pr"] in blocked,
+                    not late,
+                    (-own_wait(waiting[s], when).total_seconds(), s)
+                    if late else order(waiting, s))
+        sha = min(ready, key=approved_key)
         return sha, waiting[sha]["pr"]
     # checks.max_wait_minutes: a head that has waited that long goes
     # before every other pull request's, the oldest first, so priority

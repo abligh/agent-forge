@@ -1,6 +1,6 @@
 # 0063: An overdue head goes first among approved ones
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-20, #537: "537 approved")
 * Author: XMPPEngineer
 * Date: 2026-11-20
 * Issue: (this pull request)
@@ -66,8 +66,8 @@ In `next_head`, the approved branch's sort key becomes:
 
     (pr != first_pr,
      pr not in queued,
-     not own_overdue(s),          # new
      pr in blocked,
+     not own_overdue(s),          # new
      -own_wait(s) if own_overdue(s) else order(waiting, s))
 
 `own_overdue` is `when - queued >= MAX_WAIT`, false without
@@ -80,7 +80,7 @@ anything.
 The unapproved branch already uses `max_wait_minutes`, and it doesn't
 change.
 
-The Router's new rule goes after rule 5 and before rule 6. When an
+The Router's new rule (rule 27) goes after rule 4 and before rule 5's nobody. When an
 unreviewed head's check is pending, has been queued longer than
 `max_wait_minutes`, and the reviewer hasn't spoken since the push, the
 turn is the pull request's reviewer's: "its check has waited N
@@ -111,3 +111,13 @@ Reviewers on the project already arm approvals before green
 * The Router rule: on, with an unreviewed head pending for longer than
   the cap, gives the reviewer the turn; not when the reviewer has spoken
   since the push; not when it's off.
+
+## Amendment, 2026-11-20 (implementation)
+
+* The sort key puts `pr in blocked` before `not own_overdue(s)`, as the
+  text says ("Heads the Merger holds stay last, overdue or not"); the
+  key first written here had them the other way round.
+* A head with no `queued` (one queued before agent-forge #474) counts
+  from its `since`.
+* The Router rule is rule 27 (26 is designs/0061's), and it measures
+  the wait from the pending status's time.

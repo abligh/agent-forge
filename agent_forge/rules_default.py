@@ -76,7 +76,16 @@ Then:
    built on a base that predates a fix is red until the base merges,
    and the author can't act on that; once every named item has closed,
    the red is the author's again, woken then, as a new turn;
-5. it is `pending` or absent on the head: nobody's;
+5. it is `pending` or absent on the head: nobody's, except
+27. with `router.review_waiting_heads` (designs/0063), which needs
+   `checks.max_wait_minutes`: it is `pending` on the head, the pending
+   status is that old or older, no reviewer's review is at the head
+   (or an approval covering it), and the pull request's reviewer hasn't
+   commented since the head's commit: the reviewer's, "its check has
+   waited N minutes: review it now and arm it, so it can run". With
+   `checks.approved_first` an unreviewed head runs only when no
+   approved one waits, so without a review it could get neither. The
+   event is the pending status, so it is said once a head;
 23. with `merge.mode` `manual` (agent-forge #274), after rule 5: green,
    and nothing it names holds it (a `Blocked-by:` item open, a
    `Defer-until:` to come, a `Status:waiting-*` label): the author's,
@@ -466,6 +475,9 @@ GREEN_APPROVES = False
 ISSUE_BLOCKED_BY = "body"
 # `router.stale_blocker` (designs/0061): rule 26, off by default.
 STALE_BLOCKER = False
+# `router.review_waiting_heads` (designs/0063): checks.max_wait_minutes
+# as a timedelta when on, else None.
+REVIEW_WAITING = None
 # With "agents": the logins whose comments may carry them.
 BLOCKER_WRITERS = frozenset()
 # The project, from `configure`: whose tools' state the red-build and
@@ -537,7 +549,7 @@ def configure(project, merger_tool):
     global RETARGET, SELF_BLOCKED, DRAFT_HOURS, WAITING_PREFIX, OWNERS
     global UNREVIEWED, QUIET_LABELS, IN_PROGRESS, RED_FIRST, PROJECT
     global NIGHTLY_WAKE, ISSUE_BLOCKED_BY, BLOCKER_WRITERS, MANUAL
-    global GREEN_APPROVES, STALE_BLOCKER
+    global GREEN_APPROVES, STALE_BLOCKER, REVIEW_WAITING
     global URGENT, BUG
     merger = merger_tool
     MANUAL = project.section("merge").get("mode") == "manual"
@@ -599,6 +611,11 @@ def configure(project, merger_tool):
     ISSUE_BLOCKED_BY = project.section("router").get("issue_blocked_by",
                                                      "body")
     STALE_BLOCKER = project.section("router").get("stale_blocker") is True
+    cap = project.section("checks").get("max_wait_minutes")
+    REVIEW_WAITING = datetime.timedelta(minutes=cap) if (
+        project.section("router").get("review_waiting_heads") is True
+        and isinstance(cap, int) and not isinstance(cap, bool)
+        and cap > 0) else None
     BLOCKER_WRITERS = frozenset(
         {OWNER} | {project.slug(n).lower() for n in project.agents})
     URGENT = labels.get("urgent") or None
@@ -904,7 +921,9 @@ def route_pr_rules(pr, roster, when=None):
     if hushed:
         return nobody(n, None, "quiet: " + hushed)
     # Rules 0a, 0b and 0c, before rule 1: a draft can be stuck too.
-    stuck = stuck_pr(pr, roster, when or merger.now_utc())
+    # Rule 2 reuses `when` for the hand-back's time, a string.
+    now = when or merger.now_utc()
+    stuck = stuck_pr(pr, roster, now)
     if stuck:
         return stuck
     # Rule 1.
@@ -984,6 +1003,16 @@ def route_pr_rules(pr, roster, when=None):
         return turn(n, author, 4, status.get("createdAt") or head,
                     "%s is %s at %s" % (status.get("context")
                                         or HEAD_CONTEXT, state, head[:7]))
+    # Rule 27 (designs/0063): an unreviewed head whose check has waited
+    # the cap is its reviewer's, to arm, so it can go with the approved.
+    if state == "pending" and REVIEW_WAITING is not None:
+        late = waiting_unreviewed(pr, status, theirs, roster, now)
+        if late:
+            who, minutes = late
+            return turn(n, who, 27, status.get("createdAt") or head,
+                        "its check has waited %d minutes at %s, with no "
+                        "review: review it now and arm it, so it can run"
+                        % (minutes, head[:7]))
     # Rule 5.
     if state != "success":
         return nobody(n, 5, "%s is %s" % (HEAD_CONTEXT, state or "absent"))
@@ -1215,6 +1244,32 @@ def each_run(ctx):
     urgent = urgent_issues(ctx)
     return [AddLabel(pr["number"], URGENT) for pr in ctx.prs
             if closing_of(pr) & urgent and URGENT not in labels_of(pr)]
+
+
+def waiting_unreviewed(pr, status, theirs, roster, when):
+    """Rule 27: (reviewer, minutes) when `pr`'s head has a pending check
+    REVIEW_WAITING old or older, no review of `theirs` at the head (or
+    an approval covering it), and its reviewer hasn't commented since
+    the head's commit; else None."""
+    try:
+        pending = datetime.datetime.fromisoformat(
+            (status.get("createdAt") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when - pending < REVIEW_WAITING:
+        return None
+    if any(at_head(r, pr) or (r.get("state") == "APPROVED"
+                              and covers_head(r, pr)) for r in theirs):
+        return None
+    reviewer = roster.reviewer_for(pr)
+    if reviewer is None:
+        return None
+    nodes = (pr.get("headCommit") or {}).get("nodes") or []
+    commit = ((nodes[-1] or {}).get("commit") or {}) if nodes else {}
+    if last_by(pr.get("comments") or [], {roster.login_of(reviewer)}) > (
+            commit.get("committedDate") or ""):
+        return None
+    return reviewer, int((when - pending).total_seconds() // 60)
 
 
 def last_activity(pr):

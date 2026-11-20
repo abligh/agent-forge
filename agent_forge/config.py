@@ -299,7 +299,7 @@ ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
           "stuck": dict, "owners": dict, "unreviewed": dict,
           "forget_minutes": int, "quiet_labels": list, "red_first": dict,
           "nightly_wake": dict, "issue_blocked_by": str, "escalate": dict,
-          "stale_blocker": bool}
+          "stale_blocker": bool, "review_waiting_heads": bool}
 # router.escalate (designs/0049).
 ESCALATE = {"after_reminders": int, "undelivered_minutes": int,
             "label": str, "to": str}
@@ -700,6 +700,10 @@ def check(data):
                     data.get("nightly") or {}).get("step_issues") is True:
                 problems.append("router.red_first.everyone needs "
                                 "nightly.step_issues")
+        if router.get("review_waiting_heads") is True and not isinstance(
+                (data.get("checks") or {}).get("max_wait_minutes"), int):
+            problems.append("router.review_waiting_heads needs "
+                            "checks.max_wait_minutes")
         if isinstance(router.get("nightly_wake"), dict):
             _check_nightly_wake(router["nightly_wake"], "nightly" in data,
                                 problems)
