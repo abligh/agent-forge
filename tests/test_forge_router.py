@@ -252,6 +252,29 @@ class PullRequestRules(unittest.TestCase):
         self.assertEqual(d["line"],
                          "#41 the Merger handed it back (comment 61)")
 
+    def test_2_a_stacked_layers_conflict_note_is_the_authors(self):
+        # The Merger's own text for a layer that conflicts with the head
+        # it is built on: "Not merging <head> yet:". The author restacks
+        # it, whatever its Blocked-by line names (agent-forge, 2026-11-20:
+        # four such layers sat with nobody for up to a day).
+        merger = load_tool("forge-merger")
+        body = merger.CONFLICT_NOTE % (HEAD[:10], "Restack it.",
+                                       merger.SIGNATURE)
+        node = pr_node(reviews=[review(REVIEWER, "APPROVED", T1)],
+                       comments=[comment(MERGER, T2, body, 62)])
+        node["body"] = "Blocked-by: #7\n"
+        d = decide_pr(node)
+        self.assertTurn(d, "LeadDev", 2, T2)
+
+    def test_2_a_holding_note_is_not_a_hand_back(self):
+        # "Holding <head>: it conflicts with #N, which has right of way"
+        # waits for #N; it is nobody's to act on.
+        body = "Holding %s: it conflicts with #9, which has right of way." \
+            % HEAD[:10]
+        d = decide_pr(pr_node(reviews=[review(REVIEWER, "APPROVED", T1)],
+                              comments=[comment(MERGER, T2, body)]))
+        self.assertNotEqual(d["rule"], 2)
+
     def test_2_a_not_a_review_hand_back_is_reviewers(self):
         body = "Not-a-review\n\nNot merging 5b257c8: x.\n\n— Merger"
         d = decide_pr(pr_node(reviews=[review(REVIEWER, "APPROVED", T1)],

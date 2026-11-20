@@ -51,7 +51,8 @@ Then:
 
 1. a draft, or waiting on the owner or on someone outside: nobody's;
 2. a Merger hand-back of the current head is the newest thing said (a
-   comment by the Merger, "Not merging <head>:", newer than every review
+   comment by the Merger, "Not merging <head>:" (or "Not merging <head>
+   yet:", a stacked layer's conflict with the head beneath it), newer than every review
    and every author comment): the approving reviewer's if it starts
    `Not-a-review`, unless that reviewer has commented since (nobody's
    then), otherwise the author's;
@@ -384,7 +385,12 @@ from agent_forge.router import (ONCE, Action, AddLabel, Decision, Lookup,
                                  Reminder)
 
 # The Merger's hand-back names the head it judged, in both its forms.
-HAND_BACK_RE = re.compile(r"^Not merging ([0-9a-f]{7,40}):", re.MULTILINE)
+# "Not merging <head> yet:" is the Merger's note on a stacked layer that
+# conflicts with the head beneath it (CONFLICT_NOTE): the author's to
+# restack, as much a hand-back as any. Without the "yet", rule 2 missed
+# it and the layer sat with nobody (agent-forge, 2026-11-20).
+HAND_BACK_RE = re.compile(r"^Not merging ([0-9a-f]{7,40})(?: yet)?:",
+                          re.MULTILINE)
 
 # bin/forge-merger, given by `configure`: its own test of "nothing said
 # since the approval" and its Blocked-by reading, so the two never
