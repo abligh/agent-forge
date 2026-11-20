@@ -920,6 +920,13 @@ STALE_INCREMENTAL = datetime.timedelta(days=7)
 # A live unit's `.dwo` this much older than `stale` goes whatever links
 # to it: no incremental session that old is kept (STALE_INCREMENTAL).
 STALE_DWO_EXTRA = (STALE_INCREMENTAL - STALE_EXECUTABLE).total_seconds()
+# Past this many entries in one `deps` directory, split debug info goes
+# oldest first, whatever its age, until it is under: ext4's directory
+# index (without large_dir) fills at about three million names, and then
+# every write there fails with "No space left on device" on a disk with
+# room. On 2026-11-20 one held 3.16 million entries after a day of
+# builds, though pruning by age ran on time (#517).
+DEPS_ENTRIES_MAX = 1000000
 # How long the default branch's last green run is taken to have written
 # for, when its end wasn't recorded (state from before `cache_main_end`).
 MAIN_RUN_WINDOW = datetime.timedelta(hours=3)
@@ -6172,7 +6179,8 @@ def newest_mtime(path):
 def prune_caches(roots, limit, now, main_since=None, main_until=None):
     """Prune a slot's build caches, `roots`, in three passes, and return
     what went: {"executables", "dwo", "objects", "incremental", "units",
-    "freed", "left", "over"}.
+    "freed", "left", "over"}, and "entries": the most any `deps`
+    directory holds after pruning.
 
     1. Executables (no extension) directly in any `deps` directory older
        than STALE_EXECUTABLE that the default branch's last green run in
@@ -6204,7 +6212,7 @@ def prune_caches(roots, limit, now, main_since=None, main_until=None):
     `now`, `main_since` and `main_until` are epoch seconds. A root that
     is a link, or isn't there, is left alone."""
     gone = {"executables": 0, "dwo": 0, "objects": 0, "incremental": 0,
-            "units": 0, "freed": 0, "over": 0}
+            "units": 0, "freed": 0, "over": 0, "entries": 0}
     roots = [r for r in roots if os.path.isdir(r) and not os.path.islink(r)]
     stale = now - STALE_EXECUTABLE.total_seconds()
     if main_since is not None and main_until is None:
@@ -6230,7 +6238,8 @@ def prune_caches(roots, limit, now, main_since=None, main_until=None):
         for top, dirs, files in os.walk(root):
             name = os.path.basename(top)
             if name == "deps":
-                prune_deps(top, files, stale, mains, remove)
+                gone["entries"] = max(gone["entries"], prune_deps(
+                    top, files, stale, mains, remove))
             elif name == "incremental":
                 for entry in list(dirs):
                     path = os.path.join(top, entry)
@@ -6276,7 +6285,19 @@ def prune_caches(roots, limit, now, main_since=None, main_until=None):
 def prune_deps(top, files, stale, mains, remove):
     """Pass 1 of prune_caches in one `deps` directory, `top`, holding
     `files`: stale executables, their `.dwo`, orphaned `.dwo`, and stale
-    `.o`."""
+    `.o`; then, while it holds more than DEPS_ENTRIES_MAX entries, `.dwo`
+    oldest first, those no incremental session links to before those
+    one does. Split debug info is read only by a debugger or for a
+    backtrace's lines; no build reads it back. Returns how many entries
+    are left."""
+    removed = set()
+    own = remove
+
+    def remove(path, size, kind):
+        own(path, size, kind)
+        if not os.path.exists(path):
+            removed.add(os.path.basename(path))
+
     def unit(entry):
         return entry.split(".", 1)[0]
 
@@ -6348,6 +6369,28 @@ def prune_deps(top, files, stale, mains, remove):
                 # ext4's directory index was full: every write there
                 # failed with "No space left on device".
                 remove(path, st.st_size, "dwo")
+    left = len(files) - len(removed)
+    if left <= DEPS_ENTRIES_MAX:
+        return left
+    spare = []
+    for entry in files:
+        if not entry.endswith(".dwo") or entry in removed:
+            continue
+        path = os.path.join(top, entry)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            spare.append((st.st_nlink > 1, st.st_mtime, path, st.st_size))
+    spare.sort()
+    for _, _, path, size in spare:
+        if left <= DEPS_ENTRIES_MAX:
+            break
+        before = len(removed)
+        remove(path, size, "dwo")
+        left -= len(removed) - before
+    return left
 
 
 def incremental_sessions(roots):
@@ -6431,10 +6474,11 @@ def prune_slot_caches(state_dir, slot, out=print, clock=time.time):
     if gone["freed"]:
         log(state_dir, "CACHE-PRUNED %s: freed %d bytes (%d executables, %d "
             "incremental directories, %d directories over the limit); %d "
-            "bytes left; %d split debug info files, %d object files"
+            "bytes left; %d split debug info files, %d object files; "
+            "%d entries in the largest deps directory"
             % (slot_label(slot), gone["freed"], gone["executables"],
                gone["incremental"], gone["units"], gone["left"],
-               gone["dwo"], gone["objects"]),
+               gone["dwo"], gone["objects"], gone.get("entries", 0)),
             now_utc(), out)
     if gone.get("over"):
         log(state_dir, "CACHE-OVER-LIMIT %s: %d bytes over the limit of %d "
