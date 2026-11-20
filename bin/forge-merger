@@ -6563,7 +6563,9 @@ def head_red(check_state, pr, walk=None):
     cover. With `walk` (`update_walk`), also of a commit the head only
     brought up to date: a red head the Merger updated lost its red, so
     it boarded, and the train's top found the same failure (agent-forge
-    #502: twice in one morning, each costing a red train's search). Not while the default branch is red, when every head may be,
+    #502: twice in one morning, each costing a red train's search),
+    back to the first commit with a green run of its own, which ends
+    the walk. Not while the default branch is red, when every head may be,
     nor for an urgent one. Nor when it was red only because it
     conflicted with the default branch's tip of then (forge-pr-check's
     `conflicted`: no step ran): whether it merges now is the cut's own
@@ -6576,6 +6578,14 @@ def head_red(check_state, pr, walk=None):
     results = (check_state or {}).get("results") or {}
     for sha in walk or [pr["headRefOid"]]:
         got = results.get(sha)
+        if isinstance(got, dict) and got.get("ok") is True \
+                and not got.get("covered"):
+            # A run of its own came after the red below it: the update
+            # was checked and passed, so the older red no longer
+            # speaks for it (2026-11-20: after an outage's reds,
+            # authors' merges of main went green and still couldn't
+            # board).
+            return False
         if isinstance(got, dict) and got.get("ok") is False \
                 and not got.get("covered") and not got.get("conflicts") \
                 and got.get("failed") != ["merge"]:
