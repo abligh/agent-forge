@@ -682,6 +682,12 @@ class HandOver(unittest.TestCase):
                          owned(33), owned(34))
         self.assertNotIn("hasn't started", got[0].line)
 
+    def test_stats_watch_issues_are_not_handed_over(self):
+        # agent-forge #522: their owner re-measures them.
+        got = self.sweep(owned(30), *[owned(n, labels=["stats-watch"])
+                                      for n in (31, 32, 33)])
+        self.assertNotIn("hasn't started", got[0].line)
+
     def test_the_most_then_the_oldest(self):
         got = self.sweep(*[owned(n, owner="Reviewer", created=T1)
                            for n in (40, 41, 42)],

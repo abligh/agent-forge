@@ -402,6 +402,8 @@ STATUS_CONTEXT = "vm/build-and-test"
 HEAD_CONTEXT = "vm/build-and-test"
 # `router.idle_offer`, with its defaults filled in, or None: off.
 IDLE_OFFER = None
+# forge-stats-watch's label (designs/0038 hand-overs skip its issues).
+STATS_WATCH_LABEL = "stats-watch"
 # A label saying its issue is being worked on (designs/0038).
 IN_PROGRESS = "Status:in-progress"
 # How many unstarted issues rule 16 names at most (designs/0038).
@@ -546,6 +548,9 @@ def configure(project, merger_tool):
         "hand_over_above": offer.get("hand_over_above"),
         "retell_minutes": offer.get("retell_minutes")}
     IN_PROGRESS = labels.get("status_prefix", "Status:") + "in-progress"
+    global STATS_WATCH_LABEL
+    STATS_WATCH_LABEL = (project.section("stats_watch") or {}).get(
+        "label", "stats-watch")
     wants_directory = IDLE_OFFER is not None
     wants_previous = IDLE_OFFER is not None
     notice = project.section("router").get("merge_notice")
@@ -1909,7 +1914,9 @@ def hand_over(idle, ctx):
     """Rule 16's ask for an issue to hand to `idle` (designs/0038): " P
     owns K actionable issues it hasn't started (#a, ...): hand one to
     D, or say why not.", or "" without `hand_over_above`, or when no
-    agent owns more unstarted issues than that."""
+    agent owns more unstarted issues than that. A stats-watch issue
+    isn't one to hand over: forge-stats-watch names its owner from the
+    figure, and the owner re-measures it (agent-forge #522)."""
     above = IDLE_OFFER.get("hand_over_above")
     if above is None:
         return ""
@@ -1918,7 +1925,8 @@ def hand_over(idle, ctx):
         if agent == idle:
             continue
         unstarted = [i for i in owned_issues(agent, ctx)[0]
-                     if IN_PROGRESS not in labels_of(i)]
+                     if IN_PROGRESS not in labels_of(i)
+                     and STATS_WATCH_LABEL not in labels_of(i)]
         if len(unstarted) <= above:
             continue
         key = (-len(unstarted), unstarted[0].get("createdAt") or "",
