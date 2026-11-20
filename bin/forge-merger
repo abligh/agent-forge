@@ -9596,6 +9596,19 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         record["holds"] = tell_holds(state_dir, github, prs,
                                      {**held_by, **row_held}, live,
                                      row_held)
+        # A hold said now is the newest word on its pull request, and it
+        # asks the author to leave it until the Merger hands it back. So
+        # an earlier hand-back of the same head must not count as said:
+        # without this, once the hold lifted, the hand-back was "already
+        # said" and the author, last told to wait, never heard (one
+        # project, 2026-11-20: five approved pull requests for up to 25
+        # hours, nobody's turn).
+        forgot = [str(e["pr"]) for e in record["holds"]
+                  if e.get("result") == "done" and str(e["pr"]) in said]
+        for key in forgot:
+            del said[key]
+        if forgot and live:
+            save_json(said_path, said)
     waiting_on = waiting = None
     stopped = len(queue)
     if retarget is not None:

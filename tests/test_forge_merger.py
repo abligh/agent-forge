@@ -6346,6 +6346,17 @@ class HoldConflicting(RepoCase):
         self.assertEqual(record["holds"][0]["result"], "already said")
         self.assertEqual(self.comments(), [])
 
+    def test_a_hold_already_said_keeps_the_hand_back(self):
+        rival = self.rival()
+        self.tick([self.item(), rival], live=True)
+        said = os.path.join(self.state, "handed-back.json")
+        kept = dict(m.load_json(said, {}),
+                    **{"6": {"head": rival["headRefOid"], "reason": "x"}})
+        m.save_json(said, kept)
+        record, _ = self.tick([self.item(), rival], live=True, minutes=1)
+        self.assertEqual(record["holds"][0]["result"], "already said")
+        self.assertIn("6", m.load_json(said, {}))
+
     def test_a_new_head_is_told_again(self):
         rival = self.rival()
         self.tick([self.item(), rival], live=True)
@@ -7087,6 +7098,22 @@ class RightOfWay(RepoCase):
         self.assertNotIn("right_of_way", record)
         self.assertEqual(record["held"], {})
         self.assertEqual(record["queue"], [6, 5])
+
+    def test_a_hold_forgets_an_earlier_hand_back_of_its_head(self):
+        # #6 was handed back at this head, then held for right of way:
+        # the hold is the newest word and asks its author to wait for a
+        # hand-back, so once it lifts the hand-back must be said again,
+        # not counted "already said" (one project, 2026-11-20).
+        rival = self.rival(created=self.OLDER)
+        said = os.path.join(self.state, "handed-back.json")
+        m.save_json(said, {"6": {"approved": T1, "head": rival["headRefOid"],
+                                 "reason": m.CONFLICT_REASON},
+                           "9": {"head": "ab" * 20, "reason": "kept"}})
+        record, _ = self.tick([self.item(), rival], conclusions=(None,),
+                              live=True)
+        self.assertEqual([(h["pr"], h["result"]) for h in record["holds"]],
+                         [(6, "done")])
+        self.assertEqual(sorted(m.load_json(said, {})), ["9"])
 
     def test_it_holds_what_conflicts_and_goes_first(self):
         rival = self.rival(created=self.OLDER)
