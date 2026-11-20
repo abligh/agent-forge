@@ -982,7 +982,14 @@ def judge(argv=None, run=proc.sh, call=forge_github.api_call,
                   file=sys.stderr)
         undercounted = (closes - set(facts["declared"]) - undeclared
                         - undeclared_title)
-        negated = negated_closers(facts["body"], facts["declared"])
+        # The body's own keywords count as well as the declared ones:
+        # GitHub declares nothing for a pull request into another
+        # branch, so a stacked layer's denial read as clean until the
+        # Merger retargeted it to the default branch and merged it in
+        # one tick, closing the issue (agent-forge, 2026-11-20).
+        negated = negated_closers(
+            facts["body"],
+            set(facts["declared"]) | set(refs(blank_code(facts["body"]))))
         for number, sentence in negated:
             print("#%d will close on merge from a sentence in the body that "
                   "denies it -- GitHub ignores negation: %s"
