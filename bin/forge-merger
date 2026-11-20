@@ -2210,6 +2210,20 @@ def conflicted_paths(output):
     return {line for line in output.splitlines()[1:] if line}
 
 
+def conflict_detail(output, most=8):
+    """The hand-back's line naming the files `merge-tree`'s `output`
+    lists as conflicted, the first `most` of them, or None when it names
+    none. Which files collide is what the author needs first, and what
+    says, over a day, which files the merges keep meeting in."""
+    paths = sorted(conflicted_paths(output))
+    if not paths:
+        return None
+    shown = ", ".join("`%s`" % p for p in paths[:most])
+    more = len(paths) - most
+    return "It conflicts in %s%s." % (
+        shown, " and %d more" % more if more > 0 else "")
+
+
 def resolve_rule(paths):
     """The index of the first `merge.resolve` rule whose paths hold all
     of `paths` (a non-empty set), or None."""
@@ -3328,7 +3342,9 @@ def decide(pr, approval, repo, main_tip, github, env, run=sh, below=(),
                             "files": got.files, "branch": pr["headRefName"]}
                 return dict(back("author", CONFLICT_REASON),
                             detail=UNION_DETAIL % got.reason)
-            return back("author", CONFLICT_REASON)
+            detail = conflict_detail(merged.stdout)
+            return (dict(back("author", CONFLICT_REASON), detail=detail)
+                    if detail else back("author", CONFLICT_REASON))
         return {"action": "UPDATE"}
     state, said = status_state(github.api(*status_path(head))
         or [], head_context())
