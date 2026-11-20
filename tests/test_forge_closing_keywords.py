@@ -605,6 +605,17 @@ class MainThroughThePullRequest(unittest.TestCase):
         self.assertIn("#1159", err)
         self.assertIn("will close on merge:         #1159", out)
 
+    def test_a_stacked_layer_s_denial_is_one_though_nothing_is_declared(self):
+        # GitHub declares no closes for a pull request into another
+        # branch; the Merger retargets it to the default branch just
+        # before merging, and the denied keyword then closes the issue.
+        body = ("Part of #14033, stacked on #14046. **It does not fix "
+                "#14033.**\n\nMore prose.\n")
+        code, _, err = self.run_main(body, [])
+        self.assertEqual(code, 1)
+        self.assertIn("#14033 will close on merge from a sentence in the "
+                      "body that denies it", err)
+
     def test_the_denial_s_remedy_says_how_to_run_it_again(self):
         _, _, err = self.run_main(REAL_1253, [1159])
         self.assertIn("Reword so no closing keyword sits in front of the "
