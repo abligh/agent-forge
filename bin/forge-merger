@@ -6069,6 +6069,12 @@ def carried_base(repo, state_dir, last, main_tip, github, run=sh,
         save_json(path, dict(list(cache.items())[-300:]))
     if not all(by):
         return main_tip
+    if not by:
+        # Only the kept trains' own merges moved it, and the trains
+        # behind were predicted on that chain: nothing new to check.
+        # Asking `merge-tree` anyway cut every train after each train
+        # merge, and a nearly finished search with it (agent-forge #526).
+        return base
     top = (entries or [{}])[-1].get("sha")
     present = bool(top) and git(repo, "cat-file", "-e", top + "^{commit}",
                                 run=run).returncode == 0
