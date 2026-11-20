@@ -53,7 +53,8 @@ Then:
 2. a Merger hand-back of the current head is the newest thing said (a
    comment by the Merger, "Not merging <head>:", newer than every review
    and every author comment): the approving reviewer's if it starts
-   `Not-a-review`, otherwise the author's;
+   `Not-a-review`, unless that reviewer has commented since (nobody's
+   then), otherwise the author's;
 3. a request for changes stands (a reviewer's or the owner's newest
    verdict, `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED`, is
    `CHANGES_REQUESTED`, as `forge-merger` reads it) and the author has
@@ -95,7 +96,9 @@ Then:
    approver's, to approve again or answer it. Otherwise green, and no
    reviewer has reviewed it: no reviewer's review at the head (or
    approval covering it), or an author comment after the newest one:
-   the pull request's reviewer's.
+   the pull request's reviewer's, unless that reviewer has commented
+   since it went green or the author last spoke (nobody's then, until
+   a push or the author speaks).
 
 **A reviewer** is an agent the configuration marks `"kind":
 "reviewer"`. **A pull request's reviewer** is the one, other than its
@@ -929,6 +932,13 @@ def route_pr_rules(pr, roster, when=None):
                                               roster.reviewer_logins())
                 to = (roster.who(author_of(approval)) if approval
                       else roster.reviewer_for(pr) or roster.reviewers()[0])
+                # The reviewer has answered it since (a re-read, an
+                # approval armed for a pending check): that is its
+                # answer until the Merger speaks again (agent-forge #530).
+                said = last_by(comments, {roster.login_of(to)})
+                if said > when:
+                    return nobody(n, 2, "%s has answered the hand-back"
+                                  % to)
             return turn(n, to, 2, when, "the Merger handed it back "
                         "(comment %s)" % back.get("databaseId"))
     # Rule 3. A request for changes stands until its reviewer's next
@@ -1036,8 +1046,14 @@ def route_pr_rules(pr, roster, when=None):
         # The owner's review is an event too: a reviewer who waits for
         # the owner's approval on a code-owned path is woken by it.
         owned = last_by(reviews, {OWNER}, "submittedAt") if OWNER else ""
-        return turn(n, reviewer, 8, max(status.get("createdAt") or "", spoke,
-                                        owned),
+        since = max(status.get("createdAt") or "", spoke, owned)
+        # agent-forge #530, as #515 above: the reviewer has said
+        # something since (it holds for a Blocked-by, say).
+        if reviewer and last_by(comments,
+                                {roster.login_of(reviewer)}) > since:
+            return nobody(n, 8, "%s has said since it went green"
+                          % reviewer)
+        return turn(n, reviewer, 8, since,
                     "needs your review (green at %s)" % head[:7])
     return nobody(n, None, "no rule matched")
 

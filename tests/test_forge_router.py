@@ -332,6 +332,17 @@ class PullRequestRules(unittest.TestCase):
         self.assertTurn(d, "Reviewer", 8, T2)
         self.assertIn("you asked for changes (review 55)", d["line"])
 
+    def test_8_unreviewed_not_while_the_reviewer_has_said_since(self):
+        # agent-forge #530: a hold comment ("Blocked-by #N is open").
+        base = dict(statuses=[status("SUCCESS", T2)])
+        d = decide_pr(pr_node(comments=[comment(REVIEWER, T3)], **base))
+        self.assertNobody(d, 8)
+        d = decide_pr(pr_node(comments=[comment(REVIEWER, T1)], **base))
+        self.assertTurn(d, "Reviewer", 8, T2)
+        d = decide_pr(pr_node(comments=[comment(REVIEWER, T2),
+                                        comment(LEADDEV, T3)], **base))
+        self.assertTurn(d, "Reviewer", 8, T3)
+
     def test_8_not_while_the_reviewer_has_said_since(self):
         # agent-forge #515: "waits for the Mac run after 22:00Z".
         base = dict(reviews=[review(REVIEWER, "CHANGES_REQUESTED", T1, 55,
@@ -826,6 +837,19 @@ class TwoReviewers(unittest.TestCase):
             files=[("designs/a.md", 100)],
             reviews=[review(RENDER, "APPROVED", T1)],
             comments=[comment(MERGER, T2, "Not-a-review\n\n" + BACK)]))
+        self.assertEqual((d["who"], d["rule"]), ("RenderReviewer", 2))
+
+    def test_2_not_while_the_approver_has_answered_it(self):
+        # agent-forge #530: re-read and armed, its check still queued.
+        base = dict(files=[("designs/a.md", 100)],
+                    reviews=[review(RENDER, "APPROVED", T1)])
+        d = decide_two(pr_node(comments=[
+            comment(MERGER, T2, "Not-a-review\n\n" + BACK),
+            comment(RENDER, T3)], **base))
+        self.assertEqual((d["who"], d["rule"]), (None, 2))
+        d = decide_two(pr_node(comments=[
+            comment(RENDER, T1),
+            comment(MERGER, T2, "Not-a-review\n\n" + BACK)], **base))
         self.assertEqual((d["who"], d["rule"]), ("RenderReviewer", 2))
 
     def test_7_with_one_reviewer_its_own_is_nobodys(self):
