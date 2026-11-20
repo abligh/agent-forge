@@ -49,7 +49,9 @@ configuration's `stats_watch.figures`:
                    the train
     quick_run_cpu  a quick run's CPU time over its steps, median, in CPU
                    seconds: over `limit`, or over `ratio` x the
-                   baseline's. Little moved by how busy the host is
+                   baseline's. Little moved by how busy the host is.
+                   With `step`, that step's alone, as for main_cpu
+                   (quick_run takes `step` too, for its wall time)
     red_train_tops_per_merge  the Merger's predictions (a train's or
                    batch's top) whose run went red, over the merges:
                    over `limit`, or over `ratio` x the baseline's; its
@@ -333,6 +335,15 @@ def figures(stats, hours, watched=None):
     step = ((watched or {}).get("main_cpu") or {}).get("step")
     cpu = ((cpu.get("steps") or {}).get(step) if step
            else cpu.get("total")) or {}
+    # The quick run's figures can count one step alone (a budget for
+    # that step), as main_cpu can.
+    quick = check.get("quick_cpu") or {}
+    step = ((watched or {}).get("quick_run_cpu") or {}).get("step")
+    quick_cpu = ((quick.get("steps") or {}).get(step) or {}) if step \
+        else quick
+    step = ((watched or {}).get("quick_run") or {}).get("step")
+    quick_wall = (((quick.get("steps_wall") or {}).get(step) or {"n": 0})
+                  if step else None)
 
     def minutes(part, key):
         value, n = part.get(key), part.get("n", 0)
@@ -361,11 +372,9 @@ def figures(stats, hours, watched=None):
         "red_train_tops_per_merge": (
             (check.get("red") or {}).get("prediction", 0) / merges
             if merges else None, merges),
-        "quick_run": minutes(
-            ((check.get("tiers") or {}).get("quick") or {}).get("ran")
-            or {}, "median"),
-        "quick_run_cpu": ((check.get("quick_cpu") or {}).get("median"),
-                          (check.get("quick_cpu") or {}).get("n", 0)),
+        "quick_run": minutes(quick_wall or ((check.get("tiers") or {}).get(
+            "quick") or {}).get("ran") or {}, "median"),
+        "quick_run_cpu": (quick_cpu.get("median"), quick_cpu.get("n", 0)),
     }
 
 

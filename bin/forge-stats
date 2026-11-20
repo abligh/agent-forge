@@ -708,8 +708,13 @@ def all_cpu_stats(results, since, until):
 def quick_cpu_stats(results, since, until):
     """designs/0055: summary of each quick run's CPU seconds over its
     steps, for the quick runs (`tier` "quick") that finished in the
-    window. A run without `step_cpu` is left out."""
+    window. A run without `step_cpu` is left out. `steps` is each
+    step's own summary, of its CPU seconds (`step_cpu`) and, as
+    `steps_wall`, of its wall seconds (`step_seconds`), for stats_watch's
+    `step` on quick_run_cpu and quick_run."""
     took = []
+    steps, walls = collections.defaultdict(list), collections.defaultdict(
+        list)
     for result in (results or {}).values():
         if not isinstance(result, dict) or result.get("tier") != "quick":
             continue
@@ -721,11 +726,22 @@ def quick_cpu_stats(results, since, until):
         except (KeyError, TypeError, ValueError, AttributeError):
             continue
         if since <= when < until:
-            took.append(round(sum(
-                v for v in cpu.values()
-                if isinstance(v, (int, float))
-                and not isinstance(v, bool)), 2))
-    return summary(took)
+            values = {k: v for k, v in cpu.items()
+                      if isinstance(v, (int, float))
+                      and not isinstance(v, bool)}
+            took.append(round(sum(values.values()), 2))
+            for step, value in values.items():
+                steps[step].append(value)
+            wall = result.get("step_seconds")
+            for step, value in (wall.items() if isinstance(wall, dict)
+                                else ()):
+                if isinstance(value, (int, float)) and not isinstance(
+                        value, bool):
+                    walls[step].append(value)
+    got = summary(took)
+    got["steps"] = {k: summary(v) for k, v in sorted(steps.items())}
+    got["steps_wall"] = {k: summary(v) for k, v in sorted(walls.items())}
+    return got
 
 
 def scoped_stats(results, since, until):

@@ -111,8 +111,8 @@ STATS_WATCH_FIGURES = {
     "runs_per_merge": ("limit", "ratio", "short_hours"),
     # designs/0055, step 3: forge-stats' red predictions over merges.
     "red_train_tops_per_merge": ("limit", "ratio", "short_hours"),
-    "quick_run": ("limit", "ratio", "short_hours"),
-    "quick_run_cpu": ("limit", "ratio", "short_hours")}
+    "quick_run": ("limit", "ratio", "step", "short_hours"),
+    "quick_run_cpu": ("limit", "ratio", "step", "short_hours")}
 # forge-nightly (designs/0028): a red nightly is a red main.
 NIGHTLY = {"workflow": str, "job": str, "owners": dict, "labels": list,
            "retry_hours": int, "escalate_hours": list, "as": str,

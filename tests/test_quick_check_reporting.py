@@ -142,7 +142,7 @@ class QuickRun(unittest.TestCase):
     def test_the_figures_and_their_rules(self):
         for name in ("quick_run", "quick_run_cpu"):
             self.assertEqual(config.STATS_WATCH_FIGURES[name],
-                             ("limit", "ratio", "short_hours"))
+                             ("limit", "ratio", "step", "short_hours"))
             self.assertNotIn(name, watch.FLOORS)
         self.assertIn("quick_run", watch.CONTENDED)
         check = stats.check_stats(TIERED, SINCE, UNTIL, 2)
@@ -151,6 +151,38 @@ class QuickRun(unittest.TestCase):
         self.assertEqual(got["quick_run"], (
             check["tiers"]["quick"]["ran"]["median"] / 60, 2))
         self.assertEqual(got["quick_run_cpu"], (900.0, 3))
+
+    def test_a_step_counts_that_step_alone(self):
+        # A budget for check-head alone, though the quick tier also runs
+        # wasm and browser steps on heads.
+        results = {
+            "a": {"tier": "quick", "finished": "2026-10-12T00:10:00Z",
+                  "step_cpu": {"check-head": 400.0, "wasm": 2000},
+                  "step_seconds": {"check-head": 120, "wasm": 300}},
+            "b": {"tier": "quick", "finished": "2026-10-12T00:20:00Z",
+                  "step_cpu": {"check-head": 900, "wasm": 2500},
+                  "step_seconds": {"check-head": 240, "wasm": 400}},
+            "c": {"tier": "quick", "finished": "2026-10-12T00:30:00Z",
+                  "step_cpu": {"check-head": 600, "wasm": 2200},
+                  "step_seconds": {"check-head": 180, "wasm": 350}}}
+        check = stats.check_stats(TIERED, SINCE, UNTIL, 2)
+        check["quick_cpu"] = stats.quick_cpu_stats(results, SINCE, UNTIL)
+        both = {"check": check, "queue": {}}
+        watched = {"quick_run_cpu": {"step": "check-head"},
+                   "quick_run": {"step": "check-head"}}
+        got = watch.figures(both, 6, watched)
+        self.assertEqual(got["quick_run_cpu"], (600, 3))
+        self.assertEqual(got["quick_run"], (3.0, 3))
+        # Without it, the whole run, as before.
+        got = watch.figures(both, 6)
+        self.assertEqual(got["quick_run_cpu"], (2800.0, 3))
+        self.assertEqual(got["quick_run"], (
+            check["tiers"]["quick"]["ran"]["median"] / 60, 2))
+        # A step no run had: no samples, so not judged.
+        got = watch.figures(both, 6, {"quick_run_cpu": {"step": "nope"},
+                                      "quick_run": {"step": "nope"}})
+        self.assertEqual(got["quick_run_cpu"], (None, 0))
+        self.assertEqual(got["quick_run"], (None, 0))
 
     def test_absent_without_checks_quick(self):
         got = watch.figures({"check": {}, "queue": {}}, 6)
