@@ -1,6 +1,6 @@
 # 0062: A main trace waits for the train top
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-20, #501); first step: the `depends_minutes` trial ("A simpler first step"), measured before any code
 * Author: XMPPEngineer
 * Date: 2026-11-19
 * Issue: #499
