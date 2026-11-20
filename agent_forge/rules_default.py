@@ -1209,15 +1209,13 @@ def waits(pr, when):
 
 def deferred_until(pr):
     """The time of the newest `Defer-until:` line on the pull request,
-    found as the Merger finds it (the body, then comments and reviews
-    by time), or None when there is none or it is not a time."""
-    texts = [("", pr.get("body"))]
-    texts += [(c.get("createdAt") or "", c.get("body"))
-              for c in pr.get("comments") or []]
-    texts += [(r.get("submittedAt") or "", r.get("body"))
-              for r in pr.get("reviews") or [] if r.get("submittedAt")]
+    found as the Merger finds it (`texts_of`: the body dated by its last
+    edit, then comments and reviews by time), or None when there is none
+    or it is not a time. A body edited after a comment's line is the
+    newer text (agent-forge #522: an expired comment's line outranked a
+    later body edit, and the issue was offered as unstarted)."""
     latest = None
-    for _, text in sorted(texts, key=lambda t: t[0]):
+    for _, text in merger.texts_of(pr):
         found = merger.DEFER_ANY_RE.findall(merger.markers_of(text))
         if found:
             latest = found[-1]

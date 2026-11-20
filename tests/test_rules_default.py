@@ -755,6 +755,18 @@ class Rule22(RedFirstCase):
         self.assertGreater(rules.deferred_until(item), NOW)
         self.assertEqual(len(self.wakes(item)), 1)
 
+    def test_a_body_edited_after_a_comment_is_the_newer_defer(self):
+        # agent-forge #522: the comment's line has lapsed, the body was
+        # edited later with one still to come.
+        item = waiting_issue(body="Defer-until: 2026-10-10T03:17:00Z")
+        item["comments"] = [dict(note(LEADDEV, "2026-10-09T08:00:00Z"),
+                                 body="Defer-until: 2026-10-09T09:00Z")]
+        item["lastEditedAt"] = "2026-10-09T10:00:00Z"
+        self.assertGreater(rules.deferred_until(item), NOW)
+        item["lastEditedAt"] = None
+        item["createdAt"] = "2026-10-09T07:00:00Z"
+        self.assertLess(rules.deferred_until(item), NOW)
+
     def lapsed(self, until, comment_at="2026-10-09T13:40:00Z"):
         item = waiting_issue(body="Defer-until: %s" % until)
         item["comments"] = [note(LEADDEV, comment_at)]
