@@ -1592,7 +1592,9 @@ their top's full green (see "`merge.gate_tier`").
   and each carriage of a train its head's quick result. `stats_watch`
   can also watch the quick check's own cost: `quick_run`, its median
   run time in minutes, and `quick_run_cpu`, its median CPU seconds,
-  each with `limit`, `ratio` and `short_hours`.
+  each with `limit`, `ratio` and `short_hours`, and `step`, a step's
+  name, to count that step's time alone (a budget for one step, when
+  the quick tier runs others beside it).
 * **The Router and forge-receiver read the head's context.** Under
   `"train"` a pull request's head gets only the quick context, so the
   default rules' 4 and 5 read it there (a head with none of it, a
