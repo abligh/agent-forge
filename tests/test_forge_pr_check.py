@@ -1903,7 +1903,11 @@ class Worker(StateCase):
             return done(args)
         run = self.run_for()
         run.rules.insert(0, (lambda a: a == ["make", "test"], preempted))
-        self.assertEqual(self.work(run), 3)
+        posts = []
+        self.assertEqual(self.work(run, post=lambda *a: posts.append(a)), 3)
+        # its status no longer says "running".
+        self.assertEqual(posts[-1][:2], (SHA_A, "pending"))
+        self.assertIn("queued again at", posts[-1][2])
         state = self.state()
         self.assertEqual(state["waiting"], {SHA_A: {
             "pr": 7, "since": pc.iso(T0 - datetime.timedelta(minutes=3))}})
