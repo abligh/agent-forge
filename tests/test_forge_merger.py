@@ -2058,6 +2058,20 @@ class Tick(Decide):
                          ("done", 1))
         self.assertEqual(self.told(dict(conflict, approved=T0)), ("done", 1))
 
+    def test_a_conflict_is_not_said_again_under_a_later_approval(self):
+        # One project, 2026-11-21: a second reviewer approved the head 19 s
+        # after it was handed back for a conflict, and the next tick said
+        # the conflict again, word for word. Only a push answers it.
+        conflict = dict(m.hand_back_key(review(REVIEWER, at=T0), "h" * 40,
+                                        m.CONFLICT_REASON))
+        self.assertEqual(self.told(dict(conflict), reason=m.CONFLICT_REASON),
+                         ("already said", 0))
+        # Another reason under the later approval is still a new question,
+        # and the same conflict at a new head is new too.
+        self.assertEqual(self.told(dict(conflict)), ("done", 1))
+        self.assertEqual(self.told(dict(conflict, head="g" * 40),
+                                   reason=m.CONFLICT_REASON), ("done", 1))
+
     def test_a_conflict_after_another_reason_still_reaches_the_author(self):
         # The reviewer was told the author's merge wasn't clean; then main
         # moved and the head conflicts: the author must hear it.
