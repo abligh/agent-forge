@@ -247,3 +247,57 @@ verdict says `(run again after green)`.
 **What it costs.** Nothing more from GitHub: the verdict and its time
 come from the build check's state. A forced run is a full run of the
 head's chosen steps, once per head, when someone asks for it.
+
+## Second amendment, 2026-11-21: a red suspect's rerun runs on the full tier
+
+* Status: proposed (XMPPEngineer, agent-forge #542)
+
+**Why.** The first amendment releases a red suspect on a green rerun
+of its head, from `labels.rerun`, and meant that rerun to be a full
+run of the head's chosen steps. With `checks.quick` and
+`merge.gate_tier: "train"` (designs/0055), forge-pr-check runs every
+head on the quick tier, a labelled one too. The Merger rightly ignores
+a quick green, which leaves out the very steps the batch found red. A
+full run of a head happens only inside a batch, and a suspect is out of
+batches, so nothing short of a new head releases it. On one project,
+two approved pull requests sat out of every train for about 29 hours
+(2026-11-20 to 11-21). Both reds were the build host's docker fault,
+before any test ran. Their authors labelled them, the quick reruns
+went green, and nothing moved until the suspects were removed by
+hand.
+
+**The change.** forge-pr-check runs a `labels.rerun` run of a head on
+the full tier when the head is a red suspect's: the head
+`red-suspects.json` names, in the Merger's state directory, which
+forge-pr-check already reads. Every other labelled head runs as
+before, on the quick tier under `checks.quick`.
+
+* The run is the first amendment's forced run, on the full tier's
+  steps, merged with the default branch as the build check's runs are.
+* Its verdict posts on `checks.context`, the full tier's context.
+  Under gate_tier `"train"` the head's quick context was set pending
+  by the label, and a full verdict covers a quick one (designs/0055),
+  so the same verdict answers the quick context too.
+* The Merger releases the suspect from that green, as the first
+  amendment says: `SUSPECT-CLEARED #N: green rerun at <head>`. A red
+  keeps it out, as now.
+* The hand-back's text is unchanged. `labels.rerun` is still the way
+  out, and now it works under gate_tier `"train"` too.
+
+**Not chosen.**
+* The Merger putting the suspect's head into a batch of its own. That
+  reuses predictions, but a batch of one is a train with its own
+  pull request and merge, so a green run would be followed by a merge,
+  not just a release. The author asked for a rerun, not a merge.
+* Releasing a suspect whose red the host caused, by matching its step
+  log against the host-fault patterns forge-pr-check knows, with no
+  rerun. It would save most reruns. But a pattern that matches a real
+  red would wave it into a train, and the rerun is cheap. It's worth
+  its own design if host faults keep coming.
+
+**What it costs.** One full run per labelled suspect's head, instead of
+a quick run that released nothing: the full tier's time, on an
+ordinary slot, only when an author asks.
+
+**Switch:** none. It follows `labels.rerun`, `checks.quick` and
+`merge.test_ahead.hand_back_red_suspect`.
