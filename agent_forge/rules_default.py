@@ -75,7 +75,12 @@ Then:
    suppressed "red, and blocked by #N: the Merger holds it". A head
    built on a base that predates a fix is red until the base merges,
    and the author can't act on that; once every named item has closed,
-   the red is the author's again, woken then, as a new turn;
+   the red is the author's again, woken then, as a new turn. Nobody's
+   too while the Merger's newest comment is a hold of this head
+   ("Holding <head>:", newer than the author's last comment and younger
+   than `merge.right_of_way.minutes`, 60 by default), suppressed "red,
+   and the Merger holds it": the hold asks the author to leave it, and
+   the Merger hands it back once when the hold ends;
 5. it is `pending` or absent on the head: nobody's, except
 27. with `router.review_waiting_heads` (designs/0063), which needs
    `checks.max_wait_minutes`: it is `pending` on the head, the pending
@@ -402,6 +407,12 @@ from agent_forge.router import (ONCE, Action, AddLabel, Decision, Lookup,
 # it and the layer sat with nobody (agent-forge, 2026-11-20).
 HAND_BACK_RE = re.compile(r"^Not merging ([0-9a-f]{7,40})(?: yet)?:",
                           re.MULTILINE)
+
+# The Merger's hold of a head, right of way's or the queue's ("Holding
+# <head>: it conflicts with #N, ..."). It asks the author to leave the
+# pull request, so a red check there is not their turn (agent-forge,
+# 2026-11-21: #13891 was offered four times while held).
+HOLD_RE = re.compile(r"^Holding ([0-9a-f]{7,40}):", re.MULTILINE)
 
 # bin/forge-merger, given by `configure`: its own test of "nothing said
 # since the approval" and its Blocked-by reading, so the two never
@@ -1000,6 +1011,10 @@ def route_pr_rules(pr, roster, when=None):
         return nobody(n, 4, "red, and blocked by %s: the Merger holds it"
                       % ", ".join("#%d" % b for b in open_blockers(pr)))
     if state in ("failure", "error"):
+        hold = merger_hold(handed, head, spoke, now)
+        if hold is not None:
+            return nobody(n, 4, "red, and the Merger holds it (comment %s)"
+                          % hold.get("databaseId"))
         return turn(n, author, 4, status.get("createdAt") or head,
                     "%s is %s at %s" % (status.get("context")
                                         or HEAD_CONTEXT, state, head[:7]))
@@ -1244,6 +1259,28 @@ def each_run(ctx):
     urgent = urgent_issues(ctx)
     return [AddLabel(pr["number"], URGENT) for pr in ctx.prs
             if closing_of(pr) & urgent and URGENT not in labels_of(pr)]
+
+
+def merger_hold(handed, head, spoke, when):
+    """Rule 4: the Merger's newest comment of `handed` (its comments on
+    the pull request) when it holds `head` ("Holding <head>:"), is newer
+    than `spoke` (the author's last word) and younger than the Merger's
+    right of way (`merger.ROW_FOR`); else None. The bound keeps a hold
+    whose end the Merger never reports from hiding the red for ever."""
+    if not handed:
+        return None
+    newest = max(handed, key=lambda c: c.get("createdAt") or "")
+    at = newest.get("createdAt") or ""
+    held = HOLD_RE.search(newest.get("body") or "")
+    if not held or not head.startswith(held.group(1)) or at <= spoke:
+        return None
+    try:
+        since = datetime.datetime.fromisoformat(at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when - since >= merger.ROW_FOR:
+        return None
+    return newest
 
 
 def waiting_unreviewed(pr, status, theirs, roster, when):
