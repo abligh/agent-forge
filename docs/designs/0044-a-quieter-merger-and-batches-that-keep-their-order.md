@@ -250,7 +250,7 @@ head's chosen steps, once per head, when someone asks for it.
 
 ## Second amendment, 2026-11-21: a red suspect's rerun runs on the full tier
 
-* Status: proposed (XMPPEngineer, agent-forge #542)
+* Status: approved (Alex, 2026-11-21, in XMPPEngineer's session; agent-forge #545)
 
 **Why.** The first amendment releases a red suspect on a green rerun
 of its head, from `labels.rerun`, and meant that rerun to be a full
