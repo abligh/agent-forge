@@ -1608,7 +1608,10 @@ their top's full green (see "`merge.gate_tier`").
   run time in minutes, and `quick_run_cpu`, its median CPU seconds,
   each with `limit`, `ratio` and `short_hours`, and `step`, a step's
   name, to count that step's time alone (a budget for one step, when
-  the quick tier runs others beside it).
+  the quick tier runs others beside it). `quick_tier_run` and
+  `quick_tier_cpu` are the same two figures for the whole tier, with no
+  `step`, so a project that budgets one step can still watch the
+  tier's total.
 * **The Router and forge-receiver read the head's context.** Under
   `"train"` a pull request's head gets only the quick context, so the
   default rules' 4 and 5 read it there (a head with none of it, a
