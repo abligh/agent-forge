@@ -685,6 +685,49 @@ class ReviewWaitingHeads(unittest.TestCase):
         PullRequestRules.assertTurn(self, d, who, rule, event)
 
 
+class HeldRed(unittest.TestCase):
+    """Rule 4: a red head the Merger holds ("Holding <head>:") is
+    nobody's while the hold is its newest word, newer than the author's
+    and younger than the right of way (agent-forge, 2026-11-21)."""
+
+    HOLD = ("Holding %s: it conflicts with #7, which has right of way."
+            "\n\n— Merger")
+
+    def decide(self, comments, minutes_after=10):
+        node = pr_node(statuses=[status("FAILURE", T1)],
+                       comments=comments)
+        github = FakeGitHub(response([node], []))
+        prs, _ = r.fetch(github)
+        when = (datetime.datetime(2026, 10, 9, 12, tzinfo=datetime.timezone.utc)
+                + datetime.timedelta(minutes=minutes_after))
+        return rules.route_pr(prs[0], ROSTER, when)
+
+    def test_a_held_head_is_nobodys(self):
+        d = self.decide([comment(MERGER, T2, self.HOLD % HEAD[:10], 701)])
+        self.assertEqual((d["who"], d["rule"]), (None, 4))
+        self.assertEqual(d["why"], "red, and the Merger holds it (comment 701)")
+
+    def test_a_hold_of_an_older_head_does_not_hold(self):
+        d = self.decide([comment(MERGER, T2, self.HOLD % OLD[:10], 701)])
+        self.assertEqual((d["who"], d["rule"]), ("LeadDev", 4))
+
+    def test_a_hold_past_the_right_of_way_does_not_hold(self):
+        d = self.decide([comment(MERGER, T2, self.HOLD % HEAD[:10], 701)],
+                        minutes_after=61)
+        self.assertEqual((d["who"], d["rule"]), ("LeadDev", 4))
+
+    def test_the_author_speaking_after_the_hold_takes_the_turn_back(self):
+        d = self.decide([comment(MERGER, T2, self.HOLD % HEAD[:10], 701),
+                         comment(LEADDEV, "2026-10-09T12:05:00Z",
+                                 "text", 702)])
+        self.assertEqual((d["who"], d["rule"]), ("LeadDev", 4))
+
+    def test_a_newer_hand_back_is_rule_2s(self):
+        d = self.decide([comment(MERGER, T2, self.HOLD % HEAD[:10], 701),
+                         comment(MERGER, "2026-10-09T12:05:00Z", BACK, 702)])
+        self.assertEqual((d["who"], d["rule"]), ("LeadDev", 2))
+
+
 class BlockedRed(unittest.TestCase):
     """Rule 4: a red pull request whose body's `Blocked-by:` names an
     open item is the Merger's to hold, not its author's turn."""
