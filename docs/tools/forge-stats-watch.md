@@ -90,6 +90,8 @@ No watched figure comes from GitHub.
 | `reviewer_busy` | The busiest reviewer's share of the window busy, in percent, is over `limit`. |
 | `quick_run` | The quick check's run time on heads (`checks.quick`, [designs/0055](../designs/0055-a-quick-check-on-heads-the-full-check-on-trains.md)), median, in minutes, is over `limit` or over `ratio` times the baseline's; its samples are the quick runs. The quick check is meant to stay short: when it creeps up, move its slowest tests to the train. |
 | `quick_run_cpu` | A quick run's CPU time over its steps, median, in CPU seconds, is over `limit` or over `ratio` times the baseline's; its samples are the quick runs that recorded `step_cpu`. Little moved by how busy the host is. |
+| `quick_tier_run` | The whole quick tier's run time on heads, median, in minutes: `quick_run` without a `step`. Kept beside a `quick_run` that counts one step, so the tier's own cost is still watched when one step has its own budget. |
+| `quick_tier_cpu` | The whole quick tier's CPU time, median, in CPU seconds: `quick_run_cpu` without a `step`, likewise. |
 | `red_train_tops_per_merge` | Red train tops (the Merger's predictions whose run went red) per merge are over `limit` or over `ratio` times the baseline's; its samples are the merges. With `checks.quick`, climbing means the quick tier lets too much through ([designs/0055](../designs/0055-a-quick-check-on-heads-the-full-check-on-trains.md)). |
 
 **A shorter window as well.** A figure with `short_hours` (from 1 to

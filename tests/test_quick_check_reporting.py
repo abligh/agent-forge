@@ -145,6 +145,12 @@ class QuickRun(unittest.TestCase):
                              ("limit", "ratio", "step", "short_hours"))
             self.assertNotIn(name, watch.FLOORS)
         self.assertIn("quick_run", watch.CONTENDED)
+        self.assertIn("quick_tier_run", watch.CONTENDED)
+        for name in ("quick_tier_run", "quick_tier_cpu"):
+            # No `step`: they are the whole tier by definition.
+            self.assertEqual(config.STATS_WATCH_FIGURES[name],
+                             ("limit", "ratio", "short_hours"))
+            self.assertNotIn(name, watch.FLOORS)
         check = stats.check_stats(TIERED, SINCE, UNTIL, 2)
         check["quick_cpu"] = stats.summary([600.0, 900.0, 1200.0])
         got = watch.figures({"check": check, "queue": {}}, 6)
@@ -178,6 +184,11 @@ class QuickRun(unittest.TestCase):
         self.assertEqual(got["quick_run_cpu"], (2800.0, 3))
         self.assertEqual(got["quick_run"], (
             check["tiers"]["quick"]["ran"]["median"] / 60, 2))
+        # The whole tier's figures ignore the step.
+        got = watch.figures(both, 6, watched)
+        self.assertEqual(got["quick_tier_cpu"], (2800.0, 3))
+        self.assertEqual(got["quick_tier_run"], (
+            check["tiers"]["quick"]["ran"]["median"] / 60, 2))
         # A step no run had: no samples, so not judged.
         got = watch.figures(both, 6, {"quick_run_cpu": {"step": "nope"},
                                       "quick_run": {"step": "nope"}})
@@ -188,6 +199,8 @@ class QuickRun(unittest.TestCase):
         got = watch.figures({"check": {}, "queue": {}}, 6)
         self.assertEqual(got["quick_run"], (None, 0))
         self.assertEqual(got["quick_run_cpu"], (None, 0))
+        self.assertEqual(got["quick_tier_run"], (None, 0))
+        self.assertEqual(got["quick_tier_cpu"], (None, 0))
 
     def test_judged_as_ceilings(self):
         self.assertEqual(

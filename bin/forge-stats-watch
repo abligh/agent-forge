@@ -52,6 +52,12 @@ configuration's `stats_watch.figures`:
                    baseline's. Little moved by how busy the host is.
                    With `step`, that step's alone, as for main_cpu
                    (quick_run takes `step` too, for its wall time)
+    quick_tier_run  the whole quick tier's run time on heads, median, in
+                   minutes: quick_run without a `step`, kept beside a
+                   quick_run that counts one step, so the tier's cost
+                   is still watched when a step has its own budget
+    quick_tier_cpu  the whole quick tier's CPU time, median, in CPU
+                   seconds: quick_run_cpu without a `step`, likewise
     red_train_tops_per_merge  the Merger's predictions (a train's or
                    batch's top) whose run went red, over the merges:
                    over `limit`, or over `ratio` x the baseline's; its
@@ -182,6 +188,9 @@ WHAT = {
     "red_train_tops_per_merge": ("red train tops ÷ merges", "per merge"),
     "quick_run": ("the quick check's run time on heads, median", "min"),
     "quick_run_cpu": ("a quick run's CPU time, median", "CPU-s"),
+    "quick_tier_run": ("the whole quick tier's run time on heads, median",
+                       "min"),
+    "quick_tier_cpu": ("the whole quick tier's CPU time, median", "CPU-s"),
     "hand_backs_per_merge": ("hand-backs told (all pull requests) ÷ merges",
                              "per merge"),
     "prs_per_slot": ("pull requests merged per green run", "per run"),
@@ -195,7 +204,7 @@ FLOW = ("hand_backs_per_merge", "prs_per_slot", "reviewer_busy",
 FLOORS = ("merge_rate", "prs_per_slot")
 # The figures a busy host slows down: their issues say how busy it was.
 CONTENDED = ("check_run", "check_wait", "pr_turnaround", "main_cpu",
-             "quick_run")
+             "quick_run", "quick_tier_run")
 # forge-pr-check's line for a slot left over checks.cache_limit after a
 # prune; an instance's name may follow the word.
 OVER_RE = re.compile(r"^(\S+) CACHE-OVER-LIMIT (?:\S+ )?(slot \d+): (\d+) "
@@ -345,6 +354,8 @@ def figures(stats, hours, watched=None):
     quick_wall = (((quick.get("steps_wall") or {}).get(step) or {"n": 0})
                   if step else None)
 
+    tier_ran = ((check.get("tiers") or {}).get("quick") or {}).get("ran") or {}
+
     def minutes(part, key):
         value, n = part.get(key), part.get("n", 0)
         return (None if value is None else value / 60), n
@@ -372,9 +383,11 @@ def figures(stats, hours, watched=None):
         "red_train_tops_per_merge": (
             (check.get("red") or {}).get("prediction", 0) / merges
             if merges else None, merges),
-        "quick_run": minutes(quick_wall or ((check.get("tiers") or {}).get(
-            "quick") or {}).get("ran") or {}, "median"),
+        "quick_run": minutes(quick_wall or tier_ran, "median"),
         "quick_run_cpu": (quick_cpu.get("median"), quick_cpu.get("n", 0)),
+        # The whole tier, whatever `step` the two above count.
+        "quick_tier_run": minutes(tier_ran, "median"),
+        "quick_tier_cpu": (quick.get("median"), quick.get("n", 0)),
     }
 
 
@@ -388,7 +401,7 @@ def show(figure, value):
         return "%.1f h" % value
     if figure == "merge_rate":
         return "%.1f an hour" % value
-    if figure in ("main_cpu", "quick_run_cpu"):
+    if figure in ("main_cpu", "quick_run_cpu", "quick_tier_cpu"):
         return "%.0f CPU-s" % value
     if figure == "check_cpu_per_merge":
         return "%.0f CPU-s (%.1f CPU-hours) a merge" % (value, value / 3600)
