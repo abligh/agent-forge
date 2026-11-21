@@ -3817,6 +3817,30 @@ class PredictRestacked(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertEqual(m.train_lists(got, sizes), [[6, 7]])
 
+    def test_the_mergers_update_stays_while_trains_are_kept(self):
+        # One project, 2026-11-21: labels.keep_trains kept the trains on
+        # the base they boarded on, main moved on, and the Merger updated
+        # a member with the main of the moment. Checked against the kept
+        # base, the update read as a push and the member left its train.
+        seven, last = self.boarded()
+        kept = self.repo.main_tip()
+        self.repo.branch("later", kept)
+        later = self.repo.commit("k.txt", "k\n", "main moves on again")
+        run_git(self.repo.path, "push", "-q", "origin", later + ":main")
+        run_git(self.repo.path, "fetch", "-q", "origin")
+        head = self.updated(self.restacked_by_hand())
+        self.repo.publish_pr(6, head)
+        cut = lambda **kw: m.cut_trains(
+            self.repo.path, kept, [[pr(6, T1, head=head)], [seven]], last,
+            {6: head, 7: seven["headRefOid"]}, {6, 7}, restacks=None, **kw)
+        got, sizes, events = cut(live_main=self.repo.main_tip())
+        self.assertEqual(events, [])
+        self.assertEqual(m.train_lists(got, sizes), [[6, 7]])
+        # Without the live main, as before, it read as a push.
+        _, _, events = cut()
+        self.assertEqual(events[0], ("left", "LEFT #6: pushed %s mid-train"
+                                     % head[:10]))
+
     def test_one_out_of_the_queue_still_leaves(self):
         # Out of the queue (its new head's Mac check pending, say), it
         # may not ride: a train holds only what may merge now. The

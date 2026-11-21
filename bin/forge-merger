@@ -6164,7 +6164,8 @@ def last_trains(last):
 def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                trains=None, red=frozenset(), restacks=None, run=sh,
                files=None, note=None, force_merges=True, started=None,
-               acting=None, length=None, unreviewed=frozenset()):
+               acting=None, length=None, unreviewed=frozenset(),
+               live_main=None):
     """designs/0047: (entries, sizes, events) for the trains this tick,
     end to end from `main_tip`: the predictions as `predict_ahead` makes
     them, each with `train` (its train's place) and `carriage` (its
@@ -6279,6 +6280,16 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
     # train up to it is the same, its prediction is still what a push
     # that only merges what is below it must give.
     was, before = {}, (last or {}).get("base")
+
+    def updated_only(before_head, head):
+        # The Merger's own update merges the default branch as it is
+        # now. Kept on an older base by labels.keep_trains, `main_tip`
+        # is not that, so the update is also tried against `live_main`
+        # (2026-11-21: a train member the Merger updated was told it
+        # had pushed mid-train, and left its train).
+        return own_push(repo, before_head, head, main_tip, run) or bool(
+            live_main and live_main != main_tip
+            and own_push(repo, before_head, head, live_main, run))
     # A layer whose base has merged since it boarded still boarded as a
     # layer (`boarded_layers`), though it heads its carriage now.
     was_on = {e.get("pr"): e.get("on") for e in (last or {}).get(
@@ -6313,8 +6324,7 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                         # same, its new head's check not yet green.
                         why = ("updated by the Merger to %s; out of the "
                                "queue until its check" % head[:10]
-                               if own_push(repo, e.get("head"), head,
-                                           main_tip, run)
+                               if updated_only(e.get("head"), head)
                                else "pushed %s mid-train" % head[:10])
                     else:
                         why = "left the queue"
@@ -6327,8 +6337,8 @@ def cut_trains(repo, main_tip, carriages, last, heads, open_numbers,
                             and not restacking(repo, e.get("head"),
                                                pr["headRefOid"],
                                                (restacks or {}).get(n), run) \
-                            and not own_push(repo, e.get("head"),
-                                             pr["headRefOid"], main_tip, run):
+                            and not updated_only(e.get("head"),
+                                                 pr["headRefOid"]):
                         entry = same_prediction(
                             repo, parent, graph, e.get("head"), pr,
                             restacks, run, e.get("tree")
@@ -10371,7 +10381,7 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
                 acting=waiting_on if acting else None,
                 length=window_length(last)
                 if WINDOW and TRAINS == "live" else None,
-                unreviewed=frozenset(UNREVIEWED))
+                unreviewed=frozenset(UNREVIEWED), live_main=main_tip)
             files, note = {}, {}
             red_top = False
             if TRAINS == "live" and not searching and boarding:
