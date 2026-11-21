@@ -3540,7 +3540,9 @@ def told(before, key):
     hand-backs in a morning repeated one already told for the same head;
     one head was told 8 times in an hour, alternating between a conflict
     with main and a merge after the approval that wasn't clean, since
-    each replaced the other in `said`. Three hand-backs still count as
+    each replaced the other in `said`. A conflict with main already
+    said for a head stays said under a later approval of that head, since
+    only a push answers it. Three hand-backs still count as
     new: a conflict with main after the reviewer was told the merge
     wasn't clean, since the conflict is the author's to act on; one after a gate's refusal of a description (`text`), unless
     it is the same refusal of the same description, since the author
@@ -3548,6 +3550,12 @@ def told(before, key):
     now (`retry`) for another reason, since that refusal wasn't the
     author's to fix."""
     if {k: v for k, v in before.items() if k != "at"} == key:
+        return True
+    # Only a push answers a conflict with main, so a new approval of the
+    # same head doesn't make it a new question: a second reviewer's
+    # approval of a head already told it conflicts would say it again.
+    if before.get("head") == key["head"] and \
+            before.get("reason") == key["reason"] == CONFLICT_REASON:
         return True
     if not ONCE_PER_HEAD or before.get("approved") != key["approved"] \
             or before.get("head") != key["head"]:
