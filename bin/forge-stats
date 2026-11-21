@@ -45,7 +45,8 @@ defaults to the last `--hours` (24) up to now.
   slot, from the `tier=` each verdict line ends with, and the spread
   of their run times (`ran`). Shown only when some line has one; and
   each quick run's CPU time over its steps (`quick_cpu`), from the
-  same `step_cpu` as `cpu_all`;
+  same `step_cpu` as `cpu_all`, and, with `stats.part_line`, each
+  step's parts as its log says them (`steps_parts`, agent-forge #548);
 - red train tops per merge (`red_train_tops_per_merge`, designs/0055):
   the Merger's predictions (a train's or batch's top) whose run went
   red, over the merges in the window. Each is a red no head's own check
@@ -99,6 +100,7 @@ Exit status: 0 the report was written; 2 no configuration or no records.
 import argparse
 import collections
 import datetime
+import gzip
 import json
 import os
 import re
@@ -705,13 +707,50 @@ def all_cpu_stats(results, since, until):
     return {"seconds": round(seconds, 2), "runs": runs}
 
 
-def quick_cpu_stats(results, since, until):
+def step_parts(pr_dir, result, step, pattern):
+    """agent-forge #548: {part: (wall, cpu)} from the part lines of one
+    run's step log (`stats.part_line`), {} without one. A part said more
+    than once counts its last line."""
+    logs = result.get("logs")
+    if not isinstance(logs, str) or not logs or os.path.isabs(logs) \
+            or ".." in logs.split("/") or "/" in step or step in (".", ".."):
+        return {}
+    path = os.path.join(pr_dir, logs, step + ".log")
+    parts = {}
+    for name, opener in ((path + ".gz", gzip.open), (path, open)):
+        try:
+            with opener(name, "rt", errors="replace") as handle:
+                for line in handle:
+                    found = pattern.search(line)
+                    if not found:
+                        continue
+                    try:
+                        parts[found.group("part")] = (
+                            float(found.group("wall")),
+                            float(found.group("cpu")))
+                    except (TypeError, ValueError):
+                        continue
+            return parts
+        except OSError:
+            continue
+    return parts
+
+
+def quick_cpu_stats(results, since, until, pr_dir=None, part_line=None):
     """designs/0055: summary of each quick run's CPU seconds over its
     steps, for the quick runs (`tier` "quick") that finished in the
     window. A run without `step_cpu` is left out. `steps` is each
     step's own summary, of its CPU seconds (`step_cpu`) and, as
     `steps_wall`, of its wall seconds (`step_seconds`), for stats_watch's
-    `step` on quick_run_cpu and quick_run."""
+    `step` on quick_run_cpu and quick_run.
+
+    With `part_line` (`stats.part_line`, agent-forge #548), the parts a
+    step's log says it ran: `steps_parts[step][part]`, a summary of
+    their CPU seconds, and `steps_parts_wall` of their wall seconds."""
+    pattern = re.compile(part_line) if part_line and pr_dir else None
+    parts = collections.defaultdict(lambda: collections.defaultdict(list))
+    part_walls = collections.defaultdict(
+        lambda: collections.defaultdict(list))
     took = []
     steps, walls = collections.defaultdict(list), collections.defaultdict(
         list)
@@ -738,9 +777,21 @@ def quick_cpu_stats(results, since, until):
                 if isinstance(value, (int, float)) and not isinstance(
                         value, bool):
                     walls[step].append(value)
+            for step in (values if pattern else ()):
+                for part, (wall, cpu_s) in step_parts(
+                        pr_dir, result, step, pattern).items():
+                    parts[step][part].append(cpu_s)
+                    part_walls[step][part].append(wall)
     got = summary(took)
     got["steps"] = {k: summary(v) for k, v in sorted(steps.items())}
     got["steps_wall"] = {k: summary(v) for k, v in sorted(walls.items())}
+    if pattern:
+        got["steps_parts"] = {
+            step: {k: summary(v) for k, v in sorted(got_parts.items())}
+            for step, got_parts in sorted(parts.items())}
+        got["steps_parts_wall"] = {
+            step: {k: summary(v) for k, v in sorted(got_parts.items())}
+            for step, got_parts in sorted(part_walls.items())}
     return got
 
 
@@ -988,7 +1039,9 @@ def main(argv=None, out=print, environ=None, now=None,
     results = read_results(pr_dir)
     check["main_cpu"] = main_cpu_stats(results, since, until)
     check["cpu_all"] = all_cpu_stats(results, since, until)
-    check["quick_cpu"] = quick_cpu_stats(results, since, until)
+    check["quick_cpu"] = quick_cpu_stats(
+        results, since, until, pr_dir,
+        project.section("stats").get("part_line"))
     check["scoped"] = scoped_stats(results, since, until)
     queue = queue_stats(records, since, until)
     check["red_train_tops_per_merge"] = red_train_tops_per_merge(check, queue)

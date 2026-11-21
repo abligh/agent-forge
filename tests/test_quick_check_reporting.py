@@ -139,6 +139,66 @@ class QuickRun(unittest.TestCase):
         self.assertEqual(got["max"], 900)
         self.assertEqual(stats.quick_cpu_stats({}, SINCE, UNTIL)["n"], 0)
 
+    def test_a_step_s_parts_from_its_log(self):
+        # agent-forge #548: a step that runs several parts says each one's
+        # cost in its log; with stats.part_line they are read as parts.
+        import gzip
+        pr_dir = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, pr_dir)
+        line = "26.889 1 tool: %s: %s s, %s CPU s\n"
+        for sha, lines in (("a", [("fmt", "20.0", "22.0"),
+                                  ("tests", "50.0", "260.0"),
+                                  ("tests", "51.0", "266.0")]),
+                           ("b", [("fmt", "30.0", "24.0")])):
+            os.makedirs(os.path.join(pr_dir, "logs", sha))
+            with gzip.open(os.path.join(pr_dir, "logs", sha,
+                                        "check-head.log.gz"), "wt") as f:
+                f.write("noise: not a part\n")
+                f.writelines(line % x for x in lines)
+        results = {
+            "a": {"tier": "quick", "finished": "2026-10-12T00:10:00Z",
+                  "logs": "logs/a", "step_cpu": {"check-head": 400.0}},
+            "b": {"tier": "quick", "finished": "2026-10-12T00:20:00Z",
+                  "logs": "logs/b", "step_cpu": {"check-head": 300.0}},
+            # No log, and a log path outside the check's directory.
+            "c": {"tier": "quick", "finished": "2026-10-12T00:30:00Z",
+                  "logs": "logs/c", "step_cpu": {"check-head": 1.0}},
+            "d": {"tier": "quick", "finished": "2026-10-12T00:40:00Z",
+                  "logs": "../a", "step_cpu": {"check-head": 1.0}}}
+        pattern = (r"tool: (?P<part>[a-z-]+): (?P<wall>[0-9.]+) s, "
+                   r"(?P<cpu>[0-9.]+) CPU s")
+        got = stats.quick_cpu_stats(results, SINCE, UNTIL, pr_dir, pattern)
+        parts = got["steps_parts"]["check-head"]
+        self.assertEqual(sorted(parts), ["fmt", "tests"])
+        self.assertEqual((parts["fmt"]["n"], parts["fmt"]["max"]),
+                         (2, 24.0))
+        # A part said twice counts its last line.
+        self.assertEqual((parts["tests"]["n"], parts["tests"]["max"]),
+                         (1, 266.0))
+        self.assertEqual(
+            got["steps_parts_wall"]["check-head"]["fmt"]["max"], 30.0)
+        # Without the setting, nothing changes.
+        self.assertNotIn("steps_parts",
+                         stats.quick_cpu_stats(results, SINCE, UNTIL))
+
+    def test_the_part_line_setting(self):
+        from tests.test_config import example
+        for value, want in (
+                (r"(?P<part>\w+): (?P<wall>\S+) s, (?P<cpu>\S+) CPU", []),
+                (r"(?P<part>\w+)", ["stats.part_line needs the named groups "
+                                    "part, wall and cpu (missing: wall, "
+                                    "cpu)"]),
+                (r"(", None),
+                (3, ["stats.part_line must be a string"])):
+            data = example()
+            data["stats"] = {"part_line": value}
+            problems = config.check(data)
+            if want is None:
+                self.assertEqual(len(problems), 1)
+                self.assertIn("not a regular expression", problems[0])
+            else:
+                self.assertEqual(problems, want)
+
     def test_the_figures_and_their_rules(self):
         for name in ("quick_run", "quick_run_cpu"):
             self.assertEqual(config.STATS_WATCH_FIGURES[name],
