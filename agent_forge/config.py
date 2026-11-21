@@ -56,6 +56,7 @@ TOP = {
     "quiet": (dict, False),
     "queue": (dict, False),
     "stats_watch": (dict, False),
+    "stats": (dict, False),
     "nightly": (dict, False),
     "session_start": (dict, False),
 }
@@ -524,6 +525,31 @@ def _check_queue(queue, problems):
             problems.append("%s.nice must be from 0 to 19" % where)
 
 
+# forge-stats (agent-forge #548): `part_line` reads a step's own part
+# lines from its logs, a regex with named groups part, wall and cpu.
+STATS = {"part_line": str}
+
+
+def _check_stats(stats, problems):
+    """The `stats` section: how forge-stats reads a step's parts."""
+    if not _fields("stats", stats, STATS, problems):
+        return
+    pattern = stats.get("part_line")
+    if not isinstance(pattern, str):
+        return
+    try:
+        compiled = re.compile(pattern)
+    except re.error as error:
+        problems.append("stats.part_line is not a regular expression: %s"
+                        % error)
+        return
+    missing = [g for g in ("part", "wall", "cpu")
+               if g not in compiled.groupindex]
+    if missing:
+        problems.append("stats.part_line needs the named groups part, "
+                        "wall and cpu (missing: %s)" % ", ".join(missing))
+
+
 def _check_stats_watch(watch, data, problems):
     """The `stats_watch` section: forge-stats-watch's figures, and the
     agent its issues are for."""
@@ -873,6 +899,8 @@ def check(data):
     _check_queue(data.get("queue", {}), problems)
     if "stats_watch" in data:
         _check_stats_watch(data["stats_watch"], data, problems)
+    if "stats" in data:
+        _check_stats(data["stats"], problems)
     if "nightly" in data:
         _check_nightly(data["nightly"], data, problems)
     docs = data.get("docs", {})
