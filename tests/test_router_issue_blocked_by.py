@@ -78,6 +78,12 @@ class FromComments(Case):
         item = issue([note(LEADDEV, T1, "Waiting on these.\n\nBlocked-by: #7\n"
                            "Blocked-by: #8")], blocked_by={7: OPEN, 8: OPEN})
         self.assertEqual(rules.issue_blocker_state(item), ({7, 8}, T1))
+
+    def test_a_comment_line_may_name_several(self):
+        # agent-forge #556.
+        item = issue([note(LEADDEV, T1, "Blocked-by: #7, #8")],
+                     blocked_by={7: OPEN, 8: OPEN})
+        self.assertEqual(rules.issue_blocker_state(item), ({7, 8}, T1))
         self.assertTrue(rules.blocked(item))
 
     def test_the_owners_comment_blocks(self):

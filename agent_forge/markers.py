@@ -4,7 +4,8 @@
   rather than judging, so it neither counts as speaking after an
   approval nor wakes anyone as a review would.
 * `Blocked-by: #N` on a line of its own in a pull request's body: hold
-  it until N closes.
+  it until N closes. One line may name several, `Blocked-by: #N, #M`
+  (commas, `and` or spaces between them): hold it until all close.
 * `Defer-until: <time>`: hold it until then. The newest such line wins.
 
 Only prose counts: a marker quoted in a fenced or indented code block
@@ -15,8 +16,10 @@ import datetime
 import re
 
 NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
-BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
-                        re.MULTILINE | re.IGNORECASE)
+BLOCKED_RE = re.compile(
+    r"^\**Blocked-by:\**\s*(#\d+(?:\s*(?:,|;|&|\band\b)?\s*#\d+)*)\s*\.?\**$",
+    re.MULTILINE | re.IGNORECASE)
+NUMBER_RE = re.compile(r"#(\d+)")
 FENCE_RE = re.compile(r"^\s*(```|~~~).*?(^\s*\1|\Z)", re.MULTILINE | re.DOTALL)
 DEFER_RE = re.compile(r"^Defer-until:[ \t]*(.+?)[ \t]*$",
                       re.MULTILINE | re.IGNORECASE)
@@ -37,7 +40,8 @@ def is_not_a_review(text):
 def blockers(text):
     """The issue and pull request numbers `text` names in `Blocked-by:`
     lines."""
-    return {int(m.group(1)) for m in BLOCKED_RE.finditer(prose(text))}
+    return {int(n) for m in BLOCKED_RE.finditer(prose(text))
+            for n in NUMBER_RE.findall(m.group(1))}
 
 
 def parse_time(value):

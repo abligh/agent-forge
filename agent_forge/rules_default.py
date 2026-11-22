@@ -1736,7 +1736,7 @@ def issue_blocker_state(issue):
         if not any(merger.BLOCKED_LINE_RE.match(l)
                    for l in text.splitlines()):
             continue
-        found = {int(m.group(1)) for m in merger.BLOCKED_RE.finditer(text)}
+        found = merger.blocked_numbers(text)
         if found or merger.UNBLOCK_RE.search(text):
             named, written = found, when
     return named, written

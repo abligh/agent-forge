@@ -9486,6 +9486,28 @@ class BlockedByEverywhere(unittest.TestCase):
         item = pr(comments=[comment(PEER, at=TA, body="Blocked-by: #2")])
         self.assertEqual(self.held(item), "Blocked-by: #2")
 
+    def test_by_default_a_body_list_holds_on_each(self):
+        # agent-forge #556: "Blocked-by: #A, #B" was skipped, and the
+        # pull request merged before #B.
+        m.configure(project())
+        item = pr(body="Two first.\nBlocked-by: #2, #3")
+        self.assertEqual(self.held(item), "Blocked-by: #2, #3")
+        self.assertEqual(self.held(item, open_numbers=(3,)),
+                         "Blocked-by: #3")
+        self.assertIsNone(self.held(item, open_numbers=()))
+
+    def test_by_default_an_unparsed_body_line_holds(self):
+        m.configure(project())
+        item = pr(body="Blocked-by: #2 once it ships")
+        self.assertEqual(self.held(item),
+                         "unparsed Blocked-by line: Blocked-by: #2 once it ships")
+        self.assertIsNone(self.held(pr(body="Blocked-by: none")))
+
+    def test_a_comment_list_holds_on_each(self):
+        item = pr(comments=[comment(PEER, at=TA,
+                                    body="Blocked-by: #2 and #4")])
+        self.assertEqual(self.held(item), "Blocked-by: #2, #4")
+
     def test_two_lines_in_one_comment_both_count(self):
         item = pr(comments=[comment(PEER, at=TA, body="Waiting on two.\n"
                                     "Blocked-by: #2\nBlocked-by: #3")])

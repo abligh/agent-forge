@@ -30,7 +30,18 @@ class Blockers(unittest.TestCase):
     def test_one_per_line_bold_or_not(self):
         self.assertEqual(markers.blockers(
             "Blocked-by: #12\n**Blocked-by:** #13\n**Blocked-by: #14**\n"
-            "blocked-by:#15\nBlocked-by: #16 and #17"), {12, 13, 14, 15})
+            "blocked-by:#15"), {12, 13, 14, 15})
+
+    def test_a_line_may_name_several(self):
+        # agent-forge #556: "#16, #17" on one line was skipped whole.
+        self.assertEqual(markers.blockers(
+            "Blocked-by: #16, #17\nBlocked-by: #18 and #19\n"
+            "**Blocked-by:** #20 #21.\nBlocked-by: #22; #23"),
+            {16, 17, 18, 19, 20, 21, 22, 23})
+
+    def test_words_after_a_number_make_it_no_line(self):
+        self.assertEqual(markers.blockers(
+            "Blocked-by: #5 (the release)\nBlocked-by: #6, soon"), set())
 
 
 class Defer(unittest.TestCase):
