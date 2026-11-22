@@ -125,6 +125,7 @@ class FakeGitHub:
         self.open_prs, self.merged_prs = [], []
         self.comments, self.referenced_by = [], []
         self.workflow = WORKFLOW
+        self.closed = []
         self.fail = None
         self.writes = []
         self.pages = []
@@ -167,6 +168,8 @@ class FakeGitHub:
                 if not path.endswith("&page=1"):
                     return 200, []
                 return 200, [i for i in self.issues if i["state"] == "open"]
+            if path.startswith("/issues?state=closed&"):
+                return 200, self.closed
             if path.startswith("/actions/runs/"):
                 number = int(path.split("/")[3])
                 return 200, {"jobs": self.jobs[number]}
@@ -939,3 +942,113 @@ class Pieces(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SIDE = {"jobs": ["build-other", "test-other"], "title": "ci (other only)",
+        "inputs": {"other_only": "true"}, "issues": "^The other build went red"}
+
+
+def side_jobs(build="success", test="success"):
+    return [{"id": 910, "name": "build-and-test", "conclusion": "success",
+             "steps": []},
+            {"id": 911, "name": "build-other", "conclusion": build, "steps": []},
+            {"id": 912, "name": "test-other", "conclusion": test, "steps": []}]
+
+
+def closed(number, title, when, reason="completed"):
+    return {"number": number, "title": title, "state": "closed",
+            "closed_at": stamp(when), "state_reason": reason}
+
+
+class Side(unittest.TestCase):
+    """nightly.side: side jobs run again alone once a red one's issue
+    closes, and side runs are not the nightly's. Main's helpers, not
+    its tests."""
+
+    save_config, send, main = Main.save_config, Main.send, Main.main
+    saved, writes = Main.saved, Main.writes
+
+    def setUp(self):
+        Main.setUp(self)
+        self.data["nightly"]["side"] = dict(SIDE)
+        self.save_config()
+        self.gh.runs = [run(2, RED_SHA, "success")]
+        self.gh.jobs = {2: side_jobs(test="failure")}
+
+    def side_dispatches(self):
+        return [w for w in self.writes("POST", "/dispatches")
+                if w[2].get("inputs") == {"other_only": "true"}]
+
+    def test_a_red_side_job_runs_alone_again_once_its_issue_closes(self):
+        self.main()
+        self.assertEqual(self.saved()["side"]["red"]["jobs"], ["test-other"])
+        self.assertIn("SIDE RED run 2 at bbbbbbbbbb: test-other", self.out)
+        self.assertEqual(self.side_dispatches(), [])
+        # An issue of another title, one closed before the run, and one
+        # closed as not planned don't count.
+        self.gh.closed = [
+            closed(7, "Something else went red", NOW),
+            closed(8, "The other build went red, 10-22", NOW - 4 * HOUR),
+            closed(9, "The other build went red, 10-23", NOW, "not_planned")]
+        self.main(now=NOW + HOUR / 4)
+        self.assertEqual(self.side_dispatches(), [])
+        self.gh.closed.append(closed(10, "The other build went red, 10-23",
+                                     NOW + HOUR / 4))
+        self.main(now=NOW + HOUR / 2)
+        [(_, path, body)] = self.side_dispatches()
+        self.assertEqual(body, {"ref": "main", "inputs": {"other_only": "true"}})
+        comment = self.writes("POST", "/issues/10/comments")[-1][2]["body"]
+        self.assertTrue(comment.startswith(
+            "Ran `test-other` alone again on `main` at cccccccccc, to check "
+            "this fix: run 2 had them red."), comment)
+        # Once a red run.
+        self.main(now=NOW + HOUR)
+        self.assertEqual(len(self.side_dispatches()), 1)
+
+    def test_a_side_run_is_not_the_nightlys(self):
+        # The nightly is red; a side run after it doesn't hide a fix
+        # that merged before the side run started.
+        self.gh.runs = [run(2, RED_SHA, ended=NOW - 3 * HOUR)]
+        self.gh.jobs = {2: red_jobs()}
+        self.main(now=NOW - 2 * HOUR)
+        side = run(3, NEXT_SHA, "success", event="workflow_dispatch",
+                   ended=NOW - HOUR / 2, started=NOW - HOUR)
+        side["display_title"] = "ci (other only)"
+        self.gh.runs.insert(0, side)
+        self.gh.jobs[3] = side_jobs()
+        self.gh.merged_prs = [pr(5, body="Fixes #101",
+                                 merged=stamp(NOW - 1.5 * HOUR))]
+        self.main(now=NOW)
+        nightly = [w for w in self.writes("POST", "/dispatches")
+                   if "other_only" not in (w[2].get("inputs") or {})]
+        self.assertEqual(len(nightly), 1, self.out)
+        self.assertNotIn("NEITHER run 3", " ".join(self.out))
+
+    def test_a_green_side_run_clears_it_and_an_active_one_waits(self):
+        self.main()
+        self.gh.closed = [closed(10, "The other build went red, 10-23",
+                                 NOW + HOUR / 4)]
+        active = run(3, NEXT_SHA, status="in_progress",
+                     event="workflow_dispatch", started=NOW)
+        active["display_title"] = "ci (other only)"
+        self.gh.runs.insert(0, active)
+        self.main(now=NOW + HOUR / 2)
+        self.assertEqual(self.side_dispatches(), [])
+        self.assertIn("SIDE RUNNING run 3", self.out)
+        self.gh.runs[0] = dict(run(3, NEXT_SHA, "success",
+                                   event="workflow_dispatch",
+                                   ended=NOW + HOUR, started=NOW),
+                               display_title="ci (other only)")
+        self.gh.jobs[3] = side_jobs()
+        self.main(now=NOW + 2 * HOUR)
+        self.assertNotIn("red", self.saved()["side"])
+        self.assertIn("SIDE GREEN run 3 at cccccccccc", self.out)
+
+    def test_a_run_whose_side_jobs_skipped_keeps_it_red(self):
+        self.main()
+        self.gh.runs.insert(0, run(3, NEXT_SHA, "success",
+                                   event="workflow_dispatch",
+                                   ended=NOW + HOUR, started=NOW))
+        self.gh.jobs[3] = side_jobs("skipped", "skipped")
+        self.main(now=NOW + 2 * HOUR)
+        self.assertEqual(self.saved()["side"]["red"]["run"], 2)

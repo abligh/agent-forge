@@ -558,6 +558,20 @@ class Check(unittest.TestCase):
                 data["nightly"] = {"workflow": "ci.yaml", "job": "j",
                                    key: "yes"}
                 self.assertEqual(len(config.check(data)), 1)
+        side = {"jobs": ["build-other"], "inputs": {"other_only": "true"},
+                "issues": "^The other build went red", "title": "ci (other)"}
+        data["nightly"] = {"workflow": "ci.yaml", "job": "j", "side": side}
+        self.assertEqual(config.check(data), [])
+        data["nightly"]["side"] = {"jobs": [], "inputs": {"x": True},
+                                   "issues": "(", "title": " ", "more": 1}
+        self.assertEqual(config.check(data), [
+            "nightly.side.more is not a key",
+            "nightly.side.jobs must be a non-empty list of job names",
+            "nightly.side.inputs must be a non-empty object of the "
+            "workflow's inputs, each a string",
+            "nightly.side.title must be a non-empty string",
+            "nightly.side.issues is not a pattern: missing ), unterminated "
+            "subpattern at position 0"])
         for hours in ([], [1, 2, 3], [0], [24, 24], [True]):
             with self.subTest(hours=hours):
                 data["nightly"] = {"workflow": "ci.yaml", "job": "j",

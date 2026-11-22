@@ -123,7 +123,9 @@ NIGHTLY = {"workflow": str, "job": str, "owners": dict, "labels": list,
            "tell_owner": str, "release_jobs": list, "fixes_named": bool,
            "defer_until": bool,
            # designs/0051.
-           "lead": str, "step_issues": bool, "announce": str}
+           "lead": str, "step_issues": bool, "announce": str,
+           # Side jobs run again alone once a red one's issue closes.
+           "side": dict}
 # A workflow is named by its file, which is read for its inputs.
 WORKFLOW_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
 MERGE = {"merger": str, "ci_workflow": str, "gate": list,
@@ -677,6 +679,32 @@ def _check_nightly(nightly, data, problems):
     if isinstance(nightly.get("announce"), str) \
             and not nightly["announce"].strip():
         problems.append("%s.announce must not be empty" % where)
+    side = nightly.get("side")
+    if isinstance(side, dict):
+        for key in side:
+            if key not in ("jobs", "inputs", "issues", "title"):
+                problems.append("%s.side.%s is not a key" % (where, key))
+        jobs = side.get("jobs")
+        if not (isinstance(jobs, list) and jobs and all(
+                isinstance(j, str) and j.strip() for j in jobs)):
+            problems.append("%s.side.jobs must be a non-empty list of job "
+                            "names" % where)
+        inputs = side.get("inputs")
+        if not (isinstance(inputs, dict) and inputs and all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in inputs.items())):
+            problems.append("%s.side.inputs must be a non-empty object of "
+                            "the workflow's inputs, each a string" % where)
+        for key in ("issues", "title"):
+            if not (isinstance(side.get(key), str) and side[key].strip()):
+                problems.append("%s.side.%s must be a non-empty string"
+                                % (where, key))
+        if isinstance(side.get("issues"), str):
+            try:
+                re.compile(side["issues"])
+            except re.error as error:
+                problems.append("%s.side.issues is not a pattern: %s"
+                                % (where, error))
     name = nightly.get("as")
     if name is None:
         name = data.get("merge", {}).get("merger", "Merger")
