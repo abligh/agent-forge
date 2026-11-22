@@ -95,6 +95,21 @@ relay resolves, the run that opens the nightly's issue sends one
 notice there, and the green run that closes it another; one the relay
 doesn't take is tried again each tick for an hour.
 
+**Side jobs run again alone** (off until `nightly.side` is set). Jobs
+beside `nightly.job`, such as ones on a runner of their own, that a
+workflow input can run without it. The newest completed run in which
+any of `side.jobs` ran is judged by them; one red is kept as
+`side.red`, and a later run in which they all ran green clears it.
+While one is red, a tick dispatches the workflow with `side.inputs`
+once an issue whose title matches `side.issues` closed as completed
+after that run started (its fix merged), when no run titled
+`side.title` (the workflow's `run-name` for those inputs) is queued or
+in progress. It comments on the issue it saw close. That happens once
+for each red run, and a dispatch counts as running as the nightly's
+does. Runs titled `side.title` are not the nightly's: they are left
+out when its newest run is picked, so one never hides a fix that
+merged before it.
+
 Everything is written as the App named by `nightly.as` (default
 `merge.merger`, else `Merger`), with a token minted as forge-app-token
 does; it needs Actions (to dispatch), Issues and Pull requests. State
@@ -1159,6 +1174,98 @@ class Tick:
                         " The steps that failed last go first: `%s`."
                         % first if first else "", defer))
 
+    def side(self, saved, runs):
+        """`nightly.side`: judge the newest completed run in which a
+        side job ran by those jobs, and while one is red dispatch them
+        alone once an issue of theirs closed after that run started."""
+        side = self.cfg.get("side")
+        if not side:
+            saved.pop("side", None)
+            return
+        kept = saved.setdefault("side", {})
+        done = [r for r in runs if r.get("status") == "completed"]
+        newest = done[0] if done else None
+        if newest is not None and newest["id"] != kept.get("judged"):
+            jobs = self.get("/repos/%s/actions/runs/%d/jobs?per_page=100"
+                            % (self.repo, newest["id"]),
+                            "the jobs of run %s" % newest["id"]).get(
+                                "jobs") or []
+            ran = [j for name in side["jobs"] for j in decisive_jobs(jobs, name)
+                   if j.get("conclusion") not in ("skipped", None)]
+            kept["judged"] = newest["id"]
+            if ran:
+                red = [j.get("name") for j in ran
+                       if j.get("conclusion") in RED]
+                if red:
+                    kept["red"] = {"run": newest["id"],
+                                   "sha": newest["head_sha"],
+                                   "started": newest.get("run_started_at")
+                                   or newest["created_at"], "jobs": red}
+                    self.out("SIDE RED run %s at %s: %s" % (
+                        newest["id"], newest["head_sha"][:10],
+                        ", ".join(red)))
+                elif all(j.get("conclusion") in GREEN for j in ran):
+                    if kept.pop("red", None):
+                        self.out("SIDE GREEN run %s at %s" % (
+                            newest["id"], newest["head_sha"][:10]))
+        red = kept.get("red")
+        if not red:
+            kept.pop("dispatched", None)
+            return
+        active = [r for r in runs if r.get("status") in ACTIVE
+                  and r.get("display_title") == side["title"]]
+        if active:
+            self.out("SIDE RUNNING run %s" % active[0]["id"])
+            return
+        sent = kept.get("dispatched") or {}
+        if sent.get("for") == red["run"]:
+            return
+        started = parse_time(red["started"])
+        closed = self.closed_issues(side["issues"], started)
+        if not closed:
+            return
+        issue = closed[0]
+        head = self.get("/repos/%s/commits/%s" % (
+            self.repo, urllib.parse.quote(self.main, safe="")),
+            "the head of %s" % self.main).get("sha") or ""
+        ok, _ = self.write("POST", "/repos/%s/actions/workflows/%s/"
+                           "dispatches" % (self.repo, urllib.parse.quote(
+                               self.workflow)),
+                           {"ref": self.main,
+                            "inputs": dict(side["inputs"])}, (200, 204))
+        if not ok:
+            return
+        why = "#%d closed at %s, after run %s, red in %s, started" % (
+            issue["number"], stamp(parse_time(issue["closed_at"])),
+            red["run"], ", ".join(red["jobs"]))
+        self.out("%sDISPATCH SIDE %s on %s at %s: %s" % (
+            self.would, self.workflow, self.main, head[:10], why))
+        kept["dispatched"] = {"at": iso(self.now), "sha": head,
+                              "for": red["run"], "issue": issue["number"]}
+        self.comment(issue["number"], "Ran %s alone again on `%s` at %s, "
+                     "to check this fix: run %s had them red." % (
+                         ", ".join("`%s`" % j for j in red["jobs"]),
+                         self.main, head[:10], red["run"]))
+
+    def closed_issues(self, pattern, after):
+        """Issues whose title matches `pattern`, closed as completed
+        after `after`, oldest close first."""
+        body = self.get("/repos/%s/issues?state=closed&sort=updated"
+                        "&direction=desc&per_page=100&since=%s" % (
+                            self.repo, urllib.parse.quote(iso(after))),
+                        "the issues closed since %s" % iso(after))
+        found = []
+        for item in body or ():
+            if "pull_request" in item or not item.get("closed_at"):
+                continue
+            if item.get("state_reason") not in (None, "completed"):
+                continue
+            if not re.search(pattern, item.get("title") or ""):
+                continue
+            if parse_time(item["closed_at"]) > after:
+                found.append(item)
+        return sorted(found, key=lambda i: i["closed_at"])
+
     def takes_first(self):
         """Whether the workflow's file declares the `first` input."""
         path = ".github/workflows/%s" % self.workflow
@@ -1309,7 +1416,11 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
                     logs or (lambda job: fetch_log(token, project.repo, job)),
                     send, send_room)
         try:
-            runs = tick.runs()
+            every = tick.runs()
+            title = (tick.cfg.get("side") or {}).get("title")
+            # A side run is not the nightly's (`nightly.side`).
+            runs = [r for r in every
+                    if title is None or r.get("display_title") != title]
             done = [r for r in runs if r.get("status") == "completed"]
             newest = done[0] if done else None
             if not saved.get("green"):
@@ -1351,6 +1462,7 @@ def main(argv=None, out=print, err=None, environ=None, now=None,
                 tick.escalate(saved)
             else:
                 saved["fixes"] = []
+            tick.side(saved, every)
         except (RuntimeError, KeyError, TypeError, ValueError) as error:
             err("%s: skipping this tick: %s" % (PROG, error))
             return 2

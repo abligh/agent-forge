@@ -142,6 +142,22 @@ branch when a fix merged after the newest run started, or when
 commit and why. A dispatch counts as running until a newer run is
 seen, or for 30 minutes (`DISPATCHED at …; its run isn't seen yet`).
 
+**Runs side jobs again alone** (off until `nightly.side` is set).
+Some jobs sit beside `nightly.job`, such as ones on a runner of their
+own, and a workflow input can run them without it. The newest completed
+run in which any of `side.jobs` ran is judged by them
+(`SIDE RED run …`, kept as `side.red`); a later run in which they all
+ran green clears it (`SIDE GREEN run …`), and a run in which they
+skipped changes nothing. While one is red, the tick dispatches the
+workflow with `side.inputs` once an issue whose title matches the
+pattern `side.issues` closed as completed after the red run started
+(`DISPATCH SIDE …`), and comments on that issue. It does so once a red
+run, and not while a run titled `side.title` is queued or in progress
+(`SIDE RUNNING run …`). The workflow must title those runs so, with a
+`run-name` keyed on the inputs: they are not the nightly's, and are
+left out when its newest run is picked, so a side run never hides a fix
+that merged before it.
+
 When the workflow file on the default branch declares a
 `workflow_dispatch` input named `first`, the dispatch passes the last
 red run's failed steps there, by name, comma-separated, so a retry can
