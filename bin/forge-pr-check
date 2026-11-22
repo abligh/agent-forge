@@ -660,7 +660,11 @@ step runs: each line is `<seconds since the step started> <1 or 2,
 its stream> <the line>`, so a step's parts can be timed afterwards
 without the step printing times of its own. The verdict's `logs`
 names the directory. Logs go once they are LOGS_AGE old, and a step's
-log stops at LOGS_MAX bytes before compression, saying so.
+log stops at LOGS_MAX bytes before compression, saying so. A red
+step's log is also copied to `<step>.red-<UTC time>.log.gz` beside it,
+and its result's `red_log` names the copy: a later run on the same
+commit writes `<step>.log.gz` afresh, so without the copy a flake's
+evidence went with its green rerun (agent-forge #553).
 
 **Each step gets `CHECK_CPUS`, its run's share of the CPUs**: those
 this process may run on, divided by the slots holding a run when this
@@ -3857,9 +3861,11 @@ def prediction_prs(merger_dir, sha, repo=None):
     return []
 
 
-def flake_text(sha, pr, prs, name, test, text, first):
+def flake_text(sha, pr, prs, name, test, text, first, red_log=None):
     """An issue's body (`first`) or a later comment, for step `name`
-    (and `test`) red on the prediction sha for pr and green again."""
+    (and `test`) red on the prediction sha for pr and green again. With
+    `red_log`, the red run's kept log (keep_red_log), where to find its
+    whole output."""
     text = ANSI_RE.sub("", text).rstrip()
     if len(text) > RED_COMMENT_CHARS:
         text = "[…]\n" + text[-RED_COMMENT_CHARS:]
@@ -3875,6 +3881,11 @@ def flake_text(sha, pr, prs, name, test, text, first):
             "#%s" % n for n in prs)]
     lines += ["", "**%s**, the end of its red output:" % name, "",
               mark, text, mark]
+    if red_log:
+        lines += ["", "Its whole red output is kept%s as `%s` in "
+                  "forge-pr-check's state directory, for %d days." % (
+                      on_host(), "/".join((LOGS_DIR, sha, red_log)),
+                      LOGS_AGE.days)]
     if first:
         lines += ["", "Each later flake of this step%s is commented here "
                   "while this issue is open." % (" and test" if test
@@ -3893,7 +3904,10 @@ def report_flake(state_dir, pr, sha, failed, write, prs=(), out=print):
     when = now_utc()
     with state_lock(state_dir):
         known = dict(load(state_dir).get("flake_issues") or {})
-    for name, text in failed:
+    for item in failed:
+        # (name, the red run's tail[, its kept log's name])
+        name, text = item[0], item[1]
+        red_log = item[2] if len(item) > 2 else None
         test = failing_test(text)
         key = "%s\t%s" % (name, test or "")
         number = known.get(key)
@@ -3904,7 +3918,8 @@ def report_flake(state_dir, pr, sha, failed, write, prs=(), out=print):
                     and issue.get("state") == "open":
                 got, _ = write("POST", "/repos/%s/issues/%d/comments"
                                % (REPO_SLUG, number), {"body": flake_text(
-                                   sha, pr, prs, name, test, text, False)})
+                                   sha, pr, prs, name, test, text, False,
+                                   red_log)})
                 if got != 201:
                     log(state_dir, "REPORT-FAILED #%s %s: commenting on "
                         "#%d: HTTP %s" % (pr, sha[:10], number, got),
@@ -3918,7 +3933,8 @@ def report_flake(state_dir, pr, sha, failed, write, prs=(), out=print):
             else test[:FLAKE_TITLE_TEST] + "…"
         body = {"title": "Flaky step: %s%s" % (
                     name, ", %s" % shown if shown else ""),
-                "body": flake_text(sha, pr, prs, name, test, text, True)}
+                "body": flake_text(sha, pr, prs, name, test, text, True,
+                                   red_log)}
         if FLAKE_ISSUE["labels"]:
             body["labels"] = list(FLAKE_ISSUE["labels"])
         got, made = write("POST", "/repos/%s/issues" % REPO_SLUG, body)
@@ -6031,6 +6047,10 @@ def check(wt, env, run=sh, steps=None, prefix=(), wrap=None, kept=None,
             result["results_bytes"], dropped = keep_results(folder)
             if dropped is not None:
                 result["results_dropped"] = dropped
+        if got.returncode != 0 and logs is not None and stream is not None:
+            kept_red = keep_red_log(logs, name)
+            if kept_red is not None:
+                result["red_log"] = kept_red
         return result
 
     if side_by_side is None:
@@ -6539,6 +6559,23 @@ def prune_results(state_dir, state, when):
             continue
         if name not in state["results"] and old:
             shutil.rmtree(path, ignore_errors=True)
+
+
+def keep_red_log(logs, name, now=None):
+    """Copies red step `name`'s log in `logs` to
+    `<step>.red-<UTC time>.log.gz` beside it, so that a later run on the
+    same commit, which writes `<step>.log.gz` afresh, keeps it (agent-forge
+    #553). Returns the copy's name, or None when there was no log or it
+    couldn't be copied."""
+    source = os.path.join(logs, results_name(name) + ".log.gz")
+    when = now or datetime.datetime.now(datetime.timezone.utc)
+    copy = "%s.red-%s.log.gz" % (results_name(name),
+                                 when.strftime("%Y%m%dT%H%M%SZ"))
+    try:
+        shutil.copyfile(source, os.path.join(logs, copy))
+    except OSError:
+        return None
+    return copy
 
 
 def prune_logs(state_dir, when):
@@ -8095,7 +8132,8 @@ def run_worker(repo, state_dir, sha, pr, run=sh, out=print, clock=now_utc,
                 break
             named = [s[0] for s in subset]
             tried += named
-            first_red += [(r["name"], r.get("tail", "")) for r in results
+            first_red += [(r["name"], r.get("tail", ""), r.get("red_log"))
+                          for r in results
                           if r["rc"] != 0 and r["name"] in named]
             again_ok, again = check(wt, env, run, steps=subset, **how)
             for r in again:

@@ -5,6 +5,7 @@ runs real programs, since what is under test is how it reads them."""
 import datetime
 import gzip
 import os
+import re
 import sys
 import signal
 import tempfile
@@ -200,6 +201,53 @@ class CheckLogs(unittest.TestCase):
                                  + ".log.gz") for r in results])
         self.assertEqual(sorted(os.listdir(self.logs)), sorted(
             pc.results_name(r["name"]) + ".log.gz" for r in results))
+
+    def stream_rc(self, codes):
+        """A stream writing each step's log, each step ending with
+        `codes[name]` (0 by default)."""
+        def stream(args, cwd=None, env=None, timeout=None, log=None):
+            with gzip.open(log, "wt") as handle:
+                handle.write("0.000 1 the output of %s\n" % args[-1])
+            step = os.path.basename(log)[:-len(".log.gz")]
+            return pc.subprocess.CompletedProcess(
+                args, codes.get(step, 0), "", "")
+        return stream
+
+    def test_a_red_step_s_log_is_kept_beside_it_and_named(self):
+        # agent-forge #553: a green rerun on the same commit rewrote
+        # <step>.log.gz and the flake's whole output went with it.
+        first = pc.results_name(pc.applicable(self.wt)[0][0])
+        ok, results = pc.check(self.wt, {}, None, logs=self.logs,
+                               stream=self.stream_rc({first: 1}))
+        self.assertFalse(ok)
+        red = [r for r in results if r["rc"] != 0]
+        self.assertEqual(len(red), 1)
+        kept = red[0]["red_log"]
+        self.assertRegex(kept, r"^%s\.red-\d{8}T\d{6}Z\.log\.gz$"
+                         % re.escape(first))
+        self.assertEqual(lines_of(os.path.join(self.logs, kept)),
+                         lines_of(os.path.join(self.logs, first + ".log.gz")))
+        self.assertTrue(all("red_log" not in r for r in results
+                            if r["rc"] == 0))
+        # The green rerun writes the step's log afresh; the copy stays.
+        ok, _ = pc.check(self.wt, {}, None, logs=self.logs,
+                         stream=self.stream_rc({}))
+        self.assertTrue(ok)
+        self.assertTrue(os.path.exists(os.path.join(self.logs, kept)))
+
+    def test_a_red_step_without_a_log_keeps_nothing(self):
+        os.makedirs(self.logs)
+        self.assertIsNone(pc.keep_red_log(self.logs, "test"))
+        self.assertEqual(os.listdir(self.logs), [])
+
+    def test_the_copy_is_named_by_the_utc_time(self):
+        os.makedirs(self.logs)
+        with gzip.open(os.path.join(self.logs, "test.log.gz"), "wt") as h:
+            h.write("0.000 2 boom\n")
+        self.assertEqual(pc.keep_red_log(self.logs, "test", now=T0),
+                         "test.red-20261019T120000Z.log.gz")
+        self.assertEqual(lines_of(os.path.join(
+            self.logs, "test.red-20261019T120000Z.log.gz")), ["0.000 2 boom"])
 
     def test_without_a_stream_nothing_is_logged(self):
         ok, _ = pc.check(self.wt, {}, lambda args, **kw:

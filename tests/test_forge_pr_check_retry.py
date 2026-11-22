@@ -284,9 +284,11 @@ class FlakeHook(base.StateCase):
         self.assertEqual(code, 0)
         (sha, pr, failed), = got
         self.assertEqual((sha, pr), (SHA_P, 2))
-        (name, tail), = failed
+        (name, tail, red_log), = failed
         self.assertEqual(name, "test")
         self.assertIn("it broke", tail)
+        # No step log here (no stream), so no kept copy to name.
+        self.assertIsNone(red_log)
 
     def test_a_red_again_is_not_a_flake(self):
         self.assertEqual(self.flagged(self.flaky(2))[1], [])
@@ -347,6 +349,25 @@ class ReportFlake(unittest.TestCase):
                          {"test\ta::b": 42})
         self.assertIn("FLAKE-FILED #42: test (a::b) flaked on #7",
                       self.lines[-1])
+
+    def test_the_issue_names_the_kept_red_log(self):
+        # agent-forge #553: the rerun rewrote the step's log, so the
+        # issue says where the red run's whole output is kept.
+        write = Writer()
+        pc.report_flake(self.dir, 7, SHA_P, [
+            ("test", "test a::b ... FAILED\n",
+             "test.red-20261122T023849Z.log.gz")], write, [7],
+            self.lines.append)
+        (_, _, body), = write.writes
+        self.assertIn("`logs/%s/test.red-20261122T023849Z.log.gz`" % SHA_P,
+                      body["body"])
+        self.assertIn("for %d days" % pc.LOGS_AGE.days, body["body"])
+
+    def test_without_a_kept_log_the_issue_names_none(self):
+        write = Writer()
+        self.report(write)
+        (_, _, body), = write.writes
+        self.assertNotIn("whole red output", body["body"])
 
     def test_a_repeat_comments_on_the_open_issue(self):
         self.report(Writer())
