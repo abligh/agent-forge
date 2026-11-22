@@ -1407,8 +1407,9 @@ class TrainMerge(TrainSetup):
                          m.STATUS_CONTEXT)
         self.assertEqual(self.github.writes[2][2],
                          {"sha": top, "merge_method": "merge",
-                          "commit_title": "Merge train #5..#6 (#900)"})
-        self.assertIn("* #5 at %s" % self.approved[:10],
+                          "commit_title": "Merge train #5..#6 (#900)",
+                          "commit_message": "#5: five\n#6: six"})
+        self.assertIn("* #5 at %s: five" % self.approved[:10],
                       self.github.writes[1][2]["body"])
 
     def test_a_member_github_does_not_mark_merged_goes_on_its_own(self):

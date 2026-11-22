@@ -7617,6 +7617,18 @@ def owner_review_required(github, state_dir):
                           {}).get("required"))
 
 
+def train_message(entries, prs):
+    """The body of a train's merge commit on the default branch: one
+    line per member, "#N: its title", in the train's order. Without it
+    GitHub fills the body from the train's own pull request title, so
+    the commit on the default branch's first-parent line would name no
+    member at all; each member's own "Merge #N: title" commit sits one
+    parent down, where GitHub's commit page and `git log
+    --first-parent` don't show it."""
+    return "\n".join("#%d: %s" % (e["pr"], prs[e["pr"]].get("title") or "")
+                     for e in entries)
+
+
 def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
                 github, run=sh, sleep=time.sleep, out=print, note=None,
                 main=None, tested_tree=None):
@@ -7725,7 +7737,8 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
                 return fail("could not retarget #%d: %s" % (number, why))
     body = ("The Merger's train %s, tested green as one tree. Each "
             "member's head is merged here as it was approved:\n\n%s\n\n%s"
-            % (span, "\n".join("* #%d at %s" % (e["pr"], e["head"][:10])
+            % (span, "\n".join("* #%d at %s: %s" % (
+                e["pr"], e["head"][:10], prs[e["pr"]].get("title") or "")
                                for e in entries), SIGNATURE))
     number, why = github.create("repos/%s/pulls" % REPO_SLUG,
                                 title="Merge train %s" % span, head=branch,
@@ -7741,7 +7754,8 @@ def train_merge(repo, state_dir, entries, queue, main_tip, check_state,
                                % (REPO_SLUG, number), sha=top,
                                merge_method="merge",
                                commit_title="Merge train %s (#%d)"
-                               % (span, number))
+                               % (span, number),
+                               commit_message=train_message(entries, prs))
         if ok or TRAIN_MERGE_RETRY_TEXT not in (why or "").lower() \
                 or attempt == TRAIN_MERGE_RETRIES:
             break
