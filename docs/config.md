@@ -985,10 +985,11 @@ A list of label names. A pull request carrying one is held, `labelled
 `"body"` (the default) reads `Blocked-by:` lines from the pull
 request's body only. With `"everywhere"`, the body, its comments and
 its reviews (`Not-a-review` comments included) are read, and the
-newest of them with a `Blocked-by:` line decides: every strict
-`Blocked-by: #N` line in it counts, `Blocked-by: none` (or
-`(none)`) clears, and a line that starts `Blocked-by:` but doesn't
-parse holds the pull
+newest of them with a `Blocked-by:` line decides. Either way, every
+strict line in that text counts: `Blocked-by: #N`, or several numbers
+on one line, `Blocked-by: #N, #M` (commas, semicolons, `and` or
+spaces between them). `Blocked-by: none` (or `(none)`) clears, and a
+line that starts `Blocked-by:` but doesn't parse holds the pull
 request, `unparsed Blocked-by line: ...`, since it was meant as a hold.
 
 ### `merge.said_since`

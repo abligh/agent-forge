@@ -1652,8 +1652,13 @@ def configure(project):
     STALL_RUN_FACTOR = merge.get("stall_run_factor", 1.5)
 
 NOT_A_REVIEW_RE = re.compile(r"^Not-a-review\b", re.MULTILINE | re.IGNORECASE)
-BLOCKED_RE = re.compile(r"^\**Blocked-by:\**\s*#(\d+)\s*\**$",
-                        re.MULTILINE | re.IGNORECASE)
+# One or more numbers on a line: `Blocked-by: #N` or `Blocked-by: #N, #M`
+# (agent-forge #556: the second form was skipped, so the pull request
+# merged before #M).
+BLOCKED_RE = re.compile(
+    r"^\**Blocked-by:\**\s*(#\d+(?:\s*(?:,|;|&|\band\b)?\s*#\d+)*)\s*\.?\**$",
+    re.MULTILINE | re.IGNORECASE)
+BLOCKED_NUMBER_RE = re.compile(r"#(\d+)")
 BLOCKED_LINE_RE = re.compile(r"^\**Blocked-by:", re.IGNORECASE)
 UNBLOCK_RE = re.compile(
     r"^\**Blocked-by:\**\s*\(?(none|nothing)\)?\s*\.?\**$",
@@ -1835,6 +1840,22 @@ def texts_of(pr):
     return sorted(texts, key=lambda t: t[0])
 
 
+def blocked_numbers(text):
+    """The numbers every strict `Blocked-by:` line in `text` names."""
+    return {int(n) for m in BLOCKED_RE.finditer(text)
+            for n in BLOCKED_NUMBER_RE.findall(m.group(1))}
+
+
+def unparsed_blocker(text):
+    """The first line of `text` that starts `Blocked-by:` but is neither
+    strict nor `none`, stripped, or None."""
+    for line in text.splitlines():
+        if BLOCKED_LINE_RE.match(line) and not (
+                BLOCKED_RE.match(line) or UNBLOCK_RE.match(line)):
+            return line.strip()
+    return None
+
+
 def blocker_state(pr):
     """(numbers, unparsed) for `pr`'s `Blocked-by:` lines. With
     `merge.blocked_by: "everywhere"`, the newest text with a
@@ -1843,24 +1864,20 @@ def blocker_state(pr):
     any earlier numbers, and `Blocked-by: none` clears them. `unparsed`
     is the first line in that text that starts `Blocked-by:` but is
     neither strict nor `none`, or None: it was meant as a hold, so it
-    holds. Otherwise only the body's strict lines count, and nothing is
-    unparsed."""
+    holds. Otherwise only the body's lines count, and an unparsed one in
+    it holds the same way (agent-forge #556: it was skipped)."""
     if BLOCKED_BY != "everywhere":
-        return ({int(m.group(1))
-                 for m in BLOCKED_RE.finditer(markers_of(pr.get("body")))},
-                None)
+        body = markers_of(pr.get("body"))
+        return blocked_numbers(body), unparsed_blocker(body)
     named, unparsed = set(), None
     for _, text in texts_of(pr):
         text = markers_of(text)
-        lines = [l for l in text.splitlines() if BLOCKED_LINE_RE.match(l)]
-        if not lines:
+        if not any(BLOCKED_LINE_RE.match(l) for l in text.splitlines()):
             continue
-        bad = [l for l in lines
-               if not (BLOCKED_RE.match(l) or UNBLOCK_RE.match(l))]
-        unparsed = bad[0].strip() if bad else None
+        unparsed = unparsed_blocker(text)
         if UNBLOCK_RE.search(text):
             named = set()
-        found = {int(m.group(1)) for m in BLOCKED_RE.finditer(text)}
+        found = blocked_numbers(text)
         if found:
             named = found
     return named, unparsed
