@@ -195,7 +195,12 @@ batch can find a head red that was green on its own, and a flake there
 is lifted by a green run since. That run is forced: it is neither
 matched nor covered and reuses no step (`reruns.<sha>.force`), since
 its tree and steps are green here already and would only be posted
-green again; it says `(run again after green)`. On a head given up on (failures
+green again; it says `(run again after green)`. Under `checks.quick`,
+the head of one of the Merger's red suspects (its `red-suspects.json`)
+runs again on the full tier, forced, in a full slot and never the
+lane or a quick slot (`reruns.<sha>.full`; designs/0044, second
+amendment): only a full green releases a suspect, and its verdict
+answers the quick context too. On a head given up on (failures
 to prepare it, or host faults: neither its own) the label clears those
 counts, so the head is tried again in its old place; the tick logs
 `RERUN ... given up after ...`, posts pending and takes the label off.
@@ -2370,7 +2375,7 @@ def reds_elsewhere(sha, token, run=sh):
 
 
 def take_reruns(state, labelled, labellers, when, state_dir, out=print,
-                others=None):
+                others=None, suspects=frozenset()):
     """labels.rerun, under the state lock, before the heads are queued:
     move each labelled red head's verdict into `reruns`, so note_heads
     queues it as if new, and say what is still to do on GitHub, as
@@ -2393,7 +2398,12 @@ def take_reruns(state, labelled, labellers, when, state_dir, out=print,
     nothing of its own to run again (green, pending, answered) is left
     alone, label and all. An instance never takes the label off a head
     with nothing of its own to run again: the check itself does. A head
-    whose other contexts GitHub couldn't read (None) waits a tick."""
+    whose other contexts GitHub couldn't read (None) waits a tick.
+
+    `suspects`, the heads the Merger keeps out as red on their own
+    (merger_suspect_heads): under checks.quick, such a head runs again
+    on the full tier, forced (`full_rerun`), since only a full green
+    releases it (designs/0044, second amendment)."""
     todo = []
     reruns = state.setdefault("reruns", {})
     others = others or {}
@@ -2451,6 +2461,11 @@ def take_reruns(state, labelled, labellers, when, state_dir, out=print,
             # Its tree is green here, and its steps' verdicts are too:
             # a match or a reuse would only post that green again.
             reruns[sha]["force"] = True
+        full = QUICK_CONTEXT is not None and sha in suspects
+        if full:
+            # A quick green releases no suspect: its run is a full one,
+            # forced, so no quick verdict or reuse stands for it.
+            reruns[sha]["force"] = reruns[sha]["full"] = True
         # A fresh place at the back: queued as if new.
         state["waiting"].pop(sha, None)
         if verdict.get("main"):
@@ -2458,8 +2473,10 @@ def take_reruns(state, labelled, labellers, when, state_dir, out=print,
             # head, marked so queue_main keeps it.
             state["waiting"][sha] = {"pr": 0, "since": iso(when),
                                      "main": True, "rerun": True}
-        log(state_dir, "RERUN #%d %s: was %s; queued by %s"
-            % (pr, sha[:10], verdict_word(verdict), login), when, out)
+        log(state_dir, "RERUN #%d %s: was %s; queued by %s%s"
+            % (pr, sha[:10], verdict_word(verdict), login,
+               "; on the full tier, a red suspect" if full else ""),
+            when, out)
         todo.append((pr, sha, "rerun" if kind == "red" else "green", login))
     if not reruns:
         del state["reruns"]
@@ -2512,6 +2529,29 @@ def forced(state, sha):
     reuses a step, so the run builds and runs each chosen step."""
     return sha not in state["results"] and (
         state.get("reruns", {}).get(sha) or {}).get("force") is True
+
+
+def full_rerun(state, sha):
+    """Whether head sha waits for a full-tier run under checks.quick: a
+    red suspect's labels.rerun (designs/0044, second amendment)."""
+    return sha not in state["results"] and (
+        state.get("reruns", {}).get(sha) or {}).get("full") is True
+
+
+def merger_suspect_heads(merger_dir):
+    """The heads in the Merger's red-suspects.json (designs/0044 rule
+    4), or an empty set without a directory or a readable file."""
+    if not merger_dir:
+        return frozenset()
+    try:
+        with open(os.path.join(merger_dir, "red-suspects.json")) as handle:
+            saved = json.load(handle)
+    except (OSError, ValueError):
+        return frozenset()
+    if not isinstance(saved, dict):
+        return frozenset()
+    return frozenset(v["head"] for v in saved.values()
+                     if isinstance(v, dict) and isinstance(v.get("head"), str))
 
 
 def mark_rerun(state, sha, record):
@@ -4669,12 +4709,15 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
 
 def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
          post=None, slots=None, checkout=None, merger_dir=None,
-         stop=stop_worker):
+         stop=stop_worker, suspects_dir=None):
     """Queue the open heads and start the next one in a free slot. With
     `merger_dir` (only with MERGER_FIRST), the Merger's pull request goes
     first; with TEST_AHEAD too, its predictions come next (see the
     module docstring). With FAST_LANE_S and a checkout, the fast lane
-    is one more slot, which starts the oldest cheap head."""
+    is one more slot, which starts the oldest cheap head. With
+    `suspects_dir`, the Merger's state directory, a labels.rerun run of
+    a red suspect's head runs on the full tier (designs/0044, second
+    amendment)."""
     when = when or now_utc()
     why = []
     heads = open_heads(token, run, why)
@@ -4746,7 +4789,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             and red.get("issue") else ())
         if labelled:
             todo = take_reruns(state, labelled, labellers, when, state_dir,
-                               out, others)
+                               out, others,
+                               suspects=merger_suspect_heads(suspects_dir))
         # One left out after it was queued here has a pending status
         # that would otherwise never end.
         unrun = [(pr, sha) for pr, sha in dropped if sha in state["waiting"]]
@@ -4989,8 +5033,12 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                                    and w.get("lane_base") == head_of_main[0]
                                    for w in state["waiting"].values()
                                    if not w.get("main"))
+            # A red suspect's full rerun runs in a full slot, never the
+            # lane or a quick slot (designs/0044, second amendment).
+            fulls = {s for s in state["waiting"] if full_rerun(state, s)}
             if lane_free:
-                fast = lane_head(state, cheap, set(busy) | set(twins), when)
+                fast = lane_head(state, cheap,
+                                 set(busy) | set(twins) | fulls, when)
                 if fast is not None:
                     state["waiting"][fast[0]]["started"] = iso(when)
                     save(state_dir, state)
@@ -5002,7 +5050,7 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
                 mains = {s for s, w in state["waiting"].items()
                          if w.get("main")}
                 quick_pick = next_head(
-                    state, taken | set(held) | slot_queued | mains,
+                    state, taken | set(held) | slot_queued | mains | fulls,
                     first_pr, when, cheap, urgent, blocked, predicted_prs,
                     unblocks, slotted)
                 if quick_pick is not None:
@@ -5187,13 +5235,14 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
             free.pop(0)
             own_running += 1
             continue
+        tier = {} if sha in fulls else as_quick
         if checkout:
             spawn(state_dir, sha, pr, post is not None, free[0], checkout,
-                  **as_quick)
+                  **tier)
         else:
-            spawn(state_dir, sha, pr, post is not None, free[0], **as_quick)
+            spawn(state_dir, sha, pr, post is not None, free[0], **tier)
         out("STARTED%s #%d %s%s; %d waiting%s"
-            % ("-QUICK" if as_quick else "", pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
+            % ("-QUICK" if tier else "", pr, sha[:10], "" if free[0] == 1 else " in slot %d" % free[0],
                len(queued - taken) - 1,
                ", first: the Merger waits on it" if pr == first_pr else
                ", first: it is approved"
@@ -8601,9 +8650,13 @@ def main(argv=None, run=sh, spawn=spawn_worker, out=print, environ=None):
     if MERGER_FIRST:
         merger_dir = args.merger_dir or locks.state_dir(project.name,
                                                         "merger", environ)
+    suspects_dir = None
+    if QUICK_CONTEXT is not None and RERUN_LABEL:
+        suspects_dir = args.merger_dir or locks.state_dir(
+            project.name, "merger", environ)
     done = tick(state_dir, token, run, spawn, out, post=post,
                 slots=slots_from_env(environ), checkout=repo,
-                merger_dir=merger_dir)
+                merger_dir=merger_dir, suspects_dir=suspects_dir)
     if STEP_ALERT is not None and args.post:
         alert_steps(state_dir, repo, make_writer(project, out), out, run)
     return done

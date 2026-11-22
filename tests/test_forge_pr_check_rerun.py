@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import socket
+import tempfile
 import unittest
 from unittest import mock
 
@@ -334,6 +335,110 @@ class RerunTick(base.StateCase):
         self.tick()
         self.assertNotIn("faults", self.state()["waiting"][SHA_A])
         self.assertEqual(self.calls(is_comment), [])
+
+
+class RerunSuspectFullTier(base.StateCase):
+    """designs/0044, second amendment (agent-forge #542): under
+    checks.quick, labels.rerun on a red suspect's head runs it again on
+    the full tier, forced, outside the lane and the quick slots; any
+    other labelled head runs quick as before."""
+
+    def setUp(self):
+        super().setUp()
+        data = example()
+        data.setdefault("labels", {})["rerun"] = RERUN
+        data["checks"]["quick"] = {}
+        pc.configure(config.Project(data, None))
+        self.addCleanup(pc.configure, config.Project(example(), None))
+        self.posts = []
+        self.merger = os.path.join(self.state_dir, "merger")
+        os.makedirs(self.merger)
+
+    def suspect(self, sha=SHA_A, pr=7):
+        with open(os.path.join(self.merger, "red-suspects.json"), "w") as h:
+            json.dump({str(pr): {"head": sha, "reason": "red on its own",
+                                 "at": AT, "main": "c" * 40}}, h)
+
+    def tick(self, labels=(RERUN,), events=None, unlabel=None,
+             posting=True, sha=SHA_A):
+        text = "7\t%s\t%s\tfalse\t%s\t%s\n" % (sha, REPO, AUTHOR,
+                                              json.dumps(list(labels)))
+        events = events or done([], 0, "%s\t%s\n" % (LABELLER, AT_2))
+        self.run = FakeRun((is_pulls, done([], 0, text)),
+                           (is_events, events),
+                           (is_unlabel, unlabel or done([], 0, "")),
+                           (is_comment, done([], 0, "{}")))
+        self.spawned = []
+        post = (lambda *a, **k: self.posts.append(a) or True) \
+            if posting else None
+        return pc.tick(self.state_dir, "tok", self.run,
+                       lambda *a, **k: self.spawned.append((a[1:5], k)),
+                       self.lines.append, when=T0, post=post, slots=1,
+                       suspects_dir=self.merger)
+
+    def test_a_suspect_s_rerun_runs_full_and_forced(self):
+        self.suspect()
+        self.write_state({"results": {SHA_A: dict(green(), tier="quick")}})
+        self.assertEqual(self.tick(), 0)
+        state = self.state()
+        self.assertTrue(state["reruns"][SHA_A]["full"])
+        self.assertTrue(pc.forced(state, SHA_A))
+        self.assertTrue(pc.full_rerun(state, SHA_A))
+        # A full slot, without --quick, though the quick slot was free.
+        self.assertEqual(self.spawned, [((SHA_A, 7, True, 1), {})])
+        self.assertIn("STARTED #7 aaaaaaaaaa; 0 waiting", self.lines)
+        logged = pathlib.Path(self.state_dir, "verdicts.log").read_text()
+        self.assertIn("RERUN #7 aaaaaaaaaa: was green; queued by %s; on the "
+                      "full tier, a red suspect" % LABELLER, logged)
+
+    def test_a_red_suspect_head_runs_full_too(self):
+        self.suspect()
+        self.write_state({"results": {SHA_A: dict(red(), tier="quick")}})
+        self.tick()
+        self.assertTrue(pc.full_rerun(self.state(), SHA_A))
+        self.assertEqual(self.spawned, [((SHA_A, 7, True, 1), {})])
+
+    def test_any_other_labelled_head_runs_quick(self):
+        self.suspect(sha=SHA_B, pr=8)
+        self.write_state({"results": {SHA_A: dict(red(), tier="quick")}})
+        self.tick()
+        self.assertNotIn("full", self.state()["reruns"][SHA_A])
+        self.assertEqual([k for _, k in self.spawned], [{"quick": True}])
+
+    def test_without_checks_quick_nothing_changes(self):
+        configured()
+        self.suspect()
+        self.write_state({"results": {SHA_A: red()}})
+        self.tick()
+        self.assertNotIn("full", self.state()["reruns"][SHA_A])
+        self.assertEqual(self.spawned, [((SHA_A, 7, True, 1), {})])
+
+
+class MergerSuspectHeads(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = self._tmp.name
+
+    def write(self, text):
+        with open(os.path.join(self.dir, "red-suspects.json"), "w") as h:
+            h.write(text)
+
+    def test_the_heads_it_names(self):
+        self.write(json.dumps({"7": {"head": SHA_A, "reason": "r"},
+                               "8": {"head": SHA_B}, "9": "junk",
+                               "10": {"head": 5}}))
+        self.assertEqual(pc.merger_suspect_heads(self.dir),
+                         frozenset({SHA_A, SHA_B}))
+
+    def test_nothing_without_a_directory_or_a_readable_file(self):
+        self.assertEqual(pc.merger_suspect_heads(None), frozenset())
+        self.assertEqual(pc.merger_suspect_heads(self.dir), frozenset())
+        self.write("{not json")
+        self.assertEqual(pc.merger_suspect_heads(self.dir), frozenset())
+        self.write("[]")
+        self.assertEqual(pc.merger_suspect_heads(self.dir), frozenset())
 
 
 class RerunVerdict(base.StateCase):
