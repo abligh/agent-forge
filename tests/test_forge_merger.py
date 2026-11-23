@@ -12200,6 +12200,14 @@ class InstanceGate(RepoCase):
                                     self.approved: []}),
                          "waiting for vm/mac (pending)")
 
+    def test_a_pending_status_says_why_in_the_hold(self):
+        # designs/0064: an instance holding an unreviewed head says so.
+        self.assertEqual(self.wait({
+            self.head: self.mac("pending", "runs once a reviewer approves "
+                                "or arms it"), self.approved: []}),
+            "waiting for vm/mac (pending: runs once a reviewer approves or "
+            "arms it)")
+
     def test_red_holds_it(self):
         self.assertEqual(
             self.wait({self.head: self.mac("failure", "red(test)")}),

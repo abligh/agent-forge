@@ -37,6 +37,19 @@ class ForgeConfig(unittest.TestCase):
         self.assertIn("project widget, example/widget, 5 agent(s), "
                       "2 reviewer(s)", self.out[0])
 
+    def test_check_warns_and_still_passes(self):
+        data = example()
+        data["checks"]["instances"] = {"mac": {
+            "context": "ci/mac", "steps": [{"name": "t", "run": ["true"]}],
+            "reviewed_heads": True}}
+        with open(self.path, "w") as handle:
+            json.dump(data, handle)
+        self.assertEqual(self.run_tool("check"), 0)
+        self.assertEqual(self.err, [
+            "forge-config: warning: checks.instances.mac.reviewed_heads "
+            "without labels.armed: only an approval releases a head, so "
+            "its run starts later"])
+
     def test_check_lists_every_problem(self):
         data = example()
         del data["owner"]

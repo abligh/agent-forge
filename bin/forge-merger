@@ -5318,7 +5318,8 @@ def instance_wait(repo, pr, main_tip, github, cache, run=sh):
     default branch; one whose paths git can't list applies). The
     pull request waits, held, while an instance that applies has no
     final verdict (`instance_verdict`), and stays held while it is red:
-    the author's push, or the instance's rerun, moves it on. It is held
+    the author's push, or the instance's rerun, moves it on. A pending
+    status's description is named in the hold. It is held
     rather than waited on at the front so the queue moves past it: an
     instance's run can take an hour. Seen on 2026-11-05: a pull request
     merged with a second platform's run still pending, and broke that
@@ -5329,7 +5330,11 @@ def instance_wait(repo, pr, main_tip, github, cache, run=sh):
         if state == "success":
             continue
         if state in (None, "pending"):
-            return "waiting for %s (%s)" % (context, state or "absent")
+            # A pending status says why, such as a head an instance with
+            # reviewed_heads holds until review (designs/0064).
+            return "waiting for %s (%s)" % (
+                context, "pending: " + said if state == "pending" and said
+                else state or "absent")
         return "%s is %s at %s%s" % (context, state, sha[:10],
                                      ": " + said if said else "")
     return None

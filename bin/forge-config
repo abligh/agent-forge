@@ -59,6 +59,8 @@ def main(argv=None, out=print, err=None):
         out("forge-config: %s is good: project %s, %s, %d agent(s), "
             "%d reviewer(s)" % (path, project.name, project.repo,
                                 len(project.agents), len(project.reviewers())))
+        for warning in config.warnings(project.data):
+            err("forge-config: warning: %s" % warning)
         return 0
     if args.command == "get":
         try:
