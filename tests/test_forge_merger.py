@@ -8480,8 +8480,12 @@ class Stacks(RepoCase):
             review(REVIEWER, oid=self.upper)] if reviews is None else reviews)
 
     def tick(self, prs, live=True, minutes=0, check_state=None,
-             conclusions=("success",)):
-        github = FakeGitHub(answers(conclusions, prs=prs))
+             conclusions=("success",), statuses=None):
+        table = answers(conclusions, prs=prs)
+        # {sha: [state, ...]}: that commit's own statuses.
+        for sha, states in (statuses or {}).items():
+            table[SLUG + "/commits/" + sha] = [status(s) for s in states]
+        github = FakeGitHub(table)
         self.github = github
         lines = []
         start = datetime.datetime(2026, 10, 7, 12, 0, 0,
@@ -9399,6 +9403,108 @@ class Stacks(RepoCase):
         self.assertEqual(record["decisions"][0]["action"], "RESTACK")
         self.assertIn("STACK #6: would have merged #5's head %s into it"
                       % self.lower[:12], lines)
+
+    # designs/0025, amendment of 2026-11-23: a layer held on a base that
+    # can't merge first is said so, once, on both pull requests.
+
+    def deadlock_tick(self, base_states=("failure",), layer=None,
+                      minutes=0, live=True, check_state=None):
+        """#6 is on main on GitHub and holds #5's head; #5's head is
+        `base_states` (newest first), #6's green."""
+        return self.tick([self.bottom(), layer or self.layer("main")],
+                         live=live, minutes=minutes, check_state=check_state,
+                         statuses={self.lower: list(base_states),
+                                   self.upper: ["success"]})
+
+    def deadlock_notes(self):
+        return [w for w in self.github.writes
+                if "can't:" in w[2].get("body", "")]
+
+    def test_a_layer_on_a_red_base_it_is_green_on_is_told_once(self):
+        record, lines = self.deadlock_tick()
+        self.assertEqual(record["held"]["6"], "stacked on #5")
+        self.assertEqual(
+            [(d["kind"], d["pr"], d["after"], d["context"], d["state"],
+              d["result"]) for d in record["stale"]
+             if d.get("kind") == "deadlock"],
+            [("deadlock", 6, 5, "vm/build-and-test", "failure", "done")])
+        told = sorted(w[1] for w in self.deadlock_notes())
+        self.assertEqual(told, [SLUG + "/issues/5/comments",
+                                SLUG + "/issues/6/comments"])
+        body = self.deadlock_notes()[0][2]["body"]
+        self.assertTrue(body.startswith("Not-a-review"))
+        self.assertIn("vm/build-and-test is failure", body)
+        self.assertIn("Close #5 if #6 replaces it", body)
+        self.assertTrue(any(l.startswith(
+            "STACK-DEADLOCK #6 on #5: #5 is failure on vm/build-and-test "
+            "at %s" % self.lower[:12]) for l in lines), lines)
+        # Not again on the next tick.
+        record, lines = self.deadlock_tick(minutes=1)
+        self.assertFalse([d for d in record.get("stale") or ()
+                          if d.get("kind") == "deadlock"])
+        self.assertFalse(self.deadlock_notes())
+        self.assertFalse([l for l in lines if "STACK-DEADLOCK" in l])
+
+    def test_a_new_layer_head_is_told_again(self):
+        self.deadlock_tick()
+        self.repo.branch("upper", "upper")
+        head = self.repo.commit("u2.txt", "more\n", "more")
+        self.repo.publish_pr(6, head)
+        layer = self.layer("main", head=head,
+                           reviews=[review(REVIEWER, oid=head)])
+        record, _ = self.tick([self.bottom(), layer], minutes=1, statuses={
+            self.lower: ["failure"], head: ["success"]})
+        self.assertEqual([d["head"] for d in record["stale"]
+                          if d.get("kind") == "deadlock"], [head])
+        self.assertEqual(len(self.deadlock_notes()), 2)
+
+    def test_a_pending_base_is_not_a_deadlock(self):
+        # Pending, absent, or pending again after a red: a run may pass.
+        for states in (["pending"], [], ["pending", "failure"]):
+            record, lines = self.deadlock_tick(base_states=states)
+            self.assertFalse([d for d in record.get("stale") or ()
+                              if d.get("kind") == "deadlock"])
+            self.assertFalse(self.deadlock_notes())
+            self.assertFalse([l for l in lines if "STACK-DEADLOCK" in l])
+
+    def test_a_red_layer_or_an_unapproved_one_is_not_told(self):
+        record, _ = self.tick([self.bottom(), self.layer("main")],
+                              statuses={self.lower: ["failure"],
+                                        self.upper: ["failure"]})
+        self.assertFalse(self.deadlock_notes())
+        record, _ = self.deadlock_tick(layer=self.layer("main", reviews=[]))
+        self.assertFalse(self.deadlock_notes())
+
+    def test_not_while_main_is_red(self):
+        self.deadlock_tick(check_state={"main_red": {"issue": 9}})
+        self.assertFalse(self.deadlock_notes())
+
+    def test_a_layer_lacking_the_bases_head_is_not_told(self):
+        # #5 moves on: #6 holds only an older head of #5, so GitHub's
+        # main is its base and nothing holds it as stacked.
+        self.repo.branch("feature", "feature")
+        self.lower = self.repo.commit("v.txt", "lower again\n",
+                                      "lower again")
+        self.repo.publish_pr(5, self.lower)
+        record, lines = self.deadlock_tick()
+        self.assertNotEqual(record["held"].get("6"), "stacked on #5")
+        self.assertFalse(self.deadlock_notes())
+        self.assertFalse([l for l in lines if "STACK-DEADLOCK" in l])
+
+    def test_a_dry_run_only_logs_it(self):
+        record, lines = self.deadlock_tick(live=False)
+        self.assertTrue(any(l.startswith("STACK-DEADLOCK #6 on #5:")
+                            and l.endswith("a live tick tells both authors")
+                            for l in lines))
+
+    def test_the_merge_decisions_are_unchanged(self):
+        got, _ = self.deadlock_tick()
+        self.assertTrue(self.deadlock_notes())
+        self.state = os.path.join(self.tmp.name, "state-without")
+        with mock.patch.object(m, "stack_deadlocks", lambda *a, **k: []):
+            want, _ = self.deadlock_tick()
+        for key in ("decisions", "held", "queue"):
+            self.assertEqual(got.get(key), want.get(key), key)
 
 
 # designs/0026: settings for a project with stricter holds.

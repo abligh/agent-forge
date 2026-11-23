@@ -827,6 +827,11 @@ the paths.
 If the merge is clean and an approval covers its head, the Merger
 merges that head into it itself, once per approval and head. Without
 an approval it is told once.
+A layer GitHub has on the default branch that holds its base's head,
+and is otherwise ready (approved, green), while the base is red on a
+gate the layer is green on or isn't subject to, can never merge: both
+authors are told so once per head and base head (`STACK-DEADLOCK`),
+so a person closes the base or fixes it. Nothing else changes.
 When a live tick merges Q, the open pull requests stacked on it are
 recorded (`stacks.json` in the Merger's state directory) and the run
 goes on: the next tick retargets such a layer to the default branch

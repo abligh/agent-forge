@@ -411,3 +411,62 @@ conflict still needs the author.
 **Cost.** One `git rev-list` per open pull request a tick, one fetch of
 any heads the checkout lacks, and one `git merge-tree` per layer that
 is behind.
+
+## Amendment (2026-11-23, fifth): say so when a base can't merge first
+
+* Status: approved (Alex Bligh, 2026-11-23, option 2 of agent-forge
+  #559,
+  https://github.com/abligh/agent-forge/issues/559#issuecomment-7095741759)
+
+**What went wrong.** The fourth amendment holds a pull request that
+GitHub has on `main` but whose commits hold an open one's head as
+stacked on that one, and tells its author once (`STACK-BASE`). On one
+project on 2026-11-22 such a layer B held every commit of its base A
+unchanged, plus a fix: A was red on a gate context that B was green on.
+A could never merge, so B never could either, and after the one
+`STACK-BASE` notice nothing said so. About 85 minutes went before a
+person found it by hand.
+
+**The change.** Say so, don't act: no new merge path, and no hold or
+merge decision changes. The Merger finds this state each tick:
+1. GitHub has B on `main`, and its commits put it on A, holding A's
+   head itself (B is not behind A), so every commit of A, unchanged;
+2. B is held by nothing but the stack: judged as if based on `main`
+   it has an approval and nothing else holds it (no `Blocked-by`,
+   label, deferral or remark after the approval), and the head
+   context (`checks.context`, or `checks.quick`'s with
+   `merge.gate_tier` "train") is green for it as
+   `merge.own_head_green` reads it;
+3. A is red where B is not: the head context's newest status on A's
+   head is final and not a success, or a gated instance that applies
+   to A has a final red verdict on it while B is green on it or isn't
+   subject to it.
+
+Then both authors are told, with a `Not-a-review` comment on each pull
+request (so it holds neither), that A can't merge first and B carries
+all of it: close A if B replaces it, or push a fix to A, after which B
+no longer holds A's head and goes on its own. The log says
+`STACK-DEADLOCK #B on #A: #A is <state> on <context> at <sha>, ...`,
+and the record's `stale` lists a `NOTICE` of kind `deadlock`. It is
+told once per B's head and A's head, in `stack-notices.json` (key
+`d<B>`, with the pull requests told so far, so a refused comment is
+tried again on the next tick without repeating the other); a push to
+either tells again. A dry run logs it and writes nothing.
+
+**False alarms.** It never fires on a pending or absent verdict on A,
+since a run in progress may yet pass; nor on A being unapproved, a
+draft or blocked, which a person or time can still change by itself;
+nor while the default branch is red, when every head may be; nor when
+A's red was only a conflict with the default branch (the build
+check's `conflicts`, or only its `merge` step failed), which a later
+tip may clear. Code-owner and area waits on B are not judged: a person
+has to act on those anyway, and A still blocks B after. A red A whose
+fix B lacks is not this state either: B is then not on A's head.
+
+**Not configurable.** It changes no merge, and the other stack notices
+have no switch.
+
+**Cost.** Only for layers GitHub has on `main` that are held as
+stacked: one read of the base head's statuses, and B's green as
+`merge.own_head_green` already reads it, plus each applying gated
+instance's verdicts.
