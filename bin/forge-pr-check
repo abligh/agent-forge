@@ -25,6 +25,22 @@ the block's `pull_requests` (designs/0034), it runs only the heads of
 pull requests that change a path the block's globs match or carry its
 label; the rest it leaves alone, posting nothing.
 
+**With the block's `reviewed_heads` (designs/0064), it runs only
+reviewed heads.** A head in scope is queued only once its pull request
+is released: a reviewer agent has approved it, at any commit, or it
+carries `labels.armed`, or (on a posting tick) the block's
+`early_label`, which releases that one head and is taken off. A held
+head is posted pending once, `runs once a reviewer approves or arms
+it`, and logged `UNREVIEWED #<pr> <sha>` once; a release is logged
+`RELEASED #<pr> <sha>: approved by <login>` (or `armed`, or `early,
+asked by <login>`). A waiting head's approvals are read every tick; an
+approval found stays in approved.json while the pull request is open,
+so a later push is run at once. A head that only merges the default
+branch into a head judged here is not run (`UPDATED`): the Merger takes
+the earlier verdict for it. A run already started is never stopped for
+a release taken back. Which heads were held, released or updated is
+kept in reviewed.json.
+
 **The cron tick returns at once and the check runs detached.**
 `forge-cron-run` holds locks while a job runs, so a long test run under
 it would starve the rest of the schedule. The worker is started with
@@ -1070,6 +1086,18 @@ ARMED_LABEL = None
 APPROVED_FRESH = datetime.timedelta(minutes=5)
 APPROVED_MAX_CALLS = 30
 APPROVED_FILE = "approved.json"
+# checks.instances.<name>.reviewed_heads (designs/0064): whether the
+# instance runs a head only once its pull request is released (approved
+# by a reviewer agent, armed, or asked for early), and the block's
+# early_label, or None. Which heads were held, released or found to
+# only update a judged head is kept in REVIEWED_FILE.
+REVIEWED_HEADS = False
+EARLY_LABEL = None
+REVIEWED_FILE = "reviewed.json"
+HELD_TEXT = "runs once a reviewer approves or arms it"
+# How many merges of the default branch a head is walked back through
+# to a head judged here (`updated_from`).
+UPDATE_DEPTH = 10
 # labels.rerun: the label that runs a red head once more (designs/0022),
 # or None.
 RERUN_LABEL = None
@@ -1282,7 +1310,7 @@ def configure(project, instance=None):
     global CACHE_FAULT_TEXT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
     global PULL_REQUESTS, HOST_LOCK, APPROVED_FIRST, REVIEWER_LOGINS, ORDER
-    global ARMED_LABEL
+    global ARMED_LABEL, REVIEWED_HEADS, EARLY_LABEL
     global SCOPED, SCOPED_S
     global QUICK_CONTEXT, QUICK_SLOTS, TIERS, ALL_STEPS
     INSTANCE = instance
@@ -1395,6 +1423,12 @@ def configure(project, instance=None):
     scope = checks.get("pull_requests") if instance is not None else None
     PULL_REQUESTS = (tuple(scope.get("paths", ())), scope.get("label")) \
         if scope else None
+    # designs/0064; the configuration allows it in an instance's block
+    # only. `true` is `{}`: no early label.
+    reviewed = checks.get("reviewed_heads") if instance is not None else None
+    REVIEWED_HEADS = reviewed is True or isinstance(reviewed, dict)
+    EARLY_LABEL = reviewed.get("early_label") or None \
+        if isinstance(reviewed, dict) else None
     # The configuration refuses it without paths or "every"/"newest".
     MAIN_PATHS = instance is not None and checks.get("main_paths") is True \
         and MAIN_EVERY and bool(PULL_REQUESTS and PULL_REQUESTS[0])
@@ -1860,7 +1894,8 @@ def red_fixes(token, number, run=sh, keywords=None):
     return sorted(fixes)
 
 
-def approved_prs(state_dir, state, heads, token, when, run=sh):
+def approved_prs(state_dir, state, heads, token, when, run=sh, every=(),
+                 by=None, fresh=True):
     """checks.approved_first: the open pull requests, among those with a
     head to run (open, not a draft, no verdict yet), that one of the
     reviewer agents has approved, at any commit: an approval of an
@@ -1870,7 +1905,15 @@ def approved_prs(state_dir, state, heads, token, when, run=sh):
     than APPROVED_FRESH; at most APPROVED_MAX_CALLS pull requests are
     asked in a tick, the longest unasked first, and one that can't be
     read keeps its last answer. It only orders, so a stale or missing
-    answer costs a place, never a run."""
+    answer costs a place, never a run.
+
+    With REVIEWED_HEADS (designs/0064), the pull requests in `every`
+    are asked on every tick, whatever their answer's age and beyond
+    the cap: their heads wait for a release. An approval found then
+    stays in approved.json, unasked, while its pull request is open
+    (among `heads`), and `by` ({pr: login}), when given, is filled with
+    the reviewer it names. With `fresh` false (reviewed_heads without
+    approved_first), only `every` is asked."""
     path = os.path.join(state_dir, APPROVED_FILE)
     try:
         with open(path) as handle:
@@ -1883,16 +1926,23 @@ def approved_prs(state_dir, state, heads, token, when, run=sh):
     wanted = sorted({head[0] for head in heads
                      if not head[3] and head[1] not in results})
 
+    def released(pr):
+        entry = known.get(str(pr))
+        return REVIEWED_HEADS and isinstance(entry, dict) \
+            and entry.get("approved") is True
+
     def asked(pr):
         try:
             return parse(known[str(pr)]["at"])
         except (KeyError, TypeError, ValueError):
             return None
-    due = [pr for pr in wanted
-           if asked(pr) is None or when - asked(pr) >= APPROVED_FRESH]
+    now = sorted({pr for pr in every if not released(pr)})
+    due = [pr for pr in wanted if fresh and pr not in now
+           and not released(pr)
+           and (asked(pr) is None or when - asked(pr) >= APPROVED_FRESH)]
     due.sort(key=lambda pr: (asked(pr) is not None,
                              asked(pr) or when, pr))
-    for pr in due[:APPROVED_MAX_CALLS]:
+    for pr in now + due[:APPROVED_MAX_CALLS]:
         got = gh(["--paginate", "repos/%s/pulls/%d/reviews?per_page=100"
                   % (REPO_SLUG, pr), "--jq",
                   '.[] | select(.state == "APPROVED") | .user.login'],
@@ -1902,8 +1952,12 @@ def approved_prs(state_dir, state, heads, token, when, run=sh):
         logins = {l.strip().lower() for l in got.stdout.splitlines()}
         known[str(pr)] = {"at": iso(when),
                           "approved": bool(logins & REVIEWER_LOGINS)}
+        if REVIEWED_HEADS and logins & REVIEWER_LOGINS:
+            known[str(pr)]["by"] = sorted(logins & REVIEWER_LOGINS)[0]
+    open_prs = {head[0] for head in heads}
     known = {k: v for k, v in known.items()
-             if k.isdigit() and int(k) in wanted}
+             if k.isdigit() and (int(k) in wanted or released(int(k))
+                                 and int(k) in open_prs)}
     try:
         fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".approved.")
         with os.fdopen(fd, "w") as handle:
@@ -1911,8 +1965,12 @@ def approved_prs(state_dir, state, heads, token, when, run=sh):
         os.replace(tmp, path)
     except OSError:
         pass
-    return frozenset(int(k) for k, v in known.items()
-                     if isinstance(v, dict) and v.get("approved"))
+    approved = frozenset(int(k) for k, v in known.items()
+                         if isinstance(v, dict) and v.get("approved"))
+    if by is not None:
+        by.update({int(k): v.get("by") or "a reviewer"
+                   for k, v in known.items() if int(k) in approved})
+    return approved
 
 
 def armed_prs(heads):
@@ -2160,6 +2218,193 @@ def in_scope(heads, state_dir, token, run=sh, out=print, when=None):
     return kept, dropped
 
 
+def updated_from(sha, pr, results, checkout, run=sh):
+    """designs/0064: the head judged here (in `results`) that head sha
+    of pull request pr only brings up to date, or None: sha is a merge
+    of a commit on the default branch into it, or into a commit that is
+    one in turn, back at most UPDATE_DEPTH merges. The Merger's gate
+    takes that head's verdict for sha (`instance_verdict`), so a run of
+    sha would gate nothing. Read in the cron `checkout`, fetching the
+    head first if it doesn't have it; None whenever git can't say, so a
+    head is never left unrun for want of an answer."""
+    def have():
+        return run(["git", "-C", checkout, "cat-file", "-e",
+                    sha + "^{commit}"]).returncode == 0
+    if not have():
+        run(["git", "-C", checkout, "fetch", "-q", "--no-write-fetch-head",
+             "origin", "refs/pull/%d/head" % pr])
+        if not have():
+            return None
+    commit = sha
+    for _ in range(UPDATE_DEPTH):
+        got = run(["git", "-C", checkout, "rev-list", "--parents", "-n",
+                   "1", commit])
+        parents = (got.stdout or "").split() if got.returncode == 0 else []
+        if len(parents) != 3 or run(
+                ["git", "-C", checkout, "merge-base", "--is-ancestor",
+                 parents[2], "refs/remotes/origin/" + MAIN]).returncode != 0:
+            return None
+        commit = parents[1]
+        if commit in results:
+            return commit
+    return None
+
+
+def load_reviewed(state_dir):
+    """REVIEWED_FILE's {sha: entry}, or {} when it can't be read."""
+    try:
+        with open(os.path.join(state_dir, REVIEWED_FILE)) as handle:
+            known = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return known if isinstance(known, dict) else {}
+
+
+def save_reviewed(state_dir, known):
+    fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".reviewed.")
+    with os.fdopen(fd, "w") as handle:
+        json.dump(known, handle, indent=1, sort_keys=True)
+    os.replace(tmp, os.path.join(state_dir, REVIEWED_FILE))
+
+
+def awaiting_release(heads, state, state_dir, busy=()):
+    """designs/0064: the pull requests whose head may be held for want
+    of a release, whose approvals are read every tick: open, not a
+    draft, this repository's, with no verdict here, not running, and
+    neither released early nor found to only update a judged head."""
+    known = load_reviewed(state_dir)
+    results = state.get("results", {})
+    found = set()
+    for head in heads:
+        pr, sha, repo, draft = head[:4]
+        entry = known.get(sha) if isinstance(known.get(sha), dict) else {}
+        if draft or repo != REPO_SLUG or sha in results or sha in busy \
+                or entry.get("updated") or entry.get("early"):
+            continue
+        found.add(pr)
+    return found
+
+
+def reviewed(heads, state_dir, approved, by, busy, when, token=None, run=sh,
+             out=print, checkout=None, posting=False):
+    """checks.instances.<name>.reviewed_heads (designs/0064): `heads`,
+    less those this instance holds until their pull request is
+    released: approved by a reviewer agent (`approved`, the reviewer
+    named in `by`), carrying labels.armed, or, on a posting tick,
+    carrying EARLY_LABEL, which releases that head only, for good. A
+    draft, another repository's head, a head with a verdict here, one
+    a slot is running (a release taken back never stops a run) and one
+    labels.rerun queued again are kept as they are. A new head that
+    only merges the default branch into a head judged here is never
+    run (`updated_from`), and is logged UPDATED once. A held head is
+    logged UNREVIEWED once, and a release RELEASED once.
+
+    Returns (heads kept, [(pr, sha, what)] still to do on GitHub):
+    "held" to post HELD_TEXT pending on the head, once, and "early" to
+    take EARLY_LABEL off its pull request."""
+    if not REVIEWED_HEADS:
+        return heads, []
+    known = load_reviewed(state_dir)
+    state = load(state_dir)
+    results, waiting = state["results"], state["waiting"]
+    reruns = state.get("reruns", {})
+    kept, todo, entries = [], [], {}
+    for head in heads:
+        pr, sha, repo, draft = head[:4]
+        labels = head[5] if len(head) > 5 else []
+        was = known.get(sha) if isinstance(known.get(sha), dict) else {}
+        early_on = bool(EARLY_LABEL) and EARLY_LABEL in labels
+        if draft or repo != REPO_SLUG or sha in results or sha in busy \
+                or sha in reruns:
+            kept.append(head)
+            if was:
+                entries[sha] = was
+            if posting and early_on and was.get("early"):
+                todo.append((pr, sha, "early"))
+            continue
+        if was.get("updated"):
+            entries[sha] = was
+            continue
+        if not was and sha not in waiting and checkout:
+            base = updated_from(sha, pr, results, checkout, run)
+            if base is not None:
+                entries[sha] = {"pr": pr, "updated": base}
+                log(state_dir, "UPDATED #%d %s: only merges %s into %s, "
+                    "judged here; not run" % (pr, sha[:10], MAIN,
+                                              base[:10]), when, out)
+                continue
+        entry = {"pr": pr}
+        why = was.get("early")
+        if why:
+            entry["early"] = why
+        elif pr in approved:
+            why = "approved by %s" % by.get(pr, "a reviewer")
+        elif ARMED_LABEL and ARMED_LABEL in labels:
+            why = "armed"
+        elif early_on and posting:
+            got = labelled_by(pr, token, run, EARLY_LABEL)
+            if got is None:
+                out("EARLY-FAILED #%d %s: could not read who put %s on "
+                    "it; tried again next tick" % (pr, sha[:10],
+                                                   EARLY_LABEL))
+            else:
+                why = entry["early"] = "early, asked by %s" % got[0]
+        if why:
+            entry["released"] = why
+            kept.append(head)
+            if not was.get("released"):
+                log(state_dir, "RELEASED #%d %s: %s" % (pr, sha[:10], why),
+                    when, out)
+            # It releases this head only: a later push needs it again.
+            if posting and early_on:
+                todo.append((pr, sha, "early"))
+        else:
+            entry["held"] = True
+            entry["posted"] = bool(was.get("held") and was.get("posted"))
+            if not was.get("held"):
+                log(state_dir, "UNREVIEWED #%d %s: %s"
+                    % (pr, sha[:10], HELD_TEXT), when, out)
+            if posting and not entry["posted"]:
+                entry["posted"] = True
+                todo.append((pr, sha, "held"))
+        entries[sha] = entry
+    if entries != known:
+        try:
+            save_reviewed(state_dir, entries)
+        except OSError:
+            pass
+    return kept, todo
+
+
+def finish_reviewed(todo, state_dir, token, run=sh, post=None, out=print):
+    """GitHub's half of `reviewed`: the held heads' pending status, and
+    EARLY_LABEL taken off. A pending GitHub refuses is posted again next
+    tick; a label left on is taken off by a later tick."""
+    failed = set()
+    for pr, sha, what in todo:
+        if what == "held" and post is not None:
+            if not post(sha, "pending", HELD_TEXT):
+                failed.add(sha)
+        if what == "early":
+            got = gh(["-X", "DELETE", "repos/%s/issues/%d/labels/%s"
+                      % (REPO_SLUG, pr, urllib.parse.quote(EARLY_LABEL,
+                                                           safe=""))],
+                     token, run)
+            if got.returncode != 0 and "404" not in (got.stderr or ""):
+                out("EARLY-FAILED #%d %s: taking %s off: %s"
+                    % (pr, sha[:10], EARLY_LABEL,
+                       (got.stderr or "").strip()[:200]))
+    if failed:
+        known = load_reviewed(state_dir)
+        for sha in failed:
+            if isinstance(known.get(sha), dict):
+                known[sha]["posted"] = False
+        try:
+            save_reviewed(state_dir, known)
+        except OSError:
+            pass
+
+
 def note_heads(state, heads, when, state_dir, out=print, post=None):
     """Queue each open, non-draft head not yet checked, refuse a foreign
     one (posting why, once, with post), and forget a waiting head that
@@ -2342,14 +2587,15 @@ def rerun_labelled(heads):
             if len(extra) > 1 and RERUN_LABEL in extra[1]]
 
 
-def labelled_by(pr, token, run=sh):
-    """(login, when) of the last time labels.rerun was put on pull
-    request pr, from its events, or None if GitHub can't say."""
+def labelled_by(pr, token, run=sh, label=None):
+    """(login, when) of the last time `label` (default labels.rerun) was
+    put on pull request pr, from its events, or None if GitHub can't
+    say."""
     got = gh(["--paginate", "repos/%s/issues/%d/events?per_page=100"
               % (REPO_SLUG, pr), "--jq",
               '.[] | select(.event == "labeled" and .label.name == %s) | '
               '[(.actor.login // ""), .created_at] | @tsv'
-              % json.dumps(RERUN_LABEL)], token, run)
+              % json.dumps(label or RERUN_LABEL)], token, run)
     if got.returncode != 0:
         return None
     rows = [line.split("\t") for line in got.stdout.splitlines()
@@ -4772,11 +5018,22 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     fixes = red_fixes(token, issue, run) if issue else []
     # checks.approved_first: which waiting heads' pull requests a
     # reviewer has approved, read outside the lock.
+    # With reviewed_heads (designs/0064), the reviews are read for the
+    # heads waiting on a release too, every tick.
     global APPROVED_PRS
-    APPROVED_PRS = approved_prs(state_dir, seen, heads, token, when, run) \
-        if APPROVED_FIRST else frozenset()
+    by = {}
+    approvals = approved_prs(
+        state_dir, seen, heads, token, when, run,
+        every=awaiting_release(heads, seen, state_dir, busy)
+        if REVIEWED_HEADS else (), by=by, fresh=APPROVED_FIRST) \
+        if APPROVED_FIRST or REVIEWED_HEADS else frozenset()
+    APPROVED_PRS = approvals if APPROVED_FIRST else frozenset()
     if APPROVED_FIRST and ARMED_LABEL:
         APPROVED_PRS = APPROVED_PRS | armed_prs(heads)
+    # A head this instance holds until a release isn't open, to the rest
+    # of the tick (designs/0064).
+    heads, held = reviewed(heads, state_dir, approvals, by, busy, when,
+                           token, run, out, checkout, post is not None)
     todo = []
     with state_lock(state_dir):
         state = load(state_dir)
@@ -4827,6 +5084,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
     if post is not None:
         for pr, sha in unrun:
             post(sha, "success", OUT_OF_SCOPE_TEXT)
+    if held:
+        finish_reviewed(held, state_dir, token, run, post, out)
     current = {head[1] for head in heads}
     halt = merger_stop(merger_dir, when, checkout) \
         if TEST_AHEAD and merger_dir else set()

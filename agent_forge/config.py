@@ -211,7 +211,7 @@ CHECKS = {"context": str, "poster": str, "steps": list, "caches": dict,
           "docker_slices": dict, "pull_requests": dict, "warm": dict,
           "approved_first": bool, "scoped_minutes": int,
           "gate": bool, "flake_issue": dict, "order": str, "quick": dict,
-          "main_paths": bool}
+          "main_paths": bool, "reviewed_heads": (bool, dict)}
 # checks.flake_issue (agent-forge #287): an issue for each step a
 # prediction's retry (merge.test_ahead.retry_red) turned green.
 FLAKE_ISSUE = {"labels": list, "owner": str}
@@ -221,6 +221,9 @@ DOCKER_SLICES = {"front": str, "other": str}
 # checks.instances.<name>.pull_requests (designs/0034): which pull
 # requests' heads an instance runs.
 PULL_REQUESTS = {"paths": list, "label": str}
+# checks.instances.<name>.reviewed_heads (designs/0064): an instance runs
+# a head only once its pull request is released; `true` is `{}`.
+REVIEWED_HEADS = {"early_label": str}
 # checks.cpu_share (designs/0029): when a step's CHECK_CPUS is taken.
 CPU_SHARES = ("run", "step")
 # checks.order (designs/0052).
@@ -255,7 +258,9 @@ INSTANCE_CHECKS_ONLY = ("first_authors", "merger_first",
 # `main_paths`: the default branch's heads are scoped by
 # pull_requests.paths too, so a head that changes none of them since
 # the last one run is given that one's verdict instead of a run.
-INSTANCE_ONLY = ("pull_requests", "gate", "main_paths")
+# `reviewed_heads` (designs/0064): a head is run only once its pull
+# request is approved by a reviewer agent, armed, or asked for early.
+INSTANCE_ONLY = ("pull_requests", "gate", "main_paths", "reviewed_heads")
 # An instance's host's own exclusive lock, which agents sharing the
 # machine take with `mkdir` (agent-forge issue 54): {dir, wait_minutes}.
 # Instance-only, and checked here rather than as a `checks` key.
@@ -1310,6 +1315,9 @@ def _check_checks(checks, data, problems, where="checks"):
     if "gate" in checks and where == "checks":
         problems.append("checks.gate: only an instance may set it; the "
                         "Merger always requires checks.context")
+    if checks.get("reviewed_heads", False) is not False:
+        _check_reviewed_heads(checks["reviewed_heads"], data, problems,
+                              where)
     if isinstance(checks.get("step_alert"), dict):
         _check_step_alert(checks["step_alert"], data, problems,
                           where + ".step_alert")
@@ -1511,6 +1519,47 @@ def _check_scoped_after(steps, problems, where):
                 problems.append("%s.steps[%d].after: %r is scoped, so it "
                                 "runs after every step that isn't"
                                 % (where, i, other))
+
+
+def _check_reviewed_heads(setting, data, problems, where):
+    """checks.instances.<name>.reviewed_heads (designs/0064): true, or
+    an object with an optional `early_label`; only in an instance's
+    block, and only where a reviewer agent can release a head."""
+    at = where + ".reviewed_heads"
+    if where == "checks":
+        problems.append("checks.reviewed_heads: only an instance may set "
+                        "it, since the Merger requires checks.context on "
+                        "every head, and the reviewers read it")
+        return
+    if isinstance(setting, dict):
+        _fields(at, setting, REVIEWED_HEADS, problems)
+        label = setting.get("early_label")
+        if isinstance(label, str) and not label.strip():
+            problems.append("%s.early_label must not be empty" % at)
+    if (data.get("merge") or {}).get("approval") == "green":
+        problems.append("%s: merge.approval is \"green\", so no reviewer "
+                        "approves a head to release it" % at)
+    agents = data.get("agents") or {}
+    if not any(isinstance(e, dict) and e.get("kind") == "reviewer"
+               for e in agents.values()):
+        problems.append("%s needs an agent of kind reviewer, to release "
+                        "a head" % at)
+
+
+def warnings(data):
+    """What `forge-config check` warns of in `data`, a configuration
+    with no problems: settings that work but likely not as meant."""
+    said = []
+    labels = data.get("labels") or {}
+    for name, block in sorted(((data.get("checks") or {}).get(
+            "instances") or {}).items()):
+        if isinstance(block, dict) \
+                and block.get("reviewed_heads", False) is not False \
+                and not labels.get("armed"):
+            said.append("checks.instances.%s.reviewed_heads without "
+                        "labels.armed: only an approval releases a head, "
+                        "so its run starts later" % name)
+    return said
 
 
 def _check_pull_requests(scope, problems, where):
