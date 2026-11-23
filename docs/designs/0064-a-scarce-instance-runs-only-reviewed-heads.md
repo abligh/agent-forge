@@ -1,6 +1,6 @@
 # 0064: A scarce instance runs only reviewed heads
 
-* Status: proposed
+* Status: approved (Alex Bligh, 2026-11-23, https://github.com/abligh/agent-forge/issues/562#issuecomment-7095741439)
 * Author: XMPPEngineer
 * Date: 2026-11-23
 
