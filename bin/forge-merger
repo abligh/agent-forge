@@ -214,6 +214,11 @@ older one. One GitHub has on `main` that holds an open one's head is
 held as stacked on it, the nearest such. One GitHub has on another
 branch keeps that base, since GitHub merges into it. Where they differ,
 the author is told once (`STACK-BASE`, `stack-notices.json`).
+A layer held that way that waits on a base that can't merge first
+(the base is red on a gate the layer is green on, or isn't subject
+to, and the layer is otherwise ready) is said so on both pull
+requests, once per head and base head (`STACK-DEADLOCK`, designs/0025,
+amendment of 2026-11-23); nothing about the merge changes.
 A layer that lacks its base's head (`STALE`) is handled while the base
 is still open:
 - if that head conflicts with it, it is held and its author told at
@@ -8924,6 +8929,17 @@ MISMATCH_NOTE = ("Not-a-review\n\nGitHub has this based on %s, but its "
                  "GitHub match what the branch is built on (retarget the "
                  "pull request, or merge the right head in).\n\n%s")
 
+# designs/0025, amendment of 2026-11-23: a layer held only by a base
+# that can't merge first is said so, once, on both pull requests.
+DEADLOCK_NOTE = ("Not-a-review\n\n#%d is held as stacked on #%d: GitHub "
+                 "has it on `%s`, but it holds #%d's head %s unchanged, so "
+                 "the Merger waits for #%d to merge first. #%d can't: %s "
+                 "is %s on its head, and #%d, which carries every commit "
+                 "of #%d and more, passes it and is otherwise ready to "
+                 "merge. Nothing will change by waiting. Close #%d if #%d "
+                 "replaces it, or push a fix to #%d (#%d then no longer "
+                 "holds #%d's head, and goes on its own).\n\n%s")
+
 
 def commit_graph(repo, prs, main_ref, run=sh):
     """designs/0025, amendment of 2026-11-11: each open pull request's
@@ -9207,6 +9223,128 @@ def base_mismatches(state_dir, prs, differ, github, live, when, out):
     return done
 
 
+def stack_deadlocks(state_dir, repo, prs, graph, differ, open_numbers,
+                    github, live, when, out, main_tip, check_state=None,
+                    run=sh):
+    """designs/0025, amendment of 2026-11-23 (agent-forge #559, option
+    2): say so, don't act. A layer B that GitHub has on the default
+    branch but whose commits hold an open pull request A's head
+    unchanged is held as stacked on A (`apply_graph`). When A can't
+    merge first, B waits for ever. This finds that state and tells both
+    authors once, with a comment on each pull request, per B's head and
+    A's head (STACK_NOTICES_FILE, key "d<B>"); it changes no hold and no
+    merge.
+
+    The state, all of it:
+    - `differ` has B as (None, A): GitHub has it on the default branch,
+      its commits on A, and the graph has B not behind A (it holds A's
+      head itself, so every commit of A, unchanged);
+    - B is held by nothing but the stack: `eligible` judged as if based
+      on the default branch gives an approval, and the head context
+      (checks.context, or checks.quick's with merge.gate_tier "train")
+      is green for B as `own_green_wait` reads it;
+    - A is red where B is not: the head context's newest status on A's
+      head is final and not a success (failure or error), or a gated
+      instance that applies to A has a final red verdict on it
+      (`instance_verdict`) while it is green on B or doesn't apply to
+      B. A pending or absent verdict on A is never enough, nor A merely
+      lacking an approval or being a draft: those can still change by
+      themselves. Nor while the default branch is red, when every head
+      may be, nor when A's red was only a conflict with the default
+      branch (the build check's `conflicts`, or only its `merge` step
+      failed), which a later tip may clear.
+    Returns the decisions, for the record."""
+    path = os.path.join(state_dir, STACK_NOTICES_FILE)
+    notices = load_json(path, {})
+    if not isinstance(notices, dict):
+        notices = {}
+    if (check_state or {}).get("main_red", {}).get("issue"):
+        return []
+    results = (check_state or {}).get("results") or {}
+    by_number = {pr["number"]: pr for pr in prs}
+    files, greens, done = {}, {}, []
+    for n, (on, base_n) in sorted(differ.items()):
+        pr, base = by_number.get(n), by_number.get(base_n)
+        node = graph.get(n) or {}
+        if on is not None or pr is None or base is None \
+                or node.get("base") != base_n or node.get("behind"):
+            continue
+        approval, _ = eligible(pr, open_numbers, when, any_base=True)
+        if approval is None:
+            continue
+        base_head = base["headRefOid"]
+        got = results.get(base_head)
+        if isinstance(got, dict) and (got.get("conflicts")
+                                      or got.get("failed") == ["merge"]):
+            continue
+        try:
+            red = None
+            state, _ = status_state(
+                github.api(*status_path(base_head)) or [], head_context())
+            if state not in (None, "pending", "success"):
+                red = (head_context(), state)
+            if red is None and GATED:
+                ours = gated_instances(repo, pr, main_tip, files, run)
+                for context, creator in gated_instances(
+                        repo, base, main_tip, files, run):
+                    state, _, _ = instance_verdict(
+                        repo, base, main_tip, github, context, creator, run)
+                    if state in (None, "pending", "success"):
+                        continue
+                    if (context, creator) in ours and instance_verdict(
+                            repo, pr, main_tip, github, context, creator,
+                            run)[0] != "success":
+                        continue
+                    red = (context, state)
+                    break
+            if red is None or own_green_wait(pr, approval, github, greens,
+                                             repo, main_tip, run):
+                continue
+        except RuntimeError:
+            # A read that failed says nothing either way: next tick.
+            continue
+        key = {"kind": "deadlock", "head": pr["headRefOid"],
+               "base": base_n, "base_head": base_head}
+        entry = notices.get("d%d" % n) or {}
+        if {k: entry.get(k) for k in key} == key \
+                and set(entry.get("told") or ()) >= {n, base_n}:
+            continue
+        decision = {"action": "NOTICE", "kind": "deadlock", "pr": n,
+                    "head": pr["headRefOid"], "after": base_n,
+                    "below": base_head, "context": red[0],
+                    "state": red[1]}
+        if live:
+            told = list(entry.get("told") or ()) \
+                if {k: entry.get(k) for k in key} == key else []
+            body = DEADLOCK_NOTE % (
+                n, base_n, MAIN, base_n, base_head[:10], base_n, base_n,
+                red[0], red[1], n, base_n, base_n, n, base_n, n, base_n,
+                SIGNATURE)
+            refused = []
+            for number in (n, base_n):
+                if number in told:
+                    continue
+                ok, why = github.write(
+                    "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG,
+                                                             number),
+                    body=body)
+                if ok:
+                    told.append(number)
+                else:
+                    refused.append("#%d: %s" % (number, why))
+            decision["result"] = "refused: " + "; ".join(refused) \
+                if refused else "done"
+            notices["d%d" % n] = dict(key, told=told, at=iso(when))
+        done.append(decision)
+        out("STACK-DEADLOCK #%d on #%d: #%d is %s on %s at %s, and #%d, "
+            "which holds all of #%d, is green and otherwise ready; %s" % (
+                n, base_n, base_n, red[1], red[0], short(base_head), n,
+                base_n, "told both authors" if live else
+                "a live tick tells both authors"))
+    if live and done:
+        save_json(path, notices)
+    return done
+
 def restack_once(state_dir, decision, approval, github, said):
     """RESTACK, at most once per approval and head (RESTACKED_FILE), as
     `resolve_once`: "done", or "failed: why"."""
@@ -9437,7 +9575,9 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
         stale = base_mismatches(state_dir, prs, differ, github, live, when,
                                 out) + stale_layers(
             state_dir, repo, prs, graph, said, github, live, held, when, out,
-            run)
+            run) + stack_deadlocks(
+            state_dir, repo, prs, graph, differ, open_numbers, github, live,
+            when, out, main_tip, check_state, run)
         if live and any(d["action"] == "HAND-BACK" for d in stale):
             save_json(said_path, said)
     since, overdue = {}, {}
