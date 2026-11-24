@@ -1634,7 +1634,9 @@ their top's full green (see "`merge.gate_tier`").
   run time in minutes, and `quick_run_cpu`, its median CPU seconds,
   each with `limit`, `ratio` and `short_hours`, and `step`, a step's
   name, to count that step's time alone (a budget for one step, when
-  the quick tier runs others beside it). `quick_tier_run` and
+  the quick tier runs others beside it), and with it `part`, one part
+  of that step as its log's part lines name it, to count that part
+  alone (needs `stats.part_line`; agent-forge #548). `quick_tier_run` and
   `quick_tier_cpu` are the same two figures for the whole tier, with no
   `step`, so a project that budgets one step can still watch the
   tier's total.
