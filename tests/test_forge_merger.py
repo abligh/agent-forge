@@ -2102,6 +2102,60 @@ class Tick(Decide):
         self.assertEqual(self.told(dict(now), reason="other gate",
                                    text="d1"), ("done", 1))
 
+    def test_a_refusal_for_now_is_held_then_resaved_then_told(self):
+        # agent-forge #572: a stacked pull request retargeted to the
+        # default branch never had its closing references filled, and
+        # was handed back for a lag only a save of its body clears.
+        pr5 = {"number": 5, "title": "t", "body": "Fixes #9"}
+        github = FakeGitHub({"repos/": pr5})
+        said = {}
+        decision = {"action": "HAND-BACK", "to": "author", "pr": 5,
+                    "head": "h" * 40, "reason": "gate exited 3: lag",
+                    "text": m.description(pr5), "retry": True}
+
+        def once(at):
+            return m.carry_out(dict(decision, at=at), review(REVIEWER),
+                               github, said)
+        self.assertEqual(once(T1), "held for now (1 of 2)")
+        self.assertEqual(once(T2), "held for now (2 of 2)")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(once(T2), "held for now; description saved "
+                                   "again unchanged")
+        self.assertEqual(github.writes, [("PATCH", "repos/%s/pulls/5"
+                                          % m.REPO_SLUG,
+                                          {"body": "Fixes #9"})])
+        self.assertEqual(once(T2), "done")
+        method, path, fields = github.writes[-1]
+        self.assertEqual(path, "repos/%s/issues/5/comments" % m.REPO_SLUG)
+        self.assertIn("saved the description again", fields["body"])
+        self.assertEqual(once(T2), "already said")
+        self.assertEqual(len(github.writes), 2)
+
+    def test_a_changed_description_is_not_saved_again(self):
+        github = FakeGitHub({"repos/": {"number": 5, "title": "t",
+                                        "body": "new"}})
+        said = {}
+        decision = {"action": "HAND-BACK", "to": "author", "pr": 5,
+                    "head": "h" * 40, "reason": "gate exited 3: lag",
+                    "text": "old", "retry": True, "at": T1}
+        for _ in range(m.GATE_RETRY_QUIET):
+            m.carry_out(dict(decision), review(REVIEWER), github, said)
+        self.assertEqual(
+            m.carry_out(dict(decision), review(REVIEWER), github, said),
+            "held for now; its description has changed; not saved again")
+        self.assertEqual(github.writes, [])
+
+    def test_a_refusal_told_before_the_count_is_not_told_again(self):
+        # A record from before agent-forge #572 was told already.
+        key = dict(m.hand_back_key(review(REVIEWER), "h" * 40, "gate", "d1"),
+                   retry=True, at=T1)
+        self.assertEqual(self.told(dict(key), reason="gate", text="d1",
+                                   retry=True, at=T2), ("already said", 0))
+
+    def test_a_refusal_for_good_is_told_at_once(self):
+        self.assertEqual(self.told({}, reason="gate exited 1: no",
+                                   text="d1"), ("done", 1))
+
     def test_a_skip_writes_nothing(self):
         self.assertIsNone(m.carry_out(
             {"action": "SKIP", "pr": 1, "head": "a"}, review(REVIEWER),
@@ -5795,7 +5849,9 @@ class TickAhead(RepoCase):
         back = [d for d in record["decisions"] if d.get("ahead")]
         self.assertEqual([(d["pr"], d.get("retry")) for d in back],
                          [(6, True)])
-        self.assertEqual(comments(), 1)
+        # Held, not told (agent-forge #572).
+        self.assertEqual(back[0]["result"], "held for now (1 of 2)")
+        self.assertEqual(comments(), 0)
         # Within GATE_RETRY: not asked again, and nothing said.
         calls.clear()
         record, _ = self.tick(prs, conclusions=(None,), live=True,
@@ -8046,6 +8102,64 @@ class AreaReviewers(RepoCase):
         item = self.area_pr()
         self.assertIsNotNone(m.approval_of(item))
         self.assertIsNotNone(self.wait(item))
+
+    # merge.area_reviewers.general (agent-forge #573).
+    GENERAL = {"Generalist": {"app_id": 106, "installation_id": 206,
+                              "kind": "reviewer"}}
+
+    def general_pr(self, reviews=()):
+        """A change to web/ and to a path no area claims, approved by
+        UIReviewer alone unless `reviews` adds to that."""
+        self.repo.branch("area7", "origin/main")
+        os.makedirs(os.path.join(self.repo.path, "web"), exist_ok=True)
+        self.repo.commit("web/x.txt", "x\n", "web")
+        sha = self.repo.commit("other.txt", "x\n", "other")
+        self.repo.publish_pr(7, sha)
+        self.repo.branch("feature", "feature")
+        return pr(7, T1, head=sha, reviews=[review(self.UI, oid=sha)] + [
+            review(who, oid=sha, at=T2) for who in reviews])
+
+    def test_general_off_an_areas_approval_is_the_general_one(self):
+        m.configure(area_project(self.GENERAL))
+        self.assertIsNone(m.AREA_GENERAL)
+        self.assertIsNone(self.wait(self.general_pr()))
+
+    def test_general_a_path_outside_every_area_waits_for_her(self):
+        m.configure(area_project(self.GENERAL,
+                                 area_reviewers={"general": True}))
+        self.assertEqual(m.AREA_GENERAL[0], ("Generalist",))
+        self.assertEqual(self.wait(self.general_pr()),
+                         "waits for Generalist (outside every area): "
+                         "other.txt")
+        self.assertIsNone(self.wait(self.general_pr(
+            reviews=["generalistwidgetagent"])))
+
+    def test_general_does_not_clear_an_area(self):
+        m.configure(area_project(self.GENERAL,
+                                 area_reviewers={"general": True}))
+        item = self.general_pr(reviews=["generalistwidgetagent"])
+        item["reviews"] = item["reviews"][1:]
+        self.assertEqual(self.wait(item),
+                         "waits for UIReviewer (web/**): web/x.txt")
+
+    def test_general_an_area_only_change_needs_no_general_approval(self):
+        m.configure(area_project(self.GENERAL,
+                                 area_reviewers={"general": True}))
+        item = self.area_pr(reviews=[review(self.UI, at=T2)])
+        self.assertIsNone(self.wait(item))
+
+    def test_general_with_no_general_reviewer_is_off(self):
+        m.configure(area_project(area_reviewers={"general": True}))
+        self.assertIsNone(m.AREA_GENERAL)
+
+    def test_general_is_not_told_through_the_relay(self):
+        sent = []
+        with tempfile.TemporaryDirectory() as state:
+            m.tell_areas(state, {7: ("a" * 40, "t", [
+                (("Generalist",), m.GENERAL_GLOB, "other.txt", 1),
+                (("UIReviewer",), "web/**", "web/x.txt", 1)])},
+                lambda name, text: sent.append(name), lambda line: None)
+        self.assertEqual(sent, ["UIReviewer"])
 
     def test_identical_globs_are_one_area(self):
         m.configure(area_project({"UIReviewer2": {

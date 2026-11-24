@@ -516,6 +516,29 @@ class Check(unittest.TestCase):
             "owner": "LeadDev", "figures": {"check_run": {"step": "x"}}}),
             ["stats_watch.figures.check_run: unknown key 'step'"])
 
+    def test_stats_watch_quick_run_takes_a_part_of_its_step(self):
+        # agent-forge #548: a part, as a step's log names it.
+        def problems(rules, part_line=r"(?P<part>\w+) (?P<wall>\S+) "
+                     r"(?P<cpu>\S+)"):
+            extra = {"stats": {"part_line": part_line}} if part_line else {}
+            return self.problems(stats_watch={
+                "owner": "LeadDev", "figures": {"quick_run_cpu": rules}},
+                **extra)
+        self.assertEqual(problems({"step": "check", "part": "tests",
+                                   "limit": 900}), [])
+        at = "stats_watch.figures.quick_run_cpu"
+        self.assertEqual(problems({"part": "tests"}),
+                         ["%s.part needs %s.step" % (at, at)])
+        self.assertEqual(problems({"step": "check", "part": ""}),
+                         ["%s.part must be a part's name" % at])
+        self.assertEqual(problems({"step": "check", "part": "tests"},
+                                  part_line=None),
+                         ["%s.part needs stats.part_line" % at])
+        self.assertEqual(self.problems(stats_watch={
+            "owner": "LeadDev", "figures": {"main_cpu": {
+                "step": "x", "part": "y"}}}),
+            ["stats_watch.figures.main_cpu: unknown key 'part'"])
+
     def test_nightly(self):
         data = example()
         data["router"] = {"owners": {"triage": "LeadDev"}}
@@ -991,6 +1014,21 @@ class Check(unittest.TestCase):
         self.assertEqual(config.check(data), [
             "merge.area_reviewers needs a reviewer with reviews"])
         data["merge"] = {"area_reviewers": False}
+        self.assertEqual(config.check(data), [])
+
+    def test_merge_area_reviewers_general(self):
+        # agent-forge #573: the example's reviewers all have reviews.
+        self.assertEqual(self.problems(merge={"area_reviewers": {
+            "general": True}}), [
+            "merge.area_reviewers.general needs a reviewer without reviews"])
+        self.assertEqual(self.problems(merge={"area_reviewers": {
+            "general": False}}), [])
+        self.assertTrue(self.problems(merge={"area_reviewers": {
+            "general": "yes"}}))
+        data = example()
+        data["agents"]["Generalist"] = {"app_id": 106, "installation_id": 206,
+                                        "kind": "reviewer"}
+        data["merge"] = {"area_reviewers": {"general": True}}
         self.assertEqual(config.check(data), [])
 
     def test_merge_resolve_board_unreviewed(self):

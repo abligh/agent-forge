@@ -69,6 +69,11 @@ so the rule asks and changes nothing. forge-merger's reading of
    new referencing merge asks once, and nothing reminds. An owner who
    leaves the line hears nothing more until another pull request for
    #N merges.
+   *Amended after v0.4.245 (agent-forge #560, #571):* that asked again
+   on every merge referencing a long-open #N, though the answer was the
+   same each time. The event is now each blocker's first merge after
+   the line was written, so an owner's one answer after it holds until
+   the lines change.
 4. **Where it sits.** In `route_issue`, after rule 14 and before rule
    24. In `route_pr`, where a pull request's rules have no other turn
    for its owner. It never takes a turn from a rule above it.

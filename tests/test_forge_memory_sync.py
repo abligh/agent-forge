@@ -3,7 +3,7 @@
 Real git, against a bare repository standing in for the memory
 repository, with two memory directories standing in for two hosts.
 Mocking git would test a model of git's rebase, and the properties that
-matter here are git's: that `MEMORY.md` merges as a union, that an
+matter here are git's: that `MEMORY.md` merges as text, that an
 aborted rebase leaves the working tree as it was, and that a refused
 push is told apart from a failed one.
 """
@@ -330,9 +330,41 @@ class Sync(FleetCase):
         self.assertEqual(self.fleet.run("one")[0], 0)
         status, out, err = self.fleet.run("two")
         self.assertEqual(status, 0, err)
-        self.assertEqual(out.strip(), "forge-memory-sync: pushed")
+        self.assertEqual(out.strip(), "forge-memory-sync: pushed "
+                         "(union of MEMORY.md)")
         self.assertEqual(self.fleet.remote_file("MEMORY.md"),
                          "- [A](a.md)\n- from one\n- from two\n")
+
+    def test_a_pruned_index_stays_pruned(self):
+        # agent-forge #566: one host deleted a block of the index, the
+        # other edited a line inside it; the union driver kept the block.
+        self.fleet.two_hosts()
+        block = "".join("- [B%d](b%d.md)\n" % (i, i) for i in range(6))
+        path = self.fleet.memory("one") / "MEMORY.md"
+        path.write_text(path.read_text() + block)
+        self.assertEqual(self.fleet.run("one")[0], 0)
+        self.assertEqual(self.fleet.run("two")[0], 0)
+        path.write_text("- [A](a.md)\n")
+        self.assertEqual(self.fleet.run("one")[0], 0)
+        mem2 = self.fleet.memory("two") / "MEMORY.md"
+        edited = mem2.read_text().replace("- [B3](b3.md)",
+                                          "- [B3](b3.md) edited")
+        mem2.write_text(edited)
+        status, _, err = self.fleet.run("two")
+        self.assertEqual(status, 1, err)
+        self.assertIn("conflict with the other hosts in: MEMORY.md", err)
+        self.assertEqual(self.fleet.remote_file("MEMORY.md"),
+                         "- [A](a.md)\n")
+        self.assertEqual(mem2.read_text(), edited)
+
+    def test_the_hosts_own_attributes_are_kept(self):
+        self.fleet.two_hosts()
+        info = Path(self.fleet.git_dir("one")) / "info" / "attributes"
+        info.write_text("*.bin -diff")
+        self.assertEqual(self.fleet.run("one")[0], 0)
+        self.assertEqual(self.fleet.run("one")[0], 0)
+        self.assertEqual(info.read_text(),
+                         "*.bin -diff\nMEMORY.md merge=text\n")
 
     def test_a_topic_file_edited_on_both_stops_and_loses_nothing(self):
         self.fleet.two_hosts()

@@ -113,8 +113,8 @@ STATS_WATCH_FIGURES = {
     "runs_per_merge": ("limit", "ratio", "short_hours"),
     # designs/0055, step 3: forge-stats' red predictions over merges.
     "red_train_tops_per_merge": ("limit", "ratio", "short_hours"),
-    "quick_run": ("limit", "ratio", "step", "short_hours"),
-    "quick_run_cpu": ("limit", "ratio", "step", "short_hours"),
+    "quick_run": ("limit", "ratio", "step", "part", "short_hours"),
+    "quick_run_cpu": ("limit", "ratio", "step", "part", "short_hours"),
     # The whole quick tier, beside a quick_run(_cpu) counting one step.
     "quick_tier_run": ("limit", "ratio", "short_hours"),
     "quick_tier_cpu": ("limit", "ratio", "short_hours")}
@@ -150,7 +150,7 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
 # checks.quick's context on the head and merges only trains.
 GATE_TIERS = ("head", "train")
 # merge.area_reviewers (designs/0058).
-AREA_REVIEWERS = {"ignore": list, "tell": bool}
+AREA_REVIEWERS = {"ignore": list, "tell": bool, "general": bool}
 # merge.code_owner_ask (agent-forge #153).
 CODE_OWNER_ASK = {"labels": list, "title": str}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
@@ -311,7 +311,10 @@ ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
           "stuck": dict, "owners": dict, "unreviewed": dict,
           "forget_minutes": int, "quiet_labels": list, "red_first": dict,
           "nightly_wake": dict, "issue_blocked_by": str, "escalate": dict,
-          "stale_blocker": bool, "review_waiting_heads": bool}
+          "stale_blocker": bool, "review_waiting_heads": bool,
+          "busy_backlog": dict}
+# router.busy_backlog (agent-forge #580).
+BUSY_BACKLOG = {"untouched_hours": int, "per_day": int}
 # router.escalate (designs/0049).
 ESCALATE = {"after_reminders": int, "undelivered_minutes": int,
             "label": str, "to": str}
@@ -642,6 +645,15 @@ def _check_stats_watch(watch, data, problems):
             elif key == "step":
                 if not isinstance(value, str) or not value.strip():
                     problems.append("%s.step must be a step's name" % at)
+            elif key == "part":
+                # agent-forge #548: one part of `step`, as its log's
+                # part lines name it (stats.part_line).
+                if not isinstance(value, str) or not value.strip():
+                    problems.append("%s.part must be a part's name" % at)
+                elif "step" not in rules:
+                    problems.append("%s.part needs %s.step" % (at, at))
+                elif not (data.get("stats") or {}).get("part_line"):
+                    problems.append("%s.part needs stats.part_line" % at)
             elif key == "short_hours":
                 if not _is(value, int) or not 1 <= value < hours:
                     problems.append("%s.short_hours must be a whole number "
@@ -776,6 +788,8 @@ def check(data):
                               problems)
         if isinstance(router.get("merge_notice"), dict):
             _check_merge_notice(router["merge_notice"], problems)
+        if isinstance(router.get("busy_backlog"), dict):
+            _check_busy_backlog(router["busy_backlog"], problems)
         if isinstance(router.get("stuck"), dict):
             _check_stuck(router["stuck"], problems)
         if isinstance(router.get("owners"), dict):
@@ -1192,6 +1206,11 @@ def _check_area_reviewers(merge, data, problems):
     if not any(isinstance(e, dict) and e.get("kind") == "reviewer"
                and e.get("reviews") for e in agents.values()):
         problems.append("%s needs a reviewer with reviews" % where)
+    if isinstance(setting, dict) and setting.get("general") is True and \
+            not any(isinstance(e, dict) and e.get("kind") == "reviewer"
+                    and not e.get("reviews") for e in agents.values()):
+        problems.append("%s.general needs a reviewer without reviews"
+                        % where)
 
 
 def _check_code_owner_ask(merge, problems):
@@ -2047,6 +2066,16 @@ def _check_merge_notice(notice, problems):
     if _is(notice.get("window_minutes"), int) and \
             notice["window_minutes"] < 1:
         problems.append("%s.window_minutes must be at least 1" % where)
+
+
+def _check_busy_backlog(busy, problems):
+    """router.busy_backlog: how long an agent's issue goes untouched
+    before she is reminded of it, and at most how often a day."""
+    where = "router.busy_backlog"
+    _fields(where, busy, BUSY_BACKLOG, problems)
+    for key in BUSY_BACKLOG:
+        if _is(busy.get(key), int) and busy[key] < 1:
+            problems.append("%s.%s must be at least 1" % (where, key))
 
 
 def _check_stuck(stuck, problems):
