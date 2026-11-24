@@ -202,7 +202,8 @@ class QuickRun(unittest.TestCase):
     def test_the_figures_and_their_rules(self):
         for name in ("quick_run", "quick_run_cpu"):
             self.assertEqual(config.STATS_WATCH_FIGURES[name],
-                             ("limit", "ratio", "step", "short_hours"))
+                             ("limit", "ratio", "step", "part",
+                              "short_hours"))
             self.assertNotIn(name, watch.FLOORS)
         self.assertIn("quick_run", watch.CONTENDED)
         self.assertIn("quick_tier_run", watch.CONTENDED)

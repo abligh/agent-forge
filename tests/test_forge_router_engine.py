@@ -970,6 +970,27 @@ class Forget(EngineCase):
         self.run_router((41, 43), when=later(minutes=62), forget_s=self.HOUR)
         self.assertEqual([s for s, _ in self.posts], ["TeamAnn"])
 
+    def test_a_decisions_keep_holds_its_own_turn(self):
+        # agent-forge #561: a turn no run decided for a while, with the
+        # same key when it came back, was woken again as new.
+        self.decide({41: [turn(41, "Ann", keep=self.HOUR)]})
+        self.run_router()
+        self.assertEqual(self.state()["items"]["41"]["keep_s"], self.HOUR)
+        self.decide()
+        self.run_router(when=later(minutes=30))
+        self.assertIn("41", self.state()["items"])
+        self.decide({41: [turn(41, "Ann", keep=self.HOUR)]})
+        self.run_router(when=later(minutes=40))
+        self.assertEqual(self.posts, [])
+        self.decide()
+        self.run_router(when=later(minutes=101))
+        self.assertEqual(self.state()["items"], {})
+
+    def test_keep_must_be_seconds(self):
+        self.decide({41: [turn(41, "Ann", keep="1h")]})
+        with self.assertRaises(ValueError):
+            self.run_router()
+
     def test_not_reminded_while_undecided(self):
         self.decide({41: [turn(41, "Ann")]})
         self.run_router(forget_s=10 * self.HOUR, remind_s=600)

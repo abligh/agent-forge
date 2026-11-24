@@ -59,6 +59,7 @@ TOP = {
     "stats": (dict, False),
     "nightly": (dict, False),
     "session_start": (dict, False),
+    "units": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
@@ -112,8 +113,8 @@ STATS_WATCH_FIGURES = {
     "runs_per_merge": ("limit", "ratio", "short_hours"),
     # designs/0055, step 3: forge-stats' red predictions over merges.
     "red_train_tops_per_merge": ("limit", "ratio", "short_hours"),
-    "quick_run": ("limit", "ratio", "step", "short_hours"),
-    "quick_run_cpu": ("limit", "ratio", "step", "short_hours"),
+    "quick_run": ("limit", "ratio", "step", "part", "short_hours"),
+    "quick_run_cpu": ("limit", "ratio", "step", "part", "short_hours"),
     # The whole quick tier, beside a quick_run(_cpu) counting one step.
     "quick_tier_run": ("limit", "ratio", "short_hours"),
     "quick_tier_cpu": ("limit", "ratio", "short_hours")}
@@ -538,6 +539,8 @@ def _check_queue(queue, problems):
 # forge-stats (agent-forge #548): `part_line` reads a step's own part
 # lines from its logs, a regex with named groups part, wall and cpu.
 STATS = {"part_line": str}
+# designs/0065: each named table of test units, for forge-units.
+UNITS = {"table": str, "glob": str, "trace_ignore": list}
 
 
 def _check_stats(stats, problems):
@@ -558,6 +561,29 @@ def _check_stats(stats, problems):
     if missing:
         problems.append("stats.part_line needs the named groups part, "
                         "wall and cpu (missing: %s)" % ", ".join(missing))
+
+
+def _check_units(units, problems):
+    """The `units` section (designs/0065): each name a table of test
+    units, its path and the glob that finds the units, both required;
+    `trace_ignore`, if present, a list of non-empty globs."""
+    if not isinstance(units, dict):
+        problems.append("units must be an object")
+        return
+    for name, entry in units.items():
+        where = "units.%s" % name
+        if not _fields(where, entry, UNITS, problems):
+            continue
+        for key in ("table", "glob"):
+            if key not in entry:
+                problems.append("%s: missing %r" % (where, key))
+            elif isinstance(entry[key], str) and not entry[key]:
+                problems.append("%s.%s must not be empty" % (where, key))
+        ignore = entry.get("trace_ignore")
+        if isinstance(ignore, list) and not all(
+                isinstance(g, str) and g for g in ignore):
+            problems.append("%s.trace_ignore must be a list of globs"
+                            % where)
 
 
 def _check_stats_watch(watch, data, problems):
@@ -619,6 +645,15 @@ def _check_stats_watch(watch, data, problems):
             elif key == "step":
                 if not isinstance(value, str) or not value.strip():
                     problems.append("%s.step must be a step's name" % at)
+            elif key == "part":
+                # agent-forge #548: one part of `step`, as its log's
+                # part lines name it (stats.part_line).
+                if not isinstance(value, str) or not value.strip():
+                    problems.append("%s.part must be a part's name" % at)
+                elif "step" not in rules:
+                    problems.append("%s.part needs %s.step" % (at, at))
+                elif not (data.get("stats") or {}).get("part_line"):
+                    problems.append("%s.part needs stats.part_line" % at)
             elif key == "short_hours":
                 if not _is(value, int) or not 1 <= value < hours:
                     problems.append("%s.short_hours must be a whole number "
@@ -941,6 +976,8 @@ def check(data):
         _check_stats(data["stats"], problems)
     if "nightly" in data:
         _check_nightly(data["nightly"], data, problems)
+    if "units" in data:
+        _check_units(data["units"], problems)
     docs = data.get("docs", {})
     for key, kinds in DOCS.items():
         if key in docs and not _is(docs[key], kinds):

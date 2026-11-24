@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Says which of a step's test units a head's changes reach.
+
+Some build-check steps are a pile of independent test files, each
+reading a few paths of the repository. A project keeps a table of what
+each one reads (designs/0065), names it in its configuration under
+`units`, and its step's runner asks this tool which to run:
+
+    forge-units select --units NAME --base REF [--head REF] [--why]
+    forge-units check --units NAME
+
+**The table** is a text file, one line each, `#` starting a comment:
+
+* `unit UNIT INPUT...`: a unit (a path from the root) and the paths it
+  reads, each a prefix or a glob whose `*` crosses `/`; `-` alone for
+  none;
+* `placed DIR`: a directory whose paths are read only as the entries
+  say;
+* `everything GLOB`: a path whose change selects every unit.
+
+**`select`** takes the paths changed between the merge base of `--base`
+and the head, by `git diff --name-only --no-renames` (so a renamed path
+counts by its old name and its new one), and prints the units they
+reach, one a line and nothing else. It fails closed: one line
+`ALL <why>` when a changed path matches an `everything` glob, lies
+outside every `placed` directory, or no merge base can be found, or the
+table can't be read. A unit the glob finds with no entry is always
+selected, and so is a unit whose own file changed. No unit reached
+prints nothing. `--why` writes what selected each unit, and a last line
+`selected N of M (P%)`, to stderr, for the check's log.
+
+**`check`** holds the table to the units: every unit the glob finds
+has an entry, every entry names a unit, every line parses.
+
+Exit 0 done (for `select`, `ALL` included), 1 `check` found a fault,
+2 the configuration names no such table or can't be read (`select`
+still prints `ALL`, so a runner that reads stdout runs everything).
+"""
+import argparse
+import fnmatch
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from agent_forge import config, proc  # noqa: E402
+
+GLOB_CHARS = "*?["
+
+
+class TableError(Exception):
+    """The table can't be parsed; `problems` lists each fault."""
+
+    def __init__(self, problems):
+        self.problems = list(problems)
+        super().__init__("; ".join(self.problems))
+
+
+class Table:
+    """A parsed table: `units` (unit -> list of inputs, in file order),
+    `placed` and `everything` (lists of patterns)."""
+
+    def __init__(self, units, placed, everything):
+        self.units = units
+        self.placed = placed
+        self.everything = everything
+
+
+def parse(text):
+    """The Table `text` holds; TableError listing every bad line."""
+    units, placed, everything, problems = {}, [], [], []
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].split()
+        if not line:
+            continue
+        kind, rest = line[0], line[1:]
+        where = "line %d" % number
+        if kind == "unit":
+            if len(rest) < 2:
+                problems.append("%s: `unit UNIT INPUT...` (`-` for none)"
+                                % where)
+                continue
+            unit, inputs = rest[0], rest[1:]
+            if "-" in inputs and len(inputs) > 1:
+                problems.append("%s: `-` must stand alone" % where)
+                continue
+            if unit in units:
+                problems.append("%s: %s has a second entry" % (where, unit))
+                continue
+            units[unit] = [] if inputs == ["-"] else inputs
+        elif kind in ("placed", "everything"):
+            if len(rest) != 1:
+                problems.append("%s: `%s` takes one path" % (where, kind))
+                continue
+            (placed if kind == "placed" else everything).append(rest[0])
+        else:
+            problems.append("%s: unknown line %r" % (where, kind))
+    if problems:
+        raise TableError(problems)
+    return Table(units, placed, everything)
+
+
+def covers(pattern, path):
+    """Whether `pattern` holds `path`: a glob (its `*` crossing `/`)
+    matches it or a directory above it; anything else is a prefix of
+    whole components."""
+    if any(c in pattern for c in GLOB_CHARS):
+        return (fnmatch.fnmatchcase(path, pattern) or
+                fnmatch.fnmatchcase(path, pattern.rstrip("/") + "/*"))
+    pattern = pattern.rstrip("/")
+    return path == pattern or path.startswith(pattern + "/")
+
+
+def found(paths, glob):
+    """The units `glob` finds among `paths`, sorted."""
+    return sorted(p for p in paths if fnmatch.fnmatchcase(p, glob))
+
+
+def choose(table, units, changed):
+    """(units to run, why each, None) or (None, None, why everything).
+
+    `units` are the units the glob finds; `changed` the changed paths.
+    A unit is chosen when its own file changed, an input holds a changed
+    path, or it has no entry."""
+    for path in changed:
+        hit = next((g for g in table.everything if covers(g, path)), None)
+        if hit:
+            return None, None, "%s changed (everything %s)" % (path, hit)
+    own = set(units) | set(table.units)
+    for path in changed:
+        if path in own:
+            continue
+        if not any(covers(d, path) for d in table.placed):
+            return None, None, "%s is in no placed directory" % path
+    chosen = {}
+    for unit in units:
+        if unit not in table.units:
+            chosen[unit] = "no entry"
+            continue
+        if unit in changed:
+            chosen[unit] = "%s changed" % unit
+            continue
+        for path in changed:
+            hit = next((i for i in table.units[unit] if covers(i, path)),
+                       None)
+            if hit:
+                chosen[unit] = "%s (input %s)" % (path, hit)
+                break
+    return sorted(chosen), chosen, None
+
+
+def git(run, root, *args):
+    return run(["git", *args], cwd=root)
+
+
+def settings(name, load):
+    """(root, entry) for the table `name`; ConfigError if none."""
+    project = load()
+    entry = project.section("units").get(name)
+    if entry is None:
+        raise config.ConfigError(["no units.%s in the configuration"
+                                  % name])
+    root = project.root
+    if root is None:
+        raise config.ConfigError(["the configuration isn't in a checkout"])
+    return root, entry
+
+
+def select(args, run, load, out, err):
+    def everything(why, code=0):
+        out("ALL %s" % why)
+        if args.why:
+            err("selected all: %s" % why)
+        return code
+
+    try:
+        root, entry = settings(args.units, load)
+    except config.ConfigError as error:
+        err("forge-units: %s" % error)
+        return everything("no table to read", 2)
+    head = args.head
+    base = git(run, root, "merge-base", args.base, head)
+    if base.returncode != 0 or not base.stdout.strip():
+        return everything("no merge base of %s and %s" % (args.base, head))
+    base = base.stdout.strip()
+    shown = git(run, root, "show", "%s:%s" % (head, entry["table"]))
+    if shown.returncode != 0:
+        return everything("no table %s at %s" % (entry["table"], head))
+    try:
+        table = parse(shown.stdout)
+    except TableError as error:
+        return everything("the table doesn't parse: %s" % error)
+    listed = git(run, root, "ls-tree", "-r", "--name-only", head)
+    diff = git(run, root, "diff", "--name-only", "--no-renames", base, head)
+    if listed.returncode != 0 or diff.returncode != 0:
+        return everything("git can't read %s" % head)
+    units = found(listed.stdout.splitlines(), entry["glob"])
+    changed = [p for p in diff.stdout.splitlines() if p]
+    chosen, why, all_why = choose(table, units, changed)
+    if all_why:
+        return everything(all_why)
+    for unit in chosen:
+        out(unit)
+    if args.why:
+        for unit in chosen:
+            err("%s: %s" % (unit, why[unit]))
+        total = len(units)
+        share = 100 * len(chosen) // total if total else 0
+        err("selected %d of %d (%d%%)" % (len(chosen), total, share))
+    return 0
+
+
+def check(args, run, load, out, err):
+    try:
+        root, entry = settings(args.units, load)
+    except config.ConfigError as error:
+        err("forge-units: %s" % error)
+        return 2
+    path = os.path.join(root, entry["table"])
+    try:
+        with open(path) as handle:
+            table = parse(handle.read())
+    except OSError as error:
+        err("forge-units: can't read %s: %s" % (entry["table"], error))
+        return 1
+    except TableError as error:
+        for problem in error.problems:
+            err("%s: %s" % (entry["table"], problem))
+        return 1
+    listed = git(run, root, "ls-files", "--cached", "--others",
+                 "--exclude-standard")
+    if listed.returncode != 0:
+        err("forge-units: git ls-files failed: %s" % listed.stderr.strip())
+        return 2
+    # The index may still hold a unit deleted from the tree.
+    units = [u for u in found(listed.stdout.splitlines(), entry["glob"])
+             if os.path.exists(os.path.join(root, u))]
+    faults = ["%s has no entry" % u for u in units if u not in table.units]
+    faults += ["%s's entry names no unit %s finds" % (u, entry["glob"])
+               for u in table.units if u not in units]
+    for fault in faults:
+        err("%s: %s" % (entry["table"], fault))
+    out("forge-units: %d unit(s), %d entr%s, %d fault(s)"
+        % (len(units), len(table.units),
+           "y" if len(table.units) == 1 else "ies", len(faults)))
+    return 1 if faults else 0
+
+
+def main(argv=None, run=proc.sh, load=config.load, out=print, err=None):
+    err = err or (lambda line: print(line, file=sys.stderr))
+    parser = argparse.ArgumentParser(prog="forge-units",
+                                     description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    one = sub.add_parser("select", help="print the units a head reaches")
+    one.add_argument("--units", required=True, metavar="NAME")
+    one.add_argument("--base", required=True, metavar="REF")
+    one.add_argument("--head", default="HEAD", metavar="REF")
+    one.add_argument("--why", action="store_true",
+                     help="say what selected each unit, on stderr")
+    two = sub.add_parser("check", help="hold the table to the units")
+    two.add_argument("--units", required=True, metavar="NAME")
+    args = parser.parse_args(argv)
+    command = select if args.command == "select" else check
+    return command(args, run, load, out, err)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
