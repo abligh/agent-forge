@@ -4,8 +4,8 @@
 directory is the working tree of one private repository, and
 `forge-memory-sync` keeps the hosts in step.** Each run commits what
 changed on the host, rebases onto what the other hosts pushed, and
-pushes. `MEMORY.md` merges as a union, and so does a conflict where
-both hosts only added lines to a memory file. Any other conflict stops
+pushes. A conflict where both hosts only added lines to a memory file,
+`MEMORY.md` included, merges as a union. Any other conflict stops
 that host's sync until a person or agent resolves it. Nothing is ever
 resolved by guessing.
 
@@ -28,6 +28,10 @@ configuration's `memory.dir`. Its git directory is `memory.git_dir`
 beside the memories. The one file the repository adds there is
 `.gitattributes`, which holds `MEMORY.md merge=union`.
 `forge-memory-check` reads only `*.md` files, so it doesn't see it.
+Each run overrides that line with `MEMORY.md merge=text` in the host's
+own `info/attributes`, which outranks it (agent-forge #566): the union
+driver kept both sides of a hunk that one host deleted and the other
+edited, so a pruned index came back whole, and nothing said so.
 
 A run:
 
@@ -35,8 +39,7 @@ A run:
    host's name in the message. A memory removed as wrong on one host is
    removed on all of them;
 2. fetches `origin` and rebases onto it. Changes to different files
-   merge as usual, and `MEMORY.md` keeps both hosts' lines even where
-   they touch the same place;
+   merge as usual, and so do changes to different places in one file;
 3. pushes. If another host pushed in between, or at the same moment
    ("cannot lock ref"), it rebases and pushes once more. A second
    refusal is left to the next run. A rebase that git won't start,
@@ -46,13 +49,16 @@ A run:
 If the rebase conflicts, it is aborted. That restores the working tree
 exactly, and the local commit is kept, so nothing written on this host
 is lost. **When every conflict is two hosts adding lines to a memory
-file** (`*.md`: two appends, two inserts after the same line), the run
+file** (`*.md`, `MEMORY.md` among them: two appends, two inserts after
+the same line), the run
 then merges the two as a union instead: the other hosts' lines, then
 this host's, in a merge commit, which it fast-forwards to (refusing if
 a file changed meanwhile) and pushes, `pushed (union of <files>)`. A
 front-matter `modified:` that each host set differently keeps the later
 time (agent-forge #157; Alex, 2026-11-12: a union only for memory files,
-whose entries are lines and whose order doesn't matter). Otherwise the
+whose entries are lines and whose order doesn't matter). A line one
+host deleted that the other edited is not that, so a prune of
+`MEMORY.md` against an edit stops. Otherwise the
 run exits 1, and on every later run the host goes on
 committing locally and stopping at the same conflict until someone
 resolves it (see [When a sync stops](#when-a-sync-stops)).
@@ -114,7 +120,8 @@ says it could not report.
 | Path | Written by | What it is |
 | --- | --- | --- |
 | `memory.git_dir` | `--seed`, then each run | The repository's git directory. `core.worktree` names the memory directory. |
-| `.gitattributes` in the memory directory | `--seed`, on the first host | `MEMORY.md merge=union`. |
+| `.gitattributes` in the memory directory | `--seed`, on the first host | `MEMORY.md merge=union`, which each host overrides. |
+| `info/attributes` in `memory.git_dir` | each run | `MEMORY.md merge=text` (agent-forge #566), after any lines already there. |
 | `memory.seed_dir` | `--seed` | A host's own copy of a topic file it had before seeding, which the repository's version replaced. |
 | `~/.local/state/agent-forge/<project>/memory-sync/filed.json` | `--file` | The message last reported on the issue, so an unchanged stop isn't reported twice. |
 
