@@ -251,6 +251,27 @@ class Judge(unittest.TestCase):
                                     (1500.0, 7), (1400.0, 600), 5)[0],
                          tool.IN)
 
+    def test_a_quick_run_figure_for_one_part_of_a_step(self):
+        # agent-forge #548: `part` reads forge-stats' steps_parts.
+        quick = {"n": 9, "median": 900.0,
+                 "steps": {"check": {"n": 9, "median": 800.0}},
+                 "steps_wall": {"check": {"n": 9, "median": 600.0}},
+                 "steps_parts": {"check": {"tests": {"n": 8,
+                                                     "median": 500.0}}},
+                 "steps_parts_wall": {"check": {"tests": {
+                     "n": 8, "median": 240.0}}}}
+        got = dict(stats(), check=dict(stats()["check"], quick_cpu=quick))
+        part = {"step": "check", "part": "tests"}
+        figures = tool.figures(got, 6, {"quick_run_cpu": part,
+                                        "quick_run": part})
+        self.assertEqual(figures["quick_run_cpu"], (500.0, 8))
+        self.assertEqual(figures["quick_run"], (4.0, 8))
+        self.assertEqual(tool.figures(got, 6, {"quick_run_cpu": {
+            "step": "check"}})["quick_run_cpu"], (800.0, 9))
+        self.assertEqual(tool.figures(got, 6, {"quick_run_cpu": {
+            "step": "check", "part": "gone"}})["quick_run_cpu"], (None, 0))
+        self.assertEqual(tool.figures(got, 6)["quick_run_cpu"], (900.0, 9))
+
     def test_too_few_samples_is_not_judged(self):
         for figure in ("check_run", "slots_busy", "merge_rate"):
             with self.subTest(figure=figure):

@@ -268,7 +268,10 @@ agents with nothing to do (off without it):
     plans the work knows, once a day while what the report says (all
     but the time) stays the same, and again when it changes (agent-forge
     #489: room traffic starts a new idle period with every wake, and the
-    same report came every few minutes). A collaborator works
+    same report came every few minutes). Its turn is kept for the day
+    (`keep`) even while the developer is busy for a while (agent-forge
+    #561: busy for one run, the turn was forgotten, and the next idle
+    period's same report went out again as new). A collaborator works
     on the project only when given something: idle with nothing of
     hers to do is where she is meant to be. Not for `report_to` itself, and not
     without `report_to`. With `idle_offer.hand_over_above` (designs/0038),
@@ -2006,7 +2009,7 @@ def idle_offers(ctx, skip=()):
             None, report_to, 16, report_event(agent, said, ctx),
             "%s has been idle since %s with nothing it can act on %s"
             % (agent, since_text(stamp, ctx.when), said),
-            reminder=ONCE))
+            reminder=ONCE, keep=REPORT_KEEP))
     return decisions
 
 
@@ -2021,6 +2024,10 @@ def report_event(agent, said, ctx):
     digest = hashlib.sha256(said.encode("utf-8")).hexdigest()[:12]
     return "%s %s %s" % (agent, ctx.when.strftime("%Y-%m-%d"), digest)
 
+
+# How long rule 16's turn is kept while no run decides it: its event
+# names the day, so a day covers it (agent-forge #561).
+REPORT_KEEP = 24 * 3600
 
 # How many held issues rule 16's report lists before "and K more".
 HELD_LIST = 15
