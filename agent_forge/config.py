@@ -310,7 +310,10 @@ ROUTER = {"rules": str, "idle_offer": dict, "merge_notice": dict,
           "stuck": dict, "owners": dict, "unreviewed": dict,
           "forget_minutes": int, "quiet_labels": list, "red_first": dict,
           "nightly_wake": dict, "issue_blocked_by": str, "escalate": dict,
-          "stale_blocker": bool, "review_waiting_heads": bool}
+          "stale_blocker": bool, "review_waiting_heads": bool,
+          "busy_backlog": dict}
+# router.busy_backlog (agent-forge #580).
+BUSY_BACKLOG = {"untouched_hours": int, "per_day": int}
 # router.escalate (designs/0049).
 ESCALATE = {"after_reminders": int, "undelivered_minutes": int,
             "label": str, "to": str}
@@ -750,6 +753,8 @@ def check(data):
                               problems)
         if isinstance(router.get("merge_notice"), dict):
             _check_merge_notice(router["merge_notice"], problems)
+        if isinstance(router.get("busy_backlog"), dict):
+            _check_busy_backlog(router["busy_backlog"], problems)
         if isinstance(router.get("stuck"), dict):
             _check_stuck(router["stuck"], problems)
         if isinstance(router.get("owners"), dict):
@@ -2019,6 +2024,16 @@ def _check_merge_notice(notice, problems):
     if _is(notice.get("window_minutes"), int) and \
             notice["window_minutes"] < 1:
         problems.append("%s.window_minutes must be at least 1" % where)
+
+
+def _check_busy_backlog(busy, problems):
+    """router.busy_backlog: how long an agent's issue goes untouched
+    before she is reminded of it, and at most how often a day."""
+    where = "router.busy_backlog"
+    _fields(where, busy, BUSY_BACKLOG, problems)
+    for key in BUSY_BACKLOG:
+        if _is(busy.get(key), int) and busy[key] < 1:
+            problems.append("%s.%s must be at least 1" % (where, key))
 
 
 def _check_stuck(stuck, problems):
