@@ -2156,6 +2156,12 @@ def scoped_too(accept, need):
     return both
 
 
+def globs_key(globs):
+    """A short digest of pull_requests.paths, kept with each judgment in
+    SCOPE_FILE so that a change to them has every head judged again."""
+    return hashlib.sha1(json.dumps(list(globs)).encode()).hexdigest()[:12]
+
+
 def in_scope(heads, state_dir, token, run=sh, out=print, when=None):
     """`heads`, less the pull requests' heads this instance doesn't run
     (PULL_REQUESTS, designs/0034): one is run when its pull request
@@ -2163,12 +2169,15 @@ def in_scope(heads, state_dir, token, run=sh, out=print, when=None):
     a head already judged here, is kept as it is: they are no new run.
     Each head's paths are read from GitHub once and remembered in
     SCOPE_FILE; a head whose paths can't be read is left out until they
-    can be, and a long one GitHub cuts short is run. A head left out is
-    said once, in verdicts.log. Returns (heads kept, [(pr, sha)] newly
+    can be, and a long one GitHub cuts short is run. A judgment made
+    under other paths than today's is made again, so a head widened
+    paths now match is queued (#576). A head left out is said once, in
+    verdicts.log. Returns (heads kept, [(pr, sha)] newly
     left out)."""
     if PULL_REQUESTS is None:
         return heads, []
     globs, label = PULL_REQUESTS
+    key = globs_key(globs)
     when = when or now_utc()
     path = os.path.join(state_dir, SCOPE_FILE)
     try:
@@ -2195,8 +2204,12 @@ def in_scope(heads, state_dir, token, run=sh, out=print, when=None):
         labelled = bool(label) and label in labels
         if labelled:
             entry["labelled"] = True
-        if "in" in was:
+        # A judgment is kept while the globs it was made under are the
+        # ones configured now; widened or narrowed, the head is judged
+        # again (#576).
+        if "in" in was and was.get("globs") == key:
             entry["in"] = was["in"]
+            entry["globs"] = key
         elif labelled:
             pass
         elif globs:
@@ -2205,8 +2218,11 @@ def in_scope(heads, state_dir, token, run=sh, out=print, when=None):
                 entry["in"] = touches(paths, globs)
             elif files_count(pr, token, run) >= FILES_LIMIT:
                 entry["in"] = True
+            if "in" in entry:
+                entry["globs"] = key
         else:
             entry["in"] = False
+            entry["globs"] = key
         if "in" not in entry and not labelled:
             out("SCOPE-UNKNOWN #%d %s: could not list its files; asked "
                 "again next tick" % (pr, sha[:10]))

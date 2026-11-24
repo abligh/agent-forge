@@ -376,6 +376,37 @@ class PullRequests(StateCase):
         self.assertEqual(self.file_calls(), [])
         self.assertEqual(sum("OUT-OF-SCOPE" in l for l in self.lines), 1)
 
+    def rescope(self, paths):
+        pc.configure(config.Project(with_mac(pull_requests=dict(
+            SCOPE, paths=paths)), None), "mac")
+
+    def test_widened_paths_judge_an_out_of_scope_head_again(self):
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(self.state()["waiting"], {})
+        self.rescope(list(SCOPE["paths"]) + ["web/*"])
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(sorted(self.state()["waiting"]), [base.SHA_B])
+        self.assertEqual(len(self.file_calls()), 1)
+
+    def test_still_out_after_a_change_is_not_said_again(self):
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.rescope(list(SCOPE["paths"]) + ["other/*"])
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(self.state()["waiting"], {})
+        self.assertEqual(sum("OUT-OF-SCOPE" in l for l in self.lines), 1)
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(self.file_calls(), [])
+
+    def test_narrowing_or_a_label_change_queues_nothing(self):
+        self.tick([(8, base.SHA_B, "false", [])])
+        pc.configure(config.Project(with_mac(pull_requests=dict(
+            SCOPE, label="Check:other")), None), "mac")
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(self.file_calls(), [])
+        self.rescope(["desktop/mac/*"])
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(self.state()["waiting"], {})
+
     def test_a_head_whose_files_cant_be_read_waits_for_them(self):
         self.tick([(7, base.SHA_A, "false", [])], files_rc=1)
         self.assertEqual(self.state()["waiting"], {})
