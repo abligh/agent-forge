@@ -8047,6 +8047,64 @@ class AreaReviewers(RepoCase):
         self.assertIsNotNone(m.approval_of(item))
         self.assertIsNotNone(self.wait(item))
 
+    # merge.area_reviewers.general (agent-forge #573).
+    GENERAL = {"Generalist": {"app_id": 106, "installation_id": 206,
+                              "kind": "reviewer"}}
+
+    def general_pr(self, reviews=()):
+        """A change to web/ and to a path no area claims, approved by
+        UIReviewer alone unless `reviews` adds to that."""
+        self.repo.branch("area7", "origin/main")
+        os.makedirs(os.path.join(self.repo.path, "web"), exist_ok=True)
+        self.repo.commit("web/x.txt", "x\n", "web")
+        sha = self.repo.commit("other.txt", "x\n", "other")
+        self.repo.publish_pr(7, sha)
+        self.repo.branch("feature", "feature")
+        return pr(7, T1, head=sha, reviews=[review(self.UI, oid=sha)] + [
+            review(who, oid=sha, at=T2) for who in reviews])
+
+    def test_general_off_an_areas_approval_is_the_general_one(self):
+        m.configure(area_project(self.GENERAL))
+        self.assertIsNone(m.AREA_GENERAL)
+        self.assertIsNone(self.wait(self.general_pr()))
+
+    def test_general_a_path_outside_every_area_waits_for_her(self):
+        m.configure(area_project(self.GENERAL,
+                                 area_reviewers={"general": True}))
+        self.assertEqual(m.AREA_GENERAL[0], ("Generalist",))
+        self.assertEqual(self.wait(self.general_pr()),
+                         "waits for Generalist (outside every area): "
+                         "other.txt")
+        self.assertIsNone(self.wait(self.general_pr(
+            reviews=["generalistwidgetagent"])))
+
+    def test_general_does_not_clear_an_area(self):
+        m.configure(area_project(self.GENERAL,
+                                 area_reviewers={"general": True}))
+        item = self.general_pr(reviews=["generalistwidgetagent"])
+        item["reviews"] = item["reviews"][1:]
+        self.assertEqual(self.wait(item),
+                         "waits for UIReviewer (web/**): web/x.txt")
+
+    def test_general_an_area_only_change_needs_no_general_approval(self):
+        m.configure(area_project(self.GENERAL,
+                                 area_reviewers={"general": True}))
+        item = self.area_pr(reviews=[review(self.UI, at=T2)])
+        self.assertIsNone(self.wait(item))
+
+    def test_general_with_no_general_reviewer_is_off(self):
+        m.configure(area_project(area_reviewers={"general": True}))
+        self.assertIsNone(m.AREA_GENERAL)
+
+    def test_general_is_not_told_through_the_relay(self):
+        sent = []
+        with tempfile.TemporaryDirectory() as state:
+            m.tell_areas(state, {7: ("a" * 40, "t", [
+                (("Generalist",), m.GENERAL_GLOB, "other.txt", 1),
+                (("UIReviewer",), "web/**", "web/x.txt", 1)])},
+                lambda name, text: sent.append(name), lambda line: None)
+        self.assertEqual(sent, ["UIReviewer"])
+
     def test_identical_globs_are_one_area(self):
         m.configure(area_project({"UIReviewer2": {
             "app_id": 105, "installation_id": 205, "kind": "reviewer",

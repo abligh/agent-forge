@@ -1,6 +1,8 @@
 # 0058: The Merger waits for each area's reviewer
 
 * Status: approved (Alex Bligh, 2026-11-16, on #463: "approved"), with its three choices as proposed
+* Amended: 2026-11-24, `general` (agent-forge #573; Alex Bligh chose
+  option B, recorded on #573); see the amendment at the end
 * Author: XMPPEngineer
 * Date: 2026-11-16
 * Issue: #460
@@ -177,3 +179,39 @@ The reviews are already fetched.
 * A train never boards a held member.
 * Without the key, the Merger's decisions are unchanged (`make
   replay-compare` shows no difference).
+
+## Amendment (2026-11-24): `general`
+
+Proposed in agent-forge #573, where Alex chose option B: opt-in, with
+the default above unchanged.
+
+**What happened.** A pull request that changed a specialist's area and
+other paths too merged on the specialist's approval alone, because
+"one review can be both" (above). The general reviewer hadn't read the
+rest. Nothing went wrong that time, but the only guard was a habit
+every reviewer had to keep: a specialist comments, or arms her
+approval to wait for the general reviewer's.
+
+**The change.** `merge.area_reviewers.general: true` adds one more
+area, **outside every area**: the paths that no reviewer's `reviews`
+globs match and no `ignore` glob matches. Its reviewers are the
+reviewers with no `reviews` globs (the ones the routing already sends
+those paths to), and an `away` one's stand-in counts, as for any
+area. Its approval is judged exactly as an area's is: the newest
+verdict, `APPROVED`, at a commit that covers the head, never the
+author's.
+
+So, with it on:
+
+* a specialist's approval clears only her area. A pull request that
+  also changes other paths waits for a general reviewer, `waits for
+  Reviewer (outside every area): src/a.rs and 2 more`;
+* a general reviewer's approval doesn't clear a specialist's area,
+  as before;
+* a pull request inside one area needs only that area's approval, as
+  before.
+
+`tell` wakes only an area's reviewer: the routing already sends the
+pull request to the general one. `forge-config check` refuses
+`general` without a reviewer that has no `reviews`. Left out, or
+`false`, 0058 is unchanged.

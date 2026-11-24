@@ -688,7 +688,7 @@ merge with `gh pr merge N --match-head-commit <head>`.
 
 ### `merge.area_reviewers`
 
-With `area_reviewers: true`, or `{"ignore": [...], "tell": ...}`
+With `area_reviewers: true`, or `{"ignore": [...], "tell": ..., "general": ...}`
 ([designs/0058](designs/0058-the-merger-waits-for-each-areas-reviewer.md)),
 `agents.<name>.reviews` decides what merges as well as who
 reviews. A candidate that changes, since the default branch, a path
@@ -717,7 +717,15 @@ tried on the next tick. Nothing is posted on GitHub and no issue is
 opened; `false` leaves the hold silent. `forge-config check` refuses it
 without a reviewer that has `reviews`, an `ignore` entry that isn't a
 non-empty string, and a `tell` that isn't a boolean. Off by default
-(`false` or left out): `reviews` only routes.
+(`false` or left out): `reviews` only routes. With `general: true`
+(agent-forge #573, the amendment to designs/0058), an area reviewer's
+approval stops standing in for the general one: a path no area's globs
+match (and no `ignore` glob does) waits for a reviewer with no
+`reviews`, judged as an area's reviewer is, `waits for Reviewer
+(outside every area): src/a.rs`. That reviewer isn't woken by `tell`,
+since the routing already sends her the pull request. `forge-config
+check` refuses `general` without a reviewer that has no `reviews`.
+Off by default.
 
 ### `merge.code_owners`
 
