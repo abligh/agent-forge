@@ -112,8 +112,8 @@ STATS_WATCH_FIGURES = {
     "runs_per_merge": ("limit", "ratio", "short_hours"),
     # designs/0055, step 3: forge-stats' red predictions over merges.
     "red_train_tops_per_merge": ("limit", "ratio", "short_hours"),
-    "quick_run": ("limit", "ratio", "step", "short_hours"),
-    "quick_run_cpu": ("limit", "ratio", "step", "short_hours"),
+    "quick_run": ("limit", "ratio", "step", "part", "short_hours"),
+    "quick_run_cpu": ("limit", "ratio", "step", "part", "short_hours"),
     # The whole quick tier, beside a quick_run(_cpu) counting one step.
     "quick_tier_run": ("limit", "ratio", "short_hours"),
     "quick_tier_cpu": ("limit", "ratio", "short_hours")}
@@ -616,6 +616,15 @@ def _check_stats_watch(watch, data, problems):
             elif key == "step":
                 if not isinstance(value, str) or not value.strip():
                     problems.append("%s.step must be a step's name" % at)
+            elif key == "part":
+                # agent-forge #548: one part of `step`, as its log's
+                # part lines name it (stats.part_line).
+                if not isinstance(value, str) or not value.strip():
+                    problems.append("%s.part must be a part's name" % at)
+                elif "step" not in rules:
+                    problems.append("%s.part needs %s.step" % (at, at))
+                elif not (data.get("stats") or {}).get("part_line"):
+                    problems.append("%s.part needs stats.part_line" % at)
             elif key == "short_hours":
                 if not _is(value, int) or not 1 <= value < hours:
                     problems.append("%s.short_hours must be a whole number "

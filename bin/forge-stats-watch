@@ -346,13 +346,20 @@ def figures(stats, hours, watched=None):
            else cpu.get("total")) or {}
     # The quick run's figures can count one step alone (a budget for
     # that step), as main_cpu can.
+    # With `part` too, one part of that step, as its log names it
+    # (agent-forge #548).
     quick = check.get("quick_cpu") or {}
-    step = ((watched or {}).get("quick_run_cpu") or {}).get("step")
-    quick_cpu = ((quick.get("steps") or {}).get(step) or {}) if step \
-        else quick
-    step = ((watched or {}).get("quick_run") or {}).get("step")
-    quick_wall = (((quick.get("steps_wall") or {}).get(step) or {"n": 0})
-                  if step else None)
+
+    def one(figure, steps, parts):
+        rules = (watched or {}).get(figure) or {}
+        step, part = rules.get("step"), rules.get("part")
+        if part:
+            return ((quick.get(parts) or {}).get(step) or {}).get(part) \
+                or {"n": 0}
+        return ((quick.get(steps) or {}).get(step) or {"n": 0}) if step \
+            else None
+    quick_cpu = one("quick_run_cpu", "steps", "steps_parts") or quick
+    quick_wall = one("quick_run", "steps_wall", "steps_parts_wall")
 
     tier_ran = ((check.get("tiers") or {}).get("quick") or {}).get("ran") or {}
 
@@ -527,6 +534,8 @@ class Watch:
 
     def rules_text(self, figure, rules):
         parts = ["step `%s`" % rules["step"]] if "step" in rules else []
+        if "part" in rules:
+            parts.append("part `%s`" % rules["part"])
         if "limit" in rules:
             parts.append("limit %s" % show(figure, rules["limit"]))
         if "ratio" in rules:
