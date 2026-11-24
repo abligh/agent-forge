@@ -37,8 +37,11 @@ A run:
 2. fetches `origin` and rebases onto it. Changes to different files
    merge as usual, and `MEMORY.md` keeps both hosts' lines even where
    they touch the same place;
-3. pushes. If another host pushed in between, it rebases and pushes
-   once more. A second refusal is left to the next run.
+3. pushes. If another host pushed in between, or at the same moment
+   ("cannot lock ref"), it rebases and pushes once more. A second
+   refusal is left to the next run. A rebase that git won't start,
+   because a session wrote a memory after the commit, gets that
+   commit too and one more try.
 
 If the rebase conflicts, it is aborted. That restores the working tree
 exactly, and the local commit is kept, so nothing written on this host

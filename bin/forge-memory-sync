@@ -69,7 +69,10 @@ HELPER = ("!f() { echo username=x-access-token; "
           "echo \"password=$GH_TOKEN\"; }; f")
 # What a refused push says when the other host pushed first, as against
 # a push refused for want of access, which no retry mends.
-BEHIND = ("fetch first", "non-fast-forward", "[rejected]")
+# "cannot lock ref": another host's push to the same branch landed at
+# the same moment (two hosts' runs at the same minute). It is a race like
+# the others, and the rebase-and-push-once-more answers it.
+BEHIND = ("fetch first", "non-fast-forward", "[rejected]", "cannot lock ref")
 # One git command's bound: a network that stops answering would
 # otherwise hold the cron job, and its lock, indefinitely.
 GIT_TIMEOUT_S = 120
@@ -155,6 +158,18 @@ def rebase(git, cfg):
     r = git("rebase", "-q", "origin/" + cfg["branch"], check=False)
     if r.returncode == 0:
         return []
+    if not rebase_in_progress(cfg):
+        # The rebase never started: git refuses one over uncommitted
+        # changes, and a session can write a memory between our commit
+        # and the rebase. Commit that too and try once more; aborting
+        # here would fail with "No rebase in progress?".
+        commit_local(git, cfg)
+        r = git("rebase", "-q", "origin/" + cfg["branch"], check=False)
+        if r.returncode == 0:
+            return []
+        if not rebase_in_progress(cfg):
+            raise Stop(COULD_NOT_ASK, "git rebase failed: %s"
+                       % (r.stderr or r.stdout).strip()[:300])
     files = git("diff", "--name-only", "--diff-filter=U",
                 check=False).stdout.split()
     git("rebase", "--abort")

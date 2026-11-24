@@ -454,6 +454,47 @@ class Sync(FleetCase):
         self.assertEqual((status, len(pushes)), (1, 2))
         self.assertIn("push refused twice", err)
 
+    def test_a_push_that_loses_a_ref_lock_race_is_retried(self):
+        # Two hosts pushing in the same second: GitHub refuses one with
+        # "cannot lock ref", which is a race like "fetch first".
+        self.fleet.two_hosts()
+        self.fleet.memory("two", {"b.md": "b\n"})
+        pushes = []
+
+        def run(args, **kw):
+            if "push" in args and not pushes:
+                pushes.append(1)
+                return subprocess.CompletedProcess(
+                    args, 1, "", " ! [remote rejected]   HEAD -> main "
+                    "(cannot lock ref 'refs/heads/main': is at 3f9b "
+                    "but expected c9a9)")
+            return proc.sh(args, **kw)
+        status, out, err = self.fleet.run("two", run=run)
+        self.assertEqual(status, 0, err)
+        self.assertIn("pushed", out)
+        self.assertEqual(self.fleet.remote_file("b.md"), "b\n")
+
+    def test_a_memory_written_during_the_run_is_committed_not_fatal(self):
+        # A session writes a memory between the commit and the rebase:
+        # git refuses to start the rebase over the change, and there is
+        # no rebase to abort.
+        self.fleet.two_hosts()
+        self.fleet.memory("one", {"c.md": "c\n"})
+        self.fleet.run("one")
+        self.fleet.memory("two", {"b.md": "b\n"})
+        written = []
+
+        def run(args, **kw):
+            if "rebase" in args and "--abort" not in args and not written:
+                written.append(1)
+                self.fleet.memory("two", {"b.md": "b, then more\n"})
+            return proc.sh(args, **kw)
+        status, out, err = self.fleet.run("two", run=run)
+        self.assertEqual(status, 0, err)
+        self.assertIn("pushed", out)
+        self.assertEqual(self.fleet.remote_file("b.md"), "b, then more\n")
+        self.assertEqual(self.fleet.remote_file("c.md"), "c\n")
+
     def test_a_push_refused_for_access_is_not_retried(self):
         self.fleet.two_hosts()
         self.fleet.memory("two", {"b.md": "b\n"})
