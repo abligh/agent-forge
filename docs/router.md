@@ -116,6 +116,15 @@ changes, the old turn is kept beside the new one until its
 old value within that time, it is the old turn again and isn't woken.
 A module whose events only move forward never sees this.
 
+**A turn kept by its decision.** A decision's `keep` (seconds, default
+0) does the same for its own turn, whatever `forget_minutes` says: the
+turn is recorded with `keep_s`, and a run that doesn't decide it
+forgets it only once the longer of `keep_s` and `forget_minutes` has
+passed since its `decided_at`. It suits a turn about no item whose
+event stays the same while its subject comes and goes, such as the
+default rules' report on an idle developer (rule 16), which a short
+busy spell would otherwise make new again.
+
 **A turn already woken.** A decision whose `woken` says why (`"Woke:
 comment 6390…"`) is one someone woke some other way. When its turn is
 new it isn't sent: it is recorded as woken at this run's time,
