@@ -83,18 +83,23 @@ is an error.
 ### `forge-units select --units NAME --base REF [--head REF]`
 
 Takes the paths changed between the merge base of `REF` and the head
-(default `HEAD`), as `git diff --name-only` gives them, and prints:
+(default `HEAD`), as `git diff --name-only --no-renames` gives them,
+so that a renamed or deleted path counts by its old name as well as
+its new one, and prints on stdout, one unit a line and nothing else:
 
 * `ALL <why>`, one line, when a path matches `everything`, or no
   `placed` directory and no `everything` glob holds it;
 * otherwise each unit with an input that holds a changed path, and
   each unit with no entry, one a line;
+* `ALL <why>` too when no merge base can be found (a shallow clone, an
+  unrelated base): fail closed, never exit 1 for it;
 * nothing, with exit 0, when no unit's inputs changed. The project's
   runner then passes and says so.
 
-`--why` adds, after each unit, the changed path that selected it, for
-the check's log. The tool reads only git and the table; it runs no
-test and needs no network.
+`--why` writes, for each unit, the changed path that selected it, and
+a last line `selected N of M (P%)`, to stderr, for the check's log;
+stdout stays a list a runner can read one unit a line. The tool reads
+only git and the table; it runs no test and needs no network.
 
 ### `forge-units trace --units NAME -- COMMAND...`
 
@@ -111,9 +116,12 @@ directory. A read no input of the unit covers is a finding.
 **git is a reader too.** A unit that runs `git ls-files`, `git grep`,
 `git diff` or `git show` reads through `.git/`, which the trace sees
 only as the index. Each such `execve` is a finding unless its
-pathspecs, read from its arguments, are covered by the unit's inputs.
-One with no pathspec needs `*` as an input, which selects the unit for
-every change.
+pathspecs, read from its arguments and resolved against the
+process's working directory and any `-C`, are covered by the unit's
+inputs. A git reached through a helper script is still an `execve`
+under `-f`, so it is seen. One with no pathspec needs `*` as an input,
+which selects the unit for every change; for one unit that lists
+every tracked file, that is right and cheap.
 
 It prints a line per finding, `UNIT reads PATH (not in its entry)`,
 then the `unit` lines that would cover them, and exits 1 if there were
@@ -132,16 +140,17 @@ project can run it in the check itself.
 
 * `table`, the table's path from the root (required);
 * `glob`, the units (required);
-* `trace_ignore`, globs the trace ignores (default none).
+* `trace_ignore`, globs the trace ignores: what a unit writes inside
+  the repository and reads back (default `__pycache__/`, `target/`).
 
 Inert until present. The check host needs `strace` for `trace` only.
 
 ### Statistics
 
-`select` prints a last line, `selected N of M (P%)`, that a project's
-runner can leave in its step's log; `forge-stats` reads it from the
-check-head log when present, as `units_selected`, so the saving is
-measured, not estimated.
+`select --why`'s last stderr line, `selected N of M (P%)`, lands in
+the step's log; `forge-stats` reads it from the check-head log when
+present, as `units_selected`, so the saving is measured, not
+estimated.
 
 ## What a project does to use it
 
