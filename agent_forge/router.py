@@ -151,7 +151,11 @@ class Decision:
     configuration's fixed `relay.remind_seconds`. `woken` says why the
     agent already knows (someone woke her some other way): a new turn
     with it is recorded as woken, not sent; on a turn already recorded
-    it changes nothing."""
+    it changes nothing. `keep` (seconds) keeps the turn recorded that
+    long after the last run that decided it, though no run decides it
+    meanwhile, where that is longer than `router.forget_minutes`: a
+    turn that lapses for a while and comes back with the same key is
+    then not woken again as new."""
     item: int | None
     agent: str | None
     rule: Any
@@ -162,6 +166,7 @@ class Decision:
     actions: tuple = ()
     reminder: Any = None
     woken: str | None = None
+    keep: int = 0
 
 
 @dataclasses.dataclass(frozen=True)

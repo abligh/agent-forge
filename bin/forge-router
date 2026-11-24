@@ -54,7 +54,8 @@ none, once `relay.remind_seconds` (default 7200;
 appends every wake sent, failed, withheld or withdrawn, with the
 reason. A turn no run decides is forgotten, or, with
 `router.forget_minutes`, kept until that long after the last run that
-decided it (`decided_at`), so an item that flaps is woken once. A
+decided it (`decided_at`), so an item that flaps is woken once; a
+decision's `keep` does the same for its own turn, for that long. A
 decision whose `woken` says the agent was woken some other way is, as
 a new turn, recorded as woken and journalled as `marked woken: <why>`,
 not sent.
@@ -486,6 +487,8 @@ def find(items, decision):
 def record(items, decision, entry):
     """Record `entry` as `decision`'s turn, in place of what was."""
     key = item_key(decision)
+    if decision.keep:
+        entry = dict(entry, keep_s=decision.keep)
     put_entries(items, key, [e for e in entries(items, key)
                              if not same_turn(e, decision)] + [entry])
 
@@ -497,7 +500,9 @@ def prune(items, live, only, held=(), when=None, forget_s=0):
     A key in `held` had a wake that stays due, and is left as it was, as
     a failed wake always has been. With `forget_s` (seconds), a turn
     not decided is kept until that long after the last run that decided
-    it (`recent`), and a run `only` some items forgets nothing."""
+    it (`recent`), and a run `only` some items forgets nothing. A turn
+    recorded with a `keep_s` of its own (a decision's `keep`) is kept
+    for the longer of the two."""
     if forget_s and only:
         return
     for key in list(items):
@@ -506,7 +511,16 @@ def prune(items, live, only, held=(), when=None, forget_s=0):
         put_entries(items, key, [e for e in entries(items, key)
                                  if any(same_turn(e, d)
                                         for d in live.get(key, ()))
-                                 or recent(e, when, forget_s)])
+                                 or recent(e, when,
+                                           max(forget_s, kept_for(e)))])
+
+
+def kept_for(entry):
+    """The seconds a recorded turn's own `keep_s` keeps it, or 0."""
+    try:
+        return max(int(entry.get("keep_s") or 0), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def recent(entry, when, forget_s):
@@ -726,6 +740,9 @@ def check(decision):
         problem = "its reminder is not a Reminder"
     elif d.woken is not None and not isinstance(d.woken, str):
         problem = "its woken is not a string or None"
+    elif not isinstance(d.keep, int) or isinstance(d.keep, bool) \
+            or d.keep < 0:
+        problem = "its keep is not a number of seconds"
     elif d.actions and d.agent is None and d.kind != "surface":
         problem = "nobody's turn has no key to do its actions once for"
     elif (d.agent is not None and d.suppressed is None
