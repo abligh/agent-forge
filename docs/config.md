@@ -1404,7 +1404,9 @@ same turn, not woken again, and its reminders count on. It isn't
 reminded while it is undecided. An `--only` run then forgets nothing.
 Each recorded turn keeps `decided_at` in `state.json`; one recorded
 before has its `woken_at` used. An integer, at least 0; 0, the
-default, forgets at once. docs/router.md has the detail.
+default, forgets at once. A rule may keep one turn longer with its
+decision's `keep` (the default rules' rule 16 keeps its report for the
+day). docs/router.md has the detail.
 
 ### `router.escalate`
 
