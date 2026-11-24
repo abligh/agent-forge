@@ -732,6 +732,26 @@ class ReviewedHeads(StateCase):
             "UPDATED mac #7 bbbbbbbbbb: only merges main into aaaaaaaaaa, "
             "judged here; not run"])
 
+    def test_a_merge_of_main_into_a_red_head_is_run(self):
+        # #575: the merge may be what fixes the red, so it isn't carried.
+        state = self.state()
+        state["results"][base.SHA_A] = {"pr": 7, "ok": False,
+                                        "failed": ["test-mac"],
+                                        "finished": pc.iso(T0),
+                                        "posted": True}
+        self.write_state(state)
+        self.approvers[7] = [self.REVIEWER]
+        tip = "9" * 40
+
+        def parents(args):
+            return base.done(args, 0, "%s %s %s\n" % (base.SHA_B, base.SHA_A,
+                                                      tip))
+        git = ((lambda a: a[:1] == ["git"] and "--parents" in a, parents),)
+        self.tick([(7, base.SHA_B, "false", [])],
+                  checkout=self.state_dir, git=git)
+        self.assertIn(base.SHA_B, self.state()["waiting"])
+        self.assertEqual(self.said("UPDATED"), [])
+
     def test_drafts_and_judged_heads_are_as_before(self):
         state = self.state()
         state["results"][base.SHA_B] = {"pr": 8, "ok": True, "failed": [],

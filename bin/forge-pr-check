@@ -36,10 +36,10 @@ it`, and logged `UNREVIEWED #<pr> <sha>` once; a release is logged
 asked by <login>`). A waiting head's approvals are read every tick; an
 approval found stays in approved.json while the pull request is open,
 so a later push is run at once. A head that only merges the default
-branch into a head judged here is not run (`UPDATED`): the Merger takes
-the earlier verdict for it. A run already started is never stopped for
-a release taken back. Which heads were held, released or updated is
-kept in reviewed.json.
+branch into a head judged green here is not run (`UPDATED`): the
+Merger takes the earlier verdict for it. A run already started is
+never stopped for a release taken back. Which heads were held,
+released or updated is kept in reviewed.json.
 
 **The cron tick returns at once and the check runs detached.**
 `forge-cron-run` holds locks while a job runs, so a long test run under
@@ -2224,7 +2224,9 @@ def updated_from(sha, pr, results, checkout, run=sh):
     of a commit on the default branch into it, or into a commit that is
     one in turn, back at most UPDATE_DEPTH merges. The Merger's gate
     takes that head's verdict for sha (`instance_verdict`), so a run of
-    sha would gate nothing. Read in the cron `checkout`, fetching the
+    sha would gate nothing. Only a green verdict is taken: over a red
+    one, the merge may be what fixes it, so sha is run (#575). Read in
+    the cron `checkout`, fetching the
     head first if it doesn't have it; None whenever git can't say, so a
     head is never left unrun for want of an answer."""
     def have():
@@ -2246,7 +2248,9 @@ def updated_from(sha, pr, results, checkout, run=sh):
             return None
         commit = parents[1]
         if commit in results:
-            return commit
+            # A red verdict isn't carried over (#575): the merge may be
+            # the fix, so the head runs as any other.
+            return commit if results[commit].get("ok") else None
     return None
 
 
@@ -2296,7 +2300,8 @@ def reviewed(heads, state_dir, approved, by, busy, when, token=None, run=sh,
     a slot is running (a release taken back never stops a run) and one
     labels.rerun queued again are kept as they are. A new head that
     only merges the default branch into a head judged here is never
-    run (`updated_from`), and is logged UPDATED once. A held head is
+    run (`updated_from`), and is logged UPDATED once; one that merges
+    it into a head judged red here runs. A held head is
     logged UNREVIEWED once, and a release RELEASED once.
 
     Returns (heads kept, [(pr, sha, what)] still to do on GitHub):

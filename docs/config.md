@@ -1708,11 +1708,13 @@ a reviewer approves or arms it)`. `verdicts.log` says `UNREVIEWED #<pr>
 queued as any new head. A waiting head's reviews are read every tick,
 not every 5 minutes, and an approval found stays in `approved.json`
 while the pull request is open, so a later push is run at once. A new
-head that only merges the default branch into a head judged here is
-not run, since the Merger's gate takes that head's verdict for it; it
-is logged `UPDATED` once. A run already started is never stopped
-because a release was taken back (the armed label coming off without
-an approval); a head not yet started waits again. The early label
+head that only merges the default branch into a head judged green
+here is not run, since the Merger's gate takes that head's verdict
+for it; it is logged `UPDATED` once. Over a red verdict it is run as
+any new head, since the merge may be what fixes it. A run already
+started is never stopped because a release was taken back (the armed
+label coming off without an approval); a head not yet started waits
+again. The early label
 releases the head it is on, for good, and is taken off, as
 `labels.rerun` is; a later push needs it again. `RELEASED` names who
 put it on, and the poster's App needs `issues: write`. Anyone with
