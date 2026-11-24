@@ -1196,6 +1196,25 @@ class Tail(unittest.TestCase):
             "[23 earlier lines left out]"])
         self.assertEqual(got[3:], text.splitlines()[-pc.TAIL_LINES:])
 
+    def test_a_python_unittest_failure_above_the_tail_is_kept(self):
+        # A step that runs many test files side by side reports a failed
+        # one long before the step's last lines, which are another
+        # step's build output.
+        text = ("....F....\n"
+                "FAIL: test_x (test_tool.References.test_x)\n"
+                "AssertionError: Lists differ\n"
+                + "".join("Checking crate%d\n" % i for i in range(50))
+                + "  FAILED tools/test_tool.py\n"
+                "    FAIL: test_x (test_tool.References.test_x): - 'a.rs:3'\n"
+                "ERROR: test_y (test_tool.Other.test_y)\n"
+                + "".join("Checking more%d\n" % i for i in range(50)))
+        got = pc.tail(text).splitlines()
+        self.assertEqual(got[:3], [
+            "FAIL: test_x (test_tool.References.test_x)",
+            "    FAIL: test_x (test_tool.References.test_x): - 'a.rs:3'",
+            "ERROR: test_y (test_tool.Other.test_y)"])
+        self.assertTrue(got[3].startswith("["))
+
     def test_a_subtest_failure_and_a_panic_are_kept(self):
         text = ("    --- FAIL: TestX/sub (0.00s)\n"
                 "panic: runtime error: index out of range\n"
