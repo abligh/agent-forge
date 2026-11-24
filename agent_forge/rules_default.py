@@ -50,6 +50,8 @@ for its event, never reminded:
 Then:
 
 1. a draft, or waiting on the owner or on someone outside: nobody's;
+   so is the Merger's own train (head branch `merge.ahead.train_branch`,
+   default `forge/train-`), which has no commit of its own to review;
 2. a Merger hand-back of the current head is the newest thing said (a
    comment by the Merger, "Not merging <head>:" (or "Not merging <head>
    yet:", a stacked layer's conflict with the head beneath it), newer than every review
@@ -975,6 +977,9 @@ def route_pr_rules(pr, roster, when=None):
     # Rule 1.
     if pr.get("isDraft"):
         return nobody(n, 1, "draft")
+    branch = pr.get("headRefName") or ""
+    if merger.TRAIN_BRANCH and branch.startswith(merger.TRAIN_BRANCH):
+        return nobody(n, 1, "the Merger's train")
     for label in (WAITING_OWNER, WAITING_EXTERNAL):
         if label in labels:
             return nobody(n, 1, label)
