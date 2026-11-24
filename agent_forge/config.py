@@ -150,7 +150,7 @@ MERGE = {"merger": str, "ci_workflow": str, "gate": list,
 # checks.quick's context on the head and merges only trains.
 GATE_TIERS = ("head", "train")
 # merge.area_reviewers (designs/0058).
-AREA_REVIEWERS = {"ignore": list, "tell": bool}
+AREA_REVIEWERS = {"ignore": list, "tell": bool, "general": bool}
 # merge.code_owner_ask (agent-forge #153).
 CODE_OWNER_ASK = {"labels": list, "title": str}
 RESOLVE_RULE = {"paths": list, "command": list, "check": list}
@@ -1206,6 +1206,11 @@ def _check_area_reviewers(merge, data, problems):
     if not any(isinstance(e, dict) and e.get("kind") == "reviewer"
                and e.get("reviews") for e in agents.values()):
         problems.append("%s needs a reviewer with reviews" % where)
+    if isinstance(setting, dict) and setting.get("general") is True and \
+            not any(isinstance(e, dict) and e.get("kind") == "reviewer"
+                    and not e.get("reviews") for e in agents.values()):
+        problems.append("%s.general needs a reviewer without reviews"
+                        % where)
 
 
 def _check_code_owner_ask(merge, problems):

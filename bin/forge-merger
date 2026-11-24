@@ -1322,6 +1322,13 @@ CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
 # names whose approval clears it (their stand-ins too). None when off.
 AREAS = None
 AREA_IGNORE = ()
+# merge.area_reviewers.general (designs/0058's amendment, agent-forge
+# #573): a path no area's globs match waits for a general reviewer (one
+# with no `reviews`), so an area reviewer's approval no longer stands in
+# for hers. (names, counts) as for an area, or None when off.
+AREA_GENERAL = None
+# The glob a general wait names in `held`, and that `tell` skips.
+GENERAL_GLOB = "outside every area"
 # merge.area_reviewers.tell (designs/0058 step 2, default true): each
 # waiting area's first reviewer is woken through the relay, once per pull
 # request, head and area, recorded in AREA_TOLD_FILE ({pr: {"head": sha,
@@ -1523,6 +1530,7 @@ def configure(project):
     global BOARD_UNREVIEWED
     global RERUN_LABEL, TRAINS, TRAINS_WITHIN, GATED, OWN_HEAD_GREEN
     global TRAIN_MERGE, TRAIN_BRANCH, STALL_RUN_FACTOR, LAYERS_OWN_GREEN
+    global AREA_GENERAL
     global LEFT_TOP_COVERS, BYPASS_SEARCH
     global OWN_GREEN_TO_BOARD, APPROVAL
     global GATE_TIER, HEAD_CONTEXT, STEP_TIERS, GREENS_FILE
@@ -1620,6 +1628,8 @@ def configure(project):
     CODE_OWNERS = merge.get("code_owners", False) is True
     AREAS, AREA_IGNORE = areas_of(project, merge.get("area_reviewers"))
     setting = merge.get("area_reviewers")
+    AREA_GENERAL = general_of(project) if AREAS and isinstance(
+        setting, dict) and setting.get("general") is True else None
     AREA_TELL = bool(AREAS) and (setting is True or (
         isinstance(setting, dict) and setting.get("tell", True) is not False))
     EARLY_CONFLICTS = merge.get("early_conflicts", False) is True
@@ -5477,6 +5487,18 @@ def areas_of(project, setting):
     return found, ignore
 
 
+def general_of(project):
+    """merge.area_reviewers.general (agent-forge #573): (names, counts)
+    for the reviewers with no `reviews` globs, whose approval a path
+    outside every area needs; None when there are none."""
+    names = tuple(n for n in project.reviewers()
+                  if not project.agents[n].get("reviews"))
+    if not names:
+        return None
+    return names, frozenset(set(names)
+                            | {project.stand_in(n) for n in names})
+
+
 def newest_verdicts(pr, key=lambda review: login(review).lower()):
     """{key(review): review}: each reviewer's newest `APPROVED`,
     `CHANGES_REQUESTED` or `DISMISSED` review of `pr`."""
@@ -5550,12 +5572,21 @@ def area_waits(repo, pr, areas, main_ref, run=sh, regenerated=None,
     for path in got.stdout.split():
         if any(fnmatch.fnmatchcase(path, g) for g in ignore):
             continue
+        matched = False
         for i, (members, globs, counts) in enumerate(areas):
             glob = next((g for g in globs
                          if fnmatch.fnmatchcase(path, g)), None)
+            matched = matched or glob is not None
             if glob is None or any(approved(n) for n in counts):
                 continue
             waiting.setdefault(i, (members, glob, path))
+            paths.add(path)
+        # merge.area_reviewers.general (agent-forge #573): no area
+        # claims it, so a general reviewer must have approved it.
+        if not matched and AREA_GENERAL and not any(
+                approved(n) for n in AREA_GENERAL[1]):
+            waiting.setdefault(len(areas), (AREA_GENERAL[0], GENERAL_GLOB,
+                                            path))
             paths.add(path)
     return [waiting[i] + (len(paths),) for i in sorted(waiting)]
 
@@ -5582,7 +5613,9 @@ def tell_areas(state_dir, waits, send, out):
             if entry.get("head") == head else []
         for members, glob, first, count in found:
             name = members[0]
-            if name in done:
+            # The routing sends a pull request to the general reviewer
+            # already: only an area's is woken.
+            if name in done or glob == GENERAL_GLOB:
                 continue
             more = count - 1
             problem = send(name, AREA_TOLD_NOTE % (

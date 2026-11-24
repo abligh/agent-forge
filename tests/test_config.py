@@ -1016,6 +1016,21 @@ class Check(unittest.TestCase):
         data["merge"] = {"area_reviewers": False}
         self.assertEqual(config.check(data), [])
 
+    def test_merge_area_reviewers_general(self):
+        # agent-forge #573: the example's reviewers all have reviews.
+        self.assertEqual(self.problems(merge={"area_reviewers": {
+            "general": True}}), [
+            "merge.area_reviewers.general needs a reviewer without reviews"])
+        self.assertEqual(self.problems(merge={"area_reviewers": {
+            "general": False}}), [])
+        self.assertTrue(self.problems(merge={"area_reviewers": {
+            "general": "yes"}}))
+        data = example()
+        data["agents"]["Generalist"] = {"app_id": 106, "installation_id": 206,
+                                        "kind": "reviewer"}
+        data["merge"] = {"area_reviewers": {"general": True}}
+        self.assertEqual(config.check(data), [])
+
     def test_merge_resolve_board_unreviewed(self):
         # designs/0056 item 3: only with live trains merged as one.
         data = example()
