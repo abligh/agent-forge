@@ -232,9 +232,10 @@ again is left alone. An instance never takes the label off a head it
 has no red for; the check itself does, once nothing else is red there.
 
 **With `checks.approved_first`, approved pull requests go first**: a
-waiting head of a pull request one of the reviewer agents has approved,
-at any commit, is started before every other pull request's but an
-urgent one's, overdue ones included, the Merger's own first among them,
+waiting head of a pull request one of the reviewer agents, or the
+project's owner, has approved, at any commit, is started before every
+other pull request's but an urgent one's, overdue ones included, the
+Merger's own first among them,
 then those it predicts (`ahead.json`), then the oldest, and last those
 the Merger holds until another merges (`Blocked-by:` an open one, or
 stacked on one: its `next.json`'s `blocked`); the `STARTED` line ends
@@ -1075,6 +1076,9 @@ ORDER = "age"
 # after its last head stopped waiting.
 PR_PLACE_KEPT = datetime.timedelta(hours=24)
 REVIEWER_LOGINS = frozenset()
+# The project's owner (`owner`): their approval orders a head as a
+# reviewer agent's does (#578), though it releases nothing.
+OWNER_LOGINS = frozenset()
 APPROVED_PRS = frozenset()
 # labels.armed: a label a reviewer agent puts on a pull request it has
 # reviewed and will approve once its check is green (an approval
@@ -1310,6 +1314,7 @@ def configure(project, instance=None):
     global CACHE_FAULT_TEXT
     global DROP_NAMES, DROP_PREFIXES, KEEP_IGNORED, QUIET_DIR, INSTANCE
     global PULL_REQUESTS, HOST_LOCK, APPROVED_FIRST, REVIEWER_LOGINS, ORDER
+    global OWNER_LOGINS
     global ARMED_LABEL, REVIEWED_HEADS, EARLY_LABEL
     global SCOPED, SCOPED_S
     global QUICK_CONTEXT, QUICK_SLOTS, TIERS, ALL_STEPS
@@ -1400,6 +1405,8 @@ def configure(project, instance=None):
     ORDER = checks.get("order", "age")
     REVIEWER_LOGINS = frozenset(project.bot_login(name).lower()
                                 for name in project.reviewers())
+    OWNER_LOGINS = frozenset({project.owner.lower()}) \
+        if getattr(project, "owner", None) else frozenset()
     URGENT_LABEL = project.section("labels").get("urgent")
     ARMED_LABEL = project.section("labels").get("armed")
     # Every instance acts on it, for its own red; one leaves the label
@@ -1898,8 +1905,10 @@ def approved_prs(state_dir, state, heads, token, when, run=sh, every=(),
                  by=None, fresh=True):
     """checks.approved_first: the open pull requests, among those with a
     head to run (open, not a draft, no verdict yet), that one of the
-    reviewer agents has approved, at any commit: an approval of an
-    earlier head still means the pull request is near merging.
+    reviewer agents, or the project's owner (#578), has approved, at
+    any commit: an approval of an earlier head still means the pull
+    request is near merging. Only a reviewer agent's releases a held
+    head (`by`).
 
     Each answer is kept in approved.json and asked again once older
     than APPROVED_FRESH; at most APPROVED_MAX_CALLS pull requests are
@@ -1951,7 +1960,8 @@ def approved_prs(state_dir, state, heads, token, when, run=sh, every=(),
             continue
         logins = {l.strip().lower() for l in got.stdout.splitlines()}
         known[str(pr)] = {"at": iso(when),
-                          "approved": bool(logins & REVIEWER_LOGINS)}
+                          "approved": bool(logins & (REVIEWER_LOGINS
+                                                     | OWNER_LOGINS))}
         if REVIEWED_HEADS and logins & REVIEWER_LOGINS:
             known[str(pr)]["by"] = sorted(logins & REVIEWER_LOGINS)[0]
     open_prs = {head[0] for head in heads}

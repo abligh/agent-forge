@@ -4403,6 +4403,16 @@ class ApprovedFirst(StateCase):
                               T0, run)
         self.assertEqual(got, frozenset({1}))
 
+    def test_the_owners_approval_counts_too(self):
+        # #578: a pull request waiting on the owner's code-owner review
+        # otherwise waits behind every approved one even once approved.
+        run = self.reviews({1: ["Owner"], 2: ["someone"]})
+        heads = [(1, SHA_A, REPO, False), (2, SHA_B, REPO, False)]
+        with mock.patch.object(pc, "OWNER_LOGINS", frozenset({"owner"})):
+            got = pc.approved_prs(self.state_dir, {"results": {}}, heads,
+                                  "tok", T0, run)
+        self.assertEqual(got, frozenset({1}))
+
     def test_answers_are_kept_and_asked_again_when_stale(self):
         run = self.reviews({1: [self.REVIEWER]})
         heads = [(1, SHA_A, REPO, False)]
