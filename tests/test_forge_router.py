@@ -211,6 +211,12 @@ class PullRequestRules(unittest.TestCase):
     def test_1_a_draft_is_nobodys(self):
         self.assertNobody(decide_pr(pr_node(draft=True)), 1)
 
+    def test_1_the_mergers_train_is_nobodys(self):
+        train = dict(pr_node(), headRefName="forge/train-15769-15820")
+        self.assertNobody(decide_pr(train), 1)
+        ours = dict(pr_node(), headRefName="xe/forge-train-docs")
+        self.assertNotEqual(decide_pr(ours)["rule"], 1)
+
     def test_1_waiting_labels_are_nobodys(self):
         for label in ("Status:waiting-owner", "Status:waiting-external"):
             self.assertNobody(decide_pr(pr_node(labels=[label])), 1)

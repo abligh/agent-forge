@@ -50,6 +50,8 @@ for its event, never reminded:
 Then:
 
 1. a draft, or waiting on the owner or on someone outside: nobody's;
+   so is the Merger's own train (head branch `merge.ahead.train_branch`,
+   default `forge/train-`), which has no commit of its own to review;
 2. a Merger hand-back of the current head is the newest thing said (a
    comment by the Merger, "Not merging <head>:" (or "Not merging <head>
    yet:", a stacked layer's conflict with the head beneath it), newer than every review
@@ -371,6 +373,24 @@ a run that isn't `--only`'s also sweeps for paths no reviewer covers
     the day in it, so a write GitHub refused is tried again the next
     day.
 
+With `router.busy_backlog` (agent-forge #580), a run that isn't
+`--only`'s also reminds each agent of her own untouched issues,
+whatever her presence (off without it):
+
+28. an agent owns open issues (`Owner:<Name>`) she can act on, as rule
+    15 reads them (no waiting or quiet label, not deferred, not
+    blocked, not in hand), that aren't stats-watch issues and that she
+    hasn't touched for `busy_backlog.untouched_hours` (default 6): no
+    comment of hers, and not opened, in that time. Her turn, listing
+    them oldest first with their titles (at most thirty, then how many
+    more): "yours and untouched for N hours: start one, or say on it
+    why not". An agent who relays rooms all day is never idle, so the
+    idle offer never reached her. At most `busy_backlog.per_day`
+    (default 2) such lists a day per agent, and never the same list
+    twice: `busy_backlog.json`, in the router's state directory,
+    records each agent's lists told and how many today, as each is
+    told. The event is a digest of the list.
+
 **Who wrote something is read from its login**, never its text (but
 for rule 10's exception): an App's bot login (`<slug>[bot]`) maps to
 its name through the configuration, the Merger's under `machinery`,
@@ -449,6 +469,14 @@ wants_directory = False
 wants_previous = False
 # `router.merge_notice`, with its defaults filled in, or None: off.
 MERGE_NOTICE = None
+# `router.busy_backlog` (agent-forge #580), with its defaults filled
+# in, or None: off.
+BUSY_BACKLOG = None
+DEFAULT_UNTOUCHED_HOURS = 6
+DEFAULT_BUSY_PER_DAY = 2
+BUSY_BACKLOG_FILE = "busy_backlog.json"
+# How many lists of digests `busy_backlog.json` keeps per agent.
+BUSY_BACKLOG_KEPT = 50
 DEFAULT_MERGE_WINDOW = 30
 # `router.quiet_labels`: labels that make an open item nobody's.
 QUIET_LABELS = ()
@@ -564,6 +592,7 @@ def configure(project, merger_tool):
     global UNREVIEWED, QUIET_LABELS, IN_PROGRESS, RED_FIRST, PROJECT
     global NIGHTLY_WAKE, ISSUE_BLOCKED_BY, BLOCKER_WRITERS, MANUAL
     global GREEN_APPROVES, STALE_BLOCKER, REVIEW_WAITING
+    global BUSY_BACKLOG
     global URGENT, BUG
     merger = merger_tool
     MANUAL = project.section("merge").get("mode") == "manual"
@@ -591,6 +620,11 @@ def configure(project, merger_tool):
         "label", "stats-watch")
     wants_directory = IDLE_OFFER is not None
     wants_previous = IDLE_OFFER is not None
+    busy = project.section("router").get("busy_backlog")
+    BUSY_BACKLOG = None if busy is None else {
+        "untouched_hours": busy.get("untouched_hours",
+                                    DEFAULT_UNTOUCHED_HOURS),
+        "per_day": busy.get("per_day", DEFAULT_BUSY_PER_DAY)}
     notice = project.section("router").get("merge_notice")
     MERGE_NOTICE = None if notice is None else {
         "window_minutes": notice.get("window_minutes",
@@ -943,6 +977,9 @@ def route_pr_rules(pr, roster, when=None):
     # Rule 1.
     if pr.get("isDraft"):
         return nobody(n, 1, "draft")
+    branch = pr.get("headRefName") or ""
+    if merger.TRAIN_BRANCH and branch.startswith(merger.TRAIN_BRANCH):
+        return nobody(n, 1, "the Merger's train")
     for label in (WAITING_OWNER, WAITING_EXTERNAL):
         if label in labels:
             return nobody(n, 1, label)
@@ -1482,11 +1519,15 @@ def stale_blocker(item, who, when=None):
     """Rule 26 (designs/0061), with `router.stale_blocker`: the item
     owner's turn when one of its `Blocked-by:` lines names an issue that
     is still open, and a pull request referencing that issue merged
-    after the line was written; else None. The event is the newest such
-    merge, so each new one asks once, and nothing reminds; a comment by
-    the project's owner or an agent after it answers it, and the turn
-    ends (else the idle nudge, which lists standing turns, re-sent it).
-    Not while the item's `Defer-until:` is still to come at `when`."""
+    after the line was written; else None. It asks once per blocker
+    (agent-forge #560, #571): the event is that blocker's first such
+    merge, so later merges referencing it ask nothing more, and a
+    comment by the project's owner or an agent after that first merge
+    answers it for good (else the idle nudge, which lists standing
+    turns, re-sent it). Editing the lines starts afresh. Of several
+    blockers still unanswered, the one whose first merge is oldest is
+    asked about first; nothing reminds. Not while the item's
+    `Defer-until:` is still to come at `when`."""
     if not STALE_BLOCKER:
         return None
     # A `Defer-until:` still to come is the owner's own answer to when to
@@ -1500,35 +1541,39 @@ def stale_blocker(item, who, when=None):
     known = item.get("blockedBy") or {}
     since = written or item.get("lastEditedAt") or item.get("createdAt") \
         or ""
-    best = None
+    # Answered: the project's owner or an agent spoke on the item after
+    # a blocker's first merge (leaving the line and saying why, say).
+    said = [as_stamp(c.get("createdAt"))
+            for c in item.get("comments") or ()
+            if author_of(c) in BLOCKER_WRITERS]
+    asked = []
     for b in sorted(named):
         info = known.get(b) or {}
         if info.get("state") != "OPEN":
             continue
-        for ref in info.get("mergedRefs") or ():
-            at, number = ref.get("mergedAt") or "", ref.get("number")
-            if not at or at <= since or number == item["number"]:
-                continue
-            if best is None or at > best[2]:
-                best = (b, number, at)
-    if best is None:
+        merges = sorted((ref.get("mergedAt") or "", ref.get("number"))
+                        for ref in info.get("mergedRefs") or ()
+                        if (ref.get("mergedAt") or "") > since
+                        and ref.get("number") != item["number"])
+        if not merges:
+            continue
+        at, number = merges[0]
+        if any(t and t > at for t in said):
+            continue
+        asked.append((at, b, number, len(merges)))
+    if not asked:
         return None
-    b, number, at = best
-    # Answered: the project's owner or an agent spoke on the item after
-    # that merge (leaving the line and saying why, say). Without this the
-    # turn stood while the line did, and the idle nudge re-sent it.
-    said = [as_stamp(c.get("createdAt"))
-            for c in item.get("comments") or ()
-            if author_of(c) in BLOCKER_WRITERS]
-    if any(t and t > at for t in said):
-        return None
+    at, b, number, count = min(asked)
+    more = "" if count == 1 else " (and %s since)" % counted(
+        count - 1, "other", "others")
     return turn(item["number"], who, 26, at,
                 "says Blocked-by: #%d, which is open, but #%d, which "
-                "references it, merged at %s. If #%d's code in the default "
-                "branch is all this waits for, remove the line or write "
-                "what it waits for now; if it really waits for #%d to "
-                "close, leave it." % (b, number, at[:16].replace("T", " "),
-                                      b, b))
+                "references it, merged at %s%s. If #%d's code in the "
+                "default branch is all this waits for, remove the line or "
+                "write what it waits for now; if it really waits for #%d "
+                "to close, leave it and say so here once: later merges "
+                "won't ask again." % (b, number, at[:16].replace("T", " "),
+                                      more, b, b))
 
 
 def owner_answered(n, issue, owner, comments, roster, rule):
@@ -1578,7 +1623,8 @@ recheck = decide
 def sweep(ctx):
     """Rules 15 and 16, the idle offer, rule 21, a red build's fallback
     (which needs the idle offer too), rule 17, the merge notice, and
-    rule 19, the paths no reviewer covers, each when it is configured;
+    rule 19, the paths no reviewer covers, and rule 28, an agent's
+    untouched issues, each when it is configured;
     nothing on a run started by an event
     (`ctx.only`), whose items are all it may decide about. An agent
     rule 21 offers a red build to is offered nothing else that run."""
@@ -1597,6 +1643,8 @@ def sweep(ctx):
         decisions += merge_notices(ctx)
     if UNREVIEWED is not None:
         decisions += unreviewed(ctx)
+    if BUSY_BACKLOG is not None:
+        decisions += busy_backlogs(ctx)
     return decisions
 
 
@@ -2735,6 +2783,107 @@ def unreviewed(ctx):
                 suppressed="#%d: %s still change %s, which no reviewer "
                 "covers" % (issue, numbered(prs), area),
                 actions=(RemindUnreviewed(state_dir, area, issue, prs, day),)))
+    return decisions
+
+
+def load_busy_backlog(state_dir):
+    value = merger.load_json(os.path.join(state_dir, BUSY_BACKLOG_FILE), {})
+    return value if isinstance(value, dict) else {}
+
+
+@dataclasses.dataclass(frozen=True)
+class RecordBusyBacklog(Action):
+    """Record in `busy_backlog.json` that `agent` was told the list
+    `digest` on `day`, so no later run tells it again, and today's
+    count of lists told her."""
+    state_dir: str
+    agent: str
+    digest: str
+    day: str
+
+    def describe(self):
+        return "record %s's untouched list %s" % (self.agent, self.digest)
+
+    def run(self, github, repo):
+        state = load_busy_backlog(self.state_dir)
+        entry = state.get(self.agent)
+        if not isinstance(entry, dict):
+            entry = {}
+        told = [d for d in entry.get("told") or () if isinstance(d, str)]
+        if self.digest not in told:
+            told.append(self.digest)
+        count = entry.get("count") if entry.get("day") == self.day else 0
+        state[self.agent] = {"day": self.day,
+                             "count": (count or 0) + 1,
+                             "told": told[-BUSY_BACKLOG_KEPT:]}
+        os.makedirs(self.state_dir, exist_ok=True)
+        merger.save_json(os.path.join(self.state_dir, BUSY_BACKLOG_FILE),
+                         state)
+        return True, ""
+
+
+def untouched_since(issue, login):
+    """When the agent with `login` last touched `issue`: her newest
+    comment on it, or when it was opened, whichever is later."""
+    return max([issue.get("createdAt") or ""] +
+               [c.get("createdAt") or ""
+                for c in issue.get("comments") or ()
+                if author_of(c) == login])
+
+
+def untouched_issues(agent, ctx):
+    """The agent's issues for rule 28, oldest first: ones she can act
+    on, not stats-watch issues, untouched by her for
+    `busy_backlog.untouched_hours`."""
+    cutoff = (ctx.when - datetime.timedelta(
+        hours=BUSY_BACKLOG["untouched_hours"])).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+    login = ctx.roster.login_of(agent)
+    return [issue for issue, kind, _ in owned_issue_states(agent, ctx)
+            if kind is None and STATS_WATCH_LABEL not in labels_of(issue)
+            and untouched_since(issue, login) <= cutoff]
+
+
+def busy_backlogs(ctx):
+    """Rule 28 (agent-forge #580): each agent's list of her own issues
+    she can act on and hasn't touched for `untouched_hours`, whatever
+    her presence; at most `per_day` lists a day, never one already
+    told. Nothing without the engine's state directory to record it."""
+    state_dir = getattr(ctx, "state_dir", None)
+    if not state_dir:
+        return []
+    state = load_busy_backlog(state_dir)
+    day = ctx.when.strftime("%Y-%m-%d")
+    hours = BUSY_BACKLOG["untouched_hours"]
+    decisions = []
+    for agent in sorted(ctx.roster.agents):
+        found = untouched_issues(agent, ctx)
+        if not found:
+            continue
+        numbers = ",".join(str(i["number"]) for i in found)
+        digest = hashlib.sha256(numbers.encode("utf-8")).hexdigest()[:12]
+        known = state.get(agent) if isinstance(state.get(agent),
+                                               dict) else {}
+        if digest in (known.get("told") or ()):
+            continue
+        if known.get("day") == day and \
+                (known.get("count") or 0) >= BUSY_BACKLOG["per_day"]:
+            continue
+        listed = "; ".join(
+            "#%d%s" % (i["number"], ' "%s"' % i["title"].strip()
+                       if (i.get("title") or "").strip() else "")
+            for i in found[:UNOWNED_LIST])
+        more = len(found) - UNOWNED_LIST
+        decisions.append(Decision(
+            None, agent, 28, "busy %s" % digest,
+            "%s yours and untouched by you for %d hours or more, oldest "
+            "first: %s%s. Start one, or say on it why not (a waiting "
+            "label, a Blocked-by: or a Defer-until: line)." % (
+                counted(len(found), "open issue is",
+                        "open issues are"), hours, listed,
+                "; and %d more" % more if more > 0 else ""),
+            actions=(RecordBusyBacklog(state_dir, agent, digest, day),),
+            reminder=ONCE))
     return decisions
 
 

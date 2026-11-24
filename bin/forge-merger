@@ -358,8 +358,13 @@ or a value that is not a time, holds it.
   runs from this installation, anything else from the checkout. A tool
   that exits 3 refuses for now, not for good, as
   `forge-closing-keywords` does while GitHub's closingIssuesReferences
-  lags a body edit: the hand-back is said once, and the gate is asked
-  again 5 minutes (GATE_RETRY) after it was last asked.
+  lags a body edit: the pull request is held, untold, and the gate is
+  asked again (ahead of its batch, 5 minutes, GATE_RETRY, after it was
+  last asked). Refused for now a third time, its description is saved
+  again unchanged, since GitHub recomputes the field only on a save
+  (agent-forge #572: a stacked pull request retargeted to the default
+  branch never catches up by waiting), and only a refusal after that
+  is handed back, once.
 
 The checkout is the cron checkout (`$FORGE_CRON_CHECKOUT`), kept at
 `origin/main` by `forge-cron-run`, and the gate tools run there, so a
@@ -953,6 +958,17 @@ DEFAULT_GATE = (("forge-commit-identity", "{base}..{head}"),)
 # description.
 GATE_RETRY_EXIT = 3
 GATE_RETRY = datetime.timedelta(minutes=5)
+# agent-forge #572: a refusal for now is held, untold, while it is asked
+# again GATE_RETRY_QUIET times; refused once more, the description is
+# saved again unchanged, which makes GitHub look at it afresh, and only
+# a refusal after that is told to the author.
+GATE_RETRY_QUIET = 2
+RESAVED_DETAIL = (
+    "The gate refuses only for now (exit %d), as it does while GitHub "
+    "has yet to link an issue the description declares. It refused %d "
+    "times, the last after the Merger saved the description again "
+    "unchanged, which makes GitHub look at it afresh. Save the "
+    "description again yourself, or check what it declares.")
 DEFAULT_CONTEXT = "vm/build-and-test"
 GATE = DEFAULT_GATE
 # How a Not-a-review hand-back heads each kind of path, in the order it
@@ -3581,7 +3597,11 @@ def told(before, key):
     may fix the description alone; and one after a gate's refusal for
     now (`retry`) for another reason, since that refusal wasn't the
     author's to fix."""
-    if {k: v for k, v in before.items() if k != "at"} == key:
+    if before.get("retry") and "count" in before and not before.get("told"):
+        # Held for now, untold (`hold_for_now`): nothing was said yet.
+        return False
+    if {k: v for k, v in before.items()
+            if k not in ("at", "count", "resaved", "told")} == key:
         return True
     # Only a push answers a conflict with main, so a new approval of the
     # same head doesn't make it a new question: a second reviewer's
@@ -3668,19 +3688,73 @@ def carry_out(decision, approval, github, said):
             # the same way, it is not said again; only the time moves.
             key["retry"] = True
             asked = dict(key, at=decision.get("at") or iso(now_utc()))
+            held = hold_for_now(decision, key, asked, github, said)
+            if held is not None:
+                return held
         before = said.get(str(number))
         if isinstance(before, dict) and told(before, key):
             if decision.get("retry") and before.get("reason") == key["reason"]:
-                said[str(number)] = asked
+                said[str(number)] = dict(before, at=asked["at"])
             return "already said"
         ok, why = github.write(
             "POST", "repos/%s/issues/%d/comments" % (REPO_SLUG, number),
             body=hand_back_text(decision, approver))
         if ok:
-            said[str(number)] = asked if decision.get("retry") else key
+            said[str(number)] = dict(asked, told=True) \
+                if decision.get("retry") else key
     else:
         return None
     return "done" if ok else "refused: " + why
+
+
+def hold_for_now(decision, key, asked, github, said):
+    """agent-forge #572: what `carry_out` returns for a gate's refusal for
+    now (`decision["retry"]`, keyed `key`, asked at `asked["at"]`) that
+    isn't told yet, or None when it is to be told. The same refusal,
+    at the same approval, head, reason and description, counts up in
+    `said`. While it has been asked no more than GATE_RETRY_QUIET times,
+    it is only held; the next time, the description is saved again
+    unchanged (GitHub recomputes closingIssuesReferences only on a save,
+    so a stacked pull request retargeted to the default branch never
+    catches up by waiting), and held once more; a refusal after that is
+    told, with RESAVED_DETAIL. Once told, it isn't counted again."""
+    number = decision["pr"]
+    before = said.get(str(number))
+    same = isinstance(before, dict) and before.get("retry") and {
+        k: v for k, v in before.items()
+        if k not in ("at", "count", "resaved", "told")} == key
+    if same and (before.get("told") or "count" not in before):
+        # Told already (a record from before the count was kept was).
+        return None
+    count = (before.get("count") or 1) + 1 if same else 1
+    resaved = bool(same and before.get("resaved"))
+    if count <= GATE_RETRY_QUIET:
+        said[str(number)] = dict(asked, count=count)
+        return "held for now (%d of %d)" % (count, GATE_RETRY_QUIET)
+    if not resaved:
+        why = resave_body(number, key.get("text"), github)
+        said[str(number)] = dict(asked, count=count, resaved=True)
+        return "held for now; " + why
+    decision["detail"] = RESAVED_DETAIL % (GATE_RETRY_EXIT, count)
+    said[str(number)] = dict(asked, count=count, resaved=True)
+    return None
+
+
+def resave_body(number, text, github):
+    """Save pull request `number`'s description again unchanged, if it is
+    still the one (`description`) the gate refused, `text`; what was
+    done, for the record."""
+    try:
+        got = github.api("repos/%s/pulls/%d" % (REPO_SLUG, number))
+    except (RuntimeError, ValueError):
+        return "its description could not be read to save it again"
+    if not isinstance(got, dict) or (
+            text is not None and description(got) != text):
+        return "its description has changed; not saved again"
+    ok, why = github.write("PATCH", "repos/%s/pulls/%d" % (REPO_SLUG, number),
+                           body=got.get("body") or "")
+    return ("description saved again unchanged" if ok
+            else "saving its description again was refused: " + why)
 
 
 def load_json(path, default):

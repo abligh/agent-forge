@@ -2102,6 +2102,60 @@ class Tick(Decide):
         self.assertEqual(self.told(dict(now), reason="other gate",
                                    text="d1"), ("done", 1))
 
+    def test_a_refusal_for_now_is_held_then_resaved_then_told(self):
+        # agent-forge #572: a stacked pull request retargeted to the
+        # default branch never had its closing references filled, and
+        # was handed back for a lag only a save of its body clears.
+        pr5 = {"number": 5, "title": "t", "body": "Fixes #9"}
+        github = FakeGitHub({"repos/": pr5})
+        said = {}
+        decision = {"action": "HAND-BACK", "to": "author", "pr": 5,
+                    "head": "h" * 40, "reason": "gate exited 3: lag",
+                    "text": m.description(pr5), "retry": True}
+
+        def once(at):
+            return m.carry_out(dict(decision, at=at), review(REVIEWER),
+                               github, said)
+        self.assertEqual(once(T1), "held for now (1 of 2)")
+        self.assertEqual(once(T2), "held for now (2 of 2)")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(once(T2), "held for now; description saved "
+                                   "again unchanged")
+        self.assertEqual(github.writes, [("PATCH", "repos/%s/pulls/5"
+                                          % m.REPO_SLUG,
+                                          {"body": "Fixes #9"})])
+        self.assertEqual(once(T2), "done")
+        method, path, fields = github.writes[-1]
+        self.assertEqual(path, "repos/%s/issues/5/comments" % m.REPO_SLUG)
+        self.assertIn("saved the description again", fields["body"])
+        self.assertEqual(once(T2), "already said")
+        self.assertEqual(len(github.writes), 2)
+
+    def test_a_changed_description_is_not_saved_again(self):
+        github = FakeGitHub({"repos/": {"number": 5, "title": "t",
+                                        "body": "new"}})
+        said = {}
+        decision = {"action": "HAND-BACK", "to": "author", "pr": 5,
+                    "head": "h" * 40, "reason": "gate exited 3: lag",
+                    "text": "old", "retry": True, "at": T1}
+        for _ in range(m.GATE_RETRY_QUIET):
+            m.carry_out(dict(decision), review(REVIEWER), github, said)
+        self.assertEqual(
+            m.carry_out(dict(decision), review(REVIEWER), github, said),
+            "held for now; its description has changed; not saved again")
+        self.assertEqual(github.writes, [])
+
+    def test_a_refusal_told_before_the_count_is_not_told_again(self):
+        # A record from before agent-forge #572 was told already.
+        key = dict(m.hand_back_key(review(REVIEWER), "h" * 40, "gate", "d1"),
+                   retry=True, at=T1)
+        self.assertEqual(self.told(dict(key), reason="gate", text="d1",
+                                   retry=True, at=T2), ("already said", 0))
+
+    def test_a_refusal_for_good_is_told_at_once(self):
+        self.assertEqual(self.told({}, reason="gate exited 1: no",
+                                   text="d1"), ("done", 1))
+
     def test_a_skip_writes_nothing(self):
         self.assertIsNone(m.carry_out(
             {"action": "SKIP", "pr": 1, "head": "a"}, review(REVIEWER),
@@ -5795,7 +5849,9 @@ class TickAhead(RepoCase):
         back = [d for d in record["decisions"] if d.get("ahead")]
         self.assertEqual([(d["pr"], d.get("retry")) for d in back],
                          [(6, True)])
-        self.assertEqual(comments(), 1)
+        # Held, not told (agent-forge #572).
+        self.assertEqual(back[0]["result"], "held for now (1 of 2)")
+        self.assertEqual(comments(), 0)
         # Within GATE_RETRY: not asked again, and nothing said.
         calls.clear()
         record, _ = self.tick(prs, conclusions=(None,), live=True,
