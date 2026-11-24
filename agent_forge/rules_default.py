@@ -1482,11 +1482,15 @@ def stale_blocker(item, who, when=None):
     """Rule 26 (designs/0061), with `router.stale_blocker`: the item
     owner's turn when one of its `Blocked-by:` lines names an issue that
     is still open, and a pull request referencing that issue merged
-    after the line was written; else None. The event is the newest such
-    merge, so each new one asks once, and nothing reminds; a comment by
-    the project's owner or an agent after it answers it, and the turn
-    ends (else the idle nudge, which lists standing turns, re-sent it).
-    Not while the item's `Defer-until:` is still to come at `when`."""
+    after the line was written; else None. It asks once per blocker
+    (agent-forge #560, #571): the event is that blocker's first such
+    merge, so later merges referencing it ask nothing more, and a
+    comment by the project's owner or an agent after that first merge
+    answers it for good (else the idle nudge, which lists standing
+    turns, re-sent it). Editing the lines starts afresh. Of several
+    blockers still unanswered, the one whose first merge is oldest is
+    asked about first; nothing reminds. Not while the item's
+    `Defer-until:` is still to come at `when`."""
     if not STALE_BLOCKER:
         return None
     # A `Defer-until:` still to come is the owner's own answer to when to
@@ -1500,35 +1504,39 @@ def stale_blocker(item, who, when=None):
     known = item.get("blockedBy") or {}
     since = written or item.get("lastEditedAt") or item.get("createdAt") \
         or ""
-    best = None
+    # Answered: the project's owner or an agent spoke on the item after
+    # a blocker's first merge (leaving the line and saying why, say).
+    said = [as_stamp(c.get("createdAt"))
+            for c in item.get("comments") or ()
+            if author_of(c) in BLOCKER_WRITERS]
+    asked = []
     for b in sorted(named):
         info = known.get(b) or {}
         if info.get("state") != "OPEN":
             continue
-        for ref in info.get("mergedRefs") or ():
-            at, number = ref.get("mergedAt") or "", ref.get("number")
-            if not at or at <= since or number == item["number"]:
-                continue
-            if best is None or at > best[2]:
-                best = (b, number, at)
-    if best is None:
+        merges = sorted((ref.get("mergedAt") or "", ref.get("number"))
+                        for ref in info.get("mergedRefs") or ()
+                        if (ref.get("mergedAt") or "") > since
+                        and ref.get("number") != item["number"])
+        if not merges:
+            continue
+        at, number = merges[0]
+        if any(t and t > at for t in said):
+            continue
+        asked.append((at, b, number, len(merges)))
+    if not asked:
         return None
-    b, number, at = best
-    # Answered: the project's owner or an agent spoke on the item after
-    # that merge (leaving the line and saying why, say). Without this the
-    # turn stood while the line did, and the idle nudge re-sent it.
-    said = [as_stamp(c.get("createdAt"))
-            for c in item.get("comments") or ()
-            if author_of(c) in BLOCKER_WRITERS]
-    if any(t and t > at for t in said):
-        return None
+    at, b, number, count = min(asked)
+    more = "" if count == 1 else " (and %s since)" % counted(
+        count - 1, "other", "others")
     return turn(item["number"], who, 26, at,
                 "says Blocked-by: #%d, which is open, but #%d, which "
-                "references it, merged at %s. If #%d's code in the default "
-                "branch is all this waits for, remove the line or write "
-                "what it waits for now; if it really waits for #%d to "
-                "close, leave it." % (b, number, at[:16].replace("T", " "),
-                                      b, b))
+                "references it, merged at %s%s. If #%d's code in the "
+                "default branch is all this waits for, remove the line or "
+                "write what it waits for now; if it really waits for #%d "
+                "to close, leave it and say so here once: later merges "
+                "won't ask again." % (b, number, at[:16].replace("T", " "),
+                                      more, b, b))
 
 
 def owner_answered(n, issue, owner, comments, roster, rule):

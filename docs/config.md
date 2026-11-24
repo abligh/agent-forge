@@ -1506,11 +1506,16 @@ that is still open, and a pull request referencing that issue (a
 mention or a link, from the issue's timeline) merged after the lines
 were written, it is the item owner's turn: the text names the issue,
 the merged pull request and when it merged, and asks whether the line
-only waited for that code. The event is the newest such merge, so each
-new one asks once, and nothing reminds. A comment on the item by the
-project's owner or an agent after that merge answers it, and the turn
-ends. Until v0.4.228 it stood while the line did, and the
-idle nudge, which lists the agent's standing turns, re-sent it. On a
+only waited for that code. It asks once per blocker: the event is the
+first such merge, so later merges referencing the same issue ask
+nothing more (until v0.4.245 each one asked again, agent-forge #560
+and #571), and nothing reminds. A comment on the item by the project's
+owner or an agent after that first merge answers it for good: "it
+waits for #N to close" is said once. Editing the lines starts afresh.
+Of several open blockers, the one whose first merge is oldest is asked
+about first, and the next once that is answered. Until v0.4.228 the
+turn stood while the line did, and the idle nudge, which lists the
+agent's standing turns, re-sent it. On a
 pull request it speaks
 only where rules 4, 5 and 6 give nobody the turn; on an issue, only
 where no other rule does. It costs one GraphQL query a run while any

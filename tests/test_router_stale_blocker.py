@@ -1,7 +1,7 @@
 """Tests for `router.stale_blocker` (designs/0061): rule 26 asks an
 item's owner whether a `Blocked-by:` line naming an open issue is
-stale, once per pull request referencing that issue that merged after
-the line was written."""
+stale, once per blocker, at the first pull request referencing that
+issue that merged after the line was written."""
 import datetime
 import unittest
 
@@ -78,10 +78,44 @@ class Issues(Case):
         self.assertIn("#7", d["line"])
         self.assertIn("#12", d["line"])
 
-    def test_the_newest_merge_is_the_event(self):
-        d = rules.route_issue(issue({7: opened((12, T1), (13, T3))}), ROSTER)
-        self.assertEqual((d["rule"], d["event"]), (26, T3))
-        self.assertIn("#13", d["line"])
+    def test_the_first_merge_is_the_event(self):
+        # agent-forge #560, #571: once per blocker, not once per merge.
+        d = rules.route_issue(issue({7: opened((13, T3), (12, T2))}), ROSTER)
+        self.assertEqual((d["rule"], d["event"]), (26, T2))
+        self.assertIn("#12", d["line"])
+        self.assertIn("(and 1 other since)", d["line"])
+
+    def test_later_merges_ask_nothing_more(self):
+        one = rules.route_issue(issue({7: opened((12, T1))}), ROSTER)
+        three = rules.route_issue(
+            issue({7: opened((12, T1), (13, T2), (14, T3))}), ROSTER)
+        self.assertEqual(one["event"], three["event"])
+
+    def test_one_answer_holds_for_later_merges(self):
+        item = issue({7: opened((12, T1), (13, T3))})
+        item["comments"] = [{"author": {"login": LEADDEV},
+                             "createdAt": T2, "body": "waits for #7 to close"}]
+        self.assertIsNone(rules.stale_blocker(item, "LeadDev"))
+
+    def test_a_second_blocker_gets_its_own(self):
+        item = issue({7: opened((12, T1)), 8: opened((13, T3))},
+                     body="Blocked-by: #7\nBlocked-by: #8\n")
+        d = rules.stale_blocker(item, "LeadDev")
+        self.assertEqual(d["event"], T1)
+        self.assertIn("Blocked-by: #7", d["line"])
+        item["comments"] = [{"author": {"login": LEADDEV},
+                             "createdAt": T2, "body": "#7 stands"}]
+        d = rules.stale_blocker(item, "LeadDev")
+        self.assertEqual(d["event"], T3)
+        self.assertIn("Blocked-by: #8", d["line"])
+
+    def test_editing_the_lines_starts_afresh(self):
+        item = issue({7: opened((12, T1), (13, T3))})
+        item["comments"] = [{"author": {"login": LEADDEV},
+                             "createdAt": T2, "body": "stands"}]
+        item["lastEditedAt"] = "2026-10-09T12:30:00Z"
+        d = rules.stale_blocker(item, "LeadDev")
+        self.assertEqual(d["event"], T3)
 
     def test_a_merge_before_the_line_was_written_says_nothing(self):
         item = issue({7: opened((12, T1))})
