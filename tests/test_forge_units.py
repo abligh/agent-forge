@@ -6,6 +6,7 @@ tree holds), and a fake git would be testing the fake.
 """
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -255,6 +256,153 @@ class Configuration(unittest.TestCase):
         self.assertIn("units.t.trace_ignore must be a list of globs",
                       self.problems({"t": {"table": "a", "glob": "b",
                                            "trace_ignore": [""]}}))
+
+
+TRACED = {
+    "tools/test_listed.py": "open('tools/a.py').read()\n",
+    "tools/test_unlisted.py": "open('docs/b/two.md').read()\n",
+    "tools/test_lists.py": "import os\nos.listdir('docs')\n",
+    "tools/test_absent.py":
+        "assert 'secret' not in open('docs/a/one.md').read()\n",
+    "tools/test_skips.py":
+        "import os, sys\n"
+        "if not os.path.exists('tools/fixture.bin'):\n"
+        "    sys.exit(0)\n",
+    "tools/test_git_spec.py":
+        "import subprocess\n"
+        "subprocess.run(['git', 'ls-files', '--', 'docs/a'], check=True,\n"
+        "               capture_output=True)\n",
+    "tools/test_git_bare.py":
+        "import subprocess\n"
+        "subprocess.run(['git', 'ls-files'], check=True,\n"
+        "               capture_output=True)\n",
+    "tools/test_fails.py": "open('tools/a.py').read()\nraise SystemExit(3)\n",
+}
+TRACED_TABLE = """\
+placed tools
+placed docs
+unit tools/test_listed.py tools/a.py
+unit tools/test_unlisted.py tools/a.py
+unit tools/test_lists.py docs/a/
+unit tools/test_absent.py tools/a.py
+unit tools/test_skips.py -
+unit tools/test_git_spec.py docs/a/
+unit tools/test_git_bare.py docs/a/
+unit tools/test_fails.py tools/a.py
+"""
+
+
+@unittest.skipUnless(shutil.which("strace"), "needs strace")
+class Trace(Fixture):
+
+    def setUp(self):
+        super().setUp()
+        self.write(dict(TRACED, **{"tools/units.txt": TRACED_TABLE,
+                                   "docs/b/two.md": ""}))
+        for name in ("tools/test_a.py", "tools/test_b.py", "tools/test_c.py"):
+            (self.repo / name).unlink()
+        self.commit("traced")
+
+    def trace(self):
+        return self.call("trace", "--units", "tools", "--", "python3",
+                         "{unit}")
+
+    def lines_for(self, out, unit):
+        return [l for l in out if l.startswith(unit + " ")]
+
+    def test_a_listed_read_is_no_finding(self):
+        out = self.trace()[1]
+        self.assertEqual(self.lines_for(out, "tools/test_listed.py"), [])
+
+    def test_an_unlisted_read_is_a_finding_with_its_fix(self):
+        code, out, _ = self.trace()
+        self.assertEqual(code, 1)
+        self.assertIn("tools/test_unlisted.py reads docs/b/two.md "
+                      "(not in its entry)", out)
+        self.assertIn("  unit tools/test_unlisted.py tools/a.py "
+                      "docs/b/two.md", out)
+
+    def test_a_directory_listing_is_a_read(self):
+        out = self.trace()[1]
+        self.assertEqual(self.lines_for(out, "tools/test_lists.py"), [])
+        self.write({"tools/units.txt": TRACED_TABLE.replace(
+            "test_lists.py docs/a/", "test_lists.py tools/a.py")})
+        out = self.trace()[1]
+        self.assertIn("tools/test_lists.py lists docs (not in its entry)",
+                      out)
+
+    def test_a_test_that_asserts_text_absent_still_reads_it(self):
+        out = self.trace()[1]
+        self.assertIn("tools/test_absent.py reads docs/a/one.md "
+                      "(not in its entry)", out)
+
+    def test_a_test_that_skips_on_a_missing_input_asks_for_it(self):
+        out = self.trace()[1]
+        self.assertIn("tools/test_skips.py reads tools/fixture.bin "
+                      "(not in its entry)", out)
+
+    def test_git_with_a_covered_pathspec_is_no_finding(self):
+        out = self.trace()[1]
+        self.assertEqual(self.lines_for(out, "tools/test_git_spec.py"), [])
+
+    def test_git_with_no_pathspec_needs_a_star(self):
+        out = self.trace()[1]
+        self.assertIn("tools/test_git_bare.py runs git ls-files with no "
+                      "pathspec (not in its entry)", out)
+
+    def test_a_failing_unit_is_reported_not_counted(self):
+        code, out, err = self.trace()
+        self.assertIn("tools/test_fails.py: its own command failed (exit 3);"
+                      " its reads are judged all the same", err)
+        self.assertEqual(self.lines_for(out, "tools/test_fails.py"), [])
+
+    def test_a_command_without_unit_is_refused(self):
+        code, _, err = self.call("trace", "--units", "tools", "--",
+                                 "python3")
+        self.assertEqual(code, 2)
+        self.assertIn("{unit}", err[0])
+
+
+class TraceParsing(unittest.TestCase):
+
+    def test_an_unfinished_call_is_joined_to_its_resumption(self):
+        lines = ['1 openat(AT_FDCWD</r>, "a", O_RDONLY <unfinished ...>\n',
+                 '2 exit_group(0) = ?\n',
+                 '1 <... openat resumed>) = 3</r/a>\n']
+        got = list(tool.calls(lines))
+        self.assertEqual(got[-1][:2], (1, "openat"))
+        self.assertIn('"a"', got[-1][2])
+
+    def test_reads_resolve_against_the_dirfd_and_forks_inherit_cwd(self):
+        lines = ['1 chdir("/r/sub") = 0\n',
+                 '1 vfork() = 2\n',
+                 '2 open("x", O_RDONLY) = 3\n',
+                 '2 openat(AT_FDCWD</r>, "y", O_RDONLY) = 3\n',
+                 '2 newfstatat(AT_FDCWD</r>, "d", {st_mode=S_IFDIR|0755}, 0)'
+                 ' = 0\n',
+                 '2 openat(AT_FDCWD</r>, "z", O_RDONLY|O_DIRECTORY) = 3\n',
+                 '2 openat(AT_FDCWD</r>, "/etc/passwd", O_RDONLY) = 3\n']
+        paths, listings, gits = tool.reads(lines, "/r")
+        self.assertEqual(paths, {"sub/x", "y"})
+        self.assertEqual(listings, {"z"})
+        self.assertEqual(gits, [])
+
+    def test_a_git_process_is_judged_by_its_command_line(self):
+        lines = ['5 execve("/usr/bin/git", ["git", "-C", "sub", "grep", '
+                 '"-n", "word", "--", "docs"], 0x0 /* 3 vars */) = 0\n',
+                 '5 openat(AT_FDCWD</r/sub>, ".git/HEAD", O_RDONLY) = 3\n']
+        paths, _, gits = tool.reads(lines, "/r")
+        self.assertEqual(paths, set())
+        self.assertEqual(gits, [("grep", ["sub/docs"])])
+
+    def test_git_show_takes_rev_colon_path_from_the_top(self):
+        self.assertEqual(tool.git_pathspecs(
+            ["git", "show", "HEAD:docs/a.md"], "/r/sub", "/r"),
+            ("show", ["docs/a.md"]))
+
+    def test_git_that_reads_no_content_is_not_a_reader(self):
+        self.assertEqual(tool.git_pathspecs(["git", "rev-parse", "HEAD"],
+                                            "/r", "/r"), (None, None))
 
 
 if __name__ == "__main__":
