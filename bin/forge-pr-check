@@ -790,7 +790,8 @@ every step's exit status and time, and under a failed step its last
 TAIL_LINES lines, each prefixed `    | `. Lines before those that name a
 failure (FAILURE_LINE: `go test`'s `--- FAIL` and `_test.go:N:` lines,
 and `panic:`; Rust's `---- name stdout ----`, `test name ... FAILED`,
-and `thread 'name' panicked at`, with the panic's message) come first,
+and `thread 'name' panicked at`, with the panic's message; Python
+unittest's `FAIL: name (module.Class.name)` and `ERROR: …`) come first,
 up to FAILURE_LINES of them, so a test that failed early in a
 package's output is still named, and why. The status names the failed
 step and nothing more; why it failed is in `worker.log`.
@@ -994,10 +995,14 @@ TAIL_LINES = 40
 # captured output under `---- name stdout ----`, where a panic is
 # `thread 'name' panicked at file:line:column:`, or, from newer Rust
 # toolchains, `thread 'name' (1234) panicked at file:line:column:`.
+# Python's unittest names a failed or erroring test as `FAIL: name
+# (module.Class.name)` or `ERROR: …`, which a step running several test
+# files side by side prints long before its last lines.
 FAILURE_LINE = re.compile(
     r"^\s*--- FAIL\b|_test\.go:\d+:|^panic: "
     r"|^---- \S.* std(out|err) ----$|^thread '.*'(?: \(\d+\))? panicked at "
-    r"|^test \S+ \.\.\. FAILED$")
+    r"|^test \S+ \.\.\. FAILED$"
+    r"|^\s*(?:FAIL|ERROR): \S+ \([\w.]+\)")
 FAILURE_LINES = 40
 # A Rust panic's message is on the lines after its location: up to this
 # many of them are kept with it, stopping at a blank line or at the
