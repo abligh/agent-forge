@@ -506,6 +506,12 @@ class Retell(unittest.TestCase):
         self.assertEqual([(d.rule, d.reminder) for d in got],
                          [(16, router.ONCE)])
 
+    def test_the_report_is_kept_for_the_day(self):
+        # agent-forge #561: busy for one run, the turn was forgotten.
+        got = rules.sweep(context(issues=[],
+                                  listing=directory(entry("WidgetUIDev"))))
+        self.assertEqual(got[0].keep, 24 * 3600)
+
     def test_without_it_the_offer_is_said_once(self):
         configure(self, {"report_to": "LeadDev"})
         got = rules.sweep(context(issues=[owned(30)],
@@ -574,7 +580,7 @@ class Report(unittest.TestCase):
             "open pull requests, 1 issue blocked, 1 issue waiting). Held: "
             "#30 Blocked-by #31 (open); #32 Status:waiting-owner; #33 in "
             "hand: PR #41.",
-            reminder=router.ONCE)])
+            reminder=router.ONCE, keep=24 * 3600)])
 
     def test_the_held_list_is_capped(self):
         issues = [owned(n, owner="UIDev", labels=["Status:waiting-owner"])
