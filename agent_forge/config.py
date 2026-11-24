@@ -59,6 +59,7 @@ TOP = {
     "stats": (dict, False),
     "nightly": (dict, False),
     "session_start": (dict, False),
+    "units": (dict, False),
 }
 NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
@@ -535,6 +536,8 @@ def _check_queue(queue, problems):
 # forge-stats (agent-forge #548): `part_line` reads a step's own part
 # lines from its logs, a regex with named groups part, wall and cpu.
 STATS = {"part_line": str}
+# designs/0065: each named table of test units, for forge-units.
+UNITS = {"table": str, "glob": str, "trace_ignore": list}
 
 
 def _check_stats(stats, problems):
@@ -555,6 +558,29 @@ def _check_stats(stats, problems):
     if missing:
         problems.append("stats.part_line needs the named groups part, "
                         "wall and cpu (missing: %s)" % ", ".join(missing))
+
+
+def _check_units(units, problems):
+    """The `units` section (designs/0065): each name a table of test
+    units, its path and the glob that finds the units, both required;
+    `trace_ignore`, if present, a list of non-empty globs."""
+    if not isinstance(units, dict):
+        problems.append("units must be an object")
+        return
+    for name, entry in units.items():
+        where = "units.%s" % name
+        if not _fields(where, entry, UNITS, problems):
+            continue
+        for key in ("table", "glob"):
+            if key not in entry:
+                problems.append("%s: missing %r" % (where, key))
+            elif isinstance(entry[key], str) and not entry[key]:
+                problems.append("%s.%s must not be empty" % (where, key))
+        ignore = entry.get("trace_ignore")
+        if isinstance(ignore, list) and not all(
+                isinstance(g, str) and g for g in ignore):
+            problems.append("%s.trace_ignore must be a list of globs"
+                            % where)
 
 
 def _check_stats_watch(watch, data, problems):
@@ -936,6 +962,8 @@ def check(data):
         _check_stats(data["stats"], problems)
     if "nightly" in data:
         _check_nightly(data["nightly"], data, problems)
+    if "units" in data:
+        _check_units(data["units"], problems)
     docs = data.get("docs", {})
     for key, kinds in DOCS.items():
         if key in docs and not _is(docs[key], kinds):
