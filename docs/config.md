@@ -1691,7 +1691,10 @@ left out says so once in `verdicts.log` (`OUT-OF-SCOPE`); if it had
 been queued here, while labelled or before `pull_requests` was set,
 its pending status is ended with a green `not run: this pull request
 changes no path this check runs`. A label put on later queues the
-head on the next tick. Without `pull_requests` every head is run, as
+head on the next tick. Each judgment keeps a digest of the `paths` it
+was made under: when they change, every open head is judged again,
+so one a widening now matches is queued, and one still left out isn't
+said again. Without `pull_requests` every head is run, as
 before.
 
 **`reviewed_heads`: an instance runs only reviewed heads**
