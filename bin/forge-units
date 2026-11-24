@@ -8,6 +8,7 @@ each one reads (designs/0065), names it in its configuration under
 
     forge-units select --units NAME --base REF [--head REF] [--why]
     forge-units check --units NAME
+    forge-units trace --units NAME -- COMMAND...
 
 **The table** is a text file, one line each, `#` starting a comment:
 
@@ -32,14 +33,30 @@ prints nothing. `--why` writes what selected each unit, and a last line
 **`check`** holds the table to the units: every unit the glob finds
 has an entry, every entry names a unit, every line parses.
 
-Exit 0 done (for `select`, `ALL` included), 1 `check` found a fault,
-2 the configuration names no such table or can't be read (`select`
-still prints `ALL`, so a runner that reads stdout runs everything).
+**`trace`** runs COMMAND once for each unit, `{unit}` replaced by its
+path, under `strace -f`, and reports each path under the root the unit
+read (opened, stat'ed, listed, or asked for and didn't find) that its
+inputs don't cover, then the `unit` line that would. A project runs it
+in its nightly, never on a head. Not judged: the unit's own file, the
+`everything` paths, `.git/`, `units.<name>.trace_ignore`, a listing of
+the unit's own directory or one above it, and a listing of a directory
+an input lies in. A git process's own reads aren't judged either; its
+command line is: a reading subcommand (ls-files, grep, diff, show, ...)
+must name pathspecs the inputs cover, and one with none needs the input
+`*`. A unit whose command fails is reported, not counted.
+
+Exit 0 done (for `select`, `ALL` included), 1 `check` or `trace` found
+a fault, 2 the configuration names no such table or can't be read
+(`select` still prints `ALL`, so a runner that reads stdout runs
+everything), or strace is missing or can't trace.
 """
 import argparse
 import fnmatch
 import os
+import re
+import shutil
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from agent_forge import config, proc  # noqa: E402
@@ -104,8 +121,9 @@ def covers(pattern, path):
     matches it or a directory above it; anything else is a prefix of
     whole components."""
     if any(c in pattern for c in GLOB_CHARS):
+        pattern = pattern.rstrip("/")
         return (fnmatch.fnmatchcase(path, pattern) or
-                fnmatch.fnmatchcase(path, pattern.rstrip("/") + "/*"))
+                fnmatch.fnmatchcase(path, pattern + "/*"))
     pattern = pattern.rstrip("/")
     return path == pattern or path.startswith(pattern + "/")
 
@@ -244,6 +262,282 @@ def check(args, run, load, out, err):
            "y" if len(table.units) == 1 else "ies", len(faults)))
     return 1 if faults else 0
 
+# --- trace (designs/0065 step 2) ---
+
+TRACE_IGNORE = ["__pycache__/", "target/"]
+# git subcommands that read the tree's content by pathspec. The others
+# (rev-parse, config, status, ...) read only the repository's own
+# bookkeeping, which `select` takes as given.
+GIT_READERS = {"ls-files", "grep", "diff", "show", "log", "ls-tree",
+               "cat-file", "blame", "archive"}
+# git's global options that take a value as the next argument.
+GIT_GLOBAL_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                    "--exec-path", "--config-env"}
+LINE_RE = re.compile(r"^(\d+)\s+(.*)$")
+CALL_RE = re.compile(r"^(\w+)\((.*)\)\s+=\s+(-?\d+|\?)(.*)$")
+UNFINISHED = " <unfinished ...>"
+RESUMED_RE = re.compile(r"^<\.\.\. (\w+) resumed>(.*)$")
+STRING = r'"((?:[^"\\]|\\.)*)"'
+PATH_RE = re.compile(r"^(?:(?:AT_FDCWD|-?\d+)<([^>]*)>,\s*)?" + STRING)
+FDCWD_RE = re.compile(r"AT_FDCWD<([^>]*)>")
+FORKS = {"clone", "clone3", "fork", "vfork"}
+# Calls whose first string argument isn't a path, or whose path is
+# never a read of the tree.
+NOT_READS = {"getcwd", "statfs", "fstatfs", "umount2", "mount"}
+
+
+def unquote(text):
+    """A strace string's text, its common escapes undone."""
+    return re.sub(r'\\(["\\])', r"\1", text)
+
+
+def calls(lines):
+    """(pid, name, args, result, rest) for each complete call in strace
+    -f output, an unfinished call joined to its resumption."""
+    pending = {}
+    for raw in lines:
+        m = LINE_RE.match(raw.rstrip("\n"))
+        if not m:
+            continue
+        pid, text = int(m.group(1)), m.group(2)
+        if text.endswith(UNFINISHED):
+            pending[pid] = text[:-len(UNFINISHED)]
+            continue
+        resumed = RESUMED_RE.match(text)
+        if resumed:
+            text = pending.pop(pid, resumed.group(1) + "(") + \
+                resumed.group(2)
+        call = CALL_RE.match(text)
+        if call:
+            yield pid, call.group(1), call.group(2), call.group(3), \
+                call.group(4)
+
+
+def git_argv(args):
+    """The argument vector of an execve's argument text."""
+    m = re.search(r"\[(.*?)\](?:,|$)", args)
+    if not m:
+        return []
+    return [unquote(s) for s in re.findall(STRING, m.group(1))]
+
+
+def git_pathspecs(argv, cwd, root):
+    """(subcommand, pathspecs relative to the root) of a git command
+    line, or (None, None) when it isn't a reader. Pathspecs follow
+    `--`, or are the arguments that name a path in the tree; `show`
+    and `cat-file` take `REV:PATH`."""
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        if argv[i] == "-C" and i + 1 < len(argv):
+            cwd = os.path.join(cwd, argv[i + 1])
+            i += 2
+        elif argv[i] in GIT_GLOBAL_VALUE:
+            i += 2
+        else:
+            i += 1
+    if i >= len(argv) or argv[i] not in GIT_READERS:
+        return None, None
+    sub, rest = argv[i], argv[i + 1:]
+    specs = []
+    if "--" in rest:
+        at = rest.index("--")
+        specs, rest = rest[at + 1:], rest[:at]
+    words = [a for a in rest if not a.startswith("-")]
+    if sub == "grep" and not any(a in ("-e", "-f") for a in rest) and words:
+        words = words[1:]
+    for word in words:
+        if sub in ("show", "cat-file") and ":" in word:
+            path = word.split(":", 1)[1]
+            # REV:PATH is from the top; REV:./PATH from the cwd.
+            if path.startswith("./") or path.startswith("../"):
+                specs.append(path)
+            else:
+                specs.append(":/" + path)
+        elif sub in ("ls-files", "grep", "blame") or \
+                os.path.exists(os.path.join(cwd, word)):
+            specs.append(word)
+    out = []
+    for spec in specs:
+        if spec.startswith(":/"):
+            out.append(spec[2:].lstrip("/") or ".")
+            continue
+        if spec.startswith(":("):
+            spec = spec.split(")", 1)[-1]
+        rel = os.path.relpath(os.path.normpath(os.path.join(cwd, spec)),
+                              root)
+        out.append(rel)
+    return sub, out
+
+
+def literal_prefix(spec):
+    """The part of a pathspec before its first glob character, cut back
+    to a whole component."""
+    cut = min([spec.index(c) for c in GLOB_CHARS if c in spec] or
+              [len(spec)])
+    if cut == len(spec):
+        return spec
+    return spec[:cut].rsplit("/", 1)[0] if "/" in spec[:cut] else ""
+
+
+def reads(lines, root):
+    """What a traced run read under `root`: (paths, listings, git runs),
+    paths and listings relative to the root, git runs as
+    (subcommand, pathspecs or [])."""
+    root = os.path.realpath(root)
+    cwd, gitpid = {}, set()
+    paths, listings, gits = set(), set(), []
+    for pid, name, args, result, rest in calls(lines):
+        fd = FDCWD_RE.search(args)
+        if fd:
+            cwd[pid] = fd.group(1)
+        if name in FORKS and result.isdigit():
+            child = int(result)
+            if pid in cwd:
+                cwd[child] = cwd[pid]
+            if pid in gitpid:
+                gitpid.add(child)
+            continue
+        if name == "execve" and result == "0":
+            argv = git_argv(args)
+            exe = PATH_RE.match(args)
+            program = os.path.basename(unquote(exe.group(2))) if exe \
+                else ""
+            if program == "git" or (argv and
+                                    os.path.basename(argv[0]) == "git"):
+                gitpid.add(pid)
+                sub, specs = git_pathspecs(argv, cwd.get(pid, root), root)
+                if sub:
+                    gits.append((sub, specs))
+                continue
+        if pid in gitpid or name in NOT_READS:
+            continue
+        m = PATH_RE.match(args)
+        if not m:
+            continue
+        base = m.group(1) or cwd.get(pid, root)
+        path = os.path.normpath(os.path.join(base, unquote(m.group(2))))
+        if name == "chdir" and result == "0":
+            cwd[pid] = path
+            continue
+        rel = os.path.relpath(path, root)
+        if rel == "." or rel.startswith(".."):
+            continue
+        # A stat that finds a directory, or a readlink that finds no
+        # link, only resolves a path: it reads nothing in it.
+        if "S_IFDIR" in args or (name.startswith("readlink") and
+                                 "EINVAL" in rest):
+            continue
+        if "O_DIRECTORY" in args:
+            listings.add(rel)
+        else:
+            paths.add(rel)
+    return paths, listings, gits
+
+
+def findings(unit, inputs, paths, listings, gits, ignore):
+    """What `unit` read that its inputs don't cover, as lines."""
+    def ignored(path):
+        if path == unit or path == ".git" or path.startswith(".git/"):
+            return True
+        return any(covers(g, path) or covers("*/" + g.rstrip("/"), path)
+                   for g in ignore)
+
+    def held(path):
+        return any(covers(i, path) for i in inputs)
+
+    above = set()
+    parent = os.path.dirname(unit)
+    while parent:
+        above.add(parent)
+        parent = os.path.dirname(parent)
+    found = []
+    for path in sorted(paths):
+        if path not in above and not ignored(path) and not held(path):
+            found.append((path, "reads %s" % path))
+    for path in sorted(listings):
+        if path in above or ignored(path) or held(path):
+            continue
+        if any(covers(path, i.rstrip("*").rstrip("/") or i)
+               for i in inputs):
+            continue
+        found.append((path + "/", "lists %s" % path))
+    for sub, specs in gits:
+        if not specs:
+            if "*" not in inputs:
+                found.append(("*", "runs git %s with no pathspec" % sub))
+            continue
+        for spec in specs:
+            prefix = literal_prefix(spec)
+            if prefix and (ignored(prefix) or held(prefix)):
+                continue
+            if not prefix and "*" in inputs:
+                continue
+            found.append((spec, "runs git %s on %s" % (sub, spec)))
+    return found
+
+
+def trace(args, run, load, out, err):
+    try:
+        root, entry = settings(args.units, load)
+    except config.ConfigError as error:
+        err("forge-units: %s" % error)
+        return 2
+    command = args.runner[1:] if args.runner[:1] == ["--"] \
+        else list(args.runner)
+    if not command or not any("{unit}" in a for a in command):
+        err("forge-units: trace needs a command with {unit} in it")
+        return 2
+    if run is proc.sh and not shutil.which("strace"):
+        err("forge-units: trace needs strace, which isn't installed")
+        return 2
+    try:
+        with open(os.path.join(root, entry["table"])) as handle:
+            table = parse(handle.read())
+    except (OSError, TableError) as error:
+        err("forge-units: can't read %s: %s" % (entry["table"], error))
+        return 2
+    listed = git(run, root, "ls-files", "--cached", "--others",
+                 "--exclude-standard")
+    units = [u for u in found(listed.stdout.splitlines(), entry["glob"])
+             if os.path.exists(os.path.join(root, u))]
+    ignore = entry.get("trace_ignore", TRACE_IGNORE) + table.everything
+    total, failed = 0, 0
+    with tempfile.TemporaryDirectory(prefix="forge-units-") as scratch:
+        for number, unit in enumerate(units):
+            log = os.path.join(scratch, "%d.strace" % number)
+            argv = [a.replace("{unit}", unit) for a in command]
+            got = run(["strace", "-f", "-qq", "-y", "-v", "-s", "65535",
+                       "-e", "trace=%file,%process", "-o", log, "--",
+                       *argv], cwd=root)
+            try:
+                with open(log, errors="replace") as handle:
+                    lines = handle.readlines()
+            except OSError:
+                lines = []
+            if not lines:
+                err("forge-units: strace traced nothing for %s (exit %d): "
+                    "%s" % (unit, got.returncode, (got.stderr or "").strip()))
+                return 2
+            if got.returncode != 0:
+                failed += 1
+                err("%s: its own command failed (exit %d); its reads are "
+                    "judged all the same" % (unit, got.returncode))
+            inputs = table.units.get(unit)
+            if inputs is None:
+                err("%s has no entry; it runs for every change" % unit)
+                continue
+            found_ = findings(unit, inputs, *reads(lines, root), ignore)
+            if not found_:
+                continue
+            total += len(found_)
+            for _, why in found_:
+                out("%s %s (not in its entry)" % (unit, why))
+            more = [p for p, _ in found_ if p not in inputs]
+            out("  unit %s %s" % (unit, " ".join((inputs or []) + more)))
+    out("forge-units: %d unit(s) traced, %d finding(s), %d failed their "
+        "own test" % (len(units), total, failed))
+    return 1 if total else 0
+
 
 def main(argv=None, run=proc.sh, load=config.load, out=print, err=None):
     err = err or (lambda line: print(line, file=sys.stderr))
@@ -258,8 +552,13 @@ def main(argv=None, run=proc.sh, load=config.load, out=print, err=None):
                      help="say what selected each unit, on stderr")
     two = sub.add_parser("check", help="hold the table to the units")
     two.add_argument("--units", required=True, metavar="NAME")
+    three = sub.add_parser("trace", help="trace each unit's reads")
+    three.add_argument("--units", required=True, metavar="NAME")
+    three.add_argument("runner", nargs=argparse.REMAINDER,
+                       help="the runner, with {unit} for the unit's path")
     args = parser.parse_args(argv)
-    command = select if args.command == "select" else check
+    command = {"select": select, "check": check,
+               "trace": trace}[args.command]
     return command(args, run, load, out, err)
 
 

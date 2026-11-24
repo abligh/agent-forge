@@ -40,7 +40,7 @@ The merge pipeline, which runs from cron and on webhooks:
 | --- | --- |
 | [`forge-merger`](docs/tools/forge-merger.md) | Merges each reviewer-approved pull request in turn, oldest first. |
 | [`forge-pr-check`](docs/tools/forge-pr-check.md) | Builds and tests each open pull request's head on the host, under a memory limit, and posts the status the Merger requires. |
-| [`forge-units`](docs/tools/forge-units.md) | Says which of a step's test units a head's changes reach, from a table the project keeps of what each reads, failing closed to all of them ([designs/0065](docs/designs/0065-a-head-runs-the-test-units-its-changes-reach.md)). |
+| [`forge-units`](docs/tools/forge-units.md) | Says which of a step's test units a head's changes reach, from a table the project keeps of what each reads, failing closed to all of them; in a nightly, traces each unit's reads and reports any the table misses ([designs/0065](docs/designs/0065-a-head-runs-the-test-units-its-changes-reach.md)). |
 | [`forge-router`](docs/tools/forge-router.md) | Wakes each agent whose turn an open issue or pull request is, through the XMPP relay. |
 | [`forge-receiver`](docs/tools/forge-receiver.md) | Takes GitHub's webhook deliveries and ticks the tools an event gives work. |
 | [`forge-cron-run`](docs/tools/forge-cron-run.md) | Runs a project's tool from cron against the reviewed checkout, under locks. |
