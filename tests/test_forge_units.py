@@ -387,6 +387,31 @@ class TraceParsing(unittest.TestCase):
         self.assertEqual(listings, {"z"})
         self.assertEqual(gits, [])
 
+    def test_a_vfork_child_that_moved_before_the_parent_says_so(self):
+        # The order strace -f gave on a real trace: the child's chdir,
+        # its execve unfinished, the parent's vfork resumed, then the
+        # execve resumed. The child's own directory stands.
+        lines = ['1 chdir("/r") = 0\n',
+                 '1 vfork( <unfinished ...>\n',
+                 '2 chdir("/tmp/x") = 0\n',
+                 '2 execve("/usr/bin/git", ["git", "ls-files"], 0x0 '
+                 '/* 3 vars */ <unfinished ...>\n',
+                 '1 <... vfork resumed>) = 2\n',
+                 '2 <... execve resumed>) = 0\n']
+        paths, _, gits = tool.reads(lines, "/r")
+        self.assertEqual((paths, gits), (set(), []))
+
+    def test_a_pid_that_comes_back_inherits_afresh(self):
+        lines = ['1 chdir("/r/a") = 0\n',
+                 '1 vfork() = 2\n',
+                 '2 chdir("/tmp") = 0\n',
+                 '2 exit_group(0) = ?\n',
+                 '2 +++ exited with 0 +++\n',
+                 '1 vfork() = 2\n',
+                 '2 open("x", O_RDONLY) = 3\n']
+        paths, _, _ = tool.reads(lines, "/r")
+        self.assertEqual(paths, {"a/x"})
+
     def test_a_git_process_is_judged_by_its_command_line(self):
         lines = ['5 execve("/usr/bin/git", ["git", "-C", "sub", "grep", '
                  '"-n", "word", "--", "docs"], 0x0 /* 3 vars */) = 0\n',
