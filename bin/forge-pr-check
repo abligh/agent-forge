@@ -791,7 +791,8 @@ TAIL_LINES lines, each prefixed `    | `. Lines before those that name a
 failure (FAILURE_LINE: `go test`'s `--- FAIL` and `_test.go:N:` lines,
 and `panic:`; Rust's `---- name stdout ----`, `test name ... FAILED`,
 and `thread 'name' panicked at`, with the panic's message; Python
-unittest's `FAIL: name (module.Class.name)` and `ERROR: …`) come first,
+unittest's `FAIL: name (module.Class.name)` and `ERROR: …`; rustc's
+`error[E0061]: …` and `error: …`, with the lines that place it) come first,
 up to FAILURE_LINES of them, so a test that failed early in a
 package's output is still named, and why. The status names the failed
 step and nothing more; why it failed is in `worker.log`.
@@ -1002,12 +1003,16 @@ FAILURE_LINE = re.compile(
     r"^\s*--- FAIL\b|_test\.go:\d+:|^panic: "
     r"|^---- \S.* std(out|err) ----$|^thread '.*'(?: \(\d+\))? panicked at "
     r"|^test \S+ \.\.\. FAILED$"
-    r"|^\s*(?:FAIL|ERROR): \S+ \([\w.]+\)")
+    r"|^\s*(?:FAIL|ERROR): \S+ \([\w.]+\)"
+    r"|^error(?:\[E\d+\])?: ")
 FAILURE_LINES = 40
 # A Rust panic's message is on the lines after its location: up to this
 # many of them are kept with it, stopping at a blank line or at the
 # harness's `note:`.
 PANIC_LINE = re.compile(r"^thread '.*'(?: \(\d+\))? panicked at ")
+# rustc's error is placed on the lines after it (`--> file:line:col`, the
+# source line and its marker): kept like a panic's message.
+RUSTC_ERROR_LINE = re.compile(r"^error\[E\d+\]: ")
 PANIC_MESSAGE_LINES = 6
 # Verdicts older than this are dropped from state.json.
 KEEP = datetime.timedelta(days=21)
@@ -6170,7 +6175,8 @@ def tail(text, lines=TAIL_LINES, failures=FAILURE_LINES):
     for line in before:
         if FAILURE_LINE.search(line):
             named.append(line)
-            message = PANIC_MESSAGE_LINES if PANIC_LINE.search(line) else 0
+            message = PANIC_MESSAGE_LINES if (
+                PANIC_LINE.search(line) or RUSTC_ERROR_LINE.search(line)) else 0
         elif message and line.strip() and not line.startswith("note: "):
             named.append(line)
             message -= 1

@@ -1215,6 +1215,30 @@ class Tail(unittest.TestCase):
             "ERROR: test_y (test_tool.Other.test_y)"])
         self.assertTrue(got[3].startswith("["))
 
+    def test_a_rustc_error_above_the_tail_is_kept_with_its_place(self):
+        # A step that builds for several targets side by side prints one
+        # target's compile error long before its last lines.
+        text = ("   Checking a v0.1.0\n"
+                "error[E0061]: this function takes 7 arguments but 6 "
+                "arguments were supplied\n"
+                "   --> crates/a/src/ios/view.rs:983:28\n"
+                "    |\n"
+                "983 |     let kept = deep(a, b, c, d, e, f);\n"
+                "    |                ^^^^\n"
+                "\n"
+                "error: could not compile `a` (lib) due to 1 previous error\n"
+                + "".join("   Checking more%d\n" % i for i in range(60)))
+        got = pc.tail(text).splitlines()
+        self.assertEqual(got[:7], [
+            "error[E0061]: this function takes 7 arguments but 6 "
+            "arguments were supplied",
+            "   --> crates/a/src/ios/view.rs:983:28",
+            "    |",
+            "983 |     let kept = deep(a, b, c, d, e, f);",
+            "    |                ^^^^",
+            "error: could not compile `a` (lib) due to 1 previous error",
+            "[22 earlier lines left out]"])
+
     def test_a_subtest_failure_and_a_panic_are_kept(self):
         text = ("    --- FAIL: TestX/sub (0.00s)\n"
                 "panic: runtime error: index out of range\n"
