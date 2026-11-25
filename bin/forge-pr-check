@@ -793,7 +793,8 @@ and `panic:`; Rust's `---- name stdout ----`, `test name ... FAILED`,
 and `thread 'name' panicked at`, with the panic's message; Python
 unittest's `FAIL: name (module.Class.name)` and `ERROR: …`; rustc's
 `error[E0061]: …` and `error: …`, with the lines that place it; ESLint's
-`  12:34  error  …` under its file) come first,
+`  12:34  error  …` under its file; Vitest's `FAIL  file.test.ts > name`,
+with its assertion; each read with its colours taken out) come first,
 up to FAILURE_LINES of them, so a test that failed early in a
 package's output is still named, and why. The status names the failed
 step and nothing more; why it failed is in `worker.log`.
@@ -1006,7 +1007,8 @@ FAILURE_LINE = re.compile(
     r"|^test \S+ \.\.\. FAILED$"
     r"|^\s*(?:FAIL|ERROR): \S+ \([\w.]+\)"
     r"|^error(?:\[E\d+\])?: "
-    r"|^\s+\d+:\d+\s+error\s")
+    r"|^\s+\d+:\d+\s+error\s"
+    r"|^\s*FAIL\s+.*\S\.(?:test|spec)\.[cm]?[jt]sx?\s+>\s")
 FAILURE_LINES = 40
 # A Rust panic's message is on the lines after its location: up to this
 # many of them are kept with it, stopping at a blank line or at the
@@ -1019,6 +1021,11 @@ ESLINT_ERROR_LINE = re.compile(r"^\s+\d+:\d+\s+error\s")
 # after it (`--> file:line:col`, the source line and its marker): kept
 # like a panic's message. `could not compile` has no place of its own.
 RUSTC_ERROR_LINE = re.compile(r"^error(?:\[E\d+\])?: (?!could not compile)")
+# Vitest names a failed test as `FAIL  [project]  file.test.ts > name`,
+# in colour, with its assertion on the lines after: kept like a panic's
+# message.
+VITEST_FAIL_LINE = re.compile(
+    r"^\s*FAIL\s+.*\S\.(?:test|spec)\.[cm]?[jt]sx?\s+>\s")
 PANIC_MESSAGE_LINES = 6
 # Verdicts older than this are dropped from state.json.
 KEEP = datetime.timedelta(days=21)
@@ -6180,6 +6187,7 @@ def tail(text, lines=TAIL_LINES, failures=FAILURE_LINES):
     named, message = [], 0
     previous = ""
     for line in before:
+        line = ANSI_RE.sub("", line)
         if FAILURE_LINE.search(line):
             if (ESLINT_ERROR_LINE.search(line) and previous.strip()
                     and not previous[:1].isspace()
@@ -6187,7 +6195,8 @@ def tail(text, lines=TAIL_LINES, failures=FAILURE_LINES):
                 named.append(previous)
             named.append(line)
             message = PANIC_MESSAGE_LINES if (
-                PANIC_LINE.search(line) or RUSTC_ERROR_LINE.search(line)) else 0
+                PANIC_LINE.search(line) or RUSTC_ERROR_LINE.search(line)
+                or VITEST_FAIL_LINE.search(line)) else 0
         elif message and line.strip() and not line.startswith("note: "):
             named.append(line)
             message -= 1

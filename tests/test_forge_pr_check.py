@@ -1281,6 +1281,29 @@ class Tail(unittest.TestCase):
                          "due to 1 previous error")
         self.assertTrue(got[7].startswith("["))
 
+    def test_a_vitest_failure_above_the_tail_is_kept_with_its_assertion(self):
+        text = ("\x1b[41m\x1b[1m FAIL \x1b[22m\x1b[49m \x1b[30m\x1b[42m unit "
+                "\x1b[49m\x1b[39m src/app/css.test.ts\x1b[2m > \x1b[22m"
+                "fills every default button\n"
+                "AssertionError: expected [ 'a.tsx', …(2) ] to deeply "
+                "equal [ 'a.tsx', …(1) ]\n"
+                "\n"
+                "- Expected\n"
+                + "".join("line %d\n" % i for i in range(60)))
+        got = pc.tail(text).splitlines()
+        self.assertEqual(got[:3], [
+            " FAIL   unit  src/app/css.test.ts > fills every default button",
+            "AssertionError: expected [ 'a.tsx', …(2) ] to deeply equal "
+            "[ 'a.tsx', …(1) ]",
+            "[22 earlier lines left out]"])
+
+    def test_a_vitest_file_summary_is_not_kept(self):
+        text = (" \x1b[31m❯\x1b[39m unit src/app/css.test.ts (11 tests | "
+                "1 failed)\n"
+                " ✓ unit src/app/b.test.ts (3 tests)\n"
+                + "".join("line %d\n" % i for i in range(60)))
+        self.assertEqual(pc.tail(text).splitlines()[0], "line 20")
+
     def test_an_eslint_warning_is_not_kept(self):
         text = ("/wt/a.ts\n  1:1  warning  Unused  no-unused-vars\n"
                 + "".join("line %d\n" % i for i in range(60)))
