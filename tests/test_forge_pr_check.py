@@ -1239,6 +1239,28 @@ class Tail(unittest.TestCase):
             "error: could not compile `a` (lib) due to 1 previous error",
             "[22 earlier lines left out]"])
 
+    def test_an_eslint_error_above_the_tail_is_kept_under_its_file(self):
+        text = ("\n"
+                "/wt/web/src/app/export.ts\n"
+                "  679:100  error  Interface text comes from the locales  "
+                "no-restricted-syntax\n"
+                "  680:3    error  Another  no-restricted-syntax\n"
+                "\n"
+                "\u2716 2 problems (2 errors, 0 warnings)\n"
+                + "".join("   Checking more%d\n" % i for i in range(60)))
+        got = pc.tail(text).splitlines()
+        self.assertEqual(got[:4], [
+            "/wt/web/src/app/export.ts",
+            "  679:100  error  Interface text comes from the locales  "
+            "no-restricted-syntax",
+            "  680:3    error  Another  no-restricted-syntax",
+            "[23 earlier lines left out]"])
+
+    def test_an_eslint_warning_is_not_kept(self):
+        text = ("/wt/a.ts\n  1:1  warning  Unused  no-unused-vars\n"
+                + "".join("line %d\n" % i for i in range(60)))
+        self.assertEqual(pc.tail(text).splitlines()[0], "line 20")
+
     def test_a_subtest_failure_and_a_panic_are_kept(self):
         text = ("    --- FAIL: TestX/sub (0.00s)\n"
                 "panic: runtime error: index out of range\n"
