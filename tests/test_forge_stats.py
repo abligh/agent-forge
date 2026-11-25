@@ -197,6 +197,84 @@ class Scoped(unittest.TestCase):
                                                              UNTIL)))
 
 
+class UnitsSelected(unittest.TestCase):
+    # designs/0065 step 3: the share of test units `forge-units select
+    # --why` chose, from the line it leaves in a step's log.
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def log(self, run, step, *lines, gz=False):
+        import gzip
+        folder = os.path.join(self.dir.name, "logs", run)
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, step + ".log")
+        text = "".join(line + "\n" for line in lines)
+        if gz:
+            with gzip.open(path + ".gz", "wt") as handle:
+                handle.write(text)
+        else:
+            with open(path, "w") as handle:
+                handle.write(text)
+
+    def run_(self, run, at="2026-10-12T01:00:00Z", steps=("tools",)):
+        return {"finished": at, "logs": "logs/" + run,
+                "step_seconds": {s: 60 for s in steps}}
+
+    def stats(self, results):
+        return tool.units_selected_stats(results, SINCE, UNTIL,
+                                         self.dir.name)
+
+    def test_heads_count_and_trains_do_not(self):
+        self.log("a", "tools", "x: x.py", "selected 10 of 100 (10%)")
+        self.log("b", "tools", "selected 30 of 100 (30%)", gz=True)
+        self.log("c", "tools", "ran everything")   # a train
+        got = self.stats({"a": self.run_("a"), "b": self.run_("b"),
+                          "c": self.run_("c")})
+        self.assertEqual((got["runs"], got["all"], got["selected"],
+                          got["of"]), (2, 0, 40, 200))
+        self.assertEqual((got["share"]["median"], got["share"]["max"]),
+                         (10.0, 30.0))
+
+    def test_a_head_that_selects_everything_is_100(self):
+        self.log("a", "tools", "selected 5 of 100 (5%)")
+        self.log("b", "tools", "selected all: README.md is in everything")
+        got = self.stats({"a": self.run_("a"), "b": self.run_("b")})
+        self.assertEqual((got["runs"], got["all"], got["selected"],
+                          got["of"]), (2, 1, 5, 100))
+        self.assertEqual(sorted([got["share"]["median"],
+                                 got["share"]["max"]]), [5.0, 100.0])
+
+    def test_steps_add_up_and_a_steps_last_line_counts(self):
+        self.log("a", "tools", "selected 9 of 10 (90%)",
+                 "selected 1 of 10 (10%)")
+        self.log("a", "lib", "selected 3 of 30 (10%)")
+        got = self.stats({"a": self.run_("a", steps=("tools", "lib"))})
+        self.assertEqual((got["selected"], got["of"],
+                          got["share"]["median"]), (4, 40, 10.0))
+
+    def test_outside_the_window_or_without_a_log_is_left_out(self):
+        self.log("a", "tools", "selected 1 of 10 (10%)")
+        got = self.stats({
+            "a": self.run_("a", at="2026-10-11T23:00:00Z"),
+            "b": self.run_("b"),
+            "c": {"finished": "2026-10-12T01:00:00Z", "logs": "../a",
+                  "step_seconds": {"tools": 1}},
+            "d": {"logs": "logs/a"}})
+        self.assertEqual(got["runs"], 0)
+        self.assertIsNone(tool.units_selected_text(got))
+
+    def test_the_report_line(self):
+        self.log("a", "tools", "selected 10 of 100 (10%)")
+        self.log("b", "tools", "selected 30 of 100 (30%)")
+        self.log("c", "tools", "selected all: no merge base")
+        got = tool.units_selected_text(self.stats({
+            "a": self.run_("a"), "b": self.run_("b"), "c": self.run_("c")}))
+        self.assertEqual(got, "  test units selected: 40 of 200 on 2 "
+                         "(20%), all on 1; per run median 30%, p90 100%")
+
+
 class Queue(unittest.TestCase):
 
     def setUp(self):
