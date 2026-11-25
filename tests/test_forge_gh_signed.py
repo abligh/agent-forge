@@ -96,5 +96,57 @@ class GhSigned(unittest.TestCase):
         self.assertEqual(self.run_tool("x", "--body-file", self.body), 2)
 
 
+class PinnedReview(GhSigned):
+    """A review pinned to the commit read, through gh api."""
+
+    SHA = "a" * 40
+
+    def test_an_approval_is_posted_on_the_commit(self):
+        self.run_tool("pr", "review", "7", "--approve", "--body-file",
+                      self.body, "--commit-id", self.SHA, "-R", "o/r")
+        (prog, argv, env), = self.execs
+        self.assertEqual(argv, [
+            "gh", "api", "-X", "POST", "repos/o/r/pulls/7/reviews",
+            "-f", "commit_id=" + self.SHA, "-f", "event=APPROVE",
+            "-F", "body=@" + self.body])
+        self.assertEqual(env["GH_TOKEN"], "ghs_Reviewer")
+
+    def test_the_equals_forms_and_the_current_repository(self):
+        self.run_tool("pr", "review", "--request-changes", "9",
+                      "--body-file=" + self.body, "--commit-id=" + self.SHA)
+        (_, argv, _), = self.execs
+        self.assertIn("repos/{owner}/{repo}/pulls/9/reviews", argv)
+        self.assertIn("event=REQUEST_CHANGES", argv)
+
+    def test_it_is_still_signed_and_checked(self):
+        self.write("Fine.\n")
+        self.assertEqual(self.run_tool(
+            "pr", "review", "7", "-c", "--body-file", self.body,
+            "--commit-id", self.SHA), 3)
+        self.assertEqual(self.execs, [])
+
+    def test_what_cant_be_sent_as_one_is_refused(self):
+        for extra in (["7", "--approve", "--commit-id", "abc"],
+                      ["7", "--commit-id", self.SHA],
+                      ["--approve", "--commit-id", self.SHA],
+                      ["7", "--approve", "--comment", "--commit-id",
+                       self.SHA],
+                      ["7", "--approve", "-t", "x", "--commit-id",
+                       self.SHA]):
+            self.assertEqual(self.run_tool(
+                "pr", "review", *extra, "--body-file", self.body), 2,
+                extra)
+        self.assertEqual(self.run_tool(
+            "pr", "comment", "7", "--body-file", self.body,
+            "--commit-id", self.SHA), 2)
+        self.assertEqual(self.execs, [])
+
+    def test_without_it_a_review_goes_to_gh_as_ever(self):
+        args = ["pr", "review", "7", "--approve", "--body-file", self.body]
+        self.run_tool(*args)
+        (_, argv, _), = self.execs
+        self.assertEqual(argv, ["gh"] + args)
+
+
 if __name__ == "__main__":
     unittest.main()
