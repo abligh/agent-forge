@@ -39,6 +39,11 @@ defaults to the last `--hours` (24) up to now.
 - the scoped steps' time (`scoped_seconds`, designs/0048): on how many
   runs that finished in the window they ran, and how long they took
   there, together on each run and in all. Shown only when some did;
+- the test units the runs selected (`units_selected`, designs/0065):
+  from the `selected N of M (P%)` line `forge-units select --why`
+  leaves in a step's log, the units chosen and listed over the runs
+  that left one, and the spread of each run's share. Shown only when
+  some run did;
 - with `checks.quick` (designs/0055), the two tiers apart (`tiers`):
   for the quick runs on heads and the full runs (trains and the default
   branch), the runs, their slot time, the reds and the waits for a
@@ -707,33 +712,108 @@ def all_cpu_stats(results, since, until):
     return {"seconds": round(seconds, 2), "runs": runs}
 
 
+def step_log(pr_dir, result, step):
+    """The lines of one run's step log (gzipped or not), [] without one
+    or for a `logs` or step name that would leave the state directory."""
+    logs = result.get("logs")
+    if not isinstance(logs, str) or not logs or os.path.isabs(logs) \
+            or ".." in logs.split("/") or not isinstance(step, str) \
+            or "/" in step or step in ("", ".", ".."):
+        return []
+    path = os.path.join(pr_dir, logs, step + ".log")
+    for name, opener in ((path + ".gz", gzip.open), (path, open)):
+        try:
+            with opener(name, "rt", errors="replace") as handle:
+                return handle.readlines()
+        except OSError:
+            continue
+    return []
+
+
 def step_parts(pr_dir, result, step, pattern):
     """agent-forge #548: {part: (wall, cpu)} from the part lines of one
     run's step log (`stats.part_line`), {} without one. A part said more
     than once counts its last line."""
-    logs = result.get("logs")
-    if not isinstance(logs, str) or not logs or os.path.isabs(logs) \
-            or ".." in logs.split("/") or "/" in step or step in (".", ".."):
-        return {}
-    path = os.path.join(pr_dir, logs, step + ".log")
     parts = {}
-    for name, opener in ((path + ".gz", gzip.open), (path, open)):
+    for line in step_log(pr_dir, result, step):
+        found = pattern.search(line)
+        if not found:
+            continue
         try:
-            with opener(name, "rt", errors="replace") as handle:
-                for line in handle:
-                    found = pattern.search(line)
-                    if not found:
-                        continue
-                    try:
-                        parts[found.group("part")] = (
-                            float(found.group("wall")),
-                            float(found.group("cpu")))
-                    except (TypeError, ValueError):
-                        continue
-            return parts
-        except OSError:
+            parts[found.group("part")] = (
+                float(found.group("wall")), float(found.group("cpu")))
+        except (TypeError, ValueError):
             continue
     return parts
+
+
+SELECTED = re.compile(r"\bselected (?:(\d+) of (\d+) \(\d+%\)|all: )")
+
+
+def units_selected_stats(results, since, until, pr_dir):
+    """designs/0065: what `forge-units select --why` chose on the runs
+    that finished in the window, from the `selected N of M (P%)` line
+    it leaves in a step's log. A run whose steps hold none (a train, the
+    default branch) is not counted. A step's last line counts, and a
+    run's steps add up, so a run that selects from two tables counts
+    both. A `selected all: <why>` line (a head that changed what every
+    unit reads) is a run at 100%, counted in `all` and in the share,
+    but its units, not printed, are in neither `selected` nor `of`.
+    {"runs", "all", "selected", "of", "share": summary of each run's
+    percentage}."""
+    shares, chosen, total, everything = [], 0, 0, 0
+    for result in (results or {}).values():
+        if not isinstance(result, dict):
+            continue
+        try:
+            when = parse_time(result["finished"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if not since <= when < until:
+            continue
+        steps = set()
+        for key in ("step_seconds", "step_cpu"):
+            if isinstance(result.get(key), dict):
+                steps.update(result[key])
+        got, of, whole = 0, 0, False
+        for step in sorted(steps):
+            last = None
+            for line in step_log(pr_dir, result, step):
+                found = SELECTED.search(line)
+                if found:
+                    last = found
+            if last and last.group(2) is None:
+                whole = True
+            elif last:
+                got += int(last.group(1))
+                of += int(last.group(2))
+        if whole:
+            everything += 1
+            shares.append(100.0)
+        elif of:
+            shares.append(round(100 * got / of, 1))
+            chosen += got
+            total += of
+    return {"runs": len(shares), "all": everything, "selected": chosen,
+            "of": total, "share": summary(shares)}
+
+
+def units_selected_text(units):
+    """The report's line for test units selected, or None when no run
+    left a `selected` line."""
+    if not units or not units["runs"]:
+        return None
+    share = units["share"]
+    some = units["runs"] - units["all"]
+    said = []
+    if some:
+        said.append("%d of %d on %d (%.0f%%)" % (
+            units["selected"], units["of"], some,
+            100 * units["selected"] / units["of"]))
+    if units["all"]:
+        said.append("all on %d" % units["all"])
+    return ("  test units selected: %s; per run median %.0f%%, p90 %.0f%%"
+            % (", ".join(said), share["median"], share["p90"]))
 
 
 def quick_cpu_stats(results, since, until, pr_dir=None, part_line=None):
@@ -929,6 +1009,8 @@ def report(name, since, until, check, queue, approval, authors,
             if queue.get("merges") else ""))
     if check.get("scoped") is not None and scoped_text(check["scoped"]):
         lines.append(scoped_text(check["scoped"]))
+    if units_selected_text(check.get("units_selected")):
+        lines.append(units_selected_text(check["units_selected"]))
     lines += tiers_text(check.get("tiers"))
     if check.get("red_train_tops_per_merge") is not None:
         lines.append("  red train tops per merge: %.2f (%d red)" % (
@@ -1043,6 +1125,8 @@ def main(argv=None, out=print, environ=None, now=None,
         results, since, until, pr_dir,
         project.section("stats").get("part_line"))
     check["scoped"] = scoped_stats(results, since, until)
+    check["units_selected"] = units_selected_stats(
+        results, since, until, pr_dir)
     queue = queue_stats(records, since, until)
     check["red_train_tops_per_merge"] = red_train_tops_per_merge(check, queue)
     approval, authors = None, {}
