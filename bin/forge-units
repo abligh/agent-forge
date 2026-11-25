@@ -326,16 +326,27 @@ def git_pathspecs(argv, cwd, root):
     line, or (None, None) when it isn't a reader. Pathspecs follow
     `--`, or are the arguments that name a path in the tree; `show`
     and `cat-file` take `REV:PATH`."""
-    i = 1
+    i, tree = 1, None
     while i < len(argv) and argv[i].startswith("-"):
         if argv[i] == "-C" and i + 1 < len(argv):
             cwd = os.path.join(cwd, argv[i + 1])
             i += 2
+        elif argv[i] == "--work-tree" and i + 1 < len(argv):
+            tree = argv[i + 1]
+            i += 2
+        elif argv[i].startswith("--work-tree="):
+            tree = argv[i].split("=", 1)[1]
+            i += 1
         elif argv[i] in GIT_GLOBAL_VALUE:
             i += 2
         else:
             i += 1
     if i >= len(argv) or argv[i] not in GIT_READERS:
+        return None, None
+    # A git that works on another repository (a test's scratch one, say)
+    # reads nothing of this tree, whatever its pathspecs say.
+    top = os.path.normpath(os.path.join(cwd, tree) if tree else cwd)
+    if os.path.relpath(top, root).startswith(".."):
         return None, None
     sub, rest = argv[i], argv[i + 1:]
     specs = []

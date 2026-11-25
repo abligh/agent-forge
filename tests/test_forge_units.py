@@ -400,6 +400,31 @@ class TraceParsing(unittest.TestCase):
             ["git", "show", "HEAD:docs/a.md"], "/r/sub", "/r"),
             ("show", ["docs/a.md"]))
 
+    def test_a_git_in_another_repository_reads_nothing_here(self):
+        # A test's scratch repository outside the root: by its cwd, by
+        # -C, and by --work-tree, with and without pathspecs.
+        lines = ['5 chdir("/tmp/repo") = 0\n',
+                 '5 execve("/usr/bin/git", ["git", "ls-files"], 0x0 '
+                 '/* 3 vars */) = 0\n',
+                 '6 execve("/usr/bin/git", ["git", "-C", "/tmp/repo", '
+                 '"show", "HEAD:a.txt"], 0x0 /* 3 vars */) = 0\n',
+                 '7 execve("/usr/bin/git", ["git", "-C", "/tmp/repo", '
+                 '"ls-files", "a.txt"], 0x0 /* 3 vars */) = 0\n',
+                 '8 execve("/usr/bin/git", ["git", "--work-tree=/tmp/repo",'
+                 ' "--git-dir=/tmp/repo/.git", "grep", "x"], 0x0 '
+                 '/* 3 vars */) = 0\n']
+        paths, _, gits = tool.reads(lines, "/r")
+        self.assertEqual((paths, gits), (set(), []))
+        self.assertEqual(tool.findings("u", [], set(), set(), gits, []), [])
+
+    def test_a_git_moved_into_the_tree_is_still_judged(self):
+        self.assertEqual(tool.git_pathspecs(
+            ["git", "-C", "/r/sub", "ls-files"], "/tmp", "/r"),
+            ("ls-files", []))
+        self.assertEqual(tool.git_pathspecs(
+            ["git", "--work-tree", "/r", "show", "HEAD:a.md"], "/tmp", "/r"),
+            ("show", ["a.md"]))
+
     def test_git_that_reads_no_content_is_not_a_reader(self):
         self.assertEqual(tool.git_pathspecs(["git", "rev-parse", "HEAD"],
                                             "/r", "/r"), (None, None))
