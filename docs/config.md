@@ -1728,10 +1728,13 @@ the head it updated. Without
 **`pull_requests`: which heads an instance runs** (designs/0034). A
 pull request's head is run only when the pull request carries
 `label`, or changes a path one of `paths` matches; any other head gets
-no status from this instance at all. The paths are GitHub's list of
-the pull request's files since its merge base (both names of a
-rename), read once a head and kept in `scope.json` in the instance's
-state directory. A glob is matched by `fnmatchcase` on the path from
+no status from this instance at all. The paths are those the head
+changes since it left the default branch, as the Merger reads them
+(`git diff --name-only --no-renames origin/<main>...head` in the cron
+checkout, so both names of a rename), so the two never judge a head
+differently; when git can't say, GitHub's list of the pull request's
+files. They are read once a head and kept in `scope.json` in the
+instance's state directory. A glob is matched by `fnmatchcase` on the path from
 the repository's top, as a reviewer's `reviews` globs are, so `*`
 crosses `/` too: `desktop/mac/*` is everything under `desktop/mac`. A
 pull request GitHub lists 3,000 or more files for is run. One whose

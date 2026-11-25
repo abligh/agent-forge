@@ -2065,6 +2065,32 @@ def changed_paths(pr, token, run=sh):
     return None if not paths or len(paths) >= FILES_LIMIT else paths
 
 
+def git_changed_paths(pr, sha, checkout, run=sh):
+    """agent-forge #598: the paths head sha of pull request pr changes
+    since it left the default branch, as the Merger reads them
+    (`git diff --name-only --no-renames origin/<main>...sha`, so a
+    rename counts by both names), in the cron `checkout`, fetching the
+    head first if it doesn't have it. None when git can't say. Unlike
+    GitHub's files list, read just after a push, git's answer for a
+    commit is final, and an empty one means the head changes nothing."""
+    if not checkout:
+        return None
+
+    def have():
+        return run(["git", "-C", checkout, "cat-file", "-e",
+                    sha + "^{commit}"]).returncode == 0
+    if not have():
+        run(["git", "-C", checkout, "fetch", "-q", "--no-write-fetch-head",
+             "origin", "refs/pull/%d/head" % pr])
+        if not have():
+            return None
+    got = run(["git", "-C", checkout, "diff", "--name-only", "--no-renames",
+               "refs/remotes/origin/%s...%s" % (MAIN, sha)])
+    if got.returncode != 0:
+        return None
+    return [line for line in (got.stdout or "").splitlines() if line]
+
+
 def files_count(pr, token, run=sh):
     """How many files pull request `pr` changes, as GitHub counts them,
     or 0 when it couldn't be read."""
@@ -2185,14 +2211,18 @@ def globs_key(globs):
     return hashlib.sha1(json.dumps(list(globs)).encode()).hexdigest()[:12]
 
 
-def in_scope(heads, state_dir, token, run=sh, out=print, when=None):
+def in_scope(heads, state_dir, token, run=sh, out=print, when=None,
+             checkout=None):
     """`heads`, less the pull requests' heads this instance doesn't run
     (PULL_REQUESTS, designs/0034): one is run when its pull request
     carries the label, or changes a path the globs match. A draft, and
     a head already judged here, is kept as it is: they are no new run.
     Each head's paths are read from GitHub once and remembered in
     SCOPE_FILE; a head whose paths can't be read is left out until they
-    can be, and a long one GitHub cuts short is run. A judgment made
+    can be, and a long one GitHub cuts short is run. With the cron
+    `checkout`, a head's paths are git's (`git_changed_paths`), as the
+    Merger reads them, so the two never judge a head differently
+    (#598); GitHub's list is the fallback. A judgment made
     under other paths than today's is made again, so a head widened
     paths now match is queued (#576). A head left out is said once, in
     verdicts.log. Returns (heads kept, [(pr, sha)] newly
@@ -2236,7 +2266,9 @@ def in_scope(heads, state_dir, token, run=sh, out=print, when=None):
         elif labelled:
             pass
         elif globs:
-            paths = changed_paths(pr, token, run)
+            paths = git_changed_paths(pr, sha, checkout, run)
+            if paths is None:
+                paths = changed_paths(pr, token, run)
             if paths is not None:
                 entry["in"] = touches(paths, globs)
             elif files_count(pr, token, run) >= FILES_LIMIT:
@@ -5027,7 +5059,8 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         return 2
     # An instance runs only the pull requests its block names; to the
     # rest of the tick, the others aren't open (designs/0034).
-    heads, dropped = in_scope(heads, state_dir, token, run, out, when)
+    heads, dropped = in_scope(heads, state_dir, token, run, out, when,
+                              checkout)
     slots = slots or slots_from_env()
     lane = FAST_LANE_S is not None and bool(checkout)
     holders = {slot: running(state_dir, slot)
