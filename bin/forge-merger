@@ -563,7 +563,11 @@ check stops its run. A red prefix one longer than a green one names
 its last member, and once it leads, `SUSPECTS #a..#b: #n is red on its
 own; the search ends`. With `merge.test_ahead.hand_back_red_suspect`
 (default on; designs/0044, rule 4) it is handed back as soon as it is
-named, `SUSPECT-RED #n: ...`, and kept in `red-suspects.json`, with
+named, and so is a suspect whose own head the build check finds red
+while the search runs, at the head the search holds, without waiting
+for its prefixes (agent-forge #596: `SUSPECTS #a..#b: #n's own head is
+red; the search ends`, and the rest are predicted again). Either is
+logged `SUSPECT-RED #n: ...` and kept in `red-suspects.json`, with
 when it was found red and the tip it was found red on: until it has a
 new head it is neither predicted, updated nor merged. A green run of
 the same head also releases it (amendment, 2026-11-04), as
@@ -8576,6 +8580,29 @@ def clear_red_suspects(state_dir, reds, prs, check_state, repo, github,
     return cleared
 
 
+def own_red_suspect(saved, entries, queue, check_state):
+    """agent-forge #596: (entry, index) for the first suspect of the
+    running search, in the order predicted, whose own head the build
+    check found red (`head_red`, the evidence a train's cut already
+    keeps such a head out by) at the head the search holds, or None.
+    The entry is the suspect's own head's, so that the hand-back names
+    that run: the search pins a suspect only by its prefixes, and a
+    head that went red on its own while they ran waited for them
+    (2026-11-25: red at 10:45Z, still waiting at 11:00Z)."""
+    suspects = {s["pr"]: s["head"] for s in saved.get("suspects") or ()}
+    heads = {pr["number"]: pr for pr in queue}
+    for at, entry in enumerate(entries):
+        if entry["pr"] not in suspects:
+            break
+        pr = heads.get(entry["pr"])
+        if pr is None or pr["headRefOid"] != entry["head"] \
+                or suspects[entry["pr"]] != entry["head"]:
+            continue
+        if head_red(check_state, pr):
+            return dict(entry, sha=entry["head"], tree=None), at
+    return None
+
+
 def hand_back_red_suspect(state_dir, entry, green, queue, approvals, reds,
                           github, said, live, record, out, main_tip=None,
                           check_state=None):
@@ -10835,10 +10862,26 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
             if searching and entries:
                 found = []
                 bypassed = on_base != train_base
-                searching = suspect_round(
-                    state_dir, saved, entries, verdict, last, said_ahead,
-                    record, out, found if RED_SUSPECT_OUT else None,
-                    bypassed)
+                early = own_red_suspect(saved, entries, ahead_queue,
+                                        check_state) \
+                    if RED_SUSPECT_OUT else None
+                if early is not None:
+                    # agent-forge #596: a suspect whose own head is red
+                    # is handed back now, not when its prefixes pin it.
+                    entry, at = early
+                    out("SUSPECTS #%d..#%d: #%d's own head is red; the "
+                        "search ends" % (entries[0]["pr"], entries[at]["pr"],
+                                         entry["pr"]))
+                    path = os.path.join(state_dir, SUSPECTS_FILE)
+                    if os.path.exists(path):
+                        os.remove(path)
+                    found.append((entry, 0))
+                    searching = False
+                else:
+                    searching = suspect_round(
+                        state_dir, saved, entries, verdict, last,
+                        said_ahead, record, out,
+                        found if RED_SUSPECT_OUT else None, bypassed)
                 for entry, green in found:
                     hand_back_red_suspect(
                         state_dir, entry, green, ahead_queue, approvals,

@@ -5542,6 +5542,53 @@ class TickAhead(RepoCase):
         self.assertIn(5, record["ahead"])
         self.assertEqual(m.red_suspects(self.state, [fixed]), {})
 
+    def test_a_suspect_whose_own_head_turns_red_goes_at_once(self):
+        # agent-forge #596: one project, 2026-11-25, a suspect's own head
+        # check was red at 10:45Z while the search still ran the prefixes
+        # before it at 11:00Z.
+        m.configure(project(test_ahead={"batch": 2}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        red = {"results": {top["sha"]: {"tree": top["tree"], "ok": False}}}
+        self.tick(prs, conclusions=(None,), live=True, check_state=red)
+        self.assertTrue(os.path.exists(os.path.join(self.state,
+                                                    m.SUSPECTS_FILE)))
+        # #6's own head goes red; #5's prefix has no verdict yet.
+        six = prs[1]["headRefOid"]
+        red["results"][six] = {"pr": 6, "ok": False, "failed": ["vet"]}
+        record, lines = self.tick(prs, conclusions=(None,), live=True,
+                                  minutes=1, check_state=red)
+        self.assertIn("SUSPECTS #5..#6: #6's own head is red; the search "
+                      "ends", lines)
+        self.assertIn("SUSPECT-RED #6: red on its own at %s; handed back, "
+                      "and out of batches until a new head" % six[:10],
+                      lines)
+        back = [d for d in record["decisions"] if d.get("suspect")]
+        self.assertEqual([(d["pr"], d["result"]) for d in back],
+                         [(6, "done")])
+        self.assertEqual(record["ahead"], [5])
+        self.assertFalse(os.path.exists(os.path.join(self.state,
+                                                     m.SUSPECTS_FILE)))
+
+    def test_an_own_red_head_outside_the_search_ends_nothing(self):
+        # Only the search's own suspects, at the heads it holds.
+        m.configure(project(test_ahead={"batch": 2}))
+        prs = [self.item(), self.other_pr()]
+        self.tick(prs, conclusions=(None,), live=True)
+        top = self.ahead_json()["entries"][1]
+        red = {"results": {top["sha"]: {"tree": top["tree"], "ok": False}}}
+        self.tick(prs, conclusions=(None,), live=True, check_state=red)
+        saved = {"suspects": [{"pr": 5, "head": self.head}]}
+        entries = self.ahead_json()["entries"]
+        red["results"][prs[1]["headRefOid"]] = {"pr": 6, "ok": False}
+        self.assertIsNone(m.own_red_suspect(saved, entries, prs, red))
+        red["results"][self.head] = {"pr": 5, "ok": False}
+        entry, at = m.own_red_suspect(saved, entries, prs, red)
+        self.assertEqual((entry["pr"], at, entry["sha"]), (5, 0, self.head))
+        moved = [dict(prs[0], headRefOid="f" * 40), prs[1]]
+        self.assertIsNone(m.own_red_suspect(saved, entries, moved, red))
+
     def rerun(self, red, finished, ok=True):
         """`red` with a verdict on #5's own head that finished at
         `finished`, merged with main's tip."""
