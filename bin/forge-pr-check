@@ -1015,9 +1015,10 @@ PANIC_LINE = re.compile(r"^thread '.*'(?: \(\d+\))? panicked at ")
 # ESLint's stylish report puts each error under its file's path, so the
 # line before an error, when it is a path, is kept with it.
 ESLINT_ERROR_LINE = re.compile(r"^\s+\d+:\d+\s+error\s")
-# rustc's error is placed on the lines after it (`--> file:line:col`, the
-# source line and its marker): kept like a panic's message.
-RUSTC_ERROR_LINE = re.compile(r"^error\[E\d+\]: ")
+# rustc's error, or clippy's lint denied as one, is placed on the lines
+# after it (`--> file:line:col`, the source line and its marker): kept
+# like a panic's message. `could not compile` has no place of its own.
+RUSTC_ERROR_LINE = re.compile(r"^error(?:\[E\d+\])?: (?!could not compile)")
 PANIC_MESSAGE_LINES = 6
 # Verdicts older than this are dropped from state.json.
 KEEP = datetime.timedelta(days=21)

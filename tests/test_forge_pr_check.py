@@ -1256,6 +1256,31 @@ class Tail(unittest.TestCase):
             "  680:3    error  Another  no-restricted-syntax",
             "[23 earlier lines left out]"])
 
+    def test_a_clippy_error_above_the_tail_is_kept_with_its_place(self):
+        text = ("error: using `clone` on type `P` which implements the "
+                "`Copy` trait\n"
+                "   --> crates/a/src/t.rs:328:11\n"
+                "    |\n"
+                "328 |         ..p.clone()\n"
+                "    |           ^^^^^^^^^ help: try dereferencing it\n"
+                "    |\n"
+                "error: could not compile `a` (lib test) due to 1 previous "
+                "error\n"
+                "warning: build failed, waiting for other jobs\n"
+                + "".join("   Checking more%d\n" % i for i in range(60)))
+        got = pc.tail(text).splitlines()
+        self.assertEqual(got[:6], [
+            "error: using `clone` on type `P` which implements the "
+            "`Copy` trait",
+            "   --> crates/a/src/t.rs:328:11",
+            "    |",
+            "328 |         ..p.clone()",
+            "    |           ^^^^^^^^^ help: try dereferencing it",
+            "    |"])
+        self.assertEqual(got[6], "error: could not compile `a` (lib test) "
+                         "due to 1 previous error")
+        self.assertTrue(got[7].startswith("["))
+
     def test_an_eslint_warning_is_not_kept(self):
         text = ("/wt/a.ts\n  1:1  warning  Unused  no-unused-vars\n"
                 + "".join("line %d\n" % i for i in range(60)))
