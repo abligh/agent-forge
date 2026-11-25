@@ -293,7 +293,8 @@ def unquote(text):
 
 def calls(lines):
     """(pid, name, args, result, rest) for each complete call in strace
-    -f output, an unfinished call joined to its resumption."""
+    -f output, an unfinished call joined to its resumption, and a
+    process's end as the name "+++"."""
     pending = {}
     for raw in lines:
         m = LINE_RE.match(raw.rstrip("\n"))
@@ -302,6 +303,11 @@ def calls(lines):
         pid, text = int(m.group(1)), m.group(2)
         if text.endswith(UNFINISHED):
             pending[pid] = text[:-len(UNFINISHED)]
+            continue
+        if text.startswith("+++ "):
+            # "+++ exited with 0 +++" or "+++ killed by SIGKILL +++":
+            # the process is gone, and its pid may come back as another.
+            yield pid, "+++", "", "?", text
             continue
         resumed = RESUMED_RE.match(text)
         if resumed:
@@ -398,12 +404,19 @@ def reads(lines, root):
     cwd, gitpid = {}, set()
     paths, listings, gits = set(), set(), []
     for pid, name, args, result, rest in calls(lines):
+        if name in ("+++", "exit_group"):
+            cwd.pop(pid, None)
+            gitpid.discard(pid)
+            continue
         fd = FDCWD_RE.search(args)
         if fd:
             cwd[pid] = fd.group(1)
         if name in FORKS and result.isdigit():
             child = int(result)
-            if pid in cwd:
+            # A vfork's parent can report the child after the child has
+            # already moved (its chdir, then its execve, come first),
+            # so a child that has a directory of its own keeps it.
+            if pid in cwd and child not in cwd:
                 cwd[child] = cwd[pid]
             if pid in gitpid:
                 gitpid.add(child)
