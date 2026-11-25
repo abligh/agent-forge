@@ -102,8 +102,10 @@ not judged; a reading subcommand (`ls-files`, `grep`, `diff`, `show`,
 `log`, `ls-tree`, `cat-file`, `blame`, `archive`) must name pathspecs
 the unit's inputs cover, resolved against the process's directory and
 any `-C`. One with no pathspec needs the input `*`, which selects the
-unit for every change. A git reached through a helper script is still
-seen, since strace follows children.
+unit for every change. A git whose directory (after `-C`, or its
+`--work-tree`) is outside the root works on another repository, such
+as a test's scratch one, and is not judged at all. A git reached
+through a helper script is still seen, since strace follows children.
 
 A unit whose own command fails is reported on stderr, not counted: the
 trace judges the table, not the code. The host needs `strace`, and
