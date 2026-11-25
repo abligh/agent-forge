@@ -29,9 +29,23 @@ forge-gh-signed pr ready 34
 | --- | --- | --- |
 | `<gh arguments...>` | | Passed to `gh` unchanged. |
 | `--body-file PATH`, `--body-file=PATH` | required | The body file to check and send. If given more than once, the last one is checked. Not required for `pr ready`. |
+| `--commit-id SHA`, `--commit-id=SHA` | none | `pr review` only: the review is of that commit (see below). |
 
 Its own options are only these: everything else on the command line is
-`gh`'s, and is not interpreted. With `pr ready` (and `pr ready --undo`),
+`gh`'s, and is not interpreted, except in a review pinned to a commit.
+
+**A review pinned to a commit.** `gh pr review` reviews the head as it
+is when the call is made, so a waiter that posts an approval once a
+check is green can approve a head pushed after the reviewer read it.
+`forge-gh-signed pr review 7 --approve --body-file b.md --commit-id
+SHA` instead POSTs the review with `commit_id` through `gh api`, so it
+is of the commit read; GitHub shows it as on an older commit if the
+head has moved. It takes the pull request's number, exactly one of
+`--approve`, `--request-changes` or `--comment` (`-a`, `-r`, `-c`), a
+full 40-hex SHA and, optionally, `-R OWNER/REPO` (without it, the
+current repository); anything else is refused with status 2.
+
+With `pr ready` (and `pr ready --undo`),
 no body file is needed, since that command takes no body; but any
 argument starting `-b`, `--body` or `-F`, or `--fill`, makes the call
 need a `--body-file` as any other does.
@@ -81,7 +95,7 @@ In order:
 
 | Status | Meaning |
 | --- | --- |
-| 2 | No `--body-file`, the file does not exist, or `FORGE_AGENT` unset or not a bare name. |
+| 2 | No `--body-file`, the file does not exist, `FORGE_AGENT` unset or not a bare name, or a `--commit-id` review that can't be sent as one. |
 | 3 | The file is not signed by `FORGE_AGENT`. |
 | 4 | No App token could be minted for `FORGE_AGENT`. |
 | 5 | The file holds an `@`-mention outside code. |
