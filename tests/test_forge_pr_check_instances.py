@@ -436,6 +436,84 @@ class PullRequests(StateCase):
         self.assertEqual(self.file_calls(), [])
 
 
+class PullRequestsFromGit(PullRequests):
+    """agent-forge #598: with the cron checkout, a head's paths are
+    git's, as the Merger reads them, not GitHub's files list."""
+
+    def tick(self, heads, post=None, files_rc=0, diff=None, diff_rc=0,
+             have=True):
+        rows = "".join("%d\t%s\t%s\t%s\t\t%s\n" % (pr, sha, base.REPO,
+                                                    draft,
+                                                    json.dumps(labels))
+                       for pr, sha, draft, labels in heads)
+        diff = self.files if diff is None else diff
+        by_sha = {sha: pr for pr, sha, _, _ in heads}
+
+        def files(args):
+            pr = int([a for a in args if "/files?" in a][0]
+                     .split("/pulls/")[1].split("/")[0])
+            return base.done(args, files_rc, self.files.get(pr, ""))
+
+        def git_diff(args):
+            sha = args[-1].split("...")[1]
+            return base.done(args, diff_rc, diff.get(by_sha.get(sha), ""))
+        self.run = base.FakeRun(
+            (base.is_pulls, base.done([], 0, rows)), (is_files, files),
+            (lambda a: a[:1] == ["git"] and "cat-file" in a,
+             base.done([], 0 if have else 1)),
+            (lambda a: a[:1] == ["git"] and "diff" in a, git_diff))
+        self.spawned = []
+        return pc.tick(self.state_dir, "tok", self.run,
+                       lambda *a: self.spawned.append(a), self.lines.append,
+                       when=T0, post=post, slots=1, checkout="/repo")
+
+    def git_calls(self, what):
+        return [c for c in self.run.calls
+                if c["args"][:1] == ["git"] and what in c["args"]]
+
+    def test_files_are_read_once_a_head_and_said_once(self):
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(len(self.git_calls("diff")), 1)
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(self.git_calls("diff"), [])
+        self.assertEqual(sum("OUT-OF-SCOPE" in l for l in self.lines), 1)
+
+    def test_widened_paths_judge_an_out_of_scope_head_again(self):
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.rescope(list(SCOPE["paths"]) + ["web/*"])
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(sorted(self.state()["waiting"]), [base.SHA_B])
+
+    def test_a_head_whose_files_cant_be_read_waits_for_them(self):
+        self.tick([(7, base.SHA_A, "false", [])], files_rc=1, diff_rc=1)
+        self.assertEqual(self.state()["waiting"], {})
+        self.tick([(7, base.SHA_A, "false", [])])
+        self.assertEqual(sorted(self.state()["waiting"]), [base.SHA_A])
+
+    def test_gits_paths_win_over_a_short_list_from_github(self):
+        # The case seen: GitHub, just after the push, listed a path
+        # outside the instance's; git's diff has the one inside.
+        self.files = {7: "README.md\n"}
+        self.tick([(7, base.SHA_A, "false", [])],
+                  diff={7: "desktop/mac/App.swift\nREADME.md\n"})
+        self.assertEqual(sorted(self.state()["waiting"]), [base.SHA_A])
+        self.assertEqual(self.file_calls(), [])
+        diff = self.git_calls("diff")[0]["args"]
+        self.assertIn("refs/remotes/origin/main...%s" % base.SHA_A, diff)
+        self.assertIn("--no-renames", diff)
+
+    def test_an_empty_diff_is_final_and_out(self):
+        self.tick([(7, base.SHA_A, "false", [])], diff={7: ""})
+        self.assertEqual(self.state()["waiting"], {})
+        self.assertEqual(self.file_calls(), [])
+
+    def test_a_head_git_cant_fetch_falls_back_to_github(self):
+        self.tick([(7, base.SHA_A, "false", [])], have=False)
+        self.assertEqual(sorted(self.state()["waiting"]), [base.SHA_A])
+        self.assertEqual(len(self.git_calls("fetch")), 1)
+        self.assertEqual(len(self.file_calls()), 1)
+
+
 class MainNewest(StateCase):
     """designs/0034: an instance checks the default branch's newest tip
     first, and keeps its own red-default-branch issue."""
