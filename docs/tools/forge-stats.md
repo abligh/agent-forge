@@ -78,6 +78,12 @@ lane's slot is not counted) and whether there is a `nightly` section
 * the default branch's CPU seconds per run, and per step, from the
   check's `state.json` (`main_cpu`);
 * the scoped steps' time, when some ran (`scoped_seconds`);
+* the test units heads selected, when some run left the line
+  `forge-units select --why` writes (`units_selected`,
+  [designs/0065](../designs/0065-a-head-runs-the-test-units-its-changes-reach.md)):
+  the units chosen of those listed, and each run's share. A head that
+  selected everything counts as 100%; a run with no such line, such as
+  a train's, isn't counted;
 * with `checks.quick`, the two tiers apart (`tiers`): runs, reds, slot
   time, waits and the spread of run times (`ran`) of the quick runs and
   of the full ones, from the `tier=` each verdict line ends with

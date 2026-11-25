@@ -55,8 +55,11 @@ and prints on stdout, one a line and nothing else:
 * nothing when no unit is reached. The runner then passes and says so.
 
 `--why` writes what selected each unit, and a last line
-`selected N of M (P%)`, to stderr, for the check's log. The tool reads
-only git and the table, and needs no network.
+`selected N of M (P%)` (or `selected all: <why>`), to stderr, for the
+check's log. `forge-stats` reads that line from the step's log as
+`units_selected`, so a runner that wants the saving measured leaves
+`select`'s stderr in it. The tool reads only git and the table, and
+needs no network.
 
 A project passes a base from its head check only: its trains, default
 branch and nightly run every unit, so a wrong entry costs a red train,
