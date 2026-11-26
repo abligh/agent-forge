@@ -51,7 +51,7 @@ exits 2.
 | `FORGE_CRON_CHECKOUT` | required | The project's cron checkout. The job runs in a generation of it (step 5), whose path it is given as `FORGE_CRON_CHECKOUT`. Unset, it exits 2. |
 | `FORGE_CRON_LOGDIR` | `~/cron-logs` | Where each tool's log and the lock files go. |
 | `FORGE_CRON_PATH` | none | Extra directories for `PATH`, colon-separated, such as a host's toolchains. They come after this release's `bin` and before `~/.local/bin` and the system directories. |
-| `FORGE_CRON_APP` | none | An agent or machinery App the job acts as. Its installation token is minted into `GH_TOKEN`. A mint that fails stops the job; there is no fallback to the host's own `gh` login. |
+| `FORGE_CRON_APP` | none | An agent or machinery App the job acts as. Its installation token is minted into `GH_TOKEN`, and the sync's fetch uses it too (step 4). A mint that fails stops the job; there is no fallback to the host's own `gh` login. |
 | `FORGE_CRON_LOCK` | none | The lock file of another wrapper that runs jobs from the same checkout, while a project moves its crontab over. This one then takes that file instead of its own checkout lock. The other wrapper must use `flock`. |
 | `FORGE_CRON_LOCK_WAIT_S` | `300` | One budget, in seconds, for all the locks and the sync. Keep it shorter than any job's period. |
 | `FORGE_CRON_PIN_WAIT_S` | `600` | How long a job waits for `forge-install` when the installation isn't at the pin yet, or an install is pending (steps 7 and 8). `0`: it stops at once, as before. |
@@ -92,7 +92,13 @@ Each run, in order:
 4. Checks the checkout is a git checkout (`NO-CHECKOUT` otherwise), and
    fetches the default branch from `origin`. A fetch that fails with
    `cannot lock ref` is retried once (`RETRY: …`). Any other failure is
-   `SYNC-FAILED: fetch`.
+   `SYNC-FAILED: fetch`. With `FORGE_CRON_APP`, the fetch goes as that
+   App: its token is minted from the checkout as it stands and handed
+   to git in the environment, through a credential helper that names no
+   secret, after an empty helper that clears any other login. Nothing
+   is written to disk, and a remote over SSH goes on using its key. If
+   that mint fails, the run logs `FETCH-UNAUTHENTICATED: …` and fetches
+   without the token; the mint in step 10 still stops the job.
 5. Runs in the **generation** of `origin/<branch>`: a worktree of the
    checkout at that commit, `<checkout>.gen/<sha>`, made by the first
    job that wants it (`git worktree add --detach`, about a second) and

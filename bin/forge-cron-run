@@ -23,7 +23,10 @@ TOOL is the project's `tools/TOOL`, or, when it starts `forge-`, this
 installation's own, run with the checkout as its working directory.
 With `$FORGE_CRON_APP` set the job acts as that App: its token is
 minted into GH_TOKEN, and a mint that fails stops the job rather than
-falling back to the host's login.
+falling back to the host's login. The sync's fetch goes as the App
+too, with a token minted from the checkout before the sync and handed
+to git through the environment, never written down; a remote over SSH
+keeps using its key.
 
 **It runs only the pinned agent-forge.** When the checkout has
 `.agent-forge/pin` (a full commit SHA of agent-forge, then anything,
@@ -168,14 +171,43 @@ def branch_of(repo):
         return "main"
 
 
-def fetch(repo, branch, write, retry_s, nap=time.sleep):
-    got = git(repo, "fetch", "-q", "origin", branch)
+# A credential helper that answers git's `get` with the token in
+# FORGE_CRON_FETCH_TOKEN, so the fetch goes as $FORGE_CRON_APP without
+# the token touching the disk or the command line (agent-forge #612).
+FETCH_HELPER = ('!f() { test "$1" = get || exit 0; '
+                'echo username=x-access-token; '
+                'echo "password=$FORGE_CRON_FETCH_TOKEN"; }; f')
+
+
+def fetch_env(env, token):
+    """`env` with `token` as the only credential git may use: an empty
+    helper first clears any a broader scope set, then FETCH_HELPER. A
+    remote over SSH never asks, so its deploy key goes on working."""
+    out = dict(env)
+    n = int(out.get("GIT_CONFIG_COUNT", "0") or 0)
+    for value in ("", FETCH_HELPER):
+        out["GIT_CONFIG_KEY_%d" % n] = "credential.https://github.com.helper"
+        out["GIT_CONFIG_VALUE_%d" % n] = value
+        n += 1
+    out["GIT_CONFIG_COUNT"] = str(n)
+    out["FORGE_CRON_FETCH_TOKEN"] = token
+    return out
+
+
+def fetch(repo, branch, write, retry_s, nap=time.sleep, token=None):
+    def run():
+        if token is None:
+            return git(repo, "fetch", "-q", "origin", branch)
+        return subprocess.run(["git", "-C", repo, "fetch", "-q", "origin",
+                               branch], capture_output=True, text=True,
+                              env=fetch_env(GIT_ENV[0], token))
+    got = run()
     text = (got.stdout + got.stderr).strip()
     if got.returncode != 0 and "cannot lock ref" in text:
         write(text)
         write("RETRY: fetch lost a race for a ref; again in %ss" % retry_s)
         nap(retry_s)
-        got = git(repo, "fetch", "-q", "origin", branch)
+        got = run()
         text = (got.stdout + got.stderr).strip()
     if text:
         write(text)
@@ -463,7 +495,19 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
                            "job runs from it. Clone the project there."
                            % repo)
             branch = branch_of(repo)
-            fetch(repo, branch, write, retry_s, nap)
+            app = environ.get("FORGE_CRON_APP")
+            token = None
+            if app:
+                # Minted from the checkout as it is, before the sync, so
+                # the fetch goes as the App too (#612). A failure here
+                # only costs the fetch its token: the mint after the
+                # sync still stops the job if it fails.
+                try:
+                    token = mint(repo, app)
+                except (config.ConfigError, github.MintError) as e:
+                    write("FETCH-UNAUTHENTICATED: no token for %s before "
+                          "the sync (%s); fetching without it" % (app, e))
+            fetch(repo, branch, write, retry_s, nap, token)
             if gens:
                 sha = git(repo, "rev-parse", "origin/" + branch) \
                     .stdout.strip()
@@ -479,7 +523,7 @@ def main(argv=None, environ=None, mint=default_mint, clock=time.monotonic,
                 exclusive = True
                 if not lock(repo_lock, True, deadline, clock, nap):
                     return give_up("another job held the checkout's lock")
-                fetch(repo, branch, write, retry_s, nap)
+                fetch(repo, branch, write, retry_s, nap, token)
             if exclusive and not gens:
                 got = git(repo, "reset", "-q", "--hard", "origin/" + branch)
                 if got.returncode != 0:
