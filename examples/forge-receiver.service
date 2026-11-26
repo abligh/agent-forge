@@ -27,6 +27,10 @@ Environment=FORGE_CRON_CHECKOUT=CRON_CHECKOUT
 ExecStart=AGENT_FORGE/bin/forge-receiver
 Restart=always
 RestartSec=5
+# The receiver restarts itself on every config or release change; a
+# stop must end the receiver alone, never the checks its runs started
+# (agent-forge #607).
+KillMode=process
 
 [Install]
 WantedBy=default.target

@@ -131,6 +131,45 @@ class Names(unittest.TestCase):
             pc.spawn_worker(state_dir, SHA_A, 7)
         self.assertEqual(popen.call_args.kwargs["pass_fds"], ())
 
+    def test_the_worker_gets_a_scope_of_its_own(self):
+        # agent-forge #607: a tick run by the webhook receiver put its
+        # workers in the receiver's cgroup, and the receiver's own restart
+        # on a config change then killed every running check silently.
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/9"}):
+            prefix, env = pc.worker_scope(
+                pc.QUICK_SLOT + 2, SHA_A, which=lambda name: "/usr/bin/x",
+                exists=lambda path: path == "/run/user/9/systemd/private")
+        self.assertEqual(prefix[:5], ["systemd-run", "--user", "--scope",
+                                      "--quiet", "--collect"])
+        self.assertEqual(prefix[-1], "--")
+        unit = [a for a in prefix if a.startswith("--unit=")][0]
+        self.assertTrue(unit.startswith(
+            "--unit=forgeworker-%d-%s-" % (pc.QUICK_SLOT + 2, SHA_A[:8])))
+        self.assertEqual(env["XDG_RUNTIME_DIR"], "/run/user/9")
+
+    def test_without_a_user_manager_the_worker_is_a_plain_child(self):
+        for which, exists in ((lambda name: None, lambda path: True),
+                              (lambda name: "/usr/bin/x", lambda path: False)):
+            self.assertEqual(pc.worker_scope(2, SHA_A, which=which,
+                                             exists=exists), ([], None))
+        with mock.patch.dict(os.environ,
+                             {"FORGE_PR_CHECK_WORKER_SCOPE": "off"}):
+            self.assertEqual(pc.worker_scope(
+                2, SHA_A, which=lambda name: "/usr/bin/x",
+                exists=lambda path: True), ([], None))
+
+    def test_spawn_puts_the_scope_before_the_worker(self):
+        with tempfile.TemporaryDirectory() as state_dir, \
+                mock.patch.object(pc, "worker_scope",
+                                  return_value=(["S", "--"], {"E": "1"})), \
+                mock.patch.object(pc.subprocess, "Popen") as popen:
+            pc.spawn_worker(state_dir, SHA_A, 7, slot=2)
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv[:2], ["S", "--"])
+        self.assertIn("--worker", argv)
+        self.assertEqual(popen.call_args.kwargs["env"], {"E": "1"})
+
+
 class StepCosts(unittest.TestCase):
 
     def test_the_median_of_the_last_twenty_runs(self):
