@@ -1699,7 +1699,7 @@ platform. Without an instance, `forge-pr-check` runs as before.
 | `main_paths` | The block only, and refused in `checks`: `true` scopes the default branch's heads by `pull_requests.paths` too (default `false`; see below). Needs `paths` and `main` `every` or `newest`. |
 | `gate` | The block only, and refused in `checks`: `true` makes the Merger wait for this instance's context too, on each pull request the instance applies to (default `false`; see below). |
 | `reviewed_heads` | The block only, and refused in `checks`, whose context the Merger requires on every head and the reviewers read: `true` or `{"early_label": name}` runs a head only once its pull request is released, approved by a reviewer agent, armed, or asked for early (default none: off; `true` is `{}`, no early label; see below). Refused with `merge.approval` `"green"` and with no agent of kind `reviewer`; `forge-config check` warns without `labels.armed`. [designs/0064](designs/0064-a-scarce-instance-runs-only-reviewed-heads.md). |
-| `reviewed_heads.early_label` | none: a label that releases the head it is on, once, and is taken off. |
+| `reviewed_heads.early_label` | none: a label that releases the head it is on, once, and is taken off. On a head out of `pull_requests`' scope it is taken off with a comment saying it does nothing there. |
 | `lock` | The block only: the host's own exclusive lock, a directory that agents sharing the machine take with `mkdir`, as `{"dir": path, "wait_minutes": n}` (`wait_minutes` default 60). Before its first step a run takes it and writes `owner` inside (`forge-pr-check <instance> #<pr> <sha> pid <pid> since <time>`, the time it took the lock), so an agent waiting on it sees who holds it and since when. A run that had to wait logs `LOCK-WAITED <seconds> s for #<pr> <sha>: <holder>` once it has the lock. It lets go when the run ends, however it ends, and only while the owner file still names it. While someone else holds it the run waits, then after `wait_minutes` gives up as a `HOST-FAULT`, naming the holder. That fault isn't counted toward a head's `error`, since the host is busy rather than broken. |
 
 Any other key in a block is refused. An instance's name is lower-case
@@ -1777,7 +1777,12 @@ releases the head it is on, for good, and is taken off, as
 `labels.rerun` is; a later push needs it again. `RELEASED` names who
 put it on, and the poster's App needs `issues: write`. Anyone with
 triage access can set it. `pull_requests.label` still only puts a pull
-request in scope. Train tops and the default branch are run as before.
+request in scope. On a head `pull_requests` leaves out, the early
+label can release nothing, so a posting tick takes it off and comments
+once on the pull request: it does nothing there, and
+`pull_requests.label` runs the head anyway (`EARLY-OUTSIDE` in
+`verdicts.log`; #615). Train tops and the default branch are run as
+before.
 Which heads were held, released or updated is kept in `reviewed.json`
 in the instance's state directory. Without `reviewed_heads` every head
 in scope is run, as before.

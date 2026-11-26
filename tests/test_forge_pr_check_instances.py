@@ -691,10 +691,9 @@ def pr_of(args):
                .split("/")[0])
 
 
-class ReviewedHeads(StateCase):
-    """designs/0064: with reviewed_heads, an instance runs a head only
-    once its pull request is approved by a reviewer agent, armed, or
-    asked for early."""
+class ReviewedCase(StateCase):
+    """A `mac` instance with reviewed_heads and an early label, ticked
+    against a fake GitHub (designs/0064)."""
 
     REVIEWER = "reviewerwidgetagent[bot]"
 
@@ -731,6 +730,12 @@ class ReviewedHeads(StateCase):
 
     def calls(self, match):
         return [c["args"] for c in self.run.calls if match(c["args"])]
+
+
+class ReviewedHeads(ReviewedCase):
+    """designs/0064: with reviewed_heads, an instance runs a head only
+    once its pull request is approved by a reviewer agent, armed, or
+    asked for early."""
 
     def test_a_head_nobody_reviewed_is_held_with_a_pending_status(self):
         self.tick([(7, base.SHA_A, "false", [])])
@@ -878,3 +883,101 @@ class ReviewedHeads(StateCase):
         self.assertEqual(self.calls(is_reviews), [])
         self.assertFalse(os.path.exists(os.path.join(
             self.state_dir, pc.REVIEWED_FILE)))
+
+
+def is_comment(args):
+    return args[:2] == ["gh", "api"] and "POST" in args and any(
+        a.endswith("/comments") for a in args)
+
+
+class EarlyLabelOutOfScope(ReviewedCase):
+    """#615: an early label on a head the instance's paths leave out
+    can release nothing; it is taken off, and the pull request told
+    why, once."""
+
+    def setUp(self):
+        super().setUp()
+        pc.configure(config.Project(reviewed_mac(
+            {"early_label": "run-early"}, pull_requests=SCOPE), None),
+            "mac")
+        self.files = {7: "desktop/mac/App.swift\n", 8: "web/src/app.ts\n"}
+        self.unlabel_rc = 0
+
+    def tick(self, heads, posting=True, busy=(), checkout=None, git=()):
+        def files(args):
+            return base.done(args, 0, self.files.get(pr_of(args), ""))
+
+        def unlabel(args):
+            return base.done(args, self.unlabel_rc, "",
+                             "HTTP 404" if self.unlabel_rc else "")
+        return super().tick(heads, posting, busy, checkout,
+                            git=((is_files, files), (is_unlabel, unlabel))
+                            + tuple(git))
+
+    def test_it_is_taken_off_and_said_on_the_pull_request(self):
+        self.tick([(8, base.SHA_B, "false", ["run-early"])])
+        self.assertEqual(self.state()["waiting"], {})
+        self.assertEqual(self.spawned, [])
+        unlabel = self.calls(is_unlabel)
+        self.assertEqual(len(unlabel), 1)
+        self.assertIn("repos/example/widget/issues/8/labels/run-early",
+                      unlabel[0])
+        comments = self.calls(is_comment)
+        self.assertEqual(len(comments), 1)
+        self.assertIn("repos/example/widget/issues/8/comments", comments[0])
+        body = next(a for a in comments[0] if a.startswith("body="))
+        self.assertTrue(body.startswith("body=Not-a-review\n\n"))
+        self.assertIn("`run-early` does nothing on bbbbbbbbbb", body)
+        self.assertIn("changes no path `ci/mac` runs", body)
+        self.assertIn("add `Check:mac`", body)
+        self.assertEqual(self.said("EARLY-OUTSIDE"), [
+            "EARLY-OUTSIDE mac #8 bbbbbbbbbb: run-early taken off; the "
+            "head is out of scope"])
+        # No held status: the instance never runs it.
+        self.assertEqual(self.posts, [])
+
+    def test_a_label_already_off_is_not_told_again(self):
+        self.tick([(8, base.SHA_B, "false", ["run-early"])])
+        # GitHub's list can lag the delete by a tick.
+        self.unlabel_rc = 1
+        self.tick([(8, base.SHA_B, "false", ["run-early"])])
+        self.assertEqual(len(self.calls(is_comment)), 0)
+        self.assertEqual(self.said("EARLY-FAILED"), [])
+
+    def test_a_label_added_after_the_head_was_left_out_is_told(self):
+        self.tick([(8, base.SHA_B, "false", [])])
+        self.assertEqual(self.calls(is_unlabel), [])
+        self.tick([(8, base.SHA_B, "false", ["run-early"])])
+        self.assertEqual(len(self.calls(is_comment)), 1)
+
+    def test_a_non_posting_tick_leaves_it(self):
+        self.tick([(8, base.SHA_B, "false", ["run-early"])], posting=False)
+        self.assertEqual(self.calls(is_unlabel), [])
+        self.assertEqual(self.calls(is_comment), [])
+
+    def test_with_the_force_label_it_runs_and_is_released(self):
+        self.tick([(8, base.SHA_B, "false", ["run-early", "Check:mac"])])
+        self.assertEqual([s[1] for s in self.spawned], [base.SHA_B])
+        self.assertEqual(self.calls(is_comment), [])
+        self.assertEqual(self.said("RELEASED"), [
+            "RELEASED mac #8 bbbbbbbbbb: early, asked by alice"])
+
+    def test_in_scope_it_releases_early_as_before(self):
+        self.tick([(7, base.SHA_A, "false", ["run-early"])])
+        self.assertEqual([s[1] for s in self.spawned], [base.SHA_A])
+        self.assertEqual(self.calls(is_comment), [])
+        self.assertEqual(self.said("EARLY-OUTSIDE"), [])
+
+    def test_a_draft_is_left_alone(self):
+        self.tick([(8, base.SHA_B, "true", ["run-early"])])
+        self.assertEqual(self.calls(is_comment), [])
+        self.assertEqual(self.calls(is_unlabel), [])
+
+    def test_without_a_force_label_it_says_nothing_runs_it(self):
+        pc.configure(config.Project(reviewed_mac(
+            {"early_label": "run-early"},
+            pull_requests={"paths": SCOPE["paths"]}), None), "mac")
+        self.tick([(8, base.SHA_B, "false", ["run-early"])])
+        body = next(a for a in self.calls(is_comment)[0]
+                    if a.startswith("body="))
+        self.assertIn("Nothing makes this instance run it.", body)
