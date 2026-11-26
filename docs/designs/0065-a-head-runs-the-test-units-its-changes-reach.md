@@ -1,6 +1,9 @@
 # 0065: A head runs the test units its changes reach
 
-* Status: proposed
+* Status: approved (Alex, 2026-11-24,
+  <https://github.com/abligh/agent-forge/issues/570#issuecomment-7141037945>)
+* Implemented: v0.4.248 (a0c0eb1): steps 1 and 2 in v0.4.247 (8a093a4),
+  step 3 in v0.4.248; inert until a project configures `units`
 * Author: XMPPEngineer
 * Date: 2026-11-24
 * Issue: #568
