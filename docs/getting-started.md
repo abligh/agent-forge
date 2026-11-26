@@ -67,7 +67,17 @@ Each tool has a reference page under [tools/](tools/).
 ## 1. Install agent-forge
 
 agent-forge is standard-library Python, installed by cloning it at a
-release tag:
+release tag. Tags sort by version, not as text (`v0.4.99` is older
+than `v0.4.250`), so find the newest with:
+
+```sh
+git ls-remote --tags --refs https://github.com/abligh/agent-forge |
+    sed 's|.*refs/tags/||' | sort -V | tail -1
+```
+
+A file this page names that the newest release doesn't have yet (such
+as one under `examples/`) is on the default branch, `main`; take it
+from there.
 
 ```sh
 git clone --branch vX.Y.Z https://github.com/abligh/agent-forge \
