@@ -65,7 +65,7 @@ NAMING = {"app_slug_suffix": str, "session_prefix": str}
 APP = {"app_id": (int, type(None)), "installation_id": (int, type(None)),
        "slug": str, "key": str}
 AGENT = dict(APP, session_name=str, twins=list, kind=str, reviews=list,
-             away=str, areas=dict, offer=bool)
+             away=str, areas=dict, offer=bool, hand_over=bool)
 # An agent's areas (designs/0030): what is hers, for a rules module.
 AREAS = {"paths": list, "labels": list}
 IDENTITY = {"unattributed_domain": (str, list), "unattributed_name": str}
@@ -2274,6 +2274,12 @@ class Project:
         """Whether the agent may be offered idle work: not when her
         entry says `"offer": false`."""
         return self.agents.get(name, {}).get("offer") is not False
+
+    def handed_over(self, name):
+        """Whether rule 16 may ask for one of the agent's unstarted
+        issues to be handed to someone else: not when her entry says
+        `"hand_over": false`."""
+        return self.agents.get(name, {}).get("hand_over") is not False
 
     def reviewers(self):
         """Reviewer agents, in the configuration's order."""

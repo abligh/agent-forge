@@ -84,6 +84,7 @@ letter.
 | `reviews` | A reviewer's path globs (`fnmatch`, so `*` crosses `/`): which pull requests are theirs to review. Reviewers with the same globs share them: each pull request goes to one of them by its number, so a second reviewer for an area halves the first's load. |
 | `areas` | What is hers, for a project's own rules module to offer her work by area: `{"paths": [globs], "labels": [names]}`, each a list of non-empty strings, either left out. An item is in her area when its title or body names one of her paths, or it has one of her labels. A module reads it as `roster.areas(name)` (None without it). The default rules don't use it, and it doesn't choose a reviewer: `reviews` does. |
 | `offer` | `false`: she is never offered idle work. The default rules' rule 15 skips her and rule 16 never reports her idle, as for a reviewer. A module reads it as `roster.offered(name)`. Default `true`. |
+| `hand_over` | `false`: her issues are hers alone. Rule 16's report never asks for one of them to be handed to an idle developer (`idle_offer.hand_over_above`), however many she hasn't started, as for work one person gives her. A module reads it as `roster.handed_over(name)`. Default `true`. |
 
 ### `docs`
 
