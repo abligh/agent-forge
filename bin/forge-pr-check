@@ -581,6 +581,12 @@ when that verdict ran every scoped step the head would. Each scoped
 step that ran is in the verdict's `scoped` as `ran: <why>`, and their
 time together as `scoped_seconds`.
 
+**Each worker runs in a user scope of its own** (`forgeworker-…`,
+when systemd-run and the user's manager are there; agent-forge #607),
+so stopping the service whose tick started it, such as the webhook
+receiver restarting itself after a config change, doesn't kill the
+check. `FORGE_PR_CHECK_WORKER_SCOPE=off` starts it as a plain child.
+
 **Each step runs under a memory limit**, in its own `systemd-run
 --user --scope` with `MemoryMax` (`checks.memory_max`, default `16G`;
 `$FORGE_PR_CHECK_MEMORY_MAX` overrides it; `off` for none) and no swap.
@@ -5022,8 +5028,10 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
     # handed this tick go on to the worker, which outlives it: neither
     # the release nor the checkout it runs from goes under a run.
     held = locks.inherited_fds()
+    prefix, env = worker_scope(slot, sha)
     subprocess.Popen(
-        [sys.executable, os.path.realpath(__file__), "--worker", sha,
+        prefix
+        + [sys.executable, os.path.realpath(__file__), "--worker", sha,
          "--pr", str(pr), "--state-dir", state_dir, "--slot", str(slot)]
         + (["--checkout", checkout] if checkout else [])
         + (["--post"] if posting else [])
@@ -5035,8 +5043,40 @@ def spawn_worker(state_dir, sha, pr, posting=False, slot=1, checkout=None,
         + (["--instance", INSTANCE] if INSTANCE is not None else []),
         cwd=state_dir, stdin=subprocess.DEVNULL, stdout=wlog,
         stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
-        pass_fds=held)
+        pass_fds=held, env=env)
     wlog.close()
+
+
+def worker_scope(slot, sha, environ=None, which=shutil.which,
+                 exists=os.path.exists):
+    """(prefix, env) that start a worker in a user scope of its own,
+    `forgeworker-<slot>-<sha8>-<random>`, when systemd-run and the user's
+    manager are there; else ([], None), a plain child as before.
+
+    A new session leaves the tick's process group but not its cgroup.
+    A tick run by a service (the webhook receiver) puts its workers in
+    that service's cgroup, and the service's stop, which the receiver
+    asks for itself on every config or release change, then kills each
+    running check with no line in worker.log (agent-forge #607). Its own
+    scope takes the worker out of the service's reach. `systemd-run
+    --scope` runs the command itself, so the inherited lock descriptors
+    and worker.log stay as they were. FORGE_PR_CHECK_WORKER_SCOPE=off
+    turns it off."""
+    environ = os.environ if environ is None else environ
+    if environ.get("FORGE_PR_CHECK_WORKER_SCOPE", "").strip().lower() in (
+            "off", "0", "no", "false"):
+        return [], None
+    runtime = environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    if not which("systemd-run") or not exists(
+            os.path.join(runtime, "systemd", "private")):
+        return [], None
+    env = dict(environ)
+    env["XDG_RUNTIME_DIR"] = runtime
+    unit = "forgeworker-%s-%s-%s" % (
+        re.sub(r"[^A-Za-z0-9_]", "_", str(slot)), sha[:8],
+        os.urandom(4).hex())
+    return (["systemd-run", "--user", "--scope", "--quiet", "--collect",
+             "--unit=" + unit, "--"], env)
 
 
 def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
