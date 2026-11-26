@@ -403,6 +403,19 @@ def reads(lines, root):
     root = os.path.realpath(root)
     cwd, gitpid = {}, set()
     paths, listings, gits = set(), set(), []
+    # A git is judged where it started. strace -f can finish a vfork
+    # child's execve, and even its exit, before its parent's vfork names
+    # the child, so the child knows no directory yet: its argv waits
+    # here for the parent's vfork to give it the parent's. Only a git
+    # still waiting at the trace's end, or whose pid execs again, is
+    # judged from the root.
+    waiting = {}
+
+    def judge(pid, where):
+        sub, specs = git_pathspecs(waiting.pop(pid), where, root)
+        if sub:
+            gits.append((sub, specs))
+
     for pid, name, args, result, rest in calls(lines):
         if name in ("+++", "exit_group"):
             cwd.pop(pid, None)
@@ -420,6 +433,8 @@ def reads(lines, root):
                 cwd[child] = cwd[pid]
             if pid in gitpid:
                 gitpid.add(child)
+            if child in waiting:
+                judge(child, cwd.get(pid, root))
             continue
         if name == "execve" and result == "0":
             argv = git_argv(args)
@@ -429,9 +444,11 @@ def reads(lines, root):
             if program == "git" or (argv and
                                     os.path.basename(argv[0]) == "git"):
                 gitpid.add(pid)
-                sub, specs = git_pathspecs(argv, cwd.get(pid, root), root)
-                if sub:
-                    gits.append((sub, specs))
+                if pid in waiting:
+                    judge(pid, root)
+                waiting[pid] = argv
+                if pid in cwd:
+                    judge(pid, cwd[pid])
                 continue
         if pid in gitpid or name in NOT_READS:
             continue
@@ -455,6 +472,8 @@ def reads(lines, root):
             listings.add(rel)
         else:
             paths.add(rel)
+    for pid in list(waiting):
+        judge(pid, root)
     return paths, listings, gits
 
 

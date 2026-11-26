@@ -401,6 +401,48 @@ class TraceParsing(unittest.TestCase):
         paths, _, gits = tool.reads(lines, "/r")
         self.assertEqual((paths, gits), (set(), []))
 
+    def test_a_vfork_child_whose_execve_ends_before_the_parent_says_so(self):
+        # A nightly's order: the child's execve finished before the
+        # parent's vfork named the child, so at the execve the child had
+        # no directory; it started in the parent's, outside the root.
+        lines = ['1 chdir("/tmp/repo") = 0\n',
+                 '1 vfork( <unfinished ...>\n',
+                 '2 execve("/usr/bin/git", ["git", "cat-file", "-e", '
+                 '"abc^{commit}"], 0x0 /* 3 vars */) = 0\n',
+                 '1 <... vfork resumed>) = 2\n',
+                 '2 openat(AT_FDCWD</tmp/repo>, "/etc/ld.so.cache", '
+                 'O_RDONLY) = 3\n']
+        paths, _, gits = tool.reads(lines, "/r")
+        self.assertEqual((paths, gits), (set(), []))
+
+    def test_a_vfork_child_that_exits_before_the_parent_says_so(self):
+        # A short git can exit, too, before its parent's vfork returns.
+        lines = ['1 chdir("/tmp/repo") = 0\n',
+                 '1 vfork( <unfinished ...>\n',
+                 '2 execve("/usr/bin/git", ["git", "archive", "HEAD"], '
+                 '0x0 /* 3 vars */) = 0\n',
+                 '2 +++ exited with 0 +++\n',
+                 '1 <... vfork resumed>) = 2\n']
+        _, _, gits = tool.reads(lines, "/r")
+        self.assertEqual(gits, [])
+
+    def test_a_git_never_named_is_judged_from_the_root(self):
+        lines = ['2 execve("/usr/bin/git", ["git", "archive", "HEAD"], '
+                 '0x0 /* 3 vars */) = 0\n',
+                 '2 +++ exited with 0 +++\n']
+        _, _, gits = tool.reads(lines, "/r")
+        self.assertEqual(gits, [("archive", [])])
+
+    def test_a_git_with_no_directory_shown_takes_its_parents(self):
+        lines = ['1 chdir("/r") = 0\n',
+                 '1 vfork( <unfinished ...>\n',
+                 '2 execve("/usr/bin/git", ["git", "archive", "HEAD"], '
+                 '0x0 /* 3 vars */) = 0\n',
+                 '1 <... vfork resumed>) = 2\n',
+                 '2 exit_group(0) = ?\n']
+        _, _, gits = tool.reads(lines, "/r")
+        self.assertEqual(gits, [("archive", [])])
+
     def test_a_pid_that_comes_back_inherits_afresh(self):
         lines = ['1 chdir("/r/a") = 0\n',
                  '1 vfork() = 2\n',
