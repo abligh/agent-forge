@@ -212,6 +212,7 @@ class Check(unittest.TestCase):
                                               "labels": ["Area:build"]}
         data["agents"]["UIDev"]["areas"] = {}
         data["agents"]["Helper"]["offer"] = False
+        data["agents"]["Helper"]["hand_over"] = False
         self.assertEqual(config.check(data), [])
         data["agents"]["LeadDev"]["areas"] = {"paths": "build/",
                                               "labels": ["", 3],

@@ -291,7 +291,8 @@ agents with nothing to do (off without it):
     which of those waits are real.
 
 An agent whose entry says `"offer": false` is never offered work by
-rule 15 nor reported by rule 16.
+rule 15 nor reported by rule 16. One whose entry says `"hand_over":
+false` keeps her issues: rule 16 never asks for one to be handed on.
 
 With `router.red_first` as well (designs/0039; off without either):
 
@@ -736,6 +737,11 @@ class Roster:
         """Whether she may be offered idle work (rules 15 and 16): not
         with `"offer": false`."""
         return self.project.offered(who)
+
+    def handed_over(self, who):
+        """Whether rule 16 may ask for one of her unstarted issues to
+        be handed on: not with `"hand_over": false`."""
+        return self.project.handed_over(who)
 
     def reviewer_logins(self):
         return {self.slug(n) for n in self.reviewers()}
@@ -2093,13 +2099,15 @@ def hand_over(idle, ctx):
     D, or say why not.", or "" without `hand_over_above`, or when no
     agent owns more unstarted issues than that. A stats-watch issue
     isn't one to hand over: forge-stats-watch names its owner from the
-    figure, and the owner re-measures it (agent-forge #522)."""
+    figure, and the owner re-measures it (agent-forge #522). Nor are the
+    issues of an agent whose entry says `"hand_over": false`: work given
+    to her alone, such as research one person assigns."""
     above = IDLE_OFFER.get("hand_over_above")
     if above is None:
         return ""
     best = None
     for agent in sorted(ctx.roster.agents):
-        if agent == idle:
+        if agent == idle or not ctx.roster.handed_over(agent):
             continue
         unstarted = [i for i in owned_issues(agent, ctx)[0]
                      if IN_PROGRESS not in labels_of(i)

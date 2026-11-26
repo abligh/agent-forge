@@ -688,6 +688,24 @@ class HandOver(unittest.TestCase):
                          owned(33), owned(34))
         self.assertNotIn("hasn't started", got[0].line)
 
+    def test_an_agent_who_keeps_her_issues_is_not_asked(self):
+        data = example()
+        data["router"] = {"idle_offer": {"report_to": "LeadDev",
+                                         "hand_over_above": 2}}
+        data["agents"]["LeadDev"]["hand_over"] = False
+        project = config.Project(data, None)
+        r.configure(project)
+        got_prs, got_issues = r.fetch(FakeGitHub(response(
+            [], [owned(n) for n in (30, 31, 32, 33)])))
+        got = rules.sweep(router.Context(
+            rules.Roster(project), NOW, got_prs, got_issues,
+            directory=directory(entry("WidgetUIDev"))))
+        self.assertEqual(got[0].line, "UIDev has been idle since 13:30Z with "
+                         "nothing it can act on (no open issues of its own).")
+        self.assertEqual((rules.Roster(project).handed_over("LeadDev"),
+                          rules.Roster(project).handed_over("UIDev")),
+                         (False, True))
+
     def test_stats_watch_issues_are_not_handed_over(self):
         # agent-forge #522: their owner re-measures them.
         got = self.sweep(owned(30), *[owned(n, labels=["stats-watch"])
