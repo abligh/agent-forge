@@ -2218,7 +2218,7 @@ def globs_key(globs):
 
 
 def in_scope(heads, state_dir, token, run=sh, out=print, when=None,
-             checkout=None):
+             checkout=None, outside=None):
     """`heads`, less the pull requests' heads this instance doesn't run
     (PULL_REQUESTS, designs/0034): one is run when its pull request
     carries the label, or changes a path the globs match. A draft, and
@@ -2232,7 +2232,8 @@ def in_scope(heads, state_dir, token, run=sh, out=print, when=None,
     under other paths than today's is made again, so a head widened
     paths now match is queued (#576). A head left out is said once, in
     verdicts.log. Returns (heads kept, [(pr, sha)] newly
-    left out)."""
+    left out); `outside`, a list, gets every head left out because it
+    changes none of the paths, newly or not (#615)."""
     if PULL_REQUESTS is None:
         return heads, []
     globs, label = PULL_REQUESTS
@@ -2291,7 +2292,10 @@ def in_scope(heads, state_dir, token, run=sh, out=print, when=None,
         scope[sha] = entry
         if labelled or entry["in"]:
             kept.append(head)
-        elif not was or was.get("in") or was.get("labelled"):
+            continue
+        if outside is not None:
+            outside.append(head)
+        if not was or was.get("in") or was.get("labelled"):
             dropped.append((pr, sha))
             log(state_dir, "OUT-OF-SCOPE #%d %s: changes no path this "
                 "instance runs%s" % (pr, sha[:10],
@@ -2495,6 +2499,57 @@ def finish_reviewed(todo, state_dir, token, run=sh, post=None, out=print):
             save_reviewed(state_dir, known)
         except OSError:
             pass
+
+
+def early_outside(outside):
+    """[(pr, sha)] of the heads in `outside` (in_scope's) that carry
+    EARLY_LABEL: it can't release a head this instance never runs, so
+    the label is taken off and the pull request told why (#615)."""
+    if not (REVIEWED_HEADS and EARLY_LABEL):
+        return []
+    return [(head[0], head[1]) for head in outside
+            if not head[3] and head[2] == REPO_SLUG
+            and EARLY_LABEL in (head[5] if len(head) > 5 else [])]
+
+
+def early_outside_text(sha):
+    """The comment an early label on a head out of scope gets (#615)."""
+    if PULL_REQUESTS and PULL_REQUESTS[1]:
+        how = "To run it here anyway, add `%s`." % PULL_REQUESTS[1]
+    else:
+        how = "Nothing makes this instance run it."
+    return ("%s`%s` does nothing on %s: it changes no path `%s` runs, so "
+            "there is no run to release early, and the label is taken "
+            "off. %s\n\n%s" % (NOT_A_REVIEW, EARLY_LABEL, sha[:10],
+                                STATUS_CONTEXT, how, signature()))
+
+
+def finish_early_outside(todo, state_dir, token, run=sh, out=print,
+                         when=None):
+    """GitHub's half of early_outside: the label first, and the comment
+    only once it came off, so a head is told once without a record of
+    it; a label already off (404) was taken off by another tick."""
+    for pr, sha in todo:
+        got = gh(["-X", "DELETE", "repos/%s/issues/%d/labels/%s"
+                  % (REPO_SLUG, pr, urllib.parse.quote(EARLY_LABEL,
+                                                       safe=""))],
+                 token, run)
+        if got.returncode != 0:
+            if "404" not in (got.stderr or ""):
+                out("EARLY-FAILED #%d %s: taking %s off: %s"
+                    % (pr, sha[:10], EARLY_LABEL,
+                       (got.stderr or "").strip()[:200]))
+            continue
+        got = gh(["-X", "POST", "repos/%s/issues/%d/comments"
+                  % (REPO_SLUG, pr), "-f",
+                  "body=" + early_outside_text(sha)], token, run)
+        if got.returncode != 0:
+            out("EARLY-FAILED #%d %s: commenting: %s"
+                % (pr, sha[:10], (got.stderr or "").strip()[:200]))
+        else:
+            log(state_dir, "EARLY-OUTSIDE #%d %s: %s taken off; the head "
+                "is out of scope" % (pr, sha[:10], EARLY_LABEL),
+                when or now_utc(), out)
 
 
 def note_heads(state, heads, when, state_dir, out=print, post=None):
@@ -5099,8 +5154,12 @@ def tick(state_dir, token, run=sh, spawn=spawn_worker, out=print, when=None,
         return 2
     # An instance runs only the pull requests its block names; to the
     # rest of the tick, the others aren't open (designs/0034).
+    outside = []
     heads, dropped = in_scope(heads, state_dir, token, run, out, when,
-                              checkout)
+                              checkout, outside)
+    if post is not None:
+        finish_early_outside(early_outside(outside), state_dir, token, run,
+                             out, when)
     slots = slots or slots_from_env()
     lane = FAST_LANE_S is not None and bool(checkout)
     holders = {slot: running(state_dir, slot)

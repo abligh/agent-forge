@@ -124,7 +124,9 @@ for `labels.rerun`, `main_red_issue`, `step_alert` and `red_comment`.
    checked, and heads from another repository are refused (`REFUSED`,
    posted `error`): the steps run the pull request's code with this
    user's access to the host. An instance with `pull_requests` drops
-   the pull requests it doesn't apply to (`OUT-OF-SCOPE`).
+   the pull requests it doesn't apply to (`OUT-OF-SCOPE`). One of those
+   carrying `reviewed_heads.early_label` has it taken off, with a
+   comment saying it does nothing there (`EARLY-OUTSIDE`).
 2. Under the state lock: handles `labels.rerun`, queues new heads
    (posting `pending`, `queued at HH:MMZ for a check slot; N other
    heads waiting`), queues the default branch's head when it needs a
