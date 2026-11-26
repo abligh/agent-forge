@@ -1933,6 +1933,8 @@ Tools set some for what they start, and nothing else should:
 `FORGE_CRON_GEN_LOCK_FD`, `FORGE_CRON_GENERATION` and `FORGE_CRON_BASE`
 (the generation a job runs in, its lock, and the checkout it was made
 from),
+`FORGE_CRON_FETCH_TOKEN` (the App's token, given to the sync's fetch
+alone, never to the tool),
 `FORGE_QUEUE_TICKET` and `FORGE_QUEUE_SUMMARY` (a queued job's ticket,
 and a file whose last line is its end message), `FORGE_QUIET_HOLDER`,
 `FORGE_QUIET_MINUTES` and `FORGE_QUIET_UNTIL` (a quiet hold's command),

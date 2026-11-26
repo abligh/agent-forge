@@ -6,6 +6,7 @@ import sys
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from agent_forge import github
 from tests.helpers import Repo, load_tool
@@ -416,6 +417,55 @@ if flock -n -x "$LOCK" true; then echo lock=free; else echo lock=held; fi
                                        mint=mint), 2)
         self.assertIn("APP-TOKEN-FAILED", self.log())
         self.assertNotIn("cwd=", self.log())
+
+    def test_the_fetch_goes_as_the_app_too(self):
+        # agent-forge #612: a private repository's checkout has no other
+        # credential, so the sync's fetch needs the App's token as well.
+        minted = []
+
+        def mint(repo, app):
+            minted.append(app)
+            return "ghs_" + app
+        with mock.patch.object(tool, "fetch_env",
+                               wraps=tool.fetch_env) as given:
+            self.assertEqual(self.run_tool("report",
+                                           env={"FORGE_CRON_APP": "Merger"},
+                                           mint=mint), 0)
+        # Once for the fetch, before the sync; once from the synced tree.
+        self.assertEqual(minted, ["Merger", "Merger"])
+        self.assertTrue(given.call_args_list)
+        self.assertTrue(all(c.args[1] == "ghs_Merger"
+                            for c in given.call_args_list))
+        self.assertIn("token=ghs_Merger\n", self.log())
+
+    def test_a_failed_mint_before_the_sync_fetches_without_a_token(self):
+        calls = []
+
+        def mint(repo, app):
+            calls.append(app)
+            if len(calls) == 1:
+                raise github.MintError(3, "refused")
+            return "ghs_" + app
+        self.assertEqual(self.run_tool("report", env={"FORGE_CRON_APP": "M"},
+                                       mint=mint), 0)
+        self.assertIn("FETCH-UNAUTHENTICATED: no token for M", self.log())
+        self.assertIn("token=ghs_M\n", self.log())
+
+    def test_the_fetch_helper_answers_with_the_token_and_nothing_else(self):
+        env = dict(self.r.env, GIT_CONFIG_COUNT="1",
+                   GIT_CONFIG_KEY_0="credential.helper",
+                   GIT_CONFIG_VALUE_0="!printf 'username=u\\npassword=wrong\\n' #")
+        got = subprocess.run(
+            ["git", "-C", self.cron, "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            capture_output=True, text=True,
+            env=tool.fetch_env(env, "ghs_secret"))
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertIn("username=x-access-token\n", got.stdout)
+        self.assertIn("password=ghs_secret\n", got.stdout)
+        self.assertNotIn("wrong", got.stdout)
+        # The token rides in the environment, never in git's arguments.
+        self.assertNotIn("ghs_secret", tool.FETCH_HELPER)
 
     def hold(self, path, exclusive=True):
         os.makedirs(self.logs, exist_ok=True)
