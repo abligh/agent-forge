@@ -1917,6 +1917,7 @@ own.
 | `FORGE_CRON_APP` | `forge-cron-run` | The App (an agent or machinery name) whose token the job gets as `GH_TOKEN`. |
 | `FORGE_CRON_LOGDIR`, `FORGE_CRON_PATH`, `FORGE_CRON_LOCK`, `FORGE_CRON_LOCK_WAIT_S`, `FORGE_CRON_PIN_WAIT_S`, `FORGE_CRON_FETCH_RETRY_S`, `FORGE_CRON_GENERATIONS`, `FORGE_CRON_GEN_DIR` | `forge-cron-run` | Where logs go, the job's `PATH`, its lock, how long to wait for it, how long to wait for `forge-install` after a pin bump, how long to retry a failed fetch, and whether jobs run in generations of the checkout (`0` turns them off) and where those go ([tools/forge-cron-run.md](tools/forge-cron-run.md)). |
 | `FORGE_PR_CHECK_SLOTS`, `FORGE_PR_CHECK_MEMORY_MAX`, `FORGE_PR_CHECK_INSTANCE` | `forge-pr-check` | `checks.slots`, `checks.memory_max` and `--instance`, for one host. |
+| `FORGE_PR_CHECK_WORKER_SCOPE` | `forge-pr-check` | `off` starts each check worker as a plain child instead of in a user scope of its own (#607). |
 | `FORGE_ROUTER_RELAY`, `FORGE_ROUTER_REMIND` | `forge-router`, `forge-queue` | `relay.url` and `relay.remind_seconds`. |
 | `FORGE_RECEIVER_PORT`, `FORGE_RECEIVER_SECRET_FILE` | `forge-receiver` | `receiver.port` and `receiver.secret_file`. |
 | `FORGE_HOST_NAME` | `forge-host-settings` | The host's short name (default `hostname -s`). |
