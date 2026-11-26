@@ -1,0 +1,13 @@
+# GitHub asks the owner named here to review any pull request touching
+# these paths, and with "Require review from Code Owners" on the default
+# branch the merge waits for that approval. With "code_owners": true
+# under merge, the Merger waits for it too.
+#
+# .agent-forge/ gives each App its identity and decides which reviewer
+# may approve; tools/host/ holds the settings every agent session runs
+# under and the crontabs installed unattended. An agent may propose a
+# change to them, but only the owner's review lets it merge. This file
+# is listed too, so a pull request can't remove the guard as it goes.
+/.agent-forge/ @example-owner
+/tools/host/ @example-owner
+/.github/CODEOWNERS @example-owner

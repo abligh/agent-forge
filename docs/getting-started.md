@@ -214,6 +214,34 @@ Optional ones, each named in `labels` ([config.md](config.md#keys)):
 an urgent label that puts a pull request first, and a rerun label that
 runs a red head once more. Change any of the names under `labels`.
 
+[examples/labels.json](../examples/labels.json) is a fuller set, as a
+project with trains, armed reviews and a stats watch uses it: each
+entry's `name`, `color` and `description`, and, for those a tool
+reads, `key`, the entry under `labels` that names it (`stats-watch`
+is `stats_watch.label`'s default). Rename any of them in the file and
+under `labels` alike. To create them all, and an `Owner:` label for
+each agent:
+
+```sh
+python3 -c 'import json, sys
+for l in json.load(open(sys.argv[1])):
+    print(l["name"], l["color"], l["description"], sep="\t")' \
+    examples/labels.json |
+while IFS="$(printf '\t')" read -r name color text; do
+    gh label create "$name" --repo example/widget \
+        --color "$color" --description "$text" --force
+done
+for agent in LeadDev UIDev Reviewer; do
+    gh label create "Owner:$agent" --repo example/widget --force
+done
+```
+
+`--force` updates a label that exists, so running it again is safe.
+To compare with another project's labels, `gh label list --repo
+other/repo --json name,color,description` needs nothing beyond
+`Issues: read` on that repository: setting a project up from this page
+needs no access to another project's code.
+
 ## 5. Protect the default branch
 
 In the repository's branch protection (or a ruleset) for the default
@@ -232,7 +260,8 @@ pull request that changes a code-owned path also waits for its
 owner's approval ([`merge.code_owners`](config.md#mergecode_owners)).
 Use it for the paths that change how the team works, such as
 `.agent-forge/` and the host files, so that agents can't change their
-own rules unreviewed.
+own rules unreviewed; [examples/CODEOWNERS](../examples/CODEOWNERS) is
+a starting point.
 
 ## 6. The cron checkout and the crontab
 
