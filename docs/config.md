@@ -1520,7 +1520,10 @@ first such merge, so later merges referencing the same issue ask
 nothing more (until v0.4.245 each one asked again, agent-forge #560
 and #571), and nothing reminds. A comment on the item by the project's
 owner or an agent after that first merge answers it for good: "it
-waits for #N to close" is said once. Editing the lines starts afresh.
+waits for #N to close" is said once. Changing what the lines name
+starts afresh; a comment that restates the same numbers, as an answer
+ending with the item's usual `Blocked-by:` line does, does not (until
+v0.4.250 it did, and the next merge asked again, agent-forge #624).
 Of several open blockers, the one whose first merge is oldest is asked
 about first, and the next once that is answered. Until v0.4.228 the
 turn stood while the line did, and the idle nudge, which lists the

@@ -1530,7 +1530,8 @@ def stale_blocker(item, who, when=None):
     merge, so later merges referencing it ask nothing more, and a
     comment by the project's owner or an agent after that first merge
     answers it for good (else the idle nudge, which lists standing
-    turns, re-sent it). Editing the lines starts afresh. Of several
+    turns, re-sent it). Changing what the lines name starts afresh;
+    restating the same numbers does not (agent-forge #624). Of several
     blockers still unanswered, the one whose first merge is oldest is
     asked about first; nothing reminds. Not while the item's
     `Defer-until:` is still to come at `when`."""
@@ -1787,7 +1788,13 @@ def issue_blocker_state(issue):
          for c in issue.get("comments") or ()
          if author_of(c) in BLOCKER_WRITERS],
         key=lambda t: (t[0], t[1]))
-    named, written = set(), ""
+    # A text restating the numbers already in force keeps the earlier
+    # `written`: agents end their comments with the item's
+    # `Blocked-by:` line, and an answer to rule 26 that did so moved its
+    # start past the first merge, so the next merge asked again
+    # (agent-forge #624). Only a change of what the lines name, or a
+    # clearing, starts afresh.
+    named, written, seen = set(), "", False
     for _, _, when, text in texts:
         text = merger.markers_of(text)
         if not any(merger.BLOCKED_LINE_RE.match(l)
@@ -1795,7 +1802,9 @@ def issue_blocker_state(issue):
             continue
         found = merger.blocked_numbers(text)
         if found or merger.UNBLOCK_RE.search(text):
-            named, written = found, when
+            if not seen or found != named:
+                named, written = found, when
+            seen = True
     return named, written
 
 
