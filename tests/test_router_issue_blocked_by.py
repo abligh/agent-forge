@@ -149,6 +149,59 @@ class FromComments(Case):
         self.assertEqual(rules.blockers_of(pr), set())
 
 
+class Restated(Case):
+    """agent-forge #624: a text restating the numbers in force keeps the
+    earlier `written`, so an answer to rule 26 that ends with the usual
+    `Blocked-by:` line does not start it afresh."""
+
+    def setUp(self):
+        super().setUp()
+        data = self.project.data
+        data.setdefault("router", {})["stale_blocker"] = True
+        p = config.Project(data, None)
+        merger.configure(p)
+        rules.configure(p, merger)
+        self.roster = rules.Roster(p)
+
+    def tearDown(self):
+        super().tearDown()
+
+    def blocker(self, *refs):
+        return dict(OPEN, mergedRefs=[{"number": n, "mergedAt": at}
+                                      for n, at in refs])
+
+    def test_a_restatement_keeps_the_first_time(self):
+        item = issue([note(LEADDEV, T1, "Blocked-by: #7", id=1),
+                      note(LEADDEV, T3, "Still waits.\n\nBlocked-by: #7",
+                           id=2)])
+        self.assertEqual(rules.issue_blocker_state(item), ({7}, T1))
+
+    def test_an_answer_restating_the_line_answers_for_good(self):
+        # Line at T1, first merge at T2, answered at T3 with the line
+        # again, another merge at T4: nothing more is asked.
+        item = issue([note(LEADDEV, T1, "Blocked-by: #7", id=1),
+                      note(LEADDEV, T3, "It waits for #7 to close.\n\n"
+                           "Blocked-by: #7", id=2)],
+                     blocked_by={7: self.blocker((12, T2), (13, T4))})
+        self.assertIsNone(rules.stale_blocker(item, "LeadDev"))
+
+    def test_a_changed_set_starts_afresh(self):
+        item = issue([note(LEADDEV, T1, "Blocked-by: #7", id=1),
+                      note(LEADDEV, T3, "Blocked-by: #7\nBlocked-by: #8",
+                           id=2)],
+                     blocked_by={7: self.blocker((12, T2), (13, T4)),
+                                 8: OPEN})
+        self.assertEqual(rules.issue_blocker_state(item), ({7, 8}, T3))
+        d = rules.stale_blocker(item, "LeadDev")
+        self.assertEqual((d["rule"], d["event"]), (26, T4))
+
+    def test_clearing_and_naming_again_starts_afresh(self):
+        item = issue([note(LEADDEV, T1, "Blocked-by: #7", id=1),
+                      note(LEADDEV, T2, "Blocked-by: none", id=2),
+                      note(LEADDEV, T3, "Blocked-by: #7", id=3)])
+        self.assertEqual(rules.issue_blocker_state(item), ({7}, T3))
+
+
 class Unblocked(Case):
     """Rule 14 with the lines in a comment: the line's own time is when
     it was written."""
