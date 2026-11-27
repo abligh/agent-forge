@@ -70,8 +70,15 @@ each pull request a `completed` `check_suite` lists, whatever its
 conclusion (GitHub Actions' results move turns too). A `status`
 for `checks.context` names a commit, which the worker maps to its open
 pull requests with one API call as the Merger's App (`merge.merger`);
-other contexts are ignored. Without `route`, nothing is routed and no
-token is minted.
+other contexts are ignored. When an `issues` or `pull_request` event's
+action is `closed` (a merge is one), the open items whose body has a
+`Blocked-by:` line naming that item are routed in the same run: one
+search per closed item, as the Merger's App, read with the router's own
+rule for the lines (agent_forge.markers.blockers), so an item that only
+mentions it isn't. A waiting step then hears within seconds, not at
+cron's next router run. A failed search is logged `LOOKUP-FAILED:` and
+left to cron. Without `route`, nothing is routed and no token is
+minted.
 
 It answers `202` and never runs anything in the request. A worker waits
 until DEBOUNCE_S have passed since a key's latest event, so a burst on
@@ -120,10 +127,11 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 
 BIN = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(BIN))
-from agent_forge import config, github as forge_github, locks, proc  # noqa: E402,E501
+from agent_forge import config, github as forge_github, locks, markers, proc  # noqa: E402,E501
 
 DEDUPE_KEEP = 5000
 DEBOUNCE_S = 20
@@ -142,6 +150,11 @@ NEW_HEAD_ACTIONS = {"opened", "reopened", "synchronize", "ready_for_review"}
 # is enough for any cap the configuration allows and bounds the work
 # int() does.
 LENGTH_RE = re.compile(r"[0-9]{1,8}")
+# The events whose `closed` action (a pull request's merge included) also
+# routes the open items with a `Blocked-by:` line naming the item.
+CLOSING = {"issues", "pull_request"}
+# The most dependents one closed item's search reads: one page.
+DEPENDENTS_PAGE = 100
 # The events whose item is read from the payload, and where.
 ITEM_OF = {
     "issues": "issue",
@@ -289,6 +302,8 @@ def keys_for(event, payload):
         if not n:
             return [], "no item number"
         keys = [("item", n)] if ROUTE else []
+        if ROUTE and event in CLOSING and payload.get("action") == "closed":
+            keys.append(("closed", n))
         if gives_work(event, payload):
             keys += ticks(event)
         return keys, None if keys else "nothing to route or tick"
@@ -479,27 +494,61 @@ def prs_of(sha, github):
                    for n in [number(pr.get("number"))] if n})
 
 
+def dependents_of(n, github):
+    """The open issues and pull requests whose body has a `Blocked-by:`
+    line naming `n`. GitHub's search finds candidates; the router's own
+    reading of the lines (agent_forge.markers.blockers: one line of its
+    own, outside code) decides, so a mere mention of #N doesn't count."""
+    query = 'repo:%s is:open in:body "Blocked-by" %d' % (REPO_SLUG, n)
+    got = github.api("search/issues?q=%s&per_page=%d" % (
+        urllib.parse.quote(query, safe=""), DEPENDENTS_PAGE))
+    found = got.get("items") if isinstance(got, dict) else None
+    if not isinstance(found, list):
+        raise ValueError("search: no items")
+    return sorted({m for item in found if isinstance(item, dict)
+                   and item.get("state") == "open"
+                   for m in [number(item.get("number"))]
+                   if m and m != n
+                   and n in markers.blockers(item.get("body") or "")})
+
+
 def items_of(keys, github_for, out):
-    """The item numbers `keys` name. A commit is looked up only when
-    there is one; a failed lookup is reported and dropped, and cron's
-    sweep covers it."""
+    """The item numbers `keys` name. A commit is looked up to its open
+    pull requests, and a closed item to the open items `Blocked-by` it,
+    only when there is one; a failed lookup is reported and dropped, and
+    cron's sweep covers it."""
     items = {value for kind, value in keys if kind == "item"}
     commits = [value for kind, value in keys if kind == "commit"]
-    if commits:
-        github = github_for()
-        if github is None:
-            out("NO-TOKEN: could not mint %s's token; %d commit(s) left to "
-                "cron" % (ACT_AS, len(commits)))
-            return sorted(items)
-        for sha in commits:
-            try:
-                found = prs_of(sha, github)
-            except (RuntimeError, ValueError) as err:
-                out("LOOKUP-FAILED: %s: %s" % (sha[:10], err))
-                continue
-            out("commit %s: %s" % (sha[:10], ", ".join(
-                "#%d" % n for n in found) or "no open pull request"))
-            items.update(found)
+    closed = sorted(value for kind, value in keys if kind == "closed")
+    if not (commits or closed):
+        return sorted(items)
+    github = github_for()
+    if github is None:
+        left = ["%d commit(s)" % len(commits)] if commits else []
+        left += ["the dependents of %d closed item(s)" % len(closed)] \
+            if closed else []
+        out("NO-TOKEN: could not mint %s's token; %s left to cron"
+            % (ACT_AS, " and ".join(left)))
+        return sorted(items | set(closed))
+    for sha in commits:
+        try:
+            found = prs_of(sha, github)
+        except (RuntimeError, ValueError) as err:
+            out("LOOKUP-FAILED: %s: %s" % (sha[:10], err))
+            continue
+        out("commit %s: %s" % (sha[:10], ", ".join(
+            "#%d" % n for n in found) or "no open pull request"))
+        items.update(found)
+    for n in closed:
+        items.add(n)
+        try:
+            found = dependents_of(n, github)
+        except (RuntimeError, ValueError) as err:
+            out("LOOKUP-FAILED: #%d's dependents: %s" % (n, err))
+            continue
+        out("closed #%d: %s" % (n, ", ".join(
+            "#%d" % m for m in found) or "nothing Blocked-by it"))
+        items.update(found)
     return sorted(items)
 
 
