@@ -130,8 +130,22 @@ work only when:
 and so is each pull request a `completed` `check_suite` lists, whatever
 its conclusion. A `status` for either context names a commit; the
 worker maps it to its open pull requests with one API call, as the
-Merger's App (`LOOKUP-FAILED` or `NO-TOKEN` when that fails). Without
-`route`, nothing is routed and no token is minted.
+Merger's App (`LOOKUP-FAILED` or `NO-TOKEN` when that fails).
+
+**What waits on a closed item is routed with it.** When an `issues` or
+`pull_request` delivery's action is `closed` (a merge is one), the open
+issues and pull requests whose body has a `Blocked-by:` line naming
+that item are routed in the same router run. The worker finds them
+with one search per closed item, as the Merger's App, and reads each
+body with the router's own rule for the lines
+(`agent_forge.markers.blockers`: a line of its own, outside code). So
+an item that only mentions the number isn't routed. A step waiting on
+a merge is then woken within seconds, not at cron's next router run.
+Only bodies are read: with `router.issue_blocked_by: "agents"`, a line
+in an issue's comment is still cron's to find. A failed search is
+logged `LOOKUP-FAILED` and the closed item is routed alone; cron's run
+covers the rest. Without `route`, nothing is routed and no token is
+minted.
 
 **Running.** A worker thread waits until 20 seconds have passed since
 an item's latest event, so a burst on one item makes one run, but no
@@ -169,6 +183,7 @@ seconds are left to cron.
 | `TIMEOUT: forge-pr-check stopped after 600s` | A run went past `run_timeout`. |
 | `routing #12, #14` | The router is run for these items. |
 | `commit 1a2b3c4d5e: #12` | A `status` commit mapped to its pull requests. |
+| `closed #7: #12, #14` | The open items `Blocked-by` a closed or merged item, routed with it. |
 | `ROUTE-FAILED: …` | A worker run raised; the worker carries on. |
 | `RESTART: <file> changed; …` | It is exiting for the service manager to restart it. |
 

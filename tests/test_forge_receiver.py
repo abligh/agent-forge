@@ -332,6 +332,29 @@ class KeysTest(unittest.TestCase):
             "context": "vm/build-and-test", "sha": SHA,
             "state": "success"}), ([("tool", MERGER)], None))
 
+    def test_a_closed_issue_or_pull_request_names_its_dependents(self):
+        self.assertEqual(rc.keys_for("issues", {
+            "action": "closed", "issue": {"number": 3}})[0],
+            [("item", 3), ("closed", 3)])
+        self.assertEqual(rc.keys_for("pull_request", {
+            "action": "closed", "pull_request": {"number": 7,
+                                                 "merged": True}})[0],
+            [("item", 7), ("closed", 7)])
+
+    def test_other_actions_and_comments_name_no_dependents(self):
+        self.assertEqual(rc.keys_for("issues", {
+            "action": "reopened", "issue": {"number": 3}})[0],
+            [("item", 3)])
+        self.assertEqual(rc.keys_for("issue_comment", {
+            "action": "closed", "issue": {"number": 3}})[0],
+            [("item", 3)])
+
+    def test_without_a_route_a_close_names_nothing(self):
+        configure(route=None)
+        self.assertEqual(rc.keys_for("issues", {
+            "action": "closed", "issue": {"number": 3}}),
+            ([], "nothing to route or tick"))
+
     def test_an_event_the_table_leaves_out_ticks_nothing(self):
         configure(ticks={"pull_request": [list(BUILD)]})
         self.assertEqual(rc.keys_for("push", {"ref": "refs/heads/main"}),
@@ -756,6 +779,83 @@ class RouteTest(unittest.TestCase):
                  self.run_)
         self.assertEqual(self.runs, [])
         self.assertTrue(self.lines[0].startswith("LOOKUP-FAILED: "))
+
+    def search(self, *items):
+        return FakeGitHub({"total_count": len(items), "items": [
+            {"number": n, "state": state, "body": body}
+            for n, state, body in items]})
+
+    def test_a_closed_item_routes_the_items_blocked_by_it(self):
+        gh = self.search(
+            (12, "open", "Step two.\n\nBlocked-by: #3\n"),
+            (13, "open", "Blocked-by: #2, #3"),
+            (14, "open", "This mentions Blocked-by: #3 in passing."),
+            (15, "open", "```\nBlocked-by: #3\n```"),
+            (16, "closed", "Blocked-by: #3"),
+            (17, "open", "Blocked-by: #30"))
+        rc.route([("item", 3), ("closed", 3)], lambda: gh,
+                 self.lines.append, self.run_)
+        (path,), = gh.calls
+        self.assertTrue(path.startswith("search/issues?q="), path)
+        self.assertIn("repo%3Aexample%2Fwidget", path)
+        self.assertIn("is%3Aopen", path)
+        (command, _), = self.runs
+        self.assertEqual(command[1:], ["forge-router", "--send", "--only",
+                                       "3,12,13"])
+        self.assertIn("closed #3: #12, #13", self.lines)
+
+    def test_a_merged_pull_request_routes_its_dependents_too(self):
+        configure()
+        keys, _ = rc.keys_for("pull_request", {
+            "action": "closed", "pull_request": {"number": 7,
+                                                 "merged": True}})
+        gh = self.search((8, "open", "Blocked-by: #7"))
+        rc.route(keys, lambda: gh, self.lines.append, self.run_)
+        self.assertEqual(self.runs[0][0][-1], "7,8")
+
+    def test_a_close_with_no_dependents_routes_only_itself(self):
+        gh = self.search()
+        rc.route([("item", 3), ("closed", 3)], lambda: gh,
+                 self.lines.append, self.run_)
+        self.assertEqual(self.runs[0][0][-1], "3")
+        self.assertIn("closed #3: nothing Blocked-by it", self.lines)
+
+    def test_a_failed_search_still_routes_the_item_and_logs(self):
+        gh = FakeGitHub(RuntimeError("GET search/issues: 403"))
+        rc.route([("item", 3), ("closed", 3)], lambda: gh,
+                 self.lines.append, self.run_)
+        self.assertEqual(self.runs[0][0][-1], "3")
+        self.assertTrue(any(line.startswith("LOOKUP-FAILED: #3's dependents")
+                            for line in self.lines), self.lines)
+
+    def test_an_answer_with_no_items_is_a_failed_lookup(self):
+        gh = FakeGitHub({"message": "Validation Failed"})
+        rc.route([("item", 3), ("closed", 3)], lambda: gh,
+                 self.lines.append, self.run_)
+        self.assertEqual(self.runs[0][0][-1], "3")
+        self.assertTrue(self.lines[0].startswith("LOOKUP-FAILED: "))
+
+    def test_no_token_still_routes_a_closed_item(self):
+        rc.route([("item", 3), ("closed", 3)], lambda: None,
+                 self.lines.append, self.run_)
+        self.assertEqual(self.runs[0][0][-1], "3")
+        self.assertTrue(self.lines[0].startswith("NO-TOKEN: "))
+
+    def test_commits_and_closes_share_one_router_run(self):
+        class Both:
+            calls = []
+
+            def api(self, path):
+                self.calls.append(path)
+                if path.startswith("search/"):
+                    return {"items": [{"number": 21, "state": "open",
+                                       "body": "Blocked-by: #5"}]}
+                return [{"number": 72, "state": "open",
+                         "head": {"sha": SHA}}]
+        rc.route([("commit", SHA), ("item", 5), ("closed", 5)],
+                 lambda: Both(), self.lines.append, self.run_)
+        (command, _), = self.runs
+        self.assertEqual(command[-1], "5,21,72")
 
     def test_a_leading_tilde_is_the_run_s_home(self):
         configure(ticks={"push": [["forge-merger", "--state-dir",
