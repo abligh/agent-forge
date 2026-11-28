@@ -4,6 +4,9 @@
     forge-app-token --token NAME   the token, on stdout only
     forge-app-token --check        check every App against GitHub
     forge-app-token --list         the Apps, without the network
+    forge-app-token --installations NAME --org ORG
+                                   whether NAME's App is installed on
+                                   ORG's account only
 
 NAME is an agent or a machinery App in the project's configuration.
 See agent_forge.github for why the key is checked against GitHub on
@@ -19,6 +22,7 @@ Exit status, so a caller can tell a missing agent from a broken key:
     4   --check found an App that disagrees with GitHub or isn't made
     5   GitHub could not be reached
     6   the App isn't made yet: its ids are null
+    7   --installations found an installation on another account
 """
 import argparse
 import os
@@ -41,7 +45,11 @@ def main(argv=None, out=print, err=None, call=github.api_call,
     group.add_argument("--token", metavar="NAME")
     group.add_argument("--check", action="store_true")
     group.add_argument("--list", action="store_true")
+    group.add_argument("--installations", metavar="NAME")
+    parser.add_argument("--org", metavar="ORG")
     args = parser.parse_args(argv)
+    if (args.installations is None) != (args.org is None):
+        parser.error("--installations and --org go together")
     try:
         project = config.load_reviewed()
     except config.ConfigError as e:
@@ -64,6 +72,17 @@ def main(argv=None, out=print, err=None, call=github.api_call,
             out("  %-17s %s" % (name, line))
             ok = ok and good
         return 0 if ok else 4
+    if args.installations:
+        try:
+            count, all_on = github.installations(
+                project, args.installations, args.org, call, sign)
+        except github.MintError as e:
+            err("forge-app-token: %s" % e)
+            return e.status
+        out("%s: %d installation%s, all on %s: %s"
+            % (args.installations, count, "" if count == 1 else "s",
+               args.org, "yes" if all_on else "no"))
+        return 0 if all_on else 7
     try:
         out(github.token(project, args.token, call, sign))
     except github.MintError as e:

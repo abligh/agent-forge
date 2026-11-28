@@ -13,6 +13,7 @@ and no message on stderr ever contains a token.
     forge-app-token --token NAME
     forge-app-token --check
     forge-app-token --list
+    forge-app-token --installations NAME --org ORG
 
 Exactly one of the three options is required.
 
@@ -38,9 +39,11 @@ says, then `--check` to prove that every key and id agrees with GitHub.
 | `--token NAME` | none | Mint and print an installation token for `NAME`, an agent or a machinery App in the configuration. |
 | `--check` | off | For every agent and machinery App, check that the key signs for the App the configuration names and that its installation exists. Prints one line each. |
 | `--list` | off | Print every agent and machinery App with its ids and key path. No network. |
+| `--installations NAME` | off | Count the installations of `NAME`'s App, and say whether every one is on `--org`'s account. |
+| `--org ORG` | none | The one account `--installations` expects. Required with it, and only with it. |
 | `-h`, `--help` | | Print the usage and exit. |
 
-`--token`, `--check` and `--list` are mutually exclusive.
+`--token`, `--check`, `--list` and `--installations` are mutually exclusive.
 
 ## Environment
 
@@ -133,6 +136,19 @@ refused (404)`. It checks every App even after a failure.
 A `null` id prints as `null`. With no `key_dir` the path prints as
 `None`.
 
+**`--installations NAME --org ORG`** does the same key and slug check
+for `NAME`, then reads `GET /app/installations` with the App's JWT,
+every page. An installation token sees only its own installation, so
+this is the only way to learn where else an App is installed. It
+prints one line:
+
+    LeadDev: 2 installations, all on example: yes
+
+The account names are compared without regard to case. No other
+account is named, on stdout or stderr, so the line can be posted where
+those names must not appear. The JWT never leaves the tool. It exits 7
+when any installation is on another account.
+
 ## Exit status
 
 | Status | Meaning |
@@ -144,6 +160,7 @@ A `null` id prints as `null`. With no `key_dir` the path prints as
 | 4 | `--check` found an App that disagrees with GitHub or isn't made. |
 | 5 | GitHub could not be reached. |
 | 6 | The App isn't made yet: `app_id` or `installation_id` is null. |
+| 7 | `--installations` found an installation on another account. |
 
 ## See also
 
