@@ -14,9 +14,10 @@ two inserts after the same line, or each host setting its front
 matter's `modified:` (the later is kept). The other hosts' lines come
 first, then this host's, in a merge commit (agent-forge #157). A
 **keyed line**, one line of `; `-joined entries that each start
-`[Name]` after a lead ending ": " (such as an index's "newest per
-agent" line, which each host rewrites for its own agents), **merges
-entry by entry**: each side's changed entries are kept, and both
+`[Name` after a lead ending ": " (the lead may hold links; the
+entry's key is the first word in its brackets; such as an index's
+"newest per agent" line, which each host rewrites for its own agents),
+**merges entry by entry**: each side's changed entries are kept, and both
 sides' lines added around it too. Both hosts changing one entry
 differently still stops (agent-forge #628).
 `MEMORY.md` no longer merges with git's union driver, though the
@@ -234,9 +235,14 @@ def later_modified(base, head, main):
 # A line of entries, one per agent, that each host rewrites for its
 # own agents: "<lead>: [Name] ...; [Other] ...". Two hosts' edits
 # always meet on it, so a union can't take both (agent-forge #628).
-KEYED_RE = re.compile(r"^(?P<lead>[^\[\n]*?: )(?P<rest>\[[^\]\n]+\].*)$")
+# The lead may hold links ("older in [archive](...)"), but a line that
+# starts as an index entry ("- [Title](file)") is not keyed.
+KEYED_RE = re.compile(
+    r"^(?P<lead>(?!\s*[-*]\s*\[)[^\n]*?: )(?P<rest>\[[^\]\n]+\].*)$")
 ENTRY_SPLIT_RE = re.compile(r"; (?=\[)")
-ENTRY_KEY_RE = re.compile(r"^\[([^\]]+)\]")
+# An entry's key is the first word in its brackets, the agent: "[RD
+# 11-28 04:30Z](...)" is RD's, so a new time is a changed entry.
+ENTRY_KEY_RE = re.compile(r"^\[([^\]\s]+)")
 
 
 def keyed_line(line):
