@@ -12,7 +12,13 @@ pushes. It runs from cron under forge-cron-run.
 (`*.md`, `MEMORY.md` among them) **merges as a union**: two appends,
 two inserts after the same line, or each host setting its front
 matter's `modified:` (the later is kept). The other hosts' lines come
-first, then this host's, in a merge commit (agent-forge #157).
+first, then this host's, in a merge commit (agent-forge #157). A
+**keyed line**, one line of `; `-joined entries that each start
+`[Name]` after a lead ending ": " (such as an index's "newest per
+agent" line, which each host rewrites for its own agents), **merges
+entry by entry**: each side's changed entries are kept, and both
+sides' lines added around it too. Both hosts changing one entry
+differently still stops (agent-forge #628).
 `MEMORY.md` no longer merges with git's union driver, though the
 repository's `.gitattributes` still names it: this host's own
 attributes, which outrank it, merge it as text (agent-forge #566). The
@@ -225,6 +231,91 @@ def later_modified(base, head, main):
     return [head[0] if got[1].group(1) >= got[2].group(1) else main[0]]
 
 
+# A line of entries, one per agent, that each host rewrites for its
+# own agents: "<lead>: [Name] ...; [Other] ...". Two hosts' edits
+# always meet on it, so a union can't take both (agent-forge #628).
+KEYED_RE = re.compile(r"^(?P<lead>[^\[\n]*?: )(?P<rest>\[[^\]\n]+\].*)$")
+ENTRY_SPLIT_RE = re.compile(r"; (?=\[)")
+ENTRY_KEY_RE = re.compile(r"^\[([^\]]+)\]")
+
+
+def keyed_line(line):
+    """(lead, [keys in order], {key: entry}) for a keyed line, or None."""
+    got = KEYED_RE.match(line.rstrip("\r\n"))
+    if not got:
+        return None
+    order, entries = [], {}
+    for entry in ENTRY_SPLIT_RE.split(got.group("rest")):
+        key = ENTRY_KEY_RE.match(entry)
+        if not key or key.group(1) in entries:
+            return None
+        order.append(key.group(1))
+        entries[key.group(1)] = entry
+    return got.group("lead"), order, entries
+
+
+def merge_keyed(base, head, main):
+    """The three-way merge of one keyed line, entry by entry: each
+    side's change to an entry is kept, an entry one side removed and
+    the other left alone goes, `head`'s order first and then `main`'s
+    new entries. None when both sides changed one entry differently,
+    or changed the lead differently."""
+    (bl, _, bd), (hl, ho, hd), (ml, mo, md) = base, head, main
+    lead = hl if hl == ml or ml == bl else ml if hl == bl else None
+    if lead is None:
+        return None
+    merged = {}
+    for key in set(bd) | set(hd) | set(md):
+        b, h, m = bd.get(key), hd.get(key), md.get(key)
+        if h == m:
+            got = h
+        elif h == b:
+            got = m
+        elif m == b:
+            got = h
+        else:
+            return None
+        if got is not None:
+            merged[key] = got
+    order = [k for k in ho if k in merged] + [k for k in mo
+                                              if k not in hd and k in merged]
+    return lead + "; ".join(merged[k] for k in order)
+
+
+def keyed_pick(base, head, main):
+    """For a conflicting hunk that holds one keyed line on every side
+    (the same lead) and otherwise only lines added: the keyed line
+    merged entry by entry, in `head`'s place, and both sides' added
+    lines, `head`'s first. None otherwise, so anything else still
+    stops for a person."""
+    sides = []
+    for lines in (base, head, main):
+        keyed = [(at, keyed_line(l)) for at, l in enumerate(lines)]
+        keyed = [(at, k) for at, k in keyed if k is not None]
+        if len(keyed) != 1:
+            return None
+        sides.append(keyed[0])
+    (bat, bk), (hat, hk), (mat, mk) = sides
+    others = [[l for at, l in enumerate(lines) if at != skip]
+              for lines, skip in ((base, bat), (head, hat), (main, mat))]
+    if any(l not in others[1] or l not in others[2] for l in others[0]):
+        return None
+    line = merge_keyed(bk, hk, mk)
+    if line is None:
+        return None
+    ending = "\n" if head[hat].endswith("\n") else ""
+    out = head[:hat] + [line + ending] + head[hat + 1:]
+    return out + [l for l in others[2] if l not in head
+                  and l not in others[0]]
+
+
+def pick(base, head, main):
+    """union.resolve's rule for a hunk that isn't only additions: the
+    later `modified:`, or a keyed line merged entry by entry."""
+    got = later_modified(base, head, main)
+    return got if got is not None else keyed_pick(base, head, main)
+
+
 def union_run(git):
     """A `run` for agent_forge.union that runs its git commands as
     `git` does, in this repository, keeping a temporary index it
@@ -248,12 +339,13 @@ def union_merge(git, cfg, conflicts):
     any conflict is more than that (agent-forge #157)."""
     theirs = "origin/" + cfg["branch"]
     got = union.resolve(UNION_REPO, theirs, "HEAD", UNION_GLOBS,
-                        run=union_run(git), pick=later_modified)
+                        run=union_run(git), pick=pick)
     if not got:
         return None
     made = git("commit-tree", got.tree, "-p", theirs, "-p", "HEAD", "-m",
-               "%s: union of %s\n\nBoth sides only added lines; the other "
-               "hosts' first." % (cfg["host"], ", ".join(conflicts)))
+               "%s: union of %s\n\nBoth sides only added lines, or changed "
+               "different entries of a keyed line; the other hosts' "
+               "first." % (cfg["host"], ", ".join(conflicts)))
     # A fast-forward: it refuses rather than overwrite a file changed
     # since the commit.
     if git("merge", "--ff-only", "-q", made.stdout.strip(),
