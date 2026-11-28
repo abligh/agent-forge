@@ -62,6 +62,55 @@ class AppToken(unittest.TestCase):
         good = [l for l in self.out if l.split()[0] == "LeadDev"]
         self.assertIn("slug leaddevwidgetagent", good[0])
 
+    def installed_on(self, *logins):
+        gh = FakeGitHub()
+        inner = gh.__call__
+
+        def call(url, token, scheme="Bearer", method="GET", body=None):
+            if "/app/installations?" in url:
+                gh.calls.append((method, url, scheme, body))
+                page = int(url.rsplit("page=", 1)[1])
+                chunk = list(logins)[(page - 1) * 100:page * 100]
+                return 200, [{"account": {"login": l}} for l in chunk]
+            return inner(url, token, scheme, method, body)
+        return call
+
+    def test_installations_on_the_one_org_only(self):
+        rc = self.run_tool("--installations", "LeadDev", "--org", "Example",
+                           gh=self.installed_on("example", "EXAMPLE"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.out, ["LeadDev: 2 installations, all on "
+                                    "Example: yes"])
+
+    def test_another_account_says_no_without_naming_it(self):
+        rc = self.run_tool("--installations", "LeadDev", "--org", "example",
+                           gh=self.installed_on("example", "elsewhere"))
+        self.assertEqual(rc, 7)
+        self.assertEqual(self.out, ["LeadDev: 2 installations, all on "
+                                    "example: no"])
+        self.assertNotIn("elsewhere", " ".join(self.out + self.err))
+
+    def test_installations_read_every_page(self):
+        logins = ["example"] * 150 + ["elsewhere"]
+        rc = self.run_tool("--installations", "LeadDev", "--org", "example",
+                           gh=self.installed_on(*logins))
+        self.assertEqual(rc, 7)
+        self.assertIn("151 installations", self.out[0])
+
+    def test_installations_refused_and_unknown(self):
+        self.assertEqual(self.run_tool("--installations", "LeadDev", "--org",
+                                       "example",
+                                       gh=FakeGitHub(slug="other")), 3)
+        self.assertEqual(self.run_tool("--installations", "Nobody", "--org",
+                                       "example"), 1)
+        self.assertEqual(self.out, [])
+
+    def test_installations_and_org_go_together(self):
+        with self.assertRaises(SystemExit):
+            self.run_tool("--installations", "LeadDev")
+        with self.assertRaises(SystemExit):
+            self.run_tool("--list", "--org", "example")
+
     def test_no_configuration(self):
         self.cfg = os.path.join(self.tmp.name, "missing.json")
         self.assertEqual(self.run_tool("--list"), 2)

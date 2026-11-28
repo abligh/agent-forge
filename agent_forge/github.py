@@ -194,6 +194,34 @@ def check(project, name, call=api_call, sign=openssl_sign):
                (inst.get("account") or {}).get("login"))), True
 
 
+def installations(project, name, org, call=api_call, sign=openssl_sign):
+    """(how many installations `name`'s App has, whether every one is
+    on the account `org`), from `GET /app/installations` with the App's
+    own assertion; MintError otherwise. An installation token sees only
+    its own installation, so only the App can answer this. No account
+    name is returned, so the caller can print the answer without
+    naming any account but the one it asked about."""
+    assertion, _ = assertion_for(project, name, call, sign)
+    count, all_on = 0, True
+    page = 1
+    while True:
+        status, found = call("%s/app/installations?per_page=100&page=%d"
+                             % (api_base(), page), assertion)
+        if status == 0:
+            raise MintError(UNREACHABLE, "could not reach GitHub to list "
+                            "%s's installations" % name)
+        if status != 200 or not isinstance(found, list):
+            raise MintError(REFUSED, "GitHub refused %s's installations "
+                            "(%s)" % (name, status))
+        for inst in found:
+            count += 1
+            login = (inst.get("account") or {}).get("login") or ""
+            all_on = all_on and login.lower() == org.lower()
+        if len(found) < 100:
+            return count, all_on
+        page += 1
+
+
 def rest(token_, method, path, body=None, call=api_call):
     """(status, body) for a REST call on `path` ("/repos/o/r/..."),
     as an installation."""
