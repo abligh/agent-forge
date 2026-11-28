@@ -5542,6 +5542,32 @@ class TickAhead(RepoCase):
         self.assertIn(5, record["ahead"])
         self.assertEqual(m.red_suspects(self.state, [fixed]), {})
 
+    def test_a_default_branch_merge_into_a_red_suspect_keeps_it_out(self):
+        # agent-forge #627: one project, 2026-11-28, the Merger updated a
+        # suspect in the tick its search found it red; the next tick
+        # dropped the hold as a new head, updated it again and put it
+        # first in a train, which went red on it 40 minutes later.
+        prs, record, lines, red = self.red_alone()
+        self.repo.branch("main")
+        self.repo.commit("m5.txt", "main moved\n", "main m5")
+        self.repo.push("main")
+        self.repo.branch("update", self.head)
+        updated = self.repo.merge("origin/main")
+        self.repo.publish_pr(5, updated)
+        five = dict(prs[0], headRefOid=updated)
+        self.assertIn("5", m.red_suspects(self.state, [five], self.repo.path,
+                                          self.repo.main_tip()))
+        before = len(self.github.writes)
+        record, lines = self.tick([five, prs[1]], conclusions=("success",),
+                                  live=True, minutes=2, check_state=red)
+        self.assertNotIn(5, record["ahead"])
+        self.assertFalse([w for w in self.github.writes[before:]
+                          if "/pulls/5/" in w[1]])
+        self.assertFalse([d for d in record["decisions"] if d["pr"] == 5
+                          and d["action"] in ("UPDATE", "MERGE")])
+        # Without the repository, as before: a head that differs drops it.
+        self.assertEqual(m.red_suspects(self.state, [five]), {})
+
     def test_a_suspect_whose_own_head_turns_red_goes_at_once(self):
         # agent-forge #596: one project, 2026-11-25, a suspect's own head
         # check was red at 10:45Z while the search still ran the prefixes
@@ -12575,6 +12601,19 @@ class UpdateWalk(RepoCase):
         state = {"results": {self.approved: {"ok": False, "tree": "t"},
                              self.head: {"ok": True, "failed": []}}}
         self.assertIs(m.head_red(state, self.item, walk), False)
+
+    def test_a_red_suspect_keeps_its_hold_across_an_update(self):
+        # agent-forge #627: found red at the approved head, now updated.
+        state = tempfile.mkdtemp(dir=self.tmp.name)
+        m.save_json(os.path.join(state, m.RED_SUSPECT_FILE), {
+            "5": {"head": self.approved, "reason": "red on its own"}})
+        tip = self.repo.main_tip()
+        self.assertEqual(list(m.red_suspects(state, [self.item],
+                                             self.repo.path, tip)), ["5"])
+        # An author's own commit on top is new evidence.
+        own = pr(5, head=self.repo.commit("g.txt", "fix\n", "fix"))
+        self.assertEqual(m.red_suspects(state, [own], self.repo.path, tip),
+                         {})
 
     def test_a_covered_green_of_the_head_does_not(self):
         # A batch's cover isn't a run of its own.

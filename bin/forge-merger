@@ -8337,18 +8337,35 @@ def suspect_round(state_dir, saved, entries, verdict, last, said_ahead,
     return True
 
 
-def red_suspects(state_dir, prs):
+def red_suspects(state_dir, prs, repo=None, main_tip=None, run=sh):
     """RED_SUSPECT_FILE's entries for the pull requests in `prs` still
     at the head they were found red at (designs/0044, rule 4): {number,
     as a string: {head, reason, at, main}}. A new head is new evidence,
     so its entry is dropped, and so is a closed one's. A green run of
-    the same head is too, but that is `rerun_green`'s to say."""
-    heads = {str(pr["number"]): pr["headRefOid"] for pr in prs}
+    the same head is too, but that is `rerun_green`'s to say.
+
+    A head that only merged the default branch into the one found red
+    (given `repo` and `main_tip`: the head is that one or reached from
+    it by `update_walk`) is not new evidence, and keeps the entry
+    (agent-forge #627). The Merger can update a pull request in the
+    same tick a red batch's search finds it red, and the hand-back
+    then keeps the head from the tick's start: on one project on
+    2026-11-28 the next tick dropped the entry, updated the suspect
+    again and put it first in a train, which went red on it 40 minutes
+    later."""
+    by_number = {str(pr["number"]): pr for pr in prs}
     saved = load_json(os.path.join(state_dir, RED_SUSPECT_FILE), {})
-    return {k: v for k, v in (saved.items() if isinstance(saved, dict)
-                              else ())
-            if isinstance(v, dict) and isinstance(v.get("reason"), str)
-            and heads.get(k) is not None and heads[k] == v.get("head")}
+    kept = {}
+    for k, v in (saved.items() if isinstance(saved, dict) else ()):
+        pr = by_number.get(k)
+        if not isinstance(v, dict) or not isinstance(v.get("reason"), str) \
+                or pr is None or not pr.get("headRefOid"):
+            continue
+        if pr["headRefOid"] == v.get("head") or (
+                repo is not None and main_tip and v.get("head")
+                in update_walk(pr, repo, main_tip, run)[1:]):
+            kept[k] = v
+    return kept
 
 
 def rerun_green(entry, head, check_state, repo, run=sh):
@@ -9702,8 +9719,8 @@ def tick(repo, state_dir, github, run=sh, out=print, now=now_utc,
     os.makedirs(state_dir, exist_ok=True)
     said_path = os.path.join(state_dir, "handed-back.json")
     said = load_json(said_path, {})
-    reds = red_suspects(state_dir, prs) if TEST_AHEAD and RED_SUSPECT_OUT \
-        else {}
+    reds = red_suspects(state_dir, prs, repo, main_tip, run) \
+        if TEST_AHEAD and RED_SUSPECT_OUT else {}
     cleared = clear_red_suspects(
         state_dir, reds, prs, check_state, repo, github, said, live, out,
         run) if reds else []
