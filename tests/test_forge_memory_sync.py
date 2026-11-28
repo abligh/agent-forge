@@ -454,6 +454,36 @@ class Sync(FleetCase):
                                            ("R", "r1")])
                          + "- [B](b.md)\n- [C](c.md)\n")
 
+    def test_a_keyed_line_as_consumers_write_it_merges(self):
+        # agent-forge #628, again: the line a consumer really writes has a
+        # link in its lead, and each entry's brackets hold a time that
+        # changes with it. v0.4.252 refused it, and the sync stopped.
+        def index(p, q):
+            return ("- [A](a.md)\n- **In-flight, newest per agent** (read "
+                    "your own first; older in [archive](arch.md)): "
+                    "[P %s](p-%s.md) ([11-27](p-0.md)); [Q %s](q-%s.md)\n"
+                    % (p, p, q, q))
+        self.fleet.two_hosts()
+        for host in ("one", "two"):
+            (self.fleet.memory(host) / "MEMORY.md").write_text(
+                index("01:00Z", "01:00Z"))
+        self.fleet.run("one")
+        self.fleet.run("two")
+        self.fleet.run("one")
+        (self.fleet.memory("one") / "MEMORY.md").write_text(
+            index("04:30Z", "01:00Z"))
+        (self.fleet.memory("two") / "MEMORY.md").write_text(
+            index("01:00Z", "03:58Z"))
+        self.assertEqual(self.fleet.run("one")[0], 0)
+        status, out, err = self.fleet.run("two")
+        self.assertEqual(status, 0, err)
+        self.assertEqual(self.fleet.remote_file("MEMORY.md"),
+                         index("04:30Z", "03:58Z"))
+
+    def test_an_index_entry_is_not_a_keyed_line(self):
+        self.assertIsNone(sync.keyed_line(
+            "- [Notes](notes.md) — hook: [x] one; [y] two\n"))
+
     def test_one_entry_changed_on_both_hosts_still_stops(self):
         self.fleet.two_hosts()
         start = self.keyed_index([("P", "p0")])

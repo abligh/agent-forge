@@ -57,9 +57,11 @@ a file changed meanwhile) and pushes, `pushed (union of <files>)`. A
 front-matter `modified:` that each host set differently keeps the later
 time (agent-forge #157; Alex, 2026-11-12: a union only for memory files,
 whose entries are lines and whose order doesn't matter). A **keyed
-line**, one line of `; `-joined entries that each start `[Name]` after
+line**, one line of `; `-joined entries that each start `[Name` after
 a lead ending ": " (an index's "newest per agent" line, which every
-host rewrites for its own agents), merges entry by entry: each host's
+host rewrites for its own agents; its lead may hold a link, and an
+entry's key is the first word in its brackets, so an entry headed
+`[RD 11-28 04:30Z]` is RD's), merges entry by entry: each host's
 changed entries are kept, an entry one host removed and the other left
 alone goes, and lines added around it are kept as a union. Both hosts
 changing the same entry differently still stops (agent-forge #628:
