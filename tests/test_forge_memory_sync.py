@@ -425,6 +425,51 @@ class Sync(FleetCase):
                          (front % "2026-11-02T10:00:00Z").replace(
                              "first\n", "first\nby one\nby two\n"))
 
+    def keyed_index(self, entries):
+        return "- [A](a.md)\n- **In flight** (newest): %s\n" % "; ".join(
+            "[%s] %s" % kv for kv in entries)
+
+    def test_a_keyed_line_merges_entry_by_entry(self):
+        # agent-forge #628: four stops in two hours on one consumer, each
+        # two hosts rewriting their own agents' entries of one line.
+        self.fleet.two_hosts()
+        start = self.keyed_index([("P", "p0"), ("Q", "q0")])
+        for host in ("one", "two"):
+            (self.fleet.memory(host) / "MEMORY.md").write_text(start)
+        self.fleet.run("one")
+        self.fleet.run("two")
+        self.fleet.run("one")
+        (self.fleet.memory("one") / "MEMORY.md").write_text(
+            self.keyed_index([("P", "p1"), ("Q", "q0")]) + "- [B](b.md)\n")
+        (self.fleet.memory("two") / "MEMORY.md").write_text(
+            self.keyed_index([("P", "p0"), ("Q", "q1"), ("R", "r1")])
+            + "- [C](c.md)\n")
+        self.assertEqual(self.fleet.run("one")[0], 0)
+        status, out, err = self.fleet.run("two")
+        self.assertEqual(status, 0, err)
+        self.assertEqual(out.strip(), "forge-memory-sync: pushed "
+                         "(union of MEMORY.md)")
+        self.assertEqual(self.fleet.remote_file("MEMORY.md"),
+                         self.keyed_index([("P", "p1"), ("Q", "q1"),
+                                           ("R", "r1")])
+                         + "- [B](b.md)\n- [C](c.md)\n")
+
+    def test_one_entry_changed_on_both_hosts_still_stops(self):
+        self.fleet.two_hosts()
+        start = self.keyed_index([("P", "p0")])
+        for host in ("one", "two"):
+            (self.fleet.memory(host) / "MEMORY.md").write_text(start)
+        self.fleet.run("one")
+        self.fleet.run("two")
+        self.fleet.run("one")
+        for host in ("one", "two"):
+            (self.fleet.memory(host) / "MEMORY.md").write_text(
+                self.keyed_index([("P", "by " + host)]))
+        self.assertEqual(self.fleet.run("one")[0], 0)
+        status, _, err = self.fleet.run("two")
+        self.assertEqual(status, 1)
+        self.assertIn("conflict with the other hosts in: MEMORY.md", err)
+
     def test_a_line_changed_on_one_host_still_stops(self):
         self.fleet.two_hosts()
         (self.fleet.memory("one") / "a.md").write_text("a\nfrom one\n")

@@ -56,7 +56,14 @@ this host's, in a merge commit, which it fast-forwards to (refusing if
 a file changed meanwhile) and pushes, `pushed (union of <files>)`. A
 front-matter `modified:` that each host set differently keeps the later
 time (agent-forge #157; Alex, 2026-11-12: a union only for memory files,
-whose entries are lines and whose order doesn't matter). A line one
+whose entries are lines and whose order doesn't matter). A **keyed
+line**, one line of `; `-joined entries that each start `[Name]` after
+a lead ending ": " (an index's "newest per agent" line, which every
+host rewrites for its own agents), merges entry by entry: each host's
+changed entries are kept, an entry one host removed and the other left
+alone goes, and lines added around it are kept as a union. Both hosts
+changing the same entry differently still stops (agent-forge #628:
+four stops in two hours on one consumer, each this). A line one
 host deleted that the other edited is not that, so a prune of
 `MEMORY.md` against an edit stops. Otherwise the
 run exits 1, and on every later run the host goes on
