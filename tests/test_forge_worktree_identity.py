@@ -136,6 +136,52 @@ class PushApp(Worktrees):
         self.assertEqual(self.read(self.wt, "remote", "get-url",
                                    "origin").strip(), SSH)
 
+    def test_a_clone_of_another_repository_is_refused(self):
+        self.r.git(self.wt, "remote", "set-url", "origin",
+                   "git@github.com:example/other.git")
+        self.assertEqual(self.main("--push", "app", "LeadDev"), 2)
+        self.assertIn("origin is example/other, not the project's "
+                      "repository example/widget", self.err[-1])
+        self.assertIn("--repo example/other", self.err[-1])
+        self.assertEqual(self.read(self.wt, "config", "--worktree", "--get",
+                                   "remote.origin.pushurl"), "")
+
+    def test_repo_names_the_clone_s_own_repository(self):
+        self.r.git(self.wt, "remote", "set-url", "origin",
+                   "https://github.com/Example/Other.git")
+        self.assertEqual(self.main("--push", "app", "--repo", "example/other",
+                                   "LeadDev"), 0)
+        self.assertEqual(self.read(self.wt, "remote", "get-url", "--push",
+                                   "origin").strip(),
+                         "https://github.com/example/other.git")
+        self.assertEqual(self.main("--check", "--push", "app", "--repo",
+                                   "example/other", "LeadDev"), 0)
+
+    def test_repo_must_be_the_origin(self):
+        self.assertEqual(self.main("--push", "app", "--repo", "example/other",
+                                   "LeadDev"), 2)
+        self.assertIn("--repo example/other is not this clone's origin, "
+                      "example/widget", self.err[-1])
+
+    def test_check_fails_a_push_url_left_from_the_home_repository(self):
+        self.main("--push", "app", "LeadDev")
+        self.r.git(self.wt, "remote", "set-url", "origin",
+                   "git@github.com:example/other.git")
+        self.assertEqual(self.main("--check", "--push", "app", "LeadDev"), 2)
+        self.assertEqual(self.main("--check", "--push", "app", "--repo",
+                                   "example/other", "LeadDev"), 1)
+
+    def test_an_origin_off_github_is_refused(self):
+        self.r.git(self.wt, "remote", "set-url", "origin",
+                   "https://example.org/widget.git")
+        self.assertEqual(self.main("--push", "app", "LeadDev"), 2)
+        self.assertIn("names no GitHub repository", self.err[-1])
+
+    def test_repo_needs_push(self):
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            tool.main(["--repo", "example/other", "LeadDev"])
+
     def test_only_this_worktree_changes(self):
         self.main("--push", "app", "LeadDev")
         self.assertEqual(self.read(self.main_wt, "remote", "get-url",

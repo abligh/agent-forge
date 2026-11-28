@@ -14,6 +14,7 @@ with a deploy key that GitHub attributes to the key's owner.
     forge-worktree-identity --check AGENT       verify only
     forge-worktree-identity --push app AGENT    stamp, and push as the App
     forge-worktree-identity --push app --helper COMMAND AGENT
+    forge-worktree-identity --push app --repo OWNER/NAME AGENT
 
 An agent runs it in its session, inside each worktree it creates,
 before its first commit:
@@ -35,6 +36,7 @@ changes nothing. A session-start hook or a check script can run
 | `AGENT` | required | The agent to stamp as: a name under `agents` in the configuration. Machinery Apps are not accepted. |
 | `--check` | off | Verify only; write nothing. Exits 1 if the worktree's identity (or, with `--push app`, its push settings) is not the agent's. |
 | `--push app` | none | Also set this worktree to push as the agent's App, over HTTPS, through [forge-git-credential](forge-git-credential.md). `app` is the only value. |
+| `--repo OWNER/NAME` | the project's | With `--push app`, the repository this clone pushes to, for a clone of a repository other than the project's own. It must be the repository `remote.origin.url` names. |
 | `--helper COMMAND` | this copy's | With `--push app`, the credential helper to store, written as git takes it (such as `!/opt/tools/git-credential`). Use it when agent-forge runs from a path that changes with each release, such as a pinned cache, so worktrees keep a helper that still exists. `--check` compares against it too. |
 | `-h`, `--help` | | Print the usage and exit. |
 
@@ -112,13 +114,25 @@ git config --worktree --unset remote.origin.pushurl
 
 Other worktrees of the same repository are never changed.
 
+### A clone of another repository
+
+`<repo>` in the push URL is the configuration's repository. Before
+agent-forge #633, `--push app` wrote it whatever the clone was, so in
+a clone of a second repository it sent that clone's pushes to the
+project's repository while fetches still came from the right one, and
+nothing said so. Now it reads `remote.origin.url` first. It writes
+nothing, and exits 2 naming both, unless the origin is the project's
+repository or the one `--repo` gives. An origin that isn't on GitHub
+is refused the same way. `--check` applies the same test, so a push
+URL left over from the home repository fails it.
+
 ## Exit status
 
 | Status | Meaning |
 | --- | --- |
 | 0 | The worktree's identity (and with `--push app`, its push credential) is the agent's. |
 | 1 | It is not (with `--check`), or a `git config` write failed or did not read back. |
-| 2 | The configuration could not be read, the agent is not in it, its bot could not be resolved as a Bot user, or a usage error. |
+| 2 | The configuration could not be read, the agent is not in it, its bot could not be resolved as a Bot user, `--push app` found that the clone's origin is not the repository to push to, or a usage error. |
 
 ## See also
 
