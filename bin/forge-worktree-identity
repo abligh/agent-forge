@@ -24,6 +24,7 @@ Two traps, and how this handles them:
     forge-worktree-identity --check AGENT       verify only
     forge-worktree-identity --push app AGENT    stamp, and push as the App
     forge-worktree-identity --push app --helper '!/stable/helper' AGENT
+    forge-worktree-identity --push app --repo OWNER/NAME AGENT
 
 **`--push app`** also makes this worktree push as the agent's App,
 rather than over SSH with a deploy key, which GitHub attributes to the
@@ -33,6 +34,13 @@ key's owner. It writes, at worktree scope only:
     credential.https://github.com.helper = (empty, then)
                                            !<this copy>/forge-git-credential
     credential.https://github.com.useHttpPath = false
+
+`<repo>` is the configuration's repository. In a clone of any other
+repository that would send this clone's pushes to the wrong place
+(agent-forge #633), so `--push app` first reads `remote.origin.url`
+and refuses, writing nothing, unless it names that repository or the
+one `--repo OWNER/NAME` gives. `--check` fails a push URL that names
+another repository than the origin.
 
 `remote.origin.url` stays as it was, so fetching is unchanged. The
 empty helper value first clears any helper a broader scope configures
@@ -49,10 +57,12 @@ its bot login is a Bot before anything is written.
 
 Exit 0 when the worktree's identity (and, with `--push app`, its push
 credential) is the agent's; 1 when it is not (with `--check`), or a
-write did not read back; 2 when the agent or its bot can't be resolved.
+write did not read back; 2 when the agent or its bot can't be resolved,
+or `--push app` finds the clone's origin isn't the repository to push to.
 """
 import argparse
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -88,6 +98,37 @@ def stamp(run, name, email):
         if git(run, *args).returncode != 0:
             return False
     return True
+
+
+ORIGIN_RE = re.compile(r"^(?:https://github\.com/|ssh://git@github\.com/"
+                       r"|git@github\.com:)([^/\s]+/[^/\s]+?)(?:\.git)?/?$",
+                       re.IGNORECASE)
+
+
+def origin_repo(run):
+    """OWNER/NAME that this clone's `remote.origin.url` names on GitHub,
+    lowercased, or None when there is no such origin."""
+    got = git(run, "config", "--get", "remote.origin.url")
+    match = ORIGIN_RE.match(got.stdout.strip()) if got.returncode == 0 \
+        else None
+    return match.group(1).lower() if match else None
+
+
+def push_repo(run, home, given):
+    """(the repository this clone may push to, None) or (None, why)."""
+    origin = origin_repo(run)
+    want = (given or home).lower()
+    if origin is None:
+        return None, ("remote.origin.url names no GitHub repository, so "
+                      "the push URL can't be checked against it")
+    if origin != want:
+        if given:
+            return None, ("--repo %s is not this clone's origin, %s"
+                          % (given, origin))
+        return None, ("this clone's origin is %s, not the project's "
+                      "repository %s; pass --repo %s if this clone should "
+                      "push there as the App" % (origin, home, origin))
+    return (given or home), None
 
 
 def push_settings(repo, helper=HELPER):
@@ -137,7 +178,13 @@ def main(argv=None, run=proc.sh, load=config.load_reviewed, lookup=None,
                         help="with --push app, the credential helper to "
                         "store, as git takes it (default: this copy's "
                         "forge-git-credential)")
+    parser.add_argument("--repo", metavar="OWNER/NAME",
+                        help="with --push app, the repository this clone "
+                        "pushes to, when it isn't the project's own; it "
+                        "must be the clone's origin")
     args = parser.parse_args(argv)
+    if args.repo is not None and not args.push:
+        parser.error("--repo needs --push app")
     if args.helper is not None and not args.push:
         parser.error("--helper needs --push app")
     if args.helper == "":
@@ -172,12 +219,15 @@ def main(argv=None, run=proc.sh, load=config.load_reviewed, lookup=None,
     out("forge-worktree-identity: this worktree commits as %s <%s>" % want)
     if not args.push:
         return 0
-    if not args.check and not stamp_push(run, project.repo, helper):
+    repo, why = push_repo(run, project.repo, args.repo)
+    if repo is None:
+        err("forge-worktree-identity: %s" % why)
+        return 2
+    if not args.check and not stamp_push(run, repo, helper):
         err("forge-worktree-identity: git config failed while setting the "
             "push credential")
         return 1
-    if current_push(run, project.repo, helper) != push_settings(project.repo,
-                                                                helper):
+    if current_push(run, repo, helper) != push_settings(repo, helper):
         err("forge-worktree-identity: this worktree does not push as %s's "
             "App%s" % (args.agent, " -- run without --check to set it"
                        if args.check else ""))
